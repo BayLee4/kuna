@@ -34,7 +34,7 @@
 //! `Varnode`, `Translate` (register names), and `JoinRecord`.  Per the STUB
 //! rule, these are satisfied by **local access traits** defined here
 //! ([`DatabaseArch`], [`TypeFactoryAccess`], [`TranslateAccess`]) plus the
-//! [`crate::dtype::Datatype`] boundary; the W4 architecture porter / W6 type porter
+//! [`crate::dtype::TypeRoot`] boundary; the architecture and datatype subsystems
 //! implement them in their own modules.  Where a path needs a fully-wired
 //! subsystem that no stub can stand in for (the `Funcdata`/`Varnode`-dependent
 //! `buildDefaultName` Varnode arm, `getSizedType`, `updateType`), the method
@@ -51,7 +51,7 @@ use kuna_base::rangemap::{RangeMap, RangeRecord, RecordIdx, Subsort};
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, uint4, uint8, uintb};
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeRoot};
 
 // Varnode boolean property bits live in `varnode.rs` (W3); the Symbol/SymbolEntry
 // flag words are exactly the same bit space (`database.hh` documents the
@@ -64,17 +64,16 @@ use crate::varnode::varnode_flags;
 
 /// Access trait for the `TypeFactory` (`glb->types`, C++ `type.hh`, W6).
 ///
-/// STUB(W6): `database.cc` reaches `glb->types` to fabricate placeholder
-/// data-types for symbols (`getBase`, `getTypeCode`, `getExactPiece`).  Only the
-/// thin slice the database touches is declared here; W6 implements it on the
-/// real `TypeFactory`.
+/// Symbol placeholder types come from the architecture's real factory.
+/// Creation errors propagate to the caller; an unavailable factory must not
+/// manufacture a disconnected graph.
 pub trait TypeFactoryAccess {
     /// C++ `TypeFactory::getBase(size,metatype)` — a base data-type of the given
     /// size and meta-type.
-    fn get_base(&self, size: int4, meta: type_metatype) -> Rc<Datatype>;
+    fn get_base(&self, size: int4, meta: type_metatype) -> KunaResult<TypeRoot>;
     /// C++ `TypeFactory::getTypeCode()` — the "code" placeholder data-type used
     /// for function symbols.
-    fn get_type_code(&self) -> Rc<Datatype>;
+    fn get_type_code(&self) -> KunaResult<TypeRoot>;
 }
 
 /// Access trait for the `Translate`/`Architecture` register-name lookup
@@ -117,7 +116,7 @@ pub trait DatabaseArch {
     /// (`iVar`/`<type>Ram`, etc).  STUB(W6): the real per-type renderer lives in
     /// the type subsystem; the architecture access forwards to it.  The base
     /// renderer is "first char of the type name", empty for a nameless type.
-    fn type_name_base(&self, dt: &Datatype) -> String;
+    fn type_name_base(&self, dt: &TypeRoot) -> String;
 }
 
 // ===========================================================================
@@ -638,7 +637,7 @@ pub struct DynamicSymbolSpec {
     /// Symbol local name (C++ `Symbol::name`).
     pub name: String,
     /// Symbol data-type (C++ `Symbol::type`).
-    pub dtype: Rc<Datatype>,
+    pub dtype: TypeRoot,
     /// First-use address of the dynamic SymbolEntry (C++ `getFirstUseAddress`).
     pub addr: Address,
     /// The dynamic hash identifying the Varnode (C++ `SymbolEntry::hash`).
@@ -672,7 +671,7 @@ pub struct Symbol {
     pub display_name: String,
     /// The symbol's data-type (C++ `type`).  `None` only transiently during
     /// decode-style construction (C++ `(Datatype *)0`).
-    pub dtype: Option<Rc<Datatype>>,
+    pub dtype: Option<TypeRoot>,
     /// Id to distinguish symbols with the same name (C++ `nameDedup`).
     pub name_dedup: uint4,
     /// Varnode-like properties of the symbol (C++ `flags`).
@@ -695,7 +694,7 @@ pub struct Symbol {
 
 impl Symbol {
     /// C++ `Symbol(Scope *sc,const string &nm,Datatype *ct)` (`database.hh:963`).
-    pub fn new(scope: ScopeId, nm: &str, ct: Option<Rc<Datatype>>) -> Symbol {
+    pub fn new(scope: ScopeId, nm: &str, ct: Option<TypeRoot>) -> Symbol {
         Symbol {
             scope,
             name: nm.to_string(),
@@ -1628,6 +1627,17 @@ impl Database {
         Ok(())
     }
 
+    /// Resolve an authoritative category/index identity without a storage guess.
+    pub fn get_category_symbol(&self, scope: ScopeId, category: int4, index: int4) -> Option<SymbolId> {
+        if category < 0 || index < 0 { return None; }
+        self.scopes[scope].category.get(category as usize)?.get(index as usize).copied().flatten()
+    }
+
+    pub fn category_symbols(&self, scope: ScopeId, category: int4) -> impl Iterator<Item = SymbolId> + '_ {
+        self.scopes[scope].category.get(category as usize).into_iter()
+            .flatten().filter_map(|symbol| *symbol)
+    }
+
     /// C++ `ScopeInternal::setCategory` (`database.cc:2854`): move `sym` into the
     /// `cat`/`ind` slot of `scope`'s category table (removing it from any prior
     /// category slot first).  For `cat > 0` the index is forced to append; for
@@ -1915,7 +1925,7 @@ impl Database {
             }
             let symbol = &self.symbols[entry.symbol];
             let ct = match &symbol.dtype {
-                Some(c) => Rc::clone(c),
+                Some(c) => c.clone(),
                 None => continue,
             };
             let equate_value = match symbol.kind {
@@ -2120,7 +2130,7 @@ impl Database {
         &mut self,
         scope: ScopeId,
         nm: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
     ) -> KunaResult<SymbolId> {
         self.kuna_gen += 1;
         let sym = self.symbols.insert(Symbol::new(scope, nm, Some(ct)));
@@ -2134,13 +2144,12 @@ impl Database {
         &mut self,
         scope: ScopeId,
         nm: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         addr: &Address,
         usepoint: &Address,
     ) -> KunaResult<(SymbolId, EntryRef)> {
         self.kuna_gen += 1;
-        // C++ strips a "stripped" type first; the W6 Datatype stub has no
-        // hasStripped yet, so it is a no-op here (STUB(W6)).
+        let ct = ct.get_stripped().unwrap_or(ct);
         let sym = self.symbols.insert(Symbol::new(scope, nm, Some(ct)));
         self.add_symbol_internal(scope, sym)?;
         let eref = self.add_map_point(scope, sym, addr, usepoint)?;
@@ -2153,7 +2162,7 @@ impl Database {
         &mut self,
         scope: ScopeId,
         nm: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         addr: &Address,
         usepoint: &Address,
     ) -> KunaResult<(SymbolId, EntryRef)> {
@@ -2181,7 +2190,7 @@ impl Database {
         addr: &Address,
         nm: &str,
         min_funcsymbol_size: int4,
-        type_code: Rc<Datatype>,
+        type_code: TypeRoot,
     ) -> KunaResult<SymbolId> {
         self.kuna_gen += 1;
         // C++ warns (printMessage) on overlap; the message channel is W5, so the
@@ -2229,7 +2238,7 @@ impl Database {
         scope: ScopeId,
         addr: &Address,
         nm: &str,
-        lab_type: Rc<Datatype>,
+        lab_type: TypeRoot,
     ) -> KunaResult<SymbolId> {
         self.kuna_gen += 1;
         let mut sym = Symbol::new_empty(scope);
@@ -2249,7 +2258,7 @@ impl Database {
         &mut self,
         scope: ScopeId,
         nm: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         caddr: &Address,
         hash: uint8,
     ) -> KunaResult<SymbolId> {
@@ -2276,7 +2285,7 @@ impl Database {
         value: uintb,
         addr: &Address,
         hash: uint8,
-        base1_unknown: Rc<Datatype>,
+        base1_unknown: TypeRoot,
     ) -> KunaResult<SymbolId> {
         self.kuna_gen += 1;
         // C++ EquateSymbol ctor.
@@ -2300,7 +2309,7 @@ impl Database {
         &mut self,
         scope: ScopeId,
         nm: &str,
-        dt: Rc<Datatype>,
+        dt: TypeRoot,
         field_num: int4,
         addr: &Address,
         hash: uint8,
@@ -2343,7 +2352,7 @@ impl Database {
         &self,
         scope: ScopeId,
         space_index: usize,
-    ) -> Vec<(uintb, Rc<Datatype>, bool)> {
+    ) -> Vec<(uintb, TypeRoot, bool)> {
         let mut out = Vec::new();
         let rangemap = match self.scopes[scope].maptable.get(space_index).and_then(|m| m.as_ref()) {
             Some(rm) => rm,
@@ -2354,7 +2363,7 @@ impl Database {
             let sym = entry.symbol;
             let symbol = &self.symbols[sym];
             let ct = match &symbol.dtype {
-                Some(c) => Rc::clone(c),
+                Some(c) => c.clone(),
                 None => continue,
             };
             let type_locked = (symbol.flags & varnode_flags::typelock) != 0;
@@ -2370,7 +2379,7 @@ impl Database {
         &self,
         scope: ScopeId,
         space_index: usize,
-    ) -> Vec<(String, Rc<Datatype>, Address, uint4)> {
+    ) -> Vec<(String, TypeRoot, Address, uint4)> {
         let mut out = Vec::new();
         let rangemap = match self.scopes[scope].maptable.get(space_index).and_then(|m| m.as_ref()) {
             Some(rm) => rm,
@@ -2385,8 +2394,12 @@ impl Database {
             }
             let sym = entry.symbol;
             let symbol = &self.symbols[sym];
+            // Source formals replay through prototype/parameter authority, not local seeds.
+            if symbol.get_category() == symbol_category::FUNCTION_PARAMETER {
+                continue;
+            }
             let ct = match &symbol.dtype {
-                Some(c) => Rc::clone(c),
+                Some(c) => c.clone(),
                 None => continue,
             };
             out.push((symbol.name.clone(), ct, entry.get_addr().clone(), symbol.flags));
@@ -2407,7 +2420,7 @@ impl Database {
         &self,
         scope: ScopeId,
         space_index: usize,
-    ) -> Vec<(String, Rc<Datatype>, Address, int4)> {
+    ) -> Vec<(String, TypeRoot, Address, int4)> {
         let mut out = Vec::new();
         let rangemap = match self.scopes[scope].maptable.get(space_index).and_then(|m| m.as_ref()) {
             Some(rm) => rm,
@@ -2421,7 +2434,7 @@ impl Database {
             let sym = entry.symbol;
             let symbol = &self.symbols[sym];
             let ct = match &symbol.dtype {
-                Some(c) => Rc::clone(c),
+                Some(c) => c.clone(),
                 None => continue,
             };
             out.push((symbol.name.clone(), ct, entry.get_addr().clone(), symbol.get_category()));
@@ -2448,7 +2461,7 @@ impl Database {
         &self,
         scope: ScopeId,
         skip_space_index: usize,
-    ) -> Vec<(String, Rc<Datatype>, Address, uint4)> {
+    ) -> Vec<(String, TypeRoot, Address, uint4)> {
         let mut out = Vec::new();
         for space_index in 0..self.scopes[scope].maptable.len() {
             if space_index == skip_space_index {
@@ -2467,13 +2480,17 @@ impl Database {
                 }
                 let sym = entry.symbol;
                 let symbol = &self.symbols[sym];
+                // Source formals replay through prototype/parameter authority, not local seeds.
+                if symbol.get_category() == symbol_category::FUNCTION_PARAMETER {
+                    continue;
+                }
                 // Only addr-tied (usepoint-independent) symbols here; usepoint-scoped
                 // ones go through `scope_usepoint_symbol_specs` with their use address.
                 if (symbol.flags & varnode_flags::addrtied) == 0 {
                     continue;
                 }
                 let ct = match &symbol.dtype {
-                    Some(c) => Rc::clone(c),
+                    Some(c) => c.clone(),
                     None => continue,
                 };
                 out.push((symbol.name.clone(), ct, entry.get_addr().clone(), symbol.flags));
@@ -2495,7 +2512,7 @@ impl Database {
     pub fn scope_usepoint_symbol_specs(
         &self,
         scope: ScopeId,
-    ) -> Vec<(String, Rc<Datatype>, Address, uint4, Address, bool)> {
+    ) -> Vec<(String, TypeRoot, Address, uint4, Address, bool)> {
         let mut out = Vec::new();
         for space_index in 0..self.scopes[scope].maptable.len() {
             let rangemap = match self.scopes[scope].maptable.get(space_index).and_then(|m| m.as_ref()) {
@@ -2511,6 +2528,10 @@ impl Database {
                 }
                 let sym = entry.symbol;
                 let symbol = &self.symbols[sym];
+                // Source formals replay through prototype/parameter authority, not local seeds.
+                if symbol.get_category() == symbol_category::FUNCTION_PARAMETER {
+                    continue;
+                }
                 // addr-tied / empty-uselimit symbols are usepoint-independent and
                 // already carried by `scope_space_symbol_specs` for the stack space;
                 // here we only carry the genuinely usepoint-scoped ones.
@@ -2518,7 +2539,7 @@ impl Database {
                     continue;
                 }
                 let ct = match &symbol.dtype {
-                    Some(c) => Rc::clone(c),
+                    Some(c) => c.clone(),
                     None => continue,
                 };
                 let usepoint = entry.get_first_use_address();
@@ -3531,7 +3552,7 @@ impl Database {
         scope: ScopeId,
         addr: &Address,
         _pc: &Address,
-        ct: Option<&Datatype>,
+        ct: Option<&TypeRoot>,
         index: &mut int4,
         flags: uint4,
         arch: &dyn DatabaseArch,
@@ -3703,7 +3724,7 @@ impl Database {
                         scope,
                         &rep.addr,
                         &usepoint,
-                        dt.as_deref(),
+                        dt.as_ref(),
                         &mut index,
                         rep.flags | varnode_flags::input,
                         arch,
@@ -3714,7 +3735,7 @@ impl Database {
                     scope,
                     &rep.addr,
                     &usepoint,
-                    dt.as_deref(),
+                    dt.as_ref(),
                     &mut idx,
                     rep.flags,
                     arch,
@@ -3738,7 +3759,7 @@ impl Database {
                     scope,
                     &addr,
                     &usepoint,
-                    dt.as_deref(),
+                    dt.as_ref(),
                     &mut index,
                     flags,
                     arch,
@@ -3749,7 +3770,7 @@ impl Database {
                 scope,
                 &addr,
                 &usepoint,
-                dt.as_deref(),
+                dt.as_ref(),
                 &mut idx,
                 flags,
                 arch,
@@ -3764,7 +3785,7 @@ impl Database {
             scope,
             &Address::new_invalid(),
             &Address::new_invalid(),
-            dt.as_deref(),
+            dt.as_ref(),
             &mut idx,
             0,
             arch,
@@ -3966,7 +3987,7 @@ impl Database {
     /// same size as the old (or the symbol has no storage mappings) the type is
     /// swapped in place and the size/type lock recomputed; otherwise, for a
     /// single address-tied mapping, the mapping is rebuilt at the new size.
-    pub fn retype_symbol(&mut self, sym: SymbolId, ct: Rc<Datatype>) -> KunaResult<()> {
+    pub fn retype_symbol(&mut self, sym: SymbolId, ct: TypeRoot) -> KunaResult<()> {
         self.kuna_gen += 1;
         let ct = if ct.has_stripped() { ct.get_stripped().unwrap_or(ct) } else { ct };
         let old_size = self.symbols[sym].dtype.as_ref().map(|t| t.get_size()).unwrap_or(0);
@@ -3984,7 +4005,8 @@ impl Database {
             // Varnode::addrtied`.
             let addr_tied = (self.symbols[sym].get_flags() & varnode_flags::addrtied) != 0;
             let addr = self.entry(scope, eref).get_addr().clone();
-            if addr_tied {
+            if addr_tied || self.symbols[sym].get_category() == symbol_category::FUNCTION_PARAMETER {
+                let usepoint = self.entry(scope, eref).get_first_use_address();
                 // Remove the single map entry (C++ erases the rangemap iterator,
                 // pops mapentry, zeroes wholeCount), swap the type, then re-add the
                 // map point at the new size.
@@ -3993,7 +4015,7 @@ impl Database {
                 self.symbols[sym].whole_count = 0;
                 self.symbols[sym].dtype = Some(ct);
                 self.symbols[sym].check_size_type_lock();
-                self.add_map_point(scope, sym, &addr, &Address::new_invalid())?;
+                self.add_map_point(scope, sym, &addr, &usepoint)?;
                 return Ok(());
             }
         }
@@ -4271,7 +4293,7 @@ pub struct WireSymbol {
     /// Display name — the name the markup already printed for the variable.
     pub name: String,
     /// The variable's data-type.
-    pub dtype: Rc<Datatype>,
+    pub dtype: TypeRoot,
     /// Storage address for a MAPPED symbol; invalid when `hash != 0`.
     pub addr: Address,
     /// Data-flow hash for a DYNAMIC symbol (0 = mapped storage).  This is the
@@ -4598,12 +4620,13 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
     use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace,
         UniqueSpace};
 
     /// A simple test data-type of the given size (TYPE_UNKNOWN unless given).
-    fn dt(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn dt(size: int4) -> TypeRoot {
+        TypeFactoryImpl::new().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
     }
 
     /// Build a manager: const(0), unique(1), ram(2), register(3).
@@ -4632,17 +4655,17 @@ mod tests {
     struct TestArch {
         num_spaces: int4,
         angr: bool,
+        types: TypeFactoryImpl,
         /// Map of (space_index, offset, size) -> register name.
         regnames: BTreeMap<(int4, uintb, int4), String>,
     }
 
-    struct TestTypes;
-    impl TypeFactoryAccess for TestTypes {
-        fn get_base(&self, size: int4, meta: type_metatype) -> Rc<Datatype> {
-            Rc::new(Datatype::new(size, meta))
+    impl TypeFactoryAccess for TestArch {
+        fn get_base(&self, size: int4, meta: type_metatype) -> KunaResult<TypeRoot> {
+            self.types.get_base(size, meta)
         }
-        fn get_type_code(&self) -> Rc<Datatype> {
-            Rc::new(Datatype::new(1, type_metatype::TYPE_CODE))
+        fn get_type_code(&self) -> KunaResult<TypeRoot> {
+            self.types.get_type_code()
         }
     }
 
@@ -4660,7 +4683,7 @@ mod tests {
             self.num_spaces
         }
         fn types(&self) -> &dyn TypeFactoryAccess {
-            &TestTypes
+            self
         }
         fn translate(&self) -> &dyn TranslateAccess {
             self
@@ -4671,13 +4694,13 @@ mod tests {
         fn name_style_angr(&self) -> bool {
             self.angr
         }
-        fn type_name_base(&self, _dt: &Datatype) -> String {
-            String::new() // base Datatype stub has no name (STUB(W6))
+        fn type_name_base(&self, _dt: &TypeRoot) -> String {
+            String::new()
         }
     }
 
     fn test_arch(num_spaces: int4, angr: bool) -> TestArch {
-        TestArch { num_spaces, angr, regnames: BTreeMap::new() }
+        TestArch { num_spaces, angr, types: TypeFactoryImpl::new(), regnames: BTreeMap::new() }
     }
 
     /// Build a database with an attached global scope.  Returns (db, global id).
@@ -5249,7 +5272,7 @@ mod tests {
         // size_typelock is set only when typelocked AND type is unknown.
         s.check_size_type_lock();
         assert!(s.is_size_type_locked());
-        s.dtype = Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT)));
+        s.dtype = Some(TypeFactoryImpl::new().get_base(4, type_metatype::TYPE_INT).unwrap());
         s.check_size_type_lock();
         assert!(!s.is_size_type_locked());
 

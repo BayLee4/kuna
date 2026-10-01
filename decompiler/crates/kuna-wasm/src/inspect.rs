@@ -67,6 +67,8 @@ pub fn known_types_json(prog: &ConsoleProgram) -> String {
     use kuna_decomp::dtype::type_metatype::*;
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
     for ct in prog.arch().types_impl().dependent_order() {
+        let view = ct.read();
+        let ct = view.get(ct.id()).expect("factory type belongs to its graph");
         if ct.is_core_type() || ct.get_name().is_empty() {
             continue;
         }
@@ -189,7 +191,7 @@ fn function_json(prog: &ConsoleProgram, f: &FuncResult, kind: &str, sections: &[
             .raw("lines", &arr(lines.iter().map(usize::to_string)))
             .end()
     }));
-    Obj::new()
+    let mut document = Obj::new()
         .str("name", &f.name)
         .addr("address", f.address)
         .raw("aliases", &json_str_array(&f.aliases))
@@ -207,8 +209,17 @@ fn function_json(prog: &ConsoleProgram, f: &FuncResult, kind: &str, sections: &[
         .raw("tokens", &tokens)
         .opt_str("tokens_error", tokens_error.as_deref())
         .raw("instructions", &instructions)
-        .bool("instructions_truncated", truncated)
-        .end()
+        .bool("instructions_truncated", truncated);
+    let required = kuna_console::project::required_callable_keys(std::slice::from_ref(f));
+    let mut artifacts = f.callable_artifacts.iter()
+        .filter(|artifact| required.contains(artifact.key.as_str())).peekable();
+    if artifacts.peek().is_some() {
+        document = document.raw("callable_artifacts", &crate::json::callable_artifacts_json(artifacts));
+    }
+    if let Some(error) = &f.callable_export_error {
+        document = document.str("callable_export_error", error);
+    }
+    document.end()
 }
 
 /// The `inspect` document: one function, one load.

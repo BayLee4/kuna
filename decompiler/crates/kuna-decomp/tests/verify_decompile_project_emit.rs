@@ -308,13 +308,13 @@ fn recompile_prelude_and_type_definitions_render() {
         let s0 = tf.get_type_struct("kunaproj_t").expect("getTypeStruct");
         let i4 = tf.get_base(4, type_metatype::TYPE_INT).expect("getBase int4");
         let p = tf
-            .get_type_pointer(8, Rc::clone(&s0), 1)
+            .get_type_pointer(8, s0.clone(), 1)
             .expect("getTypePointer (self-referential)");
         tf.assign_raw_fields_struct(
             &s0,
             vec![
-                TypeField::new(0, -1, "value", i4),
-                TypeField::new(1, -1, "next", p),
+                TypeField::new(0, -1, "value", i4.id()),
+                TypeField::new(1, -1, "next", p.id()),
             ],
             vec![],
         )

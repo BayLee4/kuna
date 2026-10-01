@@ -15,7 +15,7 @@ use kuna_num::opcodes::OpCode;
 use super::*;
 use crate::action::Rule;
 use crate::context::{ArchContext, TypeOp, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
 /// Manager index of the constant space (inserted first) and of `ram`.
@@ -46,6 +46,10 @@ fn build_manager() -> AddrSpaceManager {
 fn build_fd(gate: bool) -> Funcdata {
     let manage = build_manager();
     let mut ctx = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(16);
+    ctx.types = Some(Rc::new(types));
     ctx.const_space_load_fold = gate;
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
@@ -57,8 +61,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace(
@@ -106,12 +111,12 @@ fn build_load(
         c
     } else {
         let ptrdef = mk_op(fd, 0x0f8, 1, OpCode::CPUI_COPY);
-        let p = fd.new_unique(ptr_size, Some(unk(ptr_size)));
+        let p = fd.new_unique(ptr_size, Some(unk(fd, ptr_size)));
         let p = set_def(fd, p, ptrdef);
         wire(fd, p, op, 1);
         p
     };
-    let out = fd.new_unique(out_size, Some(unk(out_size)));
+    let out = fd.new_unique(out_size, Some(unk(fd, out_size)));
     let _out = set_def(fd, out, op);
     (op, ptr)
 }

@@ -23,7 +23,7 @@
 use kuna_base::error::KunaResult;
 use kuna_base::marshal::ElementId;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::options::on_or_off;
 use kuna_base::types::int4;
 
@@ -59,7 +59,7 @@ impl OptionArrayCoverWidth {
 /// access — the one shape for which no subscript can carry the width.  A scalar,
 /// a struct, a union and an access that fits inside one element all answer
 /// false, so the whole-symbol break keeps its upstream behaviour for them.
-pub fn spans_multiple_elements(ct: &Datatype, sz: int4) -> bool {
+pub fn spans_multiple_elements(ct: &TypeRoot, sz: int4) -> bool {
     if ct.get_metatype() != type_metatype::TYPE_ARRAY {
         return false;
     }

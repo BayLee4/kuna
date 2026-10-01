@@ -32,7 +32,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 
 /// The widest extension output this module will leave un-structured.  A
@@ -43,7 +43,9 @@ const MAX_BLOB_SIZE: int4 = 16;
 /// True when `ct` is the anonymous size fallback `TypeFactory::get_base(sz,
 /// TYPE_UNKNOWN)` hands out for a width with no primitive: an array of `sz`
 /// one-byte `undefined` elements.
-fn is_size_fallback_array(ct: &Datatype, sz: int4) -> bool {
+fn is_size_fallback_array(ct: &TypeRoot, sz: int4) -> bool {
+    let view = ct.read();
+    let ct = view.get(ct.id()).expect("array type");
     if ct.get_metatype() != type_metatype::TYPE_ARRAY || ct.get_size() != sz {
         return false;
     }
@@ -52,6 +54,7 @@ fn is_size_fallback_array(ct: &Datatype, sz: int4) -> bool {
     }
     match ct.get_array_base() {
         Some(elem) => {
+            let elem = view.get(elem).expect("array element type");
             elem.get_size() == 1 && elem.get_metatype() == type_metatype::TYPE_UNKNOWN
         }
         None => false,
@@ -178,29 +181,30 @@ impl OptionMulBlob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    use crate::dtype::{Datatype, TypeFactory, TypeFactoryImpl};
 
-    fn undefined_array(elems: int4) -> Datatype {
-        let elem = Datatype::new(1, type_metatype::TYPE_UNKNOWN);
-        let mut arr = Datatype::new(elems, type_metatype::TYPE_ARRAY);
-        arr.kind = crate::dtype::DatatypeKind::Array { arrayof: Rc::new(elem), arraysize: elems };
-        arr
+    fn undefined_array(factory: &TypeFactoryImpl, elems: int4) -> TypeRoot {
+        let elem = factory.get_base(1, type_metatype::TYPE_UNKNOWN).unwrap();
+        factory.get_type_array(elems, elem).unwrap()
     }
 
     /// The width fallback `TypeFactory::get_base(16, TYPE_UNKNOWN)` hands out is
     /// the only array shape this module declines for.
     #[test]
     fn size_fallback_array_is_the_only_accepted_shape() {
-        assert!(is_size_fallback_array(&undefined_array(16), 16));
+        let factory = TypeFactoryImpl::new();
+        factory.set_default_alignment_map();
+        factory.set_max_basetype_size(8);
+        assert!(is_size_fallback_array(&undefined_array(&factory, 16), 16));
         // right shape, wrong width for the Varnode
-        assert!(!is_size_fallback_array(&undefined_array(16), 8));
+        assert!(!is_size_fallback_array(&undefined_array(&factory, 16), 8));
         // a recovered array of a real element type is not the fallback
-        let elem = Datatype::new(1, type_metatype::TYPE_INT);
-        let mut arr = Datatype::new(16, type_metatype::TYPE_ARRAY);
-        arr.kind = crate::dtype::DatatypeKind::Array { arrayof: Rc::new(elem), arraysize: 16 };
+        let elem = factory.get_base(1, type_metatype::TYPE_INT).unwrap();
+        let arr = factory.get_type_array(16, elem).unwrap();
         assert!(!is_size_fallback_array(&arr, 16));
         // a struct is piece-structured but is not an array
-        assert!(!is_size_fallback_array(&Datatype::new(16, type_metatype::TYPE_STRUCT), 16));
+        let structure = factory.intern(Datatype::new(16, type_metatype::TYPE_STRUCT)).unwrap();
+        assert!(!is_size_fallback_array(&structure, 16));
     }
 
     /// Only integer arithmetic consumes a widened operand as a value; a LOAD,

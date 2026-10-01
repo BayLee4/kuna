@@ -69,6 +69,7 @@ pub use kuna_num::pcoderaw::{ATTRIB_CODE, ELEM_SPACEID};
 
 /// Marshaling attribute "uniqbase"
 pub const ATTRIB_UNIQBASE: AttributeId = AttributeId::new("uniqbase", 46);
+pub const ATTRIB_KUNA_CALLRETURN: AttributeId = AttributeId::new("kuna_callreturn", 4002);
 
 /// Marshaling element \<op>
 pub const ELEM_OP: ElementId = ElementId::new("op", 27);
@@ -87,6 +88,7 @@ pub fn register_translate_ids(registry: &mut IdRegistry) {
     registry.register_attribute(&ATTRIB_CONTAIN);
     registry.register_attribute(&ATTRIB_DEFAULTSPACE);
     registry.register_attribute(&ATTRIB_UNIQBASE);
+    registry.register_attribute(&ATTRIB_KUNA_CALLRETURN);
     registry.register_element(&ELEM_OP);
     registry.register_element(&ELEM_SLEIGH);
     registry.register_element(&ELEM_SPACE);
@@ -147,6 +149,12 @@ impl TruncationTag {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PcodeDecodeContext {
+    Raw,
+    HostInstruction,
+}
+
 /// \brief Abstract class for emitting pcode to an application
 ///
 /// Translation engines pass back the generated pcode for an instruction to
@@ -180,25 +188,51 @@ pub trait PcodeEmit {
     /// \param addr is the address (of the instruction) to associate with the
     ///        p-code op
     /// \param decoder is the stream decoder
-    fn decode_op(&mut self, addr: &Address, decoder: &mut dyn OpcodeDecoder) -> KunaResult<()> {
-        let elem_id = decoder.open_element_id(&ELEM_OP)?;
-        let isize = decoder.read_signed_integer_id(&ATTRIB_SIZE)? as i32; // cast: intb -> int4 (truncating)
-        // (the C++ nests this check inside `isize <= 16` — the 16-entry
-        // stack-array path — but a negative isize always takes that path,
-        // so the flat check is equivalent)
-        if isize < 0 {
-            return Err(KunaError::decoder("Bad <op> size attribute"));
-        }
-        // The C++ uses a 16-entry stack array for small isize and a heap
-        // vector otherwise — an allocation optimization with identical
-        // behavior; one buffer here.
-        let mut invar = vec![VarnodeData::default(); isize as usize]; // cast: isize >= 0 checked above
-        let mut outvar = Some(VarnodeData::default()); // C++ outptr = &outvar
-        let opcode = PcodeOpRaw::decode(decoder, isize, &mut invar, &mut outvar)?;
-        decoder.close_element(elem_id)?;
-        self.dump(addr, opcode, outvar.as_ref(), &invar);
-        Ok(())
+    fn decode_op(&mut self, addr: &Address, decoder: &mut dyn OpcodeDecoder,
+        context: PcodeDecodeContext) -> KunaResult<()> {
+        decode_pcode_op(self, addr, decoder, context).map(|_| ())
     }
+}
+
+/// Decode once; only instruction callbacks may carry host lowering provenance.
+pub fn decode_pcode_op<E: PcodeEmit + ?Sized>(emit: &mut E, addr: &Address,
+    decoder: &mut dyn OpcodeDecoder, context: PcodeDecodeContext) -> KunaResult<Option<usize>> {
+    let elem_id = decoder.open_element_id(&ELEM_OP)?;
+    let mut origin = None;
+    loop {
+        let attribute = decoder.get_next_attribute_id()?;
+        if attribute == 0 { break; }
+        if attribute == ATTRIB_KUNA_CALLRETURN.get_id() {
+            if context != PcodeDecodeContext::HostInstruction || origin.is_some() {
+                return Err(KunaError::decoder("Invalid CALL_RETURN origin context"));
+            }
+            origin = Some(usize::try_from(decoder.read_unsigned_integer()?)
+                .map_err(|_| KunaError::decoder("CALL_RETURN origin ordinal overflow"))?);
+        }
+    }
+    decoder.rewind_attributes();
+    let isize = decoder.read_signed_integer_id(&ATTRIB_SIZE)? as i32; // cast: intb -> int4 (truncating)
+    // (the C++ nests this check inside `isize <= 16` — the 16-entry
+    // stack-array path — but a negative isize always takes that path,
+    // so the flat check is equivalent)
+    if isize < 0 {
+        return Err(KunaError::decoder("Bad <op> size attribute"));
+    }
+    // The C++ uses a 16-entry stack array for small isize and a heap
+    // vector otherwise — an allocation optimization with identical
+    // behavior; one buffer here.
+    let mut invar = vec![VarnodeData::default(); isize as usize]; // cast: isize >= 0 checked above
+    let mut outvar = Some(VarnodeData::default()); // C++ outptr = &outvar
+    let opcode = PcodeOpRaw::decode(decoder, isize, &mut invar, &mut outvar)?;
+    decoder.close_element(elem_id)?;
+    if origin.is_some() && (opcode != OpCode::CPUI_RETURN || outvar.is_some()
+        || invar.len() != 1 || invar[0].size == 0 || invar[0].offset != 0
+        || !invar[0].space.as_ref().is_some_and(|space|
+            space.get_type() == kuna_base::space::spacetype::IPTR_CONSTANT)) {
+        return Err(KunaError::decoder("Invalid CALL_RETURN origin operation"));
+    }
+    emit.dump(addr, opcode, outvar.as_ref(), &invar);
+    Ok(origin)
 }
 
 /// \brief Abstract class for emitting disassembly to an application
@@ -1302,7 +1336,7 @@ mod tests {
         )
         .unwrap();
         let mut emit = CollectEmit::default();
-        emit.decode_op(&addr, &mut dec).unwrap();
+        emit.decode_op(&addr, &mut dec, PcodeDecodeContext::Raw).unwrap();
         assert_eq!(
             emit.ops,
             vec![(
@@ -1332,7 +1366,7 @@ mod tests {
         let mut dec = PackedDecode::new(&manager);
         dec.ingest_stream(&stream).unwrap();
         let mut emit = CollectEmit::default();
-        emit.decode_op(&addr, &mut dec).unwrap();
+        emit.decode_op(&addr, &mut dec, PcodeDecodeContext::Raw).unwrap();
         assert_eq!(emit.ops.len(), 1);
         let (_, opc, out, ins) = &emit.ops[0];
         assert_eq!(*opc, OpCode::CPUI_STORE);
@@ -1345,9 +1379,39 @@ mod tests {
         let mut dec = XmlDecode::new(&manager, &registry);
         dec.ingest_stream(b"<op code=\"INT_ADD\" size=\"-1\"><void/></op>").unwrap();
         let mut emit = CollectEmit::default();
-        let err = emit.decode_op(&addr, &mut dec).unwrap_err();
+        let err = emit.decode_op(&addr, &mut dec, PcodeDecodeContext::Raw).unwrap_err();
         assert!(matches!(err, KunaError::Decoder { .. }));
         assert_eq!(err.explain(), "Bad <op> size attribute");
+    }
+
+    #[test]
+    fn call_return_origin_requires_host_context_and_exact_return_shape() {
+        let manager = test_manager(false);
+        let mut registry = IdRegistry::with_base_ids();
+        register_translate_ids(&mut registry);
+        let addr = Address::new(manager.get_space_by_name("ram").unwrap().clone(), 0x1000);
+        let valid = "<op code=\"RETURN\" size=\"1\" kuna_callreturn=\"2\"><void/><addr space=\"const\" offset=\"0\" size=\"1\"/></op>";
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(valid.as_bytes()).unwrap();
+        let mut emit = CollectEmit::default();
+        assert_eq!(decode_pcode_op(&mut emit, &addr, &mut decoder,
+            PcodeDecodeContext::HostInstruction).unwrap(), Some(2));
+        assert_eq!(emit.ops, vec![(0x1000, OpCode::CPUI_RETURN, None, vec![(0, 1)])]);
+        for (xml, context) in [
+            (valid.to_owned(), PcodeDecodeContext::Raw),
+            (valid.replace("RETURN", "CALLIND"), PcodeDecodeContext::HostInstruction),
+            (valid.replace("offset=\"0\"", "offset=\"1\""), PcodeDecodeContext::HostInstruction),
+            (valid.replace("space=\"const\"", "space=\"register\""), PcodeDecodeContext::HostInstruction),
+            (valid.replace("<void/>", "<addr space=\"register\" offset=\"0\" size=\"1\"/>"), PcodeDecodeContext::HostInstruction),
+            (valid.replace("kuna_callreturn=\"2\"", "kuna_callreturn=\"2\" kuna_callreturn=\"3\""), PcodeDecodeContext::HostInstruction),
+        ] {
+            let mut decoder = XmlDecode::new(&manager, &registry);
+            decoder.ingest_stream(xml.as_bytes()).unwrap();
+            let mut emit = CollectEmit::default();
+            assert!(matches!(decode_pcode_op(&mut emit, &addr, &mut decoder, context),
+                Err(KunaError::Decoder { .. })), "{xml}");
+            assert!(emit.ops.is_empty(), "invalid provenance must not emit an operation");
+        }
     }
 
     /// TranslateBase concrete behavior: unique base monotonicity,

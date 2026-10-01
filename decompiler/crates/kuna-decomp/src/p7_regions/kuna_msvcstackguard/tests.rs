@@ -32,7 +32,7 @@ use kuna_base::types::int4;
 
 use crate::action::{Action, ActionContext};
 use crate::context::{ArchContext, BlockId, TypeOp};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::fspec::{FuncCallSpecs, ProtoModel};
 
 const SP_OFF: u64 = 0x20;
@@ -78,6 +78,10 @@ fn build_fd_with_option(on: bool) -> Funcdata {
     let sp_data = VarnodeStorage { space: Some(regspc), offset: SP_OFF, size: SP_SIZE as u32 };
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
     let mut ctx = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.strip_msvc_stack_guard = on;
     let glb = Rc::new(ctx);
     let code = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
@@ -92,6 +96,10 @@ fn build_fd_with_both_options(strip: bool, preserve: bool) -> Funcdata {
     let sp_data = VarnodeStorage { space: Some(regspc), offset: SP_OFF, size: SP_SIZE as u32 };
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
     let mut ctx = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.strip_msvc_stack_guard = strip;
     ctx.callee_ret_preserves = preserve;
     let glb = Rc::new(ctx);
@@ -116,8 +124,9 @@ fn ram_addr(fd: &Funcdata, off: u64) -> Address {
     Address::new(Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap()), off)
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {
@@ -155,7 +164,8 @@ fn binop(
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     let addr = reg(fd, out_reg);
-    let out = fd.vbank_mut().create(8, addr, unk(8));
+    let datatype = unk(fd, 8);
+    let out = fd.vbank_mut().create(8, addr, datatype);
     fd.op_set_output(op, out).unwrap();
     fd.op_insert_end(op, bl);
     out
@@ -178,10 +188,11 @@ fn frame_ptr(
 fn cookie_read(fd: &mut Funcdata, bl: BlockId, at: u64, out_reg: u64) -> VarnodeId {
     let op = mk_op(fd, 1, at, OpCode::CPUI_COPY);
     let a = ram_addr(fd, 0x40_2000);
-    let global = fd.vbank_mut().create(8, a, unk(8));
+    let datatype = unk(fd, 8);
+    let global = fd.vbank_mut().create(8, a, datatype.clone());
     fd.op_set_input(op, global, 0).unwrap();
     let addr = reg(fd, out_reg);
-    let out = fd.vbank_mut().create(8, addr, unk(8));
+    let out = fd.vbank_mut().create(8, addr, datatype);
     fd.op_set_output(op, out).unwrap();
     fd.op_insert_end(op, bl);
     out
@@ -217,7 +228,8 @@ fn cast_between_the_chain_is_peeled() {
     let op = mk_op(&mut fd, 1, 0x14, OpCode::CPUI_CAST);
     fd.op_set_input(op, frame, 0).unwrap();
     let addr = reg(&fd, 0x108);
-    let out = fd.vbank_mut().create(8, addr, unk(8));
+    let datatype = unk(&fd, 8);
+    let out = fd.vbank_mut().create(8, addr, datatype);
     fd.op_set_output(op, out).unwrap();
     fd.op_insert_end(op, bl);
     let sp = sp(&fd);
@@ -281,7 +293,8 @@ fn checker_call_at(
         fd.new_code_ref(&entry)
     } else {
         let addr = reg(fd, 0x180);
-        fd.vbank_mut().create(8, addr, unk(8))
+        let datatype = unk(fd, 8);
+        fd.vbank_mut().create(8, addr, datatype)
     };
     fd.op_set_input(call, target, 0).unwrap();
     for (slot, arg) in args.iter().enumerate() {
@@ -296,7 +309,8 @@ fn push_locked_void_call(fd: &mut Funcdata, call: OpId, entry_off: u64) {
     let mut fc = FuncCallSpecs::new(call, entry);
     fc.proto_mut().set_internal(
         Rc::new(ProtoModel::new(fd.get_arch().manage())),
-        Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)),
+        fd.get_arch().types_impl().unwrap()
+            .intern(Datatype::new(0, type_metatype::TYPE_VOID)).unwrap(),
     );
     fc.proto_mut().set_output_lock(true);
     fd.push_call_specs(fc);
@@ -325,7 +339,8 @@ fn a_cookie_carried_across_many_calls_still_matches() {
         let blocker = fd.new_constant(8, i);
         fd.op_set_input(op, blocker, 1).unwrap();
         let out_addr = reg(&fd, 0x200 + i * 8);
-        let out = fd.vbank_mut().create(8, out_addr, unk(8));
+        let datatype = unk(&fd, 8);
+        let out = fd.vbank_mut().create(8, out_addr, datatype);
         fd.op_set_output(op, out).unwrap();
         fd.op_insert_end(op, bl);
         saved = out;
@@ -347,7 +362,8 @@ fn a_loop_carried_cookie_phi_uses_its_entry_scramble() {
 
     let phi_op = mk_op(&mut fd, 2, 0x1c, OpCode::CPUI_MULTIEQUAL);
     let phi_addr = reg(&fd, 0x118);
-    let carried = fd.vbank_mut().create(8, phi_addr, unk(8));
+    let datatype = unk(&fd, 8);
+    let carried = fd.vbank_mut().create(8, phi_addr, datatype);
     fd.op_set_output(phi_op, carried).unwrap();
     fd.op_set_input(phi_op, saved, 0).unwrap();
     fd.op_set_input(phi_op, carried, 1).unwrap();
@@ -375,7 +391,8 @@ fn build_multi_phi_cycle_cancel(fd: &mut Funcdata, mode: CycleExternal) -> (Varn
         CycleExternal::Backedge => None,
         CycleExternal::Unknown => {
             let unknown_addr = reg(fd, 0x500);
-            Some(fd.vbank_mut().create(8, unknown_addr, unk(8)))
+            let datatype = unk(fd, 8);
+            Some(fd.vbank_mut().create(8, unknown_addr, datatype))
         }
         CycleExternal::Scramble(off) => {
             let other_cookie = cookie_read(fd, bl, 0x100, 0x500);
@@ -394,19 +411,22 @@ fn build_multi_phi_cycle_cancel(fd: &mut Funcdata, mode: CycleExternal) -> (Varn
 
     let phi_a_op = mk_op(fd, 2, 0x1c, OpCode::CPUI_MULTIEQUAL);
     let phi_a_addr = reg(fd, 0x118);
-    let phi_a = fd.vbank_mut().create(8, phi_a_addr, unk(8));
+    let datatype = unk(fd, 8);
+    let phi_a = fd.vbank_mut().create(8, phi_a_addr, datatype);
     fd.op_set_output(phi_a_op, phi_a).unwrap();
     fd.op_insert_begin(phi_a_op, bl);
 
     let phi_b_op = mk_op(fd, 2, 0x20, OpCode::CPUI_MULTIEQUAL);
     let phi_b_addr = reg(fd, 0x120);
-    let phi_b = fd.vbank_mut().create(8, phi_b_addr, unk(8));
+    let datatype = unk(fd, 8);
+    let phi_b = fd.vbank_mut().create(8, phi_b_addr, datatype);
     fd.op_set_output(phi_b_op, phi_b).unwrap();
     fd.op_insert_begin(phi_b_op, bl);
 
     let copy_op = mk_op(fd, 1, 0x24, OpCode::CPUI_COPY);
     let copy_addr = reg(fd, 0x128);
-    let carried = fd.vbank_mut().create(8, copy_addr, unk(8));
+    let datatype = unk(fd, 8);
+    let carried = fd.vbank_mut().create(8, copy_addr, datatype);
     fd.op_set_output(copy_op, carried).unwrap();
     fd.op_insert_end(copy_op, bl);
 
@@ -436,13 +456,15 @@ fn a_seedless_multi_phi_cycle_declines() {
 
     let phi_a_op = mk_op(&mut fd, 2, 0x10, OpCode::CPUI_MULTIEQUAL);
     let phi_a_addr = reg(&fd, 0x100);
-    let phi_a = fd.vbank_mut().create(8, phi_a_addr, unk(8));
+    let datatype = unk(&fd, 8);
+    let phi_a = fd.vbank_mut().create(8, phi_a_addr, datatype);
     fd.op_set_output(phi_a_op, phi_a).unwrap();
     fd.op_insert_begin(phi_a_op, bl);
 
     let phi_b_op = mk_op(&mut fd, 2, 0x14, OpCode::CPUI_MULTIEQUAL);
     let phi_b_addr = reg(&fd, 0x108);
-    let phi_b = fd.vbank_mut().create(8, phi_b_addr, unk(8));
+    let datatype = unk(&fd, 8);
+    let phi_b = fd.vbank_mut().create(8, phi_b_addr, datatype);
     fd.op_set_output(phi_b_op, phi_b).unwrap();
     fd.op_insert_begin(phi_b_op, bl);
 
@@ -510,7 +532,8 @@ fn phi(fd: &mut Funcdata, bl: BlockId, at: u64, a: VarnodeId, b: VarnodeId, out_
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     let addr = reg(fd, out_reg);
-    let out = fd.vbank_mut().create(8, addr, unk(8));
+    let datatype = unk(fd, 8);
+    let out = fd.vbank_mut().create(8, addr, datatype);
     fd.op_set_output(op, out).unwrap();
     fd.op_insert_begin(op, bl);
     out
@@ -589,12 +612,13 @@ fn direct_call_with_a_read_output_declines() {
     let (arg, _) = build_cancel(&mut fd, -0x48, -0x48);
     let (call, bl) = checker_call(&mut fd, &[arg], OpCode::CPUI_CALL);
     let out_addr = reg(&fd, 0x188);
-    let out = fd.vbank_mut().create(8, out_addr, unk(8));
+    let datatype = unk(&fd, 8);
+    let out = fd.vbank_mut().create(8, out_addr, datatype.clone());
     fd.op_set_output(call, out).unwrap();
     let read = mk_op(&mut fd, 1, 0x34, OpCode::CPUI_COPY);
     fd.op_set_input(read, out, 0).unwrap();
     let read_addr = reg(&fd, 0x190);
-    let read_out = fd.vbank_mut().create(8, read_addr, unk(8));
+    let read_out = fd.vbank_mut().create(8, read_addr, datatype);
     fd.op_set_output(read, read_out).unwrap();
     fd.op_insert_end(read, bl);
     assert_eq!(cookie_check_op(&fd, call, &sp(&fd)), None);
@@ -633,7 +657,8 @@ fn locked_void_checker_is_marked_but_not_removed_when_stripping_is_off() {
     let mut fc = FuncCallSpecs::new(call, entry);
     fc.proto_mut().set_internal(
         Rc::new(ProtoModel::new(fd.get_arch().manage())),
-        Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)),
+        fd.get_arch().types_impl().unwrap()
+            .intern(Datatype::new(0, type_metatype::TYPE_VOID)).unwrap(),
     );
     fc.proto_mut().set_output_lock(true);
     fd.push_call_specs(fc);

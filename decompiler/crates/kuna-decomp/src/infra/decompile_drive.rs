@@ -234,6 +234,9 @@ impl FlowEnvironment for ArchFlowEnv {
         // C++ `queryCall` copies the callee proto's `isInline()` flow effect; the
         // flag is set by `option inline <name>` (OptionInline) on the resolved
         // FunctionSymbol.
+        if let Some(remote) = &self.arch().remote_scope {
+            return remote.prototype_at(entry).is_some_and(|proto| proto.is_inline());
+        }
         self.arch().symboltab.function_is_inline_across_scopes(entry)
     }
     fn query_call_inject_id(&self, entry: &Address) -> int4 {
@@ -247,6 +250,16 @@ impl FlowEnvironment for ArchFlowEnv {
         // Funcdata at that entry through the engine's `new_funcdata` factory.  No
         // callee symbol -> no inline (the C++ `fd == 0` short-circuit).
         let arch = self.arch();
+        if let Some(remote) = &arch.remote_scope {
+            return match remote.function_at(entry) {
+                Some(facts) => {
+                    let mut fd = arch.new_funcdata(&facts.name, entry.clone(), 0)?;
+                    fd.set_display_name(&facts.display_name);
+                    Ok(Some(fd))
+                }
+                None => Ok(None),
+            };
+        }
         let scope = match arch.symboltab.get_global_scope() {
             Some(s) => s,
             None => return Ok(None),
@@ -345,30 +358,6 @@ impl FlowEnvironment for ArchFlowEnv {
         String::from_utf8_lossy(&arch.pcodeinjectlib.base.get_call_fixup_name(inject_id)).into_owned()
     }
 
-    fn build_override_proto(
-        &self,
-        pieces: &crate::fspec::PrototypePieces,
-    ) -> KunaResult<Option<crate::fspec::FuncProto>> {
-        // C++ `IfcProtooverride`: `new FuncProto; setInternal(pieces.model,
-        // getTypeVoid()); setPieces(pieces)`.  The pieces carry no model
-        // back-pointer in the merged tree (// STUB(w6-fspec-2)), so use the default
-        // model (the console parses `override prototype` against the default model
-        // unless a `__model` was named — not exercised by the corpus).
-        let arch = self.arch();
-        let model = match arch.default_fp() {
-            Some(m) => Rc::clone(m),
-            None => return Ok(None),
-        };
-        let void = arch.types().get_type_void()?;
-        let mut proto = crate::fspec::FuncProto::new();
-        proto.set_internal(model.clone(), void);
-        proto.set_pieces(pieces, Some(model), arch.types(), arch.manage())?;
-        // insertProtoOverride marked this an override (locked); `set_pieces` already
-        // sets the input/output/model locks.  Flag the override bit so the call
-        // spec's `isOverride()` short-circuit (deindirect proto-merge) sees it.
-        proto.set_override(true);
-        Ok(Some(proto))
-    }
 
     fn is_v850_indirect_jmp(&self, fd: &Funcdata, op: crate::context::OpId) -> bool {
         // (kuna) GH-8817: wire the ported `kunaIsV850IndirectJmp` predicate.  The
@@ -713,7 +702,9 @@ pub fn build_and_follow_flow_with_override(
     size: int4,
     flow_overrides: &[(Address, kuna_base::types::uint4)],
 ) -> KunaResult<Funcdata> {
-    build_and_follow_flow_with_override_and_protos(arch, name, entry, size, flow_overrides, &[])
+    build_and_follow_flow_with_override_and_protos(
+        arch, name, entry, size, flow_overrides, &crate::overrides::Override::new(),
+    )
 }
 
 /// Like [`build_and_follow_flow_with_override`], but also re-seeds the
@@ -730,22 +721,13 @@ pub fn build_and_follow_flow_with_override_and_protos(
     entry: Address,
     size: int4,
     flow_overrides: &[(Address, kuna_base::types::uint4)],
-    proto_overrides: &[(Address, crate::fspec::PrototypePieces)],
+    proto_overrides: &crate::overrides::Override,
 ) -> KunaResult<Funcdata> {
     let mut fd = arch.new_funcdata(name, entry, size)?;
     for (addr, ty) in flow_overrides {
         fd.get_override_mut().insert_flow_override(addr.clone(), *ty);
     }
-    for (callpoint, pieces) in proto_overrides {
-        let mut pieces = pieces.clone();
-        if arch.format_override_callpoints.contains(&callpoint.get_offset()) {
-            pieces.first_var_arg_slot = pieces.intypes.len() as int4;
-            fd.get_override_mut().insert_format_call(callpoint.clone());
-        }
-        let ov: Box<dyn crate::overrides::FuncProtoOverride> =
-            Box::new(crate::overrides::PiecesProtoOverride { pieces });
-        fd.get_override_mut().insert_proto_override(callpoint.clone(), ov);
-    }
+    fd.get_override_mut().merge_proto_overrides(proto_overrides);
     follow_flow_on_fd(arch, fd)
 }
 
@@ -758,7 +740,8 @@ pub fn build_and_follow_flow_with_override_and_protos(
 /// — including the indirect override a prior `deindirect` installed — survives the
 /// clear, so the re-flow rebuilds the CALLIND straight as a direct CALL).
 #[allow(clippy::mutable_key_type)]
-fn follow_flow_on_fd(arch: &mut Architecture, fd: Funcdata) -> KunaResult<Funcdata> {
+fn follow_flow_on_fd(arch: &mut Architecture, mut fd: Funcdata) -> KunaResult<Funcdata> {
+    fd.select_analysis_model();
     // C++ Funcdata::followFlow(baddr, eaddr): a function carrying a declared byte
     // extent restricts flow to it; size 0 keeps the unbounded default the whole
     // engine has used until now (`kuna_console::engine::UNBOUNDED_SIZE`), so this
@@ -798,7 +781,7 @@ fn follow_flow_on_fd(arch: &mut Architecture, fd: Funcdata) -> KunaResult<Funcda
         let arch_ptr: *mut Architecture = arch;
         let mut run_jt_pipeline = |partial: &mut Funcdata,
                                    visited: &crate::flow::VisitedMap|
-         -> KunaResult<()> {
+         -> Result<(), crate::flow::JtPipelineError> {
             // SAFETY: `arch_ptr` aliases the live `&mut Architecture`; the env's
             // reads (`translate`/`inst`/`symboltab`) are disjoint from the
             // `allacts` mutation here, and the `flow` borrow of `env`/`arch` does
@@ -857,7 +840,7 @@ fn run_jumptable_pipeline(
     arch: &mut Architecture,
     partial: &mut Funcdata,
     visited: &crate::flow::VisitedMap,
-) -> KunaResult<()> {
+) -> Result<(), crate::flow::JtPipelineError> {
     // Build the partial's basic blocks (partialflow.generateBlocks).
     let env = ArchFlowEnv {
         mapped_image: None,
@@ -870,14 +853,14 @@ fn run_jumptable_pipeline(
     partial.sort_call_specs();
     partial.set_flag_raw(funcdata_flags::processing_started);
     // Run the reduced "jumptable" universalAction root over the partial.
-    let saved = arch.allacts.get_current_name().to_string();
+    let saved = selected_action_name(arch)?;
     arch.allacts.set_current("jumptable")?;
     let mut ctx = ActionContext::new();
     // (kuna decompile-all watchdog) The jumptable sub-pipeline runs inside the
     // budgeted per-function drive (flow-follow), so it shares the same deadline;
     // `None` on every unbudgeted path (console/parity — structurally unchanged).
     ctx.deadline = arch.kuna_fn_deadline;
-    let result = {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let root = arch
             .allacts
             .get_current_mut()
@@ -886,27 +869,29 @@ fn run_jumptable_pipeline(
         // catch_unwind so an un-ported pass stub in the sub-pipeline degrades to a
         // recoverable error (the recovery falls back to truncating the BRANCHIND),
         // never an abort — same policy as the main `decompile_func_full` drive.
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            root.perform(partial, &mut ctx)
-        }))
-    };
+        Ok::<_, KunaError>(root.perform(partial, &mut ctx))
+    }));
     // Restore the previous action set regardless of outcome.
-    let _ = arch.allacts.set_current(&saved);
+    arch.allacts.set_current(&saved).map_err(crate::flow::JtPipelineError::Fatal)?;
+    if let Some(error) = ctx.take_error() {
+        return Err(crate::flow::JtPipelineError::Fatal(error));
+    }
     match result {
-        Ok(r) => {
+        Ok(Ok(r)) => {
             if r < 0 {
-                return Err(KunaError::lowlevel("jumptable pipeline hit a breakpoint"));
+                return Err(KunaError::lowlevel("jumptable pipeline hit a breakpoint").into());
             }
             Ok(())
         }
+        Ok(Err(error)) => Err(error.into()),
         Err(payload) => Err(KunaError::lowlevel(format!(
             "jumptable pipeline reached an un-ported seam: {}",
             panic_message(payload)
-        ))),
+        )).into()),
     }
 }
 
-/// Run the `decompile` universalAction root to completion against `fd` (C++
+/// Run the selected universalAction root to completion against `fd` (C++
 /// `IfcDecompile::execute`, ifacedecomp.cc:889 — `getCurrent()->reset(fd)` then
 /// `getCurrent()->perform(fd)`).  Returns the perform result (`>=0` change
 /// count, `<0` on a breakpoint).
@@ -914,10 +899,418 @@ fn run_jumptable_pipeline(
 /// The action root owns the restart loop (C++ non-virtual `Action::perform`,
 /// already ported in `action.rs`); this drives it through the engine-side
 /// [`ActionContext`] so the warning-emission points are observable.
-fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> {
-    // C++ allacts.setCurrent("decompile") derives the filtered decompile root
-    // (idempotent if already current).
-    arch.allacts.set_current("decompile")?;
+/// Per-drive dependency closure: no inferred facts are persisted in Override or
+/// the immutable declaration ABI cache. A cut is explicit, never an empty ABI.
+#[derive(Clone, PartialEq, Eq)]
+struct RawNativeFingerprint {
+    opcode: kuna_num::opcodes::OpCode,
+    entry: Address,
+    inputs: Vec<(Address, int4)>,
+    output: Option<(Address, int4)>,
+    flow_override: kuna_base::types::uint4,
+}
+
+struct RawNativeSite {
+    fingerprint: RawNativeFingerprint,
+    authority: crate::fspec::FuncProto,
+    body_unavailable: bool,
+}
+
+struct NativeReplay {
+    original: RawNativeSite,
+    contract: std::rc::Rc<crate::p4_calls::kuna_callabletransport::NativeCallContract>,
+}
+
+struct GeneratedReplay {
+    original: RawNativeSite,
+    contract: std::rc::Rc<crate::p4_calls::kuna_callabletransport::GeneratedCallContract>,
+}
+
+struct RefinedIndirectReplay {
+    original: RawNativeSite,
+    contract: std::rc::Rc<crate::p4_calls::kuna_callabletransport::RawIndirectContract>,
+}
+
+impl PhysicalInputDrive {
+    fn native_site(&self, arch: &Architecture, data: &Funcdata, index: int4) -> KunaResult<Option<RawNativeSite>> {
+        use kuna_num::opcodes::OpCode;
+        let call = data.get_call_specs(index);
+        let Some(operation) = data.obank().get(call.get_op()) else { return Ok(None) };
+        if !matches!(operation.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) { return Ok(None); }
+        let direct = operation.code() == OpCode::CPUI_CALL;
+        let body_unavailable = if direct {
+            if call.get_entry_address().is_invalid() { return Ok(None); }
+            let loader = arch.translate().loader_rc();
+            let Ok(mut loader) = loader.try_borrow_mut() else { return Ok(None) };
+            match loader.load_fill(&mut [0u8; 1], call.get_entry_address()) {
+                Ok(()) => false,
+                Err(KunaError::DataUnavail { .. }) => self.no_real_bodies.contains(call.get_entry_address()),
+                Err(error) => return Err(error),
+            }
+        } else { false };
+        if direct && !body_unavailable
+            && crate::p4_calls::kuna_callabletransport::generated_direct_result_entry(data, call.get_op())?.is_none() {
+            return Ok(None);
+        }
+        let storage = |id| data.vbank().get(id)
+            .map(|value| (value.get_addr().clone(), value.get_size()));
+        let mut inputs = Vec::with_capacity(operation.num_input().max(0) as usize);
+        for slot in (if direct { 1 } else { 0 })..operation.num_input() {
+            let Some(input) = operation.get_in(slot).and_then(storage) else { return Ok(None) };
+            inputs.push(input);
+        }
+        Ok(Some(RawNativeSite {
+            fingerprint: RawNativeFingerprint {
+                opcode: operation.code(), entry: call.get_entry_address().clone(), inputs,
+                output: operation.get_out().and_then(storage),
+                flow_override: data.get_override().get_flow_override(operation.get_addr()),
+            },
+            authority: call.proto().source_prototype(), body_unavailable,
+        }))
+    }
+
+    fn seed_native(&mut self, arch: &Architecture, data: &mut Funcdata) -> KunaResult<()> {
+        use crate::p4_calls::kuna_callabletransport::native_source_abi_equal;
+        self.native_sites.clear();
+        let mut admitted = std::collections::BTreeMap::new();
+        if data.get_arch().execution_callable_c {
+            for index in 0..data.num_calls() {
+                let Some(site) = self.native_site(arch, data, index)? else { continue };
+                let call = data.get_call_specs(index);
+                let sequence = data.obank().get(call.get_op()).expect("raw call").get_seq_num().clone();
+                if let Some(replay) = self.native_replays.get(&sequence) {
+                    if site.fingerprint == replay.original.fingerprint
+                        && site.body_unavailable == replay.original.body_unavailable
+                        && native_source_abi_equal(&site.authority, &replay.original.authority) {
+                        admitted.insert(call.get_op(), replay.contract.clone());
+                    }
+                }
+                self.native_sites.insert(sequence, site);
+            }
+        }
+        // Replacing seed premises invalidates the preceding epoch's own proof.
+        data.set_native_execution_contracts(admitted);
+        Ok(())
+    }
+
+    fn generated_targets(&mut self, arch: &mut Architecture, data: &Funcdata)
+        -> KunaResult<BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_callabletransport::GeneratedBodyTarget>>>
+    {
+        let entries = std::mem::take(&mut self.generated_entries);
+        let result = (|| {
+            let mut targets = BTreeMap::new();
+            for entry in &entries {
+                let raw = self.summary(arch, entry)?;
+                let witness = self.mapped_bodies.get(entry).cloned();
+                if let Some(target) = crate::p4_calls::kuna_callabletransport::generated_body_target(
+                    data, entry, raw, witness)? {
+                    targets.insert(entry.clone(), target);
+                }
+            }
+            Ok(targets)
+        })();
+        self.generated_entries = entries;
+        result
+    }
+
+    fn seed_generated(&self, data: &mut Funcdata,
+        targets: &BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_callabletransport::GeneratedBodyTarget>>)
+        -> KunaResult<()>
+    {
+        use crate::p4_calls::kuna_callabletransport::{native_source_abi_equal, rebind_generated_contract};
+        let mut admitted = BTreeMap::new();
+        if data.get_arch().execution_callable_c {
+            for index in 0..data.num_calls() {
+                let call = data.get_call_specs(index);
+                let Some(operation) = data.obank().get(call.get_op()) else { continue; };
+                let sequence = operation.get_seq_num();
+                let Some(original) = self.native_sites.get(sequence) else { continue; };
+                let Some(replay) = self.generated_replays.get(sequence) else { continue; };
+                if original.fingerprint != replay.original.fingerprint
+                    || original.body_unavailable != replay.original.body_unavailable
+                    || !native_source_abi_equal(&original.authority, &replay.original.authority) { continue; }
+                if let Some(contract) = rebind_generated_contract(data, call.get_op(), &replay.contract, targets)? {
+                    admitted.insert(call.get_op(), std::rc::Rc::new(contract));
+                }
+            }
+        }
+        data.set_generated_execution_contracts(admitted);
+        Ok(())
+    }
+
+    fn seed_refined_indirect(&self, data: &mut Funcdata) -> KunaResult<()> {
+        use crate::p4_calls::kuna_callabletransport::{native_source_abi_equal, rebind_refined_indirect_contract};
+        let mut admitted = BTreeMap::new();
+        if data.get_arch().execution_callable_c {
+            for index in 0..data.num_calls() {
+                let call = data.get_call_specs(index);
+                let Some(operation) = data.obank().get(call.get_op()) else { continue; };
+                let sequence = operation.get_seq_num();
+                let Some(original) = self.native_sites.get(sequence) else { continue; };
+                let Some(replay) = self.refined_indirect_replays.get(sequence) else { continue; };
+                if original.fingerprint != replay.original.fingerprint
+                    || original.body_unavailable != replay.original.body_unavailable
+                    || !native_source_abi_equal(&original.authority, &replay.original.authority) { continue; }
+                if rebind_refined_indirect_contract(data, call.get_op(), &replay.contract)? {
+                    admitted.insert(call.get_op(), std::rc::Rc::clone(&replay.contract));
+                }
+            }
+        }
+        data.set_refined_indirect_contracts(admitted);
+        Ok(())
+    }
+
+    fn refine_execution(&mut self, arch: &mut Architecture, data: &Funcdata) -> KunaResult<bool> {
+        use crate::p4_calls::kuna_callabletransport::{native_call_contract, generated_call_contract,
+            generated_target_requests, refined_indirect_contract};
+        if self.execution_refined || !data.get_arch().execution_callable_c { return Ok(false); }
+        self.execution_refined = true;
+        self.branch_replays = crate::p4_calls::kuna_branchreachability::completed_replays(data);
+        self.generated_entries = generated_target_requests(data)?;
+        self.active.insert(data.get_address().clone());
+        let targets = self.generated_targets(arch, data);
+        self.active.remove(data.get_address());
+        let targets = targets?;
+        for index in 0..data.num_calls() {
+            let call = data.get_call_specs(index);
+            let Some(operation) = data.obank().get(call.get_op()).filter(|operation| !operation.is_dead()) else { continue };
+            let sequence = operation.get_seq_num();
+            let Some(original) = self.native_sites.get(sequence) else { continue };
+            if operation.code() != original.fingerprint.opcode
+                || call.get_entry_address() != &original.fingerprint.entry
+                || data.get_override().get_flow_override(operation.get_addr()) != original.fingerprint.flow_override {
+                continue;
+            }
+            if let Some(contract) = generated_call_contract(data, call.get_op(), &targets)? {
+                let original = self.native_sites.remove(sequence).expect("matched generated seed");
+                self.generated_replays.insert(sequence.clone(), GeneratedReplay {
+                    original, contract: std::rc::Rc::new(contract),
+                });
+                continue;
+            }
+            if let Some(contract) = refined_indirect_contract(data, call.get_op())? {
+                let original = self.native_sites.remove(sequence).expect("matched refined indirect seed");
+                self.refined_indirect_replays.insert(sequence.clone(), RefinedIndirectReplay {
+                    original, contract: std::rc::Rc::new(contract),
+                });
+                continue;
+            }
+            let Some(contract) = native_call_contract(data, call.get_op(), original.body_unavailable)? else { continue };
+            let original = self.native_sites.remove(sequence).expect("matched native seed");
+            self.native_replays.insert(sequence.clone(), NativeReplay { original, contract: std::rc::Rc::new(contract) });
+        }
+        Ok(!self.native_replays.is_empty() || !self.generated_replays.is_empty()
+            || !self.refined_indirect_replays.is_empty() || !self.branch_replays.is_empty())
+    }
+}
+
+#[derive(Default)]
+struct PhysicalInputDrive {
+    summaries: std::collections::BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>,
+    active: std::collections::BTreeSet<Address>,
+    decoded: usize,
+    native_sites: BTreeMap<kuna_base::address::SeqNum, RawNativeSite>,
+    native_replays: BTreeMap<kuna_base::address::SeqNum, NativeReplay>,
+    generated_replays: BTreeMap<kuna_base::address::SeqNum, GeneratedReplay>,
+    generated_entries: BTreeSet<Address>,
+    refined_indirect_replays: BTreeMap<kuna_base::address::SeqNum, RefinedIndirectReplay>,
+    execution_refined: bool,
+    branch_replays: Vec<std::rc::Rc<crate::p4_calls::kuna_branchreachability::BranchReplay>>,
+    no_real_bodies: BTreeSet<Address>,
+    mapped_bodies: BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_physicalinputs::MappedBodyWitness>>,
+}
+
+impl PhysicalInputDrive {
+    fn summary(&mut self, arch: &mut Architecture, entry: &Address)
+        -> KunaResult<std::rc::Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>
+    {
+        use crate::p4_calls::kuna_physicalinputs::{EntryRequirements, from_raw_flow};
+        if arch.kuna_fn_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return Err(KunaError::lowlevel("Physical call analysis exceeded function deadline"));
+        }
+        if let Some(summary) = self.summaries.get(entry) { return Ok(summary.clone()); }
+        if self.decoded >= 32 || !self.active.insert(entry.clone()) {
+            return Ok(std::rc::Rc::new(EntryRequirements::default()));
+        }
+        self.decoded += 1;
+        let lifted = (|| {
+            let mut probe = arch.new_funcdata("", entry.clone(), 0)?;
+            if !probe.get_func_proto().has_store() {
+                let context = probe.get_arch().clone();
+                if let Some(pieces) = context.callee_proto_pieces(entry) {
+                    probe.apply_locked_prototype_with_model(&pieces, context.callee_proto_model(entry))?;
+                }
+            }
+            follow_flow_on_fd(arch, probe)
+        })();
+        let mut mapped = false;
+        let summary = match lifted {
+            Ok(probe) => {
+                let no_real_body = probe.obank().iter_all().all(|(_, op)| {
+                    let operation = probe.obank().get(op).expect("raw target operation");
+                    operation.code() == OpCode::CPUI_RETURN && operation.get_halt_type() != 0
+                        && operation.num_input() == 1 && operation.get_out().is_none()
+                        && operation.get_in(0).and_then(|id| probe.vbank().get(id))
+                            .is_some_and(|value| value.is_constant() && value.get_offset() == 1)
+                });
+                if no_real_body { self.no_real_bodies.insert(entry.clone()); }
+                // This witnesses only a real, closed target-own CFG. Nested call
+                // cuts remain in its raw requirements and need actual bodies.
+                mapped = probe.get_arch().execution_callable_c && !no_real_body
+                    && probe.bblocks_get_size() > 0 && !probe.has_bad_data() && !probe.has_unimplemented()
+                    && probe.flags() & crate::funcdata::funcdata_flags::jumptablerecovery_on == 0
+                    && probe.obank().iter_all().all(|(_, id)| probe.obank().get(id).is_some_and(|operation|
+                        operation.get_halt_type() == 0 && (operation.code() != OpCode::CPUI_BRANCHIND
+                            || probe.find_jump_table_index(id).is_some_and(|index|
+                                probe.get_jump_table(index as int4).num_entries() != 0))));
+                let mut callees = std::collections::BTreeMap::new();
+                for index in 0..probe.num_calls() {
+                    let call = probe.get_call_specs(index);
+                    if !call.get_entry_address().is_invalid() {
+                        let child = self.summary(arch, call.get_entry_address())?;
+                        callees.insert(call.get_op(), child);
+                    }
+                }
+                // Probe-local operation identities never enter cross-target caches.
+                from_raw_flow(&probe, &callees, None).requirements
+            }
+            Err(_) => EntryRequirements { incomplete_flow: true, ..Default::default() },
+        };
+        self.active.remove(entry);
+        let summary = std::rc::Rc::new(summary);
+        if mapped {
+            self.mapped_bodies.insert(entry.clone(), std::rc::Rc::new(
+                crate::p4_calls::kuna_physicalinputs::MappedBodyWitness::new(entry.clone(), summary.clone())));
+        }
+        self.summaries.insert(entry.clone(), summary.clone());
+        Ok(summary)
+    }
+
+    fn seed_deferred(&self, data: &mut Funcdata,
+        callees: &BTreeMap<crate::context::OpId, std::rc::Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>)
+        -> KunaResult<()>
+    {
+        let mut admitted = BTreeMap::new();
+        if data.get_arch().execution_callable_c {
+            for index in 0..data.num_calls() {
+                let call = data.get_call_specs(index);
+                let Some(raw) = callees.get(&call.get_op()) else { continue };
+                let Some(witness) = self.mapped_bodies.get(call.get_entry_address()) else { continue };
+                if !std::rc::Rc::ptr_eq(raw, witness.raw()) { continue; }
+                if let Some(contract) = crate::p4_calls::kuna_callabletransport::raw_deferred_contract(
+                    data, call.get_op(), raw.clone(), witness.clone())? {
+                    admitted.insert(call.get_op(), std::rc::Rc::new(contract));
+                }
+            }
+        }
+        data.set_deferred_execution_contracts(admitted);
+        Ok(())
+    }
+
+    fn seed(&mut self, arch: &mut Architecture, data: &mut Funcdata) -> KunaResult<()> {
+        use crate::p4_calls::kuna_physicalinputs::{from_raw_flow, has_narrow_source};
+        // Explicit/parked entry declarations are installed before this point.
+        // Adopted raw IR also needs the same unlocked-model prerequisite before
+        // source/branch/body facts are captured for this flow epoch.
+        data.select_analysis_model();
+        let proto = data.get_func_proto();
+        let ambient = proto.has_store() && proto.is_input_locked() && !proto.is_dotdotdot()
+            && proto.num_params() == 0;
+        let context = data.get_arch();
+        fn callable_value(ty: &crate::dtype::TypeRoot) -> bool {
+            ty.get_ptr_to().is_some_and(|target| target.get_metatype() == crate::dtype::type_metatype::TYPE_CODE)
+        }
+        fn callable_source(proto: &crate::fspec::FuncProto) -> bool {
+            proto.has_store() && (proto.source_output().get_type().is_some_and(callable_value)
+                || (0..proto.num_params()).filter_map(|slot| proto.source_param(slot))
+                    .any(|parameter| parameter.get_type().is_some_and(callable_value)))
+        }
+        let mut callable_boundary = callable_source(proto);
+        let mut relevant = has_narrow_source(proto) || proto.has_execution_signature() || ambient;
+        for index in 0..data.num_calls() {
+            let entry = data.get_call_specs(index).get_entry_address();
+            if let Some(proto) = context.remote_scope.as_ref().and_then(|remote| remote.prototype_at(entry)) {
+                callable_boundary |= callable_source(&proto);
+                relevant |= has_narrow_source(&proto) || proto.has_execution_signature()
+                    || (proto.has_store() && proto.is_input_locked() && !proto.is_dotdotdot() && proto.num_params() == 0);
+            } else if let Some(pieces) = context.callee_proto_pieces(entry) {
+                callable_boundary |= pieces.outtype.as_ref().is_some_and(callable_value)
+                    || pieces.intypes.iter().any(callable_value);
+                relevant |= (pieces.intypes.is_empty() && pieces.outtype.is_some() && pieces.first_var_arg_slot < 0)
+                    || pieces.intypes.iter().any(|ty| ty.get_size() < 8 && matches!(ty.get_metatype(),
+                        crate::dtype::type_metatype::TYPE_INT | crate::dtype::type_metatype::TYPE_UINT
+                        | crate::dtype::type_metatype::TYPE_ENUM_INT | crate::dtype::type_metatype::TYPE_ENUM_UINT
+                        | crate::dtype::type_metatype::TYPE_BOOL));
+            }
+        }
+        relevant |= callable_boundary;
+        // Executable C needs raw effect evidence for ordinary full-width and
+        // inferred entries too; declaration width cannot prove preservation.
+        if !relevant && !context.execution_callable_c { return Ok(()); }
+        // A reflow can install authoritative indirect/flow overrides. Summaries
+        // belong to this flow epoch; never reuse a previous epoch's proof.
+        self.summaries.clear();
+        self.no_real_bodies.clear();
+        self.mapped_bodies.clear();
+        self.decoded = 0;
+        self.active.insert(data.get_address().clone());
+        if callable_boundary {
+            let mut targets = std::collections::BTreeSet::new();
+            if let Some(space) = data.get_address().get_space() {
+                for id in data.vbank().iter_loc() {
+                    let value = data.vbank().get(id).expect("live raw value");
+                    if !value.is_constant() { continue; }
+                    let candidate = Address::new(space.clone(), kuna_base::space::AddrSpace::address_to_byte(
+                        value.get_offset(), space.get_word_size()));
+                    if let Some((_, entry, _)) = data.get_arch().query_function(&candidate)? {
+                        targets.insert(entry);
+                    }
+                }
+            }
+            for entry in targets {
+                let summary = self.summary(arch, &entry)?;
+                data.set_physical_target_requirements(entry, summary);
+            }
+        }
+        let mut callees = std::collections::BTreeMap::new();
+        for index in 0..data.num_calls() {
+            let entry = data.get_call_specs(index).get_entry_address().clone();
+            if entry.is_invalid() { continue; }
+            let summary = self.summary(arch, &entry)?;
+            callees.insert(data.get_call_specs(index).get_op(), summary.clone());
+            data.set_physical_target_requirements(entry, summary.clone());
+            data.get_call_specs_mut(index).set_physical_requirements(summary);
+        }
+        let generated = self.generated_targets(arch, data)?;
+        self.active.remove(data.get_address());
+        self.seed_native(arch, data)?;
+        self.seed_generated(data, &generated)?;
+        self.seed_refined_indirect(data)?;
+        self.seed_deferred(data, &callees)?;
+        if data.get_arch().execution_callable_c {
+            crate::p4_calls::kuna_branchreachability::seed_raw(data, &self.branch_replays)?;
+        }
+        let flow = crate::p4_calls::kuna_physicalinputs::ConditionalFlowView::from_receipts(data)?;
+        // Scan the caller's actual raw IR, including its request-local Override.
+        // A recursive edge is an explicit incomplete cut, not a fresh unoverridden body.
+        let own = from_raw_flow(data, &callees, flow);
+        data.set_entry_physical_analysis(own);
+        if data.get_arch().execution_callable_c {
+            let seed = crate::p4_calls::kuna_logicalresultbody::capture_logical_result_body(data)?;
+            data.set_logical_result_body_seed(seed.map(std::rc::Rc::new));
+        }
+        Ok(())
+    }
+}
+
+fn run_pipeline(
+    arch: &mut Architecture,
+    fd: &mut Funcdata,
+    entry_proto: Option<&crate::fspec::FuncProto>,
+) -> KunaResult<int4> {
+    // Selection belongs to the caller. Host requests may deliberately select
+    // a reduced root while still needing this drive's complete seed/reflow path.
+    arch.allacts.get_current().ok_or_else(|| KunaError::lowlevel("no current action"))?;
     // The action loop's in-loop restart cannot re-follow flow (no SLEIGH
     // translator inside `allacts`); it hands a pending restart up here via
     // `ctx.reflow_requested`.  This outer loop owns `&mut Architecture`, so it can
@@ -928,7 +1321,9 @@ fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> 
     // caps in-loop restarts; this caps cross-flow restarts).
     const MAX_REFLOW: int4 = 8;
     let mut total: int4 = 0;
+    let mut physical_inputs = PhysicalInputDrive::default();
     for _ in 0..=MAX_REFLOW {
+        physical_inputs.seed(arch, fd)?;
         let res = {
             let deadline = arch.kuna_fn_deadline;
             let root = arch
@@ -941,6 +1336,9 @@ fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> 
             // into the action loop (`None` = no budget, the parity default).
             ctx.deadline = deadline;
             let r = root.perform(fd, &mut ctx);
+            if let Some(error) = ctx.take_error() {
+                return Err(error);
+            }
             (r, ctx.reflow_requested)
         };
         let (r, reflow_requested) = res;
@@ -960,7 +1358,10 @@ fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> 
             return Ok(r); // breakpoint — propagate verbatim (no re-flow)
         }
         total += r;
-        if !(reflow_requested && fd.has_restart_pending()) {
+        let flow_requested = reflow_requested && fd.has_restart_pending();
+        let conditional_requested = !flow_requested && physical_inputs.refine_execution(arch, fd)?;
+        if !flow_requested && !conditional_requested {
+            crate::p4_calls::kuna_branchreachability::validate_final(fd)?;
             drain_pipeline_comments(arch, fd);
             return Ok(total);
         }
@@ -968,7 +1369,12 @@ fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> 
         // deindirect's indirect override — survives `clear()`), then loop to
         // re-perform.  `clear()` resets the restart flag, so a fresh request must
         // come from the re-flowed pass to loop again.
-        refollow_flow(arch, fd)?;
+        let execution_seed = if fd.get_func_proto().has_execution_signature() {
+            let mut seed = crate::fspec::FuncProto::new();
+            seed.copy(fd.get_func_proto());
+            Some(seed)
+        } else { None };
+        refollow_flow(arch, fd, execution_seed.as_ref().or(entry_proto))?;
         // (kuna `rustabi`) The re-flow hands back a FRESH Funcdata, so the
         // callee-body evidence has to be taken again or the call-output seam
         // silently loses its veto on every restarted function.  Cached, so this
@@ -984,10 +1390,9 @@ fn run_pipeline(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<int4> 
         // callee's writes; shares rustabi's cache, so this is a map lookup.
         crate::p4_calls::kuna_calleepreserves::seed_callee_preserves(arch, fd);
     }
-    // Exceeded the cross-flow restart budget; keep the last analyzed IR.
-    fd.set_restart_pending(false);
-    drain_pipeline_comments(arch, fd);
-    Ok(total)
+    // The last iteration requested new physical input state but has not analyzed
+    // its re-lifted IR. Publishing that shell would silently discard live bits.
+    Err(KunaError::lowlevel("Cross-flow refinement did not converge"))
 }
 
 /// Flush any analysis comments the **action pipeline** buffered on the `Funcdata`
@@ -1002,15 +1407,34 @@ fn drain_pipeline_comments(arch: &mut Architecture, fd: &mut Funcdata) {
     }
 }
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_readonly_receipt_replay(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<()> {
+    crate::p4_calls::kuna_branchreachability::replay_tests::run(arch, fd)
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn test_internal_body_coverage(fd: &Funcdata) -> KunaResult<Vec<(Address, int4)>> {
+    fd.internal_constant_body_coverage()
+}
+
 /// Re-follow flow on an existing, already-analyzed `fd` after a restart request
 /// (C++ `ActionRestartGroup` → `clearAnalysis` + `ActionStart::startProcessing` →
 /// `followFlow`).  Clears the analysis-derived IR (`Funcdata::clear`) while
 /// preserving the per-function `Override`, then re-runs the flow follow in place.
 #[allow(clippy::mutable_key_type)]
-fn refollow_flow(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<()> {
+pub(crate) fn refollow_flow(
+    arch: &mut Architecture,
+    fd: &mut Funcdata,
+    entry_proto: Option<&crate::fspec::FuncProto>,
+) -> KunaResult<()> {
     // C++ `glb->clearAnalysis(&data)` == fd->clear() (the comment-DB clear is the
     // W4 stub) — drops ops/vbank/blocks/qlst/heritage but keeps `localoverride`.
     fd.clear();
+    if let Some(seed) = entry_proto {
+        fd.get_func_proto_mut().copy(seed);
+    }
     // Move the cleared shell out so `follow_flow_on_fd` can re-flow it (it takes
     // `fd` by value, mirroring the fresh-build path), then put the re-flowed IR
     // back into the caller's slot.  The throwaway placeholder is a minimal valid
@@ -1024,12 +1448,13 @@ fn refollow_flow(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<()> {
 }
 
 /// Decompile the function `name` at `funcaddr` to a ready-to-print
-/// [`Funcdata`] (C++ `IfcDecompile`): build the IR (follow flow), install the
-/// universalAction `decompile` root, and run the pass pipeline to completion.
+/// [`Funcdata`] (C++ `IfcDecompile`): build the IR (follow flow), then run the
+/// selected universalAction root to completion.
 ///
 /// `size` bounds the flow follow (0 = unbounded, the function's natural extent).
 /// On success the returned `Funcdata` has its IR built and the pipeline run; it
-/// is ready for [`print_c`].  The universalAction must already be installed on
+/// is ready for the selected root's consumers. Full C output requires the
+/// `decompile` root. The universalAction must already be installed on
 /// the architecture (via [`Architecture::build_action`] / `init_post_engine`).
 pub fn decompile_func(
     arch: &mut Architecture,
@@ -1049,7 +1474,7 @@ pub fn decompile_func_with_symbols(
     name: &str,
     funcaddr: Address,
     size: int4,
-    mapped_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4)],
+    mapped_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4)],
 ) -> KunaResult<Funcdata> {
     decompile_func_full(arch, name, funcaddr, size, mapped_symbols, None)
 }
@@ -1069,7 +1494,7 @@ pub fn decompile_func_full(
     name: &str,
     funcaddr: Address,
     size: int4,
-    mapped_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4)],
+    mapped_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4)],
     pending_proto: Option<&crate::fspec::PrototypePieces>,
 ) -> KunaResult<Funcdata> {
     decompile_func_full_with_override(arch, name, funcaddr, size, mapped_symbols, pending_proto, &[])
@@ -1084,7 +1509,7 @@ pub fn decompile_func_full_with_override(
     name: &str,
     funcaddr: Address,
     size: int4,
-    mapped_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4)],
+    mapped_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4)],
     pending_proto: Option<&crate::fspec::PrototypePieces>,
     flow_overrides: &[(Address, kuna_base::types::uint4)],
 ) -> KunaResult<Funcdata> {
@@ -1098,7 +1523,7 @@ pub fn decompile_func_full_with_override(
         &[],
         pending_proto,
         flow_overrides,
-        &[],
+        &crate::overrides::Override::new(),
         &[],
     )
 }
@@ -1112,12 +1537,12 @@ pub fn decompile_func_full_with_override_dyn(
     name: &str,
     funcaddr: Address,
     size: int4,
-    mapped_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4)],
-    usepoint_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4, Address, bool)],
+    mapped_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4)],
+    usepoint_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4, Address, bool)],
     dynamic_symbols: &[crate::database::DynamicSymbolSpec],
     pending_proto: Option<&crate::fspec::PrototypePieces>,
     flow_overrides: &[(Address, kuna_base::types::uint4)],
-    proto_overrides: &[(Address, crate::fspec::PrototypePieces)],
+    proto_overrides: &crate::overrides::Override,
     mapped_params: &[(int4, String, crate::fspec::ParameterPieces)],
 ) -> KunaResult<Funcdata> {
     decompile_func_full_with_override_dyn_prefollowed(
@@ -1159,12 +1584,12 @@ pub fn decompile_func_full_with_override_dyn_prefollowed(
     name: &str,
     funcaddr: Address,
     size: int4,
-    mapped_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4)],
-    usepoint_symbols: &[(String, std::rc::Rc<crate::dtype::Datatype>, Address, kuna_base::types::uint4, Address, bool)],
+    mapped_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4)],
+    usepoint_symbols: &[(String, crate::dtype::TypeRoot, Address, kuna_base::types::uint4, Address, bool)],
     dynamic_symbols: &[crate::database::DynamicSymbolSpec],
     pending_proto: Option<&crate::fspec::PrototypePieces>,
     flow_overrides: &[(Address, kuna_base::types::uint4)],
-    proto_overrides: &[(Address, crate::fspec::PrototypePieces)],
+    proto_overrides: &crate::overrides::Override,
     mapped_params: &[(int4, String, crate::fspec::ParameterPieces)],
     prefollowed: Option<Funcdata>,
 ) -> KunaResult<Funcdata> {
@@ -1238,14 +1663,9 @@ pub fn decompile_func_full_with_override_dyn_prefollowed(
         // recovery SEED): after this the inputs/output are type-locked, so
         // ActionPrototypeTypes forces the typed Varnodes.
         if let Some(pieces) = pending_proto.or(recovered_proto.as_ref()) {
-            // (ghidra-mode, Phase 4) A host-declared model rides with the
-            // pieces so parameter storage is assigned under the SAME
-            // convention the database committed (see
-            // `Architecture::kuna_pending_proto_model`); `None` everywhere
-            // else keeps the architecture default.  Standalone, the same slot
-            // carries a convention the declaration itself named
-            // (`void * __stdcall f(...)`), so the function decompiles under the
-            // convention it was declared with rather than the default one.
+            // Declaration pieces retain their explicit model and all-locked
+            // semantics. Host prototypes were copied by Funcdata::new without
+            // passing through this declaration-only path.
             let declared_model = staged_proto_model
                 .clone()
                 .or_else(|| fd.get_arch().callee_proto_model(&entry_addr));
@@ -1256,6 +1676,14 @@ pub fn decompile_func_full_with_override_dyn_prefollowed(
         // the rebuilt proto input-locked so `ActionPrototypeTypes` forces the typed
         // input Varnode (C++ `IfcMapParam` writes straight onto the live FuncProto).
         fd.apply_mapped_params(mapped_params);
+        // Only explicit entry overrides need an extra seed: ordinary host
+        // drives reuse RemoteScope's immutable canonical prototype on clear().
+        let entry_seed = (pending_proto.is_some() || recovered_proto.is_some()
+            || !mapped_params.is_empty()).then(|| {
+                let mut seed = crate::fspec::FuncProto::new();
+                seed.copy(fd.get_func_proto());
+                seed
+            });
         // Re-seed the console-mapped symbols (lost when the IR is rebuilt).
         fd.seed_mapped_symbols(mapped_symbols);
         // Re-seed the usepoint-scoped console symbols (the register-storage
@@ -1303,8 +1731,9 @@ pub fn decompile_func_full_with_override_dyn_prefollowed(
         // whole run — exactly the graceful-degradation the LOSS-130/131 measurement
         // assumes.  `fd`/`arch` are discarded on the unwind, so no half-mutated
         // state escapes (`AssertUnwindSafe` is sound here for that reason).
-        let res =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_pipeline(arch, &mut fd)));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_pipeline(arch, &mut fd, entry_seed.as_ref())
+        }));
         match res {
             Ok(r) => {
                 r?;
@@ -1327,11 +1756,10 @@ pub fn decompile_func_full_with_override_dyn_prefollowed(
 /// (kuna) Build the IR for `name` and run a **named reduced pipeline** variant
 /// over it as a sub-query (C++ `IfcKunaPipeline::execute`).
 ///
-/// Mirrors [`decompile_func_full_with_override_dyn`] but installs the named
-/// action group (`normalize`/`paramid`/`register`/`firstpass`/`jumptable`)
-/// instead of `decompile`, runs it once (no cross-flow restart loop — a reduced
-/// variant has no restart group), then restores `decompile` as the current root
-/// (the C++ save/switch/perform/restore around `allacts.setCurrent`).  The
+/// Temporarily installs the named action group
+/// (`normalize`/`paramid`/`register`/`firstpass`/`jumptable`), follows flow and
+/// runs it through the shared restart/error-aware drive, then restores the
+/// previously selected root. The
 /// resulting [`Funcdata`] holds whatever IR the reduced pipeline produced (for
 /// `normalize`, no `sblocks` — `quality` then hits its `hasNoStructBlocks`
 /// guard).  Stub aborts degrade to a recoverable `Err`, like the full drive.
@@ -1342,34 +1770,35 @@ pub fn run_named_pipeline_variant(
     size: int4,
     variant: &str,
 ) -> KunaResult<Funcdata> {
-    let mut fd = build_and_follow_flow(arch, name, funcaddr, size)?;
-    let saved = arch.allacts.get_current_name().to_string();
+    let saved = selected_action_name(arch)?;
+    arch.allacts.set_current(variant)?;
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        arch.allacts.set_current(variant)?;
-        let mut ctx = ActionContext::new();
-        let root = arch
-            .allacts
-            .get_current_mut()
-            .ok_or_else(|| KunaError::lowlevel(format!("no current {variant} action")))?;
-        root.reset(&mut fd);
-        let r = root.perform(&mut fd, &mut ctx);
+        let mut fd = build_and_follow_flow(arch, name, funcaddr, size)?;
+        let r = run_pipeline(arch, &mut fd, None)?;
         if r < 0 {
             return Err(KunaError::lowlevel(format!(
                 "{variant} pipeline hit a breakpoint"
             )));
         }
-        Ok(())
+        Ok(fd)
     }));
     // Restore the root action regardless of outcome (C++ restores setCurrent).
-    let _ = arch.allacts.set_current(&saved);
+    arch.allacts.set_current(&saved)?;
     match res {
-        Ok(Ok(())) => Ok(fd),
+        Ok(Ok(fd)) => Ok(fd),
         Ok(Err(e)) => Err(e),
         Err(payload) => Err(KunaError::lowlevel(format!(
             "{variant} pipeline reached an un-ported seam: {}",
             panic_message(payload)
         ))),
     }
+}
+
+/// Save only a usable root: restoring an empty or invalid selection would hide
+/// the temporary pipeline's effect on later host requests.
+fn selected_action_name(arch: &Architecture) -> KunaResult<String> {
+    arch.allacts.get_current().ok_or_else(|| KunaError::lowlevel("no current action"))?;
+    Ok(arch.allacts.get_current_name().to_string())
 }
 
 /// Best-effort extraction of a panic payload's message (the `panic!` string),
@@ -1681,12 +2110,24 @@ pub fn print_c_prototype(arch: &mut Architecture, fd: &Funcdata) -> String {
 /// `undefined` family block (`undefined`, `undefined1..8` — 3/5/6/7 mapped to
 /// the next larger unsigned integer with a sizeof note — and `undefined16/32`
 /// as byte-array structs).  `bool` is covered by `#include <stdbool.h>`;
-/// `char`/`void` are real C and emit nothing.
+/// C scalar keywords and standard-header types are not redeclared.
 pub fn print_c_recompile_prelude(arch: &Architecture) -> String {
+    print_c_recompile_prelude_with_roots(arch, |_| {})
+}
+
+/// The same prelude, reporting the actual graph roots whose declarations or
+/// layout checks it emits. Publication can authenticate source ownership without guessing by
+/// name; fixed synthetic helper declarations do not acquire source ownership.
+pub fn print_c_recompile_prelude_with_roots(
+    arch: &Architecture, mut emitted: impl FnMut(&crate::dtype::TypeRoot),
+) -> String {
     use crate::dtype::type_metatype::*;
+    use std::fmt::Write as _;
     let mut out = String::new();
     out.push_str("/* kuna recompile prelude (generated): core scalar typedefs */\n");
     out.push_str("#include <stdbool.h>\n");
+    out.push_str("#include <stdint.h>\n");
+    out.push_str("#include <stddef.h>\n");
     // A recovered aggregate can hold target pointers, and a host that compiles
     // this header for a different data model sizes them differently and moves
     // every field after such a member -- which also moves what `p[1]` means in
@@ -1708,12 +2149,18 @@ pub fn print_c_recompile_prelude(arch: &Architecture) -> String {
         if !ct.is_core_type() {
             continue;
         }
-        let name = ct.get_name();
-        // `void`/`char` are real C; `bool` comes from <stdbool.h> above.
-        if name.is_empty() || matches!(name, "void" | "char" | "bool") {
+        let view = ct.read();
+        let node = view.get(ct.id()).expect("retained datatype");
+        let name = node.get_name();
+        if name.is_empty() || name == "void" {
             continue;
         }
         let size = ct.get_size();
+        if crate::kuna_ctypes::is_builtin_type_name(name) {
+            lines.push(format!("typedef char kuna_core_size_{name}[(sizeof({name}) == {size}) ? 1 : -1];\n"));
+            emitted(&ct);
+            continue;
+        }
         let (spelling, note): (&str, &str) = match ct.get_metatype() {
             TYPE_INT => match size {
                 1 => ("signed char", ""),
@@ -1741,6 +2188,7 @@ pub fn print_c_recompile_prelude(arch: &Architecture) -> String {
             _ => continue,
         };
         lines.push(format!("typedef {spelling} {name};{note}\n"));
+        emitted(&ct);
     }
     lines.sort();
     lines.dedup();
@@ -1762,6 +2210,18 @@ pub fn print_c_recompile_prelude(arch: &Architecture) -> String {
     out.push_str("typedef unsigned long long undefined8;\n");
     out.push_str("typedef struct { unsigned char b[16]; } undefined16;\n");
     out.push_str("typedef struct { unsigned char b[32]; } undefined32;\n");
+    out.push_str("\n/* Scalar PIECE helpers: byte widths, high part first. */\n#ifndef KUNA_SCALAR_CONCAT_HELPERS\n#define KUNA_SCALAR_CONCAT_HELPERS\n");
+    for high in 1..8 {
+        for low in 1..=8 - high {
+            let result = match high + low { 2 => "uint16_t", 3 | 4 => "uint32_t", _ => "uint64_t" };
+            let high_mask = (1u64 << (8 * high)) - 1;
+            let low_mask = (1u64 << (8 * low)) - 1;
+            writeln!(out,
+                "static inline {result} CONCAT{high}{low}(uint64_t high, uint64_t low) {{\n  return ({result})(((high & UINT64_C(0x{high_mask:x})) << {}) | (low & UINT64_C(0x{low_mask:x})));\n}}",
+                8 * low).expect("writing to String");
+        }
+    }
+    out.push_str("#endif /* KUNA_SCALAR_CONCAT_HELPERS */\n");
     out
 }
 
@@ -1832,14 +2292,20 @@ pub fn extract_type_definitions(arch: &Architecture, fd: &Funcdata) -> Vec<TypeI
     if arch.print().out_lang() != crate::kuna_lang::OutLang::C {
         return Vec::new();
     }
-    let rt = crate::printc::RealTypeCtx::from_arch(arch, arch.print().out_lang());
+    let rt = crate::printc::RealTypeCtx::from_arch(arch, arch.print().out_lang(), arch.print().options.convention);
     let types = crate::kuna_structdefs::referenced_types(fd);
     crate::kuna_structdefs::dedup_by_name(&types)
         .iter()
-        .map(|ct| TypeInfo {
-            name: ct.get_name().to_string(),
-            definition: crate::kuna_structdefs::definition_text(ct, rt),
-            size: ct.get_size() as i64,
+        .map(|ct| {
+            let name = {
+                let view = ct.read();
+                view.get(ct.id()).expect("retained datatype").get_name().to_string()
+            };
+            TypeInfo {
+                name,
+                definition: crate::kuna_structdefs::definition_text(ct, rt),
+                size: ct.get_size() as i64,
+            }
         })
         .collect()
 }
@@ -1848,9 +2314,11 @@ pub fn extract_type_definitions(arch: &Architecture, fd: &Funcdata) -> Vec<TypeI
 /// or, for the header to check its declaration against, directly (`dat_2b080`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalInfo {
+    /// The authenticated target data address-space index.
+    pub space_index: i32,
     /// The byte address the name stands for.
     pub address: u64,
-    /// The printed name (`dat_2b080`, or `DAT_0002b080` in ghidra naming).
+    /// The actual emitted symbol name, or the unnamed-data spelling.
     pub name: String,
     /// The C declaration without `extern` or `;` (`struct_2 dat_2b080`).
     pub declaration: String,
@@ -1859,8 +2327,9 @@ pub struct GlobalInfo {
     /// True when the function only ever used the address through `void *`, so
     /// the declared type is the unknown byte.
     pub unknown: bool,
-    /// True for storage the body reads or writes directly rather than takes the
-    /// address of; its declaration is the type it is accessed at.
+    /// True for a direct storage access or an authenticated named symbol.
+    /// Its declaration governs that object, rather than tentatively choosing
+    /// a type from an unnamed address-taking expression.
     pub direct: bool,
     /// True when the declared type is a record or union: a scalar read or write
     /// of the name does not compile against it. (An array decays to a pointer,
@@ -1869,19 +2338,23 @@ pub struct GlobalInfo {
 }
 
 /// The globals the C `print_c` just rendered for `fd` names
-/// ([`crate::kuna_globalref`]): every address it takes, and every piece of
-/// unnamed program data it accesses directly. Read from the printer, so it must
-/// follow the `print_c` of the same function. Empty with the option off.
+/// ([`crate::kuna_globalref`]): authenticated named symbols, every rewritten
+/// address it takes, and unnamed program data it accesses directly. Read from
+/// the printer, so it must follow the `print_c` of the same function. Named
+/// symbol declarations do not depend on the optional global-address rewrite.
 pub fn extract_global_objects(arch: &Architecture) -> Vec<GlobalInfo> {
+    let Some(data_space) = arch.manage().get_default_data_space() else { return Vec::new(); };
     let print = arch.print();
     let plan = print.globalref_plan();
-    let rt = crate::printc::RealTypeCtx::from_arch(arch, print.out_lang());
-    let info = |address: u64, ty: &std::rc::Rc<crate::dtype::Datatype>, unknown: bool, direct: bool| {
-        let name = crate::printc::global_data_name(arch, address);
+    let rt = crate::printc::RealTypeCtx::from_arch(arch, print.out_lang(), print.options.convention);
+    let info = |address: u64, name: String, ty: &crate::dtype::TypeRoot, unknown: bool, direct: bool, volatile: bool| {
         use crate::dtype::type_metatype::{TYPE_STRUCT, TYPE_UNION};
         GlobalInfo {
+            space_index: data_space.get_index(),
             address,
-            declaration: crate::printc::declaration_text(ty, &name, rt),
+            declaration: if volatile {
+                crate::printc::declaration_text(ty, &format!("volatile {name}"), rt)
+            } else { crate::printc::declaration_text(ty, &name, rt) },
             size: i64::from(ty.get_size()),
             name,
             unknown,
@@ -1890,11 +2363,81 @@ pub fn extract_global_objects(arch: &Architecture) -> Vec<GlobalInfo> {
         }
     };
     let mut out: Vec<GlobalInfo> =
-        plan.minted.iter().map(|(&address, m)| info(address, &m.decl_type, m.unknown, false)).collect();
+        plan.minted.iter().map(|(&address, m)| info(address, crate::printc::global_data_name(arch, address),
+            &m.decl_type, m.unknown, false, false)).collect();
     for (address, ty) in plan.direct_objects() {
-        let g = info(address, ty, false, true);
+        let g = info(address, crate::printc::global_data_name(arch, address), ty, false, true, false);
         if !out.contains(&g) {
             out.push(g);
+        }
+    }
+    for (address, name, ty, volatile) in plan.named_objects() {
+        out.push(info(address, name.to_string(), ty, false, true, volatile));
+    }
+    out
+}
+
+/// (kuna `globalref`) One `extern` line per referenced global symbol, in address/name order.
+/// Shared by project exports and native callable support inventories.
+///
+/// Each function declares the object at the type IT uses it at, so two
+/// functions can disagree, and a function that reads the same `dat_<addr>`
+/// directly reads it at the type IT printed. The declaration is what every
+/// direct read and write compiles against, so it must never be a scalar of
+/// another type than theirs: that would silently change what they compute (a
+/// signed compare turned unsigned, a store truncated), where a pointer of the
+/// wrong type in an address-taking body is a diagnosed mismatch. The choice:
+///
+/// * a record or union some function takes the address of, the larger one
+///   first: a scalar access of the name does not compile against it;
+/// * otherwise the one type the direct accesses agree on;
+/// * otherwise, with direct accesses at two types, nothing, and a comment says so;
+/// * with no direct access, a type over the unknown byte a `void *` use stands
+///   for, then the larger object, then the declaration more functions make,
+///   then the earlier function.
+///
+/// Every other type is listed in a comment on the line.
+pub fn global_declarations<'a>(globals: impl IntoIterator<Item = &'a GlobalInfo>) -> String {
+    use std::fmt::Write as _;
+    let mut by_addr: BTreeMap<(i32, u64, &str), (Vec<&GlobalInfo>, Vec<&GlobalInfo>)> = BTreeMap::new();
+    for g in globals {
+        let e = by_addr.entry((g.space_index, g.address, g.name.as_str())).or_default();
+        if g.direct { e.1.push(g) } else { e.0.push(g) }
+    }
+    let quote = |d: &str| d.replace("/*", "/ *").replace("*/", "* /");
+    let mut out = String::new();
+    for (taken, direct) in by_addr.values() {
+        let mut decls: Vec<(&GlobalInfo, usize)> = Vec::new();
+        for g in taken.iter().chain(direct.iter()) {
+            match decls.iter_mut().find(|(d, _)| d.declaration == g.declaration) {
+                Some((_, n)) => *n += 1,
+                None => decls.push((g, 1)),
+            }
+        }
+        let best = |pool: &mut dyn Iterator<Item = &(&GlobalInfo, usize)>| -> Option<String> {
+            pool.max_by(|(a, an), (b, bn)| (!a.unknown, a.size, *an).cmp(&(!b.unknown, b.size, *bn)).then(std::cmp::Ordering::Greater))
+                .map(|(g, _)| g.declaration.clone())
+        };
+        let mut direct_decls: Vec<&str> = direct.iter().map(|g| g.declaration.as_str()).collect();
+        direct_decls.sort_unstable();
+        direct_decls.dedup();
+        let record = best(&mut decls.iter().filter(|(g, _)| !g.direct && g.aggregate));
+        let chosen = match (record, direct_decls.as_slice()) {
+            (Some(r), _) => r,
+            (None, [one]) => one.to_string(),
+            (None, []) => best(&mut decls.iter()).unwrap_or_default(),
+            (None, _) => {
+                let all: Vec<String> = decls.iter().map(|(g, _)| quote(&g.declaration)).collect();
+                let _ = writeln!(out, "/* {} is read at two types, so it is not declared: {} */", decls[0].0.name, all.join(", "));
+                continue;
+            }
+        };
+        let others: Vec<String> =
+            decls.iter().filter(|(g, _)| g.declaration != chosen).map(|(g, _)| quote(&g.declaration)).collect();
+        if others.is_empty() {
+            let _ = writeln!(out, "extern {chosen};");
+        } else {
+            let _ = writeln!(out, "extern {chosen}; /* also used as: {} */", others.join(", "));
         }
     }
     out
@@ -2022,7 +2565,7 @@ fn parameter_storage(fd: &Funcdata, arg_index: usize) -> Option<(Address, i64)> 
     let proto = fd.get_func_proto();
     let mut source_index = 0usize;
     for index in 0..proto.num_params() {
-        let parameter = proto.get_param(index)?;
+        let Some(parameter) = proto.source_param(index) else { continue };
         if parameter.is_hidden_return() {
             continue;
         }
@@ -2254,7 +2797,7 @@ fn signed_space_offset(space: &Rc<kuna_base::space::AddrSpace>, off: u64) -> i64
 /// surface (→ decbench `type_match`).
 ///
 /// Mirrors how the decbench Ghidra backend reads the `HighFunction` local symbol
-/// map: parameters come from the `FuncProto` in ABI order (`arg_index` = dense
+/// map: source parameters come from the `FuncProto` in ABI order (`arg_index` = dense
 /// source position, a register-passed param has `stack_offset == None`); stack
 /// locals come from the function's `ScopeLocal` stack space, keeping only
 /// `NO_CATEGORY` symbols (a `FUNCTION_PARAMETER` symbol is already emitted as a
@@ -2264,12 +2807,12 @@ pub fn extract_variables(arch: &Architecture, fd: &Funcdata) -> Vec<VarInfo> {
     let stack_index = arch.manage().get_stack_space().map(|s| s.get_index());
     let mut out: Vec<VarInfo> = Vec::new();
 
-    // 1) Parameters, in ABI order, off the FuncProto.
+    // 1) Source parameters, in ABI order, excluding derived execution-only inputs.
     let proto = fd.get_func_proto();
     let nparams = proto.num_params();
     let mut arg_pos = 0usize;
     for i in 0..nparams {
-        let Some(p) = proto.get_param(i) else { continue };
+        let Some(p) = proto.source_param(i) else { continue };
         // A hidden return-storage pointer is a synthetic ABI slot, not a
         // source-level parameter (no DWARF formal-parameter to match), so skip it.
         if p.is_hidden_return() {
@@ -2337,7 +2880,7 @@ pub fn extract_variables(arch: &Architecture, fd: &Funcdata) -> Vec<VarInfo> {
 /// element type the recovery never established.  Report those as the width-only
 /// `undefined<N>`, the same spelling Ghidra uses for the same fact, and leave every
 /// committed type exactly as the printer spells it.
-fn frame_slot_type_name(arch: &Architecture, dt: &std::rc::Rc<crate::dtype::Datatype>) -> String {
+fn frame_slot_type_name(arch: &Architecture, dt: &crate::dtype::TypeRoot) -> String {
     use crate::dtype::type_metatype;
     let n = dt.get_size();
     let uncommitted = match dt.get_metatype() {

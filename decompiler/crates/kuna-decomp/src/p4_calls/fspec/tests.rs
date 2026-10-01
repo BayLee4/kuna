@@ -17,7 +17,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
 
-use crate::dtype::{type_class, type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_class, type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 
 use super::*;
 
@@ -598,187 +598,26 @@ fn fillin_map_register_kind() {
 // ParamListStandard assignMap (assignment walk for synthetic prototypes)
 // =========================================================================
 
-/// A `TypeFactory` stub that panics on any reach — the input-list `assignMap`
-/// path with no model rules never calls it.
-struct PanicTypeFactory;
-
-macro_rules! unreached {
-    () => {
-        panic!("TypeFactory should not be reached in this test")
-    };
-}
-
-#[allow(unused_variables)]
-impl TypeFactory for PanicTypeFactory {
-    fn get_size_of_int(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_long(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_char(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_wchar(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_pointer(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_alt_pointer(&self) -> int4 {
-        unreached!()
-    }
-    fn get_alignment(&self, _size: u32) -> KunaResult<int4> {
-        unreached!()
-    }
-    fn get_primitive_align_size(&self, _size: u32) -> KunaResult<int4> {
-        unreached!()
-    }
-    fn get_type_void(&self) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_base_no_char(&self, _s: int4, _m: type_metatype) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_base(&self, _s: int4, _m: type_metatype) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_base_named(
-        &self,
-        _s: int4,
-        _m: type_metatype,
-        _n: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_char(&self, _s: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_code(&self) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_strip_array(
-        &self,
-        _s: int4,
-        _pt: Rc<Datatype>,
-        _ws: u32,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer(&self, _s: int4, _pt: Rc<Datatype>, _ws: u32) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_named(
-        &self,
-        _s: int4,
-        _pt: Rc<Datatype>,
-        _ws: u32,
-        _n: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn resize_pointer(&self, _ptr: Rc<Datatype>, _new_size: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_rel(
-        &self,
-        _parent_ptr: Rc<Datatype>,
-        _ptr_to: Rc<Datatype>,
-        _off: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_rel_full(
-        &self,
-        _sz: int4,
-        _parent: Rc<Datatype>,
-        _ptr_to: Rc<Datatype>,
-        _ws: int4,
-        _off: int4,
-        _nm: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_with_space(
-        &self,
-        _ptr_to: Rc<Datatype>,
-        _spc: Rc<AddrSpace>,
-        _nm: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_array(&self, _as_: int4, _ao: Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_struct(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_struct(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_union(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_union(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_enum(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_enum(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_spacebase(&self, _id: Rc<AddrSpace>, _addr: &Address) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn resize_integer(&self, _ct: Rc<Datatype>, _new_size: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_exact_piece(
-        &self,
-        _ct: Rc<Datatype>,
-        _offset: int4,
-        _size: int4,
-    ) -> KunaResult<Option<Rc<Datatype>>> {
-        unreached!()
-    }
-    fn find_by_name(&self, _n: &str) -> KunaResult<Option<Rc<Datatype>>> {
-        unreached!()
-    }
-    fn concretize(&self, _ct: Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
+fn type_factory() -> TypeFactoryImpl {
+    let tf = TypeFactoryImpl::new();
+    tf.setup_sizes(Some(4), 8, 8);
+    tf
 }
 
 /// A 4-byte general-purpose integer data-type.
-fn int4_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(4, 4, type_metatype::TYPE_INT))
+fn int4_type(tf: &dyn TypeFactory) -> TypeRoot {
+    tf.get_base(4, type_metatype::TYPE_INT).unwrap()
 }
 
 #[test]
 fn assign_map_standard_input_walk() {
     let mgr = AddrSpaceManager::new();
     let (model, _reg) = three_reg_model();
-    let tf = PanicTypeFactory;
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![int4_type(), int4_type()],
+        intypes: vec![int4_type(&tf), int4_type(&tf)],
         innames: vec!["a".into(), "b".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -833,14 +672,13 @@ fn assign_map_standard_out_hidden_return_emits_indirect_output_plus_pointer_para
     // w10-struct-return de-stub: a too-big (8-byte) return value that does not
     // fit the model's 4-byte output register is returned through a hidden
     // pointer parameter (C++ `ParamListStandardOut::assignMap` fspec.cc:1584+).
-    use crate::dtype::TypeFactoryImpl;
     let (mgr, reg) = manager_with_default_data_space();
     let model = single_small_out_model(&reg, &mgr);
     let tf = TypeFactoryImpl::new();
     tf.setup_sizes(Some(4), 8, 8); // initialize the size/alignment map
     // A 24-byte struct: too big for the 8-byte output register, so it must be
     // returned through a hidden pointer (which DOES fit the register).
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = tf.intern(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT)).unwrap();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: Some(outtype),
@@ -870,7 +708,8 @@ fn assign_map_standard_out_hidden_return_emits_indirect_output_plus_pointer_para
 fn assign_address_fallback_exhausts_groups() {
     let mgr = AddrSpaceManager::new();
     let (model, _reg) = three_reg_model();
-    let tp = int4_type();
+    let tf = type_factory();
+    let tp = int4_type(&tf);
     let mut status = vec![0i32; 3];
     let mut p0 = ParameterPieces::default();
     // First assignment grabs group 0.
@@ -961,6 +800,239 @@ fn three_reg_proto_model(mgr: &AddrSpaceManager, reg: &Rc<AddrSpace>) -> ProtoMo
         output.finish_decode();
     }
     model
+}
+
+/// Real resources and decoded varargs rules: fixed inputs use general
+/// registers, while every declared variadic input consumes an aligned stack
+/// slot. A dedicated result register is deliberately outside that register bank.
+fn supplied_boundary_model(
+    mgr: &AddrSpaceManager,
+    reg: &Rc<AddrSpace>,
+    hidden: Option<AssignActionResponse>,
+) -> (ProtoModel, Rc<AddrSpace>) {
+    use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+    let mut model = ProtoModel::new(mgr);
+    model.build_param_list("standard").unwrap();
+    let stack = stack_space();
+    let input = model.input_mut();
+    if hidden.is_some() {
+        input.push_entry(ParamEntry::seed(
+            0, type_class::TYPECLASS_HIDDENRET, Rc::clone(reg), 0x80,
+            8, 1, 0, 0, true, false, &[], mgr,
+        ).unwrap());
+    }
+    let base_group = i32::from(hidden.is_some());
+    for index in 0..4 {
+        let entry = excl_entry(
+            base_group + index, reg, 0x10 + index as u64 * 0x10,
+            8, input.get_entry(), mgr,
+        );
+        input.push_entry(entry);
+    }
+    let entry = stack_entry(base_group + 4, &stack, 0, 0x100, 8, input.get_entry(), mgr);
+    input.push_entry(entry);
+    input.finish_decode();
+    let mut registry = IdRegistry::with_base_ids();
+    crate::modelrules::register_ids(&mut registry);
+    let mut decoder = XmlDecode::new(mgr, &registry);
+    decoder.ingest_stream(
+        br#"<rule><datatype name="any"/><varargs first="0" last="2147483647"/><goto_stack/></rule>"#,
+    ).unwrap();
+    let rule = crate::modelrules::ModelRule::decode(&mut decoder, input).unwrap();
+    input.push_model_rule(rule);
+    let output = model.output_mut();
+    output.push_entry(excl_entry(0, reg, 0x90, 8, &[], mgr));
+    output.finish_decode();
+    if let Some(ret_code) = hidden {
+        output.push_model_rule(crate::modelrules::ModelRule::from_components(
+            crate::modelrules::DatatypeFilter::SizeRestricted(
+                crate::modelrules::SizeRestriction::new(9, 0),
+            ),
+            crate::modelrules::AssignAction::HiddenReturnAssign { ret_code },
+        ));
+    }
+    (model, stack)
+}
+
+fn supplied_big24(tf: &TypeFactoryImpl) -> TypeRoot {
+    use crate::dtype::{DatatypeKind, TypeField};
+    let word = tf.get_base(8, type_metatype::TYPE_INT).unwrap();
+    let mut draft = Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT);
+    draft.kind = DatatypeKind::Struct {
+        field: (0..3).map(|index|
+            TypeField::new(index, index * 8, format!("word{index}"), word.id())
+        ).collect(),
+        bitfield: Vec::new(),
+    };
+    tf.intern(draft).unwrap()
+}
+
+fn supplied_boundary_pieces(tf: &TypeFactoryImpl, first: i32) -> PrototypePieces {
+    PrototypePieces {
+        outtype: Some(supplied_big24(tf)),
+        intypes: vec![
+            tf.get_base(8, type_metatype::TYPE_INT).unwrap(),
+            int4_type(tf),
+            tf.get_base(8, type_metatype::TYPE_FLOAT).unwrap(),
+        ],
+        first_var_arg_slot: first,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn supplied_effective_boundary_lowers_big_result_before_varargs_rules() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = type_factory();
+    // The normal pointer result, dedicated hidden register, and void physical
+    // result must all insert exactly one hidden input before translating first.
+    for strategy in [
+        None,
+        Some(AssignActionResponse::hiddenret_specialreg),
+        Some(AssignActionResponse::hiddenret_specialreg_void),
+    ] {
+        let (model, stack) = supplied_boundary_model(&mgr, &reg, strategy);
+        let mut proto = supplied_boundary_pieces(&tf, 2);
+        let big = proto.outtype.clone().unwrap();
+        let mut assigned = Vec::new();
+        model.assign_parameter_storage_for_supplied(
+            &mut proto, &mut assigned, false, &tf, &mgr, FirstVarArgCoordinate::Effective,
+        ).unwrap();
+        assert_eq!(proto.first_var_arg_slot, 1);
+        assert_eq!(assigned.len(), 5);
+        assert_eq!(assigned[0].flags, parameter_pieces_flags::INDIRECTSTORAGE);
+        if strategy == Some(AssignActionResponse::hiddenret_specialreg_void) {
+            assert_eq!(assigned[0].type_.as_ref().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+        } else {
+            assert_eq!(assigned[0].addr, addr(&reg, 0x90));
+            assert_eq!(assigned[0].type_.as_ref().unwrap().get_ptr_to(), Some(big.clone()));
+        }
+        assert_eq!(assigned[1].flags, parameter_pieces_flags::HIDDENRETPARM);
+        assert_eq!(assigned[1].type_.as_ref().unwrap().get_ptr_to(), Some(big));
+        assert_eq!(assigned[1].addr, addr(&reg, if strategy.is_some() { 0x80 } else { 0x10 }));
+        assert_eq!(assigned[2].addr, addr(&reg, if strategy.is_some() { 0x10 } else { 0x20 }));
+        assert_eq!(assigned[3].addr, addr(&stack, 0));
+        assert_eq!(assigned[4].addr, addr(&stack, 8));
+        for (piece, declared) in assigned[2..].iter().zip(&proto.intypes) {
+            assert_eq!(piece.type_.as_ref(), Some(declared));
+            assert_eq!(piece.flags, 0);
+        }
+        let origins = callable_input_origins(&assigned, 3).unwrap();
+        assert_eq!(origins, vec![
+            AbiInputOrigin::HiddenResult, AbiInputOrigin::Declared(0),
+            AbiInputOrigin::Declared(1), AbiInputOrigin::Declared(2),
+        ]);
+        assert_eq!(physical_vararg_boundary(&origins, Some(proto.first_var_arg_slot)), Some(2));
+    }
+}
+
+#[test]
+fn supplied_declared_boundary_and_safe_sentinels_keep_fixed_inputs_in_registers() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = type_factory();
+    let (model, stack) = supplied_boundary_model(&mgr, &reg, None);
+    for (coordinate, supplied, declared, tail_on_stack) in [
+        (FirstVarArgCoordinate::Declared, 2, 2, true),
+        (FirstVarArgCoordinate::Effective, -1, -1, false),
+        (FirstVarArgCoordinate::Effective, 99, 3, false),
+    ] {
+        let mut proto = supplied_boundary_pieces(&tf, supplied);
+        let mut assigned = Vec::new();
+        model.assign_parameter_storage_for_supplied(
+            &mut proto, &mut assigned, false, &tf, &mgr, coordinate,
+        ).unwrap();
+        assert_eq!(proto.first_var_arg_slot, declared);
+        assert_eq!(assigned.len(), 5);
+        assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+        assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+        assert_eq!(assigned[3].addr, addr(&reg, 0x30));
+        assert_eq!(assigned[4].addr, if tail_on_stack { addr(&stack, 0) } else { addr(&reg, 0x40) });
+        let origins = callable_input_origins(&assigned, 3).unwrap();
+        assert_eq!(
+            physical_vararg_boundary(&origins, (declared >= 0).then_some(declared)),
+            if declared < 0 { None } else if tail_on_stack { Some(3) } else { Some(4) },
+        );
+        if coordinate == FirstVarArgCoordinate::Declared {
+            let mut ordinary = Vec::new();
+            model.assign_parameter_storage(&proto, &mut ordinary, false, &tf, &mgr).unwrap();
+            assert_eq!(ordinary.len(), assigned.len());
+            for (ordinary, supplied) in ordinary.iter().zip(&assigned) {
+                assert_eq!(ordinary.addr, supplied.addr);
+                assert_eq!(ordinary.type_, supplied.type_);
+                assert_eq!(ordinary.flags, supplied.flags);
+            }
+        }
+    }
+}
+
+#[test]
+fn supplied_explicit_pointer_and_indirect_byvalue_do_not_shift_boundary() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = type_factory();
+    let (mut model, stack) = supplied_boundary_model(&mgr, &reg, None);
+    model.input_mut().push_pointermax_rule(8);
+    let mut proto = supplied_boundary_pieces(&tf, 2);
+    let big = proto.outtype.take().unwrap();
+    let pointer = tf.get_type_pointer(8, big.clone(), 1).unwrap();
+    proto.outtype = Some(pointer.clone());
+    // A source-declared result pointer is ordinary input, and passing the next
+    // aggregate by pointer replaces one declared input rather than adding one.
+    proto.intypes[0] = pointer.clone();
+    proto.intypes[1] = big.clone();
+    let mut assigned = Vec::new();
+    model.assign_parameter_storage_for_supplied(
+        &mut proto, &mut assigned, false, &tf, &mgr, FirstVarArgCoordinate::Effective,
+    ).unwrap();
+    assert_eq!(proto.first_var_arg_slot, 2);
+    assert_eq!(assigned.len(), 4);
+    assert_eq!(assigned[0].type_.as_ref(), Some(&pointer));
+    assert_eq!(assigned[0].addr, addr(&reg, 0x90));
+    assert_eq!(assigned[1].type_.as_ref(), Some(&pointer));
+    assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+    assert_eq!(assigned[1].flags, 0);
+    assert_eq!(assigned[2].type_.as_ref().unwrap().get_ptr_to(), Some(big));
+    assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+    assert_eq!(assigned[2].flags, parameter_pieces_flags::INDIRECTSTORAGE);
+    assert_eq!(assigned[3].addr, addr(&stack, 0));
+    assert_eq!(assigned[3].type_.as_ref(), Some(&proto.intypes[2]));
+    let origins = callable_input_origins(&assigned, 3).unwrap();
+    assert_eq!(origins, vec![
+        AbiInputOrigin::Declared(0), AbiInputOrigin::Declared(1), AbiInputOrigin::Declared(2),
+    ]);
+    assert_eq!(physical_vararg_boundary(&origins, Some(2)), Some(2));
+}
+
+#[test]
+fn supplied_effective_boundary_survives_this_before_hidden_result_markup_swap() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = type_factory();
+    let (mut model, stack) = supplied_boundary_model(&mgr, &reg, None);
+    model.set_name("__thiscall");
+    model.input_mut().thisbeforeret = true;
+    let mut proto = supplied_boundary_pieces(&tf, 2);
+    let big = proto.outtype.clone().unwrap();
+    let this_type = tf.get_type_pointer(8, int4_type(&tf), 1).unwrap();
+    proto.intypes[0] = this_type.clone();
+    let mut assigned = Vec::new();
+    model.assign_parameter_storage_for_supplied(
+        &mut proto, &mut assigned, false, &tf, &mgr, FirstVarArgCoordinate::Effective,
+    ).unwrap();
+    assert_eq!(proto.first_var_arg_slot, 1);
+    assert_eq!(assigned.len(), 5);
+    assert_eq!(assigned[1].type_.as_ref(), Some(&this_type));
+    assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+    assert_eq!(assigned[1].flags, parameter_pieces_flags::ISTHIS);
+    assert_eq!(assigned[2].type_.as_ref().unwrap().get_ptr_to(), Some(big));
+    assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+    assert_eq!(assigned[2].flags, parameter_pieces_flags::HIDDENRETPARM);
+    assert_eq!(assigned[3].addr, addr(&stack, 0));
+    assert_eq!(assigned[4].addr, addr(&stack, 8));
+    let origins = callable_input_origins(&assigned, 3).unwrap();
+    assert_eq!(origins, vec![
+        AbiInputOrigin::Declared(0), AbiInputOrigin::HiddenResult,
+        AbiInputOrigin::Declared(1), AbiInputOrigin::Declared(2),
+    ]);
+    assert_eq!(physical_vararg_boundary(&origins, Some(1)), Some(2));
 }
 
 #[test]
@@ -1090,11 +1162,11 @@ fn proto_model_assign_parameter_storage_orders_output_first() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let model = three_reg_proto_model(&mgr, &reg);
-    let tf = PanicTypeFactory; // input/output assign with no model rules never reaches it
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
-        outtype: Some(int4_type()),
-        intypes: vec![int4_type(), int4_type()],
+        outtype: Some(int4_type(&tf)),
+        intypes: vec![int4_type(&tf), int4_type(&tf)],
         innames: vec!["a".into(), "b".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -1215,7 +1287,8 @@ fn proto_model_merged_fold_in_and_select() {
 #[test]
 fn parameter_basic_lock_semantics() {
     let reg = reg_space_le();
-    let mut p = ParameterBasic::new("a", addr(&reg, 0x10), int4_type(), 0);
+    let tf = type_factory();
+    let mut p = ParameterBasic::new("a", addr(&reg, 0x10), int4_type(&tf), 0);
     assert!(!p.is_type_locked());
     p.set_type_lock(true);
     assert!(p.is_type_locked());
@@ -1225,7 +1298,7 @@ fn parameter_basic_lock_semantics() {
     assert!(!p.is_type_locked());
 
     // Locking a TYPE_UNKNOWN also sets the size lock.
-    let unk = Rc::new(Datatype::new_with_align(4, 4, type_metatype::TYPE_UNKNOWN));
+    let unk = tf.get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     let mut q = ParameterBasic::new("b", addr(&reg, 0x10), unk, 0);
     q.set_type_lock(true);
     assert!(q.is_type_locked());
@@ -1235,30 +1308,32 @@ fn parameter_basic_lock_semantics() {
 #[test]
 fn parameter_basic_override_size_lock_type() {
     let reg = reg_space_le();
-    let unk = Rc::new(Datatype::new_with_align(4, 4, type_metatype::TYPE_UNKNOWN));
+    let tf = type_factory();
+    let unk = tf.get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     let mut p = ParameterBasic::new("a", addr(&reg, 0x10), unk, 0);
     p.set_type_lock(true); // sets size lock too (unknown type)
                            // Override with a same-size int succeeds.
-    assert!(p.override_size_lock_type(int4_type()).is_ok());
+    assert!(p.override_size_lock_type(int4_type(&tf)).is_ok());
     assert_eq!(
         p.get_type().unwrap().get_metatype(),
         type_metatype::TYPE_INT
     );
     // Override with a different size fails.
-    let int8 = Rc::new(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT));
+    let int8 = tf.get_base(8, type_metatype::TYPE_INT).unwrap();
     assert!(p.override_size_lock_type(int8).is_err());
 
     // Overriding a parameter that is not size-locked fails.
-    let mut q = ParameterBasic::new("b", addr(&reg, 0x10), int4_type(), 0);
-    let another = int4_type();
+    let mut q = ParameterBasic::new("b", addr(&reg, 0x10), int4_type(&tf), 0);
+    let another = int4_type(&tf);
     assert!(q.override_size_lock_type(another).is_err());
 }
 
 #[test]
 fn proto_store_internal_round_trip() {
     let reg = reg_space_le();
-    let voidt = Rc::new(Datatype::new(0, type_metatype::TYPE_VOID));
-    let mut store = ProtoStoreInternal::new(Rc::clone(&voidt));
+    let tf = type_factory();
+    let voidt = tf.get_type_void().unwrap();
+    let mut store = ProtoStoreInternal::new(voidt);
     // A fresh store has a void output and no inputs.
     assert_eq!(store.get_num_inputs(), 0);
     assert_eq!(
@@ -1267,11 +1342,11 @@ fn proto_store_internal_round_trip() {
     );
 
     // Set two inputs and an output.
-    let p0 = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type()), flags: 0 };
-    let p1 = ParameterPieces { addr: addr(&reg, 0x20), type_: Some(int4_type()), flags: 0 };
+    let p0 = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type(&tf)), flags: 0 };
+    let p1 = ParameterPieces { addr: addr(&reg, 0x20), type_: Some(int4_type(&tf)), flags: 0 };
     store.set_input(0, "a", &p0);
     store.set_input(1, "b", &p1);
-    let out = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type()), flags: 0 };
+    let out = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type(&tf)), flags: 0 };
     store.set_output(&out);
     assert_eq!(store.get_num_inputs(), 2);
     assert_eq!(store.get_input(0).unwrap().get_name(), "a");
@@ -1387,11 +1462,12 @@ fn func_proto_inject_id_toggles_inline() {
 fn func_proto_input_lock_void_and_params() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
-    let voidt = Rc::new(Datatype::new(0, type_metatype::TYPE_VOID));
+    let tf = type_factory();
+    let voidt = tf.get_type_void().unwrap();
     let model = Rc::new(three_reg_proto_model(&mgr, &reg));
 
     let mut fp = FuncProto::new();
-    fp.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fp.set_internal(Rc::clone(&model), voidt);
     // No params: locking sets the void-input lock and the model lock.
     assert!(!fp.is_input_locked());
     fp.set_input_lock(true);
@@ -1401,7 +1477,7 @@ fn func_proto_input_lock_void_and_params() {
     assert!(!fp.is_input_locked());
 
     // With a param: input lock type-locks the parameter.
-    let p0 = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type()), flags: 0 };
+    let p0 = ParameterPieces { addr: addr(&reg, 0x10), type_: Some(int4_type(&tf)), flags: 0 };
     fp.set_param(0, "a", &p0);
     assert!(!fp.is_input_locked());
     fp.set_input_lock(true);
@@ -1414,14 +1490,15 @@ fn func_proto_resolve_extra_pop_x86() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let stack = stack_space();
-    let voidt = Rc::new(Datatype::new(0, type_metatype::TYPE_VOID));
+    let tf = type_factory();
+    let voidt = tf.get_type_void().unwrap();
     let model = Rc::new(three_reg_proto_model(&mgr, &reg));
 
     let mut fp = FuncProto::new();
-    fp.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fp.set_internal(Rc::clone(&model), voidt.clone());
     // A single stack parameter at offset 0 of size 4 -> cur = (0+4+3)&~3 = 4,
     // extrapop = max(4 (retaddr), 4) = 4.
-    let p0 = ParameterPieces { addr: addr(&stack, 0x0), type_: Some(int4_type()), flags: 0 };
+    let p0 = ParameterPieces { addr: addr(&stack, 0x0), type_: Some(int4_type(&tf)), flags: 0 };
     fp.set_param(0, "a", &p0);
     fp.set_input_lock(true); // resolveExtraPop only runs when input is locked
     fp.resolve_extra_pop();
@@ -1429,8 +1506,8 @@ fn func_proto_resolve_extra_pop_x86() {
 
     // A stack parameter at offset 4 size 4 -> cur = (4+4+3)&~3 = 8 -> extrapop 8.
     let mut fp2 = FuncProto::new();
-    fp2.set_internal(Rc::clone(&model), Rc::clone(&voidt));
-    let p1 = ParameterPieces { addr: addr(&stack, 0x4), type_: Some(int4_type()), flags: 0 };
+    fp2.set_internal(Rc::clone(&model), voidt);
+    let p1 = ParameterPieces { addr: addr(&stack, 0x4), type_: Some(int4_type(&tf)), flags: 0 };
     fp2.set_param(0, "a", &p1);
     fp2.set_input_lock(true);
     fp2.resolve_extra_pop();
@@ -1441,11 +1518,12 @@ fn func_proto_resolve_extra_pop_x86() {
 fn func_proto_copy_and_compatible() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
-    let voidt = Rc::new(Datatype::new(0, type_metatype::TYPE_VOID));
+    let tf = type_factory();
+    let voidt = tf.get_type_void().unwrap();
     let model = Rc::new(three_reg_proto_model(&mgr, &reg));
 
     let mut fp = FuncProto::new();
-    fp.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fp.set_internal(Rc::clone(&model), voidt.clone());
     fp.set_inline(true);
     fp.set_no_return(true);
     fp.set_inject_id(5);
@@ -1461,7 +1539,7 @@ fn func_proto_copy_and_compatible() {
 
     // copyFlowEffects copies only inline/no_return/injectid.
     let mut fp3 = FuncProto::new();
-    fp3.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fp3.set_internal(Rc::clone(&model), voidt);
     fp3.copy_flow_effects(&fp);
     assert!(fp3.is_inline());
     assert!(fp3.is_no_return());
@@ -1478,18 +1556,6 @@ fn func_proto_return_bytes_consumed_takes_smallest() {
     assert_eq!(fp.get_return_bytes_consumed(), 4);
     assert!(!fp.set_return_bytes_consumed(6)); // larger -> no change
     assert_eq!(fp.get_return_bytes_consumed(), 4);
-}
-
-#[test]
-fn func_proto_stub_methods_error() {
-    let mut fp = FuncProto::new();
-    assert!(fp.set_scope().is_err());
-    assert!(fp.update_input_types().is_err());
-    assert!(fp.update_output_types().is_err());
-    assert!(fp.decode().is_err());
-    let mgr = AddrSpaceManager::new();
-    let mut model = ProtoModel::new(&mgr);
-    assert!(model.decode().is_err());
 }
 
 // =========================================================================
@@ -1521,19 +1587,11 @@ fn fcs_manager() -> AddrSpaceManager {
         1,
     )))
     .unwrap();
-    // A spacebase (stack) space at index 3.
-    m.insert_space(Rc::new(AddrSpace::new(
-        spacetype::IPTR_SPACEBASE,
-        "stack",
-        false,
-        8,
-        1,
-        3,
-        0,
-        1,
-        1,
-    )))
-    .unwrap();
+    // A real spacebase permits committed stack-input LOADs into its container.
+    let ram = m.get_space_by_name("ram").unwrap().clone();
+    m.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+        "stack", 3, 8, &ram, 1, true, false,
+    ))).unwrap();
     // The fspec space, so deindirect's CALLIND->CALL rewrite can build the
     // call-spec annotation Varnode (newVarnodeCallSpecs).
     m.insert_space(Rc::new(kuna_base::space::FspecSpace::new(4))).unwrap();
@@ -1542,7 +1600,9 @@ fn fcs_manager() -> AddrSpaceManager {
 }
 
 fn fcs_fd() -> Funcdata {
-    let glb = Rc::new(ArchContext::new(fcs_manager()));
+    let mut arch = ArchContext::new(fcs_manager());
+    arch.types = Some(Rc::new(type_factory()));
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let entry = Address::new(ram, 0x1000);
     Funcdata::new("caller", "caller", glb, entry, 0x10000000, 0x40).unwrap()
@@ -1574,13 +1634,14 @@ fn fcs_new_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 fn fcs_out(fd: &mut Funcdata, op: OpId, space: Rc<AddrSpace>, off: u64, size: int4) -> VarnodeId {
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum: seq };
+    let tp = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
     let vn = {
         let mut noop = |_b: &mut crate::varnode::VarnodeBank,
                         _o: VarnodeId,
                         _n: VarnodeId|
          -> KunaResult<()> { panic!("collision") };
         fd.vbank_mut()
-            .create_def(size, Address::new(space, off), Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN)), def, &mut noop)
+            .create_def(size, Address::new(space, off), tp, def, &mut noop)
             .unwrap()
     };
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));
@@ -1589,16 +1650,17 @@ fn fcs_out(fd: &mut Funcdata, op: OpId, space: Rc<AddrSpace>, off: u64, size: in
 
 fn fcs_const_vn(fd: &mut Funcdata, val: u64, size: int4) -> VarnodeId {
     let c = fcs_const(fd);
-    fd.vbank_mut().create(size, Address::new(c, val), Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN)))
+    let tp = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
+    fd.vbank_mut().create(size, Address::new(c, val), tp)
 }
 
 /// A `FuncProto` with a standard model and an internal (void-output) store —
 /// the post-construction state a real `FuncCallSpecs` has before parameter
 /// recovery (model from the ProtoModel registry, internal store).
-fn proto_with_std_model(mgr: &AddrSpaceManager) -> FuncProto {
+fn proto_with_std_model(mgr: &AddrSpaceManager, tf: &dyn TypeFactory) -> FuncProto {
     let mut model = ProtoModel::new(mgr);
     model.build_param_list("standard").unwrap();
-    let voidt = Rc::new(Datatype::new(1, type_metatype::TYPE_VOID));
+    let voidt = tf.get_type_void().unwrap();
     let mut fp = FuncProto::new();
     fp.set_internal(Rc::new(model), voidt);
     fp
@@ -1606,9 +1668,9 @@ fn proto_with_std_model(mgr: &AddrSpaceManager) -> FuncProto {
 
 /// A `FuncCallSpecs` on `call` with a standard model + internal store (FuncProto
 /// `copy` carries both the model and a `clone_box` of the store).
-fn fcs_with_std_model(mgr: &AddrSpaceManager, call: OpId) -> FuncCallSpecs {
+fn fcs_with_std_model(mgr: &AddrSpaceManager, call: OpId, fd: &Funcdata) -> FuncCallSpecs {
     let mut fc = FuncCallSpecs::new(call, Address::default());
-    let fp = proto_with_std_model(mgr);
+    let fp = proto_with_std_model(mgr, fd.get_arch().types().unwrap());
     fc.proto_mut().copy(&fp);
     fc
 }
@@ -1641,7 +1703,7 @@ fn func_call_specs_state_toggles_and_set_funcdata() {
     let mut fd = fcs_fd();
     let ram = fcs_ram(&fd);
     let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
-    let mut fc = fcs_with_std_model(&mgr, call);
+    let mut fc = fcs_with_std_model(&mgr, call, &fd);
 
     fc.set_paramshift(2);
     assert_eq!(fc.get_paramshift(), 2);
@@ -1722,7 +1784,7 @@ fn func_call_specs_check_input_join_gates() {
     let mgr = fcs_manager();
     let mut fd = fcs_fd();
     let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
-    let mut fc = fcs_with_std_model(&mgr, call);
+    let mut fc = fcs_with_std_model(&mgr, call, &fd);
     let stk = stack_space();
 
     // Two adjacent 4-byte stack trials.
@@ -1748,7 +1810,7 @@ fn func_call_specs_do_input_join_locked_errs() {
     let mgr = fcs_manager();
     let mut fd = fcs_fd();
     let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
-    let mut fc = fcs_with_std_model(&mgr, call);
+    let mut fc = fcs_with_std_model(&mgr, call, &fd);
     // Lock the input prototype (0 params => VOIDINPUTLOCK).
     fc.proto_mut().set_input_lock(true);
     // A trivial RegisterLookup: the default-impl trait object is reached via
@@ -1784,7 +1846,7 @@ fn func_call_specs_late_restriction_no_model_copies() {
     let mut restricted = FuncProto::new();
     restricted.set_extra_pop(12);
 
-    let mut newinput: Vec<Option<VarnodeId>> = Vec::new();
+    let mut newinput = Vec::new();
     let mut newoutput: Vec<VarnodeId> = Vec::new();
     let ok = fc.late_restriction(&fd, &restricted, &mut newinput, &mut newoutput).unwrap();
     assert!(ok);
@@ -1809,10 +1871,331 @@ fn func_call_specs_late_restriction_incompatible_models_false() {
     let mut restricted = FuncProto::new();
     restricted.set_model(Some(Rc::new(model_b)));
 
-    let mut ni: Vec<Option<VarnodeId>> = Vec::new();
+    let mut ni = Vec::new();
     let mut no: Vec<VarnodeId> = Vec::new();
     let ok = fc.late_restriction(&fd, &restricted, &mut ni, &mut no).unwrap();
     assert!(!ok);
+}
+
+#[test]
+fn func_call_specs_unmodeled_locked_input_without_trial_requires_restart() {
+    let mgr = fcs_manager();
+    let mut fd = fcs_fd();
+    let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
+    let target = fcs_const_vn(&mut fd, 0x2000, 8);
+    fd.op_set_input(call, target, 0).unwrap();
+    let mut fc = FuncCallSpecs::new(call, Address::default());
+    let tf = fd.get_arch().types_rc().unwrap();
+    let mut restricted = proto_with_std_model(&mgr, tf.as_ref());
+    restricted.set_param(0, "arg", &ParameterPieces {
+        addr: addr(&fcs_ram(&fd), 0x10),
+        type_: Some(int4_type(tf.as_ref())),
+        flags: 0,
+    });
+    restricted.set_input_lock(true);
+
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    assert!(!fc.late_restriction(&fd, &restricted, &mut inputs, &mut outputs).unwrap());
+    assert!(!fc.proto().has_model());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
+
+    let mut log = RestartLog::new();
+    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+    assert!(fd.has_restart_pending());
+    assert!(!log.is_empty_for(&fd));
+    assert!(!fc.proto().has_model());
+    assert!(fc.proto().is_input_locked());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
+    let site = fd.obank().get(call).unwrap().get_addr();
+    let pinned = fd.get_override().find_proto_override(site).unwrap();
+    assert!(pinned.is_input_locked());
+    assert_eq!(pinned.num_params(), 1);
+    assert_eq!(pinned.get_param(0).unwrap().get_name(), "arg");
+    assert_eq!(pinned.get_param(0).unwrap().get_address(), restricted.get_param(0).unwrap().get_address());
+    assert_eq!(pinned.get_param(0).unwrap().get_type(), restricted.get_param(0).unwrap().get_type());
+}
+
+#[test]
+fn locked_input_slices_preserve_physical_bytes_through_late_commit() {
+    for big_endian in [false, true] {
+        for force in [false, true] {
+            // Physical offset, parameter size, trial size, operand size,
+            // expected value for LE and BE storage respectively.
+            for (offset, size, trial_size, operand_size, little, big) in [
+                (0, 4, 8, 8, 0x9abcdef0, 0x12345678),
+                (4, 4, 8, 8, 0x12345678, 0x9abcdef0),
+                (2, 2, 8, 8, 0x9abc, 0x5678),
+                (0, 8, 8, 8, 0x123456789abcdef0, 0x123456789abcdef0),
+                (0, 2, 4, 8, 0xdef0, 0x9abc),
+            ] {
+                let (mut fd, mut fc, physical, original) =
+                    input_transfer_fixture(big_endian, trial_size, operand_size);
+                let mut restricted = FuncProto::new();
+                restricted.copy(fc.proto());
+                let parameter = &physical + offset;
+                set_transfer_parameter(&fd, &mut restricted, 0, &parameter, size);
+                restricted.set_input_lock(true);
+                let mut log = RestartLog::new();
+                if force {
+                    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+                } else {
+                    let target = addr(&fcs_ram(&fd), 0x2000);
+                    fc.deindirect(&mut fd, target, "selected_bytes", &restricted, false, false, &mut log).unwrap();
+                }
+                assert!(!fd.has_restart_pending());
+                let selected = fd.obank().get(fc.get_op()).unwrap().get_in(1).unwrap();
+                assert_eq!(transfer_value(&fd, selected), if big_endian { big } else { little });
+                assert_eq!(fd.vbank().get(selected).unwrap().get_size(), size);
+                if size == operand_size {
+                    assert_eq!(selected, original, "exact storage reuse needs no copy");
+                }
+                assert_eq!(fc.proto().get_param(0).unwrap().get_address(), parameter);
+                if force {
+                    let site = fd.obank().get(fc.get_op()).unwrap().get_addr();
+                    let pinned = fd.get_override().find_proto_override(site).unwrap();
+                    assert_eq!(pinned.get_param(0).unwrap().get_address(), parameter);
+                    // A later recovered datatype must not replace committed site facts.
+                    let mut other = FuncProto::new();
+                    other.copy(&restricted);
+                    set_transfer_parameter(&fd, &mut other, 0, &physical, 1);
+                    fc.force_set(&mut fd, &other, &mut log).unwrap();
+                    assert_eq!(fd.obank().get(fc.get_op()).unwrap().get_in(1), Some(selected));
+                    assert_eq!(fc.proto().get_param(0).unwrap().get_address(), parameter);
+                    assert_eq!(fc.proto().get_param(0).unwrap().get_size(), size);
+                }
+            }
+        }
+    }
+}
+
+/// The physical trial is a register, but its current CALL operand is a defined
+/// unique-space SSA value. This makes address-based reconstruction incorrect.
+fn input_transfer_fixture(
+    big_endian: bool, trial_size: int4, operand_size: int4,
+) -> (Funcdata, FuncCallSpecs, Address, VarnodeId) {
+    let mut manager = fcs_manager();
+    let register = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "register", big_endian, 8, 1, 5, 0, 1, 1,
+    ));
+    manager.insert_space(register.clone()).unwrap();
+    manager.insert_space(Rc::new(kuna_base::space::JoinSpace::new(6, big_endian))).unwrap();
+    let mut arch = ArchContext::new(manager);
+    arch.types = Some(Rc::new(type_factory()));
+    let ram = arch.manage().get_space_by_name("ram").unwrap().clone();
+    let mut fd = Funcdata::new(
+        "caller", "caller", Rc::new(arch), addr(&ram, 0x1000), 0x10000000, 0x40,
+    ).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let copy = fcs_new_op(&mut fd, 1, 0x1008, OpCode::CPUI_COPY);
+    let value = fd.new_constant(operand_size, 0x123456789abcdef0);
+    fd.op_set_input(copy, value, 0).unwrap();
+    let source = fd.new_unique_out(operand_size, copy).unwrap();
+    fd.op_insert_end(copy, block);
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALLIND);
+    let target = fd.new_constant(8, 0x2000);
+    fd.op_set_input(call, target, 0).unwrap();
+    fd.op_set_input(call, source, 1).unwrap();
+    fd.op_insert_end(call, block);
+    let mut fc = fcs_with_std_model(fd.get_arch().manage(), call, &fd);
+    let physical = addr(&register, 0x38);
+    fc.get_active_input().register_trial(&physical, trial_size);
+    (fd, fc, physical, source)
+}
+
+fn set_transfer_parameter(fd: &Funcdata, proto: &mut FuncProto, slot: int4, storage: &Address, size: int4) {
+    proto.set_param(slot, "bytes", &ParameterPieces {
+        addr: storage.clone(),
+        type_: Some(fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UINT).unwrap()),
+        flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::CUSTOM_STORAGE,
+    });
+}
+
+/// Evaluate the small integer-expression subset generated by these fixtures,
+/// starting at the committed CALL operand rather than the staging structure.
+fn transfer_value(fd: &Funcdata, id: VarnodeId) -> u64 {
+    let vn = fd.vbank().get(id).unwrap();
+    let value = if vn.is_constant() {
+        vn.get_offset()
+    } else {
+        let op = fd.obank().get(vn.get_def().unwrap()).unwrap();
+        let first = transfer_value(fd, op.get_in(0).unwrap());
+        match op.code() {
+            OpCode::CPUI_COPY => first,
+            OpCode::CPUI_SUBPIECE => first >> (8 * transfer_value(fd, op.get_in(1).unwrap())),
+            OpCode::CPUI_INT_ADD => first.wrapping_add(transfer_value(fd, op.get_in(1).unwrap())),
+            code => panic!("unexpected argument expression {code:?}"),
+        }
+    };
+    if vn.get_size() >= 8 { value } else { value & ((1u64 << (8 * vn.get_size())) - 1) }
+}
+
+#[test]
+fn locked_inputs_select_distinct_parts_of_one_trial_and_nonlow_join_piece() {
+    use kuna_base::space::VarnodeStorage;
+
+    for joined in [false, true] {
+        let (mut fd, mut fc, physical, _) = input_transfer_fixture(false, 8, 8);
+        let (low, high) = if joined {
+            // Register numbering deliberately opposes significance order.
+            let low = &physical + 0x40;
+            let high = &physical - 0x20;
+            let pieces = [high.clone(), low.clone()].map(|a| VarnodeStorage {
+                space: a.get_space().cloned(), offset: a.get_offset(), size: 4,
+            });
+            let join = fd.get_arch().manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+            fc.get_active_input().clear();
+            fc.get_active_input().register_trial(&join, 8);
+            (low, high)
+        } else {
+            (physical.clone(), &physical + 4)
+        };
+        let mut restricted = FuncProto::new();
+        restricted.copy(fc.proto());
+        set_transfer_parameter(&fd, &mut restricted, 0, &high, 4);
+        set_transfer_parameter(&fd, &mut restricted, 1, &low, 4);
+        let mut log = RestartLog::new();
+        fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+        assert!(!fd.has_restart_pending());
+        let call = fd.obank().get(fc.get_op()).unwrap();
+        assert_eq!(transfer_value(&fd, call.get_in(1).unwrap()), 0x12345678);
+        assert_eq!(transfer_value(&fd, call.get_in(2).unwrap()), 0x9abcdef0);
+        assert_eq!(fc.proto().get_param(0).unwrap().get_address(), high);
+        assert_eq!(fc.proto().get_param(1).unwrap().get_address(), low);
+    }
+}
+
+#[test]
+fn unavailable_locked_input_transfer_preserves_operands_and_persists_restart() {
+    for reason in ["narrower", "space", "straddle", "join_straddle", "stripped", "missing", "destination", "stack"] {
+        let operand_size = if reason == "narrower" { 4 } else { 8 };
+        let (mut fd, mut fc, physical, original) = input_transfer_fixture(false, 8, operand_size);
+        let call = fc.get_op();
+        let parameter = match reason {
+            "space" => addr(&fcs_ram(&fd), physical.get_offset()),
+            "straddle" => &physical + 7,
+            "join_straddle" => {
+                let pieces = [physical.clone(), &physical + 0x40].map(|a| kuna_base::space::VarnodeStorage {
+                    space: a.get_space().cloned(), offset: a.get_offset(), size: 4,
+                });
+                let join = fd.get_arch().manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+                fc.get_active_input().clear();
+                fc.get_active_input().register_trial(&join, 8);
+                &physical + 3
+            }
+            "stack" => addr(&fcs_stack(&fd), 0x28),
+            _ => physical,
+        };
+        if reason == "stripped" { fc.get_active_input().get_trial_mut(0).mark_no_use(); }
+        if reason == "missing" { fd.op_unset_input(call, 1); }
+        if reason == "destination" { fd.op_unset_input(call, 0); }
+        let old_destination = fd.obank().get(call).unwrap().get_in(0);
+        let old_argument = fd.obank().get(call).unwrap().get_in(1);
+        let mut restricted = FuncProto::new();
+        restricted.copy(fc.proto());
+        set_transfer_parameter(&fd, &mut restricted, 0, &parameter, 2);
+        let mut log = RestartLog::new();
+        fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+        assert!(fd.has_restart_pending(), "{reason}");
+        assert_eq!(fd.obank().get(call).unwrap().get_in(0), old_destination);
+        assert_eq!(fd.obank().get(call).unwrap().get_in(1), old_argument);
+        assert_eq!(fd.vbank().get(original).unwrap().get_size(), operand_size);
+        assert_eq!(fc.proto().num_params(), 0, "failed staging must not partially replace the prototype");
+        let site = fd.obank().get(call).unwrap().get_addr();
+        let pinned = fd.get_override().find_proto_override(site).unwrap();
+        assert!(pinned.is_input_locked());
+        assert_eq!(pinned.get_param(0).unwrap().get_address(), parameter);
+        assert_eq!(pinned.get_param(0).unwrap().get_size(), 2);
+    }
+}
+
+#[test]
+fn locked_stack_input_fallback_loads_requested_storage() {
+    let (mut fd, mut fc, _, _) = input_transfer_fixture(false, 8, 8);
+    let call = fc.get_op();
+    fc.get_active_input().clear();
+    let placeholder = fcs_new_op(&mut fd, 2, 0x100c, OpCode::CPUI_LOAD);
+    let ram = fcs_ram(&fd);
+    let space = fd.new_varnode_space(&ram);
+    let stack_pointer = fd.new_constant(8, 0x1000);
+    fd.op_set_input(placeholder, space, 0).unwrap();
+    fd.op_set_input(placeholder, stack_pointer, 1).unwrap();
+    let temporary = fd.new_unique_out(8, placeholder).unwrap();
+    fd.vbank_mut().get_mut(temporary).unwrap().set_spacebase_placeholder();
+    fd.op_insert_before(placeholder, call);
+    fd.op_set_input(call, temporary, 1).unwrap();
+    fc.set_stack_placeholder_slot(1);
+    let stack = fcs_stack(&fd);
+    let parameter = addr(&stack, 0x28);
+    let mut restricted = FuncProto::new();
+    restricted.copy(fc.proto());
+    set_transfer_parameter(&fd, &mut restricted, 0, &parameter, 4);
+    let mut log = RestartLog::new();
+    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+    assert!(!fd.has_restart_pending());
+    let argument = fd.obank().get(call).unwrap().get_in(1).unwrap();
+    let vn = fd.vbank().get(argument).unwrap();
+    assert_eq!(vn.get_size(), 4);
+    let load = fd.obank().get(vn.get_def().unwrap()).unwrap();
+    assert_eq!(load.code(), OpCode::CPUI_LOAD);
+    assert_eq!(transfer_value(&fd, load.get_in(1).unwrap()), 0x1028);
+    assert_eq!(fc.proto().get_param(0).unwrap().get_address(), parameter);
+}
+
+#[test]
+fn narrowing_joined_call_output_restarts_without_invalid_extensions() {
+    use kuna_base::space::{JoinSpace, VarnodeStorage};
+
+    let mut manager = fcs_manager();
+    manager.insert_space(Rc::new(JoinSpace::new(5, false))).unwrap();
+    let mut arch = ArchContext::new(manager);
+    arch.types = Some(Rc::new(type_factory()));
+    let ram = arch.manage().get_space_by_name("ram").unwrap().clone();
+    let join = arch.manage().find_add_join(&[
+        VarnodeStorage { space: Some(ram.clone()), offset: 0x20, size: 8 },
+        VarnodeStorage { space: Some(ram.clone()), offset: 0x10, size: 8 },
+    ], 0).unwrap().get_unified().get_addr();
+    let mut fd = Funcdata::new(
+        "caller", "caller", Rc::new(arch), addr(&ram, 0x1000), 0x10000000, 0x40,
+    ).unwrap();
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALLIND);
+    let target = fcs_const_vn(&mut fd, 0x2000, 8);
+    fd.op_set_input(call, target, 0).unwrap();
+    let old_input = fd.new_unique(8, None);
+    fd.op_set_input(call, old_input, 1).unwrap();
+    let old_output = fcs_out(&mut fd, call, join.get_space().unwrap().clone(), join.get_offset(), 16);
+    let mut restricted = proto_with_std_model(fd.get_arch().manage(), fd.get_arch().types().unwrap());
+    restricted.set_output(&ParameterPieces {
+        addr: addr(&ram, 0x10),
+        type_: Some(fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_INT).unwrap()),
+        flags: 0,
+    });
+    restricted.set_output_lock(true);
+    let mut fc = FuncCallSpecs::new(call, Address::new_invalid());
+    fc.proto_mut().copy(&restricted);
+    fc.proto_mut().set_output_lock(false);
+    fc.get_active_input().register_trial(&addr(&ram, 0x38), 8);
+    set_transfer_parameter(&fd, &mut restricted, 0, &addr(&ram, 0x3c), 4);
+    restricted.set_input_lock(true);
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    assert!(!fc.late_restriction(&fd, &restricted, &mut inputs, &mut outputs).unwrap());
+    assert_eq!(outputs, vec![old_output]);
+    let mut log = RestartLog::new();
+    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+
+    assert!(fd.has_restart_pending());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(old_input));
+    assert_eq!(fd.vbank().get(old_input).unwrap().get_size(), 8);
+    assert_eq!(fd.obank().get(call).unwrap().get_out(), Some(old_output));
+    assert_eq!(fd.vbank().get(old_output).unwrap().get_size(), 16);
+    assert_eq!(fd.vbank().get(old_output).unwrap().get_addr(), &join);
+    let site = fd.obank().get(call).unwrap().get_addr();
+    let pinned = fd.get_override().find_proto_override(site).unwrap();
+    assert!(pinned.is_output_locked());
+    assert_eq!(pinned.get_output().get_address(), addr(&ram, 0x10));
+    assert_eq!(pinned.get_output().get_size(), 8);
 }
 
 #[test]
@@ -1852,13 +2235,28 @@ fn func_call_specs_deindirect_restart_when_incompatible() {
 fn func_call_specs_deindirect_override_short_circuits() {
     let mgr = fcs_manager();
     let mut fd = fcs_fd();
+    let tf = fd.get_arch().types_rc().unwrap();
     let ram = fcs_ram(&fd);
     let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
     let mut fc = FuncCallSpecs::new(call, Address::default());
 
     let mut m_a = ProtoModel::new(&mgr);
     m_a.build_param_list("standard").unwrap();
-    fc.proto_mut().set_model(Some(Rc::new(m_a)));
+    m_a.set_name("site_model");
+    fc.proto_mut().set_internal(
+        Rc::new(m_a), tf.get_type_void().unwrap(),
+    );
+    fc.proto_mut().set_param(0, "site_argument", &ParameterPieces {
+        addr: Address::new(Rc::clone(&ram), 0x90),
+        type_: Some(int4_type(tf.as_ref())),
+        flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+    });
+    fc.proto_mut().set_output(&ParameterPieces {
+        addr: Address::new(Rc::clone(&ram), 0x10),
+        type_: Some(int4_type(tf.as_ref())),
+        flags: parameter_pieces_flags::TYPELOCK,
+    });
+    fc.proto_mut().set_custom_storage(true);
     // Mark the call-site as overridden: deindirect must bail before any restart.
     fc.proto_mut().set_override(true);
 
@@ -1874,6 +2272,68 @@ fn func_call_specs_deindirect_override_short_circuits() {
 
     assert!(!fd.has_restart_pending());
     assert!(log.is_empty_for(&fd));
+    assert_eq!(fc.proto().get_model_name(), "site_model");
+    assert!(fc.proto().has_custom_storage());
+    assert!(fc.proto().is_override());
+    assert_eq!(fc.proto().num_params(), 1);
+    let param = fc.proto().get_param(0).unwrap();
+    assert_eq!(param.get_name(), "site_argument");
+    assert_eq!(param.get_address().get_offset(), 0x90);
+    assert_eq!(param.get_size(), 4);
+    assert!(param.is_type_locked() && param.is_name_locked());
+    assert_eq!(fc.proto().get_output().get_address().get_offset(), 0x10);
+    assert_eq!(fc.proto().get_output().get_size(), 4);
+    assert_eq!(fd.obank().get(call).unwrap().code(), OpCode::CPUI_CALL);
+}
+
+#[test]
+fn deindirect_override_requests_machine_reflow_only_with_load_image() {
+    use kuna_base::marshal::IdRegistry;
+    use kuna_base::xml::xml_tree;
+    use kuna_sleigh::loadimage_xml::{LoadImageXml, register_loadimage_xml_ids};
+
+    for with_image in [false, true] {
+        let mut arch = ArchContext::new(fcs_manager());
+        arch.types = Some(Rc::new(type_factory()));
+        if with_image {
+            let doc = xml_tree(br#"<binaryimage arch="x86:LE:64:default"><bytechunk space="ram" offset="0x2000">4889f8c3</bytechunk></binaryimage>"#).unwrap();
+            let mut image = LoadImageXml::new("callee", Rc::clone(doc.get_root())).unwrap();
+            let mut registry = IdRegistry::with_base_ids();
+            register_loadimage_xml_ids(&mut registry);
+            image.open(arch.manage(), &registry).unwrap();
+            arch.loader = Some(Rc::new(std::cell::RefCell::new(Box::new(image))));
+        }
+        let ram = arch.manage().get_space_by_name("ram").unwrap().clone();
+        let mut fd = Funcdata::new("caller", "caller", Rc::new(arch),
+            addr(&ram, 0x1000), 0x10000000, 0x40).unwrap();
+        let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALLIND);
+        let target = fcs_const_vn(&mut fd, 0x2000, 8);
+        let argument = fcs_const_vn(&mut fd, 0x123456789abcdef0, 8);
+        fd.op_set_input(call, target, 0).unwrap();
+        fd.op_set_input(call, argument, 1).unwrap();
+        let mut fc = fcs_with_std_model(fd.get_arch().manage(), call, &fd);
+        set_transfer_parameter(&fd, fc.proto_mut(), 0, &addr(&ram, 0x90), 1);
+        fc.proto_mut().set_custom_storage(true);
+        fc.proto_mut().set_override(true);
+        let mut discovered = FuncProto::new();
+        discovered.copy(fc.proto());
+        discovered.set_override(false);
+        let entry = addr(&ram, 0x2000);
+        let mut log = RestartLog::new();
+        fc.deindirect(&mut fd, entry.clone(), "callee", &discovered, false, false, &mut log).unwrap();
+
+        assert_eq!(fd.has_restart_pending(), with_image);
+        assert_eq!(!log.is_empty_for(&fd), with_image);
+        let operation = fd.obank().get(call).unwrap();
+        assert_eq!(operation.code(), OpCode::CPUI_CALL);
+        assert_eq!(operation.get_in(1), Some(argument));
+        assert_eq!(fd.vbank().get(argument).unwrap().get_size(), 8);
+        assert_eq!(fd.get_override().find_indirect_override(operation.get_addr()), Some(&entry));
+        assert!(fc.proto().is_override());
+        assert!(fc.proto().has_custom_storage());
+        assert_eq!(fc.proto().get_param(0).unwrap().get_size(), 1);
+        assert_eq!(fc.proto().get_param(0).unwrap().get_address(), addr(&ram, 0x90));
+    }
 }
 
 #[test]
@@ -1881,13 +2341,13 @@ fn func_call_specs_force_set_restart_and_locks() {
     let mgr = fcs_manager();
     let mut fd = fcs_fd();
     let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
-    let mut fc = fcs_with_std_model(&mgr, call);
+    let mut fc = fcs_with_std_model(&mgr, call, &fd);
 
     // Incompatible restrictive prototype (different model name) => lateRestriction
     // fails => restart.
     let mut m_b = ProtoModel::new(&mgr);
     m_b.build_param_list("register").unwrap();
-    let voidt = Rc::new(Datatype::new(1, type_metatype::TYPE_VOID));
+    let voidt = fd.get_arch().types().unwrap().get_type_void().unwrap();
     let mut fp = FuncProto::new();
     fp.set_internal(Rc::new(m_b), voidt);
     fp.set_input_errors(true);
@@ -1925,10 +2385,11 @@ fn build_call_with_placeholder(mgr: &AddrSpaceManager) -> (Funcdata, FuncCallSpe
     // relative value).
     let load = fcs_new_op(&mut fd, 1, 0x1008, OpCode::CPUI_LOAD);
     // refvn: a free varnode in the stack space at offset 0x10.
+    let tp = fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_UNKNOWN).unwrap();
     let refvn = fd.vbank_mut().create(
         8,
         Address::new(Rc::clone(&stk), 0x10),
-        Rc::new(Datatype::new(8, type_metatype::TYPE_UNKNOWN)),
+        tp,
     );
     fd.op_set_input(load, refvn, 0).unwrap();
     // phvn: the LOAD output (written), placed in unique space, marked placeholder.
@@ -1939,7 +2400,7 @@ fn build_call_with_placeholder(mgr: &AddrSpaceManager) -> (Funcdata, FuncCallSpe
     // Wire phvn as the CALLIND placeholder input at slot 1.
     fd.op_set_input(call, phvn, 1).unwrap();
 
-    let mut fc = fcs_with_std_model(mgr, call);
+    let mut fc = fcs_with_std_model(mgr, call, &fd);
     fc.set_paramshift(0);
     (fd, fc, phvn)
 }
@@ -2024,21 +2485,56 @@ fn func_call_specs_transfer_locked_output_void_ok() {
     let mut model = ProtoModel::new(&mgr);
     model.build_param_list("standard").unwrap();
     let model = Rc::new(model);
-    let voidt = Rc::new(Datatype::new(1, type_metatype::TYPE_VOID));
+    let voidt = fd.get_arch().types().unwrap().get_type_void().unwrap();
 
     // fc and restricted share the same model => isCompatible true.
-    fc.proto_mut().set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fc.proto_mut().set_internal(Rc::clone(&model), voidt.clone());
 
     let mut restricted = FuncProto::new();
-    restricted.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    restricted.set_internal(Rc::clone(&model), voidt);
     restricted.set_output_lock(true); // output is void by default => transfer Ok(true)
 
-    let mut ni: Vec<Option<VarnodeId>> = Vec::new();
+    let mut ni = Vec::new();
     let mut no: Vec<VarnodeId> = Vec::new();
     // Not input-locked, output-locked-void => lateRestriction succeeds.
     let ok = fc.late_restriction(&fd, &restricted, &mut ni, &mut no).unwrap();
     assert!(ok);
     assert!(no.is_empty());
+}
+
+#[test]
+fn joined_output_storage_preserves_piece_significance_and_byte_justification() {
+    use kuna_base::space::{JoinSpace, VarnodeStorage};
+
+    for big_endian_join in [false, true] {
+        let mut mgr = AddrSpaceManager::new();
+        let low = reg_space_le();
+        let high = reg_space_be();
+        mgr.insert_space(low.clone()).unwrap();
+        mgr.insert_space(high.clone()).unwrap();
+        mgr.insert_space(Rc::new(JoinSpace::new(6, big_endian_join))).unwrap();
+        let join = mgr.find_add_join(&[
+            VarnodeStorage { space: Some(high.clone()), offset: 0x20, size: 8 },
+            VarnodeStorage { space: Some(low.clone()), offset: 0x10, size: 8 },
+        ], 0).unwrap();
+        let whole = join.get_unified().get_addr();
+
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&low, 0x10), 8).unwrap(), 0);
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&high, 0x20), 8).unwrap(), 8);
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&low, 0x14), 4).unwrap(), 4);
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&high, 0x24), 4).unwrap(), 8);
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&high, 0x20), 4).unwrap(), 12);
+        assert_eq!(storage_justified_contain(&whole, 16, &addr(&low, 0x18), 4).unwrap(), -1);
+
+        let low_half = &whole + if big_endian_join { 8i64 } else { 0i64 };
+        assert_eq!(storage_justified_contain(&low_half, 8, &addr(&low, 0x10), 8).unwrap(), 0);
+        assert_eq!(storage_justified_contain(&low_half, 8, &addr(&high, 0x20), 8).unwrap(), -1);
+        let high_half = &whole + if big_endian_join { 0i64 } else { 8i64 };
+        assert_eq!(storage_justified_contain(&high_half, 8, &addr(&high, 0x20), 8).unwrap(), 0);
+        assert_eq!(storage_justified_contain(&high_half, 8, &addr(&high, 0x24), 4).unwrap(), 0);
+        assert_eq!(storage_justified_contain(&high_half, 8, &addr(&high, 0x20), 4).unwrap(), 4);
+        assert_eq!(storage_justified_contain(&high_half, 8, &addr(&low, 0x10), 8).unwrap(), -1);
+    }
 }
 
 // =========================================================================
@@ -2053,8 +2549,8 @@ fn func_call_specs_transfer_locked_output_void_ok() {
 /// A 10-byte float (x87 long double / `float10`), aligned to 8 (the gcc
 /// alignment map gives `getAlignment(10)==8`; `getAlignSize` then rounds the
 /// 10-byte size up to the 16-byte 2-slot footprint).
-fn float10_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(10, 8, type_metatype::TYPE_FLOAT))
+fn float10_type(tf: &TypeFactoryImpl) -> TypeRoot {
+    tf.intern(Datatype::new_with_align(10, 8, type_metatype::TYPE_FLOAT)).unwrap()
 }
 
 /// A model with one 8-byte general register (group 0) and an 8-byte-aligned,
@@ -2108,11 +2604,11 @@ fn modelrule_gotostack_routes_oversized_float_to_aligned_stack_footprint() {
     // longdouble `passmany` stack layout: `x`(float10)@0x0..0x10, next@0x10.
     let mgr = AddrSpaceManager::new();
     let (model, _reg, stk) = reg_plus_stack_gotostack_model(&mgr);
-    let tf = PanicTypeFactory; // goto_stack never touches the TypeFactory
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![float10_type(), int4_type()],
+        intypes: vec![float10_type(&tf), int4_type(&tf)],
         innames: vec!["x".into(), "z".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -2142,11 +2638,11 @@ fn modelrule_precedes_metatype_fallback() {
     // fallback, fspec.cc:783-792).
     let mgr = AddrSpaceManager::new();
     let (model, reg, stk) = reg_plus_stack_gotostack_model(&mgr);
-    let tf = PanicTypeFactory;
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![int4_type()],
+        intypes: vec![int4_type(&tf)],
         innames: vec!["a".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -2185,11 +2681,11 @@ fn no_modelrule_falls_through_to_metatype_fallback() {
     model.push_entry(e0);
     model.finish_decode();
     assert_eq!(model.num_model_rules(), 0);
-    let tf = PanicTypeFactory;
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![int4_type()],
+        intypes: vec![int4_type(&tf)],
         innames: vec!["a".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -2200,20 +2696,6 @@ fn no_modelrule_falls_through_to_metatype_fallback() {
     assert_eq!(res.len(), 1);
     assert!(Rc::ptr_eq(res[0].addr.get_space().unwrap(), &reg));
     assert_eq!(res[0].addr.get_offset(), 0x10);
-}
-
-#[test]
-fn push_pointermax_rule_appends_convert_to_pointer() {
-    // The synthetic `pointermax` rule (C++ fspec.cc:1507-1512): a
-    // SizeRestrictedFilter(pointermax+1, 0) feeding a ConvertToPointer action,
-    // appended to model_rules.  Verifies the count bump (the action's pointer
-    // build is exercised by the modelrules ConvertToPointer tests, which need a
-    // real TypeFactory).
-    let mgr = AddrSpaceManager::new();
-    let (mut model, _reg) = three_reg_model();
-    assert_eq!(model.num_model_rules(), 0);
-    model.push_pointermax_rule(8);
-    assert_eq!(model.num_model_rules(), 1);
 }
 
 // =========================================================================
@@ -2265,11 +2747,11 @@ fn w10_float_typeclass_failing_rule_does_not_short_circuit_chain() {
     };
     model.push_model_rule(crate::modelrules::ModelRule::from_components(ok_filter, ok_action));
     assert_eq!(model.num_model_rules(), 2);
-    let tf = PanicTypeFactory;
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![int4_type()],
+        intypes: vec![int4_type(&tf)],
         innames: vec!["a".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -2303,11 +2785,11 @@ fn w10_float_typeclass_pointermax_rule_appends_after_existing_rules() {
     // the pointermax rule, so it wins -> the float10 lands on the stack at its
     // full 10-byte size, NOT converted to a pointer (which would shrink it to
     // the pointer width).
-    let tf = PanicTypeFactory;
+    let tf = type_factory();
     let proto = PrototypePieces {
         name: "f".to_string(),
         outtype: None,
-        intypes: vec![float10_type()],
+        intypes: vec![float10_type(&tf)],
         innames: vec!["x".into()],
         first_var_arg_slot: -1,
         output_storage: None,

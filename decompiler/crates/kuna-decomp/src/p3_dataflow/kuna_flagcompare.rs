@@ -30,7 +30,7 @@ use kuna_base::address::calc_mask;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -64,11 +64,8 @@ impl Rule for RuleBoolSignLess {
         vec![OpCode::CPUI_INT_SLESS]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleBoolSignLess { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBoolSignLess { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleBoolSignLess::applyOp` (`kuna_flagcompare.cc:23`) — transcribed.
@@ -171,11 +168,8 @@ impl Rule for RuleSborrowGe {
         vec![OpCode::CPUI_BOOL_AND, OpCode::CPUI_BOOL_OR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSborrowGe { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSborrowGe { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleSborrowGe::applyOp` (`kuna_flagcompare.cc:242`) — transcribed.
@@ -221,12 +215,14 @@ pub fn specs() -> Vec<RuleSpec> {
     vec![
         RuleSpec {
             group: "analysis",
+            aliases: &[],
             // Shipped default: `option flagcompare on` (fold_flag_compare = true;
             // kuna DIV-3 default-on, GH-1276/8777).
             ctor: || Box::new(RuleBoolSignLess::with_group(true, "analysis")),
         },
         RuleSpec {
             group: "analysis",
+            aliases: &[],
             ctor: || Box::new(RuleSborrowGe::with_group(true, "analysis")),
         },
     ]

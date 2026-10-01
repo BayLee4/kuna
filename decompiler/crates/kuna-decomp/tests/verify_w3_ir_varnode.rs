@@ -26,12 +26,12 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::context::{OpId, VarnodeId};
 use kuna_decomp::varnode::{varnode_flags, DefOpInfo, VarnodeBank};
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(types: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    types.intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 /// const(0), unique(1), ram(2, 8-byte), small(3, 1-byte so highest == 0xFF).
@@ -96,12 +96,13 @@ fn def_info(idc: &mut u32, pc: Address, uniq: u32) -> DefOpInfo {
 #[test]
 fn def_tree_is_seqnum_dominated_not_address() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut bank = VarnodeBank::new(&m, 0).unwrap();
     let hi_addr = Address::new(space(&m, 2), 0x2000);
     let lo_addr = Address::new(space(&m, 2), 0x1000);
 
-    let fa = bank.create(4, hi_addr.clone(), dt(4));
-    let fb = bank.create(4, lo_addr.clone(), dt(4));
+    let fa = bank.create(4, hi_addr.clone(), dt(&types, 4));
+    let fb = bank.create(4, lo_addr.clone(), dt(&types, 4));
     let mut idc = 0u32;
     // A: higher address, earlier seqnum (uniq 1)
     let a = bank
@@ -129,17 +130,18 @@ fn def_tree_is_seqnum_dominated_not_address() {
 #[test]
 fn flag_class_wrap_free_sorts_last() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut bank = VarnodeBank::new(&m, 0).unwrap();
     let addr = Address::new(space(&m, 2), 0x3000);
 
     // create the free first, then written, then input — scrambled vs final order
-    let free = bank.create(4, addr.clone(), dt(4));
-    let wf = bank.create(4, addr.clone(), dt(4));
+    let free = bank.create(4, addr.clone(), dt(&types, 4));
+    let wf = bank.create(4, addr.clone(), dt(&types, 4));
     let mut idc = 0u32;
     let written = bank
         .set_def(wf, def_info(&mut idc, Address::new(space(&m, 2), 0x10), 2), &mut no_replace())
         .unwrap();
-    let inf = bank.create(4, addr.clone(), dt(4));
+    let inf = bank.create(4, addr.clone(), dt(&types, 4));
     let input = bank.set_input(inf, &mut no_replace()).unwrap();
 
     let order: Vec<VarnodeId> = bank.iter_loc().collect();
@@ -154,17 +156,18 @@ fn flag_class_wrap_free_sorts_last() {
 #[test]
 fn find_covered_input_address_wrap_branch() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut bank = VarnodeBank::new(&m, 0).unwrap();
     let small = space(&m, 3);
     assert_eq!(small.get_highest(), 0xFF, "1-byte space tops out at 0xFF");
 
     // input occupying the very last byte 0xFF
     let top_addr = Address::new(Rc::clone(&small), 0xFF);
-    let top_free = bank.create(1, top_addr.clone(), dt(1));
+    let top_free = bank.create(1, top_addr.clone(), dt(&types, 1));
     let top = bank.set_input(top_free, &mut no_replace()).unwrap();
     // a second, lower input so the def tree has a real predecessor to bound on
     let lo_addr = Address::new(Rc::clone(&small), 0x10);
-    let lo_free = bank.create(1, lo_addr.clone(), dt(1));
+    let lo_free = bank.create(1, lo_addr.clone(), dt(&types, 1));
     let _lo = bank.set_input(lo_free, &mut no_replace()).unwrap();
 
     // size-1 query at 0xFF: end = 0xFF + 1 - 1 = 0xFF == highest -> wrap branch
@@ -182,10 +185,11 @@ fn find_covered_input_address_wrap_branch() {
 #[test]
 fn create_unique_accumulates_and_clear_resets() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let base: u32 = 0x4000;
     let mut bank = VarnodeBank::new(&m, base).unwrap();
-    let u0 = bank.create_unique(8, dt(8));
-    let u1 = bank.create_unique(4, dt(4));
+    let u0 = bank.create_unique(8, dt(&types, 8));
+    let u1 = bank.create_unique(4, dt(&types, 4));
     assert_eq!(bank.get(u0).unwrap().get_offset(), base as u64);
     assert_eq!(bank.get(u1).unwrap().get_offset(), base as u64 + 8);
     assert_eq!(bank.get(u1).unwrap().get_create_index(), 1);
@@ -193,7 +197,7 @@ fn create_unique_accumulates_and_clear_resets() {
     bank.clear();
     assert_eq!(bank.num_varnodes(), 0);
     assert_eq!(bank.get_create_index(), 0, "create_index resets on clear");
-    let u2 = bank.create_unique(2, dt(2));
+    let u2 = bank.create_unique(2, dt(&types, 2));
     assert_eq!(bank.get(u2).unwrap().get_offset(), base as u64, "uniqid resets to base on clear");
     assert_eq!(bank.get(u2).unwrap().get_create_index(), 0);
 }
@@ -204,12 +208,13 @@ fn create_unique_accumulates_and_clear_resets() {
 #[test]
 fn xref_writtens_distinct_by_seqnum_but_equal_inputs_unify() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut bank = VarnodeBank::new(&m, 0).unwrap();
     let addr = Address::new(space(&m, 2), 0x5000);
 
     // two writtens, same (addr,size), DIFFERENT seqnum -> both survive
-    let f1 = bank.create(4, addr.clone(), dt(4));
-    let f2 = bank.create(4, addr.clone(), dt(4));
+    let f1 = bank.create(4, addr.clone(), dt(&types, 4));
+    let f2 = bank.create(4, addr.clone(), dt(&types, 4));
     let mut idc = 0u32;
     let w1 = bank
         .set_def(f1, def_info(&mut idc, Address::new(space(&m, 2), 0x10), 1), &mut no_replace())
@@ -222,9 +227,9 @@ fn xref_writtens_distinct_by_seqnum_but_equal_inputs_unify() {
 
     // two inputs, same (addr,size) -> the second unifies onto the first and the
     // replace callback fires once with (old=second, new=first).
-    let g1 = bank.create(2, Address::new(space(&m, 2), 0x6000), dt(2));
+    let g1 = bank.create(2, Address::new(space(&m, 2), 0x6000), dt(&types, 2));
     let i1 = bank.set_input(g1, &mut no_replace()).unwrap();
-    let g2 = bank.create(2, Address::new(space(&m, 2), 0x6000), dt(2));
+    let g2 = bank.create(2, Address::new(space(&m, 2), 0x6000), dt(&types, 2));
     let mut seen: Vec<(VarnodeId, VarnodeId)> = Vec::new();
     let mut rec = |_: &mut VarnodeBank, old: VarnodeId, new: VarnodeId| -> kuna_base::error::KunaResult<()> {
         seen.push((old, new));
@@ -244,8 +249,9 @@ fn xref_writtens_distinct_by_seqnum_but_equal_inputs_unify() {
 #[test]
 fn descend_push_back_and_boundary_erase() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut bank = VarnodeBank::new(&m, 0).unwrap();
-    let free = bank.create(4, Address::new(space(&m, 2), 0x7000), dt(4));
+    let free = bank.create(4, Address::new(space(&m, 2), 0x7000), dt(&types, 4));
     let mut idc = 0u32;
     let v = bank
         .set_def(free, def_info(&mut idc, Address::new(space(&m, 2), 0x10), 1), &mut no_replace())

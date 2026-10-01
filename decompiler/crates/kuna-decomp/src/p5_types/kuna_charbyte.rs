@@ -27,8 +27,8 @@
 //! `char` (through pointers and arrays), and otherwise puts the first one's
 //! types back.  Everything kept is a propagation upstream itself could
 //! produce: a character constant compared
-//! with the byte takes `char` from it (`v1 == '-'`, and `v1 == '\xe9'` rather
-//! than a `char` compared with `0xe9`), the pointer keeps `char *`, and a
+//! with the byte takes `char` from it (`v1 == '-'`, and the signed value -23
+//! rather than a `char` compared with `0xe9`), the pointer keeps `char *`, and a
 //! `uint1` that reaches the byte from anywhere else still wins it.
 //!
 //! "Only because of the zero-extension" is checked on the readers: an
@@ -66,7 +66,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
@@ -78,12 +78,12 @@ thread_local! {
 }
 
 /// Is `t` the one-byte ASCII `char` core type?
-pub fn is_char(t: &Datatype) -> bool {
+pub fn is_char(t: &TypeRoot) -> bool {
     t.get_size() == 1 && t.get_metatype() == type_metatype::TYPE_INT && t.is_ascii()
 }
 
 /// Is `t` the plain one-byte unsigned integer (`uint1`)?
-pub fn is_uint1(t: &Datatype) -> bool {
+pub fn is_uint1(t: &TypeRoot) -> bool {
     t.get_size() == 1
         && t.get_metatype() == type_metatype::TYPE_UINT
         && !t.is_char_print()
@@ -281,7 +281,7 @@ pub fn take_noted() -> Option<Vec<VarnodeId>> {
     Some(bytes)
 }
 
-fn points_to(t: &Datatype, pred: fn(&Datatype) -> bool) -> bool {
+fn points_to(t: &TypeRoot, pred: fn(&TypeRoot) -> bool) -> bool {
     t.get_metatype() == type_metatype::TYPE_PTR && t.get_ptr_to().map(|p| pred(&p)).unwrap_or(false)
 }
 
@@ -299,8 +299,8 @@ pub fn note_edge(
     outslot: int4,
     invn: VarnodeId,
     outvn: VarnodeId,
-    newtype: &Rc<Datatype>,
-    cur: &Rc<Datatype>,
+    newtype: &TypeRoot,
+    cur: &TypeRoot,
 ) {
     let byte = if inslot == 1 && outslot == -1 {
         if !is_char(newtype) || !is_uint1(cur) {
@@ -351,13 +351,14 @@ pub fn seed_char(data: &mut Funcdata, bytes: &[VarnodeId]) {
             }
             _ => continue,
         };
+        let usepoint = data.vn_use_point(vn);
         let locked = data
             .get_scope_local()
-            .and_then(|lm| lm.build_localtype_seed(&addr, size, tlst))
+            .and_then(|lm| lm.build_localtype_seed(&addr, size, &usepoint, tlst))
             .is_some();
         if !locked {
             if let Some(v) = data.vbank_mut().get_mut(vn) {
-                v.set_temp_type(Rc::clone(&c));
+                v.set_temp_type(c.clone());
             }
         }
     }
@@ -365,20 +366,20 @@ pub fn seed_char(data: &mut Funcdata, bytes: &[VarnodeId]) {
 
 /// Every Varnode's temporary type after the first propagation, so a second
 /// one that strays beyond `uint1` -> `char` can be undone.
-pub type Snapshot = Vec<(VarnodeId, Rc<Datatype>)>;
+pub type Snapshot = Vec<(VarnodeId, TypeRoot)>;
 
 /// Record every Varnode's temporary type.
 pub fn snapshot(data: &Funcdata) -> Snapshot {
     data.vbank()
         .iter_loc()
-        .filter_map(|vn| data.vbank().get(vn).and_then(|v| v.get_temp_type()).map(|t| (vn, Rc::clone(t))))
+        .filter_map(|vn| data.vbank().get(vn).and_then(|v| v.get_temp_type()).map(|t| (vn, t.clone())))
         .collect()
 }
 
 /// Is `now` the type `up` with `uint1` read as `char`, through any depth of
 /// pointers and arrays?
-pub fn same_but_char(up: &Datatype, now: &Datatype) -> bool {
-    if std::ptr::eq(up, now) || (up.get_metatype() == now.get_metatype() && up.type_order(now).ok() == Some(0)) {
+pub fn same_but_char(up: &TypeRoot, now: &TypeRoot) -> bool {
+    if up == now || (up.get_metatype() == now.get_metatype() && up.type_order(now).ok() == Some(0)) {
         return true;
     }
     if is_uint1(up) && is_char(now) {

@@ -834,7 +834,7 @@ impl Action for ActionConstantPtr {
 fn search_for_space_attribute(data: &Funcdata, mut vn: VarnodeId, mut op: OpId) -> Option<Rc<AddrSpace>> {
     for _ in 0..3 {
         // If the Varnode is explicitly a pointer carrying a space attribute, use it.
-        let dt = Rc::clone(data.vbank().get(vn)?.get_type());
+        let dt = data.vbank().get(vn)?.get_type().clone();
         if dt.get_metatype() == type_metatype::TYPE_PTR {
             if let Some(spc) = dt.get_pointer_space() {
                 if spc.get_addr_size() as int4 == data.vbank().get(vn)?.get_size() {
@@ -911,7 +911,7 @@ fn space_from_const(data: &Funcdata, vn: VarnodeId) -> Rc<AddrSpace> {
 /// `searchForSpaceAttribute`.
 fn select_infer_space(data: &Funcdata, vn: VarnodeId, op: OpId) -> Option<Rc<AddrSpace>> {
     let vn_size = data.vbank().get(vn)?.get_size();
-    let dt = Rc::clone(data.vbank().get(vn)?.get_type());
+    let dt = data.vbank().get(vn)?.get_type().clone();
     if dt.get_metatype() == type_metatype::TYPE_PTR {
         if let Some(spc) = dt.get_pointer_space() {
             if spc.get_addr_size() as int4 == vn_size {
@@ -1156,7 +1156,7 @@ impl Action for ActionDeindirect {
         }
         Some(Box::new(ActionDeindirect { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
         // C++ coreaction.cc:1235 — ActionDeindirect::apply.  For each CALLIND whose
         // target Varnode resolves (through COPYs) to a known function — an external
         // reference or a constant code address — convert it to a direct CALL via
@@ -1165,7 +1165,19 @@ impl Action for ActionDeindirect {
         let ncalls = data.num_calls();
         for i in 0..ncalls {
             let op = data.get_call_specs(i).get_op();
-            if data.obank().get(op).map(|o| o.code()) != Some(OpCode::CPUI_CALLIND) {
+            let opcode = data.obank().get(op).map(|operation| operation.code());
+            if data.has_type_recovery_started()
+                && (opcode == Some(OpCode::CPUI_CALL)
+                    || opcode == Some(OpCode::CPUI_CALLIND) && data.generated_execution_contracts().contains_key(&op))
+            {
+                match crate::kuna_callabletransport::settle_execution_inputs(data, i) {
+                    Ok(true) => self.base.count += 1,
+                    Ok(false) => {}
+                    Err(error) => { ctx.fail(error); return -1; }
+                }
+                if opcode == Some(OpCode::CPUI_CALL) { continue; }
+            }
+            if opcode != Some(OpCode::CPUI_CALLIND) {
                 continue;
             }
             // Trace the call target back through COPYs.
@@ -1200,10 +1212,11 @@ impl Action for ActionDeindirect {
 
             // queryFunction/queryExternalRefFunction resolve a target address to the
             // global FunctionSymbol, returning its (name, entry, recovered proto).
-            let resolved: Option<(String, Address, std::rc::Rc<crate::fspec::FuncProto>)> =
+            let resolved =
                 if v.is_persist() && v.is_external_ref() {
                     // Check for a possible external reference.
-                    glb.query_function(v.get_addr())
+                    let usepoint = data.obank().get(op).unwrap().get_addr();
+                    glb.query_external_ref_function(v.get_addr(), v.get_size(), usepoint)
                 } else if v.is_constant() {
                     // Assume the function is in the same space as the calling function;
                     // convert the constant to a byte address in that space.
@@ -1222,8 +1235,15 @@ impl Action for ActionDeindirect {
                     let codeaddr = Address::new(sp, offset);
                     glb.query_function(&codeaddr)
                 } else {
-                    None
+                    Ok(None)
                 };
+            let resolved = match resolved {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    ctx.fail(error);
+                    return -1;
+                }
+            };
 
             if let Some((name, entry, proto)) = resolved {
                 // fc->deindirect(data, newfd): splice the call spec out so it can be
@@ -1231,21 +1251,89 @@ impl Action for ActionDeindirect {
                 // merge), then re-insert it at the same index to keep `qlst` ordering.
                 let no_return = proto.is_no_return();
                 let inline = proto.is_inline();
+                if let Err(error) = crate::kuna_callabletransport::prepare_direct(data, i, &entry, &proto) {
+                    ctx.fail(error);
+                    return -1;
+                }
                 let mut fc = data.replace_call_specs(i);
                 let mut restartlog = crate::kuna_restartlog::RestartLog::new();
                 let r =
                     fc.deindirect(data, entry, &name, &proto, no_return, inline, &mut restartlog);
                 data.restore_call_specs_at(i, fc);
-                r.expect("ActionDeindirect: deindirect failed");
+                if let Err(error) = r {
+                    ctx.fail(error);
+                    return -1;
+                }
                 count += 1;
                 continue;
             }
 
-            // C++ data.hasTypeRecoveryStarted() function-pointer prototype arm
-            // (coreaction.cc:1274-1293, fc->forceSet from an attached TypeCode
-            // prototype) is not exercised by the deindirect datatests and its
-            // commit path (`FuncCallSpecs::forceSet` -> commitNewInputs/Outputs) is
-            // still a W4 stub; left for a follow-up.  No change applied here.
+            if !data.has_type_recovery_started() {
+                continue;
+            }
+            let call = data.get_call_specs(i);
+            let callpoint = data.obank().get(op).unwrap().get_addr();
+            if call.proto().is_override()
+                || data.get_override().find_proto_override(callpoint).is_some()
+            {
+                // The source override remains authoritative. A reflow discards
+                // derived call-spec descriptors, so prove its execution family
+                // again without replacing the override from a propagated type.
+                let source = call.proto().source_prototype();
+                if let Err(error) = crate::kuna_callabletransport::prepare_indirect(data, i, &source) {
+                    ctx.fail(error);
+                    return -1;
+                }
+                continue;
+            }
+            // Read the call-facing declaration, not a reconstructed signature
+            // from current CALL operands. Alias-aware root traversal retains the
+            // nominal identities used by the shared materializer.
+            let target_type = v.get_type_read_facing(op);
+            let Some(code_type) = target_type.get_ptr_to() else {
+                continue;
+            };
+            if code_type.get_metatype() != type_metatype::TYPE_CODE {
+                continue;
+            }
+            let has_declaration = {
+                let view = code_type.read();
+                view.resolve_alias(code_type.id())
+                    .and_then(|id| view.get_code_prototype(id).map(|signature| signature.is_some()))
+            };
+            match has_declaration {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    ctx.fail(error);
+                    return -1;
+                }
+            }
+            let Some(types) = glb.types() else {
+                continue;
+            };
+            // Incomplete by-value layouts are not an ABI yet. No type guard is
+            // held while assignment interns effective pointer/slot types.
+            let abi = match crate::fspec::materialize_callable(types, &code_type) {
+                Ok(Some(abi)) => abi,
+                Ok(None) => continue,
+                Err(error) => {
+                    ctx.fail(error);
+                    return -1;
+                }
+            };
+            if let Err(error) = crate::kuna_callabletransport::prepare_indirect(data, i, abi.prototype()) {
+                ctx.fail(error);
+                return -1;
+            }
+            let mut fc = data.replace_call_specs(i);
+            let mut restartlog = crate::kuna_restartlog::RestartLog::new();
+            let result = fc.force_set(data, abi.prototype(), &mut restartlog);
+            data.restore_call_specs_at(i, fc);
+            if let Err(error) = result {
+                ctx.fail(error);
+                return -1;
+            }
         }
         let _ = count; // change is observed through the rewritten ops / restart flag
         0
@@ -2813,6 +2901,356 @@ impl Action for ActionDynamicSymbols {
     }
 }
 
+pub(crate) struct InternalConstantBody {
+    model: Rc<crate::fspec::ProtoModel>,
+    roles: Vec<InternalConstantRole>,
+}
+
+struct InternalConstantRole {
+    address: Address,
+    size: int4,
+    writes: Vec<InternalConstantWrite>,
+    inherited: Vec<InternalConstantWrite>,
+    terminals: Option<Vec<InternalConstantTerminal>>,
+}
+
+struct InternalConstantWrite {
+    op: OpId,
+    address: Address,
+    time: u32,
+}
+
+enum InternalConstantTerminal {
+    Read { site: InternalConstantWrite, space: Rc<AddrSpace>, size: int4 },
+    Store { site: InternalConstantWrite, space: Rc<AddrSpace>, size: int4 },
+    Spill { site: InternalConstantWrite, obligation: crate::p4_calls::kuna_physicalinputs::PrivateStoreObligation },
+}
+
+fn internal_overlap(a: &Address, asize: int4, b: &Address, bsize: int4) -> bool {
+    asize > 0 && bsize > 0
+        && a.get_space().zip(b.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+        && a.get_offset() < b.get_offset().saturating_add(bsize as u64)
+        && b.get_offset() < a.get_offset().saturating_add(asize as u64)
+}
+
+fn internal_source_disjoint(data: &Funcdata, address: &Address, size: int4) -> bool {
+    let proto = data.get_func_proto();
+    if !proto.has_store() { return false; }
+    let disjoint = |parameter: &dyn crate::fspec::ProtoParameter| {
+        let at = parameter.get_address();
+        if at.get_space().is_some_and(|space|
+            space.get_type() == kuna_base::space::spacetype::IPTR_JOIN)
+        {
+            let Ok(join) = data.get_arch().manage().find_join(at.get_offset()) else { return false; };
+            (0..join.num_pieces()).all(|index| {
+                let piece = join.get_piece(index);
+                piece.space.as_ref().is_some_and(|space|
+                    !internal_overlap(address, size, &Address::new(space.clone(), piece.offset), piece.size as int4))
+            })
+        } else {
+            !internal_overlap(address, size, &at, parameter.get_size())
+        }
+    };
+    (0..proto.num_params()).all(|slot| proto.source_param(slot).is_some_and(&disjoint)
+        && proto.get_param(slot).is_some_and(&disjoint))
+        && disjoint(proto.source_output()) && disjoint(proto.get_output())
+}
+
+impl InternalConstantBody {
+    pub(crate) fn seed(data: &Funcdata, safe_roles: &[(Address, int4)],
+        inherited_roles: &[crate::p4_calls::kuna_physicalinputs::InheritedInternalRole]) -> Option<Self>
+    {
+        let proto = data.get_func_proto();
+        if !proto.has_model() || data.entry_physical_requirements().is_none() { return None; }
+        let mut roles = Vec::new();
+        for storage in proto.internal_list() {
+            let Some(space) = storage.space.as_ref() else { continue; };
+            let address = Address::new(space.clone(), storage.offset);
+            let Ok(size) = int4::try_from(storage.size) else { continue; };
+            if size <= 0 || !safe_roles.iter().any(|(safe, bytes)| safe == &address && *bytes == size)
+                || !internal_source_disjoint(data, &address, size) { continue; }
+            let mut writes = Vec::new();
+            let mut exact = true;
+            for (_, op) in data.obank().iter_all() {
+                let operation = data.obank().get(op).expect("raw internal definition");
+                if operation.is_dead() { continue; }
+                let Some(output) = operation.get_out().and_then(|id| data.vbank().get(id)) else { continue; };
+                if !internal_overlap(&address, size, output.get_addr(), output.get_size()) { continue; }
+                if output.get_addr() != &address || output.get_size() != size { exact = false; break; }
+                writes.push(InternalConstantWrite { op, address: operation.get_addr().clone(), time: operation.get_time() });
+            }
+            let inherited = inherited_roles.iter().find(|role| role.address == address && role.size == size)
+                .map(|role| role.calls.iter().map(|&op| {
+                    let operation = data.obank().get(op).filter(|operation| !operation.is_dead()
+                        && operation.code() == OpCode::CPUI_CALL)?;
+                    Some(InternalConstantWrite { op, address: operation.get_addr().clone(), time: operation.get_time() })
+                }).collect::<Option<Vec<_>>>()).unwrap_or_else(|| Some(Vec::new()));
+            let Some(inherited) = inherited else { continue; };
+            if exact && (!writes.is_empty() || !inherited.is_empty()) {
+                roles.push(InternalConstantRole { address, size, writes, inherited, terminals: None });
+            }
+        }
+        (!roles.is_empty()).then(|| Self { model: proto.model().clone(), roles })
+    }
+
+    pub(crate) fn certify(&mut self, data: &Funcdata) -> kuna_base::error::KunaResult<()> {
+        if data.get_heritage_pass() != 1 || !data.get_func_proto().has_model()
+            || !Rc::ptr_eq(&self.model, data.get_func_proto().model())
+        {
+            self.roles.clear();
+            return Ok(());
+        }
+        for role in &mut self.roles {
+            if !internal_inherited_calls_match(data, role, false)? { role.terminals = None; continue; }
+            role.terminals = certify_internal_role(data, role);
+
+        }
+        Ok(())
+    }
+
+    pub(crate) fn final_coverage(&self, data: &Funcdata) -> kuna_base::error::KunaResult<Vec<(Address, int4)>> {
+        if !data.get_func_proto().has_model()
+            || !Rc::ptr_eq(&self.model, data.get_func_proto().model()) { return Ok(Vec::new()); }
+        let mut covered = Vec::new();
+        'role: for role in &self.roles {
+            let Some(terminals) = role.terminals.as_ref() else { continue; };
+            if !internal_source_disjoint(data, &role.address, role.size)
+                || !internal_inherited_calls_match(data, role, true)? { continue; }
+            for (_, op) in data.obank().iter_all() {
+                let operation = data.obank().get(op).expect("final internal use");
+                if operation.is_dead() { continue; }
+                for id in (0..operation.num_input()).filter_map(|slot| operation.get_in(slot))
+                    .chain(operation.get_out())
+                {
+                    let value = data.vbank().get(id).expect("final internal value");
+                    if !value.is_constant() && internal_overlap(&role.address, role.size, value.get_addr(), value.get_size()) {
+                        continue 'role;
+                    }
+                }
+            }
+            if !terminals.iter().all(|terminal| internal_terminal_materialized(data, terminal)) { continue; }
+            covered.push((role.address.clone(), role.size));
+        }
+        Ok(covered)
+    }
+}
+
+fn internal_memory_space(data: &Funcdata, op: OpId) -> Option<Rc<AddrSpace>> {
+    let operation = data.obank().get(op)?;
+    let space = data.vbank().get(operation.get_in(0)?)?;
+    if !space.is_constant() { return None; }
+    data.get_arch().manage().get_space(int4::try_from(space.get_offset()).ok()?).cloned()
+}
+
+fn internal_inherited_calls_match(data: &Funcdata, role: &InternalConstantRole,
+    final_ssa: bool) -> kuna_base::error::KunaResult<bool>
+{
+    for site in &role.inherited {
+        if data.obank().get(site.op).is_none_or(|operation| operation.is_dead()
+            || operation.code() != OpCode::CPUI_CALL || operation.get_addr() != &site.address
+            || operation.get_time() != site.time)
+            || !crate::p4_calls::kuna_callabletransport::internal_role_obligation_matches(
+                data, site.op, &role.address, role.size, final_ssa)? { return Ok(false); }
+    }
+    Ok(true)
+}
+
+fn internal_inherited_marker(data: &Funcdata, op: OpId, role: &InternalConstantRole) -> bool {
+    let Some(operation) = data.obank().get(op).filter(|operation| !operation.is_dead()
+        && operation.code() == OpCode::CPUI_INDIRECT && operation.num_input() == 2) else { return false; };
+    let Some(effect) = operation.get_in(1).and_then(|id| data.vbank().get(id)) else { return false; };
+    if effect.get_space().get_type() != kuna_base::space::spacetype::IPTR_IOP { return false; }
+    let call = crate::funcdata_varnode::op_iop_decode(effect.get_offset());
+    if !role.inherited.iter().any(|site| site.op == call) { return false; }
+    operation.get_out().and_then(|id| data.vbank().get(id)).is_some_and(|output|
+        output.get_addr() == &role.address && output.get_size() == role.size && !output.is_volatile())
+}
+
+// Only unused implicit-effect bookkeeping may stand for an inherited role.
+// Any actual read/address/arithmetic or different-width marker refuses. The
+// all-original raw guard separately prevents hidden dirty observations even if
+// later SSA/dead-code would make their values disappear.
+fn internal_inherited_bookkeeping(data: &Funcdata, original: VarnodeId, role: &InternalConstantRole) -> bool {
+    if role.inherited.is_empty() { return false; }
+    let mut queue = [None; 128];
+    queue[0] = Some(original);
+    let (mut cursor, mut count) = (0, 1);
+    while cursor < count {
+        let Some(value) = data.vbank().get(queue[cursor].expect("bounded internal bookkeeping")) else { return false; };
+        cursor += 1;
+        if value.is_volatile() || value.get_addr() != &role.address || value.get_size() != role.size
+            || value.get_def().is_some_and(|op| !internal_inherited_marker(data, op, role)) { return false; }
+        for op in value.descend_iter() {
+            let Some(operation) = data.obank().get(op) else { return false; };
+            if operation.is_dead() { continue; }
+            if !internal_inherited_marker(data, op, role) || operation.get_in(0) != queue[cursor - 1] { return false; }
+            let Some(output) = operation.get_out() else { return false; };
+            if !queue[..count].contains(&Some(output)) {
+                if count == queue.len() { return false; }
+                queue[count] = Some(output);
+                count += 1;
+            }
+        }
+    }
+    true
+}
+
+fn certify_internal_role(data: &Funcdata, role: &InternalConstantRole) -> Option<Vec<InternalConstantTerminal>> {
+    if !internal_source_disjoint(data, &role.address, role.size) { return None; }
+    let mut pending = Vec::new();
+    for site in &role.writes {
+        let operation = data.obank().get(site.op).filter(|operation| !operation.is_dead()
+            && operation.get_addr() == &site.address && operation.get_time() == site.time)?;
+        let output = operation.get_out()?;
+        let value = data.vbank().get(output)?;
+        if value.get_addr() != &role.address || value.get_size() != role.size
+            || !dc_is_eventual_constant(data, output, 3, 0) { return None; }
+        pending.push(output);
+    }
+    // A newly introduced/partial definition or an entry dependency cannot hide
+    // behind the original-write list, even when later dead-code removes it.
+    for id in data.vbank().iter_loc() {
+        let value = data.vbank().get(id)?;
+        if value.is_constant() || !internal_overlap(&role.address, role.size, value.get_addr(), value.get_size()) { continue; }
+        let used = value.descend_iter().any(|op| data.obank().get(op).is_some_and(|op| !op.is_dead()));
+        let written = value.get_def().and_then(|op| data.obank().get(op)).is_some_and(|op| !op.is_dead());
+        if !used && !written { continue; }
+        if value.get_addr() != &role.address || value.get_size() != role.size { return None; }
+        if !dc_is_eventual_constant(data, id, 3, 0) {
+            if !internal_inherited_bookkeeping(data, id, role) { return None; }
+            continue;
+        }
+        pending.push(id);
+    }
+    let mut visited = HashSet::new();
+    let mut terminals = Vec::new();
+    while let Some(value) = pending.pop() {
+        if !visited.insert(value) { continue; }
+        let node = data.vbank().get(value)?;
+        if node.is_volatile() { return None; }
+        for op in node.descend_iter() {
+            let operation = data.obank().get(op)?;
+            if operation.is_dead() { continue; }
+            for slot in 0..operation.num_input() {
+                if operation.get_in(slot) != Some(value) { continue; }
+                match (operation.code(), slot) {
+                    (OpCode::CPUI_LOAD, 1) => {
+                        let output = data.vbank().get(operation.get_out()?)?;
+                        if node.is_volatile() || output.is_volatile() { return None; }
+                        terminals.push(InternalConstantTerminal::Read {
+                            site: InternalConstantWrite { op, address: operation.get_addr().clone(), time: operation.get_time() },
+                            space: internal_memory_space(data, op)?, size: output.get_size(),
+                        });
+                    }
+                    (OpCode::CPUI_STORE, 1) => {
+                        let size = data.vbank().get(operation.get_in(2)?)?.get_size();
+                        terminals.push(InternalConstantTerminal::Store {
+                            site: InternalConstantWrite { op, address: operation.get_addr().clone(), time: operation.get_time() },
+                            space: internal_memory_space(data, op)?, size });
+                    }
+                    (OpCode::CPUI_STORE, 2) => {
+                        let spill = data.private_store_obligations().iter().find(|spill|
+                            spill.op == op && spill.size == node.get_size() && spill.offset < 0
+                                && spill.offset.checked_add(i64::from(spill.size)).is_some_and(|end| end <= 0))?;
+                        if !internal_spill_materialized(data, spill) { return None; }
+                        terminals.push(InternalConstantTerminal::Spill {
+                            site: InternalConstantWrite { op, address: operation.get_addr().clone(), time: operation.get_time() },
+                            obligation: spill.clone() });
+                    }
+                    (OpCode::CPUI_INDIRECT, 0) if internal_inherited_marker(data, op, role) => {
+                        if !internal_inherited_bookkeeping(data, operation.get_out()?, role) { return None; }
+                    }
+                    (OpCode::CPUI_COPY | OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_SEXT
+                        | OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB | OpCode::CPUI_INT_XOR
+                        | OpCode::CPUI_INT_OR | OpCode::CPUI_INT_AND | OpCode::CPUI_INT_LEFT
+                        | OpCode::CPUI_INT_RIGHT | OpCode::CPUI_INT_SRIGHT | OpCode::CPUI_INT_MULT, _) => {
+                        let output = operation.get_out()?;
+                        let result = data.vbank().get(output)?;
+                        let local = result.get_space().get_type() == kuna_base::space::spacetype::IPTR_INTERNAL
+                            || role.address.get_space().is_some_and(|space| Rc::ptr_eq(space, result.get_space()));
+                        if !local || result.is_volatile() { return None; }
+                        if !dc_is_eventual_constant(data, output, 3, 0) { return None; }
+                        pending.push(output);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    Some(terminals)
+}
+
+fn internal_terminal_materialized(data: &Funcdata, terminal: &InternalConstantTerminal) -> bool {
+    let (site, space, size, read) = match terminal {
+        InternalConstantTerminal::Spill { site, obligation } => {
+            if !data.private_store_obligations().iter().any(|actual|
+                actual.op == obligation.op && actual.root == obligation.root && actual.root_size == obligation.root_size
+                    && actual.offset == obligation.offset && actual.size == obligation.size) { return false; }
+            let Some(operation) = data.obank().get(site.op).filter(|op| !op.is_dead()) else {
+                // The first-SSA STORE was authenticated below before internal
+                // storage marking. Its raw private interval has no observable
+                // loads/aliases under the separately validated execution facts.
+                return true;
+            };
+            return operation.get_addr() == &site.address && operation.get_time() == site.time
+                && internal_spill_materialized(data, obligation);
+        }
+        InternalConstantTerminal::Read { site, space, size } => (site, space, *size, true),
+        InternalConstantTerminal::Store { site, space, size } => (site, space, *size, false),
+    };
+    let Some(operation) = data.obank().get(site.op).filter(|op| !op.is_dead()) else {
+        // Only the captured nonvolatile read is eliminable. A STORE never
+        // succeeds by disappearance except the isolated compiler spill above.
+        return read;
+    };
+    if operation.get_addr() != &site.address || operation.get_time() != site.time { return false; }
+    let direct_memory_value = |id: Option<VarnodeId>| id.and_then(|id| data.vbank().get(id))
+        .is_some_and(|value| value.get_size() == size && !value.is_constant()
+            && value.get_addr().get_space().is_some_and(|actual| Rc::ptr_eq(actual, space)));
+    if operation.code() == OpCode::CPUI_COPY {
+        return if read { direct_memory_value(operation.get_in(0)) }
+            else { direct_memory_value(operation.get_out()) };
+    }
+    let expected_opcode = if read { OpCode::CPUI_LOAD } else { OpCode::CPUI_STORE };
+    operation.code() == expected_opcode
+        && internal_memory_space(data, site.op).is_some_and(|actual| Rc::ptr_eq(&actual, space))
+        && operation.get_in(1).and_then(|id| data.vbank().get(id)).is_some_and(|value| value.is_constant())
+        && (if read { operation.get_out() } else { operation.get_in(2) })
+            .and_then(|id| data.vbank().get(id)).is_some_and(|value| value.get_size() == size)
+}
+
+fn internal_spill_materialized(data: &Funcdata,
+    expected: &crate::p4_calls::kuna_physicalinputs::PrivateStoreObligation) -> bool
+{
+    let Some(operation) = data.obank().get(expected.op).filter(|op| !op.is_dead()) else { return false; };
+    let Some(stack) = data.get_func_proto().get_spacebase() else { return false; };
+    if stack.num_spacebase() != 1 { return false; }
+    let Ok(storage) = stack.get_spacebase(0) else { return false; };
+    if storage.size as int4 != expected.root_size || storage.offset != expected.root.get_offset()
+        || !storage.space.as_ref().zip(expected.root.get_space()).is_some_and(|(a,b)| Rc::ptr_eq(a,b))
+        || expected.root_size <= 0 || expected.root_size > 8 || expected.offset >= 0 || expected.size <= 0
+        || expected.offset.checked_add(i64::from(expected.size)).is_none_or(|end| end > 0) { return false; }
+    if operation.code() == OpCode::CPUI_COPY && operation.num_input() == 1 {
+        if !operation.get_in(0).and_then(|id| data.vbank().get(id)).is_some_and(|value|
+            value.get_size() == expected.size && !value.is_volatile()) { return false; }
+        return operation.get_out().and_then(|id| data.vbank().get(id)).is_some_and(|value|
+            Rc::ptr_eq(value.get_space(), stack) && value.get_size() == expected.size
+                && value.get_offset() == (expected.offset as u64 & stack.get_highest()));
+    }
+    if operation.code() != OpCode::CPUI_STORE || operation.num_input() != 3
+        || !internal_memory_space(data, expected.op).as_ref().zip(data.get_arch().manage().get_default_data_space())
+            .is_some_and(|(memory, actual)| Rc::ptr_eq(memory, actual))
+        || !operation.get_in(2).and_then(|id| data.vbank().get(id)).is_some_and(|value| value.get_size() == expected.size)
+    { return false; }
+    let Some(pointer) = operation.get_in(1) else { return false; };
+    let Some((root, offset)) = crate::p4_calls::kuna_logicalresultbody::final_pointer(data, pointer, expected.root_size)
+        else { return false; };
+    let Some(root) = data.vbank().get(root) else { return false; };
+    let mask = if expected.root_size >= 8 { u64::MAX } else { (1u64 << (expected.root_size * 8)) - 1 };
+    root.is_input() && root.get_addr() == &expected.root && root.get_size() == expected.root_size
+        && offset & mask == expected.offset as u64 & mask
+}
+
 // =============================================================================
 // ActionInternalStorage (coreaction.hh:1073, coreaction.cc:5192)
 // =============================================================================
@@ -2847,7 +3285,8 @@ impl Action for ActionInternalStorage {
         }
         Some(Box::new(ActionInternalStorage { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        if let Err(error) = data.certify_internal_constant_body() { ctx.fail(error); return 0; }
         // C++ coreaction.cc:5192 — ActionInternalStorage::apply (marking only, no
         // count bump).
         //

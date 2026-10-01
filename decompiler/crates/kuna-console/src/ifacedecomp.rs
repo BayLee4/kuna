@@ -146,13 +146,13 @@ pub struct IfaceDecompData {
     /// Prototype overrides installed by `override prototype <addr> <decl>`, keyed
     /// by function name.  C++ keeps these on `dcp->fd->getOverride()` (the Funcdata
     /// is reused); the kuna console rebuilds the IR on `decompile`, so the
-    /// `(callpoint, pieces)` facts are stashed here and re-seeded onto the fresh
+    /// completed caller facts are stashed here and re-seeded onto the fresh
     /// Funcdata's `localoverride` at flow time (the `pending_flow_overrides`
     /// precedent) — `FlowInfo::build_call_specs` consumes them as
     /// `Override::applyPrototype` (`fspecs.copy(*proto)`).
     pub pending_proto_overrides: std::collections::BTreeMap<
         String,
-        Vec<(kuna_base::address::Address, kuna_decomp::fspec::PrototypePieces)>,
+        kuna_decomp::overrides::Override,
     >,
     /// Parameter storage locks installed by `map param <i> <addr> <typedecl>`
     /// (`IfcMapParam`), keyed by function name.  C++ writes these straight onto
@@ -613,20 +613,11 @@ fn mark_property_range(
     Ok(())
 }
 
-/// C++ `Architecture::setPrototype(pieces)` (architecture.cc:393) for the
-/// console boundary: find the FunctionSymbol named `pieces.name` in the global scope
-/// and lock the parsed prototype onto it.  The kuna model stores the locked
-/// signature as the symbol's `TypeCode` prototype (built by
-/// `TypeFactory::getTypeCode(PrototypePieces)` — the same construction the C++
-/// `FuncProto::setPieces` ultimately produces); we retype the FunctionSymbol to
-/// that prototype-bearing code type.  A missing symbol is a no-op (the C++ would
-/// throw "Unknown function name", but the kuna `parse line extern` path also
-/// stashes the pieces for the active-function load, so a name that is only ever
-/// the *current* decompile target is still handled there); a non-function symbol
-/// is left untouched.
+/// Commit a full C declaration as logical callable shape and independent
+/// function facts. ABI storage is not part of the callable datatype.
 fn apply_prototype_to_symbol(
     status: &mut IfaceStatus,
-    pieces: &kuna_decomp::fspec::PrototypePieces,
+    pieces: &mut kuna_decomp::fspec::PrototypePieces,
     model: Option<&std::rc::Rc<kuna_decomp::fspec::ProtoModel>>,
 ) -> IfaceResult<()> {
     let dcp = dcp_mut(status)?;
@@ -634,32 +625,10 @@ fn apply_prototype_to_symbol(
         Some(p) => p,
         None => return Ok(()),
     };
-    let arch = prog.arch_mut();
-    let scope = match arch.symboltab.get_global_scope() {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-    // queryFunction(basename) — the function must already be a FunctionSymbol
-    // (a `<symbol>` loader record, or a prior `load function`).
-    let sid = match arch.symboltab.query_function_by_name(scope, &pieces.name) {
-        Some(s) => s,
-        None => return Ok(()),
-    };
-    // getTypeCode(pieces): the prototype-bearing TypeCode the symbol's
-    // getPrototype() will return.  A build failure (no proto context) is a
-    // no-op — fall back to the stashed-pieces path.
-    // A declaration that named a calling convention is built under it, so the
-    // storage a CALLER sees for each argument is the declared convention's.
-    let built = match model {
-        Some(m) => arch.types_impl().get_type_code_proto_model(pieces, std::rc::Rc::clone(m)),
-        None => arch.types().get_type_code_proto(pieces),
-    };
-    let type_code = match built {
-        Ok(tc) => tc,
-        Err(_) => return Ok(()),
-    };
-    let _ = arch.symboltab.retype_symbol(sid, type_code);
-    Ok(())
+    let target = crate::assertions::resolve_proto_target(prog, &pieces.name)
+        .map_err(IfaceError::execution)?;
+    crate::assertions::park_prototype(prog, &target, pieces, model)
+        .map_err(IfaceError::execution)
 }
 
 /// Shared body of `IfcParseFile`/`IfcParseLine` (`ifacedecomp.cc:347,384`): run
@@ -699,41 +668,25 @@ fn run_parse_c(status: &mut IfaceStatus, content: &str) -> IfaceResult<()> {
     let _ = org; // org is consumed by parse_c; kept for symmetry with the C++ glb
     match parse_result {
         Ok(()) => {
-            if let Some((pieces, model)) = extern_pieces {
-                // C++ `Architecture::setPrototype(pieces)` (architecture.cc:393):
-                // resolve the FunctionSymbol by name and lock the parsed prototype
-                // onto it (`fd->getFuncProto().setPieces(pieces)`).  In kuna the
-                // function's data-type IS its `TypeCode`, whose `getPrototype()`
-                // carries the locked `FuncProto`; so we build the prototype-bearing
-                // TypeCode (`getTypeCode(PrototypePieces)`) and retype the symbol.
-                // This makes a *callee*'s declared signature visible to
-                // `ActionDefaultParams`' `fc->copy(otherfunc->getFuncProto())` —
-                // without it a by-value struct call argument never gets the callee
-                // param type and `RulePieceStructure` cannot split its CONCAT into
-                // per-field writes.  (Generic over the signature: keyed by the
-                // declared name only, exactly as the C++ `queryFunction(basename)`.)
-                // The calling convention the declaration named (`__stdcall` &c.),
-                // so parameter storage is assigned under it rather than under the
-                // architecture default.
+            if let Some((mut pieces, model)) = extern_pieces {
                 let model = {
                     let dcp = dcp_mut(status)?;
-                    match dcp.conf.as_mut() {
-                        Some(prog) => {
-                            let m = crate::assertions::declared_model(prog, &model);
-                            if let Some(m) = m.as_ref() {
-                                prog.arch_mut()
-                                    .set_function_prototype_model(&pieces.name, m.clone());
-                            }
-                            m
-                        }
+                    match dcp.conf.as_ref() {
+                        Some(prog) => crate::assertions::declared_model(prog, &model),
                         None => None,
                     }
                 };
-                apply_prototype_to_symbol(status, &pieces, model.as_ref())?;
+                apply_prototype_to_symbol(status, &mut pieces, model.as_ref())?;
                 // Also stash for re-application when THIS function is the one being
                 // decompiled (the IR is rebuilt on `decompile`, discarding the
                 // symbol-table proto link for the active Funcdata).
                 let dcp = dcp_mut(status)?;
+                if let Some(fd) = dcp.fd.as_mut().filter(|fd| fd.get_name() == pieces.name) {
+                    fd.clear();
+                    fd.apply_locked_prototype_with_model(&pieces, model.clone())
+                        .map_err(|error| IfaceError::execution(error.explain().to_string()))?;
+                }
+                dcp.pending_param_maps.remove(&pieces.name);
                 dcp.pending_prototypes.insert(pieces.name.clone(), pieces);
             }
             Ok(())
@@ -811,7 +764,7 @@ fn bind_func_param(
         });
     let slot = index as usize;
     while entry.intypes.len() <= slot {
-        entry.intypes.push(std::rc::Rc::clone(&filler));
+        entry.intypes.push(filler.clone());
     }
     while entry.innames.len() <= slot {
         entry.innames.push(String::new());
@@ -821,9 +774,18 @@ fn bind_func_param(
     })?;
     entry.innames[slot] = pname.to_string();
     entry.input_storage.retain(|(i, _)| *i != index);
-    entry.input_storage.push((index, piece));
+    entry.input_storage.push((index, piece.clone()));
     let pieces = entry.clone();
-    retype_symbol_if_complete(status, &pieces)
+    let mapping = (index, pname.to_string(), piece);
+    // A newer qualified slot declaration supersedes only that slot's replay.
+    let replay = dcp.pending_param_maps.entry(func.to_string()).or_default();
+    replay.retain(|(slot, _, _)| *slot != index);
+    replay.push(mapping.clone());
+    if let Some(fd) = dcp.fd.as_mut().filter(|fd| fd.get_name() == func) {
+        fd.clear();
+        fd.apply_mapped_params(std::slice::from_ref(&mapping));
+    }
+    park_partial_prototype(status, &pieces)
 }
 
 /// Park the locked return storage + type of `func` on its prototype pieces —
@@ -846,35 +808,20 @@ fn bind_func_return(
         });
     entry.output_storage = Some(piece);
     let pieces = entry.clone();
-    retype_symbol_if_complete(status, &pieces)
+    park_partial_prototype(status, &pieces)
 }
 
-/// Retype the named `FunctionSymbol` to the prototype-bearing `TypeCode`, but
-/// only once the pieces describe a return type.
-///
-/// `param`/`return` build a signature one slot at a time, so the pieces are
-/// incomplete in between — and the storage assignment behind `getTypeCode`
-/// dereferences `outtype` unconditionally.  The `PrototypePieces` parked on the
-/// symbol is what a caller actually reads (`ActionDefaultParams`); the retype is
-/// the extra step that lets a by-value struct argument be split, so skipping it
-/// for an input-only declaration costs nothing else.
-fn retype_symbol_if_complete(
+/// Slot edits remain independent function facts, including input-only and
+/// output-only declarations. They never manufacture a closed callable shape.
+fn park_partial_prototype(
     status: &mut IfaceStatus,
     pieces: &kuna_decomp::fspec::PrototypePieces,
 ) -> IfaceResult<()> {
-    if pieces.outtype.is_none() {
-        return Ok(());
+    let dcp = dcp_mut(status)?;
+    if let Some(prog) = dcp.conf.as_mut() {
+        prog.arch_mut().set_function_prototype_pieces(&pieces.name, pieces.clone());
     }
-    // A convention a previous `prototype` directive named for this function is
-    // kept: the incremental `param`/`return` rebuild must not silently revert
-    // the signature to the architecture default.
-    let model = {
-        let dcp = dcp_mut(status)?;
-        dcp.conf
-            .as_ref()
-            .and_then(|prog| prog.arch().function_prototype_model(&pieces.name).cloned())
-    };
-    apply_prototype_to_symbol(status, pieces, model.as_ref())
+    Ok(())
 }
 
 /// Parse the `<storage> <C typedeclaration>` tail both `map param` and `map
@@ -960,7 +907,14 @@ pub(crate) fn bind_prototype(
     let target = crate::assertions::resolve_proto_target(prog, func)
         .map_err(IfaceError::execution)?;
     let model = crate::assertions::declared_model(prog, &model);
-    crate::assertions::park_prototype(prog, &target, &mut pieces, model.as_ref());
+    crate::assertions::park_prototype(prog, &target, &mut pieces, model.as_ref())
+        .map_err(IfaceError::execution)?;
+    if let Some(fd) = dcp.fd.as_mut().filter(|fd| fd.get_name() == target.name()) {
+        fd.clear();
+        fd.apply_locked_prototype_with_model(&pieces, model.clone())
+            .map_err(|error| IfaceError::execution(error.explain().to_string()))?;
+    }
+    dcp.pending_param_maps.remove(target.name());
     dcp.pending_prototypes.insert(target.name().to_string(), pieces);
     Ok(())
 }
@@ -1672,18 +1626,10 @@ decomp_command!(
             type_: Some(ct),
             flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
         };
-        // The C++ `FuncProto::store` is always present (set by `setScope` at
-        // Funcdata construction); the merged-tree load path leaves it null, so
-        // attach the stand-alone internal store before writing (as IfcMapReturn).
-        let void_type = prog
-            .arch()
-            .types()
-            .get_type_void()
-            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-        // C++: dcp->fd->getFuncProto().setParam(i, name, piece).
         let fd = dcp.fd.as_mut().expect("fd checked Some above");
-        fd.get_func_proto_mut().attach_internal_store(void_type);
-        fd.get_func_proto_mut().set_param(i, &name, &piece);
+        let mapping = (i, name, piece);
+        fd.clear();
+        fd.apply_mapped_params(std::slice::from_ref(&mapping));
         // Stash the lock keyed by function name so the `decompile` IR rebuild can
         // re-seed it on the fresh prototype (C++ keeps it on the reused Funcdata;
         // the kuna console discards `dcp.fd` on `decompile`).  Precedent:
@@ -1692,7 +1638,7 @@ decomp_command!(
         dcp.pending_param_maps
             .entry(fname)
             .or_default()
-            .push((i, name, piece));
+            .push(mapping);
         Ok(())
     }
 );
@@ -2250,7 +2196,7 @@ decomp_command!(
                 && pending_proto.is_none()
                 && all_pending_protos_empty
                 && mapped_params.is_empty()
-                && proto_overrides.is_empty();
+                && !proto_overrides.has_proto_overrides();
             let stamp_matches = matches!(&dcp.pristine_flow, Some(p)
                 if p.command_seq + 1 == command_seq
                     && p.name == name
@@ -2318,18 +2264,16 @@ decomp_command!(
             prefollowed,
         );
         let result = step.result;
-        if !step.discovered.is_empty() {
+        if step.discovered.has_proto_overrides() {
             status.out("Re-decompiling with format-string varargs typing\n");
         }
         // Persist the discovered call-site overrides for any later re-decompile of
         // this function (the `pending_proto_overrides` precedent).
-        for (callpoint, pieces) in step.discovered {
-            dcp_mut(status)?
-                .pending_proto_overrides
-                .entry(name.clone())
-                .or_default()
-                .push((callpoint, pieces));
-        }
+        dcp_mut(status)?
+            .pending_proto_overrides
+            .entry(name.clone())
+            .or_default()
+            .merge_proto_overrides(&step.discovered);
         // Restore the program (and the fresh Funcdata on success) regardless.
         if result.is_err() {
             // Re-follow the adopted IR so the console is left holding the same
@@ -2801,12 +2745,67 @@ decomp_command!(
 
 // --- rename / remove / retype / isolate (ifacedecomp.cc:1332-1443) ---------
 
+/// Native source rename shared by the console and naming-policy assertions.
+pub(crate) fn rename_symbol(
+    status: &mut IfaceStatus,
+    oldname: &str,
+    newname: &str,
+) -> IfaceResult<()> {
+    use kuna_decomp::database::symbol_category;
+    use kuna_decomp::varnode::varnode_flags;
+    let dcp = dcp_mut(status)?;
+    let sym_list = dcp.read_symbol(oldname)?;
+    if sym_list.is_empty() {
+        // (kuna) The local scope backs the stack slots and the parameters
+        // only; a register-resident local exists solely as the HighVariable
+        // the printer named (`v6 // rax`), so fall back to mapping a Symbol
+        // over that high's storage at its use point
+        // (`crate::kuna_hightarget`).
+        let fd = dcp
+            .fd
+            .as_mut()
+            .ok_or_else(|| IfaceError::execution("No function selected"))?;
+        let target = crate::kuna_hightarget::resolve_printed_local(fd, oldname)
+            .map_err(IfaceError::execution)?;
+        let ct = target.dtype.clone();
+        return crate::kuna_hightarget::bind_printed_local(fd, &target, newname, ct)
+            .map_err(IfaceError::execution);
+    }
+    if sym_list.len() > 1 {
+        return Err(IfaceError::execution(format!("More than one symbol named: {oldname}")));
+    }
+    let sym = sym_list[0];
+    let fd = dcp.fd.as_mut().expect("read_symbol succeeded => fd present");
+    let lm = fd
+        .get_scope_local_mut()
+        .ok_or_else(|| IfaceError::execution("Function has no local scope"))?;
+    // C++: if (sym->getCategory() == function_parameter)
+    //        dcp->fd->getFuncProto().setInputLock(true);
+    if lm.symbol_category(sym) == symbol_category::FUNCTION_PARAMETER {
+        fd.get_func_proto_mut().set_input_lock(true);
+        let lm = fd.get_scope_local_mut().expect("local scope present");
+        lm.rename_symbol(sym, newname)
+            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        lm.set_attribute(sym, varnode_flags::namelock | varnode_flags::typelock);
+    } else {
+        lm.rename_symbol(sym, newname)
+            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        lm.set_attribute(sym, varnode_flags::namelock | varnode_flags::typelock);
+    }
+    if fd.get_scope_local().is_some_and(|scope|
+        scope.symbol_category(sym) == symbol_category::FUNCTION_PARAMETER)
+    {
+        let replay = fd.commit_source_parameter_edit(sym)
+            .map_err(|error| IfaceError::execution(error.explain().to_string()))?;
+        dcp.pending_param_maps.insert(fd.get_name().to_string(), replay);
+    }
+    Ok(())
+}
+
 decomp_command!(
     /// C++ `IfcRename`: `rename <oldname> <newname>` (ifacedecomp.cc:1332).
     IfcRename,
     fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
-        use kuna_decomp::database::symbol_category;
-        use kuna_decomp::varnode::varnode_flags;
         s.skip_ws();
         let oldname = s.read_token();
         s.skip_ws();
@@ -2818,46 +2817,7 @@ decomp_command!(
         if newname.is_empty() {
             return Err(IfaceError::parse("Missing new name"));
         }
-        let dcp = dcp_mut(status)?;
-        let sym_list = dcp.read_symbol(&oldname)?;
-        if sym_list.is_empty() {
-            // (kuna) The local scope backs the stack slots and the parameters
-            // only; a register-resident local exists solely as the HighVariable
-            // the printer named (`v6 // rax`), so fall back to mapping a Symbol
-            // over that high's storage at its use point
-            // (`crate::kuna_hightarget`).
-            let fd = dcp
-                .fd
-                .as_mut()
-                .ok_or_else(|| IfaceError::execution("No function selected"))?;
-            let target = crate::kuna_hightarget::resolve_printed_local(fd, &oldname)
-                .map_err(IfaceError::execution)?;
-            let ct = target.dtype.clone();
-            return crate::kuna_hightarget::bind_printed_local(fd, &target, &newname, ct)
-                .map_err(IfaceError::execution);
-        }
-        if sym_list.len() > 1 {
-            return Err(IfaceError::execution(format!("More than one symbol named: {oldname}")));
-        }
-        let sym = sym_list[0];
-        let fd = dcp.fd.as_mut().expect("read_symbol succeeded => fd present");
-        let lm = fd
-            .get_scope_local_mut()
-            .ok_or_else(|| IfaceError::execution("Function has no local scope"))?;
-        // C++: if (sym->getCategory() == function_parameter)
-        //        dcp->fd->getFuncProto().setInputLock(true);
-        if lm.symbol_category(sym) == symbol_category::FUNCTION_PARAMETER {
-            fd.get_func_proto_mut().set_input_lock(true);
-            let lm = fd.get_scope_local_mut().expect("local scope present");
-            lm.rename_symbol(sym, &newname)
-                .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-            lm.set_attribute(sym, varnode_flags::namelock | varnode_flags::typelock);
-        } else {
-            lm.rename_symbol(sym, &newname)
-                .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-            lm.set_attribute(sym, varnode_flags::namelock | varnode_flags::typelock);
-        }
-        Ok(())
+        rename_symbol(status, &oldname, &newname)
     }
 );
 
@@ -2939,6 +2899,11 @@ decomp_command!(
             lm.rename_symbol(sym, &newname)
                 .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
             lm.set_attribute(sym, varnode_flags::namelock);
+        }
+        if is_param {
+            let replay = fd.commit_source_parameter_edit(sym)
+                .map_err(|error| IfaceError::execution(error.explain().to_string()))?;
+            dcp.pending_param_maps.insert(fd.get_name().to_string(), replay);
         }
         Ok(())
     }
@@ -3216,43 +3181,6 @@ decomp_command!(
 
 // --- override prototype / jumptable / flow (ifacedecomp.cc:1840-1953) ------
 
-/// A console-side [`FuncProtoOverride`](kuna_decomp::overrides::FuncProtoOverride)
-/// holding the parsed [`PrototypePieces`] for `override prototype <addr> <decl>`.
-///
-/// C++ wraps the pieces in a full `FuncProto` (`setInternal`/`setPieces`) and
-/// stores it in the function's `Override`.  The W4 `applyPrototype` consume
-/// (`FlowInfo::queryCall`) is still stubbed (LOSS-031 neighborhood), so this wrapper
-/// only needs to round-trip the pieces; `encode`/`print_raw` (debug-only surfaces,
-/// not exercised by the datatest corpus) are faithful stubs.
-struct PiecesProtoOverride {
-    pieces: kuna_decomp::fspec::PrototypePieces,
-}
-
-impl kuna_decomp::overrides::FuncProtoOverride for PiecesProtoOverride {
-    fn set_override(&mut self, _val: bool) {
-        // C++ FuncProto::setOverride sets a flag consumed by the (stubbed)
-        // applyPrototype; the pieces carry no such flag, so this is a no-op until
-        // the W4 FuncProto-backed override lands.
-    }
-    fn encode(&self, _encoder: &mut dyn kuna_base::marshal::Encoder) -> kuna_base::error::KunaResult<()> {
-        // STUB(W4): FuncProto::encode of an override is a debug/save surface absent
-        // from the datatest corpus.
-        Err(kuna_base::error::KunaError::lowlevel(
-            "kuna rust port: prototype-override encode needs the W4 FuncProto::encode",
-        ))
-    }
-    fn print_raw(&self, s: &mut String) {
-        // C++ FuncProto::printRaw uses the literal name "func"; render the pieces'
-        // model name + arity for a faithful-enough debug line.
-        s.push_str("func(");
-        s.push_str(&self.pieces.intypes.len().to_string());
-        s.push(')');
-    }
-    fn pieces(&self) -> Option<&kuna_decomp::fspec::PrototypePieces> {
-        Some(&self.pieces)
-    }
-}
-
 decomp_command!(
     /// C++ `IfcProtooverride`: `override prototype <addr> <declaration>`.
     ///
@@ -3286,29 +3214,34 @@ decomp_command!(
         let decl = s.rest().trim().to_string();
         let (addr_size, word_size) = prog.arch().data_org();
         let org = crate::grammar::DataOrg { addr_size, word_size };
-        let pieces = crate::grammar::parse_protopieces(&decl, prog.arch().types(), org)
+        let text = format!("extern {};", decl.trim_end_matches(';'));
+        let models = crate::assertions::model_names(prog);
+        let captured = std::cell::RefCell::new(None);
+        crate::grammar::parse_c(&text, prog.arch().types(), org, &models, |pieces, model| {
+            *captured.borrow_mut() = Some((pieces, model.to_string()));
+            Ok(())
+        })
             .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-        // C++ builds a FuncProto (setInternal + setPieces) and
-        // insertProtoOverride(callpoint, newproto).  The W4 `applyPrototype` consume
-        // (FlowInfo::queryCall) is still stubbed (LOSS-031 neighborhood), so the
-        // override is stored but not yet applied at flow time; the command succeeds
-        // (the script proceeds) exactly as C++.
-        // The kuna console rebuilds the IR on `decompile`, dropping this fd's
-        // Override; stash the (callpoint, pieces) by function name so the next
-        // `decompile` re-seeds it onto the fresh Funcdata (the `flow`/`proto`
-        // override precedent).
+        let (pieces, model_name) = captured.into_inner()
+            .ok_or_else(|| IfaceError::execution("Not a function declaration"))?;
+        let model = crate::assertions::declared_model(prog, &model_name)
+            .or_else(|| prog.arch().default_fp().cloned())
+            .ok_or_else(|| IfaceError::execution("No default prototype model"))?;
+        let mut proto = kuna_decomp::fspec::FuncProto::new();
+        let void_type = prog.arch().types().get_type_void()
+            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        proto.seed_locked_from_pieces(&pieces, model, void_type, prog.arch().types(), prog.arch().manage())
+            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        // Lower the declaration once. Pending and live state share the completed
+        // immutable signature; each reflow copies it only into the call spec.
         let funcname = dcp.fd.as_ref().expect("fd present").get_display_name().to_string();
-        dcp.pending_proto_overrides
-            .entry(funcname)
-            .or_default()
-            .push((callpoint.clone(), pieces.clone()));
-        let ov: Box<dyn kuna_decomp::overrides::FuncProtoOverride> =
-            Box::new(PiecesProtoOverride { pieces });
+        let pending = dcp.pending_proto_overrides.entry(funcname).or_default();
+        pending.insert_proto_override(callpoint, proto);
         dcp.fd
             .as_mut()
             .expect("fd present")
             .get_override_mut()
-            .insert_proto_override(callpoint, ov);
+            .merge_proto_overrides(pending);
         status.out("Successfully added override\n");
         Ok(())
     }
@@ -3988,7 +3921,7 @@ decomp_command!(
             let ptrto = prog
                 .arch()
                 .types()
-                .get_ptr_to_from_parent(std::rc::Rc::clone(&bt), off)
+                .get_ptr_to_from_parent(bt.clone(), off)
                 .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
             // spc = conf->getDefaultDataSpace(); then getTypePointerRel(6-arg).
             let spc = prog
@@ -4028,7 +3961,8 @@ decomp_command!(
                 .ok_or_else(|| IfaceError::parse(format!("Unknown space: {space_name}")))?;
             prog.arch()
                 .types()
-                .get_type_pointer_with_space(ptr_to, spc, &type_name)
+                .get_type_pointer_with_space(prog.arch().types().get_size_of_pointer(), ptr_to,
+                                             spc.get_word_size(), spc, &type_name)
                 .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
         } else {
             return Err(IfaceError::parse(format!("Unknown pointer setting: {setting}")));

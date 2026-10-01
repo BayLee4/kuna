@@ -14,6 +14,11 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "../../kuna-console/tests/common/mod.rs"]
+mod common;
+#[path = "../../kuna-console/tests/common/raw_calls.rs"]
+mod raw_calls;
+
 /// The `ret` of each link in `chain_entry`, and the plain epilogue after them.
 const FIRST_LINK_RET: &str = "0x8049019";
 const EPILOGUE_RET: &str = "0x8049032";
@@ -39,6 +44,10 @@ fn specs_missing(stderr: &str) -> bool {
 /// Decompile `chain_entry`, optionally under a `flow` assertion.  `None` ⇒ the
 /// `.sla` tree is not built (a visible skip, never a false green).
 fn decompile(assertion: Option<&str>) -> Option<String> {
+    decompile_output(assertion, false)
+}
+
+fn decompile_output(assertion: Option<&str>, raw: bool) -> Option<String> {
     let binary = fixture();
     let sleigh = repo_root().join("specs").to_string_lossy().into_owned();
     let mut args: Vec<&str> =
@@ -46,6 +55,9 @@ fn decompile(assertion: Option<&str>) -> Option<String> {
     if let Some(spec) = assertion {
         args.push("--assert");
         args.push(spec);
+    }
+    if raw {
+        args.push("--raw");
     }
     let out = Command::new(env!("CARGO_BIN_EXE_kuna")).args(&args).output().expect("spawn kuna");
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -60,34 +72,35 @@ fn decompile(assertion: Option<&str>) -> Option<String> {
     Some(stdout)
 }
 
-/// The three callees the chain reaches, by the global each `ret` pops.
-const CALLS: [&str; 3] = ["(*dat_804a000)()", "(*dat_804a004)()", "(*dat_804a008)()"];
-
 /// Unasserted entry chains are recovered by the same strict detector.
 #[test]
 fn the_default_recovers_the_whole_entry_chain() {
     let Some(code) = decompile(None) else { return };
-    for call in CALLS {
-        assert!(code.contains(call), "the default chain stopped before {call}:\n{code}");
-    }
+    common::c_behavior::assert_three_call_chain("default-chain", &code, "chain_entry");
 }
 
 /// The need's own case: one override on the first link recovers all three calls.
 #[test]
 fn overriding_the_first_link_recovers_the_whole_chain() {
     let Some(code) = decompile(Some(&format!("flow {FIRST_LINK_RET} call"))) else { return };
-    for call in CALLS {
-        assert!(code.contains(call), "the chain stopped before {call}:\n{code}");
-    }
+    common::c_behavior::assert_three_call_chain("first-link-override", &code, "chain_entry");
 }
 
 /// A caller can still override the plain epilogue independently; it does not
 /// disturb the automatically recovered links before it.
 #[test]
 fn overriding_the_plain_epilogue_extends_to_nothing() {
-    let Some(code) = decompile(Some(&format!("flow {EPILOGUE_RET} call"))) else { return };
-    for call in CALLS {
-        assert!(code.contains(call), "the default chain stopped before {call}:\n{code}");
-    }
+    let Some(code) = decompile_output(Some(&format!("flow {EPILOGUE_RET} call")), true) else { return };
     assert!(code.contains("funcboundflow:"), "the epilogue override did not stay local:\n{code}");
+
+    // The explicit epilogue override deliberately calls an unresolved stack
+    // target, so execute neither it nor a rewritten body. Trace actual CLI
+    // SSA operands: the three original links remain ordered and only the
+    // epilogue adds a call through the incoming return-address slot.
+    assert_eq!(raw_calls::indirect_targets(&code), [
+        (0x8049019, 'r', 0x804a000),
+        (0x8049025, 'r', 0x804a004),
+        (0x8049031, 'r', 0x804a008),
+        (0x8049032, 's', 0),
+    ]);
 }

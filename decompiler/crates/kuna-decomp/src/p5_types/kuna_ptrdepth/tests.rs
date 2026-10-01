@@ -22,11 +22,11 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn ptr(f: &TypeFactoryImpl, to: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr(f: &TypeFactoryImpl, to: TypeRoot) -> TypeRoot {
     f.get_type_pointer(8, to, 1).unwrap()
 }
 
-fn char_t(f: &TypeFactoryImpl) -> Rc<Datatype> {
+fn char_t(f: &TypeFactoryImpl) -> TypeRoot {
     f.get_type_char(1).unwrap()
 }
 
@@ -44,7 +44,7 @@ fn depth_one_and_two_over_a_concrete_base_are_left_alone() {
     // regression, not the fix.
     let f = factory();
     let p1 = ptr(&f, char_t(&f));
-    let p2 = ptr(&f, Rc::clone(&p1));
+    let p2 = ptr(&f, p1.clone());
     assert_eq!(pointer_depth(&p1, 8), 1);
     assert_eq!(pointer_depth(&p2, 8), 2);
     assert!(cap_pointer_depth(&f, &p1).is_none());
@@ -74,7 +74,7 @@ fn every_deeper_chain_collapses_to_the_same_type() {
     for _ in 0..5 {
         cur = ptr(&f, cur);
         let capped = cap_pointer_depth(&f, &cur).expect("a deeper chain must still be capped");
-        assert!(Rc::ptr_eq(&capped, &expected) || capped.get_name() == expected.get_name());
+        assert_eq!(capped, expected);
         assert_eq!(pointer_depth(&capped, 8), 1);
     }
 }
@@ -96,7 +96,7 @@ fn a_pointer_to_the_capped_type_collapses_back_one_level() {
     // unchanged in exactly this case, so the chain cannot grow past the cap.
     let f = factory();
     let capped = cap_pointer_depth(&f, &ptr(&f, ptr(&f, ptr(&f, char_t(&f))))).unwrap();
-    let grown = ptr(&f, Rc::clone(&capped));
+    let grown = ptr(&f, capped.clone());
     assert_eq!(pointer_depth(&grown, 8), 2);
     let recapped = cap_pointer_depth(&f, &grown).expect("the regrown chain must be capped again");
     assert_eq!(pointer_depth(&recapped, 8), 1);

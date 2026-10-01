@@ -11,7 +11,7 @@
 //! The fence pins two invariants the next (Casts) wave depends on:
 //!
 //!   1. **Threaded.** For a written Varnode carrying a merged HighVariable, the
-//!      *high*-facing accessor returns the SAME interned `Rc<Datatype>` as the
+//!      *high*-facing accessor returns the SAME graph identity as the
 //!      merged `high->getType()` — i.e. the facing graph really reads the merged
 //!      high, not the bare Varnode type.  (`getHighTypeDefFacing` ==
 //!      `high->getType()` in the no-resolution default, varnode.cc:670-677.)
@@ -252,7 +252,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                 Some(t) => t,
                 None => continue,
             };
-            let bare_ty = Rc::clone(fd.vbank().get(w.vn).unwrap().get_type());
+            let bare_ty = fd.vbank().get(w.vn).unwrap().get_type().clone();
 
             // Invariant 2: with no unions flowing, no facing accessor resolves —
             // the high-facing type IS the merged high type (interned identity).
@@ -260,7 +260,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                 if let Some(def) = w.def {
                     let def_facing = fd.vn_high_type_def_facing(w.vn);
                     assert!(
-                        Rc::ptr_eq(&def_facing, &high_ty),
+                        def_facing.id() == high_ty.id(),
                         "{name}: getHighTypeDefFacing must equal high->getType() for \
                          non-resolution type (def op present {def:?})"
                     );
@@ -268,7 +268,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                 for &op in &w.reads {
                     let read_facing = fd.vn_high_type_read_facing(w.vn, op);
                     assert!(
-                        Rc::ptr_eq(&read_facing, &high_ty),
+                        read_facing.id() == high_ty.id(),
                         "{name}: getHighTypeReadFacing must equal high->getType() for \
                          non-resolution type"
                     );
@@ -282,7 +282,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                 if w.def.is_some() {
                     let dfac = fd.vn_type_def_facing(w.vn);
                     assert!(
-                        Rc::ptr_eq(&dfac, &bare_ty),
+                        dfac.id() == bare_ty.id(),
                         "{name}: getTypeDefFacing must equal vn->getType() for \
                          non-resolution type"
                     );
@@ -290,7 +290,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                 for &op in &w.reads {
                     let rfac = fd.vn_type_read_facing(w.vn, op);
                     assert!(
-                        Rc::ptr_eq(&rfac, &bare_ty),
+                        rfac.id() == bare_ty.id(),
                         "{name}: getTypeReadFacing must equal vn->getType() for \
                          non-resolution type"
                     );

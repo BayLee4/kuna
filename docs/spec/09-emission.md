@@ -177,6 +177,14 @@ instead flags the constant for suffixing — `mark_explicit_unsigned` (the `U`
 suffix) and `mark_explicit_long_size` (the `L`/`LL` suffix) — which the
 literal formatter reads back at §9.2's constant push.
 
+Plain C `char` does not establish the signed interpretation required by SEXT.
+For a character-printed source, the C printer casts through a numeric signed
+type at the source width, then the actual destination type. The operand is
+evaluated once and its source/global datatype is unchanged. This preserves
+MOVSBL-style loads under both signed- and unsigned-plain-char compiler modes;
+an unsigned destination still receives the sign-extended bit pattern. The
+explicit `nocasts` display option and non-C renderers retain their own policy.
+
 **Casting an input.** `coreaction_casts.rs (Funcdata::cast_input)` asks the
 per-opcode `getInputCast` surface (`coreaction_casts.rs (get_input_cast)`)
 what type the operator requires at that slot: LOAD/STORE coerce the pointer to
@@ -194,6 +202,135 @@ and a pointer-to-struct being read as pointer-to-its-first-field inserts a
 cast (`coreaction_casts.rs (test_struct_offset0)`). Only when all of that
 fails is a real `CPUI_CAST` op inserted before the reader, with an implied
 unique output carrying the required type.
+
+**Callable input views.** A CALLIND target must be a callable C expression,
+not an invocation of the `void *` spelling used for a generic code pointer.
+For a materialized logical declaration, physical source roles select the
+declared arguments: hidden-result inputs are omitted and indirect by-value
+inputs are dereferenced. A hidden aggregate result captures its destination
+once, stores the logical call result through it, and yields that pointer only
+if the physical result has a consumer. The capture also applies in nested
+expressions, preserving destination side effects.
+
+Generated callback execution uses compatible execution-family signatures and
+stable target-owned adapters, not calls through incompatible function-pointer
+casts. Conditional direct and indirect uses retain required definition
+dependencies, including unchanged-signature targets; executable whole-unit export
+requires the selected target bodies to discharge their own obligations and the
+dependency closure. If a native or unresolved boundary still requires
+unrepresentable machine inputs, outputs or effects, diagnostic code and authentic
+source metadata remain available, but executable C export is refused rather than
+supplied with a fabricated bridge.
+
+**Callable publication is not a function fragment.** The execution header may
+expose wider or additional physical inputs while the original source parameter
+name, datatype, storage and locks remain authoritative. The carrier and its
+source projection are real SSA values; printing does not invent an ABI extension
+rule for machine bits the declaration does not describe. Host signature editing
+continues to address the source declaration, not the execution carrier.
+
+A compilation unit joins native callable artifacts with actual successfully
+rendered target bodies. Keys identify the full target and execution family;
+matching names, matching arity, or a copied callee fragment are not provider
+receipts. An existing-target provider must agree with the canonical declaration
+of its actual body. A wrapper provider contributes one compatible C definition,
+separate from the current function's text. Required declarations without their
+concrete provider, conflicting observations, failed bodies, and deferred
+assumptions participating in a dependency cycle refuse publication. Complete
+cycles without deferred assumptions remain valid.
+
+Protocol-2 `BodyProof` records are non-emitting, role-qualified obligations. Each
+references a concrete wrapper or existing-target provider for the same body,
+family and declaration, using one canonical `_internal_<space>_<byte>_<size>`
+role suffix. Required proof edges remain deferred; a proof cannot erase that
+assumption, point to another proof, or manufacture an extra callable definition.
+The referenced concrete provider is retained even when only the qualified proof
+is requested. Worker results carry the reference explicitly (`KUNAJOBRES10`),
+and CLI/Wasm JSON represents it as `definition.kind = "body_proof"` with a
+`provider` key. These protocol joins do not themselves establish the native
+instruction-level preservation proof.
+
+The Ghidra native result carries immutable callable support separately from
+`getC()` and `getSignature()`, which remain the current function fragment.
+Publication uses the native prelude, exact final type/global inventory,
+canonical declarations, bodies and adapters. Source-type ownership covers the
+complete authenticated dependency graph, including callable inputs/results and
+relative-pointer parents; an ordinary presentation-only traversal is
+insufficient. Markerless inline structural shapes require their actual decode
+provenance, not guessed identities. Relevant source edits or dependency mutations
+invalidate that authority. The ordinary exporter validates the complete
+publication before replacing its staged destinations; see
+[the Ghidra response contract](../ghidra-integration.md#6-response-contracts-that-make-the-gui-work).
+
+The cast pass constructs an operation-local callable view: locked signature
+parts come from the completed callsite prototype, while genuinely unlocked
+parts use the final operand/result types. This neither rewrites a shared
+callback declaration nor changes recovered call operands. A known nonvoid
+return remains nonvoid when its result is unused.
+`kuna_langc.rs (CDeclarator)` composes function postfixes with pointers and
+arrays, including functions returning pointers. Closed zero-input signatures
+use `(void)`; an unspecified/open zero-input signature uses `()`, not the
+invalid C11 `(...)`.
+
+The semantic CAST or directly typed constant remains unchanged when printing
+modes change. A shared display policy checks both the canonical call prototype
+and its completed callable view. Overrides, model/custom-storage commitments,
+locked empty inputs, and any independent input/output type, name or size lock
+retain the full signature in every dialect. A later parameter's lock counts
+even when the first parameter is unlocked.
+
+The call spec records the exact target-view identity synthesized from inference.
+That operation-local provenance distinguishes a recovered concrete signature
+from an independently supplied callable declaration; structural equality alone
+cannot authorize generic spelling. Prototype mutation invalidates the record,
+and fresh or cloned call analyses do not inherit it.
+
+For genuinely inferred, closed, nonvariadic CALLIND targets with a single use,
+the live TypeSpeller selects among three forms:
+
+- An expression proven to have the dialect's callable generic core `code *`
+  type needs no visible outer wrapper when pointer representations agree.
+- A proven integer or unknown scalar address keeps an explicit conversion,
+  spelled as generic `code *` only at the same width and without losing
+  address-space or truncation metadata.
+- Actual object pointers, concrete signature mismatches, and unproven
+  expressions retain the full typed callable conversion.
+
+Named values use their actual declaration types, not an individual merged
+member's type. A bounded expression proof follows visible casts, copies,
+width-checked loads and correctly scaled pointer indexing: `((code **)p)[1]`
+can be callable even when `p` is declared `void *`. A failed load/index proof
+never falls back to scalar classification from its inferred output type.
+Scalar arithmetic and extensions require positively established scalar
+operands. Either the callsite's or the view's variadic/open-tail boundary
+prevents generic projection. Native object-pointer spelling restores the full
+wrapper on the same analyzed function; no analysis snapshot or IR mutation
+depends on the selected printing mode.
+
+Constant call targets can receive their completed pointer type directly in the
+cast pass, without an intervening CAST operation. The numeric pointer-constant
+fallback uses the same display policy, only after string, configured NULL and
+symbol/global-address rendering have declined. It preserves an explicit
+conversion and the constant's type, bits and call operands; arbitrary
+pointer-typed constants are not classified as scalar expressions.
+
+**Resolved presentation decision.** Generic `code *` is appropriate for an
+untyped computed address in the legacy dialect; it must not erase a supplied
+signature merely to reproduce older text. This decision affects current output
+and is independent of aggregate ABI lowering in chapter 04.
+The retained variadic ABI boundary (chapter 04) affects only the callable
+view: its fixed prefix ends in an ellipsis while the stored override keeps
+its closed input list. A retained logical declaration can include known
+expanded tail types; C type spelling stops at `logical_first` rather than
+printing those tail types as fixed formals. Argument emission still uses the
+complete source-role map, including hidden-result omission and indirect-by-value
+dereferencing. This is required for native variadic calling conventions, not
+just a shorter cast. Arguments beyond that boundary retain their declared
+types through explicit casts. Floating constants must first be interpreted
+as floating bit patterns, so an explicit cast renders `(double)2.5`, not a
+numeric conversion of `0x4004000000000000`. Shared or conflicting typed
+constant occurrences are isolated; the input actually attached to the CAST
+retains its floating type even when `op_set_input` duplicates it.
 
 **Narrowed call arguments (kuna).** Dead-code analysis counts only the
 possibly-nonzero bits of a call input as consumed, so when a caller
@@ -401,11 +538,9 @@ one gets a CAST (or a `PTRSUB #0`, by the same struct-offset-0 test) inserted
 implied value that is not feeding a RETURN forces the cast even when the
 lattice would allow silence — the user's declared type must stay visible.
 A LOAD's token, and the type a STORE asks of its value, is the pointee of the
-address; when that pointee is a synthesized structure's pointer to its own
-incomplete shell (`structsynth nest`, chapter 05), both take the pointer to the
-completed structure instead (`coreaction_casts.rs (resolve_self_pointer)`), the
-same type the lattice gave the value, so no cast is printed between a node and
-the link it was loaded from.
+address. Recursive pointer edges retain the nominal identity completed by the
+datatype graph (`structsynth nest`, chapter 05); propagation and cast tokens
+therefore see the same completed body, without reconstructing a self pointer.
 
 **Union edges.** A value whose data-type still `needs_resolution()` (a union,
 or a pointer to one) is resolved per read/write edge: `coreaction_casts.rs
@@ -627,8 +762,9 @@ model and decision function live in
 `decompiler/crates/kuna-decomp/src/p9_emit/printlanguage.rs`, the driving
 methods in `printc.rs`), and the low-level emitters in
 `decompiler/crates/kuna-decomp/src/p9_emit/prettyprint.rs`: a line-breaking
-`EmitPrettyPrint` wrapping either the plain-text `EmitNoMarkup` (the
-byte-exact datatest path) or the XML `EmitMarkup` (the Ghidra-client path).
+`EmitPrettyPrint` can wrap either plain text or markup. The host document path
+uses its queued line breaking; CLI text and provenance/token-coordinate paths
+retain their unwrapped sinks.
 The whole-document entry is `printc.rs (PrintC::doc_function_full)`, driven by
 `decompiler/crates/kuna-decomp/src/infra/decompile_drive.rs` after analysis
 completes.
@@ -722,6 +858,32 @@ signedness from the type), or a named variable, including the partial-cover
 walk that renders `name.field`, `name[index]`, a `(int4)name` truncation cast,
 or the artificial `name._8_4_` member when a Varnode covers only part of its
 mapped symbol (`printc.rs (PrintC::push_partial_symbol_ir)`).
+
+**Finite-width symbolic constants.** Enum decomposition is over the declared
+bit width, not C's promoted `int` width. `printc.rs
+(PrintC::push_enum_constant_ir)` keeps named flags and accounts for target C
+integer promotions. A wide enum requires conversion before complementing,
+because an individual enumerator can have a narrower C type. An unsigned enum
+no wider than `int` requires conversion afterward to restore its declared value;
+a signed enum no wider than `int` needs neither conversion. Unknown target
+integer widths retain both conversions conservatively.
+Thus an unsigned byte comparison against `0xfe` does not
+become the always-false `value == ~FLAG_A` when `FLAG_A` is 1. Partial enums
+normalize to the unsigned parent width before shifting, then convert to the
+unsigned projected width; truncating before the shift would discard the selected
+bits. Non-complement C masks may omit conversions only when an implied AND is
+consumed solely as a zero/nonzero test and the parent sign and shift width make
+that omission safe. Other uses preserve the projected result type, including
+its behavior in mixed-signedness comparisons. Rust uses its language-specific
+integer casts, not C enum casts.
+
+Default one-byte character constants at or above `0x80` print numerically
+(`printc.rs (PrintC::push_char_constant_ir)`). Their C values follow the declared
+signedness; Rust follows its existing unsigned text-byte representation.
+A literal such as `'\xfe'` is not a portable spelling of unsigned 254 and must
+not change a byte comparison on a signed-`char` target. Low character literals
+and explicitly requested character or numeric display formats retain their
+existing policies.
 
 **Which symbols enter the partial walk.** Upstream routes *every* partial cover
 of a mapped Symbol through that walk — the walk itself decides, per type, what
@@ -891,6 +1053,29 @@ prototype (kuna DIV-34 — upstream's `skip_line` default leaves a blank line
 between the prototype and `{`; `option braceformat function skip` restores
 it, exercised by `tests/stages/kuna-cnorm-protogap.xml`).
 
+`PrintC::doc_function_markup` installs a queued host sink with the persistent
+width and indentation settings; invalid widths outside 20–10000 are rejected.
+The sink, context checkpoint, and function association are restored on success,
+error, or unwind, and failed documents discard partial expression state.
+Ghidra returns rendering errors without a partial result frame. Selecting the
+existing Rust language uses its grammar with the same host token references;
+unsupported languages fail rather than silently selecting C.
+
+Comment style and category masks apply at emission, including header/banner and
+multiline comments. The existing `warnstyle=inline` warning slug deliberately
+retains `//` independently of ordinary comment style; masks still control whether
+it appears. Only warning-only categories use that slug: console comments carry
+the selected visibility mask, which can include both user and warning bits,
+and remain ordinary standalone comments. Namespace `minimal`, `none`, and `all` are emission policies over
+retained symbol ancestry, not mutations of bound names. They affect declarations,
+direct calls, globals, and volatile annotations without changing target addresses
+or selected aliases. Rust applies its identifier adaptation after qualification.
+Convention printing consumes the selected model's visibility metadata: the
+architecture's default model and reserved `unknown` name are hidden, while a
+visible non-default model prints only when the convention option is enabled.
+Changing the default updates this presentation flag on the shared model identity,
+not on copied prototypes.
+
 **Position maps.** Every token can carry a resolved back-reference,
 `prettyprint.rs (MarkupRef)`: an op reference (the op's `getTime`, the same id
 the function's `<ast>` encoding writes as `<seqnum uniq>`) and a Varnode
@@ -900,6 +1085,38 @@ but under `EmitMarkup` (selected by `printc.rs (PrintC::set_markup)`, the
 ghidra-mode front-end) `<variable>` elements carry `varref`/`opref` (declarations add `symref`) and `<op>` elements carry `opref`; plain `<syntax>` elements carry only color/content that resolve against the AST by
 construction, which is how the Ghidra client maps a clicked token back to
 p-code, and how statement groups map to addresses.
+
+Parenthesis open/close IDs are document-local associations, not engine identities.
+Each close carries the ID returned for its matching open, including queued
+pretty-print output; updating an RPN entry must retain that returned ID. IDs may
+differ across repeated documents without changing token, symbol, or p-code identity.
+
+Field atoms retain their nominal containing datatype through emission. Markup
+uses its host datatype ID and name, never its graph-local ID. Ordinary fields
+carry byte offsets rather than component ordinals, including partial and
+nested member access; bitfields retain their component identifiers. The
+operation reference accompanies the field so Java's `ClangFieldToken` resolves
+both the parent type and the selected member.
+
+Composite declarations retain host identities for their actual nominal type
+leaves. The existing C/Rust spelling traversal optionally records UTF-8 byte
+spans on both declarator halves; markup uses those spans to bind `Node` in
+`Node *`, and each distinct leaf in a nested callable suffix, to its own source
+ID. Typedef names retain their nominal identity. A selected symbol declaration
+override supplies both spelling and identity, rather than borrowing an ID from
+the original high variable. Declarator punctuation has no invented type identity.
+Plain rendering does not collect spans or compute host IDs.
+
+Each span also distinguishes an atomic nominal name from composed type spelling.
+An original non-core C type name is one `<type>` token even when its name
+contains spaces or punctuation, as in Ghidra's auto-named relative-pointer
+typedefs. Java's C exporter must sanitize that whole identifier, not fragments
+of it. Core, relabelled and generated spellings such as `unsigned long *` keep
+their lexical type/syntax split; Rust type expressions retain their existing
+grammar. The spelling decision supplies this policy directly, without looking
+up rendered names. Atomic boundaries survive even without a host ID, and syntax
+between spans never inherits an enclosing type's ID. This policy changes packed
+token boundaries, not plain text, raw capture or pretty-print queue layout.
 
 **Token source map** (kuna). A front-end that links the C to the machine code
 needs every token of the *plain* text with its place in it, and the plain
@@ -914,7 +1131,12 @@ emitted text advances the column by its length, so a token lands exactly where
 the plain back-end printed the same characters; blank tokens are dropped and
 surrounding spaces trimmed. A `tag_type` records one token for the whole
 declarator front (`unsigned long *`) and mutes the per-word split the packed
-encoding makes for the Ghidra client. Anything printed in the constant colour
+encoding makes for the Ghidra client. Annotated composite declarations likewise
+record their original token once: a suffix emitted as syntax remains a syntax
+capture even when its packed markup contains typed leaves. Splitting never
+changes captured text, associations, colour or UTF-16 positions. Queued spans
+are immutable shared payloads and are cleared when queue slots are reused.
+Anything printed in the constant colour
 (a `tag_variable` literal or a plain `print`) and case labels are `value`
 tokens. Declaration context rides along: tokens inside the return type, the
 prototype, and a local declaration are marked, and a comment or label keeps the
@@ -1746,9 +1968,9 @@ Three artifacts make up the plane, all in
   array is `T (*p)[N]`, an array of pointers is `T *p[N]`, and deeper
   pointer/array alternations preserve the same precedence instead of moving only
   the nearest parenthesis.  Casts, parameters, locals, members, typedefs, and
-  exported type strings all share this speller. The internal postfix builder is
-  generic enough to obey the same rule for a function suffix, although current
-  `Datatype` traversal supplies pointer and array modifiers only.
+  exported type strings all share this speller. Completed callable datatypes
+  supply function suffixes through the same modifier traversal, preserving
+  precedence for function pointers, pointer returns and nested callback types.
 
   Every declaration places both halves around its name, because the front of a
   pointer-to-array declarator (`T (*`) is not a type on its own.
@@ -1868,11 +2090,25 @@ What differs, and why each is a language fact rather than a preference:
   the same treatment: resolving it needs the next arm's body duplicated, which is
   a block-graph edit and not a printing decision.
 
-The contract is **`syn::parse_file` validity, not `rustc` compilation**, and
-`kuna-console/tests/verify_outlang_rust_syntax.rs` enforces exactly that by
-parsing the emitted document. Decompiled output calls functions that have no
-definition, `CARRY4(a, b)` has no Rust spelling, and `[u8; 3]` does not do
-arithmetic; making the output compile is a separate and much larger project.
+**Syntax coverage is not semantic fidelity.**
+Decompiled output may call undefined external functions,
+`CARRY4(a, b)` has no native Rust spelling, and `[u8; 3]` is not an arithmetic
+type. There is no whole-program Rust compilation guarantee.
+
+Integer arithmetic truncates to the operation width before any extension;
+zero-extension widens the truncated result without changing its modulus.
+Pointer offsets preserve the target's address width and byte stride, not the
+compiler host's width or the pointee size. Array addresses use
+`as_mut_ptr()` and the same target-width wrapping byte offset as raw pointers,
+not host array indexing: a large index whose scaled offset wraps back into the
+array must select that cell rather than panic on the unscaled index.
+Unsupported `PTRADD` forms retain their operation fallback and pointer
+dereference; they require an external implementation to compile and link.
+
+**Callback maturity remains limited.** A recovered Rust callback pointer can
+still be emitted as opaque `*mut *const ()`; calling it is rejected by `rustc`
+(E0618). A native callback declaration requires the exact callable ABI and
+parameter/result types, not a cast guessed from pointer size.
 
 **The marker is reported, not only emitted** (GH-668). A body whose jump became a
 `panic!` is a translation up to that jump and not past it, so a consumer that
@@ -1900,11 +2136,13 @@ deliberately outside this count: it is a different lossy construct, and naming
 one number `unstructured_gotos` that meant two things would be worse than
 reporting the one.
 
-Two surfaces refuse the language rather than half-honouring it. `kuna-ghidra`
-pins its Clang token-markup document to C (`process.rs`), because that document
-is consumed by Ghidra's C token model and Rust text in C token slots is a GUI
-regression. `kuna decompile-project` errors, because its `.c`/`.h`/`.asm` export
-is C-shaped end to end.
+`kuna-ghidra` supports the existing C and Rust grammars through packed token
+markup, retaining the token hierarchy and engine references consumed by Java.
+The historical Clang token-model name is not a C-only output restriction, nor
+does successful markup decoding establish Rust semantic fidelity.
+`kuna decompile-project` still rejects non-C output because its
+`.c`/`.h`/`.asm` export is C-shaped end to end; `decompile-graph` similarly keeps
+its `codeC` contract.
 
 The Java back-end is deliberately not ported:
 `decompiler/crates/kuna-decomp/src/p9_emit/printjava.rs (PrintJava)` is a
@@ -2021,6 +2259,14 @@ bytes, named data symbols for the `.asm`/`README.md` artifacts) lives on the
 console engine, `decompiler/crates/kuna-console/src/engine.rs
 (ConsoleProgram::sections, disassemble_at, read_bytes, global_data_symbols)`,
 not in this folder.
+
+The shared prelude also supplies guarded `static inline` `CONCAT<high><low>`
+helpers for scalar joins of two positive byte widths totaling at most eight
+bytes. `<stdint.h>` carriers convert each argument once to unsigned storage;
+piece-width masks discard excess bits before the high part is shifted and
+combined. This makes native register-pair returns recompilable without a
+consumer-supplied macro. Joins wider than eight bytes are not implemented by
+these scalar helpers.
 
 **The streamed layout.** `kuna decompile-project --stream` (chapter
 [00](00-overview.md)) drives these same renders one result at a time and
@@ -2148,10 +2394,15 @@ name: composites, enums and typedefs, never core types.
 (referenced_types)` collects the function's semantic type surface — the
 prototype's return and parameter types, every Varnode data-type, and every
 mapped Symbol type behind a HighVariable — and walks each one's dependency cone
-(`kuna_structdefs.rs (visit)`): the typedef base first, then the component
-sub-types `substrate/dtype.rs (Datatype::get_depend)` reports — a pointer's
-pointee, an array's element, a struct's fields — pushing each definable type
-after everything it depends on. The result is definition-before-use over
+(`kuna_structdefs.rs (visit)`): the complete edges exposed by
+`substrate/dtype_graph.rs (ReadView::dependencies)`, including typedef bases,
+callable inputs and results, bitfields, and relative-pointer parents as well as
+ordinary pointer, array and record components. A callback-only reference must
+therefore retain its input and result definitions even when neither appears as
+a separate Varnode type. The walk borrows one graph view per root and retains
+new roots only for emitted definitions; graph identities terminate recursive
+callback/record cycles. Each definable type is pushed after its dependencies.
+The result is definition-before-use over
 exactly the referenced subset, which is the order §9.7's
 `TypeFactoryImpl::dependent_order` produces over the whole factory, computed
 here from the roots instead so a whole-binary run costs the types a function

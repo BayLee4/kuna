@@ -50,8 +50,6 @@
 //! returns `0` — "made no change" — preserving the engine contract.  These are
 //! enumerated in the item's `losses` output.
 
-use std::rc::Rc;
-
 use kuna_base::address::{
     calc_mask, count_leading_zeros, popcount, sign_extend, sign_extend_sized, signbit_negative,
 };
@@ -62,7 +60,7 @@ use kuna_num::multiprecision::{
 };
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -292,10 +290,10 @@ fn is_proto_partial(data: &Funcdata, vn: VarnodeId) -> bool {
 fn vn_addr(data: &Funcdata, vn: VarnodeId) -> kuna_base::address::Address {
     data.vbank().get(vn).expect("ruleaction_6: stale vn").get_addr().clone()
 }
-/// `vn->getType()` (cloned `Rc`).
+/// `vn->getType()` (retained root).
 #[inline]
-fn vn_type(data: &Funcdata, vn: VarnodeId) -> std::rc::Rc<crate::dtype::Datatype> {
-    std::rc::Rc::clone(data.vbank().get(vn).expect("ruleaction_6: stale vn").get_type())
+fn vn_type(data: &Funcdata, vn: VarnodeId) -> crate::dtype::TypeRoot {
+    data.vbank().get(vn).expect("ruleaction_6: stale vn").get_type().clone()
 }
 /// `vn->getSpace()->isBigEndian()`.
 #[inline]
@@ -330,11 +328,8 @@ impl Rule for RulePtraddUndo {
         vec![OpCode::CPUI_PTRADD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePtraddUndo::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePtraddUndo::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -603,7 +598,7 @@ impl RulePtrsubUndo {
     /// are the PTRSUB constant decomposition exactly as `applyOp` computes them.
     fn preserve_thumb_funcptr(
         data: &Funcdata,
-        read_facing: &Rc<crate::dtype::Datatype>,
+        read_facing: &crate::dtype::TypeRoot,
         val: int8,
         extra: int8,
         multiplier: int8,
@@ -668,11 +663,8 @@ impl Rule for RulePtrsubUndo {
         vec![OpCode::CPUI_PTRSUB]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePtrsubUndo::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePtrsubUndo::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -741,11 +733,8 @@ impl Rule for RuleMultNegOne {
         vec![OpCode::CPUI_INT_MULT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleMultNegOne::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleMultNegOne::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -786,11 +775,8 @@ impl Rule for RuleAddUnsigned {
         vec![OpCode::CPUI_INT_ADD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleAddUnsigned::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAddUnsigned::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -864,11 +850,8 @@ impl Rule for Rule2Comp2Sub {
         vec![OpCode::CPUI_INT_2COMP]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(Rule2Comp2Sub::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(Rule2Comp2Sub::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -921,11 +904,8 @@ impl Rule for RuleSubRight {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubRight::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubRight::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1065,11 +1045,8 @@ impl Rule for RulePtrsubCharConstant {
         vec![OpCode::CPUI_PTRSUB]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePtrsubCharConstant::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePtrsubCharConstant::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1109,11 +1086,8 @@ impl Rule for RuleExtensionPush {
         vec![OpCode::CPUI_INT_ZEXT, OpCode::CPUI_INT_SEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleExtensionPush::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleExtensionPush::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1192,21 +1166,24 @@ impl RulePieceStructure {
     /// Pure (operates on the dtype tree) — fully transcribed.  Uses the available
     /// `Datatype::get_size`/`get_sub_type`/`is_piece_structured` surface.
     pub fn spanning_range(
-        ct: &std::rc::Rc<crate::dtype::Datatype>,
+        ct: &crate::dtype::TypeRoot,
         offset: int4,
         size: int4,
     ) -> KunaResult<bool> {
+        let view = ct.read();
+        let ct = view.get(ct.id())?;
         if offset + size > ct.get_size() {
             return Ok(false);
         }
         let mut new_off: int8 = offset as int8;
-        let mut cur = ct.clone();
+        let mut cur = ct;
         loop {
             let (sub, off2) = cur.get_sub_type(new_off)?;
             new_off = off2;
             match sub {
                 None => return Ok(true), // Don't know what it spans, assume multiple
                 Some(s) => {
+                    let s = view.get(s)?;
                     if new_off + size as int8 > s.get_size() as int8 {
                         return Ok(true); // Spans more than 1
                     }
@@ -1237,7 +1214,7 @@ impl RulePieceStructure {
     fn determine_datatype(
         data: &Funcdata,
         vn: VarnodeId,
-    ) -> KunaResult<(Option<std::rc::Rc<crate::dtype::Datatype>>, int4)> {
+    ) -> KunaResult<(Option<crate::dtype::TypeRoot>, int4)> {
         let vnsize = size(data, vn);
         // C++ getStructuredType(): mapentry ? symbol->getType() : vn->getType(); piece-structured else null.
         // Resolve the containing local SymbolEntry (the kuna `mapentry`).
@@ -1248,7 +1225,7 @@ impl RulePieceStructure {
             .and_then(|lm| lm.query_container_for_link(&addr, &usepoint));
         let (ct, base_offset_hint) = match container
             .as_ref()
-            .and_then(|c| c.sym_type.as_ref().map(|t| (std::rc::Rc::clone(t), c.sym_off)))
+            .and_then(|c| c.sym_type.as_ref().map(|t| (t.clone(), c.sym_off)))
         {
             Some((symty, off)) => (symty, off),
             None => (vn_type(data, vn), 0),
@@ -1265,7 +1242,7 @@ impl RulePieceStructure {
                 return Ok((None, 0));
             }
             // Walk to the concrete sub-type that matches the Varnode size.
-            let mut sub_type = Some(std::rc::Rc::clone(&ct));
+            let mut sub_type = Some(ct.clone());
             let mut sub_offset: int8 = base_offset as int8;
             while let Some(st) = &sub_type {
                 if st.get_size() <= vnsize {
@@ -1295,7 +1272,7 @@ impl RulePieceStructure {
     fn convert_zext_to_piece(
         data: &mut Funcdata,
         zext: OpId,
-        ct: Option<std::rc::Rc<crate::dtype::Datatype>>,
+        ct: Option<crate::dtype::TypeRoot>,
         mut offset: int4,
     ) -> KunaResult<bool> {
         let outvn = out_vn(data, zext);
@@ -1322,7 +1299,7 @@ impl RulePieceStructure {
         let zerovn = data.new_constant(sz, 0);
         if let Some(c) = &cur {
             if c.get_size() == sz {
-                data.vbank_mut().get_mut(zerovn).expect("convertZextToPiece: stale zerovn").update_type(std::rc::Rc::clone(c));
+                data.vbank_mut().get_mut(zerovn).expect("convertZextToPiece: stale zerovn").update_type(c.clone());
             }
         }
         data.op_set_opcode_code(zext, OpCode::CPUI_PIECE);
@@ -1338,7 +1315,7 @@ impl RulePieceStructure {
     fn find_replace_zext(
         data: &mut Funcdata,
         stack: &[crate::op::PieceNode],
-        structured_type: &std::rc::Rc<crate::dtype::Datatype>,
+        structured_type: &crate::dtype::TypeRoot,
     ) -> KunaResult<bool> {
         let mut change = false;
         for node in stack {
@@ -1360,7 +1337,7 @@ impl RulePieceStructure {
             if !Self::spanning_range(structured_type, node.get_type_offset(), size(data, vn))? {
                 continue;
             }
-            if Self::convert_zext_to_piece(data, op, Some(std::rc::Rc::clone(structured_type)), node.get_type_offset())? {
+            if Self::convert_zext_to_piece(data, op, Some(structured_type.clone()), node.get_type_offset())? {
                 change = true;
             }
         }
@@ -1405,11 +1382,8 @@ impl Rule for RulePieceStructure {
         vec![OpCode::CPUI_PIECE, OpCode::CPUI_INT_ZEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePieceStructure::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePieceStructure::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1523,12 +1497,12 @@ impl Rule for RulePieceStructure {
                 let new_type = match data
                     .get_arch()
                     .types()
-                    .and_then(|t| t.get_exact_piece(std::rc::Rc::clone(&ct), node.get_type_offset(), vnsize).ok().flatten())
+                    .and_then(|t| t.get_exact_piece(ct.clone(), node.get_type_offset(), vnsize).ok().flatten())
                 {
                     Some(t) => t,
                     None => vn_type(data, vn),
                 };
-                data.vbank_mut().get_mut(new_vn).expect("piecestructure: stale newVn").update_type(std::rc::Rc::clone(&new_type));
+                data.vbank_mut().get_mut(new_vn).expect("piecestructure: stale newVn").update_type(new_type.clone());
                 data.op_set_opcode_code(copy_op, OpCode::CPUI_COPY);
                 if data.op_set_input(copy_op, vn, 0).is_err() {
                     continue;
@@ -1596,11 +1570,8 @@ impl Rule for RuleSubNormal {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubNormal::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubNormal::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1732,11 +1703,8 @@ impl Rule for RulePositiveDiv {
         vec![OpCode::CPUI_INT_SDIV, OpCode::CPUI_INT_SREM]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePositiveDiv::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePositiveDiv::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1822,11 +1790,8 @@ impl Rule for RuleDivTermAdd {
         vec![OpCode::CPUI_SUBPIECE, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDivTermAdd::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDivTermAdd::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1959,11 +1924,8 @@ impl Rule for RuleDivTermAdd2 {
         vec![OpCode::CPUI_INT_RIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDivTermAdd2::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDivTermAdd2::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2446,11 +2408,8 @@ impl Rule for RuleDivOpt {
              OpCode::CPUI_INT_AND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDivOpt::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDivOpt::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2572,29 +2531,32 @@ impl Rule for RuleDivOpt {
 /// `coreaction.cc`'s `ActionDatabase::universalAction`.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "ptraddundo", ctor: || Box::new(RulePtraddUndo::new("ptraddundo")) },
-        RuleSpec { group: "ptrsubundo", ctor: || Box::new(RulePtrsubUndo::new("ptrsubundo")) },
-        RuleSpec { group: "multnegone", ctor: || Box::new(RuleMultNegOne::new("multnegone")) },
-        RuleSpec { group: "addunsigned", ctor: || Box::new(RuleAddUnsigned::new("addunsigned")) },
-        RuleSpec { group: "2comp2sub", ctor: || Box::new(Rule2Comp2Sub::new("2comp2sub")) },
-        RuleSpec { group: "subright", ctor: || Box::new(RuleSubRight::new("subright")) },
+        RuleSpec { group: "ptraddundo", aliases: &[], ctor: || Box::new(RulePtraddUndo::new("ptraddundo")) },
+        RuleSpec { group: "ptrsubundo", aliases: &[], ctor: || Box::new(RulePtrsubUndo::new("ptrsubundo")) },
+        RuleSpec { group: "multnegone", aliases: &[], ctor: || Box::new(RuleMultNegOne::new("multnegone")) },
+        RuleSpec { group: "addunsigned", aliases: &[], ctor: || Box::new(RuleAddUnsigned::new("addunsigned")) },
+        RuleSpec { group: "2comp2sub", aliases: &[], ctor: || Box::new(Rule2Comp2Sub::new("2comp2sub")) },
+        RuleSpec { group: "subright", aliases: &[], ctor: || Box::new(RuleSubRight::new("subright")) },
         RuleSpec {
             group: "ptrsubcharconstant",
+            aliases: &[],
             ctor: || Box::new(RulePtrsubCharConstant::new("ptrsubcharconstant")),
         },
         RuleSpec {
             group: "extensionpush",
+            aliases: &[],
             ctor: || Box::new(RuleExtensionPush::new("extensionpush")),
         },
         RuleSpec {
             group: "piecestructure",
+            aliases: &[],
             ctor: || Box::new(RulePieceStructure::new("piecestructure")),
         },
-        RuleSpec { group: "subnormal", ctor: || Box::new(RuleSubNormal::new("subnormal")) },
-        RuleSpec { group: "positivediv", ctor: || Box::new(RulePositiveDiv::new("positivediv")) },
-        RuleSpec { group: "divtermadd", ctor: || Box::new(RuleDivTermAdd::new("divtermadd")) },
-        RuleSpec { group: "divtermadd2", ctor: || Box::new(RuleDivTermAdd2::new("divtermadd2")) },
-        RuleSpec { group: "divopt", ctor: || Box::new(RuleDivOpt::new("divopt")) },
+        RuleSpec { group: "subnormal", aliases: &[], ctor: || Box::new(RuleSubNormal::new("subnormal")) },
+        RuleSpec { group: "positivediv", aliases: &[], ctor: || Box::new(RulePositiveDiv::new("positivediv")) },
+        RuleSpec { group: "divtermadd", aliases: &[], ctor: || Box::new(RuleDivTermAdd::new("divtermadd")) },
+        RuleSpec { group: "divtermadd2", aliases: &[], ctor: || Box::new(RuleDivTermAdd2::new("divtermadd2")) },
+        RuleSpec { group: "divopt", aliases: &[], ctor: || Box::new(RuleDivOpt::new("divopt")) },
     ]
 }
 

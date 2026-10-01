@@ -45,12 +45,11 @@
 //! `docs/rust-port/losses.md`).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
 
 use kuna_base::types::{int2, int4, uint4};
 
 use crate::cover::{Cover, PcodeOpSet};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::context::{HighVariableId, VarnodeId};
 
 // =============================================================================
@@ -134,7 +133,7 @@ pub struct VarnodeView {
     /// `vn->getSize()`
     pub size: int4,
     /// `vn->getType()`
-    pub type_: Rc<Datatype>,
+    pub type_: TypeRoot,
     /// `vn->isTypeLock()`
     pub type_lock: bool,
     /// `vn->getMergeGroup()`
@@ -335,7 +334,7 @@ pub struct HighVariable {
     /// Boolean properties inherited from members (C++ `flags`).
     flags: uint4,
     /// The data-type for \b this (C++ `type`; `None` == null).
-    type_: Option<Rc<Datatype>>,
+    type_: Option<TypeRoot>,
     /// Storage location used to generate a Symbol name (C++ `nameRepresentative`).
     name_representative: Option<VarnodeId>,
     /// The internal cover (C++ `internalCover`).
@@ -353,10 +352,13 @@ pub struct HighVariable {
     /// default name (`vN`) directly here and the printer reads it as the
     /// `getSymbol()->getDisplayName()` stand-in.  `None` == unnamed.
     kuna_name: Option<String>,
+    /// Owning global symbol namespace, innermost first. Qualification is a
+    /// printer policy, not part of the bound symbol's identity or base name.
+    kuna_symbol_scope: Option<Vec<String>>,
     /// (kuna) The data-type of the mapped Symbol this high renders through (the
     /// `getSymbol()->getType()` stand-in, used by the printer to render an array
     /// or struct member access `name[idx]`).  `None` for an unnamed/scalar high.
-    kuna_symbol_type: Option<Rc<Datatype>>,
+    kuna_symbol_type: Option<TypeRoot>,
     /// (kuna) The local-scope EquateSymbol bound to this high by
     /// `Funcdata::build_dynamic_symbol` (C++ `vn->setSymbolEntry(sym->...)` whose
     /// effect is `high->getSymbol() == sym`).  The W4 `Symbol`/`SymbolEntry`
@@ -431,6 +433,7 @@ impl HighVariable {
             symbol: None,
             symbol_offset: -1,
             kuna_name: None,
+            kuna_symbol_scope: None,
             kuna_symbol_type: None,
             kuna_equate_symbol: None,
             kuna_global: false,
@@ -448,6 +451,15 @@ impl HighVariable {
     /// (kuna) Bind the angr default name to this HighVariable.
     pub fn set_kuna_name(&mut self, name: impl Into<String>) {
         self.kuna_name = Some(name.into());
+        self.kuna_symbol_scope = None;
+    }
+
+    pub fn set_kuna_symbol_scope(&mut self, scope: Vec<String>) {
+        self.kuna_symbol_scope = Some(scope);
+    }
+
+    pub fn kuna_symbol_scope(&self) -> Option<&[String]> {
+        self.kuna_symbol_scope.as_deref()
     }
 
     /// (kuna) Set the in-symbol byte offset for an array/struct member access
@@ -503,12 +515,12 @@ impl HighVariable {
     }
 
     /// (kuna) Bind the mapped Symbol's data-type (for array/struct rendering).
-    pub fn set_symbol_type(&mut self, ct: Rc<Datatype>) {
+    pub fn set_symbol_type(&mut self, ct: TypeRoot) {
         self.kuna_symbol_type = Some(ct);
     }
 
     /// (kuna) The mapped Symbol's data-type, or `None`.
-    pub fn kuna_symbol_type(&self) -> Option<&Rc<Datatype>> {
+    pub fn kuna_symbol_type(&self) -> Option<&TypeRoot> {
         self.kuna_symbol_type.as_ref()
     }
 
@@ -813,7 +825,7 @@ impl HighVariable {
     }
 
     /// Get the data-type (C++ `getType`, `variable.hh:175`): runs `updateType`.
-    pub fn get_type(&mut self, ctx: &dyn HighContext, symbol_submeta: Option<type_metatype>) -> Rc<Datatype> {
+    pub fn get_type(&mut self, ctx: &dyn HighContext, symbol_submeta: Option<type_metatype>) -> TypeRoot {
         self.update_type(ctx, symbol_submeta);
         self.type_.clone().expect("getType: null type after update (internal invariant)")
     }
@@ -2226,6 +2238,8 @@ impl HighVariableBank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::{Datatype, TypeFactoryImpl};
+    use std::rc::Rc;
     use kuna_base::address::Address;
     use kuna_base::space::{spacetype, AddrSpace};
     use slotmap::KeyData;
@@ -2281,11 +2295,11 @@ mod tests {
         }
     }
 
-    fn dt(size: int4, meta: type_metatype) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, meta))
+    fn dt(types: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+        types.intern(Datatype::new(size, meta)).unwrap()
     }
 
-    fn view(flags: uint4, ty: Rc<Datatype>, type_lock: bool) -> VarnodeView {
+    fn view(flags: uint4, ty: TypeRoot, type_lock: bool) -> VarnodeView {
         VarnodeView {
             flags,
             size: ty.get_size(),
@@ -2338,6 +2352,7 @@ mod tests {
 
     #[test]
     fn update_flags_inherits_member_props() {
+        let types = TypeFactoryImpl::new();
         let mut bank = HighVariableBank::new();
         let id = bank.new_high(vid(1));
         let mut views = BTreeMap::new();
@@ -2351,7 +2366,7 @@ mod tests {
                     | varnode_flags::mapped
                     | varnode_flags::directwrite
                     | varnode_flags::insert,
-                dt(4, type_metatype::TYPE_UNKNOWN),
+                dt(&types, 4, type_metatype::TYPE_UNKNOWN),
                 false,
             ),
         );
@@ -2368,6 +2383,7 @@ mod tests {
 
     #[test]
     fn update_type_picks_most_specialized() {
+        let types = TypeFactoryImpl::new();
         // Two members: an UNKNOWN(4) and an INT(4). INT is more specialized
         // (lower typeOrderFormal), so it should win.
         let mut bank = HighVariableBank::new();
@@ -2379,11 +2395,11 @@ mod tests {
         let mut views = BTreeMap::new();
         views.insert(
             MapCtx::key(vid(1)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_UNKNOWN), false),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_UNKNOWN), false),
         );
         views.insert(
             MapCtx::key(vid(2)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_INT), false),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_INT), false),
         );
         let ctx = MapCtx { views, covers: BTreeMap::new() };
         let h = bank.get_mut(id).unwrap();
@@ -2395,6 +2411,7 @@ mod tests {
 
     #[test]
     fn update_type_typelock_wins() {
+        let types = TypeFactoryImpl::new();
         // A type-locked UNKNOWN beats an unlocked INT (typelock preferred).
         let mut bank = HighVariableBank::new();
         let id = bank.new_high(vid(1));
@@ -2403,11 +2420,11 @@ mod tests {
         let mut views = BTreeMap::new();
         views.insert(
             MapCtx::key(vid(1)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_INT), false),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_INT), false),
         );
         views.insert(
             MapCtx::key(vid(2)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_UNKNOWN), true),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_UNKNOWN), true),
         );
         let ctx = MapCtx { views, covers: BTreeMap::new() };
         let h = bank.get_mut(id).unwrap();
@@ -2473,6 +2490,7 @@ mod tests {
 
     #[test]
     fn internal_cover_unions_members() {
+        let types = TypeFactoryImpl::new();
         // Build a HighVariable with two members: member 1 has a def-point in
         // block 0, member 2 has a def-point in block 1.  The internal cover is
         // the union -> both blocks present.
@@ -2499,11 +2517,11 @@ mod tests {
         let mut views = BTreeMap::new();
         views.insert(
             MapCtx::key(vid(1)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_UNKNOWN), false),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_UNKNOWN), false),
         );
         views.insert(
             MapCtx::key(vid(2)),
-            view(varnode_flags::insert, dt(4, type_metatype::TYPE_UNKNOWN), false),
+            view(varnode_flags::insert, dt(&types, 4, type_metatype::TYPE_UNKNOWN), false),
         );
         let ctx = MapCtx { views, covers };
         bank.get_mut(id).unwrap().update_internal_cover(&ctx);

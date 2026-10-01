@@ -23,6 +23,10 @@
 //! [`coreaction_render::ActionInferTypes`] wrapper; this module is the engine it
 //! drives.
 //!
+//! Inference carries external [`TypeRoot`] handles and compares graph identities.
+//! Recursive pointees retain their reserved identity as definitions complete, so
+//! dereference propagation returns the pointee directly without shell replacement.
+//!
 //! ## Faithfulness / seams
 //!
 //! The metatype lattice control flow (COPY, MULTIEQUAL, INDIRECT, every
@@ -47,16 +51,28 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeFactory, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::typeop::type_op_info;
+
+/// Volatile annotations retain the locked source object's exact type. Replaced
+/// volatile Varnodes live in unique space, so ordinary storage typing cannot
+/// recover this declaration from the output's new address.
+fn volatile_type_local(data: &Funcdata, op: OpId, size: int4) -> Option<TypeRoot> {
+    let operation = data.obank().get(op)?;
+    if !operation.does_special_propagation() || size <= 0 { return None; }
+    let annotation = data.vbank().get(operation.get_in(1)?)?;
+    let (datatype, offset) = data.get_arch().sized_type_for_global_varnode(
+        annotation.get_addr(), size, operation.get_addr())?;
+    data.get_arch().types()?.get_exact_piece(datatype, offset, size).ok().flatten()
+}
 
 /// Resolve `op->outputTypeLocal()` / `op->inputTypeLocal(slot)` faithfully via the
 /// W6 typeop inst table (`getOutputLocal`/`getInputLocal`).  Falls back to a
 /// size-correct `TYPE_UNKNOWN` if the factory query fails (the C++ getBase never
 /// fails for a valid size).
-pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
+pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> TypeRoot {
     let arch = Rc::clone(data.get_arch());
     let o = data.obank().get(op).expect("output_type_local: stale op");
     let out_size = o
@@ -75,9 +91,13 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
             .and_then(|v| data.vbank().get(v))
             .map(|v| v.get_offset())
             .unwrap_or(0);
+        if in0_off == crate::userop::BUILTIN_VOLATILE_READ as u64 && o.num_input() == 2
+            && o.get_in(0).and_then(|id| data.vbank().get(id)).is_some_and(|value| value.is_constant()) {
+            if let Some(datatype) = volatile_type_local(data, op, out_size) { return datatype; }
+        }
         if in0_off == crate::userop::BUILTIN_STRINGDATA as u64 {
             if let Some(out) = o.get_out().and_then(|v| data.vbank().get(v)) {
-                return Rc::clone(out.get_type());
+                return out.get_type().clone();
             }
         }
     }
@@ -93,15 +113,13 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
         }
     }
     let info = type_op_info(o.code());
-    match arch.types() {
-        Some(tlst) => info
-            .get_output_local(tlst, out_size)
-            .unwrap_or_else(|_| Rc::new(Datatype::new(out_size, type_metatype::TYPE_UNKNOWN))),
-        None => Rc::new(Datatype::new(out_size, type_metatype::TYPE_UNKNOWN)),
-    }
+    let tlst = arch.types().expect("architecture context has a type factory");
+    info.get_output_local(tlst, out_size).unwrap_or_else(|_| {
+        tlst.get_base(out_size, type_metatype::TYPE_UNKNOWN).expect("valid output size")
+    })
 }
 
-pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Datatype> {
+pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> TypeRoot {
     input_type_local_with(data, op, slot, true)
 }
 
@@ -109,11 +127,11 @@ pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Data
 /// type a call argument is REQUIRED to have, which is what a cast is measured
 /// against.  A recovered type is a vote about the value, not a declaration the
 /// value must be converted to, so it never emits a cast.
-pub(crate) fn declared_input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Datatype> {
+pub(crate) fn declared_input_type_local(data: &Funcdata, op: OpId, slot: int4) -> TypeRoot {
     input_type_local_with(data, op, slot, false)
 }
 
-fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool) -> Rc<Datatype> {
+fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool) -> TypeRoot {
     let arch = Rc::clone(data.get_arch());
     let o = data.obank().get(op).expect("input_type_local: stale op");
     let opcode = o.code();
@@ -122,6 +140,12 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
         .and_then(|v| data.vbank().get(v))
         .map(|v| v.get_size())
         .unwrap_or(1);
+
+    if opcode == OpCode::CPUI_CALLOTHER && slot == 2 && o.num_input() == 3
+        && o.get_in(0).and_then(|id| data.vbank().get(id)).is_some_and(|value|
+            value.is_constant() && value.get_offset() == crate::userop::BUILTIN_VOLATILE_WRITE as u64) {
+        if let Some(datatype) = volatile_type_local(data, op, in_size) { return datatype; }
+    }
 
     // C++ `TypeOpCall::getInputLocal` (typeop.cc:689) / `TypeOpCallind` (typeop.cc:763):
     // for a slot>0 whose in(0) is an fspec (CALL) / code-pointer (CALLIND) reference
@@ -141,9 +165,7 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
     // `(*v1)(...)` rather than treating the funcptr as a plain integer).
     if opcode == OpCode::CPUI_CALLIND && slot == 0 {
         if let Some(tlst) = arch.types() {
-            let code = tlst.get_type_code().unwrap_or_else(|_| {
-                Rc::new(Datatype::new(0, type_metatype::TYPE_CODE))
-            });
+            let code = tlst.get_type_code().expect("generic code type");
             let spc = o.get_addr().get_space().cloned();
             let wordsize = spc.as_ref().map(|s| s.get_word_size()).unwrap_or(1);
             if let Ok(ptr) = tlst.get_type_pointer(in_size, code, wordsize) {
@@ -165,18 +187,16 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
     if opcode == OpCode::CPUI_RETURN && slot >= 1 && data.get_func_proto().has_store() {
         if let Some(ct) = data.get_func_proto().get_output_type() {
             if ct.get_metatype() != type_metatype::TYPE_VOID && ct.get_size() == in_size {
-                return Rc::clone(ct);
+                return ct.clone();
             }
         }
     }
 
     let info = type_op_info(opcode);
-    match arch.types() {
-        Some(tlst) => info
-            .get_input_local(tlst, slot, in_size)
-            .unwrap_or_else(|_| Rc::new(Datatype::new(in_size, type_metatype::TYPE_UNKNOWN))),
-        None => Rc::new(Datatype::new(in_size, type_metatype::TYPE_UNKNOWN)),
-    }
+    let tlst = arch.types().expect("architecture context has a type factory");
+    info.get_input_local(tlst, slot, in_size).unwrap_or_else(|_| {
+        tlst.get_base(in_size, type_metatype::TYPE_UNKNOWN).expect("valid input size")
+    })
 }
 
 /// The callee-parameter arm of `TypeOpCall::getInputLocal` / `TypeOpCallind::getInputLocal`
@@ -192,7 +212,7 @@ fn call_input_type_local(
     slot: int4,
     opcode: OpCode,
     recovered: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     // C++: vn = op->getIn(0); for a CALL the prototype lives only when in(0) is an
     // fspec reference (CALLIND always consults the recovered spec).
     if opcode == OpCode::CPUI_CALL {
@@ -233,7 +253,7 @@ fn call_input_type_local(
                 if recovered && crate::kuna_libcfit::overruns(data, op, slot, ct) {
                     return crate::kuna_libcfit::width_stable_vote(data, ct);
                 }
-                return Some(Rc::clone(ct));
+                return Some(ct.clone());
             }
             return None;
         } else if param.is_this_pointer() {
@@ -245,7 +265,7 @@ fn call_input_type_local(
                     .map(|p| p.get_metatype() == type_metatype::TYPE_STRUCT)
                     .unwrap_or(false)
             {
-                return Some(Rc::clone(ct));
+                return Some(ct.clone());
             }
             return None;
         }
@@ -261,7 +281,7 @@ fn call_input_type_local(
 /// for the CALL/CALLIND op and, if its output prototype is locked (committed) and
 /// non-VOID, return that return data-type.  `None` falls back to the generic
 /// size-only `getOutputLocal`.
-fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<Rc<Datatype>> {
+fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<TypeRoot> {
     // C++ `TypeOpCall`: the prototype lives only when in(0) is an fspec reference;
     // a CALL whose in(0) is not an fspec falls through to the default.
     if opcode == OpCode::CPUI_CALL {
@@ -296,19 +316,19 @@ fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<R
     if ct.get_metatype() == type_metatype::TYPE_VOID {
         return None;
     }
-    Some(Rc::clone(ct))
+    Some(ct.clone())
 }
 
 /// C++ `Varnode::getLocalType(bool &blockup)` (varnode.cc:919).  Determine an
 /// initial Datatype from the defining op's output and the reading ops' input
 /// requirements, picking the most-specific (`typeOrder`).  Returns the local type
 /// and whether up-propagation should be blocked (`def->stopsTypePropagation()`).
-fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
+fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (TypeRoot, bool) {
     let v = data.vbank().get(vn).expect("get_local_type: stale vn");
     if v.is_type_lock() {
-        return (Rc::clone(v.get_type()), false);
+        return (v.get_type().clone(), false);
     }
-    let mut ct: Option<Rc<Datatype>> = None;
+    let mut ct: Option<TypeRoot> = None;
     let mut blockup = false;
     if let Some(def) = v.get_def() {
         ct = Some(output_type_local(data, def));
@@ -340,7 +360,10 @@ fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
     }
     // C++ throws on a null local type; a live Varnode always has a def or a
     // descendant, but guard with a size-correct UNKNOWN to avoid a panic.
-    let ct = ct.unwrap_or_else(|| Rc::new(Datatype::new(v.get_size(), type_metatype::TYPE_UNKNOWN)));
+    let ct = ct.unwrap_or_else(|| {
+        data.get_arch().types().expect("architecture context has a type factory")
+            .get_base(v.get_size(), type_metatype::TYPE_UNKNOWN).expect("valid varnode size")
+    });
     (ct, blockup)
 }
 
@@ -371,10 +394,11 @@ fn build_localtypes(data: &mut Funcdata) {
         // (a type-locked Varnode already carries its own definitive type via the
         // getLocalType `isTypeLock` fast-path).
         let seed = if !vn_type_lock {
+            let usepoint = data.vn_use_point(vn);
             data.get_scope_local().and_then(|lm| {
                 data.get_arch()
                     .types()
-                    .and_then(|t| lm.build_localtype_seed(&vn_addr, vn_size, t))
+                    .and_then(|t| lm.build_localtype_seed(&vn_addr, vn_size, &usepoint, t))
             })
         } else {
             None
@@ -482,7 +506,7 @@ fn write_back(data: &mut Funcdata) -> bool {
                 continue;
             }
             match v.get_temp_type() {
-                Some(ct) => Rc::clone(ct),
+                Some(ct) => ct.clone(),
                 None => continue,
             }
         };
@@ -540,7 +564,7 @@ fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int
     if alttype.needs_resolution() {
         let res_type = match data.resolve_in_flow(&alttype, op, inslot) {
             Ok(t) => t,
-            Err(_) => Rc::clone(&alttype),
+            Err(_) => alttype.clone(),
         };
         let is_marker = data.obank().get(op).map(|o| o.is_marker()).unwrap_or(false);
         if !is_marker {
@@ -623,7 +647,7 @@ fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int
 /// Build a spacebase code-pointer type `getTypePointer(altSize, getBase(1,UNKNOWN),
 /// defaultDataSpace.wordSize)` — the shared `invn->isSpacebase()` arm of COPY /
 /// MULTIEQUAL / INDIRECT / compare propagation.
-fn spacebase_pointer(data: &Funcdata, alt_size: int4) -> Option<Rc<Datatype>> {
+fn spacebase_pointer(data: &Funcdata, alt_size: int4) -> Option<TypeRoot> {
     let arch = Rc::clone(data.get_arch());
     let tlst = arch.types()?;
     let spc = Rc::clone(arch.manage().get_default_data_space()?);
@@ -649,10 +673,10 @@ fn space_from_const(data: &Funcdata, op: OpId, slot: int4) -> Option<Rc<AddrSpac
 /// data-type up to its pointer data-type through a LOAD/STORE (depth at most 1).
 fn propagate_to_pointer(
     tlst: &dyn TypeFactory,
-    dt: Rc<Datatype>,
+    dt: TypeRoot,
     sz: int4,
     wordsz: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let meta = dt.get_metatype();
     let dt = if meta == type_metatype::TYPE_PTR {
         // Make sure that at least we return a pointer to something the size of -pt-
@@ -669,9 +693,9 @@ fn propagate_to_pointer(
 /// data-type down to its element data-type through a LOAD/STORE.
 fn propagate_from_pointer(
     tlst: &dyn TypeFactory,
-    dt: Rc<Datatype>,
+    dt: TypeRoot,
     sz: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if dt.get_metatype() != type_metatype::TYPE_PTR {
         return None;
     }
@@ -756,13 +780,13 @@ fn piece_pointer_sizes(data: &Funcdata) -> (int4, int4) {
 #[allow(clippy::too_many_arguments)]
 pub fn propagate_type_pub(
     data: &mut Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     invn: VarnodeId,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     propagate_type(data, alttype, op, invn, outvn, inslot, outslot)
 }
 
@@ -770,13 +794,13 @@ pub fn propagate_type_pub(
 /// outgoing data-type, or `None` (no propagation).
 fn propagate_type(
     data: &mut Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     invn: VarnodeId,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let code = data.obank().get(op)?.code();
     let invn_is_spacebase = data.vbank().get(invn).map(|v| v.is_spacebase()).unwrap_or(false);
     match code {
@@ -956,14 +980,14 @@ fn propagate_type(
 #[allow(clippy::too_many_arguments)]
 fn propagate_load_store(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     invn_is_spacebase: bool,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
     is_load: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if inslot == 0 || outslot == 0 {
         return None; // Don't propagate along this edge
     }
@@ -992,22 +1016,20 @@ fn propagate_load_store(
                 }
             }
         }
-        let value = propagate_from_pointer(tlst, alttype, out_size)?;
-        // (kuna `structsynth nest`) A record's pointer to itself names its shell.
-        Some(crate::kuna_structsynth::resolve_self_pointer(tlst, &value).unwrap_or(value))
+        propagate_from_pointer(tlst, alttype, out_size)
     }
 }
 
 /// C++ `TypeOpPiece::propagateType` (typeop.cc:2076).
 fn propagate_piece(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     invn: VarnodeId,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let (near_ptr, far_ptr) = piece_pointer_sizes(data);
     let in_size = data.vbank().get(invn).map(|v| v.get_size())?;
     let out_size = data.vbank().get(outvn).map(|v| v.get_size())?;
@@ -1071,13 +1093,13 @@ fn compute_byte_offset_for_composite_piece(
 /// C++ `TypeOpSubpiece::propagateType` (typeop.cc:2163).
 fn propagate_subpiece(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     invn: VarnodeId,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let (near_ptr, far_ptr) = piece_pointer_sizes(data);
     let in_size = data.vbank().get(invn).map(|v| v.get_size())?;
     let out_size = data.vbank().get(outvn).map(|v| v.get_size())?;
@@ -1139,12 +1161,12 @@ fn compute_byte_offset_for_composite_subpiece(data: &Funcdata, op: OpId) -> Opti
 /// C++ `TypeOpEqual::propagateAcrossCompare` (typeop.cc:965).
 fn propagate_across_compare(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     invn_is_spacebase: bool,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if inslot == -1 || outslot == -1 {
         return None;
     }
@@ -1168,6 +1190,9 @@ fn propagate_across_compare(
             let tlst = arch.types()?;
             let base = tlst.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?;
             let ws = alttype.get_word_size().unwrap_or(1);
+            if let Some(space) = alttype.get_pointer_space() {
+                return tlst.get_type_pointer_with_space(alttype.get_size(), base, ws, space, "").ok();
+            }
             return tlst.get_type_pointer(alttype.get_size(), base, ws).ok();
         }
     }
@@ -1179,12 +1204,12 @@ fn propagate_across_compare(
 /// `downChain` walk routes through the existing `Datatype::down_chain` machinery.
 fn propagate_int_add(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let invn_meta = alttype.get_metatype();
     if invn_meta != type_metatype::TYPE_PTR {
         if invn_meta != type_metatype::TYPE_INT && invn_meta != type_metatype::TYPE_UINT {
@@ -1318,10 +1343,10 @@ fn propagate_add_pointer(data: &Funcdata, op: OpId, slot: int4, sz: int4) -> (in
 /// (preserving any containing TYPE_STRUCT/TYPE_ARRAY as a relative pointer).
 fn propagate_add_in2_out(
     data: &Funcdata,
-    alttype: Rc<Datatype>,
+    alttype: TypeRoot,
     op: OpId,
     inslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let arch = Rc::clone(data.get_arch());
     let tlst = arch.types_impl()?;
     let ptr_to = alttype.get_ptr_to()?;
@@ -1330,8 +1355,8 @@ fn propagate_add_in2_out(
     if command == 2 {
         return None; // Doesn't look like a good pointer add
     }
-    let mut pointer: Option<Rc<Datatype>> = Some(Rc::clone(&alttype));
-    let mut parent: Option<Rc<Datatype>> = None;
+    let mut pointer: Option<TypeRoot> = Some(alttype.clone());
+    let mut parent: Option<TypeRoot> = None;
     let mut parent_off: int8 = 0;
     if command != 3 {
         let word_size = alttype.get_word_size().unwrap_or(1);
@@ -1585,7 +1610,7 @@ fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
 
     let mut lastoff: uintb = 0;
     let mut lastsize: int4 = ct_size;
-    let mut lastct: Option<Rc<Datatype>> = Some(Rc::clone(&ct));
+    let mut lastct: Option<TypeRoot> = Some(ct.clone());
     for curvn in curvns {
         let (is_annot, written, no_descend, typelock, has_symentry, curoff_abs, cursize) =
             match data.vbank().get(curvn) {
@@ -1630,10 +1655,10 @@ fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
             // getExactPiece(ct, curoff, cursize).
             // cast: `curoff` (uintb) is the byte offset within `ct`, bounded by the
             // guard above (`curoff + cursize <= ct->getSize()`), so it fits int4.
-            lastct = typegrp.get_exact_piece(Rc::clone(&ct), curoff as int4, cursize).ok().flatten();
+            lastct = typegrp.get_exact_piece(ct.clone(), curoff as int4, cursize).ok().flatten();
         }
         let lct = match &lastct {
-            Some(c) => Rc::clone(c),
+            Some(c) => c.clone(),
             None => continue,
         };
         // A negative typeOrder here means the new type is more
@@ -1644,7 +1669,7 @@ fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
         };
         if 0 > lct.type_order(&cur_temp).unwrap_or(0) {
             if let Some(v) = data.vbank_mut().get_mut(curvn) {
-                v.set_temp_type(Rc::clone(&lct));
+                v.set_temp_type(lct.clone());
             }
             propagate_one_type(data, curvn);
         }
@@ -1658,7 +1683,7 @@ fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
 fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
     // spctype = spcvn->getType() (the absolute type, NOT temptype); must be
     // pointer-to-spacebase.
-    let spctype = match data.vbank().get(spcvn).map(|v| Rc::clone(v.get_type())) {
+    let spctype = match data.vbank().get(spcvn).map(|v| v.get_type().clone()) {
         Some(t) => t,
         None => return,
     };
@@ -1745,7 +1770,7 @@ fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
 /// C++ `ActionInferTypes::canonicalReturnOp` (coreaction.cc:5567).
 fn canonical_return_op(data: &Funcdata) -> Option<OpId> {
     let mut res: Option<OpId> = None;
-    let mut bestdt: Option<Rc<Datatype>> = None;
+    let mut bestdt: Option<TypeRoot> = None;
     for retop in data.obank().iter_code(OpCode::CPUI_RETURN) {
         let o = data.obank().get(retop)?;
         if o.is_dead() || o.get_halt_type() != 0 {
@@ -1798,7 +1823,7 @@ fn propagate_across_returns(data: &mut Funcdata) {
             None => return,
         };
         let ct = match v.get_temp_type() {
-            Some(t) => Rc::clone(t),
+            Some(t) => t.clone(),
             None => return,
         };
         (ct, v.get_size())
@@ -1832,12 +1857,12 @@ fn propagate_across_returns(data: &mut Funcdata) {
             if is_bool && v.get_nz_mask() > 1 {
                 continue;
             }
-            if v.get_temp_type().map(|t| Rc::ptr_eq(t, &ct)).unwrap_or(false) {
+            if v.get_temp_type().map(|t| t.id() == ct.id()).unwrap_or(false) {
                 continue;
             }
         }
         if let Some(v) = data.vbank_mut().get_mut(vn) {
-            v.set_temp_type(Rc::clone(&ct));
+            v.set_temp_type(ct.clone());
         }
         propagate_one_type(data, vn);
     }
@@ -1922,11 +1947,11 @@ mod propagate_type_tests {
         // int4 * --LOAD(4)--> int4   (propagateFromPointer: ptrto->getSize()==sz)
         let f = factory();
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
-        let ptr = f.get_type_pointer(8, Rc::clone(&int4t), 1).unwrap();
+        let ptr = f.get_type_pointer(8, int4t.clone(), 1).unwrap();
         let out = propagate_from_pointer(&f, ptr, 4).expect("should dereference");
         assert_eq!(out.get_metatype(), type_metatype::TYPE_INT);
         assert_eq!(out.get_size(), 4);
-        assert!(Rc::ptr_eq(&out, &int4t), "returns the exact pointee type");
+        assert_eq!(out.id(), int4t.id(), "returns the exact pointee type");
     }
 
     #[test]
@@ -1950,11 +1975,11 @@ mod propagate_type_tests {
         // int4 --STORE(value->ptr)--> int4 * (propagateToPointer of a plain value).
         let f = factory();
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
-        let out = propagate_to_pointer(&f, Rc::clone(&int4t), 8, 1).expect("should wrap");
+        let out = propagate_to_pointer(&f, int4t.clone(), 8, 1).expect("should wrap");
         assert_eq!(out.get_metatype(), type_metatype::TYPE_PTR);
         assert_eq!(out.get_size(), 8);
         let pointee = out.get_ptr_to().unwrap();
-        assert!(Rc::ptr_eq(&pointee, &int4t), "points at the original value type");
+        assert_eq!(pointee.id(), int4t.id(), "points at the original value type");
     }
 
     #[test]
@@ -1979,15 +2004,15 @@ mod propagate_type_tests {
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         let st = f.get_type_struct("twofield").unwrap();
         let fields = vec![
-            crate::dtype::TypeField::new(0, 0, "a", Rc::clone(&int4t)),
-            crate::dtype::TypeField::new(1, 4, "b", Rc::clone(&int4t)),
+            crate::dtype::TypeField::new(0, 0, "a", int4t.id()),
+            crate::dtype::TypeField::new(1, 4, "b", int4t.id()),
         ];
-        let st = f.assign_raw_fields_struct(&st, fields, Vec::new()).unwrap();
+        let st = f.set_fields_struct_raw(&st, fields, Vec::new(), 8, 4, 0).unwrap();
         let sz = st.get_size();
-        let ptr = f.get_type_pointer(8, Rc::clone(&st), 1).unwrap();
+        let ptr = f.get_type_pointer(8, st.clone(), 1).unwrap();
         let out = propagate_from_pointer(&f, ptr, sz).expect("deref whole struct");
         assert_eq!(out.get_metatype(), type_metatype::TYPE_STRUCT);
-        assert!(Rc::ptr_eq(&out, &st));
+        assert_eq!(out.id(), st.id());
     }
 
     // ---- W10 verifier (w10-type-propagation) adversarial tests ------------
@@ -2016,7 +2041,7 @@ mod propagate_type_tests {
         assert!(en.is_enum_type(), "fixture must be a real enum");
         let full = en.get_size();
         assert!(full >= 2, "enum must be wider than the truncated deref");
-        let ptr = f.get_type_pointer(8, Rc::clone(&en), 1).unwrap();
+        let ptr = f.get_type_pointer(8, en.clone(), 1).unwrap();
         // Dereference at a strictly smaller size than the enum.
         let out = propagate_from_pointer(&f, ptr, 1).expect("partial enum, not null");
         // C++ `TypePartialEnum(par,off,sz,strip)` chains `TypeEnum(sz,
@@ -2061,20 +2086,20 @@ mod propagate_type_tests {
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         // array of 3 int4 (align_size of element = 4); a partial at offset 0 of
         // a whole element should resolve to the int4 element type.
-        let arr = f.get_type_array(3, Rc::clone(&int4t)).unwrap();
-        let partial = f.get_type_partial_struct(Rc::clone(&arr), 0, 4).unwrap();
+        let arr = f.get_type_array(3, int4t.clone()).unwrap();
+        let partial = f.get_type_partial_struct(arr.clone(), 0, 4).unwrap();
         assert_eq!(partial.get_metatype(), type_metatype::TYPE_PARTIALSTRUCT);
         // getComponentForPtr should pick the element type (offset 0 % 4 == 0).
         let comp = partial.get_component_for_ptr().expect("component");
         assert!(
-            Rc::ptr_eq(&comp, &int4t),
+            comp.id() == int4t.id(),
             "element-aligned partial of an array maps to the element type"
         );
         let out = propagate_to_pointer(&f, partial, 8, 1).expect("pointer");
         assert_eq!(out.get_metatype(), type_metatype::TYPE_PTR);
         let pointee = out.get_ptr_to().unwrap();
         assert!(
-            Rc::ptr_eq(&pointee, &int4t),
+            pointee.id() == int4t.id(),
             "the produced pointer points at the array element, not the partial"
         );
     }
@@ -2090,24 +2115,24 @@ mod propagate_type_tests {
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         let st = f.get_type_struct("two").unwrap();
         let fields = vec![
-            crate::dtype::TypeField::new(0, 0, "a", Rc::clone(&int4t)),
-            crate::dtype::TypeField::new(1, 4, "b", Rc::clone(&int4t)),
+            crate::dtype::TypeField::new(0, 0, "a", int4t.id()),
+            crate::dtype::TypeField::new(1, 4, "b", int4t.id()),
         ];
-        let st = f.assign_raw_fields_struct(&st, fields, Vec::new()).unwrap();
-        let ptr = f.get_type_pointer(8, Rc::clone(&st), 1).unwrap();
+        let st = f.set_fields_struct_raw(&st, fields, Vec::new(), 8, 4, 0).unwrap();
+        let ptr = f.get_type_pointer(8, st.clone(), 1).unwrap();
         // downChain into offset 4 (the second field): parent must be the struct
         // pointer, parentOff the entry offset (4), result a pointer to field `b`.
         let (next, off, parent, par_off) = f.down_chain(&ptr, 4, true).expect("downchain");
         let parent = parent.expect("struct sets parent");
         assert_eq!(parent.get_metatype(), type_metatype::TYPE_PTR);
         assert!(
-            Rc::ptr_eq(&parent.get_ptr_to().unwrap(), &st),
+            parent.get_ptr_to().unwrap().id() == st.id(),
             "parent is the pointer to the containing struct"
         );
         assert_eq!(par_off, 4, "parentOff is the byte offset of entry");
         assert_eq!(off, 0, "landed exactly on field b");
         let next = next.expect("sub-pointer");
-        assert!(Rc::ptr_eq(&next.get_ptr_to().unwrap(), &int4t));
+        assert_eq!(next.get_ptr_to().unwrap().id(), int4t.id());
     }
 
     /// downChain on a *scalar* pointee must NOT set a parent (C++ only the
@@ -2143,15 +2168,15 @@ mod propagate_type_tests {
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         let st = f.get_type_struct("s").unwrap();
         let fields =
-            vec![crate::dtype::TypeField::new(0, 0, "a", Rc::clone(&int4t))];
-        let st = f.assign_raw_fields_struct(&st, fields, Vec::new()).unwrap();
-        let ptr = f.get_type_pointer(8, Rc::clone(&st), 1).unwrap();
+            vec![crate::dtype::TypeField::new(0, 0, "a", int4t.id())];
+        let st = f.set_fields_struct_raw(&st, fields, Vec::new(), 4, 4, 0).unwrap();
+        let ptr = f.get_type_pointer(8, st.clone(), 1).unwrap();
 
         // Exact replica of the FIXED propagate_add_in2_out do-while (allow_wrap=true,
         // type_offset=2 == 2 bytes into the int4 field).
         let mut type_offset: int8 = 2;
-        let mut pointer: Option<Rc<Datatype>> = Some(Rc::clone(&ptr));
-        let mut parent: Option<Rc<Datatype>> = None;
+        let mut pointer: Option<TypeRoot> = Some(ptr.clone());
+        let mut parent: Option<TypeRoot> = None;
         let mut parent_off: int8 = 0;
         let mut iters = 0;
         while let Some(cur) = pointer.clone() {
@@ -2175,7 +2200,7 @@ mod propagate_type_tests {
         let parent = parent.expect("struct container retained across scalar tail");
         assert_eq!(parent.get_metatype(), type_metatype::TYPE_PTR);
         assert!(
-            Rc::ptr_eq(&parent.get_ptr_to().unwrap(), &st),
+            parent.get_ptr_to().unwrap().id() == st.id(),
             "retained parent is the pointer to the containing struct"
         );
         assert_eq!(parent_off, 2, "parentOff is the byte offset into the struct");
@@ -2227,16 +2252,16 @@ mod propagate_type_tests {
     fn w10_r2_downchain_struct_with_array_field_retains_struct_across_strip() {
         let f = factory();
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
-        let arr = f.get_type_array(3, Rc::clone(&int4t)).unwrap(); // int4[3], size 12
+        let arr = f.get_type_array(3, int4t.clone()).unwrap(); // int4[3], size 12
         let st = f.get_type_struct("sa").unwrap();
-        let fields = vec![crate::dtype::TypeField::new(0, 0, "arr", Rc::clone(&arr))];
-        let st = f.assign_raw_fields_struct(&st, fields, Vec::new()).unwrap();
-        let ptr = f.get_type_pointer(8, Rc::clone(&st), 1).unwrap();
+        let fields = vec![crate::dtype::TypeField::new(0, 0, "arr", arr.id())];
+        let st = f.set_fields_struct_raw(&st, fields, Vec::new(), 12, 4, 0).unwrap();
+        let ptr = f.get_type_pointer(8, st.clone(), 1).unwrap();
 
         // Replay the FIXED loop body for byte offset 4 (== &s.arr[1]).
         let mut type_offset: int8 = 4;
-        let mut pointer: Option<Rc<Datatype>> = Some(Rc::clone(&ptr));
-        let mut parent: Option<Rc<Datatype>> = None;
+        let mut pointer: Option<TypeRoot> = Some(ptr.clone());
+        let mut parent: Option<TypeRoot> = None;
         let mut parent_off: int8 = 0;
         let mut saw_struct_parent = false;
         let mut saw_scalar_tail_none = false;
@@ -2245,7 +2270,7 @@ mod propagate_type_tests {
             let (next, new_off, par, par_off) = f.down_chain(&cur, type_offset, true).unwrap();
             type_offset = new_off;
             match &par {
-                Some(p) if Rc::ptr_eq(&p.get_ptr_to().unwrap(), &st) => saw_struct_parent = true,
+                Some(p) if p.get_ptr_to().unwrap().id() == st.id() => saw_struct_parent = true,
                 None if iters >= 1 => saw_scalar_tail_none = true,
                 _ => {}
             }
@@ -2275,7 +2300,7 @@ mod propagate_type_tests {
         // The retained container is the STRUCT (the array was stripped, so it
         // never became a `par`); the fix kept it across the par=None tail.
         assert!(
-            Rc::ptr_eq(&parent.get_ptr_to().unwrap(), &st),
+            parent.get_ptr_to().unwrap().id() == st.id(),
             "retained parent is the struct, kept across the scalar tail (F1 fix)"
         );
         assert_eq!(parent_off, 4, "parentOff is the byte offset into the struct");
@@ -2293,8 +2318,8 @@ mod propagate_type_tests {
         let ptr = f.get_type_pointer(8, int8t, 1).unwrap();
 
         let mut type_offset: int8 = 4;
-        let mut pointer: Option<Rc<Datatype>> = Some(Rc::clone(&ptr));
-        let mut parent: Option<Rc<Datatype>> = None;
+        let mut pointer: Option<TypeRoot> = Some(ptr.clone());
+        let mut parent: Option<TypeRoot> = None;
         let mut iters = 0;
         while let Some(cur) = pointer.clone() {
             let (next, new_off, par, par_off) = f.down_chain(&cur, type_offset, true).unwrap();
@@ -2324,9 +2349,9 @@ mod propagate_type_tests {
     fn w10_r2_component_for_ptr_misaligned_offset_returns_stripped_not_element() {
         let f = factory();
         let int4t = f.get_base(4, type_metatype::TYPE_INT).unwrap();
-        let arr = f.get_type_array(3, Rc::clone(&int4t)).unwrap();
+        let arr = f.get_type_array(3, int4t.clone()).unwrap();
         // partial struct over the array, offset 2 (misaligned within int4 element).
-        let partial_mis = f.get_type_partial_struct(Rc::clone(&arr), 2, 4).unwrap();
+        let partial_mis = f.get_type_partial_struct(arr.clone(), 2, 4).unwrap();
         let comp_mis = partial_mis
             .get_component_for_ptr()
             .expect("partial-struct yields a component");
@@ -2336,10 +2361,10 @@ mod propagate_type_tests {
             "misaligned offset must NOT take the element fast-path; returns stripped"
         );
         // Aligned offset 0 DOES take the element fast-path -> the int4 element.
-        let partial_aln = f.get_type_partial_struct(Rc::clone(&arr), 0, 4).unwrap();
+        let partial_aln = f.get_type_partial_struct(arr.clone(), 0, 4).unwrap();
         let comp_aln = partial_aln.get_component_for_ptr().expect("component");
         assert!(
-            Rc::ptr_eq(&comp_aln, &int4t),
+            comp_aln.id() == int4t.id(),
             "aligned element-boundary offset returns the array element type"
         );
     }

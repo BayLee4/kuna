@@ -23,7 +23,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::pcoderaw::VarnodeData;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::type_metatype;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::prefersplit::{PreferSplitManager, PreferSplitRecord};
 use kuna_decomp::context::ArchContext;
@@ -65,7 +65,11 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let arch = ArchContext::new(manage);
+    let types = arch.types_impl().unwrap();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -83,7 +87,7 @@ fn rec(space: Rc<AddrSpace>, off: u64, size: u32, splitoffset: int4) -> PreferSp
 }
 
 fn mk_vn(fd: &mut Funcdata, sp: Rc<AddrSpace>, off: u64, size: int4) -> kuna_decomp::context::VarnodeId {
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN));
+    let ct = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
     fd.vbank_mut().create(size, Address::new(sp, off), ct)
 }
 

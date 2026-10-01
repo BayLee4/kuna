@@ -31,14 +31,21 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::op::{gather_pieces, piece_is_leaf, PcodeOpBank, PieceNode};
 use kuna_decomp::ruleaction_6::RulePieceStructure;
 use kuna_decomp::context::{OpId, TypeOp, VarnodeId};
 use kuna_decomp::varnode::{DefOpInfo, VarnodeBank};
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn type_factory() -> TypeFactoryImpl {
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types
+}
+
+fn dt(types: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    types.intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 /// const(0), unique(1), ram(2) — `big_end` selects the ram endianness so the
@@ -108,13 +115,14 @@ fn mark_written(obank: &PcodeOpBank, vbank: &mut VarnodeBank, vn: VarnodeId, op:
 // A coincidental "always slot-0-gets-the-size" shortcut would FAIL this test.
 #[test]
 fn at1_gather_pieces_big_endian_offsets_are_mirrored() {
+    let types = type_factory();
     let m = manager(true); // BIG-endian ram
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut obank = PcodeOpBank::new();
 
-    let hi = vbank.create(4, ram(&m, 0x0), dt(4)); // slot 0, 4 bytes
-    let lo = vbank.create(4, ram(&m, 0x4), dt(4)); // slot 1, 4 bytes
-    let out = vbank.create(8, ram(&m, 0x0), dt(8));
+    let hi = vbank.create(4, ram(&m, 0x0), dt(&types, 4)); // slot 0, 4 bytes
+    let lo = vbank.create(4, ram(&m, 0x4), dt(&types, 4)); // slot 1, 4 bytes
+    let out = vbank.create(8, ram(&m, 0x0), dt(&types, 8));
     let op = piece_op(&mut obank, &mut vbank, &m, 0x100, out, hi, lo);
 
     let mut stack: Vec<PieceNode> = Vec::new();
@@ -148,15 +156,16 @@ fn at1_gather_pieces_big_endian_offsets_are_mirrored() {
 //   top.slot1 (c): 0
 #[test]
 fn at2_gather_pieces_nested_tree_dfs_order_and_accumulated_offsets() {
+    let types = type_factory();
     let m = manager(false); // little-endian
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut obank = PcodeOpBank::new();
 
-    let a = vbank.create(2, ram(&m, 0x10), dt(2));
-    let b = vbank.create(2, ram(&m, 0x12), dt(2));
-    let c = vbank.create(4, ram(&m, 0x20), dt(4));
-    let mid = vbank.create(4, ram(&m, 0x30), dt(4));
-    let out = vbank.create(8, ram(&m, 0x40), dt(8));
+    let a = vbank.create(2, ram(&m, 0x10), dt(&types, 2));
+    let b = vbank.create(2, ram(&m, 0x12), dt(&types, 2));
+    let c = vbank.create(4, ram(&m, 0x20), dt(&types, 4));
+    let mid = vbank.create(4, ram(&m, 0x30), dt(&types, 4));
+    let out = vbank.create(8, ram(&m, 0x40), dt(&types, 8));
 
     // inner: mid = PIECE(a, b)
     let inner = piece_op(&mut obank, &mut vbank, &m, 0x200, mid, a, b);
@@ -197,14 +206,15 @@ fn at2_gather_pieces_nested_tree_dfs_order_and_accumulated_offsets() {
 // ---------------------------------------------------------------------------
 #[test]
 fn at3_piece_is_leaf_when_two_descendants_force_lone_descend_null() {
+    let types = type_factory();
     let m = manager(false);
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut obank = PcodeOpBank::new();
 
     // mid = PIECE(a, b); mid is read by the top PIECE AND by a second consumer.
-    let a = vbank.create(2, ram(&m, 0x10), dt(2));
-    let b = vbank.create(2, ram(&m, 0x12), dt(2));
-    let mid = vbank.create(4, ram(&m, 0x30), dt(4));
+    let a = vbank.create(2, ram(&m, 0x10), dt(&types, 2));
+    let b = vbank.create(2, ram(&m, 0x12), dt(&types, 2));
+    let mid = vbank.create(4, ram(&m, 0x30), dt(&types, 4));
     let inner = piece_op(&mut obank, &mut vbank, &m, 0x200, mid, a, b);
     mark_written(&obank, &mut vbank, mid, inner);
 
@@ -234,16 +244,17 @@ fn at3_piece_is_leaf_when_two_descendants_force_lone_descend_null() {
 // ---------------------------------------------------------------------------
 #[test]
 fn at4_piece_is_leaf_addrtied_address_mismatch() {
+    let types = type_factory();
     let m = manager(false);
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut obank = PcodeOpBank::new();
 
     // root at ram:0x100 (8 bytes); the candidate `mid` is PIECE-defined,
     // addr-tied, lone-descended.
-    let a = vbank.create(2, ram(&m, 0x10), dt(2));
-    let b = vbank.create(2, ram(&m, 0x12), dt(2));
-    let root = vbank.create(8, ram(&m, 0x100), dt(8));
-    let mid = vbank.create(4, ram(&m, 0x104), dt(4)); // sits at root+4
+    let a = vbank.create(2, ram(&m, 0x10), dt(&types, 2));
+    let b = vbank.create(2, ram(&m, 0x12), dt(&types, 2));
+    let root = vbank.create(8, ram(&m, 0x100), dt(&types, 8));
+    let mid = vbank.create(4, ram(&m, 0x104), dt(&types, 4)); // sits at root+4
     let inner = piece_op(&mut obank, &mut vbank, &m, 0x200, mid, a, b);
     mark_written(&obank, &mut vbank, mid, inner);
     // exactly one descendant (loneDescend != null)
@@ -278,14 +289,17 @@ fn at4_piece_is_leaf_addrtied_address_mismatch() {
 #[test]
 fn at5_spanning_range_overrun_returns_false() {
     // A bare 8-byte STRUCT (metatype TYPE_STRUCT == 4 <= TYPE_ARRAY -> piece-structured).
-    let ct = Rc::new(Datatype::new(8, type_metatype::TYPE_STRUCT));
+    let types = type_factory();
+    let mut draft = Datatype::new(8, type_metatype::TYPE_STRUCT);
+    draft.kind = DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
+    let ct = types.intern(draft).unwrap();
     // offset 6 + size 4 = 10 > 8 -> the `offset+size > ct->getSize()` guard fires.
     assert!(
         !RulePieceStructure::spanning_range(&ct, 6, 4).unwrap(),
         "a range overrunning the struct must return false (not-spanning)"
     );
     // A range fully inside (offset 0 + size 8 == 8, not >) does NOT take the
-    // early-false; with no concrete subtype factory the getSubType walk returns
+    // early-false; with no component fields the getSubType walk returns
     // None -> true ("don't know, assume multiple").
     assert!(
         RulePieceStructure::spanning_range(&ct, 0, 8).unwrap(),

@@ -1,9 +1,7 @@
 //! Unit tests for `slotptr`: which pointer types a slot may take, and what counts
 //! as a foreign access to the slot.
 
-use std::rc::Rc;
-
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory, TypeFactoryImpl};
 
 use super::{admit, Decline, SlotEvidence, SlotStore};
 
@@ -21,7 +19,7 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn ptr(f: &TypeFactoryImpl, to: Rc<Datatype>, size: i32) -> Rc<Datatype> {
+fn ptr(f: &TypeFactoryImpl, to: TypeRoot, size: i32) -> TypeRoot {
     f.get_type_pointer(size, to, 1).unwrap()
 }
 

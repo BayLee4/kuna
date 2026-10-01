@@ -76,7 +76,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{BlockId, OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::p0_knowledge::options::on_or_off;
 use crate::varmap::{MapState, RangeHint, RangeType, COPY_CONSTANT};
@@ -580,8 +580,8 @@ fn blocks(h: &RangeHint, w: &PointerWalk) -> bool {
         && (h.type_.get_metatype() != type_metatype::TYPE_UNKNOWN || h.size as i64 != w.step)
 }
 
-fn element_type(hints: &[RangeHint], w: &PointerWalk) -> Option<Rc<Datatype>> {
-    let mut elem: Option<Rc<Datatype>> = None;
+fn element_type(hints: &[RangeHint], w: &PointerWalk) -> Option<TypeRoot> {
+    let mut elem: Option<TypeRoot> = None;
     for h in hints {
         if h.sstart < w.start || h.sstart >= w.end || h.type_.get_size() as i64 != w.step {
             continue;
@@ -599,7 +599,7 @@ fn element_type(hints: &[RangeHint], w: &PointerWalk) -> Option<Rc<Datatype>> {
             continue;
         }
         if elem.as_ref().is_none_or(|e| h.type_.type_order(e).is_ok_and(|o| o < 0)) {
-            elem = Some(Rc::clone(&h.type_));
+            elem = Some(h.type_.clone());
         }
     }
     elem

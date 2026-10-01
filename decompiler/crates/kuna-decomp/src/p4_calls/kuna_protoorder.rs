@@ -24,7 +24,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::infra::architecture::Architecture;
 use crate::p4_calls::fspec::{FuncCallSpecs, FuncProto, PrototypePieces};
@@ -145,7 +145,7 @@ impl OptionProtoOrder {
 pub struct RecoveredTypes {
     /// One entry per recovered parameter, in the callee's own order: the storage
     /// recovery put it in, and the type recovery gave it.
-    pub inputs: Vec<(Address, int4, Rc<Datatype>)>,
+    pub inputs: Vec<(Address, int4, TypeRoot)>,
     /// Would [`ProtoOrderMode::Lock`]'s arity policy accept this list -- it does
     /// not end on the register-file boundary a variadic's register-save prologue
     /// leaves, and it is where the convention would put those types?  Computed
@@ -155,7 +155,7 @@ pub struct RecoveredTypes {
     /// The recovered return value -- storage, size and type -- when it is not
     /// `void`.  Recorded only when `option passthrough` is on, whose tail-call
     /// arm is its one reader; `None` otherwise.
-    pub output: Option<(Address, int4, Rc<Datatype>)>,
+    pub output: Option<(Address, int4, TypeRoot)>,
     /// The storage of every parameter in [`Self::inputs`] the callee's body only
     /// ever feeds to a variadic tail
     /// ([`crate::p4_calls::kuna_varargtail`]): read by the callee, but only
@@ -175,7 +175,7 @@ impl RecoveredTypes {
     /// there are; storage alone would let a register the conventions reuse carry
     /// a type across a slot boundary.  Together they say "we are talking about
     /// the same argument", which is the only claim a type vote may rest on.
-    pub fn param_type_at(&self, index: usize, addr: &Address, size: int4) -> Option<&Rc<Datatype>> {
+    pub fn param_type_at(&self, index: usize, addr: &Address, size: int4) -> Option<&TypeRoot> {
         let (paddr, psize, ct) = self.inputs.get(index)?;
         if psize != &size || paddr != addr {
             return None;
@@ -207,10 +207,10 @@ pub fn call_argument_vote(
     fc: &FuncCallSpecs,
     slot: int4,
     arg_size: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let ct = stated_argument_type(data, fc, slot)?;
     if vote_holds(data, op, fc, slot, arg_size, ct)? {
-        return Some(Rc::clone(ct));
+        return Some(ct.clone());
     }
     let bare = crate::kuna_structheadless::bare_pointer_for(data, ct)?;
     vote_holds(data, op, fc, slot, arg_size, &bare)?.then_some(bare)
@@ -223,7 +223,7 @@ fn vote_holds(
     fc: &FuncCallSpecs,
     slot: int4,
     arg_size: int4,
-    ct: &Rc<Datatype>,
+    ct: &TypeRoot,
 ) -> Option<bool> {
     if class_of(ct).is_none()
         || ct.get_size() > arg_size
@@ -273,7 +273,7 @@ fn points_into_code(data: &Funcdata, op: OpId, vn: VarnodeId) -> bool {
     })
 }
 
-fn stated_argument_type<'a>(data: &'a Funcdata, fc: &FuncCallSpecs, slot: int4) -> Option<&'a Rc<Datatype>> {
+fn stated_argument_type<'a>(data: &'a Funcdata, fc: &FuncCallSpecs, slot: int4) -> Option<&'a TypeRoot> {
     let stated = data.kuna_protoorder_types(fc.get_entry_address())?;
     let index = (slot - 1) as usize;
     let (addr, size) = fc.final_input_storage().get(index)?;
@@ -394,7 +394,7 @@ enum Class {
     Float,
 }
 
-fn class_of(ct: &Datatype) -> Option<Class> {
+fn class_of(ct: &TypeRoot) -> Option<Class> {
     match ct.get_metatype() {
         type_metatype::TYPE_PTR | type_metatype::TYPE_PTRREL => Some(Class::Pointer),
         type_metatype::TYPE_FLOAT => Some(Class::Float),
@@ -409,7 +409,7 @@ fn class_of(ct: &Datatype) -> Option<Class> {
 
 /// A float vote in a general register is ordinary (soft-float ABIs); an integer
 /// or pointer vote in a float register is a bit reinterpretation.
-fn storage_disagrees(proto: &FuncProto, addr: &Address, size: int4, ct: &Datatype) -> bool {
+fn storage_disagrees(proto: &FuncProto, addr: &Address, size: int4, ct: &TypeRoot) -> bool {
     if ct.get_metatype() == type_metatype::TYPE_FLOAT || !proto.has_model() {
         return false;
     }
@@ -471,7 +471,7 @@ enum Reading<'a> {
 /// outrank a caller's type `ct` for it?  The refusals a callee's vote meets at
 /// a call site, asked of the callee's own uses, and one more for a character
 /// pointer ([`splits_a_wide_constant`]).
-pub(crate) fn input_refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
+pub(crate) fn input_refuses(data: &Funcdata, vn: VarnodeId, ct: &TypeRoot) -> bool {
     class_of(ct).is_none()
         || family_refuses(data, vn, Reading::Input, ct)
         || indexes_a_pointer(data, vn)
@@ -517,7 +517,7 @@ pub(crate) fn handed_to_a_declared_pointer(data: &Funcdata, vn: VarnodeId) -> bo
 
 /// (kuna `calleevote`) Does the function load or store through its input `vn`
 /// anywhere but the one pointee of `ct` at offset zero?
-pub(crate) fn reaches_past_the_pointee(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
+pub(crate) fn reaches_past_the_pointee(data: &Funcdata, vn: VarnodeId, ct: &TypeRoot) -> bool {
     let Some(pointee) = ct.get_ptr_to() else { return false };
     let Some((accesses, _)) = accesses_through(data, &value_family(data, vn)) else { return true };
     accesses.iter().any(|a| a.stride != 0 || a.at < 0 || a.at + a.size as i64 > pointee.get_size() as i64)
@@ -528,7 +528,7 @@ pub(crate) fn reaches_past_the_pointee(data: &Funcdata, vn: VarnodeId, ct: &Data
 /// byte?  For a `char *` the stores are the ones through the value itself; for
 /// a pointer to a pointer, the ones through every pointer-width value loaded
 /// through it or stored through it, which take the pointee.
-fn splits_a_wide_constant(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: u32) -> bool {
+fn splits_a_wide_constant(data: &Funcdata, family: &[VarnodeId], ct: &TypeRoot, depth: u32) -> bool {
     let Some(pointee) = ct.get_ptr_to() else { return false };
     let character = pointee.get_size() == 1 && pointee.is_char_print();
     if !character && (pointee.get_metatype() != type_metatype::TYPE_PTR || depth >= 2) {
@@ -557,7 +557,7 @@ fn splits_a_wide_constant(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, 
 /// `int *`.  So does a parameter of the caller's own in a register the
 /// convention never passes a float in, and, for a member, a load through
 /// another pointer that nothing reads as a float.
-fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatype) -> bool {
+fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &TypeRoot) -> bool {
     let class = class_of(ct);
     let mut float_seen = false;
     let mut integer_seen = false;
@@ -881,7 +881,7 @@ pub(crate) fn accesses_through(data: &Funcdata, family: &[VarnodeId]) -> Option<
 }
 
 enum Member {
-    Exact(Rc<Datatype>),
+    Exact(TypeRoot),
     Gap,
     Split,
 }
@@ -890,8 +890,8 @@ enum Member {
 /// (nested) member, a hole in a structure, or anything else -- part of a member,
 /// or several at once, which the split rules print piece by piece
 /// (`v6._0_1_ = a4[1].field_0x0`).
-fn member_at(ct: &Rc<Datatype>, off: i64, size: int4) -> Member {
-    let composite = |t: &Datatype| {
+fn member_at(ct: &TypeRoot, off: i64, size: int4) -> Member {
+    let composite = |t: &TypeRoot| {
         matches!(
             t.get_metatype(),
             type_metatype::TYPE_STRUCT
@@ -901,7 +901,7 @@ fn member_at(ct: &Rc<Datatype>, off: i64, size: int4) -> Member {
                 | type_metatype::TYPE_PARTIALUNION
         )
     };
-    let mut t = Rc::clone(ct);
+    let mut t = ct.clone();
     let mut o = off;
     for _ in 0..16 {
         if o == 0 && t.get_size() == size && !composite(&t) {
@@ -945,7 +945,7 @@ fn member_at(ct: &Rc<Datatype>, off: i64, size: int4) -> Member {
 /// anything but a float, or hands on: the float-vote rule one level down, so
 /// `u->l[0] = v + 1` through a union a callee reads as `double *` does not print
 /// as `*a0 = (double)(a1 + 1)`.
-fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: u32) -> bool {
+fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &TypeRoot, depth: u32) -> bool {
     let (pointee, base) = match ct.get_metatype() {
         type_metatype::TYPE_PTR => (ct.get_ptr_to(), 0),
         type_metatype::TYPE_PTRREL => (ct.get_rel_parent(), ct.get_byte_offset().unwrap_or(0) as i64),
@@ -990,7 +990,7 @@ fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: 
     {
         return true;
     }
-    let mut floats: Vec<(&Access, Rc<Datatype>)> = Vec::new();
+    let mut floats: Vec<(&Access, TypeRoot)> = Vec::new();
     for a in &accesses {
         let at = a.at.wrapping_add(base);
         if a.stride % size != 0 || (!float && a.stride != 0 && a.stride.abs() != size) {
@@ -1304,7 +1304,7 @@ pub fn recovered_pieces(
         if addr.is_invalid() || param.get_size() <= 0 {
             return Err(Decline::InvalidStorage);
         }
-        pieces.intypes.push(Rc::clone(ct));
+        pieces.intypes.push(ct.clone());
         let pname = param.get_name();
         pieces.innames.push(if pname.is_empty() { format!("a{i}") } else { pname.to_string() });
         storage.push((addr, param.get_size()));
@@ -1627,7 +1627,7 @@ fn arity_claim_sound(
 fn recovered_output(
     proto: &FuncProto,
     data: &crate::funcdata::Funcdata,
-) -> Option<(Address, int4, Rc<Datatype>)> {
+) -> Option<(Address, int4, TypeRoot)> {
     let out = proto.get_output();
     let ct = out.get_type()?;
     if ct.get_metatype() == type_metatype::TYPE_VOID {
@@ -1640,7 +1640,7 @@ fn recovered_output(
     if addr.is_invalid() || out.get_size() <= 0 {
         return None;
     }
-    Some((addr, out.get_size(), Rc::clone(ct)))
+    Some((addr, out.get_size(), ct.clone()))
 }
 
 /// State the callee's recovered TYPES for the callers still ahead of it, without
@@ -1668,13 +1668,13 @@ fn state_recovered_types(
     pieces: PrototypePieces,
     storage: Vec<(Address, int4)>,
     arity_sound: bool,
-    output: Option<(Address, int4, Rc<Datatype>)>,
+    output: Option<(Address, int4, TypeRoot)>,
     vararg_tail: Vec<Address>,
 ) -> Result<Recovered, Decline> {
-    let inputs: Vec<(Address, int4, Rc<Datatype>)> = storage
+    let inputs: Vec<(Address, int4, TypeRoot)> = storage
         .iter()
         .zip(pieces.intypes.iter())
-        .map(|((addr, size), ct)| (addr.clone(), *size, Rc::clone(ct)))
+        .map(|((addr, size), ct)| (addr.clone(), *size, ct.clone()))
         .collect();
     if inputs.is_empty() {
         return Err(Decline::VoidVoid);
@@ -1709,10 +1709,14 @@ pub fn forget_statements_naming(arch: &mut Architecture, names: &[String]) {
 }
 
 /// Is `ct`, or what it points at at any depth, named one of `names`?
-pub(crate) fn names_type(ct: &Rc<Datatype>, names: &[String]) -> bool {
-    let mut cur = Rc::clone(ct);
+pub(crate) fn names_type(ct: &TypeRoot, names: &[String]) -> bool {
+    let mut cur = ct.clone();
     for _ in 0..8 {
-        if names.iter().any(|n| n == cur.get_name()) {
+        let named = {
+            let view = cur.read();
+            view.get(cur.id()).is_ok_and(|t| names.iter().any(|n| n == t.get_name()))
+        };
+        if named {
             return true;
         }
         match cur.get_ptr_to() {

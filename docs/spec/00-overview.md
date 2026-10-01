@@ -515,16 +515,18 @@ Four front-ends drive one engine assembly:
   lands in a negative-cache range list (never re-queried) and its
   readonly/volatile bits paint a local property map that `clear()` rolls back
   to the locked default. Namespace ids resolve once through getNamespacePath.
-  A decoded LOCKED signature (typelocked params or a locked-void input) parks a
-  `TypeCode` prototype for `query_callee_proto` plus `PrototypePieces` for
-  `ActionDefaultParams` and — for the current function — seeds the fresh
-  `Funcdata`'s prototype at `decompileAt`, whose display name now comes from
+  A decoded signature is retained as an immutable, entry-address-keyed
+  `FuncProto` in `RemoteFunctionFacts`, independently of structural `TypeCode`
+  interning. `query_callee_proto`, `ActionDefaultParams`, resolved function
+  lookups, and fresh current functions copy that same prototype, preserving
+  exact storage and independent input/output locks (chapter 04). The current
+  function's display name comes from
   the mapsym answer (the Java `Function.getName()` echo), getCodeLabel demoted
   to fallback. The decoded `<function noreturn>` fact truncates flow at
   no-return call sites, exactly as the console's analysis facts do.
   Types: registerProgram decodes the wire `<coretypes>` (so kuna's core-type
-  ids equal the host's), and a `find_by_id` miss fetches the definition with
-  getDataType (`decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+  ids equal the host's), and an exact source/instance lookup miss fetches the
+  definition with getDataType (`decompiler/crates/kuna-decomp/src/substrate/dtype_factory.rs
   (decode_type, decode_core_types, find_by_id_or_remote)`); composites intern
   an incomplete stub before their fields decode so a self-referential struct
   cannot re-query forever. Comments fill once per flush cycle from getComments,
@@ -598,6 +600,10 @@ Four front-ends drive one engine assembly:
   instead of re-querying unboundedly.  setOptions follows the upstream
   reset-then-apply contract (`Architecture::reset_wire_defaults` + the DIV-77
   preset layer before every decode) because Java delta-encodes the list.
+  The adapter overlays Java's sparse defaults for NULL/inplace printing and
+  function braces through shared setters. Action defaults and derived roots
+  reset to `decompile`; program facts are retained. Java replays the chosen
+  style after options when initializing a process, not after every snapshot.
   ghidra-mode also prints a `Kuna v…` plate comment (the release
   `KUNA_VERSION` bake, `kuna_banner_text`) at the top of every function —
   cache-only, HEADER-typed, rendered by the printer's plate arm
@@ -610,8 +616,12 @@ Four front-ends drive one engine assembly:
   comments, decoded strings.
   `setOptions` decodes the `<optionslist>` for real through
   `decompiler/crates/kuna-decomp/src/p0_knowledge/options.rs (decode_lenient)`
-  — every known option applies, unknown elements are skipped whole with a
-  "Warning:"-prefixed 16/17 line (DIV-76), and the command always answers `t`.
+  — unknown elements are skipped whole with a "Warning:"-prefixed 16/17 line
+  (DIV-76). Known options parse and apply sequentially; invalid values, malformed
+  parameters, unsupported languages, or missing roots/models stop the list and
+  answer `f`, without rolling back preceding entries. A valid replacement
+  snapshot recovers the session. `protoeval=default` selects the compiler
+  specification's default prototype model.
   registerProgram also applies the CLI `aggressive` ENGINE-TIER preset (the
   GUI has no `--mode` surface) and flips address-derived fallback naming to the
   Ghidra GUI convention `FUN_`/`DAT_`/`LAB_` (DIV-77) via
@@ -660,7 +670,13 @@ Four front-ends drive one engine assembly:
   cover the storage yet the naming pass declined the bind as a CONFLICT (the
   narrower addr-tied return over a wider scalar parameter; the float8 lane over
   a float4 param) — a data-flow-HASHED one, upstream's `buildDynamicSymbol`
-  answer. The encode never re-derives a container binding itself: doing so
+  answer. Named computed spacebase-derived pointers participate in this
+  linking; only non-nameable canonical stack-pointer inputs are excluded.
+  Their `HighOther` class does not prevent a real symbol reference. A dynamic
+  symbol retains both the hash and the anchor address returned by
+  `dynamic_unique_hash`: its replay range must use that anchor, which can
+  differ from the defining instruction when the hash crosses a CAST.
+  The encode never re-derives a container binding itself: doing so
   would hand a conflict-separated high the parameter's id, and a rename from
   that variable's token would rename the parameter. Wire symbols are encoded
   into `<localdb>` and referenced by `<high symref>`, but never enter the
@@ -700,6 +716,14 @@ Four front-ends drive one engine assembly:
   pair.  The markup `<function>` is rendered BEFORE `fd.encode` runs (the
   link pass must not perturb the printed C) and spliced after the syntax tree,
   keeping the upstream document order.
+  Each operation's `<seqnum>` carries its instruction address and `uniq`
+  identity as attributes, not as a nested `<addr>`. The Rust reader
+  (`decompiler/crates/kuna-base/src/address.rs (SeqNum::decode)`) owns exactly
+  that element: it reads address attributes without opening a child and
+  independently scans `uniq`, regardless of attribute order. An absent `uniq`
+  retains the unspecified-identity sentinel `u32::MAX`. Both XML and packed
+  decoding must preserve the address and identity and leave the next sibling
+  readable; losing `uniq` conflates operations at the same instruction.
   The rename/retype PERSISTENCE loop closes the circle: a GUI edit is a DB
   write (`HighFunctionDBUtil.updateDBVariable`) followed by an event-driven
   re-decompile whose getMappedSymbols answer now carries the edited local in
@@ -726,24 +750,21 @@ Four front-ends drive one engine assembly:
   `DynamicHash::find_varnode` by
   `Funcdata::kuna_apply_dynamic_recommendations`).  Dropping the hash-storage
   half would silently revert renames of exactly the register/temporary
-  variables users rename most.  The host's declared prototype MODEL and its
-  EXACT committed parameter storage ride along too
-  (`Architecture::kuna_pending_proto_model`,
-  `Funcdata::apply_locked_prototype_with_model`, and the decoded cat-0
-  storage threaded into `Funcdata::apply_mapped_params`, whose slots are
-  counted in the SAME compacted basis `RemoteProto::to_pieces` builds).  The
+  variables users rename most. The host's model, exact committed parameter
+  storage, and independent parameter flags ride in the canonical function
+  prototype (`RemoteScope::prototype_at`, `Funcdata::new`), not through the
+  standalone declaration or mapped-parameter assignment adapters. The
   storage echo is the load-bearing half: Java's `checkFullCommit` compares the
   parameter COUNT, each `categoryIndex`, and each storage — never the model
   name — so a kuna-rederived storage or a slot skew force-rewrites the user's
-  signature on the next rename.  The model rides along because the storage kuna
-  would otherwise derive comes from it, not because Java inspects it.  Those
-  echoed pieces carry the `ParameterPieces` lock bits (`TYPELOCK|NAMELOCK`),
-  never the same-named `varnode_flags` ones — the two namespaces share no bit,
-  and `apply_mapped_params` re-`setParam`s each slot WHOLESALE after the
-  prototype channel has already locked it, so unlocked pieces here silently
-  unlock the whole signature (`FuncProto::isInputLocked` reads slot 0's
-  typelock) and the host's declared types and names get re-derived instead of
-  applied.
+  signature on the next rename. `Funcdata::link_proto_params` explicitly
+  translates parameter flags into local symbol attributes, including
+  name/type locks and hidden-return/indirect/this metadata. Reusing an exact
+  mapped symbol preserves its independently committed name/type locks; an
+  unlocked recovered parameter must not erase a user's mapping. Java then
+  receives the committed input storage, including auto-parameter identity,
+  while returned output storage uses its normalized physical pieces and
+  lowered datatype.
 
 (kuna) **Locating the engine and the specs.** Two installations are first class
 (`decompiler/crates/kuna-cli/src/paths.rs (binary, specs_dir)`), and neither is
@@ -954,7 +975,12 @@ string. The function is then driven once more without those overrides. Under
 once, read the constant format strings off the lifted printf/scanf-family
 `CALL`s, install the derived overrides and decompile a second time. Reading a
 constant that way needs read-only propagation, so the step enables it for the
-duration of the loop and restores the prior value. The caller supplies only the facts it has — the console its `map addr` /
+duration of the loop and restores the prior value. Completed callpoint
+prototypes and their standalone format-origin markers share the caller-owned
+`Override` store; declaration pieces are lowered once rather than rebuilt
+under a default model during flow. Host overrides use the same completed
+representation without being mistaken for standalone format discoveries.
+The caller supplies only the facts it has — the console its `map addr` /
 `parse line` / `override` state, the whole-binary loop the function's DWARF
 locals and the no-return flow prunes — through one seed struct, and both the
 console `decompile` command
@@ -1649,6 +1675,15 @@ not be pasted back at it, and the manual's own example
 (`prototype authenticate int authenticate(char *user,char *pass)`) was rejected
 as a syntax error.
 
+Integer literals in declarations preserve the full unsigned 64-bit domain:
+`0x8000000000000000` and `0xffffffffffffffff` remain distinct enum values,
+rather than both saturating at the signed maximum. Base detection and
+longest-valid-prefix scanning are unchanged; negative literals retain signed
+saturation and their two's-complement bit pattern. Positive overflow beyond
+64 bits saturates at the unsigned maximum. Array counts and bitfield widths
+must fit the engine's signed 32-bit size representation, so a wide literal
+cannot silently wrap into a small positive dimension.
+
 The grammar therefore also accepts the standard C scalar specifiers
 (`decompiler/crates/kuna-console/src/grammar.rs (CParse::scalar_specifier)`):
 `void`, `char`, `short`, `int`, `long`, `float`, `double`, `signed`, `unsigned`,
@@ -1926,6 +1961,14 @@ still orders the way it did — `decompiler/crates/kuna-decomp/src/substrate/op.
 the CFG, and `sblocks`, the structuring tree — physically distinct, seeded as a
 `BlockCopy` mirror of the CFG when structuring begins
 (`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs (seed_sblocks_copy)`).
+
+Attaching an already-used constant to another operation can duplicate it
+(`decompiler/crates/kuna-decomp/src/substrate/funcdata_op.rs
+(Funcdata::op_set_input, Funcdata::copy_symbol)`). A same-size duplicate keeps
+the source Varnode's datatype and type/name locks even without a Symbol;
+associated HighVariable type/flag caches are dirtied. This copies the Varnode
+type, not an equate Symbol's potentially size-one placeholder type, and leaves
+cross-size equate-fold behavior unchanged.
 
 The varnode bank's two sorted trees are the container the decompiler touches most
 — a large function creates and destroys well over a million Varnodes, each one
@@ -2278,6 +2321,23 @@ only what a reduced flow analysis needs — the switch-recovery sub-decompilatio
 of §2.3 runs under it), `normalize`, `paramid`, `register`, `firstpass`. A
 variant is a filter over the same tree, not a separate pipeline, which is what
 makes reduced sub-queries cheap.
+
+`ActionDatabase` owns both the selected root name and its executable tree.
+Selection derives before committing, so an unknown root leaves the current
+root intact. Group replacement, cloning, and subgroup toggles invalidate the
+affected cached tree and rebuild it immediately if selected; ordinary selection
+preserves cached rule state. Reset retains the universal registration, discards
+custom groups and derived trees, and selects the default `decompile` root.
+Rule membership comes only from each registration's primary group or explicit
+compatibility aliases. Concrete `clone_rule` methods copy state without a second
+membership test; executable pools and schedule listings use the same predicate.
+
+The shared seeded drive obeys the selected root, including host prototype,
+local, and override facts. CLI/console full-decompile entry points explicitly
+select `decompile`. Temporary named and jumptable drives restore the previous
+valid root on success, failure, or unwind. Cross-flow restarts retain explicit
+entry prototype and mapped-parameter seeds rather than replacing them with the
+host's canonical prototype; ordinary drives do not copy those absent seeds.
 
 The shape, outermost-in: a RestartGroup wraps setup passes (constant-base,
 default params, extrapop, prototype seeding, function linking), then

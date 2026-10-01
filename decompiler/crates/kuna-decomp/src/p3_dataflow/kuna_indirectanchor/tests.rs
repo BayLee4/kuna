@@ -44,6 +44,10 @@ fn build_fd(on: bool) -> Funcdata {
     )))
     .unwrap();
     let mut ctx = ArchContext::new(m);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.indirect_anchor = on;
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());

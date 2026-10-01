@@ -47,21 +47,20 @@
 //! # How a W5 rule registers (READ THIS before adding rules)
 //!
 //! A rule is a type implementing [`Rule`].  The *only* required methods are
-//! [`Rule::clone_rule`] (the group-filter clone — return `Some(boxed self)`
-//! iff `grouplist` contains your group) and [`Rule::apply_op`] (the
+//! [`Rule::clone_rule`] (clone implementation state, without membership checks)
+//! and [`Rule::apply_op`] (the
 //! transformation).  Optionally override [`Rule::get_op_list`] to restrict the
 //! opcodes you are offered (default = every opcode, the C++
 //! `Rule::getOpList` default).
 //!
 //! Per-rule **state the engine owns** (name, group, enable/disable flag,
 //! breakpoints, `count_tests`/`count_apply` statistics, warning flags) lives in
-//! [`RuleState`], not in your struct — exactly as the prompt's "engine wrapper
-//! owns counts/breakpoints/warnings/flags" mandates.  You construct your rule
-//! with its group string and the engine wraps it.  The convention is a
+//! [`RuleState`], not in your struct. The registered primary group and explicit
+//! compatibility aliases are the sole rule-membership authority. The convention is a
 //! [`RuleSpec`] row:
 //!
 //! ```ignore
-//! RuleSpec { group: "analysis", ctor: || Box::new(RuleTermOrder::new()) }
+//! RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTermOrder::new()) }
 //! ```
 //!
 //! and the W5 `universal_action` builder pushes specs into pools with
@@ -303,7 +302,7 @@ impl ActionBase {
 
     /// Reset for a new function (C++ `Action::reset`): status back to start and
     /// clear the warning-given latch.
-    fn reset_base(&mut self) {
+    pub(crate) fn reset_base(&mut self) {
         self.status = statusflags::status_start;
         self.flags &= !ruleflags::rule_warnings_given;
     }
@@ -344,6 +343,7 @@ impl WarningSink {
 /// The result of a single [`Action::apply`] / [`Action::perform`] step,
 /// mirroring the C++ convention that `int4` doubles as a status code: a
 /// non-negative value is a change count, `-1` is a breakpoint/partial return.
+/// A fatal [`ActionContext`] error takes precedence over this scalar status.
 pub type ApplyResult = int4;
 
 /// Large-scale transformation applied to the varnode/op graph (C++ `Action`).
@@ -364,8 +364,9 @@ pub trait Action {
     ///
     /// Returns the number of changes via `base_mut().count` increments (as in
     /// C++) and an `int4`: `0` for complete application, `-1` for a partial
-    /// completion (breakpoint).  `ctx` carries the engine-side sinks the C++
-    /// reaches through `glb`.
+    /// completion (breakpoint). A fatal failure calls [`ActionContext::fail`]
+    /// and returns immediately; the driver propagates the original error.
+    /// `ctx` also carries the engine-side sinks the C++ reaches through `glb`.
     fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult;
 
     /// Clone this Action filtered by `grouplist` (C++ virtual
@@ -468,9 +469,13 @@ pub trait Action {
 
     /// Run this Action until completion or a breakpoint (C++ non-virtual
     /// `Action::perform`, `action.cc:298`).  Returns the change count, or `-1`
-    /// on a breakpoint.  Resumes from a prior partial return via the `status`
-    /// state.
+    /// on a breakpoint or a fatal error recorded in `ctx`. Drivers must take
+    /// and return a recorded error before interpreting the scalar result.
+    /// Resumes from a prior breakpoint via the `status` state.
     fn perform(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        if ctx.has_error() {
+            return -1;
+        }
         loop {
             // --- the status switch with C++ fall-through preserved ---------
             let st = self.base().status;
@@ -503,6 +508,10 @@ pub trait Action {
                 } else {
                     self.apply(data, ctx) // Start or continue action
                 };
+                if ctx.has_error() {
+                    return -1;
+                }
+                if ctx.reflow_requested { return self.base().count; }
                 if res < 0 {
                     // negative indicates partial completion
                     self.base_mut().status = statusflags::status_mid;
@@ -562,6 +571,9 @@ pub trait Action {
 /// observable.  // LOCAL STUB(W4/W9)
 #[derive(Debug, Default)]
 pub struct ActionContext {
+    /// Fatal action failure. Containers retain the first error unchanged;
+    /// only the outer driver takes it, before restart or result publication.
+    error: Option<KunaError>,
     /// Where `issueWarning` / `warningHeader` text lands.
     pub warnings: WarningSink,
     /// Whether the restart loop ([`ActionRestartGroup`]) can re-follow flow after
@@ -610,6 +622,25 @@ impl ActionContext {
     /// A fresh context.
     pub fn new() -> ActionContext {
         ActionContext::default()
+    }
+
+    /// Abort this pipeline with the original error. The failing action must
+    /// return immediately; later failures cannot replace the first cause.
+    pub fn fail(&mut self, error: KunaError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    /// Whether scheduling must stop without bookkeeping or restarting.
+    pub fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    /// Take the fatal error at the driver boundary. The driver must return it,
+    /// not resume or publish the partially analyzed function.
+    pub fn take_error(&mut self) -> Option<KunaError> {
+        self.error.take()
     }
 
     /// (kuna decompile-all watchdog) `true` once the cooperative per-function
@@ -778,6 +809,9 @@ impl Action for ActionGroup {
 
     /// C++ `ActionGroup::apply`, `action.cc:506`.
     fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        if ctx.has_error() {
+            return -1;
+        }
         if self.base.status != statusflags::status_mid {
             self.state = 0; // Initialize the derived action (list.begin())
         }
@@ -791,6 +825,10 @@ impl Action for ActionGroup {
                 return 0;
             }
             let res = self.list[self.state].perform(data, ctx);
+            if ctx.has_error() {
+                return -1;
+            }
+            if ctx.reflow_requested { return 0; }
             if res > 0 {
                 // A change was made
                 self.base.count += res;
@@ -879,11 +917,17 @@ impl Action for ActionRestartGroup {
 
     /// C++ `ActionRestartGroup::apply`, `action.cc:553`.
     fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        if ctx.has_error() {
+            return -1;
+        }
         if self.curstart == -1 {
             return 0; // Already completed
         }
         loop {
             let res = self.group.apply(data, ctx);
+            if ctx.has_error() {
+                return -1;
+            }
             if res != 0 {
                 return res;
             }
@@ -954,7 +998,7 @@ fn warning_header_text(data: &Funcdata, txt: &str) -> String {
 /// A single transformation on a [`PcodeOp`] (C++ `Rule`).
 ///
 /// Concrete rules implement [`apply_op`](Rule::apply_op) (the transformation),
-/// [`clone_rule`](Rule::clone_rule) (the group-filter clone), and optionally
+/// [`clone_rule`](Rule::clone_rule) (the membership-free clone), and optionally
 /// [`get_op_list`](Rule::get_op_list) (the opcode whitelist).  All per-rule
 /// engine state (name/group/flags/breakpoints/statistics) lives in the
 /// [`RuleState`] the owning [`ActionPool`] holds alongside the rule object —
@@ -973,11 +1017,9 @@ pub trait Rule {
         all_opcodes()
     }
 
-    /// Clone this Rule filtered by `grouplist` (C++ virtual `clone(grouplist)`).
-    /// Returns `None` if filtered out.  The implementor decides membership,
-    /// conventionally `grouplist.contains(my_group)`; the engine supplies the
-    /// group string to the new instance.
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>>;
+    /// Clone the rule's implementation state. Membership belongs exclusively
+    /// to the owning pool's registration, not to concrete rule constructors.
+    fn clone_rule(&self) -> Box<dyn Rule>;
 
     /// Reset any function-specific state (C++ virtual `reset`).  The default is
     /// a no-op; the engine separately clears the [`RuleState`] warning latch.
@@ -999,6 +1041,8 @@ pub struct RuleState {
     pub name: String,
     /// Group to which this Rule belongs (C++ `basegroup`).
     pub basegroup: String,
+    /// Explicit per-rule compatibility groups, never inferred from its name.
+    pub aliases: &'static [&'static str],
     /// Number of attempted applications (C++ `count_tests`).
     pub count_tests: uint4,
     /// Number of successful applications (C++ `count_apply`).
@@ -1014,9 +1058,19 @@ impl RuleState {
             breakpoint: 0,
             name: nm.into(),
             basegroup: g.into(),
+            aliases: &[],
             count_tests: 0,
             count_apply: 0,
         }
+    }
+
+    pub fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
+        self.aliases = aliases;
+        self
+    }
+
+    pub fn is_in_group(&self, groups: &ActionGroupList) -> bool {
+        rule_group_enabled(&self.basegroup, self.aliases, |group| groups.contains(group))
     }
 
     /// Return `true` if disabled (C++ `Rule::isDisabled`).
@@ -1068,10 +1122,20 @@ struct RuleEntry {
 
 impl RuleEntry {
     fn clone_filtered(&self, grouplist: &ActionGroupList) -> Option<RuleEntry> {
-        self.rule
-            .clone_rule(grouplist)
-            .map(|rule| RuleEntry { state: self.state.clone(), rule })
+        self.state.is_in_group(grouplist).then(|| RuleEntry {
+            state: self.state.clone(),
+            rule: self.rule.clone_rule(),
+        })
     }
+}
+
+/// Shared registration predicate for executable pools and schedule listings.
+pub fn rule_group_enabled(
+    group: &str,
+    aliases: &[&str],
+    mut contains: impl FnMut(&str) -> bool,
+) -> bool {
+    contains(group) || aliases.iter().any(|alias| contains(alias))
 }
 
 /// A registration row for a [`Rule`] (the W5 convention).  `group` is the rule's
@@ -1080,6 +1144,8 @@ impl RuleEntry {
 pub struct RuleSpec {
     /// The rule's stage group (matched against [`ActionGroupList`]).
     pub group: &'static str,
+    /// Explicit compatibility groups for this rule only.
+    pub aliases: &'static [&'static str],
     /// Constructor for a fresh instance of the rule.
     pub ctor: fn() -> Box<dyn Rule>,
 }
@@ -1205,7 +1271,7 @@ impl ActionPool {
     /// [`RuleState`] from the spec's group and the rule's debug name.
     pub fn add_spec(&mut self, spec: &RuleSpec, name: impl Into<String>) {
         let rule = (spec.ctor)();
-        self.add_rule(RuleState::new(spec.group, 0, name), rule);
+        self.add_rule(RuleState::new(spec.group, 0, name).with_aliases(spec.aliases), rule);
     }
 
     /// Number of rules in the pool (test/inspection helper).
@@ -1400,6 +1466,9 @@ impl Action for ActionPool {
 
     /// C++ `ActionPool::apply`, `action.cc:877`.
     fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        if ctx.has_error() {
+            return -1;
+        }
         if self.base.status != statusflags::status_mid {
             self.op_state = OpCursor::Unstarted;
             self.rule_index = 0;
@@ -1558,7 +1627,12 @@ impl ActionDatabase {
     /// Install the universal action tree (the W5 `universal_action` output).
     /// Registers it under [`UNIVERSAL_NAME`].  Replaces any prior universal.
     pub fn set_universal(&mut self, act: Box<dyn Action>) {
+        self.actionmap.clear();
         self.register_action(UNIVERSAL_NAME, act);
+        let current = self.currentactname.clone();
+        if !current.is_empty() && current != UNIVERSAL_NAME {
+            self.refresh_group(&current);
+        }
     }
 
     /// Get the current root Action (C++ `getCurrent`).
@@ -1584,14 +1658,15 @@ impl ActionDatabase {
     }
 
     /// (Re)set the grouplist for a particular root Action (C++ `setGroup`).
-    /// Do not use to redefine an already-instantiated root Action.
+    /// Replacing a group invalidates its executable tree, rebuilding it
+    /// immediately if it is the selected root.
     pub fn set_group<I, S>(&mut self, grp: impl Into<String>, members: I)
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
         let grp = grp.into();
-        let curgrp = self.groupmap.entry(grp).or_default();
+        let curgrp = self.groupmap.entry(grp.clone()).or_default();
         curgrp.clear();
         for m in members {
             let s: String = m.into();
@@ -1602,14 +1677,17 @@ impl ActionDatabase {
             curgrp.insert(s);
         }
         self.is_default_groups = false;
+        self.refresh_group(&grp);
     }
 
     /// Copy an existing root Action's grouplist under a new name (C++
     /// `cloneGroup`).
     pub fn clone_group(&mut self, oldname: &str, newname: impl Into<String>) -> KunaResult<()> {
         let curgrp = self.get_group(oldname)?.clone();
-        self.groupmap.insert(newname.into(), curgrp);
+        let newname = newname.into();
+        self.groupmap.insert(newname.clone(), curgrp);
         self.is_default_groups = false;
+        self.refresh_group(&newname);
         Ok(())
     }
 
@@ -1617,16 +1695,54 @@ impl ActionDatabase {
     /// `true` for a new addition.
     pub fn add_to_group(&mut self, grp: impl Into<String>, basegroup: impl Into<String>) -> bool {
         self.is_default_groups = false;
-        let curgrp = self.groupmap.entry(grp.into()).or_default();
-        curgrp.insert(basegroup)
+        let grp = grp.into();
+        let changed = self.groupmap.entry(grp.clone()).or_default().insert(basegroup);
+        if changed { self.refresh_group(&grp); }
+        changed
     }
 
     /// Remove a group from a root Action's grouplist (C++ `removeFromGroup`).
     /// Returns `true` if it existed.
     pub fn remove_from_group(&mut self, grp: impl Into<String>, basegrp: &str) -> bool {
         self.is_default_groups = false;
-        let curgrp = self.groupmap.entry(grp.into()).or_default();
-        curgrp.erase(basegrp)
+        let grp = grp.into();
+        let changed = self.groupmap.entry(grp.clone()).or_default().erase(basegrp);
+        if changed { self.refresh_group(&grp); }
+        changed
+    }
+
+    /// Change a subgroup of an existing root. Arbitrary subgroup strings are
+    /// permitted; only the root must already exist.
+    pub fn toggle_action(&mut self, root: &str, subgroup: &str, enable: bool) -> KunaResult<()> {
+        self.get_group(root)?;
+        if enable {
+            self.add_to_group(root, subgroup);
+        } else {
+            self.remove_from_group(root, subgroup);
+        }
+        Ok(())
+    }
+
+    /// Discard derived trees and custom groups while retaining the universal
+    /// registration, then restore the standard selected root.
+    pub fn reset_defaults(&mut self) -> KunaResult<()> {
+        self.get_action(UNIVERSAL_NAME)?;
+        self.currentactname.clear();
+        self.actionmap.retain(|name, _| name == UNIVERSAL_NAME);
+        self.is_default_groups = false;
+        build_default_groups(self);
+        self.set_current("decompile")
+    }
+
+    fn refresh_group(&mut self, group: &str) {
+        if group == UNIVERSAL_NAME { return; }
+        self.actionmap.remove(group);
+        if !self.currentactname.is_empty() && self.currentactname == group {
+            // A selected derived root necessarily has both a registered
+            // universal tree and a group. Group edits preserve those inputs.
+            self.derive_action(UNIVERSAL_NAME, group)
+                .expect("selected action retains its universal tree and group");
+        }
     }
 
     /// Look up a registered root Action by name (C++ `getAction`).  Errors if
@@ -1649,9 +1765,9 @@ impl ActionDatabase {
     /// is cached in `actionmap`; the current action is then `actionmap[actname]`
     /// (see [`get_current`](ActionDatabase::get_current)).
     pub fn set_current(&mut self, actname: &str) -> KunaResult<()> {
+        self.derive_action(UNIVERSAL_NAME, actname)?;
         self.currentactname = actname.to_string();
         crate::actionprof::set_root(actname);
-        self.derive_action(UNIVERSAL_NAME, actname)?;
         Ok(())
     }
 
@@ -1698,6 +1814,9 @@ pub fn build_default_groups(db: &mut ActionDatabase) {
     if db.is_default_groups {
         return;
     }
+    let selected = !db.currentactname.is_empty();
+    db.currentactname.clear();
+    db.actionmap.retain(|name, _| name == UNIVERSAL_NAME);
     db.groupmap.clear();
     // (kuna) "canonicalcompare" (comparison canonicalization, split out of
     // "analysis") accompanies "analysis" in every variant; "presentcompare"
@@ -1753,6 +1872,9 @@ pub fn build_default_groups(db: &mut ActionDatabase) {
 
     db.set_group("firstpass", ["base"]);
     db.is_default_groups = true;
+    if selected {
+        db.set_current("decompile").expect("selected action retains its universal tree");
+    }
 }
 
 #[cfg(test)]

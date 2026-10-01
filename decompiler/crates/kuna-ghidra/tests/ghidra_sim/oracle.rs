@@ -51,15 +51,15 @@ use kuna_sleigh::translate::{PcodeEmit, Translate, ATTRIB_CODE, ELEM_OP};
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram};
 use kuna_decomp::comment::ELEM_COMMENTDB;
 use kuna_decomp::decompile_drive::print_c;
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, ELEM_TYPEREF};
-use kuna_decomp::fspec::PrototypePieces;
+use kuna_decomp::dtype::{type_metatype, DatatypeKind, ReadView, TypeId, TypeRoot, ELEM_TYPEREF};
+use kuna_decomp::fspec::{parameter_pieces_flags, FuncProto, ParameterPieces, PrototypePieces};
 use kuna_decomp::funcdata_encode::ELEM_FUNCTION;
 use kuna_decomp::inject_sleigh::SleighInjectEngine;
 use kuna_decomp::options::{OptionDatabase, KUNA_OPTION_NAMES};
 use kuna_decomp::pcodeinject::{
     InjectContext, CALLFIXUP_TYPE, CALLOTHERFIXUP_TYPE, ELEM_CONTEXT,
 };
-use kuna_decomp::prettyprint::ids::{ELEM_FIELD, ELEM_TYPE};
+use kuna_decomp::prettyprint::ids::ELEM_TYPE;
 use kuna_decomp::remote_provider::{
     ATTRIB_CAT, ATTRIB_DOTDOTDOT, ATTRIB_EXTRAPOP, ATTRIB_LOCK, ATTRIB_MAIN, ATTRIB_NORETURN,
     ATTRIB_VOIDLOCK, ELEM_HASH, ELEM_HOLE, ELEM_LOCALDB, ELEM_MAPSYM, ELEM_PARENT,
@@ -149,17 +149,13 @@ pub struct SimOracle {
     /// analysis-committed libproto/DWARF signatures the CLI path consumes; the
     /// `<mapsym><function><prototype>` answer source.
     pub callee_pieces: BTreeMap<u64, PrototypePieces>,
-    /// Entry offsets whose localdb includes Java's AUTO hidden-return parameter.
-    pub hidden_return_overrides: BTreeSet<u64>,
     /// Entry offsets whose prototype uses custom variable storage.
     pub custom_storage_overrides: BTreeSet<u64>,
-    /// Entry offsets whose parameter records should carry address storage.
-    pub parameter_address_overrides: BTreeSet<u64>,
-    /// Entry offsets whose custom return should carry explicit RAX storage.
+    /// Entry offsets whose return uses a committed RAX/RDX/RCX join.
     pub custom_return_address_overrides: BTreeSet<u64>,
     /// Real register storage for the x86-64 parameter stream.
     parameter_registers: Vec<VarnodeData>,
-    return_register: Option<VarnodeData>,
+    return_registers: Vec<VarnodeData>,
     /// Read-only image ranges (READONLY|CODE sections) — the `<hole>`
     /// mutability source (the CLI paints the same const-ness from ELF flags).
     pub readonly_ranges: Vec<(u64, u64)>,
@@ -260,7 +256,10 @@ impl SimOracle {
             .into_iter()
             .filter_map(|name| sleigh.get_register_varnode(name).ok())
             .collect();
-        let return_register = sleigh.get_register_varnode(b"RAX").ok();
+        let return_registers = [b"RAX".as_slice(), b"RDX", b"RCX"]
+            .into_iter()
+            .filter_map(|name| sleigh.get_register_varnode(name).ok())
+            .collect();
 
         let data_symbols: BTreeMap<u64, (String, i64)> = prog
             .global_data_symbols()
@@ -296,12 +295,10 @@ impl SimOracle {
             label_overrides: BTreeMap::new(),
             data_symbols,
             callee_pieces,
-            hidden_return_overrides: BTreeSet::new(),
             custom_storage_overrides: BTreeSet::new(),
-            parameter_address_overrides: BTreeSet::new(),
             custom_return_address_overrides: BTreeSet::new(),
             parameter_registers,
-            return_register,
+            return_registers,
             readonly_ranges,
             tracked_overrides: Vec::new(),
             local_var_overrides: BTreeMap::new(),
@@ -519,6 +516,7 @@ impl SimOracle {
         noreturn: bool,
         pieces: Option<&PrototypePieces>,
     ) -> Vec<u8> {
+        let proto = pieces.map(|p| self.committed_prototype(entry.get_offset(), p));
         let mut doc = Vec::new();
         {
             let mut e = PackedEncode::new(&mut doc);
@@ -539,11 +537,11 @@ impl SimOracle {
                 .get(&entry.get_offset())
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]);
-            if pieces.is_some() || !locals.is_empty() {
-                self.encode_localdb(&mut e, entry.get_offset(), name, pieces, locals);
+            if proto.is_some() || !locals.is_empty() {
+                self.encode_localdb(&mut e, name, proto.as_ref(), locals);
             }
-            if let Some(p) = pieces {
-                self.encode_prototype(&mut e, entry.get_offset(), p);
+            if let Some(p) = proto.as_ref() {
+                self.encode_prototype(&mut e, p);
             }
             e.close_element(&ELEM_FUNCTION);
             // The mapping SymbolEntry: <addr size=1/> + empty <rangelist/>.
@@ -556,6 +554,62 @@ impl SimOracle {
         doc
     }
 
+    /// The host assigns ABI storage before encoding Function/localdb facts.
+    /// Declaration pieces are the fixture source, not the wire representation.
+    fn committed_prototype(&self, entry: u64, pieces: &PrototypePieces) -> FuncProto {
+        let arch = self.prog.arch();
+        let mut pieces = pieces.clone();
+        if self.custom_storage_overrides.contains(&entry) {
+            pieces.input_storage = pieces.intypes.iter().enumerate().map(|(i, ct)| {
+                let reg = &self.parameter_registers[i + 1];
+                (i as i32, ParameterPieces {
+                    addr: Address::new(Rc::clone(reg.space.as_ref().unwrap()), reg.offset),
+                    type_: Some(ct.clone()),
+                    flags: parameter_pieces_flags::CUSTOM_STORAGE,
+                })
+            }).collect();
+        }
+        if self.custom_return_address_overrides.contains(&entry) {
+            let ct = pieces.outtype.as_ref().expect("custom return type");
+            let mut remaining = ct.get_size() as u32;
+            let mut storage = Vec::new();
+            for reg in &self.return_registers {
+                if remaining == 0 {
+                    break;
+                }
+                let size = remaining.min(reg.size);
+                storage.push(kuna_base::space::VarnodeStorage {
+                    space: reg.space.clone(),
+                    offset: reg.offset,
+                    size,
+                });
+                remaining -= size;
+            }
+            assert_eq!(remaining, 0, "custom return exceeds fixture register storage");
+            // Join pieces are listed most-significant first.
+            storage.reverse();
+            let addr = if storage.len() == 1 {
+                storage[0].get_addr()
+            } else {
+                self.manager.find_add_join(&storage, 0).unwrap().get_unified().get_addr()
+            };
+            pieces.output_storage = Some(ParameterPieces {
+                addr,
+                type_: Some(ct.clone()),
+                flags: parameter_pieces_flags::CUSTOM_STORAGE,
+            });
+        }
+        let mut proto = FuncProto::new();
+        proto.seed_locked_from_pieces(
+            &pieces,
+            Rc::clone(arch.default_fp().expect("fixture default calling convention")),
+            arch.types().get_type_void().unwrap(),
+            arch.types(),
+            &self.manager,
+        ).expect("host assigns committed parameter storage");
+        proto
+    }
+
     /// `<localdb lock main><scope><parent id=0/><rangelist/><symbollist>` with
     /// one cat-0 `<mapsym><symbol>` per declared parameter (Java
     /// `LocalSymbolMap.encodeLocalDb`) plus one plain `<mapsym>` per
@@ -563,9 +617,8 @@ impl SimOracle {
     fn encode_localdb(
         &self,
         e: &mut PackedEncode,
-        entry: u64,
         fname: &str,
-        pieces: Option<&PrototypePieces>,
+        proto: Option<&FuncProto>,
         locals: &[HostLocalVar],
     ) {
         let ram = self
@@ -632,64 +685,41 @@ impl SimOracle {
             e.close_element(&ELEM_RANGELIST);
             e.close_element(&ELEM_MAPSYM);
         }
-        let Some(pieces) = pieces else {
+        let Some(proto) = proto else {
             e.close_element(&ELEM_SYMBOLLIST);
             e.close_element(&ELEM_SCOPE);
             e.close_element(&ELEM_LOCALDB);
             return;
         };
-        let hidden = self.hidden_return_overrides.contains(&entry);
-        let custom = self.custom_storage_overrides.contains(&entry);
-        let total = pieces.intypes.len() + usize::from(hidden);
-        for i in 0..total {
-            let declared_index = i.checked_sub(usize::from(hidden));
-            let ct = declared_index.map(|j| &pieces.intypes[j]);
+        for i in 0..proto.num_params() {
+            let param = proto.get_param(i).expect("committed parameter");
             e.open_element(&ELEM_MAPSYM);
             e.open_element(&ELEM_SYMBOL);
-            let pname = declared_index
-                .and_then(|j| pieces.innames.get(j).cloned())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| {
-                    if declared_index.is_none() {
-                        "__return_storage_ptr__".to_string()
-                    } else {
-                        format!("param_{}", i + 1)
-                    }
-                });
+            let pname = if param.is_hidden_return() {
+                "__return_storage_ptr__".to_string()
+            } else if param.get_name().is_empty() {
+                format!("param_{}", i + 1)
+            } else {
+                param.get_name().to_string()
+            };
             e.write_string(&ATTRIB_NAME, pname.as_bytes());
             e.write_bool(&ATTRIB_TYPELOCK, true);
             e.write_bool(&ATTRIB_NAMELOCK, true);
             e.write_signed_integer(&ATTRIB_CAT, 0);
             e.write_unsigned_integer(&ATTRIB_INDEX, i as u64);
-            if declared_index.is_none() {
+            if param.is_hidden_return() {
                 e.write_bool(&kuna_base::marshal::ATTRIB_HIDDENRETPARM, true);
-                e.open_element(&ELEM_TYPE);
-                e.write_string(&ATTRIB_NAME, b"");
-                e.write_string(&ATTRIB_METATYPE, b"ptr");
-                e.write_signed_integer(&ATTRIB_SIZE, 8);
-                self.encode_wire_type(e, pieces.outtype.as_ref().expect("hidden return type"));
-                e.close_element(&ELEM_TYPE);
-            } else {
-                self.encode_wire_type(e, ct.expect("declared parameter type"));
             }
+            if param.is_indirect_storage() {
+                e.write_bool(&kuna_base::marshal::ATTRIB_INDIRECTSTORAGE, true);
+            }
+            if param.is_this_pointer() {
+                e.write_bool(&kuna_base::marshal::ATTRIB_THISPTR, true);
+            }
+            self.encode_wire_type(e, param.get_type().expect("committed parameter type"));
             e.close_element(&ELEM_SYMBOL);
-            if let Some(storage) = self
-                .parameter_address_overrides
-                .contains(&entry)
-                .then(|| self.parameter_registers.get(i + usize::from(custom)))
-                .flatten()
-            {
-                Address::new(
-                    Rc::clone(storage.space.as_ref().expect("register space")),
-                    storage.offset,
-                )
-                .encode_sized(e, storage.size as i32)
-                .expect("parameter storage encodes");
-            } else {
-                e.open_element(&ELEM_HASH);
-                e.write_unsigned_integer(&ATTRIB_VAL, 1);
-                e.close_element(&ELEM_HASH);
-            }
+            param.get_address().encode_sized(e, param.get_size())
+                .expect("committed parameter storage encodes");
             e.open_element(&ELEM_RANGELIST);
             e.close_element(&ELEM_RANGELIST);
             e.close_element(&ELEM_MAPSYM);
@@ -699,43 +729,42 @@ impl SimOracle {
         e.close_element(&ELEM_LOCALDB);
     }
 
-    /// `<prototype extrapop="unknown" model="default" …><returnsym>` (Java
+    /// `<prototype extrapop model …><returnsym>` (Java
     /// `FunctionPrototype.encodePrototype`, params via `<localdb>`).
-    fn encode_prototype(&self, e: &mut PackedEncode, entry: u64, pieces: &PrototypePieces) {
+    fn encode_prototype(&self, e: &mut PackedEncode, proto: &FuncProto) {
         e.open_element(&ELEM_PROTOTYPE);
-        e.write_string(&ATTRIB_EXTRAPOP, b"unknown");
-        e.write_string(&ATTRIB_MODEL, b"default");
-        if self.custom_storage_overrides.contains(&entry) {
+        if proto.get_extra_pop() == kuna_decomp::fspec::EXTRAPOP_UNKNOWN {
+            e.write_string(&ATTRIB_EXTRAPOP, b"unknown");
+        } else {
+            e.write_signed_integer(&ATTRIB_EXTRAPOP, proto.get_extra_pop() as i64);
+        }
+        e.write_string(&ATTRIB_MODEL, proto.get_model_name().as_bytes());
+        if proto.has_custom_storage() {
             e.write_bool(&kuna_decomp::remote_provider::ATTRIB_CUSTOM, true);
         }
-        if pieces.first_var_arg_slot >= 0 {
+        if proto.is_dotdotdot() {
             e.write_bool(&ATTRIB_DOTDOTDOT, true);
         }
-        if pieces.intypes.is_empty() {
+        if proto.num_params() == 0 && proto.is_input_locked() {
             e.write_bool(&ATTRIB_VOIDLOCK, true);
         }
-        e.open_element(&ELEM_RETURNSYM);
-        e.write_bool(&ATTRIB_TYPELOCK, true);
-        if self.custom_return_address_overrides.contains(&entry) {
-            let storage = self.return_register.as_ref().expect("x86-64 return register");
-            let size = pieces.outtype.as_ref().map(|ct| ct.get_size()).unwrap_or(1);
-            Address::new(
-                Rc::clone(storage.space.as_ref().expect("return register space")),
-                storage.offset,
-            )
-            .encode_sized(e, size)
-            .expect("custom return storage encodes");
-        } else {
-            e.open_element(&kuna_base::address::ELEM_ADDR);
-            e.close_element(&kuna_base::address::ELEM_ADDR);
-        }
-        match &pieces.outtype {
-            Some(ct) => self.encode_wire_type(e, ct),
-            None => {
-                e.open_element(&ELEM_VOID);
-                e.close_element(&ELEM_VOID);
+        for (attribute, enabled) in [
+            (&kuna_decomp::remote_provider::ATTRIB_MODELLOCK, proto.is_model_locked()),
+            (&kuna_decomp::remote_provider::ATTRIB_INLINE, proto.is_inline()),
+            (&ATTRIB_NORETURN, proto.is_no_return()),
+            (&kuna_base::marshal::ATTRIB_CONSTRUCTOR, proto.is_constructor()),
+            (&kuna_base::marshal::ATTRIB_DESTRUCTOR, proto.is_destructor()),
+        ] {
+            if enabled {
+                e.write_bool(attribute, true);
             }
         }
+        e.open_element(&ELEM_RETURNSYM);
+        e.write_bool(&ATTRIB_TYPELOCK, proto.is_output_locked());
+        let output = proto.get_output();
+        output.get_address().encode_sized(e, output.get_size())
+            .expect("committed output storage encodes");
+        self.encode_wire_type(e, output.get_type().expect("committed output type"));
         e.close_element(&ELEM_RETURNSYM);
         e.close_element(&ELEM_PROTOTYPE);
     }
@@ -807,16 +836,32 @@ impl SimOracle {
     /// named types travel as `<typeref name id/>` (core types resolve locally
     /// on the kuna side — same hash ids — and unknown named types trigger a
     /// getDataType query answered by [`Self::answer_data_type`]); anonymous
-    /// pointers/arrays inline recursively; everything else inlines as a base.
-    fn encode_wire_type(&self, e: &mut PackedEncode, dt: &Rc<Datatype>) {
+    /// pointers/arrays inline recursively. Other anonymous definitions retain
+    /// their full graph shape, including callable declarations.
+    fn encode_wire_type(&self, e: &mut PackedEncode, dt: &TypeRoot) {
+        self.encode_wire_type_id(e, &dt.read(), dt.id());
+    }
+
+    fn encode_wire_type_id(&self, e: &mut PackedEncode, view: &ReadView<'_>, id: TypeId) {
         use type_metatype::*;
+        let dt = view.get(id).expect("oracle datatype belongs to its graph");
+        // Test nominal identity before inspecting effective shape: a named
+        // pointer typedef can close a recursive callable/aggregate cycle.
+        if dt.get_metatype() != TYPE_VOID && !dt.get_name().is_empty() && dt.get_id() != 0 {
+            e.open_element(&ELEM_TYPEREF);
+            e.write_string(&ATTRIB_NAME, dt.get_name().as_bytes());
+            e.write_unsigned_integer(&ATTRIB_ID, dt.get_id());
+            if dt.is_variable_length() { e.write_signed_integer(&ATTRIB_SIZE, dt.get_size() as i64); }
+            e.close_element(&ELEM_TYPEREF);
+            return;
+        }
         match dt.get_metatype() {
             TYPE_VOID => {
                 e.open_element(&ELEM_VOID);
                 e.close_element(&ELEM_VOID);
             }
             TYPE_PTR => {
-                if let DatatypeKind::Pointer { ptrto, wordsize, .. } = &dt.kind {
+                if let DatatypeKind::Pointer { ptrto, wordsize, spaceid, .. } = &dt.kind {
                     e.open_element(&ELEM_TYPE);
                     e.write_string(&ATTRIB_NAME, b"");
                     e.write_string(&ATTRIB_METATYPE, b"ptr");
@@ -827,10 +872,13 @@ impl SimOracle {
                             *wordsize as u64,
                         );
                     }
-                    self.encode_wire_type(e, ptrto);
+                    if let Some(space) = spaceid {
+                        e.write_space(&kuna_base::marshal::ATTRIB_SPACE, space);
+                    }
+                    self.encode_wire_type_id(e, view, *ptrto);
                     e.close_element(&ELEM_TYPE);
                 } else {
-                    self.encode_base_inline(e, dt);
+                    dt.encode(e).expect("oracle datatype encodes");
                 }
             }
             TYPE_ARRAY => {
@@ -843,34 +891,14 @@ impl SimOracle {
                         &kuna_decomp::dtype::ATTRIB_ARRAYSIZE,
                         *arraysize as i64,
                     );
-                    self.encode_wire_type(e, arrayof);
+                    self.encode_wire_type_id(e, view, *arrayof);
                     e.close_element(&ELEM_TYPE);
                 } else {
-                    self.encode_base_inline(e, dt);
+                    dt.encode(e).expect("oracle datatype encodes");
                 }
             }
-            _ if !dt.get_name().is_empty() && dt.get_id() != 0 => {
-                e.open_element(&ELEM_TYPEREF);
-                e.write_string(&ATTRIB_NAME, dt.get_name().as_bytes());
-                e.write_unsigned_integer(&ATTRIB_ID, dt.get_id());
-                e.close_element(&ELEM_TYPEREF);
-            }
-            _ => self.encode_base_inline(e, dt),
+            _ => dt.encode(e).expect("oracle datatype encodes"),
         }
-    }
-
-    /// An inline `<type>` for a base/unknown shape.
-    fn encode_base_inline(&self, e: &mut PackedEncode, dt: &Rc<Datatype>) {
-        let meta = kuna_decomp::dtype::metatype2string(dt.get_metatype())
-            .unwrap_or_else(|_| "unknown".to_string());
-        e.open_element(&ELEM_TYPE);
-        e.write_string(&ATTRIB_NAME, dt.get_name().as_bytes());
-        e.write_string(&ATTRIB_METATYPE, meta.as_bytes());
-        e.write_signed_integer(&ATTRIB_SIZE, dt.get_size().max(1) as i64);
-        if dt.get_id() != 0 && !dt.get_name().is_empty() {
-            e.write_unsigned_integer(&ATTRIB_ID, dt.get_id());
-        }
-        e.close_element(&ELEM_TYPE);
     }
 
     /// getDataType: look the (name, id) up in the oracle's own factory and
@@ -880,14 +908,9 @@ impl SimOracle {
         let name =
             String::from_utf8_lossy(&dec.read_string_id(&ATTRIB_NAME).expect("type name"))
                 .into_owned();
-        let _id = dec.read_signed_integer_id(&ATTRIB_ID).unwrap_or(0);
-        let found = self
-            .prog
-            .arch()
-            .types()
-            .find_by_name(&name)
-            .ok()
-            .flatten();
+        let id = dec.read_signed_integer_id(&ATTRIB_ID).unwrap_or(0) as u64;
+        let found = self.prog.arch().types_impl().find_by_source_id(&name, id)
+            .expect("host datatype source identity is unambiguous");
         match found {
             Some(dt) => {
                 let mut doc = Vec::new();
@@ -901,39 +924,13 @@ impl SimOracle {
         }
     }
 
-    /// A full (non-typeref) `<type>` definition for a getDataType answer:
-    /// composites carry their fields; everything else the base shape.
-    fn encode_full_type(&self, e: &mut PackedEncode, dt: &Rc<Datatype>) {
-        use type_metatype::*;
-        match (&dt.kind, dt.get_metatype()) {
-            (DatatypeKind::Struct { field, .. }, TYPE_STRUCT)
-            | (DatatypeKind::Union { field }, _) => {
-                let meta = if dt.get_metatype() == TYPE_STRUCT {
-                    "struct"
-                } else {
-                    "union"
-                };
-                e.open_element(&ELEM_TYPE);
-                e.write_string(&ATTRIB_NAME, dt.get_name().as_bytes());
-                e.write_unsigned_integer(&ATTRIB_ID, dt.get_id());
-                e.write_string(&ATTRIB_METATYPE, meta.as_bytes());
-                e.write_signed_integer(&ATTRIB_SIZE, dt.get_size() as i64);
-                e.write_signed_integer(
-                    &kuna_decomp::dtype::ATTRIB_ALIGNMENT,
-                    dt.alignment.max(1) as i64,
-                );
-                for f in field {
-                    e.open_element(&ELEM_FIELD);
-                    e.write_string(&ATTRIB_NAME, f.name.as_bytes());
-                    e.write_signed_integer(&ATTRIB_OFFSET, f.offset as i64);
-                    e.write_signed_integer(&ATTRIB_ID, f.ident as i64);
-                    self.encode_wire_type(e, &f.field_type);
-                    e.close_element(&ELEM_FIELD);
-                }
-                e.close_element(&ELEM_TYPE);
-            }
-            _ => self.encode_base_inline(e, dt),
-        }
+    /// A full nominal definition for getDataType. The graph encoder retains
+    /// field/bitfield identities, typedef edges and logical callable model,
+    /// arity and semantic flags; recursive edges remain references.
+    /// Committed ABI storage and hidden roles are encoded separately by
+    /// `encode_prototype` and `encode_localdb`.
+    fn encode_full_type(&self, e: &mut PackedEncode, dt: &TypeRoot) {
+        dt.encode(e).expect("oracle full datatype encodes");
     }
 
     /// getBytes: the oracle load image (the same bytes the CLI engine reads).
@@ -1293,7 +1290,7 @@ pub fn decompile_cli(prog: &mut ConsoleProgram, name: &str, addr: &Address) -> S
         addr.clone(),
         0,
         &kuna_console::decompile_step::DecompileSeed::plain(&mapped, &flow_ovr),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     )
     .result
     .unwrap_or_else(|e| panic!("CLI-path decompile of {name} failed: {}", e.explain()));

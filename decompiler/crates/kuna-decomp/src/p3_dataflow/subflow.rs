@@ -90,8 +90,8 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, uint4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::{type_metatype, TypeFactory, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{ArchHandle, OpId, TypeOp, VarnodeId};
@@ -2382,11 +2382,8 @@ impl Rule for RuleSubvarAnd {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarAnd::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarAnd::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2449,11 +2446,8 @@ impl Rule for RuleSubvarSubpiece {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarSubpiece::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarSubpiece::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2509,11 +2503,8 @@ impl Rule for RuleSubvarCompZero {
         vec![OpCode::CPUI_INT_NOTEQUAL, OpCode::CPUI_INT_EQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarCompZero::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarCompZero::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2593,11 +2584,8 @@ impl Rule for RuleSubvarShift {
         vec![OpCode::CPUI_INT_RIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarShift::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarShift::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2642,11 +2630,8 @@ impl Rule for RuleSubvarZext {
         vec![OpCode::CPUI_INT_ZEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarZext::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarZext::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2681,11 +2666,8 @@ impl Rule for RuleSubvarSext {
         vec![OpCode::CPUI_INT_SEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubvarSext::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubvarSext::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -3152,11 +3134,8 @@ impl Rule for RuleSplitFlow {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSplitFlow::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSplitFlow::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -3267,9 +3246,9 @@ mod option_split_datatypes {
 #[allow(dead_code)]
 struct Component {
     /// Data-type coming into the logical COPY operation (C++ `inType`).
-    in_type: Rc<Datatype>,
+    in_type: TypeRoot,
     /// Data-type coming out of the logical COPY operation (C++ `outType`).
-    out_type: Rc<Datatype>,
+    out_type: TypeRoot,
     /// Offset of this logical piece within the whole (C++ `offset`).
     offset: int4,
 }
@@ -3352,16 +3331,19 @@ impl SplitDatatype {
     fn get_component(
         &self,
         types: &dyn crate::dtype::TypeFactory,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
         offset: int4,
-    ) -> KunaResult<(Option<Rc<Datatype>>, bool)> {
-        let mut cur_type = Rc::clone(ct);
+    ) -> KunaResult<(Option<TypeRoot>, bool)> {
+        let view = ct.read();
+        let mut cur_id = ct.id();
+        let mut cur_type = view.get(cur_id)?;
         let mut cur_off: int8 = offset as int8;
         loop {
             let (sub, newoff) = cur_type.get_sub_type(cur_off)?;
             match sub {
                 None => {
-                    let hole = ct.get_hole_size(offset)?;
+                    let hole = view.get(ct.id())?.get_hole_size(offset)?;
+                    drop(view);
                     if hole > 0 {
                         let hole = if hole > 8 { 8 } else { hole };
                         return Ok((Some(types.get_base(hole, type_metatype::TYPE_UNKNOWN)?), true));
@@ -3369,7 +3351,8 @@ impl SplitDatatype {
                     return Ok((None, false));
                 }
                 Some(s) => {
-                    cur_type = s;
+                    cur_id = s;
+                    cur_type = view.get(s)?;
                     cur_off = newoff;
                 }
             }
@@ -3377,7 +3360,7 @@ impl SplitDatatype {
                 break;
             }
         }
-        Ok((Some(cur_type), false))
+        Ok((Some(ct.related(cur_id)?), false))
     }
 
     /// Categorize if and how a data-type should be split (C++
@@ -3386,13 +3369,15 @@ impl SplitDatatype {
     /// Returns -1 (not splittable), 0 (struct-based), 1 (array-based), 2
     /// (primitive splittable multiple ways).
     #[allow(dead_code)] // consumed by the stub-gated splitCopy/Load/Store build path
-    fn categorize_datatype(&self, ct: &Rc<Datatype>) -> int4 {
+    fn categorize_datatype(&self, ct: &TypeRoot) -> int4 {
+        let view = ct.read();
+        let ct = view.get(ct.id()).expect("split datatype");
         match ct.get_metatype() {
             type_metatype::TYPE_ARRAY => {
                 if !self.split_arrays {
                     return -1;
                 }
-                let sub = ct.get_array_base().expect("TYPE_ARRAY has base");
+                let sub = view.get(ct.get_array_base().expect("TYPE_ARRAY has base")).expect("array base");
                 if sub.get_metatype() != type_metatype::TYPE_UNKNOWN || sub.get_size() != 1 {
                     1
                 } else {
@@ -3400,12 +3385,12 @@ impl SplitDatatype {
                 }
             }
             type_metatype::TYPE_PARTIALSTRUCT => {
-                let sub = ct.get_partial_base().expect("TYPE_PARTIALSTRUCT has parent");
+                let sub = view.get(ct.get_partial_base().expect("TYPE_PARTIALSTRUCT has parent")).expect("partial parent");
                 if sub.get_metatype() == type_metatype::TYPE_ARRAY {
                     if !self.split_arrays {
                         return -1;
                     }
-                    let subsub = sub.get_array_base().expect("array base");
+                    let subsub = view.get(sub.get_array_base().expect("array base")).expect("array element");
                     if subsub.get_metatype() != type_metatype::TYPE_UNKNOWN || subsub.get_size() != 1 {
                         1
                     } else {
@@ -3442,8 +3427,8 @@ impl SplitDatatype {
     fn test_datatype_compatibility(
         &mut self,
         types: &dyn crate::dtype::TypeFactory,
-        in_base: &Rc<Datatype>,
-        out_base: &Rc<Datatype>,
+        in_base: &TypeRoot,
+        out_base: &TypeRoot,
         in_constant: bool,
     ) -> KunaResult<bool> {
         let in_category = self.categorize_datatype(in_base);
@@ -3458,7 +3443,7 @@ impl SplitDatatype {
             return Ok(false);
         }
         if !in_constant
-            && Rc::ptr_eq(in_base, out_base)
+            && in_base == out_base
             && in_base.get_metatype() == type_metatype::TYPE_STRUCT
         {
             return Ok(false); // Don't split a whole structure unless initialized from a constant
@@ -3484,7 +3469,7 @@ impl SplitDatatype {
                 };
                 // Throw away primitive data-type if it is a constant
                 let cur_in = if in_constant {
-                    Rc::clone(&cur_out)
+                    cur_out.clone()
                 } else {
                     types.get_base(cur_out.get_size(), type_metatype::TYPE_UNKNOWN)?
                 };
@@ -3652,7 +3637,7 @@ impl SplitDatatype {
             losize = data.vbank().get(i1).expect("stale in1").get_size();
         }
         for i in 0..self.data_type_pieces.len() {
-            let dt = Rc::clone(&self.data_type_pieces[i].in_type);
+            let dt = self.data_type_pieces[i].in_type.clone();
             if dt.get_size() as usize > std::mem::size_of::<uintb>() {
                 in_varnodes.clear();
                 return Ok(false);
@@ -3684,6 +3669,8 @@ impl SplitDatatype {
 
     /// Assuming the input is a constant, build split constants (C++
     /// `SplitDatatype::buildInConstants`, subflow.cc:2478).
+    /// Constant payloads are uintb-sized even when their logical width is larger;
+    /// extraction beyond that payload yields zero, as with CPUI_SUBPIECE.
     fn build_in_constants(
         &self,
         data: &mut Funcdata,
@@ -3694,14 +3681,17 @@ impl SplitDatatype {
         let base_val = data.vbank().get(root_vn).expect("stale root").get_offset();
         let root_size = data.vbank().get(root_vn).expect("stale root").get_size();
         for i in 0..self.data_type_pieces.len() {
-            let dt = Rc::clone(&self.data_type_pieces[i].in_type);
+            let dt = self.data_type_pieces[i].in_type.clone();
             let off = if big_endian {
                 root_size - self.data_type_pieces[i].offset - dt.get_size()
             } else {
                 self.data_type_pieces[i].offset
             };
-            // cast: off is a byte offset within a Varnode (< 8 here).
-            let val = (base_val >> ((8 * off) as u32)) & calc_mask(dt.get_size());
+            let val = if off >= std::mem::size_of::<uintb>() as int4 {
+                0
+            } else {
+                (base_val >> ((8 * off) as u32)) & calc_mask(dt.get_size())
+            };
             let out_vn = data.new_constant(dt.get_size(), val);
             in_varnodes.push(out_vn);
             data.vbank_mut().get_mut(out_vn).expect("stale const").update_type(dt);
@@ -3724,7 +3714,7 @@ impl SplitDatatype {
         let root_size = data.vbank().get(root_vn).expect("stale root").get_size();
         let follow_addr = data.obank().get(follow_op).expect("stale follow").get_addr().clone();
         for i in 0..self.data_type_pieces.len() {
-            let dt = Rc::clone(&self.data_type_pieces[i].in_type);
+            let dt = self.data_type_pieces[i].in_type.clone();
             let mut off = self.data_type_pieces[i].offset;
             let mut addr = &base_addr + off as i64;
             addr.renormalize(dt.get_size(), data.get_arch().manage())?;
@@ -3755,7 +3745,7 @@ impl SplitDatatype {
     ) -> KunaResult<()> {
         let base_addr = data.vbank().get(root_vn).expect("stale root").get_addr().clone();
         for i in 0..self.data_type_pieces.len() {
-            let dt = Rc::clone(&self.data_type_pieces[i].out_type);
+            let dt = self.data_type_pieces[i].out_type.clone();
             let off = self.data_type_pieces[i].offset;
             let mut addr = &base_addr + off as i64;
             addr.renormalize(dt.get_size(), data.get_arch().manage())?;
@@ -3854,7 +3844,7 @@ impl SplitDatatype {
         &mut self,
         data: &mut Funcdata,
         root_vn: VarnodeId,
-        ptr_type: &Rc<Datatype>,
+        ptr_type: &TypeRoot,
         base_offset: int4,
         follow_op: OpId,
         ptr_varnodes: &mut Vec<VarnodeId>,
@@ -3866,19 +3856,19 @@ impl SplitDatatype {
         let follow_addr = data.obank().get(follow_op).expect("stale follow").get_addr().clone();
         for i in 0..self.data_type_pieces.len() {
             let match_type = if is_input {
-                Rc::clone(&self.data_type_pieces[i].in_type)
+                self.data_type_pieces[i].in_type.clone()
             } else {
-                Rc::clone(&self.data_type_pieces[i].out_type)
+                self.data_type_pieces[i].out_type.clone()
             };
             let mut cur_off: int8 = base_offset as int8 + self.data_type_pieces[i].offset as int8;
-            let mut tmp_type = Rc::clone(&base_type);
+            let mut tmp_type = base_type.clone();
             let mut in_ptr = root_vn;
             loop {
                 let new_off: int8;
-                let new_type: Rc<Datatype>;
+                let new_type: TypeRoot;
                 if cur_off < 0 || cur_off >= tmp_type.get_size() as int8 {
                     // An offset not within the data-type indicates an array.
-                    new_type = Rc::clone(&tmp_type);
+                    new_type = tmp_type.clone();
                     let mut no = cur_off % tmp_type.get_size() as int8;
                     no = if no < 0 { no + tmp_type.get_size() as int8 } else { no };
                     new_off = no;
@@ -3891,7 +3881,7 @@ impl SplitDatatype {
                         }
                         None => {
                             // Null only for a hole in a structure; use precomputed type.
-                            new_type = Rc::clone(&match_type);
+                            new_type = match_type.clone();
                             new_off = 0;
                         }
                     }
@@ -3899,11 +3889,11 @@ impl SplitDatatype {
                 let res_type = if new_type.needs_resolution() {
                     self.resolver.resolve(if is_input { 0 } else { 1 }, &new_type)
                 } else {
-                    Rc::clone(&new_type)
+                    new_type.clone()
                 };
 
                 let new_op: OpId;
-                if Rc::ptr_eq(&tmp_type, &res_type)
+                if tmp_type == res_type
                     || tmp_type.get_metatype() == type_metatype::TYPE_ARRAY
                 {
                     let mut final_offset = cur_off - new_off;
@@ -3939,7 +3929,7 @@ impl SplitDatatype {
                 in_ptr = data.new_unique_out(in_ptr_size, new_op)?;
                 let tmp_ptr = self
                     .types()?
-                    .get_type_pointer_strip_array(ptr_size, Rc::clone(&new_type), word_size)?;
+                    .get_type_pointer_strip_array(ptr_size, new_type.clone(), word_size)?;
                 data.vbank_mut().get_mut(in_ptr).expect("stale ptr").update_type(tmp_ptr);
                 data.op_insert_before(new_op, follow_op);
                 tmp_type = res_type;
@@ -3983,8 +3973,8 @@ impl SplitDatatype {
         &mut self,
         data: &mut Funcdata,
         copy_op: OpId,
-        in_type: &Rc<Datatype>,
-        out_type: &Rc<Datatype>,
+        in_type: &TypeRoot,
+        out_type: &TypeRoot,
     ) -> KunaResult<bool> {
         if !self.test_copy_constraints(data, copy_op) {
             return Ok(false);
@@ -4036,7 +4026,7 @@ impl SplitDatatype {
         &mut self,
         data: &mut Funcdata,
         load_op: OpId,
-        in_type: &Rc<Datatype>,
+        in_type: &TypeRoot,
     ) -> KunaResult<bool> {
         self.is_load_store = true;
         let mut out_vn = data.obank().get(load_op).expect("stale load").get_out().expect("load out");
@@ -4131,12 +4121,12 @@ impl SplitDatatype {
         &mut self,
         data: &mut Funcdata,
         store_op: OpId,
-        out_type: &Rc<Datatype>,
+        out_type: &TypeRoot,
     ) -> KunaResult<bool> {
         self.is_load_store = true;
         let in_vn = data.obank().get(store_op).expect("stale store").get_in(2).expect("store in2");
         let mut load_op: Option<OpId> = None;
-        let mut in_type: Option<Rc<Datatype>> = None;
+        let mut in_type: Option<TypeRoot> = None;
         if data.vbank().get(in_vn).expect("stale in").is_written() {
             let def = data.vbank().get(in_vn).expect("stale in").get_def().expect("in def");
             if data.obank().get(def).expect("stale def").code() == OpCode::CPUI_LOAD
@@ -4205,7 +4195,7 @@ impl SplitDatatype {
                 let spcvn = data.new_varnode_space(&load_space);
                 data.op_set_input(new_load_op, spcvn, 0)?;
                 data.op_set_input(new_load_op, load_ptr, 1)?;
-                let dt = Rc::clone(&self.data_type_pieces[i].in_type);
+                let dt = self.data_type_pieces[i].in_type.clone();
                 let vn = data.new_unique_out(dt.get_size(), new_load_op)?;
                 data.vbank_mut().get_mut(vn).expect("stale load out").update_type(dt);
                 in_varnodes.push(vn);
@@ -4254,13 +4244,13 @@ impl SplitDatatype {
         data: &Funcdata,
         load_store: OpId,
         size: int4,
-    ) -> Option<Rc<Datatype>> {
+    ) -> Option<TypeRoot> {
         let in1 = data.obank().get(load_store).expect("stale ls").get_in(1)?;
         let ptr_type = data.vbank().get(in1).expect("stale in1").get_type_read_facing(load_store).clone();
         if ptr_type.get_metatype() != type_metatype::TYPE_PTR {
             return None;
         }
-        let res_type: Rc<Datatype>;
+        let res_type: TypeRoot;
         let base_offset: int4;
         if ptr_type.is_pointer_rel() {
             res_type = ptr_type.get_rel_parent()?;
@@ -4314,7 +4304,7 @@ struct RootPointer {
     /// The LOAD or STORE op (C++ `loadStore`).
     load_store: Option<OpId>,
     /// Base pointer data-type of the LOAD/STORE (C++ `ptrType`).
-    ptr_type: Option<Rc<Datatype>>,
+    ptr_type: Option<TypeRoot>,
     /// First (original) pointer in the chain (C++ `firstPointer`).
     first_pointer: Option<VarnodeId>,
     /// The current root pointer Varnode (C++ `pointer`).
@@ -4326,7 +4316,7 @@ struct RootPointer {
 impl RootPointer {
     /// Back up the root pointer through a COPY/INT_ADD/PTRSUB/PTRADD (C++
     /// `SplitDatatype::RootPointer::backUpPointer`, subflow.cc:2098).
-    fn back_up_pointer(&mut self, data: &Funcdata, implied_base: Option<&Rc<Datatype>>) -> bool {
+    fn back_up_pointer(&mut self, data: &Funcdata, implied_base: Option<&TypeRoot>) -> bool {
         let pointer = self.pointer;
         if !data.vbank().get(pointer).expect("stale ptr").is_written() {
             return false;
@@ -4355,7 +4345,7 @@ impl RootPointer {
         let meta = parent.get_metatype();
         if meta != type_metatype::TYPE_STRUCT && meta != type_metatype::TYPE_ARRAY {
             let parent_is_implied = match implied_base {
-                Some(ib) => Rc::ptr_eq(&parent, ib),
+                Some(ib) => &parent == ib,
                 None => false,
             };
             if (opc != OpCode::CPUI_PTRADD && opc != OpCode::CPUI_COPY) || !parent_is_implied {
@@ -4384,16 +4374,16 @@ impl RootPointer {
         data: &Funcdata,
         resolver: &mut crate::unionresolve::ResolveCache,
         op: OpId,
-        value_type: &Rc<Datatype>,
+        value_type: &TypeRoot,
     ) -> KunaResult<bool> {
-        let mut implied_base: Option<Rc<Datatype>> = None;
-        let mut value_type = Rc::clone(value_type);
+        let mut implied_base: Option<TypeRoot> = None;
+        let mut value_type = value_type.clone();
         if value_type.get_metatype() == type_metatype::TYPE_PARTIALSTRUCT {
             value_type = value_type.get_partial_base().expect("partial parent");
         }
         if value_type.get_metatype() == type_metatype::TYPE_ARRAY {
             value_type = value_type.get_array_base().expect("array base");
-            implied_base = Some(Rc::clone(&value_type)); // allow implied array (pointer to element)
+            implied_base = Some(value_type.clone()); // allow implied array (pointer to element)
         }
         let key = if data.obank().get(op).expect("stale op").code() == OpCode::CPUI_LOAD { 0 } else { 1 };
         self.load_store = Some(op);
@@ -4407,9 +4397,9 @@ impl RootPointer {
         }
         // resolver.addResolution(key, pointer->getType(), op, 1) — no-op (non-union).
         let _ = (resolver, key);
-        self.ptr_type = Some(Rc::clone(&ct));
+        self.ptr_type = Some(ct.clone());
         let ptr_to = ct.get_ptr_to().expect("pointer ptrTo");
-        if !Rc::ptr_eq(&ptr_to, &value_type) {
+        if ptr_to != value_type {
             if implied_base.is_some() {
                 return Ok(false);
             }
@@ -4417,7 +4407,7 @@ impl RootPointer {
                 return Ok(false);
             }
             let cur_ptr_to = self.ptr_type.as_ref().expect("ptrType").get_ptr_to().expect("ptrTo");
-            if !Rc::ptr_eq(&cur_ptr_to, &value_type) {
+            if cur_ptr_to != value_type {
                 return Ok(false);
             }
         }
@@ -4479,11 +4469,8 @@ impl Rule for RuleSplitCopy {
         vec![OpCode::CPUI_COPY]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSplitCopy::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSplitCopy::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -4527,11 +4514,8 @@ impl Rule for RuleSplitLoad {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSplitLoad::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSplitLoad::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -4573,11 +4557,8 @@ impl Rule for RuleSplitStore {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSplitStore::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSplitStore::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -4624,11 +4605,8 @@ impl Rule for RuleDumptyHumpLate {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDumptyHumpLate::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDumptyHumpLate::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -6020,11 +5998,8 @@ impl Rule for RuleSubfloatConvert {
         vec![OpCode::CPUI_FLOAT_FLOAT2FLOAT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSubfloatConvert::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubfloatConvert::new(self.group.clone()))
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -6075,41 +6050,48 @@ impl Rule for RuleSubfloatConvert {
 /// placeholder, as the W5 subvar entries already document).
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "subvar_and_grp", ctor: || Box::new(RuleSubvarAnd::new("subvar_and_grp")) },
+        RuleSpec { group: "subvar_and_grp", aliases: &[], ctor: || Box::new(RuleSubvarAnd::new("subvar_and_grp")) },
         // NOTE: groups are placeholders; W8 supplies the real stage-group
         // strings from coreaction.cc when it assembles universalAction.  The
         // load-bearing facts here are the rule set, their order, and that each
         // rule keeps its exact name() and getOpList().
         RuleSpec {
             group: "subvar_subpiece_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubvarSubpiece::new("subvar_subpiece_grp")),
         },
         RuleSpec {
             group: "subvar_compzero_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubvarCompZero::new("subvar_compzero_grp")),
         },
         RuleSpec {
             group: "subvar_shift_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubvarShift::new("subvar_shift_grp")),
         },
         RuleSpec {
             group: "subvar_zext_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubvarZext::new("subvar_zext_grp")),
         },
         RuleSpec {
             group: "subvar_sext_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubvarSext::new("subvar_sext_grp")),
         },
-        RuleSpec { group: "splitflow_grp", ctor: || Box::new(RuleSplitFlow::new("splitflow_grp")) },
-        RuleSpec { group: "splitcopy_grp", ctor: || Box::new(RuleSplitCopy::new("splitcopy_grp")) },
-        RuleSpec { group: "splitload_grp", ctor: || Box::new(RuleSplitLoad::new("splitload_grp")) },
-        RuleSpec { group: "splitstore_grp", ctor: || Box::new(RuleSplitStore::new("splitstore_grp")) },
+        RuleSpec { group: "splitflow_grp", aliases: &[], ctor: || Box::new(RuleSplitFlow::new("splitflow_grp")) },
+        RuleSpec { group: "splitcopy_grp", aliases: &[], ctor: || Box::new(RuleSplitCopy::new("splitcopy_grp")) },
+        RuleSpec { group: "splitload_grp", aliases: &[], ctor: || Box::new(RuleSplitLoad::new("splitload_grp")) },
+        RuleSpec { group: "splitstore_grp", aliases: &[], ctor: || Box::new(RuleSplitStore::new("splitstore_grp")) },
         RuleSpec {
             group: "dumptyhumplate_grp",
+            aliases: &[],
             ctor: || Box::new(RuleDumptyHumpLate::new("dumptyhumplate_grp")),
         },
         RuleSpec {
             group: "subfloat_convert_grp",
+            aliases: &[],
             ctor: || Box::new(RuleSubfloatConvert::new("subfloat_convert_grp")),
         },
     ]
@@ -6130,7 +6112,8 @@ mod tests {
         IopSpace, UniqueSpace,
     };
 
-    use crate::dtype::{type_metatype, Datatype, TypeFactory};
+    use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
+    use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeRoot};
     use crate::context::{ArchContext, TypeOp};
     use crate::varnode::DefOpInfo;
 
@@ -6159,7 +6142,14 @@ mod tests {
 
     fn build_fd() -> Funcdata {
         let manage = build_manager();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(16);
+        types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -6169,8 +6159,8 @@ mod tests {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
     }
 
-    fn unk(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+        fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
     }
 
     fn no_replace(
@@ -6192,7 +6182,7 @@ mod tests {
     /// A register varnode at a ram address (free / "free"-like until wired).
     fn mk_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+        fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
     }
 
     /// A register varnode promoted to a function input (so it isn't \e free, the
@@ -6487,15 +6477,6 @@ mod tests {
         assert_eq!(lists[11], vec![OpCode::CPUI_FLOAT_FLOAT2FLOAT]); // subfloat_convert
     }
 
-    #[test]
-    fn clone_rule_filters_by_group() {
-        let rule = RuleSubvarAnd::new("mygroup");
-        let yes = ActionGroupList::from_names(["mygroup"]);
-        let no = ActionGroupList::from_names(["other"]);
-        assert!(rule.clone_rule(&yes).is_some());
-        assert!(rule.clone_rule(&no).is_none());
-    }
-
     // ===== w8x-subflow-splits =================================================
 
     fn mk_const(fd: &mut Funcdata, size: int4, val: u64) -> VarnodeId {
@@ -6624,8 +6605,25 @@ mod tests {
         let user = mk_op(&mut fd, 0x200, 1, OpCode::CPUI_COPY);
         wire_in(&mut fd, user, outvn, 0);
 
-        let mut rule = RuleDumptyHumpLate::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 1);
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+        for op in [pieceop, sub, user] {
+            fd.op_insert_end(op, block);
+        }
+        let mut pool = ActionPool::new(0, "subflow-pool");
+        pool.add_rule(
+            RuleState::new("registered-subflow", 0, "dumptyhumplate"),
+            Box::new(RuleDumptyHumpLate::new("g")),
+        );
+        assert!(pool.clone_filtered(&ActionGroupList::from_names(["g"])).is_none());
+        assert_eq!(fd.obank().get(user).unwrap().get_in(0), Some(outvn));
+        let mut selected = pool
+            .clone_filtered(&ActionGroupList::from_names(["registered-subflow"]))
+            .unwrap();
+        selected.reset(&mut fd);
+        let mut ctx = ActionContext::new();
+        assert_eq!(selected.perform(&mut fd, &mut ctx), 1);
+        assert!(!ctx.has_error());
         // The user now reads W directly (totalReplace).
         assert_eq!(fd.obank().get(user).unwrap().get_in(0), Some(w));
     }
@@ -6693,7 +6691,7 @@ mod tests {
         let sd = SplitDatatype::new(0);
         let int4t = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
         assert_eq!(sd.categorize_datatype(&int4t), 2); // TYPE_INT -> primitive
-        let unk2 = unk(2);
+        let unk2 = factory.get_base(2, type_metatype::TYPE_UNKNOWN).unwrap();
         assert_eq!(sd.categorize_datatype(&unk2), 2); // TYPE_UNKNOWN -> primitive
     }
 
@@ -6706,7 +6704,7 @@ mod tests {
         // out = int4[2] (size 8); in = unknown8 (primitive).  With arrays enabled,
         // testDatatypeCompatibility splits the primitive into the two int4 lanes.
         let int4t = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
-        let arr = factory.get_type_array(2, Rc::clone(&int4t)).unwrap();
+        let arr = factory.get_type_array(2, int4t.clone()).unwrap();
         let unk8 = factory.get_base(8, type_metatype::TYPE_UNKNOWN).unwrap();
         // option_array bit set (config == 2).
         let mut sd = SplitDatatype::new(2);
@@ -6731,10 +6729,9 @@ mod tests {
         // With split_datatype_config == 0, splitStructures/splitArrays are false,
         // so a struct categorizes as not-splittable (-1).
         let sd = SplitDatatype::new(0);
-        // Build a 2-field struct (size 8) via the factory not required: a bare
-        // TYPE_STRUCT with >1 depend is needed; use a partial-struct's parent path
-        // instead exercising the metatype switch's struct arm.
-        let struct_ty = Rc::new(Datatype::new(8, type_metatype::TYPE_STRUCT));
+        let fd = build_fd();
+        let struct_ty = fd.get_arch().types().unwrap()
+            .intern(Datatype::new(8, type_metatype::TYPE_STRUCT)).unwrap();
         assert_eq!(sd.categorize_datatype(&struct_ty), -1);
     }
 
@@ -6774,6 +6771,66 @@ mod tests {
     // targeting the fragile transcriptions: the testCopyConstraints boolean
     // ladder, the generateConstants extended-precision shift arithmetic, and the
     // getValueDatatype TYPE_PTR guard.
+
+    #[test]
+    fn split_datatype_constant_pieces_preserve_bytes() {
+        const PAYLOAD: u64 = 0x8877_6655_4433_2211;
+        for (root_size, big_endian, payload, offset, size, expected) in [
+            (16, false, PAYLOAD, 0, 8, PAYLOAD),
+            (16, false, PAYLOAD, 0, 1, 0x11),
+            (16, false, PAYLOAD, 6, 2, 0x8877),
+            (16, false, PAYLOAD, 7, 1, 0x88),
+            (16, false, PAYLOAD, 7, 2, 0x88),
+            (16, false, PAYLOAD, 4, 8, 0x8877_6655),
+            (16, false, PAYLOAD, 8, 2, 0),
+            (16, false, PAYLOAD, 15, 1, 0),
+            (16, true, PAYLOAD, 8, 8, PAYLOAD),
+            (16, true, PAYLOAD, 15, 1, 0x11),
+            (16, true, PAYLOAD, 8, 2, 0x8877),
+            (16, true, PAYLOAD, 8, 1, 0x88),
+            (16, true, PAYLOAD, 7, 2, 0x88),
+            (16, true, PAYLOAD, 4, 8, 0x8877_6655),
+            (16, true, PAYLOAD, 6, 2, 0),
+            (16, true, PAYLOAD, 0, 1, 0),
+            (8, false, PAYLOAD, 0, 8, PAYLOAD),
+            (8, false, PAYLOAD, 6, 2, 0x8877),
+            (8, true, PAYLOAD, 0, 2, 0x8877),
+            (8, true, PAYLOAD, 7, 1, 0x11),
+            (16, false, 0, 8, 8, 0),
+            (16, true, 0, 0, 8, 0),
+            (16, false, u64::MAX, 7, 2, 0xff),
+            (16, true, u64::MAX, 7, 2, 0xff),
+            (16, false, u64::MAX, 8, 8, 0),
+            (16, true, u64::MAX, 0, 8, 0),
+            (32, false, PAYLOAD, 31, 1, 0),
+            (32, true, PAYLOAD, 0, 1, 0),
+        ] {
+            let mut fd = build_fd();
+            let root = fd.new_constant(root_size, payload);
+            let dt = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UINT).unwrap();
+            let mut splitter = SplitDatatype::new(3);
+            splitter.data_type_pieces.push(Component {
+                in_type: dt.clone(),
+                out_type: dt,
+                offset,
+            });
+            let mut pieces = Vec::new();
+            splitter.build_in_constants(&mut fd, root, &mut pieces, big_endian);
+            let actual: Vec<_> = pieces
+                .iter()
+                .map(|id| {
+                    let vn = fd.vbank().get(*id).unwrap();
+                    assert!(vn.is_constant());
+                    (vn.get_size(), vn.get_offset())
+                })
+                .collect();
+            assert_eq!(
+                actual,
+                vec![(size, expected)],
+                "root_size={root_size} big_endian={big_endian} payload={payload:#x} offset={offset}"
+            );
+        }
+    }
 
     /// `SplitDatatype::testCopyConstraints` (subflow.cc:2390): the C++ rejects
     /// COPYs whose input is a function input, and the written-LOAD-lone-descend
@@ -6850,9 +6907,9 @@ mod tests {
         let _ = wire_out(&mut fd, sink, sinkout);
 
         // Two int2 pieces at offsets 0 and 2 (low half of the ZEXT value).
-        let int2 = Rc::new(Datatype::new(2, type_metatype::TYPE_INT));
-        sd.data_type_pieces.push(Component { in_type: Rc::clone(&int2), out_type: Rc::clone(&int2), offset: 0 });
-        sd.data_type_pieces.push(Component { in_type: Rc::clone(&int2), out_type: Rc::clone(&int2), offset: 2 });
+        let int2 = fd.get_arch().types().unwrap().get_base(2, type_metatype::TYPE_INT).unwrap();
+        sd.data_type_pieces.push(Component { in_type: int2.clone(), out_type: int2.clone(), offset: 0 });
+        sd.data_type_pieces.push(Component { in_type: int2.clone(), out_type: int2.clone(), offset: 2 });
         let mut inv: Vec<VarnodeId> = Vec::new();
         assert!(sd.generate_constants(&mut fd, zout, &mut inv).unwrap());
         assert_eq!(inv.len(), 2);
@@ -6874,8 +6931,9 @@ mod tests {
         wire_in(&mut fd, sink, zout, 0);
         let sinkout = mk_reg(&mut fd, 0x90, 16);
         let _ = wire_out(&mut fd, sink, sinkout);
-        let big = Rc::new(Datatype::new(16, type_metatype::TYPE_INT)); // > sizeof(uintb)
-        sd.data_type_pieces.push(Component { in_type: Rc::clone(&big), out_type: Rc::clone(&big), offset: 0 });
+        let big = fd.get_arch().types().unwrap()
+            .intern(Datatype::new(16, type_metatype::TYPE_INT)).unwrap(); // > sizeof(uintb)
+        sd.data_type_pieces.push(Component { in_type: big.clone(), out_type: big.clone(), offset: 0 });
         let mut inv: Vec<VarnodeId> = Vec::new();
         assert!(!sd.generate_constants(&mut fd, zout, &mut inv).unwrap());
         assert!(inv.is_empty(), "oversize piece must clear the accumulator");
@@ -6890,10 +6948,11 @@ mod tests {
         let spaceid = mk_const(&mut fd, 8, 0);
         // ptr Varnode carries a plain int8 (NOT a pointer) read-facing type.
         let ptr = mk_input(&mut fd, 0x40, 8);
+        let int8 = fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_INT).unwrap();
         fd.vbank_mut()
             .get_mut(ptr)
             .unwrap()
-            .update_type(Rc::new(Datatype::new(8, type_metatype::TYPE_INT)));
+            .update_type(int8);
         let load = mk_op(&mut fd, 0x100, 2, OpCode::CPUI_LOAD);
         wire_in(&mut fd, load, spaceid, 0);
         wire_in(&mut fd, load, ptr, 1);

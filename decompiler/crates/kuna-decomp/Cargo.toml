@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# Cross-crate engine regressions only; normal library/CLI builds exclude helpers.
+test-support = []
+
 [dependencies]
 kuna-base.workspace = true
 kuna-num.workspace = true

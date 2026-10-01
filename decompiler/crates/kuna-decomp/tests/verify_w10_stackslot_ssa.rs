@@ -26,7 +26,7 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_3::RuleMultiCollapse;
 use kuna_decomp::action::Rule;
@@ -50,7 +50,12 @@ fn build_fd() -> Funcdata {
         1,
     )))
     .unwrap();
-    let glb = Rc::new(ArchContext::new(m));
+    let mut context = ArchContext::new(m);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -59,8 +64,9 @@ fn build_fd() -> Funcdata {
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 fn set_opcode(fd: &mut Funcdata, op: OpId, opc: OpCode) {
     fd.op_set_opcode(op, TypeOp::new(opc, 0, format!("{opc:?}")));
@@ -78,7 +84,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// A non-free processor register Varnode (heritaged input → isHeritageKnown).
 fn mk_reg(fd: &mut Funcdata, s: int4, off: u64) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.vbank_mut().create(s, Address::new(r, off), dt(s));
+    let datatype = dt(fd, s);
+    let vn = fd.vbank_mut().create(s, Address::new(r, off), datatype);
     fd.vbank_mut().set_input(vn, &mut |_, _, _| Ok(())).expect("set_input")
 }
 /// Fresh unique output of `op`, marked heritage-known (`insert`), as a real
@@ -86,9 +93,10 @@ fn mk_reg(fd: &mut Funcdata, s: int4, off: u64) -> VarnodeId {
 fn mk_out(fd: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
     let seqnum = fd.obank().get(op).unwrap().get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum };
+    let datatype = dt(fd, s);
     let vn = fd
         .vbank_mut()
-        .create_def_unique(s, dt(s), def, &mut |_, _, _| Ok(()))
+        .create_def_unique(s, datatype, def, &mut |_, _, _| Ok(()))
         .expect("create_def_unique");
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));
     // A written SSA def is heritage-known: set the `insert` flag the heritage

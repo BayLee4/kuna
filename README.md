@@ -111,7 +111,7 @@ directly: `cd decompiler && cargo build` / `cargo test --workspace`.
 Four gates, all expected green before every commit:
 
 ```bash
-make test        # the 675/675 decompiler regression parity (tests/datatests/ vs docs/baseline.json)
+make test        # the 674/674 decompiler regression parity (tests/datatests/ vs docs/baseline.json)
 make test-stages # the kuna-owned issue testcases (tests/stages/ vs docs/baseline-stages.json)
 make rust-test   # the full cargo workspace suite (ported unit tests, golden differential
                  # vectors, SLEIGH-compiler .sla content-parity, docs/options.md freshness, ...)
@@ -120,14 +120,26 @@ make check-spec  # docs/spec/ honesty: anchors and inline code paths resolve, an
 ```
 
 `make test` compiles the specs with the Rust SLEIGH compiler and decodes the XML regression
-corpus (`tests/datatests/`, 83 files / 675 assertions) with the Rust decompiler.
+corpus (`tests/datatests/`, 83 files / 674 assertions) with the Rust decompiler.
+
+The console integration tests execute corpus setup scripts through the production loader.
+Emitted-C behavior checks in the console and CLI require a native C11 compiler (`CC`, or `cc` by default):
+they compile the unchanged function bodies and check return values, calls, memory effects,
+and floating-point bits. Serialized-AST tests check storage, operands, control-flow edges,
+and markup references; these are Rust-side consumer checks, not C++ oracle comparisons.
+The direct `decomp_test_dbg` harness returns failure for file parsing, script execution,
+or missing output even when no assertions were applied.
+
+The CLI `globalref` round-trip test checks exported code and declarations on every host.
+Its ELF memory-mapping execution witness requires Linux x86-64 and at least one of GCC
+or Clang; other hosts report that execution limit without skipping the export checks.
 
 ### Layout
 
 | Path | What it is |
 |---|---|
 | `decompiler/` | The engine — a cargo workspace. `kuna-decomp` (the decompiler, phase-foldered `p0_knowledge/`…`p9_emit/`), `kuna-analysis` (the loader/analyzer tier), `kuna-sleigh`/`kuna-slacomp` (SLEIGH runtime + compiler, binary `slacomp`), `kuna-console` (the `decomp_dbg`/`decomp_test_dbg` binaries), `kuna-cli` (the `kuna` binary), `kuna-ghidra`/`kuna-wasm` (the Ghidra and browser front-ends), plus support crates |
-| `tests/datatests/` | Upstream XML decompilation regression tests (83 files → 675 assertions); the corpus `make test` runs |
+| `tests/datatests/` | Upstream XML decompilation regression tests (83 files → 674 assertions); the corpus `make test` runs |
 | `tests/stages/` | kuna-owned issue testcases; the corpus `make test-stages` runs |
 | `tests/golden/` | Differential golden vectors for the workspace suite (`make rust-test`) |
 | `specs/Ghidra/Processors/` | Vendored SLEIGH processor specs; `.sla` are build artifacts produced by `slacomp` |

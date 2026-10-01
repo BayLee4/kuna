@@ -29,7 +29,6 @@
 //! performed.
 
 use std::collections::{BTreeMap, HashSet};
-use std::rc::Rc;
 
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
@@ -38,7 +37,7 @@ use kuna_num::opcodes::OpCode;
 
 use crate::architecture::Architecture;
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::options::on_or_off;
 
@@ -63,7 +62,7 @@ impl OptionGlobalRef {
 #[derive(Debug, Clone)]
 pub struct Minted {
     /// The type the function uses the object at.
-    pub decl_type: Rc<Datatype>,
+    pub decl_type: TypeRoot,
     /// True when `decl_type` is the unknown byte: the function only ever used
     /// the address through `void *` and never reads the storage there directly.
     pub unknown: bool,
@@ -74,24 +73,31 @@ pub struct Minted {
 struct Direct {
     start: u64,
     size: u64,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
     /// No global Symbol covers it, so the body prints it as `dat_<start>`.
     unnamed: bool,
+}
+
+#[derive(Debug)]
+struct Named {
+    name: String,
+    ty: TypeRoot,
+    volatile: bool,
 }
 
 /// What one function reads an address at.
 #[derive(Debug, Clone)]
 enum Seen {
     /// Only ever through `void *`.
-    Void(Rc<Datatype>),
+    Void(TypeRoot),
     /// One pointed-to type other than `void`, perhaps also through `void *`.
-    One(Rc<Datatype>),
+    One(TypeRoot),
     /// Two different pointed-to types other than `void`.
     Conflict,
 }
 
 impl Seen {
-    fn merge(prev: Option<Seen>, to: Rc<Datatype>) -> Seen {
+    fn merge(prev: Option<Seen>, to: TypeRoot) -> Seen {
         let is_void = to.get_metatype() == type_metatype::TYPE_VOID;
         match prev {
             None | Some(Seen::Void(_)) if is_void => Seen::Void(to),
@@ -101,9 +107,9 @@ impl Seen {
         }
     }
 
-    fn object(&self) -> Option<Rc<Datatype>> {
+    fn object(&self) -> Option<TypeRoot> {
         match self {
-            Seen::Void(t) | Seen::One(t) => Some(Rc::clone(t)),
+            Seen::Void(t) | Seen::One(t) => Some(Clone::clone(t)),
             Seen::Conflict => None,
         }
     }
@@ -121,10 +127,13 @@ pub struct Plan {
     pointees: BTreeMap<u64, Seen>,
     /// Every global this function's C names, by address.
     pub minted: BTreeMap<u64, Minted>,
+    /// Authenticated named symbols reached by the renderer, independent of the
+    /// optional constant-address rewriting policy.
+    named: BTreeMap<u64, Vec<Named>>,
 }
 
-/// Build the plan for `fd`. Off (and empty) unless the option is on, the image
-/// reported data sections, and the output language is C.
+/// Build the optional address-rewrite plan. Authenticated named symbols are
+/// recorded separately by the renderer even when this rewrite is disabled.
 pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> Plan {
     if !on || !is_c || arch.globalref_ranges.is_empty() {
         return Plan::default();
@@ -159,13 +168,13 @@ pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> Plan {
             direct.push(Direct {
                 start: v.get_offset(),
                 size: v.get_size().max(1) as u64,
-                ty: Rc::clone(v.get_type()),
+                ty: Clone::clone(v.get_type()),
                 unnamed,
             });
         }
     }
     let trace = std::env::var_os("KUNA_GLOBALREF_TRACE").is_some();
-    Plan { on: true, trace, numeric, direct, pointees, minted: BTreeMap::new() }
+    Plan { on: true, trace, numeric, direct, pointees, minted: BTreeMap::new(), named: BTreeMap::new() }
 }
 
 /// Does `opcode` read its operand as a number rather than as an address?
@@ -174,6 +183,20 @@ fn reads_as_number(opcode: OpCode) -> bool {
 }
 
 impl Plan {
+    pub(crate) fn record_named(&mut self, address: u64, name: &str, ty: &TypeRoot, volatile: bool) {
+        let objects = self.named.entry(address).or_default();
+        if let Some(object) = objects.iter_mut().find(|object| object.name == name && &object.ty == ty) {
+            object.volatile |= volatile;
+        } else {
+            objects.push(Named { name: name.to_string(), ty: ty.clone(), volatile });
+        }
+    }
+
+    pub(crate) fn named_objects(&self) -> impl Iterator<Item = (u64, &str, &TypeRoot, bool)> + '_ {
+        self.named.iter().flat_map(|(&address, objects)| objects.iter()
+            .map(move |object| (address, object.name.as_str(), &object.ty, object.volatile)))
+    }
+
     /// Decide whether the pointer-typed constant `vn` (value `off`, read by
     /// `op` at type `ct`) names a global, and record it. Returns the address to
     /// name, or `None` to keep the upstream cast.
@@ -184,17 +207,19 @@ impl Plan {
         vn: VarnodeId,
         op: OpId,
         off: uintb,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
     ) -> Option<u64> {
         if !self.on {
             return None;
         }
         let verdict = self.judge(fd, arch, vn, op, off, ct);
         if self.trace {
+            let view = ct.read();
+            let record = view.get(ct.id()).expect("live global pointer type");
             eprintln!(
                 "[globalref] {} 0x{off:x} {} {}",
                 fd.get_name(),
-                ct.get_name(),
+                record.get_name(),
                 match &verdict {
                     Ok(()) => "named",
                     Err(why) => why.as_str(),
@@ -211,7 +236,7 @@ impl Plan {
         vn: VarnodeId,
         op: OpId,
         off: uintb,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
     ) -> Result<(), Refusal> {
         if off == 0 || ct.get_metatype() != type_metatype::TYPE_PTR || ct.get_word_size().unwrap_or(1) != 1 {
             return Err(Refusal::NotAPointer);
@@ -237,7 +262,7 @@ impl Plan {
         if pointee.get_metatype() == type_metatype::TYPE_VOID && !void_reader_converts(fd, op, vn) {
             return Err(Refusal::VoidReader);
         }
-        let space = Rc::clone(arch.manage().get_default_data_space().ok_or(Refusal::OutsideData)?);
+        let space = Clone::clone(arch.manage().get_default_data_space().ok_or(Refusal::OutsideData)?);
         let addr = Address::new(space, off);
         let invalid = Address::new_invalid();
         if fd.get_arch().query_container_global(&addr, 1, &invalid).is_some() {
@@ -254,14 +279,18 @@ impl Plan {
         let size = decl_type.get_size().max(1) as u64;
         if let Some(d) = self.direct.iter().find(|d| overlaps(d, off, size) && !same_object(d, off, size, &decl_type)) {
             if self.trace {
+                let decl_view = decl_type.read();
+                let direct_view = d.ty.read();
+                let decl_record = decl_view.get(decl_type.id()).expect("live global declaration");
+                let direct_record = direct_view.get(d.ty.id()).expect("live direct access type");
                 eprintln!(
                     "[globalref-direct] {} 0x{off:x} decl={}:{} direct=0x{:x}:{}:{}",
                     fd.get_name(),
-                    decl_type.get_name(),
+                    decl_record.get_name(),
                     size,
                     d.start,
                     d.size,
-                    d.ty.get_name()
+                    direct_record.get_name()
                 );
             }
             return Err(Refusal::DirectAccess);
@@ -274,13 +303,13 @@ impl Plan {
 impl Plan {
     /// The unnamed program data this function reads or writes directly, by
     /// start and type: the `dat_<addr>` it prints that are not addresses taken.
-    pub fn direct_objects(&self) -> impl Iterator<Item = (u64, &Rc<Datatype>)> + '_ {
+    pub fn direct_objects(&self) -> impl Iterator<Item = (u64, &TypeRoot)> + '_ {
         self.direct.iter().filter(|d| d.unnamed).map(|d| (d.start, &d.ty))
     }
 
     /// The one type this function reads or writes the storage at `off` at,
     /// when every direct access that touches it starts there at that type.
-    fn direct_type_at(&self, off: u64) -> Option<Rc<Datatype>> {
+    fn direct_type_at(&self, off: u64) -> Option<TypeRoot> {
         let mut found: Option<&Direct> = None;
         for d in self.direct.iter().filter(|d| overlaps(d, off, 1)) {
             match found {
@@ -289,7 +318,7 @@ impl Plan {
                 _ => return None,
             }
         }
-        found.map(|d| Rc::clone(&d.ty))
+        found.map(|d| Clone::clone(&d.ty))
     }
 }
 
@@ -344,7 +373,7 @@ fn overlaps(d: &Direct, off: u64, size: u64) -> bool {
 /// at a type that spells the same C type as `ty`? A wider unknown is the
 /// unsigned integer of its size on every surface; a one-byte unknown is `char`
 /// on one and `unsigned char` on another, so it matches only itself.
-fn same_object(d: &Direct, off: u64, size: u64, ty: &Rc<Datatype>) -> bool {
+fn same_object(d: &Direct, off: u64, size: u64, ty: &TypeRoot) -> bool {
     if d.start != off || d.size != size {
         return false;
     }
@@ -355,12 +384,12 @@ fn same_object(d: &Direct, off: u64, size: u64, ty: &Rc<Datatype>) -> bool {
             && ty.get_size() > 1)
 }
 
-fn same_type(a: &Rc<Datatype>, b: &Rc<Datatype>) -> bool {
-    Rc::ptr_eq(a, b) || a.type_order(b).map(|o| o == 0).unwrap_or(false)
+fn same_type(a: &TypeRoot, b: &TypeRoot) -> bool {
+    TypeRoot::eq(a, b) || a.type_order(b).map(|o| o == 0).unwrap_or(false)
 }
 
 /// Is `ct` a pointer to `void`?
-fn is_void_pointer(ct: &Datatype) -> bool {
+fn is_void_pointer(ct: &TypeRoot) -> bool {
     ct.get_metatype() == type_metatype::TYPE_PTR
         && ct.get_ptr_to().is_some_and(|p| p.get_metatype() == type_metatype::TYPE_VOID)
 }
@@ -372,7 +401,7 @@ fn is_void_pointer(ct: &Datatype) -> bool {
 fn void_reader_converts(fd: &Funcdata, op: OpId, vn: VarnodeId) -> bool {
     let Some(o) = fd.obank().get(op) else { return false };
     let slot = o.get_slot(vn);
-    let ty_of = |v: Option<VarnodeId>| v.and_then(|v| fd.vbank().get(v)).map(|v| Rc::clone(v.get_type()));
+    let ty_of = |v: Option<VarnodeId>| v.and_then(|v| fd.vbank().get(v)).map(|v| Clone::clone(v.get_type()));
     match o.code() {
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND | OpCode::CPUI_RETURN => slot >= 1,
         OpCode::CPUI_COPY => ty_of(o.get_out()).is_some_and(|t| is_void_pointer(&t)),

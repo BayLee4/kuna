@@ -3,9 +3,8 @@
 //! The diff under review closes two console seams — `IfcMaphash` (`map hash`)
 //! and `IfcMapunionfacet` (`map unionfacet`) — by wiring them to the existing
 //! `Scope::addDynamicSymbol` / `Scope::addUnionFacetSymbol` database methods
-//! through two new thin `ScopeLocal` wrappers in `varmap.rs`
-//! (`add_dynamic_symbol` / `add_union_facet_symbol`), and fills four missing
-//! arms in the `ruleaction_3::opflags_for` W6 shim.
+//! through the `ScopeLocal` entrypoints in `varmap.rs`
+//! (`add_dynamic_symbol` / `add_union_facet_symbol`).
 //!
 //! These tests target the spots the hunt list flagged as most fragile for this
 //! item:
@@ -33,7 +32,7 @@ use kuna_base::address::Address;
 use kuna_base::space::{addrspace_flags, spacetype, AddrSpace};
 
 use kuna_decomp::database::{symbol_category, SymbolKind};
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField, TypeRoot};
 use kuna_decomp::varmap::ScopeLocal;
 use kuna_decomp::varnode::varnode_flags;
 
@@ -62,21 +61,22 @@ fn scope_local() -> ScopeLocal {
 }
 
 /// A base data-type of `size` bytes (TYPE_UNKNOWN), align == size.
-fn base(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn base(types: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new_with_align(size, size, meta)).unwrap()
 }
 
 /// A synthetic TYPE_UNION with `n` int4-sized fields so `num_depend() == n`.
-fn union_with_fields(n: usize) -> Rc<Datatype> {
+fn union_with_fields(types: &TypeFactoryImpl, n: usize) -> TypeRoot {
+    let member = base(types, 4, type_metatype::TYPE_INT);
     let mut field = Vec::new();
     for i in 0..n {
-        field.push(TypeField::new(i as int4, 0, format!("f{i}"), base(4, type_metatype::TYPE_INT)));
+        field.push(TypeField::new(i as int4, 0, format!("f{i}"), member.id()));
     }
     // Union size == max field size (4 here); override the Base payload with the
     // Union kind so `num_depend()` walks the field list.
     let mut dt = Datatype::new_with_align(4, 4, type_metatype::TYPE_UNION);
     dt.kind = DatatypeKind::Union { field };
-    Rc::new(dt)
+    types.intern(dt).unwrap()
 }
 
 use kuna_base::types::int4;
@@ -91,11 +91,12 @@ fn union_facet_whole_union_minus_one_roundtrips() {
     // carry that -1, the UNION_FACET category, and the union data-type — not a
     // silently-zeroed field or a dropped type.
     let mut sl = scope_local();
-    let un = union_with_fields(3);
+    let types = TypeFactoryImpl::new();
+    let un = union_with_fields(&types, 3);
     let space = Rc::clone(sl.get_space_id());
     let addr = Address::new(space, 0x401000);
     let sid = sl
-        .add_union_facet_symbol("unionfacet0_401000", Rc::clone(&un), -1, &addr, 0xdeadbeef)
+        .add_union_facet_symbol("unionfacet0_401000", un.clone(), -1, &addr, 0xdeadbeef)
         .expect("addUnionFacetSymbol");
 
     let sym = sl.database().symbol(sid);
@@ -122,7 +123,8 @@ fn union_facet_field_zero_boundary_roundtrips() {
     // wrapper that mishandled 0 (e.g. treating it like the -1 sentinel) would be
     // silent corruption.
     let mut sl = scope_local();
-    let un = union_with_fields(2);
+    let types = TypeFactoryImpl::new();
+    let un = union_with_fields(&types, 2);
     let space = Rc::clone(sl.get_space_id());
     let addr = Address::new(space, 0x8);
     let sid = sl
@@ -144,11 +146,12 @@ fn dynamic_symbol_size_from_type_and_lock_flags() {
     // 8 would be caught.  Also exercise the console seam's
     // setAttribute(namelock|typelock) on the produced symbol.
     let mut sl = scope_local();
-    let ct = base(7, type_metatype::TYPE_UNKNOWN);
+    let types = TypeFactoryImpl::new();
+    let ct = base(&types, 7, type_metatype::TYPE_UNKNOWN);
     let space = Rc::clone(sl.get_space_id());
     let addr = Address::new(space, 0x402000);
     let sid =
-        sl.add_dynamic_symbol("hv", Rc::clone(&ct), &addr, 0x55).expect("addDynamicSymbol");
+        sl.add_dynamic_symbol("hv", ct.clone(), &addr, 0x55).expect("addDynamicSymbol");
     sl.set_attribute(sid, varnode_flags::namelock | varnode_flags::typelock);
 
     let sym = sl.database().symbol(sid);
@@ -172,7 +175,8 @@ fn dynamic_symbol_invalid_address_skips_range_but_keeps_symbol() {
     // the varnode).  A port that unconditionally indexed caddr.getSpace() would
     // panic here.
     let mut sl = scope_local();
-    let ct = base(4, type_metatype::TYPE_INT);
+    let types = TypeFactoryImpl::new();
+    let ct = base(&types, 4, type_metatype::TYPE_INT);
     let invalid = Address::new_invalid();
     let sid = sl
         .add_dynamic_symbol("noaddr", ct, &invalid, 0x99)
@@ -184,30 +188,3 @@ fn dynamic_symbol_invalid_address_skips_range_but_keeps_symbol() {
     assert_eq!(sym.mapentry.len(), 1, "the dynamic hash entry is created even with no address");
 }
 
-// --- F5: opflags arms — the four newly-filled W6 entries match typeop.cc ----
-
-#[test]
-fn opflags_constants_match_cpp_pcodeop_enum() {
-    // The four new `opflags_for` arms are `binary | commutative` (XOR/AND/OR),
-    // `unary` (NEGATE/2COMP), `binary` (LEFT/RIGHT), `binary | booloutput`
-    // (LESS).  `opflags_for` is private, but the arms are built from these
-    // public flag constants; pin the constant VALUES against op.hh so a future
-    // edit that renumbered them (and thus silently changed every transcribed
-    // arm) is caught.  These are the exact bit values the C++ PcodeOp enum uses.
-    use kuna_decomp::op::pcodeop_flags;
-    assert_eq!(pcodeop_flags::booloutput, 0x80, "PcodeOp::booloutput (op.hh:82)");
-    assert_eq!(pcodeop_flags::commutative, 0x4000, "PcodeOp::commutative (op.hh:89)");
-    assert_eq!(pcodeop_flags::unary, 0x8000, "PcodeOp::unary (op.hh:90)");
-    assert_eq!(pcodeop_flags::binary, 0x10000, "PcodeOp::binary (op.hh:91)");
-    // The composite words the new arms produce:
-    assert_eq!(
-        pcodeop_flags::binary | pcodeop_flags::commutative,
-        0x14000,
-        "INT_XOR/AND/OR opflags (typeop.cc:1413/1446/1479)",
-    );
-    assert_eq!(
-        pcodeop_flags::binary | pcodeop_flags::booloutput,
-        0x10080,
-        "INT_LESS opflags (typeop.cc:1072)",
-    );
-}

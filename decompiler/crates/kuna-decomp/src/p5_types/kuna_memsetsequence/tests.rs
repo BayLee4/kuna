@@ -20,7 +20,7 @@ use kuna_base::types::int4;
 
 use crate::action::Rule;
 use crate::constseq::WriteNode;
-use crate::dtype::type_metatype;
+use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
 use crate::context::{ArchContext, BlockId, TypeOp};
 
 fn build_manager() -> AddrSpaceManager {
@@ -54,9 +54,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn char1(_fd: &Funcdata) -> Rc<Datatype> {
+fn char1(_fd: &Funcdata) -> TypeRoot {
     // A 1-byte char-like element (align_size 1) — matches the C++ array element.
-    Rc::new(Datatype::new(1, type_metatype::TYPE_INT))
+    TypeFactoryImpl::new().intern(Datatype::new(1, type_metatype::TYPE_INT)).unwrap()
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {
@@ -269,17 +269,6 @@ fn rule_gate_on_declines_until_stubs_land() {
     assert_eq!(rule.apply_op(op, &mut fd), 0);
 }
 
-/// The rule matches on CPUI_COPY and clone-filters by group.
-#[test]
-fn rule_oplist_and_clone() {
-    let rule = RuleMemsetCopy::new(true);
-    assert_eq!(rule.get_op_list(), vec![OpCode::CPUI_COPY]);
-    let in_list = ActionGroupList::from_names(["analysis"]);
-    let out_list = ActionGroupList::from_names(["other"]);
-    assert!(rule.clone_rule(&in_list).is_some());
-    assert!(rule.clone_rule(&out_list).is_none());
-}
-
 // --- OptionMemsetRecover parse -----------------------------------------------
 
 #[test]
@@ -310,18 +299,3 @@ fn parse_garbage_is_error() {
     assert!(parse_memset_recover_form("maybe").is_err());
 }
 
-// --- specs -------------------------------------------------------------------
-
-#[test]
-fn specs_ship_default_on() {
-    let s = specs();
-    assert_eq!(s.len(), 1);
-    assert_eq!(s[0].group, "analysis");
-    // The shipped ctor builds an enabled rule (memset_recover = true, DIV-2).
-    let rule = (s[0].ctor)();
-    // A real apply still declines (stub-blocked), but the rule is constructed
-    // in the enabled state — exercise its op list to confirm it is RuleMemsetCopy.
-    assert_eq!(rule.get_op_list(), vec![OpCode::CPUI_COPY]);
-    // gate is on: clone in the analysis group survives.
-    assert!(rule.clone_rule(&ActionGroupList::from_names(["analysis"])).is_some());
-}

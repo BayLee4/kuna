@@ -74,18 +74,17 @@
 //! Output languages without implicit integer conversions (Rust) get nothing.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{HighVariableId, OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 
 /// What the printer knows about how an op prints, which the IR alone does not say.
 pub(crate) trait PrintedForms {
     /// The text the printer writes for `ty` in a cast or a declaration.
-    fn spell(&self, ty: &Rc<Datatype>) -> String;
+    fn spell(&self, ty: &TypeRoot) -> String;
     /// Does this `INT_SEXT`/`INT_ZEXT` print as a cast (not as `SEXT14(x)`)?
     fn extension_is_cast(&self, op: OpId) -> bool;
     /// Does upstream's integer-promotion rule already hide this extension?
@@ -97,7 +96,7 @@ pub(crate) trait PrintedForms {
     /// The name the printer writes for `high`.
     fn high_name(&self, high: HighVariableId) -> Option<String>;
     /// A declared type some other pass chose for `high` (`signedness`).
-    fn planned_decl_type(&self, high: HighVariableId) -> Option<Rc<Datatype>>;
+    fn planned_decl_type(&self, high: HighVariableId) -> Option<TypeRoot>;
     /// Is `op` being printed as the statement `lhs = <op>;` (not, say, as one arm
     /// of a `c ? a : b`, whose type is the arms' common type)?
     fn is_statement(&self, op: OpId) -> bool;
@@ -111,7 +110,7 @@ pub(crate) trait PrintedForms {
 #[derive(Debug)]
 pub(crate) enum CType {
     /// The printed text states this type.
-    Known(Rc<Datatype>),
+    Known(TypeRoot),
     /// Nothing states it; C's type is at most a promotion of the IR's.
     Unknown,
     /// The text states a type that is none of the IR's (a pointer declaration
@@ -120,7 +119,7 @@ pub(crate) enum CType {
 }
 
 impl CType {
-    fn known(&self) -> Option<&Rc<Datatype>> {
+    fn known(&self) -> Option<&TypeRoot> {
         match self {
             CType::Known(t) => Some(t),
             _ => None,
@@ -308,7 +307,7 @@ impl ImpliedCasts {
         p: &dyn PrintedForms,
         fd: &Funcdata,
         def: OpId,
-        t: Rc<Datatype>,
+        t: TypeRoot,
         reader: Option<OpId>,
     ) -> CType {
         let Some(d) = fd.obank().get(def) else { return CType::Unknown };
@@ -415,7 +414,7 @@ impl ImpliedCasts {
     /// depends only on the value modulo 2^N (C11 6.3.1.3, and gcc and clang define
     /// the signed case that way), so converting `e` straight to the declaration
     /// yields the bits the cast followed by the assignment's conversion would.
-    fn assigns_to(&self, p: &dyn PrintedForms, fd: &Funcdata, lhs: VarnodeId, want: &str, target: &Datatype) -> bool {
+    fn assigns_to(&self, p: &dyn PrintedForms, fd: &Funcdata, lhs: VarnodeId, want: &str, target: &TypeRoot) -> bool {
         if self.declared_spelling(p, fd, lhs).as_deref() == Some(want) {
             return true;
         }
@@ -424,7 +423,7 @@ impl ImpliedCasts {
 
     /// The type `signedness` re-declared `vn`'s variable as, when `castsign` is on
     /// and that is the declaration the printer wrote.
-    fn resigned_type(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId) -> Option<Rc<Datatype>> {
+    fn resigned_type(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId) -> Option<TypeRoot> {
         if !self.resigned {
             return None;
         }
@@ -518,7 +517,7 @@ fn fixes_type(p: &dyn PrintedForms, fd: &Funcdata, r: OpId) -> bool {
 
 /// The declared type of the parameter `arg` fills at the direct call `call`,
 /// when that declaration is one C sees at this call.
-fn trusted_param(fd: &Funcdata, call: OpId, arg: VarnodeId) -> Option<Rc<Datatype>> {
+fn trusted_param(fd: &Funcdata, call: OpId, arg: VarnodeId) -> Option<TypeRoot> {
     let o = fd.obank().get(call)?;
     if o.code() != OpCode::CPUI_CALL {
         return None;
@@ -544,13 +543,13 @@ fn trusted_param(fd: &Funcdata, call: OpId, arg: VarnodeId) -> Option<Rc<Datatyp
 
 /// Is `t` an integer type a conversion here may target?  `bool` is not: a
 /// conversion to `bool` tests the operand against zero.
-fn is_int_target(t: &Datatype) -> bool {
+fn is_int_target(t: &TypeRoot) -> bool {
     matches!(t.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT)
         && int_range(t).is_some()
 }
 
 /// The values an integer type holds, or `None` for anything else.
-pub(crate) fn int_range(t: &Datatype) -> Option<(i128, i128)> {
+pub(crate) fn int_range(t: &TypeRoot) -> Option<(i128, i128)> {
     if t.is_enum_type() {
         return None;
     }
@@ -568,7 +567,7 @@ pub(crate) fn int_range(t: &Datatype) -> Option<(i128, i128)> {
 }
 
 /// Does converting any value of `src` to `dst` leave it unchanged?
-pub(crate) fn preserves(src: &Datatype, dst: &Datatype) -> bool {
+pub(crate) fn preserves(src: &TypeRoot, dst: &TypeRoot) -> bool {
     if !is_int_target(dst) {
         return false;
     }

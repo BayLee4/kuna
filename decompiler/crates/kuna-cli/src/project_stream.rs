@@ -39,7 +39,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kuna_console::engine::{ConsoleProgram, EntrySelector, FunctionEntry};
 use kuna_console::project::{
-    build_header, collect_dat_addrs, decompile_pulled, render_c, render_readme,
+    build_header, collect_dat_addrs, decompile_pulled, render_c_bodies, render_callable_definitions, render_readme,
     render_readme_streaming, AsmPhase, BatchOutcome, DecompileOptions, FuncResult, ReadmeCounts,
     ReadmeFacts, ReadmeLayout, StreamPhase, StreamProgress,
 };
@@ -586,6 +586,8 @@ struct ProjectWriter {
     /// One per finished target, with the code dropped — what the `.h`, the
     /// `.asm` variables section and the final README are built from.
     records: Vec<FuncResult>,
+    /// Successful C body writes, aligned with `records` after their code is dropped.
+    bodies_written: Vec<bool>,
     bodies: usize,
     errors: Vec<String>,
     dat: BTreeSet<u64>,
@@ -619,6 +621,7 @@ impl ProjectWriter {
             c_bytes,
             seq: 0,
             records: Vec::new(),
+            bodies_written: Vec::new(),
             bodies: 0,
             errors: Vec::new(),
             dat: BTreeSet::new(),
@@ -636,7 +639,7 @@ impl ProjectWriter {
     /// Append one finished function: its `.c` block, then its `index.jsonl`
     /// line, then the compact record the tail artifacts are built from.
     fn append(&mut self, mut r: FuncResult, run: &StreamRun) -> Result<(), String> {
-        let block = render_c(std::slice::from_ref(&r));
+        let block = render_c_bodies(std::slice::from_ref(&r));
         self.c
             .write_all(block.as_bytes())
             .map_err(|e| format!("cannot append to {}.c: {e}", self.file_name))?;
@@ -657,12 +660,15 @@ impl ProjectWriter {
         }
         let failed = r.error.is_some();
         self.bodies += usize::from(r.code.is_some());
+        let body_written = r.code.is_some() && r.error.is_none()
+            && r.callable_export_error.is_none();
         r.code = None;
         r.line_mappings.clear();
         r.aliases.clear();
         r.callee_hints.clear();
         r.object_location = None;
         self.records.push(r);
+        self.bodies_written.push(body_written);
 
         let mut shared = run.lock();
         shared.status.done += 1;
@@ -704,7 +710,7 @@ impl ProjectWriter {
     fn write_header(&self, types: Option<&str>) -> Result<(), String> {
         let types =
             types.unwrap_or("/* pending until the export completes */\n");
-        let text = build_header(&self.file_name, &self.prelude, types, &self.records);
+        let text = build_header(&self.file_name, &self.prelude, types, &self.records)?;
         write_atomic(&self.dir.join(format!("{}.h", self.file_name)), text.as_bytes())
     }
 }
@@ -908,6 +914,11 @@ fn export(
     type_blocks.push(print_c_types(prog.arch_mut()));
     let types = jobs::merge_type_definitions(&type_blocks, jobs::STREAM_TAG);
     writer.write_header(Some(&types))?;
+    let adapters = render_callable_definitions(&writer.records, &writer.bodies_written)?;
+    writer.c.write_all(adapters.as_bytes()).and_then(|()| writer.c.flush())
+        .map_err(|error| format!("cannot append callable adapters: {error}"))?;
+    writer.c_bytes += adapters.len() as u64;
+    run.lock().status.c_bytes = writer.c_bytes;
     asm.write_all(render_variables_section(&writer.records).as_bytes())
         .and_then(|()| asm.write_all(render_data_tail(&prog, &writer.dat).as_bytes()))
         .and_then(|()| asm.flush())
@@ -1258,6 +1269,8 @@ mod tests {
             object_location: None,
             callee_hints: hints,
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         }
     }
@@ -1524,7 +1537,7 @@ mod tests {
     #[test]
     fn an_index_line_slices_the_c_to_its_block() {
         let ok = result(0x401000, Vec::new());
-        let block = render_c(std::slice::from_ref(&ok));
+        let block = render_c_bodies(std::slice::from_ref(&ok));
         let prelude = "#include \"x.h\"\n\n";
         let c = format!("{prelude}{block}");
         let offset = prelude.len();

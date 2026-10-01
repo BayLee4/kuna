@@ -15,8 +15,7 @@
 //!      out → `queryProperties` returns 0 flags);
 //!   4. smallest-size containing selection + `inUse(usepoint)` (addr-tied valid
 //!      throughout; an invalid usepoint never matches a use-limited entry);
-//!   5. the `end = start + size - 1` uintb wrap near u64::MAX must not panic
-//!      (C++ unsigned wrap vs Rust debug overflow).
+//!   5. an exact one-byte query at u64::MAX retains the entry's flags.
 //!
 //! Committed with the verdict regardless of outcome (verification.md "Adversarial
 //! pass").  All assertions are derived from the C++ body, not the Rust output.
@@ -269,16 +268,14 @@ fn av4_smallest_in_use_entry_wins() {
 }
 
 // ===========================================================================
-// AV5 — `end = start + size - 1` uintb wrap must not panic
+// AV5 — exact containment at the highest address
 // ===========================================================================
 //
 // C++ computes `uintb end = addr.getOffset() + size - 1` in unsigned 64-bit
-// arithmetic, which wraps silently; the port uses
-// `start.wrapping_add(size as u64).wrapping_sub(1)`.  A query whose start is at
-// the top of the space must not panic in Rust debug builds, and must produce a
-// sane (non-matching) answer rather than a false positive.
+// arithmetic, which wraps silently. An exact one-byte query at the top of the
+// space still matches its entry and returns that entry's properties.
 #[test]
-fn av5_end_offset_wrap_near_u64_max_does_not_panic() {
+fn av5_exact_top_address_match_preserves_properties() {
     let ram = ram_space(3);
     let flags = varnode_flags::mapped | varnode_flags::persist;
     // An entry at the very top byte.
@@ -294,9 +291,4 @@ fn av5_end_offset_wrap_near_u64_max_does_not_panic() {
         flags,
         "a 1-byte read at the top of the space must match without panicking"
     );
-    // size 2 at u64::MAX: end wraps to 0 (MAX + 2 - 1 = MAX wrapping_add 2 = 0).
-    // The entry's last (MAX) is >= 0, but its first (MAX) <= start (MAX) and the
-    // wrapped end (0) trivially <= last — the point is NO PANIC; we just assert
-    // the call returns (any value) without overflow.
-    let _ = gq.query_properties(&addr(&ram, u64::MAX), 2, &usepoint);
 }

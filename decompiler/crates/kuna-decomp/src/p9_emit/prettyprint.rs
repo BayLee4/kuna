@@ -259,6 +259,14 @@ pub enum TokenKind {
     Value,
 }
 
+/// The original capture category of a fragment containing datatype leaves.
+/// Callback suffixes remain syntax captures even when their wire leaves bind types.
+#[derive(Debug, Clone, Copy)]
+pub enum TypeTextOrigin {
+    Type,
+    Syntax,
+}
+
 impl TokenKind {
     pub fn name(self) -> &'static str {
         match self {
@@ -432,6 +440,21 @@ pub trait Emit {
     fn tag_func_name(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef);
     /// Emit a data-type identifier token.
     fn tag_type(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef);
+    /// Emit existing text with optional wire-only datatype provenance.
+    fn tag_type_text(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
+        origin: TypeTextOrigin,
+    ) {
+        let _ = spans;
+        match origin {
+            TypeTextOrigin::Type => self.tag_type(text, hl, markup),
+            TypeTextOrigin::Syntax => self.print(text, hl),
+        }
+    }
     /// Emit a field identifier within a structured data-type.  `off` is the
     /// byte offset of the field.
     fn tag_field(&mut self, name: &str, hl: SyntaxHighlight, off: int4, markup: &MarkupRef);
@@ -758,6 +781,9 @@ pub struct EmitNoMarkup {
     base: EmitBase,
     out: String,
     line_number: usize,
+    line_indent: int4,
+    comment_indent: Option<int4>,
+    comment_fill: String,
     capture_statement_provenance: bool,
     statement_provenance: MarkupProvenance,
 }
@@ -769,6 +795,9 @@ impl EmitNoMarkup {
             base: EmitBase::new(),
             out: String::new(),
             line_number: 0,
+            line_indent: 0,
+            comment_indent: None,
+            comment_fill: String::new(),
             capture_statement_provenance: false,
             statement_provenance: MarkupProvenance::default(),
         }
@@ -800,6 +829,8 @@ impl EmitNoMarkup {
     pub fn set_output_stream(&mut self) {
         self.out.clear();
         self.line_number = 0;
+        self.line_indent = 0;
+        self.comment_indent = None;
         self.statement_provenance.associations.clear();
     }
 }
@@ -832,17 +863,17 @@ impl Emit for EmitNoMarkup {
         // the collapsed EmitNoMarkup must absorb that responsibility here for the
         // `else if` syntax to work.  Cleared-before-callback, so no re-entry.
         self.emit_pending();
-        self.out.push('\n');
-        for _ in 0..self.base.indentlevel {
-            self.out.push(' ');
-        }
-        self.line_number += 1;
+        self.tag_line_indent(self.comment_indent.unwrap_or(self.base.indentlevel));
     }
     fn tag_line_indent(&mut self, indent: int4) {
         self.emit_pending();
+        self.line_indent = indent;
         self.out.push('\n');
         for _ in 0..indent {
             self.out.push(' ');
+        }
+        if self.comment_indent.is_some() {
+            self.out.push_str(&self.comment_fill);
         }
         self.line_number += 1;
     }
@@ -921,6 +952,17 @@ impl Emit for EmitNoMarkup {
     fn emits_markup(&self) -> bool {
         false
     }
+    fn set_comment_fill(&mut self, fill: &str) {
+        self.comment_fill.clear();
+        self.comment_fill.push_str(fill);
+    }
+    fn start_comment(&mut self) -> int4 {
+        self.comment_indent = Some(self.line_indent);
+        0
+    }
+    fn stop_comment(&mut self, _id: int4) {
+        self.comment_indent = None;
+    }
 }
 
 // ===========================================================================
@@ -961,6 +1003,9 @@ pub struct EmitMarkup {
     /// packed encoder is wired here.
     packed: bool,
     line_number: usize,
+    line_indent: int4,
+    comment_indent: Option<int4>,
+    comment_fill: String,
     provenance: MarkupProvenance,
     capture: Option<TokenCapture>,
 }
@@ -980,6 +1025,9 @@ impl EmitMarkup {
             out: Vec::new(),
             packed: true,
             line_number: 0,
+            line_indent: 0,
+            comment_indent: None,
+            comment_fill: String::new(),
             provenance: MarkupProvenance::default(),
             capture: None,
         }
@@ -1027,6 +1075,8 @@ impl EmitMarkup {
     pub fn set_output_stream(&mut self) {
         self.out.clear();
         self.line_number = 0;
+        self.line_indent = 0;
+        self.comment_indent = None;
         self.provenance.associations.clear();
         if self.capture.is_some() {
             self.capture = Some(TokenCapture::default());
@@ -1058,46 +1108,94 @@ impl EmitMarkup {
     /// The `<type>` encoding of `tag_type`: one token, or identifier words as
     /// `<type>` tokens and separator runs as `<syntax>` tokens.
     fn tag_type_split(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        if markup_type_token_needs_split(name) {
-            let mut chunk = String::new();
-            let mut syn = String::new();
-            let mut depth = 0i32;
-            for c in name.chars() {
-                let ident = c.is_ascii_alphanumeric() || c == '_';
-                if ident || c == '<' || c == '>' || depth > 0 {
-                    if c == '<' {
-                        depth += 1;
-                    } else if c == '>' {
-                        depth = (depth - 1).max(0);
-                    }
-                    if !syn.is_empty() {
-                        self.print(&syn, SyntaxHighlight::NoColor);
-                        syn.clear();
-                    }
-                    chunk.push(c);
+        self.write_type_text(name, hl, markup, None, TypeTextOrigin::Type);
+    }
+
+    /// Original names are atomic host symbols; composed type spellings retain
+    /// the lexical split. Span boundaries come from the speller, never from a
+    /// rendered-name lookup or the presence of a host ID.
+    fn write_type_text(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<&[crate::kuna_langtypes::TypeSpan]>,
+        origin: TypeTextOrigin,
+    ) {
+        let Some(spans) = spans else {
+            // Legacy callers have not declared any atomic nominal boundaries.
+            self.write_type_words(text, hl, markup.type_id, origin);
+            return;
+        };
+        let mut end = 0;
+        for span in spans {
+            if end < span.start {
+                self.write_type_words(&text[end..span.start], hl, None, origin);
+            }
+            let leaf = &text[span.start..span.end];
+            match span.policy {
+                crate::kuna_langtypes::TypeTokenPolicy::NominalName =>
+                    self.tag_type_single(leaf, hl, Some(span.id)),
+                crate::kuna_langtypes::TypeTokenPolicy::SpelledWords =>
+                    self.write_type_words(leaf, hl, Some(span.id), origin),
+            }
+            end = span.end;
+        }
+        if end < text.len() {
+            self.write_type_words(&text[end..], hl, None, origin);
+        }
+    }
+
+    /// The legacy lexical spelling contract, also used for generated language
+    /// grammar and unannotated gaps around nominal leaves.
+    fn write_type_words(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        id: Option<uintb>,
+        origin: TypeTextOrigin,
+    ) {
+        let write_range = |emit: &mut Self, start: usize, end: usize, word: bool| {
+            let chunk = &text[start..end];
+            if word && (matches!(origin, TypeTextOrigin::Type) || id.is_some()) {
+                emit.tag_type_single(chunk, hl, id);
+            } else {
+                let color = if matches!(origin, TypeTextOrigin::Type) {
+                    SyntaxHighlight::NoColor
                 } else {
-                    if !chunk.is_empty() {
-                        self.tag_type_single(&chunk, hl, markup);
-                        chunk.clear();
-                    }
-                    syn.push(c);
-                }
+                    hl
+                };
+                emit.print(chunk, color);
             }
-            if !chunk.is_empty() {
-                self.tag_type_single(&chunk, hl, markup);
-            }
-            if !syn.is_empty() {
-                self.print(&syn, SyntaxHighlight::NoColor);
-            }
+        };
+        if !markup_type_token_needs_split(text) {
+            write_range(self, 0, text.len(), true);
             return;
         }
-        self.tag_type_single(name, hl, markup);
+        let mut depth = 0i32;
+        let mut start = 0;
+        let mut previous = None;
+        for (offset, c) in text.char_indices() {
+            let word = c.is_ascii_alphanumeric() || c == '_' || c == '<' || c == '>' || depth > 0;
+            if c == '<' {
+                depth += 1;
+            } else if c == '>' {
+                depth = (depth - 1).max(0);
+            }
+            if previous.is_some_and(|kind| kind != word) {
+                write_range(self, start, offset, previous.unwrap());
+                start = offset;
+            }
+            previous = Some(word);
+        }
+        if let Some(word) = previous {
+            write_range(self, start, text.len(), word);
+        }
     }
 
     /// Write ONE `<type>` token (the pre-split body of `tag_type`; C++
     /// `EmitMarkup::tagType`, prettyprint.cc).
-    fn tag_type_single(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        let tid = markup.type_id;
+    fn tag_type_single(&mut self, name: &str, hl: SyntaxHighlight, tid: Option<uintb>) {
         self.with_encoder(|e| {
             e.open_element(&ids::ELEM_TYPE);
             if hl != SyntaxHighlight::NoColor {
@@ -1171,19 +1269,11 @@ impl Emit for EmitMarkup {
         // emitPending() (C++ EmitMarkup::tagLine): fire a registered PendingBrace
         // before the break.  Cleared-before-callback, so no re-entry.
         self.emit_pending();
-        let indent = self.base.indentlevel;
-        if let Some(c) = self.capture.as_mut() {
-            c.newline(indent);
-        }
-        self.with_encoder(|e| {
-            e.open_element(&ids::ELEM_BREAK);
-            e.write_signed_integer(&ids::ATTRIB_INDENT, indent as i64);
-            e.close_element(&ids::ELEM_BREAK);
-        });
-        self.line_number += 1;
+        self.tag_line_indent(self.comment_indent.unwrap_or(self.base.indentlevel));
     }
     fn tag_line_indent(&mut self, indent: int4) {
         self.emit_pending();
+        self.line_indent = indent;
         if let Some(c) = self.capture.as_mut() {
             c.newline(indent);
         }
@@ -1193,6 +1283,11 @@ impl Emit for EmitMarkup {
             e.close_element(&ids::ELEM_BREAK);
         });
         self.line_number += 1;
+        if self.comment_indent.is_some() && !self.comment_fill.is_empty() {
+            let fill = std::mem::take(&mut self.comment_fill);
+            self.print(&fill, SyntaxHighlight::CommentColor);
+            self.comment_fill = fill;
+        }
     }
 
     fn begin_return_type(&mut self, markup: &MarkupRef) -> int4 {
@@ -1337,6 +1432,34 @@ impl Emit for EmitMarkup {
             c.mute -= 1;
         }
     }
+    fn tag_type_text(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
+        origin: TypeTextOrigin,
+    ) {
+        let Some(spans) = spans else {
+            match origin {
+                TypeTextOrigin::Type => self.tag_type(text, hl, markup),
+                TypeTextOrigin::Syntax => self.print(text, hl),
+            }
+            return;
+        };
+        let (kind, captured_markup) = match origin {
+            TypeTextOrigin::Type => (TokenKind::Type, Some(markup)),
+            TypeTextOrigin::Syntax => (TokenKind::Syntax, None),
+        };
+        self.capture(text, kind, hl, captured_markup, None);
+        if let Some(c) = self.capture.as_mut() {
+            c.mute += 1;
+        }
+        self.write_type_text(text, hl, markup, Some(&spans), origin);
+        if let Some(c) = self.capture.as_mut() {
+            c.mute -= 1;
+        }
+    }
     fn tag_field(&mut self, name: &str, hl: SyntaxHighlight, off: int4, markup: &MarkupRef) {
         self.record_association(markup);
         self.capture(name, TokenKind::Field, hl, Some(markup), None);
@@ -1468,6 +1591,17 @@ impl Emit for EmitMarkup {
     }
     fn emits_markup(&self) -> bool {
         true
+    }
+    fn set_comment_fill(&mut self, fill: &str) {
+        self.comment_fill.clear();
+        self.comment_fill.push_str(fill);
+    }
+    fn start_comment(&mut self) -> int4 {
+        self.comment_indent = Some(self.line_indent);
+        0
+    }
+    fn stop_comment(&mut self, _id: int4) {
+        self.comment_indent = None;
     }
 }
 
@@ -1732,6 +1866,7 @@ pub struct TokenSplit {
     tok: String,
     hl: SyntaxHighlight,
     markup: MarkupRef,
+    type_spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
     addr: Option<AddrPayload>,
     off: uintb,
     indentbump: int4,
@@ -1751,6 +1886,7 @@ impl Default for TokenSplit {
             tok: String::new(),
             hl: SyntaxHighlight::NoColor,
             markup: MarkupRef::default(),
+            type_spans: None,
             addr: None,
             off: 0,
             indentbump: 0,
@@ -1909,12 +2045,27 @@ impl TokenSplit {
     }
     /// C++ `tagType(name,h,ct)`.
     pub fn tag_type(&mut self, name: &str, h: SyntaxHighlight, markup: &MarkupRef) {
+        self.type_spans = None;
         self.tok = name.to_string();
         self.size = self.tok.len() as int4;
         self.tagtype = TagType::TypeT;
         self.delimtype = PrintClass::TokenString;
         self.hl = h;
         self.markup.type_id = markup.type_id;
+    }
+    pub fn tag_type_text(
+        &mut self,
+        text: &str,
+        h: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
+        origin: TypeTextOrigin,
+    ) {
+        match origin {
+            TypeTextOrigin::Type => self.tag_type(text, h, markup),
+            TypeTextOrigin::Syntax => self.print_tok(text, h),
+        }
+        self.type_spans = spans;
     }
     /// C++ `tagField(name,h,ct,o,inOp)`.
     pub fn tag_field(&mut self, name: &str, h: SyntaxHighlight, o: int4, markup: &MarkupRef) {
@@ -1972,6 +2123,7 @@ impl TokenSplit {
     }
     /// C++ `print(const string &data,h)`.
     pub fn print_tok(&mut self, data: &str, h: SyntaxHighlight) {
+        self.type_spans = None;
         self.tok = data.to_string();
         self.size = self.tok.len() as int4;
         self.tagtype = TagType::SyntT;
@@ -2121,7 +2273,9 @@ impl TokenSplit {
             TagType::VariT => emit.tag_variable(&self.tok, self.hl, &self.markup),
             TagType::OpT => emit.tag_op(&self.tok, self.hl, &self.markup),
             TagType::FnamT => emit.tag_func_name(&self.tok, self.hl, &self.markup),
-            TagType::TypeT => emit.tag_type(&self.tok, self.hl, &self.markup),
+            TagType::TypeT => emit.tag_type_text(
+                &self.tok, self.hl, &self.markup, self.type_spans.clone(), TypeTextOrigin::Type,
+            ),
             TagType::FieldT => emit.tag_field(&self.tok, self.hl, self.off as int4, &self.markup),
             TagType::BitfieldT => {
                 emit.tag_bit_field(&self.tok, self.hl, self.off as int4, &self.markup)
@@ -2135,7 +2289,9 @@ impl TokenSplit {
                 emit.tag_label(&self.tok, self.hl, &addr.spc, self.off);
             }
             TagType::CaseT => emit.tag_case_label(&self.tok, self.hl, &self.markup, self.off),
-            TagType::SyntT => emit.print(&self.tok, self.hl),
+            TagType::SyntT => emit.tag_type_text(
+                &self.tok, self.hl, &MarkupRef::none(), self.type_spans.clone(), TypeTextOrigin::Syntax,
+            ),
             TagType::OparT => {
                 emit.open_paren(&self.tok, self.count);
             }
@@ -2207,9 +2363,13 @@ impl LowLevel {
 ///
 /// The whole `scan`/`advanceleft`/`print`/`overflow` machinery is transcribed
 /// verbatim because the inserted breaks are part of the byte-exact C output.
+#[derive(Debug)]
 pub struct EmitPrettyPrint {
     base: EmitBase,
     lowlevel: LowLevel,
+    /// First failure encountered through the infallible `Emit` token API.
+    /// Further tokens are discarded until flush reports it or clear resets it.
+    deferred_error: Option<KunaError>,
     /// Space available for currently active nesting levels.
     indentstack: Vec<int4>,
     /// Space remaining in current line.
@@ -2224,8 +2384,10 @@ pub struct EmitPrettyPrint {
     needbreak: bool,
     /// `true` if in the middle of a comment.
     commentmode: bool,
-    /// Used to fill comments if line breaks are forced.
+    /// Fill configured for the next queued comment.
     commentfill: String,
+    /// Fill belonging to the comment currently reaching the output sink.
+    active_commentfill: String,
     /// References to current open and whitespace tokens.
     scanqueue: CircularQueue<int4>,
     /// The full stream of tokens.
@@ -2248,6 +2410,7 @@ impl EmitPrettyPrint {
         let mut pp = EmitPrettyPrint {
             base: EmitBase::new(),
             lowlevel: LowLevel::NoMarkup(EmitNoMarkup::new()),
+            deferred_error: None,
             indentstack: Vec::new(),
             spaceremain: 0,
             maxlinesize: 0,
@@ -2256,6 +2419,7 @@ impl EmitPrettyPrint {
             needbreak: false,
             commentmode: false,
             commentfill: String::new(),
+            active_commentfill: String::new(),
             scanqueue: CircularQueue::new(3 * 100),
             tokqueue: CircularQueue::new(3 * 100),
         };
@@ -2281,9 +2445,18 @@ impl EmitPrettyPrint {
         &mut self.lowlevel
     }
 
+    /// Start a fresh document without changing width, indentation, or capture.
+    pub fn set_output_stream(&mut self) {
+        self.clear_pretty();
+        match &mut self.lowlevel {
+            LowLevel::NoMarkup(e) => e.set_output_stream(),
+            LowLevel::Markup(e) => e.set_output_stream(),
+        }
+    }
+
     /// C++ `resetDefaultsPrettyPrint()`: `setMaxLineSize(100)`.
     fn reset_defaults_pretty_print(&mut self) {
-        let _ = self.set_max_line_size(100);
+        self.set_max_line_size(100).expect("default line width is valid");
     }
 
     /// C++ `EmitPrettyPrint::expand()`.
@@ -2323,7 +2496,7 @@ impl EmitPrettyPrint {
         if newspaceremain == self.spaceremain {
             return; // Line breaking doesn't give us any additional space
         }
-        if self.commentmode && (newspaceremain == self.spaceremain + self.commentfill.len() as int4)
+        if self.commentmode && (newspaceremain == self.spaceremain + self.active_commentfill.len() as int4)
         {
             return; // Line breaking doesn't give us any additional space
         }
@@ -2331,12 +2504,11 @@ impl EmitPrettyPrint {
         self.lowlevel
             .as_emit_mut()
             .tag_line_indent(self.maxlinesize - self.spaceremain);
-        if self.commentmode && !self.commentfill.is_empty() {
-            let fill = self.commentfill.clone();
+        if self.commentmode && !self.active_commentfill.is_empty() {
             self.lowlevel
                 .as_emit_mut()
-                .print(&fill, SyntaxHighlight::CommentColor);
-            self.spaceremain -= self.commentfill.len() as int4;
+                .print(&self.active_commentfill, SyntaxHighlight::CommentColor);
+            self.spaceremain -= self.active_commentfill.len() as int4;
         }
     }
 
@@ -2358,12 +2530,14 @@ impl EmitPrettyPrint {
                 tok.print_to(self.lowlevel.as_emit_mut())?;
             }
             PrintClass::BeginIndent => {
-                val = *self.indentstack.last().expect("begin_indent with empty indentstack")
+                val = *self.indentstack.last()
+                    .ok_or_else(|| KunaError::lowlevel("indent outside pretty-print group"))?
                     - self.tokqueue.get_ref(tok_ref).get_indent_bump();
                 self.indentstack.push(val);
             }
             PrintClass::BeginComment => {
                 self.commentmode = true;
+                self.active_commentfill.clone_from(&self.tokqueue.get_ref(tok_ref).tok);
                 // fallthru, treat as a group begin
                 let tok = self.tokqueue.get_ref(tok_ref).clone();
                 tok.print_to(self.lowlevel.as_emit_mut())?;
@@ -2408,7 +2582,8 @@ impl EmitPrettyPrint {
                         self.spaceremain = self.maxlinesize - tok.get_indent_bump();
                     } else {
                         // relative indent
-                        val = *self.indentstack.last().expect("token_break with empty indentstack")
+                        val = *self.indentstack.last()
+                            .ok_or_else(|| KunaError::lowlevel("line break outside pretty-print group"))?
                             - tok.get_indent_bump();
                         // If creating a line break doesn't save that much
                         // don't do the line break
@@ -2425,12 +2600,11 @@ impl EmitPrettyPrint {
                     self.lowlevel
                         .as_emit_mut()
                         .tag_line_indent(self.maxlinesize - self.spaceremain);
-                    if self.commentmode && !self.commentfill.is_empty() {
-                        let fill = self.commentfill.clone();
+                    if self.commentmode && !self.active_commentfill.is_empty() {
                         self.lowlevel
                             .as_emit_mut()
-                            .print(&fill, SyntaxHighlight::CommentColor);
-                        self.spaceremain -= self.commentfill.len() as int4;
+                            .print(&self.active_commentfill, SyntaxHighlight::CommentColor);
+                        self.spaceremain -= self.active_commentfill.len() as int4;
                     }
                 } else {
                     let num = tok.get_num_spaces();
@@ -2608,8 +2782,7 @@ impl EmitPrettyPrint {
     // Every C++ `EmitPrettyPrint` tag method follows the same shape:
     //   check*(); push token; build token; scan();
     // `scan()` can throw (`LowlevelError`), so these are fallible.  The `Emit`
-    // trait methods (below) wrap these, panicking on the internal-invariant
-    // errors the way a C++ uncaught `LowlevelError` would abort.
+    // trait methods (below) retain the first error for the document's flush.
 
     /// Fallible C++ `beginDocument()`.
     pub fn try_begin_document(&mut self) -> KunaResult<int4> {
@@ -2776,6 +2949,19 @@ impl EmitPrettyPrint {
         self.tokqueue.get_ref_mut(slot).tag_type(name, hl, markup);
         self.scan()
     }
+    pub fn try_tag_type_text(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
+        origin: TypeTextOrigin,
+    ) -> KunaResult<()> {
+        self.checkstring()?;
+        let slot = self.tokqueue.push();
+        self.tokqueue.get_ref_mut(slot).tag_type_text(text, hl, markup, spans, origin);
+        self.scan()
+    }
     /// Fallible C++ `tagField(...)`.
     pub fn try_tag_field(
         &mut self,
@@ -2885,6 +3071,7 @@ impl EmitPrettyPrint {
         self.checkstart()?;
         let slot = self.tokqueue.push();
         let id = self.tokqueue.get_ref_mut(slot).start_comment();
+        self.tokqueue.get_ref_mut(slot).tok.clone_from(&self.commentfill);
         self.scan()?;
         Ok(id)
     }
@@ -2919,6 +3106,7 @@ impl EmitPrettyPrint {
 
     /// C++ `EmitPrettyPrint::clear()`.
     pub fn clear_pretty(&mut self) {
+        self.deferred_error = None;
         // The base Emit::clear() body, inlined.
         self.base.parenlevel = 0;
         self.base.indentlevel = 0;
@@ -2938,6 +3126,10 @@ impl EmitPrettyPrint {
 
     /// C++ `EmitPrettyPrint::flush()`.
     pub fn try_flush(&mut self) -> KunaResult<()> {
+        if let Some(error) = self.deferred_error.take() {
+            self.clear_pretty();
+            return Err(error);
+        }
         while !self.tokqueue.empty() {
             let bottom_ref = self.tokqueue.bottomref();
             if self.tokqueue.get_ref(bottom_ref).get_size() < 0 {
@@ -2965,6 +3157,7 @@ impl EmitPrettyPrint {
         } else {
             LowLevel::NoMarkup(EmitNoMarkup::new())
         };
+        self.lowlevel.as_emit_mut().set_indent_increment(self.base.indentincrement);
     }
 
     /// C++ `EmitPrettyPrint::setMaxLineSize(int4 val)`.
@@ -2991,6 +3184,26 @@ impl EmitPrettyPrint {
     }
 }
 
+// `Emit` intentionally has an infallible token API. Keep its first queue error
+// until the document's mandatory flush instead of panicking mid-serialization.
+macro_rules! pp_defer {
+    ($self:ident . $method:ident ( $($arg:expr),* )) => {
+        if $self.deferred_error.is_some() {
+            Default::default()
+        } else {
+            match $self.$method($($arg),*) {
+                Ok(value) => value,
+                Err(error) => {
+                    if $self.deferred_error.is_none() {
+                        $self.deferred_error = Some(error);
+                    }
+                    Default::default()
+                }
+            }
+        }
+    };
+}
+
 impl Emit for EmitPrettyPrint {
     fn state(&self) -> &EmitBase {
         &self.base
@@ -3000,94 +3213,104 @@ impl Emit for EmitPrettyPrint {
     }
 
     fn begin_document(&mut self) -> int4 {
-        self.try_begin_document().expect("EmitPrettyPrint::beginDocument")
+        pp_defer!(self.try_begin_document())
     }
     fn end_document(&mut self, id: int4) {
-        self.try_end_document(id).expect("EmitPrettyPrint::endDocument")
+        pp_defer!(self.try_end_document(id))
     }
     fn begin_function(&mut self) -> int4 {
-        self.try_begin_function().expect("EmitPrettyPrint::beginFunction")
+        pp_defer!(self.try_begin_function())
     }
     fn end_function(&mut self, id: int4) {
-        self.try_end_function(id).expect("EmitPrettyPrint::endFunction")
+        pp_defer!(self.try_end_function(id))
     }
     fn begin_block(&mut self, blockref: int4) -> int4 {
-        self.try_begin_block(blockref).expect("EmitPrettyPrint::beginBlock")
+        pp_defer!(self.try_begin_block(blockref))
     }
     fn end_block(&mut self, id: int4) {
-        self.try_end_block(id).expect("EmitPrettyPrint::endBlock")
+        pp_defer!(self.try_end_block(id))
     }
     fn tag_line(&mut self) {
-        self.try_tag_line().expect("EmitPrettyPrint::tagLine")
+        pp_defer!(self.try_tag_line())
     }
     fn tag_line_indent(&mut self, indent: int4) {
-        self.try_tag_line_indent(indent).expect("EmitPrettyPrint::tagLine")
+        pp_defer!(self.try_tag_line_indent(indent))
     }
     fn begin_return_type(&mut self, markup: &MarkupRef) -> int4 {
-        self.try_begin_return_type(markup).expect("EmitPrettyPrint::beginReturnType")
+        pp_defer!(self.try_begin_return_type(markup))
     }
     fn end_return_type(&mut self, id: int4) {
-        self.try_end_return_type(id).expect("EmitPrettyPrint::endReturnType")
+        pp_defer!(self.try_end_return_type(id))
     }
     fn begin_var_decl(&mut self, markup: &MarkupRef) -> int4 {
-        self.try_begin_var_decl(markup).expect("EmitPrettyPrint::beginVarDecl")
+        pp_defer!(self.try_begin_var_decl(markup))
     }
     fn end_var_decl(&mut self, id: int4) {
-        self.try_end_var_decl(id).expect("EmitPrettyPrint::endVarDecl")
+        pp_defer!(self.try_end_var_decl(id))
     }
     fn begin_statement(&mut self, markup: &MarkupRef) -> int4 {
-        self.try_begin_statement(markup).expect("EmitPrettyPrint::beginStatement")
+        pp_defer!(self.try_begin_statement(markup))
     }
     fn end_statement(&mut self, id: int4) {
-        self.try_end_statement(id).expect("EmitPrettyPrint::endStatement")
+        pp_defer!(self.try_end_statement(id))
     }
     fn begin_func_proto(&mut self) -> int4 {
-        self.try_begin_func_proto().expect("EmitPrettyPrint::beginFuncProto")
+        pp_defer!(self.try_begin_func_proto())
     }
     fn end_func_proto(&mut self, id: int4) {
-        self.try_end_func_proto(id).expect("EmitPrettyPrint::endFuncProto")
+        pp_defer!(self.try_end_func_proto(id))
     }
     fn tag_variable(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        self.try_tag_variable(name, hl, markup).expect("EmitPrettyPrint::tagVariable")
+        pp_defer!(self.try_tag_variable(name, hl, markup))
     }
     fn tag_op(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        self.try_tag_op(name, hl, markup).expect("EmitPrettyPrint::tagOp")
+        pp_defer!(self.try_tag_op(name, hl, markup))
     }
     fn tag_func_name(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        self.try_tag_func_name(name, hl, markup).expect("EmitPrettyPrint::tagFuncName")
+        pp_defer!(self.try_tag_func_name(name, hl, markup))
     }
     fn tag_type(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        self.try_tag_type(name, hl, markup).expect("EmitPrettyPrint::tagType")
+        pp_defer!(self.try_tag_type(name, hl, markup))
+    }
+    fn tag_type_text(
+        &mut self,
+        text: &str,
+        hl: SyntaxHighlight,
+        markup: &MarkupRef,
+        spans: Option<Rc<[crate::kuna_langtypes::TypeSpan]>>,
+        origin: TypeTextOrigin,
+    ) {
+        pp_defer!(self.try_tag_type_text(text, hl, markup, spans, origin))
     }
     fn tag_field(&mut self, name: &str, hl: SyntaxHighlight, off: int4, markup: &MarkupRef) {
-        self.try_tag_field(name, hl, off, markup).expect("EmitPrettyPrint::tagField")
+        pp_defer!(self.try_tag_field(name, hl, off, markup))
     }
     fn tag_bit_field(&mut self, name: &str, hl: SyntaxHighlight, id: int4, markup: &MarkupRef) {
-        self.try_tag_bit_field(name, hl, id, markup).expect("EmitPrettyPrint::tagBitField")
+        pp_defer!(self.try_tag_bit_field(name, hl, id, markup))
     }
     fn tag_comment(&mut self, name: &str, hl: SyntaxHighlight, spc: &Rc<AddrSpace>, off: uintb) {
-        self.try_tag_comment(name, hl, spc, off).expect("EmitPrettyPrint::tagComment")
+        pp_defer!(self.try_tag_comment(name, hl, spc, off))
     }
     fn tag_label(&mut self, name: &str, hl: SyntaxHighlight, spc: &Rc<AddrSpace>, off: uintb) {
-        self.try_tag_label(name, hl, spc, off).expect("EmitPrettyPrint::tagLabel")
+        pp_defer!(self.try_tag_label(name, hl, spc, off))
     }
     fn tag_case_label(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef, value: uintb) {
-        self.try_tag_case_label(name, hl, markup, value).expect("EmitPrettyPrint::tagCaseLabel")
+        pp_defer!(self.try_tag_case_label(name, hl, markup, value))
     }
     fn print(&mut self, data: &str, hl: SyntaxHighlight) {
-        self.try_print(data, hl).expect("EmitPrettyPrint::print")
+        pp_defer!(self.try_print(data, hl))
     }
     fn open_paren(&mut self, paren: &str, id: int4) -> int4 {
-        self.try_open_paren(paren, id).expect("EmitPrettyPrint::openParen")
+        pp_defer!(self.try_open_paren(paren, id))
     }
     fn close_paren(&mut self, paren: &str, id: int4) {
-        self.try_close_paren(paren, id).expect("EmitPrettyPrint::closeParen")
+        pp_defer!(self.try_close_paren(paren, id))
     }
     fn open_group(&mut self) -> int4 {
-        self.try_open_group().expect("EmitPrettyPrint::openGroup")
+        pp_defer!(self.try_open_group())
     }
     fn close_group(&mut self, id: int4) {
-        self.try_close_group(id).expect("EmitPrettyPrint::closeGroup")
+        pp_defer!(self.try_close_group(id))
     }
     fn clear(&mut self) {
         self.clear_pretty();
@@ -3096,19 +3319,19 @@ impl Emit for EmitPrettyPrint {
         self.lowlevel.as_emit_mut().set_packed_output(val);
     }
     fn spaces(&mut self, num: int4, bump: int4) {
-        self.try_spaces(num, bump).expect("EmitPrettyPrint::spaces")
+        pp_defer!(self.try_spaces(num, bump))
     }
     fn start_indent(&mut self) -> int4 {
-        self.try_start_indent().expect("EmitPrettyPrint::startIndent")
+        pp_defer!(self.try_start_indent())
     }
     fn stop_indent(&mut self, id: int4) {
-        self.try_stop_indent(id).expect("EmitPrettyPrint::stopIndent")
+        pp_defer!(self.try_stop_indent(id))
     }
     fn start_comment(&mut self) -> int4 {
-        self.try_start_comment().expect("EmitPrettyPrint::startComment")
+        pp_defer!(self.try_start_comment())
     }
     fn stop_comment(&mut self, id: int4) {
-        self.try_stop_comment(id).expect("EmitPrettyPrint::stopComment")
+        pp_defer!(self.try_stop_comment(id))
     }
     fn flush(&mut self) -> KunaResult<()> {
         self.try_flush()
@@ -3119,8 +3342,13 @@ impl Emit for EmitPrettyPrint {
     fn get_max_line_size(&self) -> int4 {
         self.maxlinesize
     }
+    fn set_indent_increment(&mut self, val: int4) {
+        self.base.indentincrement = val;
+        self.lowlevel.as_emit_mut().set_indent_increment(val);
+    }
     fn set_comment_fill(&mut self, fill: &str) {
-        self.commentfill = fill.to_string();
+        self.commentfill.clear();
+        self.commentfill.push_str(fill);
     }
     fn emits_markup(&self) -> bool {
         self.lowlevel.as_emit().emits_markup()

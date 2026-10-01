@@ -61,7 +61,7 @@ fn decompile(libcsigs: &str) -> Option<String> {
         entry,
         extent,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let function = step.result.expect("the PE caller decompiles");
     Some(kuna_decomp::decompile_drive::print_c(

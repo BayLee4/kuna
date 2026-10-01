@@ -60,7 +60,7 @@ use kuna_base::types::{int4, uint4};
 use kuna_num::pcoderaw::VarnodeData;
 
 use crate::dtype::{
-    metatype2typeclass, string2metatype, string2typeclass, type_class, type_metatype, Datatype,
+    metatype2typeclass, string2metatype, string2typeclass, type_class, type_metatype, TypeRoot,
     TypeFactory,
 };
 use crate::fspec::{
@@ -226,13 +226,13 @@ mod prim_flags {
 #[derive(Debug, Clone)]
 pub struct Primitive {
     /// Primitive data-type (C++ `dt`).
-    pub dt: Rc<Datatype>,
+    pub dt: TypeRoot,
     /// Offset within container (C++ `offset`).
     pub offset: int4,
 }
 
 impl Primitive {
-    pub fn new(dt: Rc<Datatype>, off: int4) -> Primitive {
+    pub fn new(dt: TypeRoot, off: int4) -> Primitive {
         Primitive { dt, offset: off }
     }
 }
@@ -251,7 +251,7 @@ impl PrimitiveExtractor {
     /// Construct from a data-type (C++
     /// `PrimitiveExtractor(Datatype *dt,bool unionIllegal,int offset,int4 max)`,
     /// modelrules.cc:242-248).
-    pub fn new(dt: &Rc<Datatype>, union_illegal: bool, offset: int4, max: int4) -> PrimitiveExtractor {
+    pub fn new(dt: &TypeRoot, union_illegal: bool, offset: int4, max: int4) -> PrimitiveExtractor {
         let mut res = PrimitiveExtractor {
             primitives: Vec::new(),
             flags: if union_illegal { prim_flags::UNION_INVALID } else { 0 },
@@ -375,7 +375,7 @@ impl PrimitiveExtractor {
 
     /// Add primitives representing a union data-type (C++ `handleUnion`,
     /// modelrules.cc:139-164).
-    fn handle_union(&mut self, dt: &Rc<Datatype>, max: int4, offset: int4) -> bool {
+    fn handle_union(&mut self, dt: &TypeRoot, max: int4, offset: int4) -> bool {
         if (self.flags & prim_flags::UNION_INVALID) != 0 {
             return false;
         }
@@ -383,28 +383,28 @@ impl PrimitiveExtractor {
         if num == 0 {
             return false;
         }
-        let cur_field = match dt.get_field(0) {
+        let (field_type, field_offset) = match Self::field_root(dt, 0) {
             Some(f) => f,
             None => return false,
         };
         let mut common = PrimitiveExtractor::new(
-            &cur_field.field_type,
+            &field_type,
             false,
-            offset + cur_field.offset,
+            offset + field_offset,
             max,
         );
         if !common.is_valid() {
             return false;
         }
         for i in 1..num {
-            let cur_field = match dt.get_field(i) {
+            let (field_type, field_offset) = match Self::field_root(dt, i) {
                 Some(f) => f,
                 None => return false,
             };
             let next = PrimitiveExtractor::new(
-                &cur_field.field_type,
+                &field_type,
                 false,
-                offset + cur_field.offset,
+                offset + field_offset,
                 max,
             );
             if !next.is_valid() {
@@ -425,7 +425,7 @@ impl PrimitiveExtractor {
 
     /// Extract list of primitives from given data-type (C++ `extract`,
     /// modelrules.cc:179-236).
-    fn extract(&mut self, dt: &Rc<Datatype>, max: int4, offset: int4) -> bool {
+    fn extract(&mut self, dt: &TypeRoot, max: int4, offset: int4) -> bool {
         match dt.get_metatype() {
             type_metatype::TYPE_UNKNOWN => {
                 self.flags |= prim_flags::UNKNOWN_ELEMENT; // contains an unknown primitive
@@ -433,7 +433,7 @@ impl PrimitiveExtractor {
                 if self.primitives.len() as int4 >= max {
                     return false;
                 }
-                self.primitives.push(Primitive::new(Rc::clone(dt), offset));
+                self.primitives.push(Primitive::new(dt.clone(), offset));
                 true
             }
             type_metatype::TYPE_INT
@@ -446,7 +446,7 @@ impl PrimitiveExtractor {
                 if self.primitives.len() as int4 >= max {
                     return false;
                 }
-                self.primitives.push(Primitive::new(Rc::clone(dt), offset));
+                self.primitives.push(Primitive::new(dt.clone(), offset));
                 true
             }
             type_metatype::TYPE_ARRAY => {
@@ -471,16 +471,13 @@ impl PrimitiveExtractor {
     }
 
     /// The `TYPE_STRUCT` tail of [`Self::extract`] (modelrules.cc:215-235).
-    fn extract_struct(&mut self, dt: &Rc<Datatype>, max: int4, offset: int4) -> bool {
+    fn extract_struct(&mut self, dt: &TypeRoot, max: int4, offset: int4) -> bool {
         let num = dt.num_depend();
         let mut expected_off = offset;
         for i in 0..num {
-            let (comp_dt, field_off) = {
-                let field = match dt.get_field(i) {
-                    Some(f) => f,
-                    None => return false,
-                };
-                (Rc::clone(&field.field_type), field.offset)
+            let (comp_dt, field_off) = match Self::field_root(dt, i) {
+                Some(field) => field,
+                None => return false,
             };
             let cur_off = field_off + offset;
             let align = comp_dt.get_alignment();
@@ -500,6 +497,16 @@ impl PrimitiveExtractor {
             expected_off = cur_off + comp_dt.get_align_size();
         }
         true
+    }
+
+    fn field_root(dt: &TypeRoot, index: int4) -> Option<(TypeRoot, int4)> {
+        let (id, offset) = {
+            let view = dt.read();
+            let effective = view.resolve_alias(dt.id()).ok()?;
+            let field = view.get_field(effective, index).ok()??;
+            (field.field_type, field.offset)
+        };
+        Some((dt.related(id).ok()?, offset))
     }
 }
 
@@ -571,7 +578,7 @@ impl SizeRestriction {
 
     /// Enforce any size bounds on a given data-type (C++ `filterOnSize`,
     /// modelrules.cc:327-335).
-    fn filter_on_size(&self, dt: &Datatype) -> bool {
+    fn filter_on_size(&self, dt: &TypeRoot) -> bool {
         if self.max_size == 0 {
             return true; // maxSize of 0 means no size filtering
         }
@@ -624,7 +631,7 @@ impl SizeRestriction {
 impl DatatypeFilter {
     /// Test whether the given data-type belongs to this filter's class (C++
     /// `filter`, the per-subclass overrides).
-    pub fn filter(&self, dt: &Rc<Datatype>) -> bool {
+    pub fn filter(&self, dt: &TypeRoot) -> bool {
         match self {
             // SizeRestrictedFilter::filter (modelrules.hh:135).
             DatatypeFilter::SizeRestricted(sz) => sz.filter_on_size(dt),
@@ -656,7 +663,7 @@ impl DatatypeFilter {
                 }
                 for i in 1..primitives.size() {
                     // C++ compares the Datatype pointers directly.
-                    if !Rc::ptr_eq(&primitives.get(i).dt, base) {
+                    if &primitives.get(i).dt != base {
                         return false;
                     }
                 }
@@ -767,14 +774,14 @@ impl QualifierFilter {
                 // The position of the current parameter being assigned, pos, is NOT used.
                 let dt = if *position < 0 {
                     match &proto.outtype {
-                        Some(t) => Rc::clone(t),
+                        Some(t) => t.clone(),
                         None => return false, // C++ would call filter(null) — guard
                     }
                 } else {
                     if *position >= proto.intypes.len() as int4 {
                         return false;
                     }
-                    Rc::clone(&proto.intypes[*position as usize])
+                    proto.intypes[*position as usize].clone()
                 };
                 type_filter.filter(&dt)
             }
@@ -1052,7 +1059,7 @@ impl AssignAction {
     #[allow(clippy::too_many_arguments)]
     pub fn assign_address(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         proto: &PrototypePieces,
         pos: int4,
         tlist: &dyn TypeFactory,
@@ -1098,7 +1105,7 @@ impl AssignAction {
     /// `MultiSlotAssign::assignAddress` (modelrules.cc:833-900).
     fn assign_multi_slot(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         status: &mut [int4],
         res: &mut ParameterPieces,
         resource: &ParamListStandard,
@@ -1207,7 +1214,7 @@ impl AssignAction {
         }
         status.copy_from_slice(&tmp_status); // Commit resource usage for all the pieces
         res.flags = 0;
-        res.type_ = Some(Rc::clone(dt));
+        res.type_ = Some(dt.clone());
         res.assign_address_from_pieces(&mut pieces, consume_most_sig, manager)?;
         Ok(RES_SUCCESS)
     }
@@ -1215,7 +1222,7 @@ impl AssignAction {
     /// `MultiMemberAssign::assignAddress` (modelrules.cc:992-1017).
     fn assign_multi_member(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         status: &mut [int4],
         res: &mut ParameterPieces,
         resource: &ParamListStandard,
@@ -1240,7 +1247,7 @@ impl AssignAction {
         }
         let mut param = ParameterPieces::default();
         for i in 0..primitives.size() {
-            let cur_type = Rc::clone(&primitives.get(i).dt);
+            let cur_type = primitives.get(i).dt.clone();
             if resource.assign_address_fallback(
                 resource_type,
                 &cur_type,
@@ -1260,7 +1267,7 @@ impl AssignAction {
         }
         status.copy_from_slice(&tmp_status); // Commit resource usage for all the pieces
         res.flags = 0;
-        res.type_ = Some(Rc::clone(dt));
+        res.type_ = Some(dt.clone());
         res.assign_address_from_pieces(&mut pieces, consume_most_sig, manager)?;
         Ok(RES_SUCCESS)
     }
@@ -1268,7 +1275,7 @@ impl AssignAction {
     /// `MultiSlotDualAssign::assignAddress` (modelrules.cc:1174-1240).
     fn assign_multi_slot_dual(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         status: &mut [int4],
         res: &mut ParameterPieces,
         resource: &ParamListStandard,
@@ -1374,7 +1381,7 @@ impl AssignAction {
         }
         status.copy_from_slice(&tmp_status); // Commit resource usage for all the pieces
         res.flags = 0;
-        res.type_ = Some(Rc::clone(dt));
+        res.type_ = Some(dt.clone());
         res.assign_address_from_pieces(&mut pieces, consume_most_sig, manager)?;
         Ok(RES_SUCCESS)
     }
@@ -1435,7 +1442,7 @@ impl AssignAction {
     /// `ConsumeExtra::assignAddress` (modelrules.cc:1434-1450).
     fn assign_consume_extra(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         status: &mut [int4],
         resource: &ParamListStandard,
     ) -> KunaResult<AssignActionResponse> {
@@ -1487,7 +1494,7 @@ impl AssignAction {
     /// `ExtraStack::assignAddress` (modelrules.cc:1542-1572).
     fn assign_extra_stack(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         status: &mut [int4],
         res: &mut ParameterPieces,
         resource: &ParamListStandard,
@@ -1989,7 +1996,7 @@ fn new_extra_stack_decode() -> AssignAction {
 /// `GotoStack::assignAddress` (modelrules.cc:721-729).
 fn assign_goto_stack(
     stack_entry: Option<usize>,
-    dt: &Rc<Datatype>,
+    dt: &TypeRoot,
     status: &mut [int4],
     res: &mut ParameterPieces,
     resource: &ParamListStandard,
@@ -1998,7 +2005,7 @@ fn assign_goto_stack(
     let se = stack_entry.expect("GotoStack stack entry");
     let entry = &resource.get_entry()[se];
     let grp = entry.get_group() as usize;
-    res.type_ = Some(Rc::clone(dt));
+    res.type_ = Some(dt.clone());
     let mut slot = status[grp];
     res.addr = entry.get_addr_by_slot(&mut slot, dt.get_size(), dt.get_alignment(), manager)?;
     status[grp] = slot;
@@ -2010,7 +2017,7 @@ fn assign_goto_stack(
 #[allow(clippy::too_many_arguments)]
 fn assign_convert_to_pointer(
     space: &Option<Rc<AddrSpace>>,
-    dt: &Rc<Datatype>,
+    dt: &TypeRoot,
     proto: &PrototypePieces,
     pos: int4,
     tlist: &dyn TypeFactory,
@@ -2030,7 +2037,7 @@ fn assign_convert_to_pointer(
     let pointersize = spc.get_addr_size() as int4;
     let wordsize = spc.get_word_size();
     // Convert the data-type to a pointer.
-    let pointertp = tlist.get_type_pointer(pointersize, Rc::clone(dt), wordsize)?;
+    let pointertp = tlist.get_type_pointer(pointersize, dt.clone(), wordsize)?;
     // (Recursively) assign storage.
     let response_code =
         resource.assign_address(&pointertp, proto, pos, tlist, status, res, manager)?;
@@ -2330,7 +2337,7 @@ impl ModelRule {
     #[allow(clippy::too_many_arguments)]
     pub fn assign_address(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         proto: &PrototypePieces,
         pos: int4,
         tlist: &dyn TypeFactory,

@@ -52,21 +52,20 @@
 //!   unification, so it is done here at the bank level (assignHigh is the W7
 //!   no-op stub; checkForLanedRegister is skipped — STUB(W7)).
 
-use std::rc::Rc;
-
 use kuna_base::address::calc_mask;
 use kuna_base::error::KunaResult;
 use kuna_base::space::spacetype;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::type_metatype;
 use crate::expression::AddExpression;
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{OpId, VarnodeId};
 use crate::varnode::DefOpInfo;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 // =============================================================================
 // inst-table resolution: OpCode -> TypeOp (canonical typeop.cc table)
@@ -83,8 +82,7 @@ fn set_opcode(data: &mut Funcdata, op: OpId, opc: OpCode) {
 /// `funcdata_varnode.cc:131`): create a fresh unique Varnode as the output of
 /// `op`.
 ///
-/// `Datatype *ct = glb->types->getBase(s,TYPE_UNKNOWN);` (STUB(W6), built as the
-/// unknown-base skeleton exactly as the funcdata_varnode factories do);
+/// `Datatype *ct = glb->types->getBase(s,TYPE_UNKNOWN);`
 /// `vn = vbank.createDefUnique(s,ct,op); op->setOutput(vn);`.  The fresh uniqid
 /// guarantees `createDefUnique`'s xref never unifies, so the replace-reads
 /// callback is the no-op (matching the C++, where a brand-new unique has no
@@ -92,7 +90,8 @@ fn set_opcode(data: &mut Funcdata, op: OpId, opc: OpCode) {
 /// `checkForLanedRegister` laned-register probe is skipped (STUB(W7); it affects
 /// only later analysis, never the op graph this rule edits).
 fn new_unique_out(data: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(s, type_metatype::TYPE_UNKNOWN));
+    let ct = data.get_arch().types().expect("type factory")
+        .get_base(s, type_metatype::TYPE_UNKNOWN).expect("unknown type");
     let seqnum = data.obank().get(op).expect("new_unique_out: stale op").get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum };
     let mut no_replace = |_: &mut crate::varnode::VarnodeBank,
@@ -225,12 +224,8 @@ impl Rule for RuleBooleanDedup {
         vec![OpCode::CPUI_BOOL_AND, OpCode::CPUI_BOOL_OR]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleBooleanDedup))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBooleanDedup)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -392,12 +387,8 @@ impl Rule for RuleBooleanNegate {
         vec![OpCode::CPUI_INT_NOTEQUAL, OpCode::CPUI_INT_EQUAL]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleBooleanNegate))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBooleanNegate)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -445,12 +436,8 @@ impl Rule for RuleBoolZext {
         vec![OpCode::CPUI_INT_ZEXT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleBoolZext))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBoolZext)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -614,12 +601,8 @@ impl Rule for RuleLogic2Bool {
         vec![OpCode::CPUI_INT_AND, OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleLogic2Bool))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLogic2Bool)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -660,12 +643,8 @@ impl Rule for RuleIndirectCollapse {
         vec![OpCode::CPUI_INDIRECT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleIndirectCollapse))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleIndirectCollapse)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -802,12 +781,8 @@ impl Rule for RuleMultiCollapse {
         vec![OpCode::CPUI_MULTIEQUAL]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleMultiCollapse))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleMultiCollapse)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -992,12 +967,8 @@ impl Rule for RuleSborrow {
         vec![OpCode::CPUI_INT_SBORROW]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleSborrow))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSborrow)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1089,12 +1060,8 @@ impl Rule for RuleScarry {
         vec![OpCode::CPUI_INT_SCARRY]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleScarry))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleScarry)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1205,12 +1172,8 @@ impl Rule for RuleTrivialShift {
         vec![OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleTrivialShift))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTrivialShift)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1250,12 +1213,8 @@ impl Rule for RuleSignShift {
         vec![OpCode::CPUI_INT_RIGHT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleSignShift))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignShift)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1341,12 +1300,8 @@ impl Rule for RuleTestSign {
         vec![OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleTestSign))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTestSign)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1421,12 +1376,8 @@ impl Rule for RuleIdentityEl {
         ]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleIdentityEl))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleIdentityEl)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1436,8 +1387,10 @@ impl Rule for RuleIdentityEl {
         }
         let val = vn_offset(data, constvn);
         if (val == 0) && (op_code(data, op) != OpCode::CPUI_INT_MULT) {
+            let receipt = branch_receipt::begin_identity(data, op);
             set_opcode(data, op, OpCode::CPUI_COPY);
             data.op_remove_input(op, 1); // Remove identity from operation
+            branch_receipt::finish(data, receipt);
             return 1;
         }
         if op_code(data, op) != OpCode::CPUI_INT_MULT {
@@ -1472,12 +1425,8 @@ impl Rule for RuleShift2Mult {
         vec![OpCode::CPUI_INT_LEFT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleShift2Mult))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShift2Mult)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1518,9 +1467,12 @@ impl Rule for RuleShift2Mult {
         if flag == 0 {
             return 0;
         }
-        let newconst = data.new_constant(vn_size(data, vn), 1u64 << val);
+        let multiplier = 1u64 << val;
+        let receipt = branch_receipt::begin_shift(data, op, multiplier);
+        let newconst = data.new_constant(vn_size(data, vn), multiplier);
         data.op_set_input(op, newconst, 1).expect("RuleShift2Mult: opSetInput");
         set_opcode(data, op, OpCode::CPUI_INT_MULT);
+        branch_receipt::finish(data, receipt);
         1
     }
 }
@@ -1540,12 +1492,8 @@ impl Rule for RuleShiftPiece {
         vec![OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR, OpCode::CPUI_INT_ADD]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleShiftPiece))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShiftPiece)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1678,12 +1626,8 @@ pub struct RuleCollapseConstants;
 impl Rule for RuleCollapseConstants {
     // applies to all opcodes (no getOpList override)
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleCollapseConstants))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleCollapseConstants)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1721,6 +1665,7 @@ impl Rule for RuleCollapseConstants {
         if marked_input {
             collapse_constant_symbol(op, vn, data);
         }
+        let receipt = branch_receipt::begin_collapse(data, op, collapsed);
         let n = data.obank().get(op).expect("RuleCollapseConstants: stale op").num_input();
         let mut i = n - 1;
         while i > 0 {
@@ -1729,6 +1674,7 @@ impl Rule for RuleCollapseConstants {
         }
         data.op_set_input(op, vn, 0).expect("RuleCollapseConstants: opSetInput");
         data.op_set_opcode(op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
+        branch_receipt::finish(data, receipt);
         1
     }
 }
@@ -1853,12 +1799,8 @@ impl Rule for RuleTransformCpool {
         vec![OpCode::CPUI_CPOOLREF]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleTransformCpool))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTransformCpool)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1888,12 +1830,8 @@ pub struct RulePropagateCopy;
 impl Rule for RulePropagateCopy {
     // applies to all opcodes (no getOpList override)
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RulePropagateCopy))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePropagateCopy)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1972,7 +1910,9 @@ impl Rule for RulePropagateCopy {
                     }
                 }
             }
+            let receipt = branch_receipt::begin_copy(data, op, i, copyop);
             data.op_set_input(op, invn, i).expect("RulePropagateCopy: opSetInput"); // propagate just a single copy
+            branch_receipt::finish(data, receipt);
             return 1;
         }
         0
@@ -1993,12 +1933,8 @@ impl Rule for Rule2Comp2Mult {
         vec![OpCode::CPUI_INT_2COMP]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(Rule2Comp2Mult))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(Rule2Comp2Mult)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2024,12 +1960,8 @@ impl Rule for RuleCarryElim {
         vec![OpCode::CPUI_INT_CARRY]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleCarryElim))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleCarryElim)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2075,15 +2007,12 @@ impl Rule for RuleSub2Add {
         vec![OpCode::CPUI_INT_SUB]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleSub2Add))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSub2Add)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+        let receipt = branch_receipt::begin_subtract(data, op);
         let vn = op_in(data, op, 1).expect("RuleSub2Add: null in1"); // Parameter being subtracted
         let opaddr = data.obank().get(op).expect("RuleSub2Add: stale op").get_addr().clone();
         let newop = data.new_op(2, opaddr);
@@ -2095,6 +2024,7 @@ impl Rule for RuleSub2Add {
         data.op_set_input(newop, negone, 1).expect("RuleSub2Add: opSetInput");
         set_opcode(data, op, OpCode::CPUI_INT_ADD);
         data.op_insert_before(newop, op);
+        branch_receipt::finish(data, receipt);
         1
     }
 }
@@ -2113,12 +2043,8 @@ impl Rule for RuleXorCollapse {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleXorCollapse))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleXorCollapse)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2184,12 +2110,8 @@ impl Rule for RuleAddMultCollapse {
         vec![OpCode::CPUI_INT_ADD, OpCode::CPUI_INT_MULT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone`: returns null iff the rule's group is not in `grouplist`.
-        // The rule's group lives in the engine-owned `RuleState` (not in this
-        // zero-sized marker), and the pool only holds rules whose group W8
-        // enabled, so the clone is unconditional here.  See module docs.
-        Some(Box::new(RuleAddMultCollapse))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAddMultCollapse)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2267,10 +2189,12 @@ impl Rule for RuleAddMultCollapse {
 
         let c0sz = vn_size(data, c0);
         let val = eval_binary(opc, c0sz, vn_offset(data, c0), vn_offset(data, c1));
+        let receipt = branch_receipt::begin_reassociate(data, op, subop, val);
         let newvn = data.new_constant(c0sz, val);
         // STUB(W6): copySymbolIfValid(c0 or c1) -- symbol-entry copy skipped.
         data.op_set_input(op, newvn, 1).expect("RuleAddMultCollapse: opSetInput"); // Replace c0 with c0(+|*)c1
         data.op_set_input(op, sub2, 0).expect("RuleAddMultCollapse: opSetInput"); // Replace sub with sub2
+        branch_receipt::finish(data, receipt);
         1
     }
 }
@@ -2302,40 +2226,40 @@ fn eval_binary(opc: OpCode, size: int4, in1: uintb, in2: uintb) -> uintb {
 
 /// The [`RuleSpec`] rows for this batch, in C++ definition order.
 ///
-/// `group` is left empty here: the W8 assembly assigns the real stage group when
-/// it places each rule into a pool (the C++ constructs every rule as
-/// `RuleXxx(group)` with the group supplied by `universalAction`).  The `ctor`
-/// builds a fresh zero-sized rule marker.
+/// All rules in this batch register under `"analysis"`, matching the
+/// universal-action table. Membership belongs to the pool's registration
+/// state; each `ctor` builds a fresh zero-sized rule marker.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "", ctor: || Box::new(RuleBooleanDedup) },
-        RuleSpec { group: "", ctor: || Box::new(RuleBooleanNegate) },
-        RuleSpec { group: "", ctor: || Box::new(RuleBoolZext) },
-        RuleSpec { group: "", ctor: || Box::new(RuleLogic2Bool) },
-        RuleSpec { group: "", ctor: || Box::new(RuleIndirectCollapse) },
-        RuleSpec { group: "", ctor: || Box::new(RuleMultiCollapse) },
-        RuleSpec { group: "", ctor: || Box::new(RuleSborrow) },
-        RuleSpec { group: "", ctor: || Box::new(RuleScarry) },
-        RuleSpec { group: "", ctor: || Box::new(RuleTrivialShift) },
-        RuleSpec { group: "", ctor: || Box::new(RuleSignShift) },
-        RuleSpec { group: "", ctor: || Box::new(RuleTestSign) },
-        RuleSpec { group: "", ctor: || Box::new(RuleIdentityEl) },
-        RuleSpec { group: "", ctor: || Box::new(RuleShift2Mult) },
-        RuleSpec { group: "", ctor: || Box::new(RuleShiftPiece) },
-        RuleSpec { group: "", ctor: || Box::new(RuleCollapseConstants) },
-        RuleSpec { group: "", ctor: || Box::new(RuleTransformCpool) },
-        RuleSpec { group: "", ctor: || Box::new(RulePropagateCopy) },
-        RuleSpec { group: "", ctor: || Box::new(Rule2Comp2Mult) },
-        RuleSpec { group: "", ctor: || Box::new(RuleCarryElim) },
-        RuleSpec { group: "", ctor: || Box::new(RuleSub2Add) },
-        RuleSpec { group: "", ctor: || Box::new(RuleXorCollapse) },
-        RuleSpec { group: "", ctor: || Box::new(RuleAddMultCollapse) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleBooleanDedup) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleBooleanNegate) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleBoolZext) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleLogic2Bool) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleIndirectCollapse) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleMultiCollapse) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSborrow) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleScarry) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTrivialShift) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignShift) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTestSign) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleIdentityEl) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleShift2Mult) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleShiftPiece) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleCollapseConstants) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTransformCpool) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePropagateCopy) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(Rule2Comp2Mult) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleCarryElim) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSub2Add) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleXorCollapse) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleAddMultCollapse) },
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::{Action, ActionContext, ActionGroupList, ActionPool};
     use std::rc::Rc;
 
     /// Regression: the opcode seam must cover the equality comparisons (a
@@ -2423,7 +2347,14 @@ mod tests {
 
     fn build_fd() -> Fd {
         let manage = build_manager();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         let mut fd = Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap();
@@ -2723,7 +2654,17 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd), 1);
+        fd.obank_mut().mark_alive(op);
+        let mut pool = ActionPool::new(0, "identity");
+        pool.add_spec(&specs()[11], "identityel");
+        if let Some(mut excluded) = pool.clone_filtered(&ActionGroupList::new()) {
+            assert_eq!(excluded.apply(&mut fd, &mut ActionContext::new()), 0);
+        }
+        assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_ADD);
+        let mut selected = pool
+            .clone_filtered(&ActionGroupList::from_names(["analysis"]))
+            .expect("registered analysis group survives");
+        assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         assert_eq!(op_in(&fd, op, 0), Some(v));
@@ -3188,23 +3129,6 @@ mod tests {
         assert_eq!(RulePropagateCopy.apply_op(op, &mut fd), 0);
     }
 
-    // --- registration ordering -------------------------------------------
-
-    #[test]
-    fn specs_are_in_cpp_definition_order() {
-        let specs = specs();
-        assert_eq!(specs.len(), 22);
-        // Spot-check the first, a middle, and the last by exercising the ctor
-        // and the rule's getOpList (a cheap structural identity).
-        let first = (specs[0].ctor)();
-        assert_eq!(first.get_op_list(), vec![OpCode::CPUI_BOOL_AND, OpCode::CPUI_BOOL_OR]);
-        let last = (specs[21].ctor)();
-        assert_eq!(last.get_op_list(), vec![OpCode::CPUI_INT_ADD, OpCode::CPUI_INT_MULT]);
-        // RuleCollapseConstants (index 14) applies to all opcodes (default list).
-        let collapse = (specs[14].ctor)();
-        assert!(collapse.get_op_list().len() > 2);
-    }
-
     // =====================================================================
     // VERIFIER adversarial tests (item w5-s3-rules-3) — target the fully
     // ported rules whose rewrites are most fragile (slot selection, sgn
@@ -3527,7 +3451,7 @@ mod tests {
     // --- W10: Convert #17 equate survives the size-4 fold (DynamicHash re-bind) -
 
     use crate::database::{symbol_dispflags, SymbolId};
-    use crate::dtype::{type_metatype, Datatype};
+    use crate::dtype::type_metatype;
     use kuna_base::space::SpacebaseSpace;
     use kuna_base::types::{uint4, uintb};
 
@@ -3542,7 +3466,14 @@ mod tests {
         manage
             .insert_space(Rc::new(SpacebaseSpace::new("stack", 5, 8, &ram, 0, true, false)))
             .unwrap();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let r = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(r, 0x1000);
         let mut fd = Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap();
@@ -3556,7 +3487,8 @@ mod tests {
     /// returning its Symbol id.  No special-casing: the caller supplies value and
     /// format, exactly as the datatest's `map convert` line does.
     fn add_equate(fd: &mut Fd, format: uint4, value: uintb) -> SymbolId {
-        let base1 = Rc::new(Datatype::new(1, type_metatype::TYPE_UNKNOWN));
+        let base1 = fd.fd.get_arch().types().expect("type factory")
+            .get_base(1, type_metatype::TYPE_UNKNOWN).unwrap();
         let addr = pc(fd);
         fd.fd
             .get_scope_local_mut()

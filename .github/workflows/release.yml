@@ -41,7 +41,7 @@ concurrency:
   cancel-in-progress: false
 
 # The Ghidra release the extension zip is built against (and version-locked to;
-# other 12.x installs need "Install Anyway" at the version-mismatch dialog).
+# the producer is hash-bound to this distribution; other installs require a rebuild).
 # The asset filename embeds a build date not derivable from the version, so the
 # full URL is pinned alongside it -- bump both together to retarget.
 env:
@@ -321,5 +321,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "kuna v$ver" \
             --generate-notes \
-            --notes "$(printf 'Each archive ships `kuna` (the CLI), `decomp_dbg` (the decompiler console), and `slacomp` (the SLEIGH compiler).\n\nThe engine needs compiled SLEIGH specs at runtime: extract `kuna-v%s-specs.tar.gz` and point `KUNA_SPECS` at the extracted `specs/` directory. See docs/release.md.\n\n`kuna-v%s-KunaDecompiler-ghidra_%s.zip` is the ready-to-install KunaDecompiler extension for **Ghidra %s** (in Ghidra: File -> Install Extensions... -> `+` -> pick the zip -> restart -> enable KunaDecompilerPlugin). It bundles prebuilt `kuna_ghidra` backends for Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64, so it installs fully airgapped: the Ghidra release zip plus this zip are the only two files needed -- no network, no Rust toolchain. The zip is version-locked to Ghidra %s; other Ghidra 12.x versions can choose "Install Anyway" at the version-mismatch dialog (compatibility unverified).' "$ver" "$ver" "$GHIDRA_VERSION" "$GHIDRA_VERSION" "$GHIDRA_VERSION")" \
+            --notes "$(printf 'Each archive ships `kuna` (the CLI), `decomp_dbg` (the decompiler console), and `slacomp` (the SLEIGH compiler).\n\nThe engine needs compiled SLEIGH specs at runtime: extract `kuna-v%s-specs.tar.gz` and point `KUNA_SPECS` at the extracted `specs/` directory. See docs/release.md.\n\n`kuna-v%s-KunaDecompiler-ghidra_%s.zip` is the ready-to-install KunaDecompiler extension for **Ghidra %s** (extract the zip, run its `kuna.KunaIntegratedInstall` Java installer to create a new isolated Ghidra copy, then launch that copy and enable KunaDecompilerPlugin; see integrations/ghidra/KunaDecompiler/README.md). It bundles prebuilt `kuna_ghidra` backends for Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64, so it installs fully airgapped: the Ghidra release zip plus this zip are the only two files needed -- no network, no Rust toolchain. The producer is hash-bound to the Ghidra %s distribution used for the build; other distributions require rebuilding the extension, not choosing "Install Anyway".' "$ver" "$ver" "$GHIDRA_VERSION" "$GHIDRA_VERSION" "$GHIDRA_VERSION")" \
             dist/*

@@ -15,7 +15,7 @@ use kuna_num::opcodes::OpCode;
 use super::*;
 use crate::action::Rule;
 use crate::context::{ArchContext, TypeOp, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
 /// The user-op id the fixture registers as `pshufb`.
@@ -97,6 +97,10 @@ fn build_fd(shuffle_ids: Vec<u32>) -> Funcdata {
 fn build_fd_gated(shuffle_ids: Vec<u32>, gate: bool) -> Funcdata {
     let manage = build_manager();
     let mut ctx = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(16);
+    ctx.types = Some(Rc::new(types));
     ctx.simd_lane_fold = gate;
     ctx.simd_shuffle_userops = shuffle_ids;
     let glb = Rc::new(ctx);
@@ -109,8 +113,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace(
@@ -160,23 +165,23 @@ fn build_lane_read(
     // `src` is given a definition: a free Varnode may not gain a second
     // descendant, and the rewrite adds one (the lane read re-anchors on it).
     let srcdef = mk_op(fd, 0x0f8, 1, OpCode::CPUI_COPY);
-    let src = fd.new_unique(vecsize, Some(unk(vecsize)));
+    let src = fd.new_unique(vecsize, Some(unk(fd, vecsize)));
     let src = set_def(fd, src, srcdef);
     wire(fd, src, shuf, 1);
     let mask = if mask_is_constant {
         fd.new_constant(vecsize, 0)
     } else {
-        fd.new_unique(vecsize, Some(unk(vecsize)))
+        fd.new_unique(vecsize, Some(unk(fd, vecsize)))
     };
     wire(fd, mask, shuf, 2);
-    let shufout = fd.new_unique(vecsize, Some(unk(vecsize)));
+    let shufout = fd.new_unique(vecsize, Some(unk(fd, vecsize)));
     let shufout = set_def(fd, shufout, shuf);
 
     let op = mk_op(fd, 0x104, 2, OpCode::CPUI_SUBPIECE);
     wire(fd, shufout, op, 0);
     let kc = fd.new_constant(4, k);
     wire(fd, kc, op, 1);
-    let out = fd.new_unique(outsize, Some(unk(outsize)));
+    let out = fd.new_unique(outsize, Some(unk(fd, outsize)));
     let _out = set_def(fd, out, op);
     (op, src)
 }

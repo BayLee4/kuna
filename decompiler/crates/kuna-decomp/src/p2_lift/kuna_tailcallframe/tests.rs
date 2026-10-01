@@ -13,7 +13,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{ArchContext, OpId, TypeOp};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 
 use super::*;
@@ -52,14 +52,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn space_of(fd: &Funcdata, name: &str) -> Rc<AddrSpace> {
@@ -74,12 +80,14 @@ fn sp_loc(fd: &Funcdata) -> VarnodeStorage {
 
 fn sp_vn(fd: &mut Funcdata) -> crate::context::VarnodeId {
     let reg = space_of(fd, "register");
-    fd.vbank_mut().create(8, Address::new(reg, 0x20), unk_type(8))
+    let datatype = unk_type(fd, 8);
+    fd.vbank_mut().create(8, Address::new(reg, 0x20), datatype)
 }
 
 fn const_vn(fd: &mut Funcdata, val: u64) -> crate::context::VarnodeId {
     let cst = space_of(fd, "const");
-    fd.vbank_mut().create(8, Address::new(cst, val), unk_type(8))
+    let datatype = unk_type(fd, 8);
+    fd.vbank_mut().create(8, Address::new(cst, val), datatype)
 }
 
 /// `SP = SP <opc> k` at instruction address `at`.
@@ -102,8 +110,9 @@ fn emit_filler(fd: &mut Funcdata, at: u64) -> OpId {
     let op = fd.obank_mut().create_at(1, Address::new(ram, at));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_COPY, 0, "op"));
     let reg = space_of(fd, "register");
-    let src = fd.vbank_mut().create(8, Address::new(Rc::clone(&reg), 0x18), unk_type(8));
-    let dst = fd.vbank_mut().create(8, Address::new(reg, 0x10), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let src = fd.vbank_mut().create(8, Address::new(Rc::clone(&reg), 0x18), datatype.clone());
+    let dst = fd.vbank_mut().create(8, Address::new(reg, 0x10), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(src), 0);
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(dst));
     op
@@ -114,7 +123,8 @@ fn emit_branch(fd: &mut Funcdata, at: u64, dest: u64) -> OpId {
     let ram = space_of(fd, "ram");
     let op = fd.obank_mut().create_at(1, Address::new(Rc::clone(&ram), at));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_BRANCH, 0, "op"));
-    let vn = fd.vbank_mut().create(8, Address::new(ram, dest), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let vn = fd.vbank_mut().create(8, Address::new(ram, dest), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);
     op
 }
@@ -126,10 +136,11 @@ fn emit_sp_store(fd: &mut Funcdata, at: u64) {
     let op = fd.obank_mut().create_at(3, Address::new(Rc::clone(&ram), at));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_STORE, 0, "op"));
     let cst = space_of(fd, "const");
-    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), datatype.clone());
     let ptr = sp_vn(fd);
     let reg = space_of(fd, "register");
-    let val = fd.vbank_mut().create(8, Address::new(reg, 0x8), unk_type(8));
+    let val = fd.vbank_mut().create(8, Address::new(reg, 0x8), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(spc), 0);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(ptr), 1);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(val), 2);
@@ -142,10 +153,11 @@ fn emit_sp_load(fd: &mut Funcdata, at: u64) {
     let op = fd.obank_mut().create_at(2, Address::new(Rc::clone(&ram), at));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_LOAD, 0, "op"));
     let cst = space_of(fd, "const");
-    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), datatype.clone());
     let ptr = sp_vn(fd);
     let reg = space_of(fd, "register");
-    let out = fd.vbank_mut().create(8, Address::new(reg, 0x8), unk_type(8));
+    let out = fd.vbank_mut().create(8, Address::new(reg, 0x8), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(spc), 0);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(ptr), 1);
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(out));
@@ -282,7 +294,8 @@ fn opaque_frame_pointer_restore_declines() {
     let op = fd.obank_mut().create_at(1, Address::new(ram, 0x1100));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_COPY, 0, "op"));
     let reg = space_of(&fd, "register");
-    let src = fd.vbank_mut().create(8, Address::new(reg, 0x28), unk_type(8));
+    let datatype = unk_type(&fd, 8);
+    let src = fd.vbank_mut().create(8, Address::new(reg, 0x28), datatype);
     let out = sp_vn(&mut fd);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(src), 0);
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(out));
@@ -319,7 +332,8 @@ fn indirect_branch_excluded() {
     let ram = space_of(&fd, "ram");
     let op = fd.obank_mut().create_at(1, Address::new(Rc::clone(&ram), 0x1106));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_BRANCHIND, 0, "op"));
-    let vn = fd.vbank_mut().create(8, Address::new(ram, 0x2000), unk_type(8));
+    let datatype = unk_type(&fd, 8);
+    let vn = fd.vbank_mut().create(8, Address::new(ram, 0x2000), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);
     let sp = sp_loc(&fd);
     let (e, d) = (entry_addr(&fd), dest_addr(&fd, 0x2000));

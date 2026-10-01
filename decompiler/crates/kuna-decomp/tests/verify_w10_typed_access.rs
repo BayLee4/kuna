@@ -22,27 +22,28 @@
 //! Item id: w10-typed-access.
 
 use kuna_base::types::int4;
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField, TypeRoot};
 use kuna_decomp::unionresolve::{score_locked_type, score_truncation};
-use std::rc::Rc;
 
 // ---- type builders (mirror the in-module test helpers, public API only) ----
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(factory: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    factory.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// Build a union of (offset, type) fields, exactly as the in-module
 /// `make_union` helper does (C++ `TypeUnion`).
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(factory: &TypeFactoryImpl, name: &str, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
+    u.name = name.to_string();
+    u.id = Datatype::hash_name(name);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    factory.intern(u).unwrap()
 }
 
 // ===========================================================================
@@ -53,8 +54,9 @@ fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
 /// recurse a data-type from truncation of a union").  cpp:935-948.
 #[test]
 fn w10_typed_access_union_field_size_match_scores_plus10() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(8, &[(0, base(8, type_metatype::TYPE_FLOAT)), (0, Rc::clone(&int4t))]);
+    let factory = TypeFactoryImpl::new();
+    let int4t = base(&factory, 4, type_metatype::TYPE_INT);
+    let u = make_union(&factory, "union_t", 8, &[(0, base(&factory, 8, type_metatype::TYPE_FLOAT)), (0, int4t)]);
     // vn_size 4 matches field f1 (offset 0, size 4).  result_base = None so the
     // `+5 if result.getBase()==unionDt` bonus does not apply.
     let (score, ct_out) = score_truncation(&u, 4, 0, None).unwrap();
@@ -65,8 +67,9 @@ fn w10_typed_access_union_field_size_match_scores_plus10() {
 /// UNION branch, NO field matches the truncation size -> -10.  cpp:938.
 #[test]
 fn w10_typed_access_union_no_match_scores_minus10() {
+    let factory = TypeFactoryImpl::new();
     // Only an 8-byte field; a 4-byte truncation at offset 0 matches nothing.
-    let u = make_union(8, &[(0, base(8, type_metatype::TYPE_FLOAT))]);
+    let u = make_union(&factory, "union_t", 8, &[(0, base(&factory, 8, type_metatype::TYPE_FLOAT))]);
     let (score, ct_out) = score_truncation(&u, 4, 0, None).unwrap();
     assert_eq!(score, -10, "union with no size-matching field scores -10 (cpp:938)");
     assert!(ct_out.is_none());
@@ -76,13 +79,14 @@ fn w10_typed_access_union_no_match_scores_minus10() {
 /// cpp:944-945 (`if (result.getBase() == unionDt) score += 5;`).
 #[test]
 fn w10_typed_access_union_match_self_base_bonus_plus5() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, Rc::clone(&int4t))]);
+    let factory = TypeFactoryImpl::new();
+    let int4t = base(&factory, 4, type_metatype::TYPE_INT);
+    let u = make_union(&factory, "union_t", 4, &[(0, int4t.clone())]);
     // Pass the union itself as the result base -> the +5 self-base bonus fires.
     let (score, _ct) = score_truncation(&u, 4, 0, Some(&u)).unwrap();
     assert_eq!(score, 15, "matching field + base==union -> +10+5");
     // A *different* base must NOT get the bonus.
-    let other = make_union(4, &[(0, int4t)]);
+    let other = make_union(&factory, "other_union_t", 4, &[(0, int4t)]);
     let (score2, _) = score_truncation(&u, 4, 0, Some(&other)).unwrap();
     assert_eq!(score2, 10, "base != this union -> no +5 bonus");
 }
@@ -91,19 +95,20 @@ fn w10_typed_access_union_match_self_base_bonus_plus5() {
 /// preserved.  cpp:951-953 (`curOff==0 && size==vn->size` falsifies the guard).
 #[test]
 fn w10_typed_access_scalar_exact_match_scores_plus10() {
-    let int4t = base(4, type_metatype::TYPE_INT);
+    let factory = TypeFactoryImpl::new();
+    let int4t = base(&factory, 4, type_metatype::TYPE_INT);
     let (score, ct_out) = score_truncation(&int4t, 4, 0, None).unwrap();
     assert_eq!(score, 10, "exact scalar size/offset match scores +10");
-    assert!(ct_out.is_some(), "scalar branch returns the (unrecursed) type, not None");
-    assert!(Rc::ptr_eq(ct_out.as_ref().unwrap(), &int4t));
+    assert_eq!(ct_out, Some(int4t), "exact scalar truncation preserves its type");
 }
 
 /// SCALAR branch, an INT wider than the truncation that still covers it
 /// (`size >= vn_size + curOff`) -> +1.  cpp:954-958.
 #[test]
 fn w10_typed_access_scalar_wider_int_covers_scores_plus1() {
+    let factory = TypeFactoryImpl::new();
     // 8-byte int, truncate 4 bytes at offset 0: size(8) >= 4+0 -> score 1.
-    let int8t = base(8, type_metatype::TYPE_INT);
+    let int8t = base(&factory, 8, type_metatype::TYPE_INT);
     let (score, _ct) = score_truncation(&int8t, 4, 0, None).unwrap();
     assert_eq!(score, 1, "wide INT covering the truncation scores +1 (cpp:956)");
 }
@@ -113,10 +118,11 @@ fn w10_typed_access_scalar_wider_int_covers_scores_plus1() {
 /// None, loop exits with ct==0 -> -10.  cpp:970-973.
 #[test]
 fn w10_typed_access_scalar_unreachable_scores_minus10() {
+    let factory = TypeFactoryImpl::new();
     // 8-byte float, ask for a 4-byte truncation at a non-zero offset that no
     // sub-type can satisfy.  The while-guard stays true (curOff!=0), FLOAT is
     // neither INT/UINT nor ARRAY, getSubType(curOff) returns None -> ct==0.
-    let f8 = base(8, type_metatype::TYPE_FLOAT);
+    let f8 = base(&factory, 8, type_metatype::TYPE_FLOAT);
     let (score, ct_out) = score_truncation(&f8, 4, 2, None).unwrap();
     assert_eq!(score, -10, "no sub-type reaches the truncation -> -10 (cpp:973)");
     assert!(ct_out.is_none(), "ct==0 sentinel maps to None");
@@ -126,22 +132,28 @@ fn w10_typed_access_scalar_unreachable_scores_minus10() {
 // score_locked_type — pointer-chain stripping + metatype scoring
 // ===========================================================================
 
-/// Pointer-identity perfect match: lockType == ct (same Rc) -> +5 seed before
+/// Nominal-identity perfect match: lockType == ct -> +5 seed before
 /// the pointer-strip loop even begins.  unionresolve.cc scoreLockedType head
 /// (`if (lockType == ct) score += 5;`).
 #[test]
-fn w10_typed_access_locked_type_pointer_identity_seeds_plus5() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    // Same Rc on both sides -> identity bonus + a same-metatype contribution.
+fn w10_typed_access_locked_type_nominal_identity_seeds_plus5() {
+    let factory = TypeFactoryImpl::new();
+    let mut first = Datatype::new(4, type_metatype::TYPE_INT);
+    first.name = "first_int".to_string();
+    first.id = Datatype::hash_name(&first.name);
+    let int4t = factory.intern(first).unwrap();
+    // The same nominal type receives both identity and metatype contributions.
     let identical = score_locked_type(&int4t, &int4t);
-    // A structurally-equal-but-distinct INT4 (no Rc identity) must score lower
-    // by exactly the +5 identity seed.
-    let other_int4 = base(4, type_metatype::TYPE_INT);
+    // A distinct nominal INT4 with the same layout does not receive the bonus.
+    let mut second = Datatype::new(4, type_metatype::TYPE_INT);
+    second.name = "second_int".to_string();
+    second.id = Datatype::hash_name(&second.name);
+    let other_int4 = factory.intern(second).unwrap();
     let distinct = score_locked_type(&int4t, &other_int4);
     assert_eq!(
         identical,
         distinct + 5,
-        "Rc-identity match adds exactly +5 over a structurally-equal distinct type"
+        "nominal-identity match adds exactly +5 over a same-layout distinct type"
     );
 }
 
@@ -150,8 +162,9 @@ fn w10_typed_access_locked_type_pointer_identity_seeds_plus5() {
 /// on mismatched leaf types.
 #[test]
 fn w10_typed_access_locked_type_metatype_mismatch_is_lower() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let float4t = base(4, type_metatype::TYPE_FLOAT);
+    let factory = TypeFactoryImpl::new();
+    let int4t = base(&factory, 4, type_metatype::TYPE_INT);
+    let float4t = base(&factory, 4, type_metatype::TYPE_FLOAT);
     let matched = score_locked_type(&int4t, &int4t);
     let mismatched = score_locked_type(&float4t, &int4t);
     assert!(

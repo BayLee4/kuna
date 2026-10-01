@@ -12,7 +12,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{ArchContext, BlockId, OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
+use crate::dtype::{type_metatype, Datatype, TypeRoot, TypeFactory, TypeFactoryImpl};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::varmap::{MapState, RangeType, COPY_CONSTANT, TYPELOCK};
@@ -54,6 +54,7 @@ impl Fx {
         let sp_data = VarnodeStorage { space: Some(Rc::clone(&reg)), offset: SP_OFF, size: 8 };
         manage.add_spacebase_pointer(&stack, &sp_data, 8, true).unwrap();
         let mut glb = ArchContext::new(manage);
+        glb.types = Some(Rc::new(factory()));
         glb.end_ptr_bound = option;
         let entry = Address::new(Rc::clone(&reg), 0x1000);
         let mut fd = Funcdata::new("walk", "walk", Rc::new(glb), entry, 0x1000_0000, 0x40).unwrap();
@@ -602,13 +603,12 @@ fn the_option_off_gathers_nothing() {
     assert!(gather_walks(&fx.fd, &fx.stack()).is_empty());
 }
 
-fn char_array(len: int4) -> Rc<Datatype> {
-    let f = factory();
+fn char_array(f: &dyn TypeFactory, len: int4) -> TypeRoot {
     let elem = f.get_base(1, type_metatype::TYPE_INT).unwrap();
     f.get_type_array(len, elem).unwrap()
 }
 
-fn map_local(fx: &mut Fx, off: i64, ty: Rc<Datatype>) {
+fn map_local(fx: &mut Fx, off: i64, ty: TypeRoot) {
     let stack = fx.stack();
     let addr = Address::new(Rc::clone(&stack), stack.wrap_offset(off as u64));
     let inv = Address::new_invalid();
@@ -626,7 +626,8 @@ fn bound_def(fx: &Fx, cmp: OpId, slot: int4) -> (OpCode, Option<i64>) {
 #[test]
 fn the_bound_is_rebuilt_on_an_array_covering_exactly_the_walk() {
     let mut dw = do_while(START, END, 1, 1, false, not_equal);
-    map_local(&mut dw.fx, START, char_array(8));
+    let ty = char_array(dw.fx.fd.get_arch().types().unwrap(), 8);
+    map_local(&mut dw.fx, START, ty);
     assert!(dw.fx.fd.start_type_recovery());
     let walks = dw.fx.walks();
     let stack = dw.fx.stack();
@@ -639,10 +640,13 @@ fn the_bound_is_rebuilt_on_an_array_covering_exactly_the_walk() {
 
 #[test]
 fn the_bound_is_left_alone_without_that_exact_array() {
-    let cases: Vec<(i64, Rc<Datatype>)> =
-        vec![(START, char_array(16)), (START - 1, char_array(9)), (START, factory().get_base(8, type_metatype::TYPE_INT).unwrap())];
-    for (off, ty) in cases {
+    for (off, len) in [(START, Some(16)), (START - 1, Some(9)), (START, None)] {
         let mut dw = do_while(START, END, 1, 1, false, not_equal);
+        let types = dw.fx.fd.get_arch().types().unwrap();
+        let ty = match len {
+            Some(len) => char_array(types, len),
+            None => types.get_base(8, type_metatype::TYPE_INT).unwrap(),
+        };
         map_local(&mut dw.fx, off, ty);
         assert!(dw.fx.fd.start_type_recovery());
         let walks = dw.fx.walks();
@@ -651,12 +655,14 @@ fn the_bound_is_left_alone_without_that_exact_array() {
         assert_eq!(bound_def(&dw.fx, dw.cmp, 1), (OpCode::CPUI_PTRSUB, Some(END)));
     }
     let mut none = do_while(START, END, 1, 1, false, not_equal);
-    map_local(&mut none.fx, START, char_array(8));
+    let ty = char_array(none.fx.fd.get_arch().types().unwrap(), 8);
+    map_local(&mut none.fx, START, ty);
     assert!(none.fx.fd.start_type_recovery());
     let stack = none.fx.stack();
     assert_eq!(rebase_bounds(&mut none.fx.fd, &stack, &[]), 0, "nothing is rebuilt without a proven walk");
     let mut early = do_while(START, END, 1, 1, false, not_equal);
-    map_local(&mut early.fx, START, char_array(8));
+    let ty = char_array(early.fx.fd.get_arch().types().unwrap(), 8);
+    map_local(&mut early.fx, START, ty);
     let (walks, stack) = (early.fx.walks(), early.fx.stack());
     assert_eq!(walks.len(), 1);
     assert_eq!(rebase_bounds(&mut early.fx.fd, &stack, &walks), 0, "nothing is rebuilt before type recovery");
@@ -666,8 +672,8 @@ fn stack_space() -> Rc<AddrSpace> {
     Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "stack", false, 8, 1, 4, addrspace_flags::hasphysical, 1, 1))
 }
 
-fn base(size: i32, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn base(types: &TypeFactoryImpl, size: i32, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new_with_align(size, size, meta)).unwrap()
 }
 
 fn factory() -> TypeFactoryImpl {
@@ -698,15 +704,15 @@ fn layout(state: &mut MapState) -> Vec<(i64, i32, RangeType, i32)> {
 fn constant_initializers_and_pointer_hints_become_one_buffer() {
     let (space, types) = (stack_space(), factory());
     let mut st = state(&space, &types);
-    let char1 = base(1, type_metatype::TYPE_INT);
-    st.add_range_pub(0x20, Some(base(4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
-    st.add_range_pub(0x24, Some(base(4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
-    st.add_range_pub(0x20, Some(Rc::clone(&char1)), 0, RangeType::Open, -1);
-    st.add_range_pub(0x28, Some(base(8, type_metatype::TYPE_UINT)), 0, RangeType::Fixed, -1);
+    let char1 = base(&types, 1, type_metatype::TYPE_INT);
+    st.add_range_pub(0x20, Some(base(&types, 4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
+    st.add_range_pub(0x24, Some(base(&types, 4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
+    st.add_range_pub(0x20, Some(char1.clone()), 0, RangeType::Open, -1);
+    st.add_range_pub(0x28, Some(base(&types, 8, type_metatype::TYPE_UINT)), 0, RangeType::Fixed, -1);
     coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
     assert_eq!(layout(&mut st), vec![(0x20, 1, RangeType::Open, 7), (0x28, 8, RangeType::Fixed, -1)]);
     let buf = st.hints_mut().iter().find(|h| h.sstart == 0x20).unwrap().type_.clone();
-    assert!(Rc::ptr_eq(&buf, &char1), "the element type comes from the walk's own byte hint");
+    assert_eq!(buf.id(), char1.id(), "the element type comes from the walk's own byte hint");
 }
 
 #[test]
@@ -721,8 +727,8 @@ fn a_store_straddling_either_edge_vetoes_the_buffer() {
     ];
     for (at, size, rt, flags) in cases {
         let mut st = state(&space, &types);
-        st.add_range_pub(0x20, Some(base(4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
-        st.add_range_pub(at, Some(base(size, type_metatype::TYPE_UNKNOWN)), flags, rt, -1);
+        st.add_range_pub(0x20, Some(base(&types, 4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
+        st.add_range_pub(at, Some(base(&types, size, type_metatype::TYPE_UNKNOWN)), flags, rt, -1);
         let before = layout(&mut st);
         coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
         assert_eq!(layout(&mut st), before, "hint at {at:#x} size {size}");
@@ -733,9 +739,9 @@ fn a_store_straddling_either_edge_vetoes_the_buffer() {
 fn a_fresh_walk_leaves_the_buffer_open_to_the_next_hint() {
     let (space, types) = (stack_space(), factory());
     let mut st = state(&space, &types);
-    st.add_range_pub(0x20, Some(base(1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
-    st.add_range_pub(0x24, Some(base(4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
-    st.add_range_pub(0x28, Some(base(1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
+    st.add_range_pub(0x20, Some(base(&types, 1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
+    st.add_range_pub(0x24, Some(base(&types, 4, type_metatype::TYPE_UNKNOWN)), COPY_CONSTANT, RangeType::Fixed, -1);
+    st.add_range_pub(0x28, Some(base(&types, 1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
     coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
     assert_eq!(layout(&mut st), vec![(0x20, 1, RangeType::Open, 7), (0x28, 1, RangeType::Open, -1)]);
 }
@@ -751,7 +757,7 @@ fn a_typed_value_or_locked_symbol_inside_vetoes_the_buffer() {
     ];
     for (flags, meta, size) in cases {
         let mut st = state(&space, &types);
-        st.add_range_pub(0x24, Some(base(size, meta)), flags, RangeType::Fixed, -1);
+        st.add_range_pub(0x24, Some(base(&types, size, meta)), flags, RangeType::Fixed, -1);
         let before = layout(&mut st);
         coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
         assert_eq!(layout(&mut st), before);
@@ -765,13 +771,13 @@ fn a_non_constant_access_that_is_not_one_element_vetoes_the_buffer() {
     let (space, types) = (stack_space(), factory());
     for (at, size) in [(0x20, 8), (0x22, 2)] {
         let mut st = state(&space, &types);
-        st.add_range_pub(at, Some(base(size, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Fixed, -1);
+        st.add_range_pub(at, Some(base(&types, size, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Fixed, -1);
         let before = layout(&mut st);
         coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
         assert_eq!(layout(&mut st), before, "access at {at:#x} size {size}");
     }
     let mut st = state(&space, &types);
-    st.add_range_pub(0x23, Some(base(1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Fixed, -1);
+    st.add_range_pub(0x23, Some(base(&types, 1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Fixed, -1);
     coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
     assert_eq!(layout(&mut st), vec![(0x20, 1, RangeType::Open, 7)], "an untyped one-element access is an element");
 }
@@ -780,7 +786,7 @@ fn a_non_constant_access_that_is_not_one_element_vetoes_the_buffer() {
 fn index_evidence_past_the_end_vetoes_the_buffer() {
     let (space, types) = (stack_space(), factory());
     let mut st = state(&space, &types);
-    st.add_range_pub(0x20, Some(base(1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, 15);
+    st.add_range_pub(0x20, Some(base(&types, 1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, 15);
     let before = layout(&mut st);
     coalesce_hints(&mut st, &[walk(0x20, 0x28, 1)], &space, &types);
     assert_eq!(layout(&mut st), before);
@@ -1050,7 +1056,8 @@ fn a_bound_also_used_elsewhere_keeps_its_definition() {
             used = Some(other(fx, bl, p1, e));
             fx.cmp(bl, OpCode::CPUI_INT_NOTEQUAL, p1, e)
         });
-        map_local(&mut dw.fx, START, char_array(8));
+        let ty = char_array(dw.fx.fd.get_arch().types().unwrap(), 8);
+        map_local(&mut dw.fx, START, ty);
         assert!(dw.fx.fd.start_type_recovery());
         let (walks, stack) = (dw.fx.walks(), dw.fx.stack());
         let e = dw.fx.fd.obank().get(dw.cmp).unwrap().get_in(1).unwrap();
@@ -1066,23 +1073,23 @@ fn a_bound_also_used_elsewhere_keeps_its_definition() {
 #[test]
 fn typed_index_evidence_of_another_width_vetoes_the_buffer() {
     let (space, types) = (stack_space(), factory());
-    let int4 = base(4, type_metatype::TYPE_INT);
+    let int4 = base(&types, 4, type_metatype::TYPE_INT);
     let mut st = state(&space, &types);
-    st.add_range_pub(0x20, Some(base(1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
-    st.add_range_pub(0x20, Some(Rc::clone(&int4)), 0, RangeType::Open, 3);
+    st.add_range_pub(0x20, Some(base(&types, 1, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, -1);
+    st.add_range_pub(0x20, Some(int4.clone()), 0, RangeType::Open, 3);
     let before = layout(&mut st);
     coalesce_hints(&mut st, &[walk(0x20, 0x30, 1)], &space, &types);
     assert_eq!(layout(&mut st), before, "a byte walk keeps an int array's indexing");
 
     let mut st = state(&space, &types);
-    st.add_range_pub(0x20, Some(Rc::clone(&int4)), 0, RangeType::Open, 3);
+    st.add_range_pub(0x20, Some(int4.clone()), 0, RangeType::Open, 3);
     coalesce_hints(&mut st, &[walk(0x20, 0x30, 4)], &space, &types);
     assert_eq!(layout(&mut st), vec![(0x20, 4, RangeType::Open, 3)]);
     let elem = st.hints_mut()[0].type_.clone();
-    assert!(Rc::ptr_eq(&elem, &int4), "same-width index evidence types the elements");
+    assert_eq!(elem.id(), int4.id(), "same-width index evidence types the elements");
 
     let mut st = state(&space, &types);
-    st.add_range_pub(0x20, Some(base(4, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, 3);
+    st.add_range_pub(0x20, Some(base(&types, 4, type_metatype::TYPE_UNKNOWN)), 0, RangeType::Open, 3);
     coalesce_hints(&mut st, &[walk(0x20, 0x30, 1)], &space, &types);
     assert_eq!(layout(&mut st), vec![(0x20, 1, RangeType::Open, 15)], "untyped index evidence is not a type");
 }

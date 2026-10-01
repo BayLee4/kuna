@@ -20,7 +20,7 @@ use kuna_base::space::{
 };
 
 use crate::context::{ArchContext, TypeOp};
-use crate::dtype::{type_class, type_metatype, Datatype};
+use crate::dtype::type_class;
 use crate::fspec::{effect_type, EffectRecord, ParamEntry, ProtoModel};
 use crate::kuna_rustabi::CalleeReturnWrites;
 use kuna_num::opcodes::OpCode;
@@ -76,7 +76,7 @@ fn with_convention(fd: &Funcdata, fc: &mut FuncCallSpecs) {
         vd.size = 8;
         model.push_effect(EffectRecord::from_varnode(vd, ty));
     }
-    let void_ty = Rc::new(Datatype::new(0, type_metatype::TYPE_VOID));
+    let void_ty = fd.get_arch().types().unwrap().get_type_void().unwrap();
     fc.proto_mut().set_internal(Rc::new(model), void_ty);
 }
 

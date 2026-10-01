@@ -87,13 +87,12 @@
 //! `Funcdata::apply_locked_prototype` reads as "lock the INPUT half only".
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use object::read::{Object, ObjectSymbol};
 use object::SymbolKind;
 
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeRoot, TypeFactory};
 use kuna_decomp::fspec::PrototypePieces;
 
 use crate::demangle::demangle_raw;
@@ -550,7 +549,7 @@ fn build_pieces(
     ptr: int4,
     word_size: uint4,
 ) -> Option<PrototypePieces> {
-    let mut intypes: Vec<Rc<Datatype>> = Vec::with_capacity(decl.params.len() + 1);
+    let mut intypes: Vec<TypeRoot> = Vec::with_capacity(decl.params.len() + 1);
     let mut innames: Vec<String> = Vec::with_capacity(decl.params.len() + 1);
     if has_this {
         let cls = types.get_type_struct(&decl.class).ok()?;
@@ -579,7 +578,7 @@ fn build_pieces(
     })
 }
 
-/// Map one demangled parameter type to a kuna [`Datatype`], or `None` when the
+/// Map one demangled parameter type to a kuna [`TypeRoot`], or `None` when the
 /// declaration describes something this pass refuses to model.
 ///
 /// The accepted grammar is deliberately narrow, because the demangled text
@@ -605,7 +604,7 @@ fn build_param_type(
     types: &dyn TypeFactory,
     ptr: int4,
     word_size: uint4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let mut t = text.trim();
     if t.contains('(') || t.contains('[') || t.contains("::*") {
         return None; // function pointer, array, pointer-to-member
@@ -674,7 +673,7 @@ fn build_param_type(
 /// through to the aggregate arm) and `Some(None)` when it is a primitive the type
 /// factory declined to build (so the caller refuses the signature).
 #[allow(clippy::type_complexity)]
-fn primitive_type(text: &str, types: &dyn TypeFactory) -> Option<Option<Rc<Datatype>>> {
+fn primitive_type(text: &str, types: &dyn TypeFactory) -> Option<Option<TypeRoot>> {
     let long = types.get_size_of_long();
     let int = types.get_size_of_int();
     let (size, meta) = match text {

@@ -6,9 +6,10 @@ use super::*;
 
 use kuna_base::space::{spacetype, AddrSpace};
 
-use crate::dtype::{flags, sub_metatype, DatatypeKind};
+use crate::dtype::{flags, sub_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl};
 
 thread_local! {
+    static TYPES: TypeFactoryImpl = TypeFactoryImpl::new();
     static REG: Rc<AddrSpace> =
         Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 1, 0, 0, 0));
 }
@@ -21,84 +22,113 @@ fn at(space: &Rc<AddrSpace>, off: uintb) -> Address {
     Address::new(Rc::clone(space), off)
 }
 
-fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
-    let mut p = Datatype::new(8, type_metatype::TYPE_PTR);
-    p.submeta = sub_metatype::SUB_PTR;
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(p)
+fn intern(mut draft: Datatype) -> TypeRoot {
+    if !draft.name.is_empty() {
+        draft.id = Datatype::hash_name(&draft.name);
+    }
+    TYPES.with(|types| types.intern(draft).unwrap())
 }
 
-fn record(name: &str) -> Rc<Datatype> {
-    let mut t = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+fn ptr_to(ptrto: TypeRoot) -> TypeRoot {
+    let mut p = Datatype::new(8, type_metatype::TYPE_PTR);
+    p.submeta = sub_metatype::SUB_PTR;
+    p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    intern(p)
+}
+
+fn record(name: &str) -> TypeRoot {
+    let mut t = Datatype::new_with_align(0x18, 8, type_metatype::TYPE_STRUCT);
     t.name = name.to_string();
-    Rc::new(t)
+    if !name.is_empty() {
+        t.id = Datatype::hash_name(name);
+    }
+    t.kind = DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
+    TYPES.with(|types| {
+        if let Some(root) = types.find_by_name(name).unwrap() {
+            if root.is_incomplete() {
+                types.complete(&root, t).unwrap();
+                return root;
+            }
+        }
+        types.intern(t).unwrap()
+    })
 }
 
 /// A synthesized record with one field, `field_0x10`, as `structsynth` mints
 /// it for a closed getter.
-fn lone(name: &str) -> Rc<Datatype> {
-    let mut t = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+fn lone(name: &str) -> TypeRoot {
+    let mut t = Datatype::new_with_align(0x18, 8, type_metatype::TYPE_STRUCT);
     t.name = name.to_string();
     t.kind = DatatypeKind::Struct {
         field: vec![crate::dtype::TypeField {
             ident: 0,
             offset: 0x10,
             name: "field_0x10".to_string(),
-            field_type: long8(),
+            field_type: long8().id(),
         }],
         bitfield: Vec::new(),
     };
-    Rc::new(t)
+    intern_inferred(t)
+}
+
+fn intern_inferred(mut draft: Datatype) -> TypeRoot {
+    draft.id = Datatype::hash_name(&draft.name);
+    TYPES.with(|types| {
+        let root = types.reserve_inferred(&draft.name, draft.id, draft.metatype).unwrap();
+        types.complete(&root, draft).unwrap();
+        root
+    })
 }
 
 /// A synthesized record read past its start, as `structheadless closed` mints
 /// it for `tail`'s `parse_obsolete_option`: `field_0x8` and `field_0x10`, nothing
 /// at 0.
-fn headless(name: &str) -> Rc<Datatype> {
-    let mut t = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+fn headless(name: &str) -> TypeRoot {
+    let mut t = Datatype::new_with_align(0x18, 8, type_metatype::TYPE_STRUCT);
     t.name = name.to_string();
     let field = |offset: int4| crate::dtype::TypeField {
         ident: offset,
         offset,
         name: format!("field_0x{offset:x}"),
-        field_type: long8(),
+        field_type: long8().id(),
     };
     t.kind = DatatypeKind::Struct { field: vec![field(8), field(0x10)], bitfield: Vec::new() };
-    Rc::new(t)
+    intern_inferred(t)
 }
 
 /// A libc shell as `libctypes` interns one without `glibc` layouts: a name, a
 /// size, and no fields.
-fn shell(name: &str) -> Rc<Datatype> {
+fn shell(name: &str) -> TypeRoot {
     let mut t = Datatype::new(0xd8, type_metatype::TYPE_STRUCT);
     t.name = name.to_string();
     t.flags |= flags::type_incomplete;
-    Rc::new(t)
+    t.kind = DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
+    intern(t)
 }
 
-fn char1() -> Rc<Datatype> {
+fn char1() -> TypeRoot {
     let mut t = Datatype::new(1, type_metatype::TYPE_INT);
     t.flags |= flags::chartype;
-    Rc::new(t)
+    intern(t)
 }
 
-fn voidt() -> Rc<Datatype> {
-    Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))
+fn voidt() -> TypeRoot {
+    intern(Datatype::new(0, type_metatype::TYPE_VOID))
 }
 
-fn long8() -> Rc<Datatype> {
-    Rc::new(Datatype::new(8, type_metatype::TYPE_INT))
+fn long8() -> TypeRoot {
+    intern(Datatype::new(8, type_metatype::TYPE_INT))
 }
 
-fn typed(space: &Rc<AddrSpace>, off: uintb, ct: &Rc<Datatype>) -> Typed {
-    Typed { addr: at(space, off), size: 8, ct: Rc::clone(ct), frame: false }
+fn typed(space: &Rc<AddrSpace>, off: uintb, ct: &TypeRoot) -> Typed {
+    Typed { addr: at(space, off), size: 8, ct: ct.clone(), frame: false }
 }
 
 const CALLEE: (int4, uintb) = (1, 0x5c70);
 
 /// A ledger holding one callee with a `void *` parameter in `rdi` and one call
 /// from each caller, each passing `passed[i]` there.
-fn ledger(passed: &[(uintb, Rc<Datatype>)]) -> Ledger {
+fn ledger(passed: &[(uintb, TypeRoot)]) -> Ledger {
     let r = reg();
     let mut l = Ledger::default();
     l.own.insert(CALLEE, vec![typed(&r, 0x38, &ptr_to(voidt()))]);
@@ -143,7 +173,7 @@ fn a_laid_out_record_or_a_character_pointer_is_committed_and_a_shell_is_not() {
 fn only_a_bare_pointer_or_a_word_is_uncommitted() {
     assert!(uncommitted(&ptr_to(voidt()), 8));
     assert!(uncommitted(&long8(), 8));
-    assert!(!uncommitted(&Datatype::new(4, type_metatype::TYPE_INT), 8));
+    assert!(!uncommitted(&intern(Datatype::new(4, type_metatype::TYPE_INT)), 8));
     assert!(!uncommitted(&ptr_to(record("struct_2")), 8));
     assert!(!uncommitted(&ptr_to(char1()), 8));
 }
@@ -151,12 +181,12 @@ fn only_a_bare_pointer_or_a_word_is_uncommitted() {
 #[test]
 fn every_caller_passing_one_record_states_it() {
     let rec = ptr_to(record("struct_2"));
-    let l = ledger(&[(0x6600, Rc::clone(&rec)), (0x6800, Rc::clone(&rec))]);
+    let l = ledger(&[(0x6600, rec.clone()), (0x6800, rec.clone())]);
     let got = decide_ledger(&l, 8, &all_calls(&l));
     assert_eq!(got.len(), 1);
     let stated = &got[0].1;
     let ct = &stated.at(&at(&reg(), 0x38), 8).expect("stated for rdi").ct;
-    assert!(Rc::ptr_eq(ct, &rec));
+    assert_eq!(ct, &rec);
     assert!(stated.at(&at(&reg(), 0x30), 8).is_none());
 }
 
@@ -188,7 +218,7 @@ fn an_escaping_address_states_nothing() {
 #[test]
 fn a_recursive_call_is_not_a_vote() {
     let rec = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone())]);
     let r = reg();
     l.sites.get_mut(&CALLEE).unwrap().push(CallSite {
         caller: CALLEE.1,
@@ -221,7 +251,7 @@ fn a_committed_parameter_is_never_voted_on() {
 #[test]
 fn an_unchanged_statement_is_not_decided_again() {
     let rec = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone())]);
     let first = decide_ledger(&l, 8, &all_calls(&l));
     for (k, st) in first {
         l.stated.insert(k, Rc::new(st));
@@ -232,7 +262,7 @@ fn an_unchanged_statement_is_not_decided_again() {
 #[test]
 fn a_forgotten_function_keeps_no_statement() {
     let rec = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone())]);
     let first = decide_ledger(&l, 8, &all_calls(&l));
     for (k, st) in first {
         l.stated.insert(k, Rc::new(st));
@@ -245,7 +275,7 @@ fn a_forgotten_function_keeps_no_statement() {
 #[test]
 fn a_declined_function_keeps_the_statement_its_kept_body_used() {
     let first = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&first))]);
+    let mut l = ledger(&[(0x6600, first.clone())]);
     let decided = decide_ledger(&l, 8, &all_calls(&l));
     for (k, st) in decided {
         l.stated.insert(k, Rc::new(st));
@@ -257,14 +287,14 @@ fn a_declined_function_keeps_the_statement_its_kept_body_used() {
     l.stated.insert(CALLEE, Rc::new(CallerTypes { inputs: vec![typed(&reg(), 0x38, &second)] }));
     l.decline(CALLEE);
     let kept = l.stated.get(&CALLEE).expect("the statement its body was printed with");
-    assert!(Rc::ptr_eq(&kept.at(&at(&reg(), 0x38), 8).expect("stated").ct, &first));
+    assert_eq!(&kept.at(&at(&reg(), 0x38), 8).expect("stated").ct, &first);
     assert!(decide_ledger(&l, 8, &all_calls(&l)).is_empty());
 }
 
 #[test]
 fn a_declined_function_that_was_never_redone_keeps_no_statement() {
     let rec = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone())]);
     let decided = decide_ledger(&l, 8, &all_calls(&l));
     for (k, st) in decided {
         l.stated.insert(k, Rc::new(st));
@@ -278,7 +308,7 @@ fn a_declined_function_that_was_never_redone_keeps_no_statement() {
 fn a_first_statement_that_repeats_the_callees_record_is_not_made() {
     let rec = ptr_to(lone("struct_7"));
     assert!(uncommitted(&rec, 8) && committed(&rec));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec)), (0x6800, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone()), (0x6800, rec.clone())]);
     let r = reg();
     l.own.insert(CALLEE, vec![typed(&r, 0x38, &rec)]);
     assert!(decide_ledger(&l, 8, &all_calls(&l)).is_empty());
@@ -288,18 +318,18 @@ fn a_first_statement_that_repeats_the_callees_record_is_not_made() {
 fn a_callers_record_replaces_the_callees_lone_record() {
     let mine = ptr_to(lone("struct_7"));
     let theirs = ptr_to(record("struct_9"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&theirs))]);
+    let mut l = ledger(&[(0x6600, theirs.clone())]);
     let r = reg();
     l.own.insert(CALLEE, vec![typed(&r, 0x38, &mine)]);
     let got = decide_ledger(&l, 8, &all_calls(&l));
     assert_eq!(got.len(), 1);
-    assert!(Rc::ptr_eq(&got[0].1.at(&at(&r, 0x38), 8).expect("stated").ct, &theirs));
+    assert_eq!(&got[0].1.at(&at(&r, 0x38), 8).expect("stated").ct, &theirs);
 }
 
 #[test]
 fn a_statement_naming_a_superseded_record_is_forgotten() {
     let rec = ptr_to(record("struct_2"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&rec))]);
+    let mut l = ledger(&[(0x6600, rec.clone())]);
     let first = decide_ledger(&l, 8, &all_calls(&l));
     for (k, st) in first {
         l.stated.insert(k, Rc::new(st));
@@ -318,14 +348,14 @@ fn a_frame_address_from_any_caller_marks_the_statement() {
     let pp = ptr_to(ptr_to(char1()));
     let r = reg();
     for (frames, marked) in [([false, false], false), ([false, true], true)] {
-        let mut l = ledger(&[(0x6600, Rc::clone(&pp)), (0x6800, Rc::clone(&pp))]);
+        let mut l = ledger(&[(0x6600, pp.clone()), (0x6800, pp.clone())]);
         for (site, frame) in l.sites.get_mut(&CALLEE).unwrap().iter_mut().zip(frames) {
             site.args[0].as_mut().unwrap().frame = frame;
         }
         let got = decide_ledger(&l, 8, &all_calls(&l));
         assert_eq!(got.len(), 1);
         let t = got[0].1.at(&at(&r, 0x38), 8).expect("stated for rdi");
-        assert!(Rc::ptr_eq(&t.ct, &pp));
+        assert_eq!(&t.ct, &pp);
         assert_eq!(t.frame, marked);
     }
 }
@@ -339,7 +369,7 @@ fn a_frame_address_from_any_caller_marks_the_statement() {
 fn a_callers_argument_vector_replaces_a_headless_record_only_under_the_rule() {
     let mine = ptr_to(headless("struct_19"));
     let argv = ptr_to(ptr_to(char1()));
-    let mut l = ledger(&[(0x6600, Rc::clone(&argv))]);
+    let mut l = ledger(&[(0x6600, argv.clone())]);
     let r = reg();
     l.own.insert(CALLEE, vec![typed(&r, 0x38, &mine)]);
     assert!(!uncommitted(&mine, 8) && uncommitted_under(&mine, 8, true));
@@ -347,7 +377,7 @@ fn a_callers_argument_vector_replaces_a_headless_record_only_under_the_rule() {
     assert!(decide_ledger_under(&l, 8, false, &all_calls(&l)).is_empty());
     let got = decide_ledger_under(&l, 8, true, &all_calls(&l));
     assert_eq!(got.len(), 1);
-    assert!(Rc::ptr_eq(&got[0].1.at(&at(&r, 0x38), 8).expect("stated for rsi's slot").ct, &argv));
+    assert_eq!(&got[0].1.at(&at(&r, 0x38), 8).expect("stated for rsi's slot").ct, &argv);
 
     let rec = ptr_to(record("struct_2"));
     assert!(!uncommitted_under(&rec, 8, true));
@@ -361,7 +391,7 @@ fn a_callers_argument_vector_replaces_a_headless_record_only_under_the_rule() {
 #[test]
 fn a_callers_synthesized_record_does_not_replace_a_headless_record() {
     let theirs = ptr_to(headless("struct_20"));
-    let mut l = ledger(&[(0x6600, Rc::clone(&theirs))]);
+    let mut l = ledger(&[(0x6600, theirs.clone())]);
     let r = reg();
     assert_eq!(decide_ledger_under(&l, 8, true, &all_calls(&l)).len(), 1);
     l.own.insert(CALLEE, vec![typed(&r, 0x38, &ptr_to(headless("struct_19")))]);

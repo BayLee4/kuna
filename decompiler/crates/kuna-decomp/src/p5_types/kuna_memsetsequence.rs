@@ -71,15 +71,13 @@
 // merged `constseq` base carries for the same reason.
 #![allow(dead_code)]
 
-use std::rc::Rc;
-
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::constseq::{ArraySequence, StringSequence, WriteNode};
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 use crate::funcdata::Funcdata;
 use crate::context::OpId;
 
@@ -112,7 +110,7 @@ impl MemsetSequence {
     /// current port the live driver supplies the collected `move_ops` directly
     /// via [`MemsetSequence::from_collected`] and this constructor leaves the run
     /// empty.  The C++ control flow is preserved for restoration.
-    pub fn new(char_type: Rc<Datatype>, data: &Funcdata) -> MemsetSequence {
+    pub fn new(char_type: TypeRoot, data: &Funcdata) -> MemsetSequence {
         let mut seq = MemsetSequence {
             base: ArraySequence::new(char_type),
             fill_value: 0,
@@ -140,7 +138,7 @@ impl MemsetSequence {
     /// `pub(crate)`: [`WriteNode`] is the constseq base's `pub(crate)` type, so
     /// this seam bridge is in-crate (the live driver and tests build it).
     pub(crate) fn from_collected(
-        char_type: Rc<Datatype>,
+        char_type: TypeRoot,
         move_ops: Vec<WriteNode>,
         data: &Funcdata,
     ) -> MemsetSequence {
@@ -245,11 +243,8 @@ impl Rule for RuleMemsetCopy {
         vec![OpCode::CPUI_COPY]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleMemsetCopy { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleMemsetCopy { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleMemsetCopy::applyOp` (`kuna_memsetsequence.cc:188`) — gate +
@@ -269,9 +264,8 @@ impl Rule for RuleMemsetCopy {
             Some(v) => v,
             None => return 0,
         };
-        let ct = Rc::clone(
-            data.vbank().get(outvn).expect("RuleMemsetCopy: stale outvn").get_type_def_facing(),
-        );
+        let ct =
+            data.vbank().get(outvn).expect("RuleMemsetCopy: stale outvn").get_type_def_facing().clone();
         if !ct.is_char_print() {
             return 0;
         }
@@ -365,6 +359,7 @@ pub fn parse_memset_recover_form(p1: &str) -> KunaResult<(MemsetRecoverForm, Str
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         ctor: || Box::new(RuleMemsetCopy::with_group(true, "analysis")),
     }]
 }

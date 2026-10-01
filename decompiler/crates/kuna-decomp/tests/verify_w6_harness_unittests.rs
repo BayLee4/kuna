@@ -18,11 +18,10 @@
 //!     ordering (values the two ported TESTs do not cover).
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::address::calc_mask;
 use kuna_base::types::{int4, uintb, Wrap};
-use kuna_decomp::dtype::{flags, type_metatype, Datatype, DatatypeKind};
+use kuna_decomp::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::rangeutil::CircleRange;
 
 // ---------------------------------------------------------------------------
@@ -259,7 +258,7 @@ fn w6_harness_unittests_multiset_ops() {
 // make_enum + Datatype::get_matches adversarial coverage.
 // ---------------------------------------------------------------------------
 
-fn make_enum(size: i32, entries: &[(u64, &str)]) -> Rc<Datatype> {
+fn make_enum(size: i32, entries: &[(u64, &str)]) -> TypeRoot {
     let mut dt = Datatype::new_with_align(size, size, type_metatype::TYPE_INT);
     dt.flags |= flags::enumtype;
     let mut namemap: BTreeMap<u64, String> = BTreeMap::new();
@@ -267,7 +266,7 @@ fn make_enum(size: i32, entries: &[(u64, &str)]) -> Rc<Datatype> {
         namemap.insert(*v, (*n).to_string());
     }
     dt.kind = DatatypeKind::Enum { namemap };
-    Rc::new(dt)
+    TypeFactoryImpl::new().intern(dt).unwrap()
 }
 
 #[test]

@@ -153,12 +153,15 @@ fn append_size_matches_cpp() {
 
 #[test]
 fn datatype_userop_pushes_only_nonnull_inputs() {
-    let t = Rc::new(crate::dtype::Datatype::new(4, crate::dtype::type_metatype::TYPE_INT));
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let t = types.intern(crate::dtype::Datatype::new(4, crate::dtype::type_metatype::TYPE_INT)).unwrap();
     let op = UserPcodeOp::new_datatype(
         b"builtin_memcpy",
         BUILTIN_MEMCPY as int4,
-        Some(Rc::clone(&t)),
-        &[Some(Rc::clone(&t)), None, Some(Rc::clone(&t))],
+        Some(t.clone()),
+        &[Some(t.clone()), None, Some(t)],
     );
     match &op.kind {
         UserOpKind::Datatype(d) => {

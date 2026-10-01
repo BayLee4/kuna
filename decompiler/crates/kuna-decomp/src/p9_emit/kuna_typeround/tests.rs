@@ -177,10 +177,12 @@ fn a_definition_votes_but_never_vetoes() {
 
 #[test]
 fn only_a_sole_named_declaration_keeps_its_flip() {
-    let int4 = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
     let mut plan = SignPlan::default();
     for id in 1..=4u32 {
-        plan.decls.insert(HighVariableId(id), Rc::clone(&int4));
+        plan.decls.insert(HighVariableId(id), int4.clone());
     }
     // v1 is declared once; v2 is declared by two highs (a group about to collapse
     // onto one line); high 4 never reaches the candidate list at all (a signature

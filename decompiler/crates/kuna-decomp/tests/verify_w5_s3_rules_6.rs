@@ -32,7 +32,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_6::{RuleDivOpt, RulePtrsubUndo, RuleSubNormal};
 use kuna_decomp::action::Rule;
@@ -64,7 +64,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -79,8 +86,8 @@ fn mk_block(fd: &mut Funcdata) -> BlockId {
     fd.bblocks_mut().new_block_basic(root)
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -101,7 +108,7 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();

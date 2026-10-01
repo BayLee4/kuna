@@ -29,7 +29,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::action::{Action, ActionContext};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
 
@@ -54,7 +54,12 @@ fn build_manager(big: bool) -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager(false);
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -64,8 +69,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
@@ -77,7 +83,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.vbank_mut().create(size, Address::new(r, off), unk(size))
+    let datatype = unk(fd, size);
+    fd.vbank_mut().create(size, Address::new(r, off), datatype)
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {

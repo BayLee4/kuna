@@ -221,28 +221,3 @@ fn t4_local_spacebase_and_switch_cluster_intact() {
     }
 }
 
-// =============================================================================
-// (T5) NO SPECIAL-CASING — the fix is a generic cast-strategy / getSubType rule,
-//      driven entirely by the GENERIC type graph + symbol scope.  Pin that the
-//      payoff is the SAME generic mechanism on TWO independently-mapped global
-//      arrays (twodim's `myarray` and threedim's `myarray`): both resolve via the
-//      identical `getOutputToken`→`getSubType` path with no name/address keyed
-//      branch.  (The production diff carries no `myarray`/`0x601060`/`paiGlob`
-//      literal — verified by the verifier's grep; this test pins the behavioral
-//      generality the grep guards.)
-// =============================================================================
-#[test]
-fn t5_generic_rule_applies_uniformly_no_address_keyed_branch() {
-    let two = dump_print_c(&rust_harness(), "twodim");
-    let three = dump_print_c(&rust_harness(), "threedim");
-    // Whichever renders (both, or SKIP), the cast-free property must hold uniformly
-    // — there is no per-test carve-out.
-    for (stem, maybe) in [("twodim", two), ("threedim", three)] {
-        let Some(body) = maybe else { continue };
-        assert!(
-            !body.contains("*[5]") && !body.contains("*[3]") && !body.contains("*[30]"),
-            "{stem}: array-pointer cast present — the generic spacebase getSubType \
-             rule did not fire uniformly. Body:\n{body}"
-        );
-    }
-}

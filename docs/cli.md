@@ -787,9 +787,15 @@ choice in a top-level `"language"` key. The same recovered function is rendered
 through a different profile — types, structuring and analysis are identical —
 producing `unsafe fn n(mut a0: i64) -> u32`, `let mut v: T;` declarations, Rust
 primitive spelling, `x as T` casts, `loop`/`while c {}`, and `match v { A | B =>
-{ … } _ => {} }`. The contract is `syn::parse_file` validity, not `rustc`
-compilation: the output calls functions that have no definition and does no type
-checking. Constructs Rust cannot express — an unstructured `goto` the structurer
+{ … } _ => {} }`. Rust output has a broad `syn::parse_file` syntax gate, not a
+whole-program compilation guarantee: external definitions and recovered types
+can still be incomplete. Supported expressions must preserve behavior, not only
+parse. Integer add/subtract/multiply use width-preserving wrapping operations;
+raw-pointer offsets must preserve the p-code byte stride and target width.
+Recovered callback pointers can remain opaque (`*mut *const ()`), which cannot
+be called as Rust functions; callable ABI, parameter and result types must be
+known before a native function-pointer spelling is justified.
+Constructs Rust cannot express — an unstructured `goto` the structurer
 could not remove, a C switch fall-through — render as a comment plus a diverging
 `panic!("kuna: …")` so a lossy site is never mistaken for a translation. An
 emitted `goto` marker is also **reported**: one `note:` line on stderr naming the
@@ -799,8 +805,10 @@ body either side of the marker is a translation, so this is a fidelity warning,
 not a failed run. `--language c` spells the jump as a real `goto`; a P8
 structuring option (`kuna catalog`) can remove it instead. `--language` also works on
 `decompile-all`; `decompile-project` is C-only -- it never auto-selects, and errors on an
-explicit non-C language -- and the Ghidra front-end pins its markup document to
-C. The browser decompiler carries the same three choices in its **Language**
+explicit non-C language. The Ghidra front-end supports the existing C and Rust
+grammars through packed token markup; Java's Clang token model does not imply a
+C-only language policy. This transport support does not remove Rust's semantic
+limitations. The browser decompiler carries the same three choices in its **Language**
 control. See `docs/spec/09-emission.md` §9.6.
 Omitting `--mode` selects `auto`: files below 500 KiB use `aggressive`, files
 from 500 KiB up to 2 MiB use `reliable`, and files at least 2 MiB use `fast`.
@@ -953,8 +961,10 @@ to `decompile` (text and JSON), `decompile-all`, `functions`, and
 `strings` require object metadata. A headerless file used without `--raw-image`
 reports the required raw-image command shape, including when its first byte is
 `<`; only a parsed document containing `<binaryimage>` is treated as XML. Quoted
-console filenames preserve paths containing whitespace; the interactive spelling
-is `load raw <target> <base> <entry[,entry...]> <filename>`.
+console filenames preserve paths containing whitespace. The text CLI resolves
+the input to its canonical path before quoting it, so a symlink selects the
+same image without preserving the alias's spelling in the console script.
+The interactive spelling is `load raw <target> <base> <entry[,entry...]> <filename>`.
 
 **Failure contract (DIV-45).** A function whose decompile pipeline aborts is
 *loud*:
@@ -1291,6 +1301,36 @@ translation; it is `0` on every C render, and a non-zero one is also spoken as a
 `note:` on stderr. It does not change the run's verdict — a record with a
 `null` `error` and a non-zero `unstructured_gotos` is usable output with named
 lossy sites, which is what makes it worth filtering or re-running on.
+
+When callable transport is needed, a function record can also carry
+`callable_artifacts`, an array of `{key,declaration,required,definition}` records.
+`key` is the opaque stable target/family identity, including the entry code-space,
+physical input/output layout and logical type family; consumers join by the full
+key, never by declaration text or a function name. `declaration` is the C forward
+declaration for the emitted callable spelling. `required` is a boolean:
+`true` means this body requires that family to be published. `definition` is
+`null` for a request only, `{kind:"wrapper",code:"<C definition>"}` for a wrapper,
+or `{kind:"existing_target",space:<numeric space index>,byte_address:"0x<hex>"}`
+for a validated target body whose final physical/logical prototype exactly matches
+the requested family. The address is a byte address, encoded as a hex string to
+preserve all 64 bits; it is not a symbol name or a word-addressed offset. There is
+no string-only definition form. An existing-target candidate does not by itself
+prove publication: the referenced body must be successfully included in the export.
+Missing or incompatible targets remain export failures even when the emitted call
+uses the real target name rather than a wrapper. `callable_export_error`, when
+present, retains the callable-export diagnostic separately from ordinary decompile
+`error`; consumers must not discard it merely because decompiled `code` is present.
+Ordinary native calls can contribute a request-local C ABI preservation premise
+only after their actual argument/result layout and default calling ABI are
+validated and replayed against the same raw call site. Calls without a locked,
+overridden, or retained source input declaration use the settled SSA operands and
+their recovered physical storage, not an empty inferred prototype. An unprinted
+unknown-model placeholder qualifies only through its recorded default-model ABI
+identity and matching layout, effects, and stack adjustment. Source signatures
+and raw machine facts remain unchanged. This premise never replaces a generated
+target body dependency, and unresolved machine flow or effects still refuse
+executable export while retaining diagnostic code.
+
 `line_mappings` maps 1-based
 lines in `code` to sorted, unique machine-instruction VMAs. Variable `line_numbers`
 come from the printer's `varref` tokens; variable `addresses` are the union of the
@@ -1326,6 +1366,17 @@ Per-function `code` matches `kuna decompile ... --option listing on` byte-for-by
 x86-64 (elsewhere, see the injected defaults below), `error` isolates a single failed
 function, and `variables` (params in ABI order + DWARF/stack locals) feed type-recovery
 scoring. `--no-vars` leaves `variables` empty but still emits function line mappings.
+
+Argument records describe source formals, not synthesized execution carriers.
+Their names, types, sizes and dense `arg_index` order remain authentic even when
+the machine reads a wider register or does not use the formal. Thus a packed
+byte parameter can remain `Flags value` of size 1 in `variables` while `code`
+accepts an unsigned physical carrier. A rename/retype edits the source formal
+and rebuilds that execution view; the carrier is not an editable source symbol.
+Source parameters replay through their prototype and explicit parameter maps,
+never through local-symbol snapshots. This keeps unused formals and their
+independent storage edits authoritative without cloning them into ambiguous local
+symbols during a rebuild.
 
 `types` is the layout side of the same record: one object per composite, enum or
 typedef the function's C names, carrying its name, its definition text (the same

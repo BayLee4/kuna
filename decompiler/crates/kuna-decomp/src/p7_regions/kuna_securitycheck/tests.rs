@@ -39,7 +39,12 @@ fn build_fd() -> Funcdata {
         1,
     )))
     .unwrap();
-    let glb = Rc::new(ArchContext::new(m));
+    let mut context = ArchContext::new(m);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()

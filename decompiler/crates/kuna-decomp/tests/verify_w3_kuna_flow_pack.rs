@@ -21,7 +21,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::type_metatype;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::op::pcodeop_flags;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp};
@@ -57,10 +57,6 @@ fn build_fd() -> Funcdata {
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
@@ -84,9 +80,10 @@ fn make_op(fd: &mut Funcdata, opc: OpCode, pc_off: u64, ninputs: int4, start: bo
 
 fn set_const_input(fd: &mut Funcdata, op: OpId, slot: int4, value: uintb) {
     let cspace = const_space(fd);
+    let dtype = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     let vn = fd
         .vbank_mut()
-        .create(4, Address::new(cspace, value), unk_type(4));
+        .create(4, Address::new(cspace, value), dtype);
     fd.obank_mut()
         .get_mut(op)
         .unwrap()
@@ -218,9 +215,10 @@ fn flowpack_v850_only_exact_pc_spellings_excluded() {
     fd.obank_mut()
         .change_opcode(op, TypeOp::new(OpCode::CPUI_CALLIND, 0, "callind"));
     let rspace = ram(&fd);
+    let dtype = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     let vn = fd
         .vbank_mut()
-        .create(4, Address::new(rspace, 0x10), unk_type(4));
+        .create(4, Address::new(rspace, 0x10), dtype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);
 
     // "PC" and "pc" excluded ...

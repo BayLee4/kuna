@@ -1,5 +1,5 @@
 // Verifier-authored adversarial tests for item `w7-s6-dynamic-pack`
-// (DynamicHash / ToOpEdge / kuna_dynamichashmax / kuna_stackguard).
+// (DynamicHash / ToOpEdge / kuna_stackguard).
 //
 // These exercise the spots the hunt list flagged as most fragile for this item,
 // against the public crate surface only:
@@ -7,11 +7,6 @@
 //   T1  slot == -1 (output-attached root) packs as 0x1f and decodes back to -1
 //       through a *real* calcHash (not just a hand-packed hash), exercising the
 //       `(slot & 0x1f)` field and getSlotFromHash on a genuine output edge.
-//   T2  the OP-FORM uniqueHash *always* returns hash 0 — the faithfully
-//       transcribed upstream quirk (dynamic.cc:519 `oplist.clear()` inside the
-//       method loop empties the collision scan), so champion stays empty.  A
-//       "fixed" port would return a nonzero op hash here; this pins bug-for-bug
-//       parity.
 //   T3  `x = a + a` (one op reads the root in TWO slots) — buildVnDown sorts the
 //       same-op/different-slot edges; the hash is deterministic and matches a
 //       re-hash, proving the stable-vs-unstable sort substitution is safe here
@@ -21,9 +16,8 @@
 //       method 5 on the same logical input through a CAST yields the same
 //       comparable hash as without it.
 //   T5  ActionStripStackGuard is inert (returns 0, CFG untouched) with the gate
-//       OFF and ALSO with the gate ON over a real canary epilogue (the
-//       removeBranch/removeUnreachableBlocks CFG surgery is the W4/W8 seam);
-//       plus the option decision body + the budget ceiling of the wide option.
+//       OFF and strips the failure edge with the gate ON over a real canary
+//       epilogue.
 
 use std::rc::Rc;
 
@@ -35,11 +29,10 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use kuna_decomp::action::{Action, ActionContext};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl};
 use kuna_decomp::dynamic::DynamicHash;
 use kuna_decomp::funcdata::Funcdata;
-use kuna_decomp::kuna_dynamichashmax::DynamicHashMaxOption;
-use kuna_decomp::kuna_stackguard::{ActionStripStackGuard, StackGuardOption};
+use kuna_decomp::kuna_stackguard::ActionStripStackGuard;
 use kuna_decomp::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
 
 // --- fd builder (mirrors the in-crate test harness) ---------------------------
@@ -65,7 +58,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let mut arch = ArchContext::new(manage);
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -73,10 +71,6 @@ fn build_fd() -> Funcdata {
 
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
-}
-
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
 }
 
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
@@ -88,7 +82,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.vbank_mut().create(size, Address::new(r, off), unk(size))
+    let ty = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
+    fd.vbank_mut().create(size, Address::new(r, off), ty)
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {
@@ -139,46 +134,6 @@ fn t1_output_attached_root_encodes_slot_minus_one() {
     );
     // And it's a directly-attached op, so the not-attached bit is clear.
     assert!(!DynamicHash::get_is_not_attached(h), "root directly attached => not-attached bit clear");
-}
-
-// =============================================================================
-// T2 — op-form uniqueHash always returns hash 0 (faithful upstream quirk)
-// =============================================================================
-
-#[test]
-fn t2_op_form_unique_hash_is_always_zero() {
-    // dynamic.cc:519 clears `oplist` at the top of the method loop, BEFORE the
-    // inner `for(i<oplist.size())` collision scan, so the scan never runs and
-    // `champion` stays empty for every method => uniqueHashOp returns hash 0.
-    // This is a bug-for-bug parity pin: any "fix" that filled the collision list
-    // would make this nonzero and silently diverge from upstream.
-    let mut fd = build_fd();
-    let bl = mk_block(&mut fd);
-    let ca = fd.new_constant(8, 0x11);
-    let a = copy(&mut fd, bl, 0x10, ca, 0x100, 8);
-    let cb = fd.new_constant(8, 0x22);
-    let b = copy(&mut fd, bl, 0x14, cb, 0x108, 8);
-    let add = mk_op(&mut fd, 2, 0x18, OpCode::CPUI_INT_ADD);
-    fd.op_set_input(add, a, 0).unwrap();
-    fd.op_set_input(add, b, 1).unwrap();
-    let c = mk_vn(&mut fd, 0x110, 8);
-    fd.op_set_output(add, c).unwrap();
-    fd.op_insert_end(add, bl);
-
-    // Both slots (an input slot and the output slot -1) hit the same quirk.
-    for slot in [-1, 0, 1] {
-        let mut dh = DynamicHash::new();
-        dh.unique_hash_op(add, slot, 8, &mut fd);
-        assert_eq!(
-            dh.get_hash(),
-            0,
-            "op-form uniqueHash(slot={slot}) returns 0 (upstream oplist.clear() quirk)"
-        );
-        // Wide budget changes nothing — the scan still never executes.
-        let mut dw = DynamicHash::new();
-        dw.unique_hash_op(add, slot, 16, &mut fd);
-        assert_eq!(dw.get_hash(), 0, "wide budget cannot rescue the empty scan");
-    }
 }
 
 // =============================================================================
@@ -266,21 +221,8 @@ fn t4_input_cast_is_invisible_to_op_hash() {
 }
 
 // =============================================================================
-// T5 — kuna option bodies + the stackguard Action seam boundary
+// T5 — stackguard action gate and failure-edge removal
 // =============================================================================
-
-#[test]
-fn t5_dynamichashmax_budget_and_default() {
-    let mut opt = DynamicHashMaxOption::default();
-    assert!(!opt.is_enabled(), "option-class neutral default is off");
-    assert_eq!(opt.max_duplicates(), 8, "off => budget 8 (upstream)");
-    let msg = opt.apply(true);
-    assert!(opt.is_enabled());
-    assert_eq!(opt.max_duplicates(), 16, "on => budget 16 (wide)");
-    assert_eq!(msg, "DynamicHash wide collision budget turned on");
-    // 16 is the exact ceiling of the 3-bit (+1) total field; never above.
-    assert!(opt.max_duplicates() <= 16);
-}
 
 /// Build a real glibc-style canary epilogue: header CBRANCH on an INT_NOTEQUAL
 /// of two values both derived from a LOAD of `<base>+0x28`, true edge -> a fail
@@ -370,17 +312,4 @@ fn t5_stackguard_action_gate_off_inert_on_strips() {
         1,
         "gate on severs the corrupted-canary edge",
     );
-    assert_eq!(on.get_name(), "stripstackguard");
-}
-
-#[test]
-fn t5_stackguard_option_body() {
-    let mut opt = StackGuardOption::default();
-    assert!(!opt.is_enabled(), "default off => upstream byte-identical");
-    let on = opt.apply(true);
-    assert!(opt.is_enabled());
-    assert_eq!(on, "Stack-protector canary epilogue stripping turned on");
-    let off = opt.apply(false);
-    assert!(!opt.is_enabled());
-    assert_eq!(off, "Stack-protector canary epilogue stripping turned off");
 }

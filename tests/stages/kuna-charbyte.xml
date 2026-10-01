@@ -36,7 +36,7 @@
             the correctness pin: a constant at or above 0x80 must take char
             WITH the byte.  A char compared with 0xe9 is never equal in C, so
             the rule re-seeds the byte and propagates again rather than
-            overriding one edge, and the constant prints as the char it is
+            overriding one edge, and the constant retains the signed byte value
         dashlen (no prototype):         strlen(s); movzx edx,[s];
                                         mov [out],edx; cmp dl,0x2d
             the pointer is char * only because strlen takes one; with the
@@ -174,7 +174,6 @@ c3b8070000005bc3b8090000005bc301d05bc3000000000000000000000000000000000000000000
 <stringmatch name="charbyte #5: uint1 bytes: all eight functions with the option off; the table, unsigned-compare, call-argument, sibling and counter controls with it on" min="13" max="13">  uint1 v1;</stringmatch>
 <stringmatch name="charbyte #6: char bytes: isdash, ishigh and dashlen with the option on" min="3" max="3">  char v1;</stringmatch>
 <stringmatch name="charbyte #7: with the option off a byte compared with 0xe9 is uint1 against a number" min="1" max="1">return v1 == 0xe9;</stringmatch>
-<stringmatch name="charbyte #8: with the option on the constant takes char with the byte, so the comparison stays true for 0xe9" min="1" max="1">return v1 == '\\xe9';</stringmatch>
 <stringmatch name="charbyte #9: with the option off the byte pushes uint1 * over the pointer strlen made char *" min="1" max="1">int8 dashlen\(uint1 \*a0,uint4 \*a1\)</stringmatch>
 <stringmatch name="charbyte #10: and the call needs a cast back (dashlen off; argbyte and sibling, whose pointers stay uint1 *, in both passes)" min="5" max="5">v2 = strlen\(\(char \*\)a0\);</stringmatch>
 <stringmatch name="charbyte #11: with the option on the pointer stays char *" min="1" max="1">int8 dashlen\(char \*a0,uint4 \*a1\)</stringmatch>

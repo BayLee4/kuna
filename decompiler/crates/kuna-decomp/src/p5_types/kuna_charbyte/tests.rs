@@ -32,7 +32,7 @@ fn the_zext_vote_outranks_char_in_the_lattice() {
     let f = factory();
     let c = f.get_base(1, type_metatype::TYPE_INT).unwrap();
     let u = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
-    assert_eq!(c.get_name(), "char");
+    assert!(is_char(&c));
     assert!(u.type_order(&c).unwrap() < 0);
     assert!(c.type_order(&u).unwrap() > 0);
 }

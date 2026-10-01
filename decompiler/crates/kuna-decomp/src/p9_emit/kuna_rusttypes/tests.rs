@@ -5,50 +5,61 @@
 //! inversion of the declarator.
 
 use super::*;
-use crate::dtype::DatatypeKind;
+use crate::dtype::{Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeRoot};
 use crate::kuna_lang::OutLang;
 
 fn ctx() -> SpellCtx {
     SpellCtx { lang: OutLang::Rust, ..SpellCtx::OFF }
 }
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, -1, m))
+fn base(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    let mut t = Datatype::new_with_align(size, -1, m);
+    t.kind = match m {
+        type_metatype::TYPE_VOID => DatatypeKind::Void,
+        type_metatype::TYPE_CODE => DatatypeKind::Code { proto: None },
+        _ => DatatypeKind::Base,
+    };
+    types.intern(t).unwrap()
 }
 
-fn named(size: int4, m: type_metatype, nm: &str) -> Rc<Datatype> {
+fn named(types: &TypeFactoryImpl, size: int4, m: type_metatype, nm: &str) -> TypeRoot {
     let mut t = Datatype::new_with_align(size, -1, m);
     t.name = nm.to_string();
     t.display_name = nm.to_string();
-    Rc::new(t)
+    t.id = Datatype::hash_name(nm);
+    if m == type_metatype::TYPE_STRUCT {
+        t.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+    }
+    types.intern(t).unwrap()
 }
 
-fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr_to(types: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
     let mut p = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(p)
+    p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    types.intern(p).unwrap()
 }
 
-fn array_of(arrayof: Rc<Datatype>, n: int4) -> Rc<Datatype> {
+fn array_of(types: &TypeFactoryImpl, arrayof: TypeRoot, n: int4) -> TypeRoot {
     let elt = arrayof.get_size().max(1);
     let mut a = Datatype::new_with_align(elt * n, -1, type_metatype::TYPE_ARRAY);
-    a.kind = DatatypeKind::Array { arrayof, arraysize: n };
-    Rc::new(a)
+    a.kind = DatatypeKind::Array { arrayof: arrayof.id(), arraysize: n };
+    types.intern(a).unwrap()
 }
 
-fn spell(ct: &Rc<Datatype>) -> String {
+fn spell(ct: &TypeRoot) -> String {
     RUST_SPELLER.declarator(&ctx(), ct).0
 }
 
 #[test]
 fn integers_spell_by_width_and_sign() {
+    let types = TypeFactoryImpl::new();
     for (sz, s, u) in [(1, "i8", "u8"), (2, "i16", "u16"), (4, "i32", "u32"), (8, "i64", "u64")] {
-        assert_eq!(spell(&base(sz, type_metatype::TYPE_INT)), s);
-        assert_eq!(spell(&base(sz, type_metatype::TYPE_UINT)), u);
+        assert_eq!(spell(&base(&types, sz, type_metatype::TYPE_INT)), s);
+        assert_eq!(spell(&base(&types, sz, type_metatype::TYPE_UINT)), u);
     }
-    assert_eq!(spell(&base(4, type_metatype::TYPE_FLOAT)), "f32");
-    assert_eq!(spell(&base(8, type_metatype::TYPE_FLOAT)), "f64");
-    assert_eq!(spell(&base(1, type_metatype::TYPE_BOOL)), "bool");
+    assert_eq!(spell(&base(&types, 4, type_metatype::TYPE_FLOAT)), "f32");
+    assert_eq!(spell(&base(&types, 8, type_metatype::TYPE_FLOAT)), "f64");
+    assert_eq!(spell(&base(&types, 1, type_metatype::TYPE_BOOL)), "bool");
 }
 
 /// C spells an un-inferred 3-byte value `undefined3`. Rust has no 3-byte
@@ -56,21 +67,23 @@ fn integers_spell_by_width_and_sign() {
 /// width the value does not have.
 #[test]
 fn widths_rust_cannot_name_become_byte_arrays() {
+    let types = TypeFactoryImpl::new();
     for sz in [3, 5, 6, 7] {
-        assert_eq!(spell(&base(sz, type_metatype::TYPE_UNKNOWN)), format!("[u8; {sz}]"));
+        assert_eq!(spell(&base(&types, sz, type_metatype::TYPE_UNKNOWN)), format!("[u8; {sz}]"));
     }
     // x87 long double and the 16-byte float: no Rust type, so storage-exact.
-    assert_eq!(spell(&base(10, type_metatype::TYPE_FLOAT)), "[u8; 10]");
-    assert_eq!(spell(&base(16, type_metatype::TYPE_FLOAT)), "[u8; 16]");
+    assert_eq!(spell(&base(&types, 10, type_metatype::TYPE_FLOAT)), "[u8; 10]");
+    assert_eq!(spell(&base(&types, 16, type_metatype::TYPE_FLOAT)), "[u8; 16]");
 }
 
 /// Sign is genuinely unknown for an un-inferred value, so unsigned -- the same
 /// judgement the C `realtypes` relabel makes.
 #[test]
 fn unknown_widths_rust_can_name_are_unsigned() {
-    assert_eq!(spell(&base(1, type_metatype::TYPE_UNKNOWN)), "u8");
-    assert_eq!(spell(&base(4, type_metatype::TYPE_UNKNOWN)), "u32");
-    assert_eq!(spell(&base(8, type_metatype::TYPE_UNKNOWN)), "u64");
+    let types = TypeFactoryImpl::new();
+    assert_eq!(spell(&base(&types, 1, type_metatype::TYPE_UNKNOWN)), "u8");
+    assert_eq!(spell(&base(&types, 4, type_metatype::TYPE_UNKNOWN)), "u32");
+    assert_eq!(spell(&base(&types, 8, type_metatype::TYPE_UNKNOWN)), "u64");
 }
 
 /// A Rust `char` is a 4-byte Unicode scalar value with a validity invariant. A
@@ -78,11 +91,13 @@ fn unknown_widths_rust_can_name_are_unsigned() {
 /// recovery cannot support.
 #[test]
 fn text_types_spell_as_unsigned_integers_not_char() {
+    let types = TypeFactoryImpl::new();
     let mut c = Datatype::new_with_align(1, -1, type_metatype::TYPE_INT);
     c.name = "char".to_string();
     c.display_name = "char".to_string();
+    c.id = Datatype::hash_name("char");
     c.flags |= crate::dtype::flags::chartype;
-    let c = Rc::new(c);
+    let c = types.intern(c).unwrap();
     assert!(c.is_char_print());
     assert_eq!(spell(&c), "u8");
 }
@@ -91,45 +106,74 @@ fn text_types_spell_as_unsigned_integers_not_char() {
 /// than C's `(front, back)` pair: C wraps the identifier, Rust prefixes it.
 #[test]
 fn pointers_and_arrays_are_pure_prefixes() {
-    let i32_ = named(4, type_metatype::TYPE_INT, "int4");
-    assert_eq!(spell(&ptr_to(i32_.clone())), "*mut i32");
-    assert_eq!(spell(&array_of(i32_.clone(), 4)), "[i32; 4]");
+    let types = TypeFactoryImpl::new();
+    let i32_ = named(&types, 4, type_metatype::TYPE_INT, "int4");
+    assert_eq!(spell(&ptr_to(&types, i32_.clone())), "*mut i32");
+    assert_eq!(spell(&array_of(&types, i32_.clone(), 4)), "[i32; 4]");
     // C renders this `int4 (*a)[1]`; the parenthesisation is a C declarator
     // artifact with no Rust counterpart.
-    assert_eq!(spell(&ptr_to(array_of(i32_.clone(), 1))), "*mut [i32; 1]");
-    assert_eq!(spell(&array_of(ptr_to(i32_.clone()), 2)), "[*mut i32; 2]");
-    assert_eq!(spell(&ptr_to(ptr_to(i32_))), "*mut *mut i32");
+    assert_eq!(spell(&ptr_to(&types, array_of(&types, i32_.clone(), 1))), "*mut [i32; 1]");
+    assert_eq!(spell(&array_of(&types, ptr_to(&types, i32_.clone()), 2)), "[*mut i32; 2]");
+    assert_eq!(spell(&ptr_to(&types, ptr_to(&types, i32_))), "*mut *mut i32");
     // `back` is always empty, which is the contract a prefix language keeps.
-    let (_, back) = RUST_SPELLER.declarator(&ctx(), &ptr_to(base(4, type_metatype::TYPE_INT)));
+    let (_, back) = RUST_SPELLER.declarator(&ctx(), &ptr_to(&types, base(&types, 4, type_metatype::TYPE_INT)));
     assert!(back.is_empty());
-    let row = ptr_to(array_of(named(4, type_metatype::TYPE_INT, "int4"), 16));
+    let row = ptr_to(&types, array_of(&types, named(&types, 4, type_metatype::TYPE_INT, "int4"), 16));
     let (front, back) = RUST_SPELLER.type_name(&ctx(), &row);
     assert_eq!((front.as_str(), back.as_str()), ("*mut [i32; 16]", ""));
 }
 
 #[test]
+fn nested_type_spans_retain_nominal_leaf_not_pointer_or_array_identity() {
+    let types = TypeFactoryImpl::new();
+    let node = named(&types, 8, type_metatype::TYPE_STRUCT, "Node");
+    let alias = types.get_typedef(&node, "NodeAlias", 0x1234, 0).unwrap();
+    let root = ptr_to(&types, array_of(&types, ptr_to(&types, alias), 2));
+    let (front, back) = RUST_SPELLER.declarator_annotated(&ctx(), &root, true);
+    assert_eq!(front.text, "*mut [*mut NodeAlias; 2]");
+    assert!(back.text.is_empty() && back.spans.is_empty());
+    let leaves: Vec<_> = front.spans.iter().map(|span|
+        (span.start, span.end, &front.text[span.start..span.end], span.id)
+    ).collect();
+    assert_eq!(leaves, vec![(11, 20, "NodeAlias", 0x1234)]);
+    let (plain, _) = RUST_SPELLER.declarator_annotated(&ctx(), &root, false);
+    assert_eq!(plain.text, front.text);
+    assert!(plain.spans.is_empty());
+    front.into_parts();
+
+    // The u8 in a storage-only fallback is not the original three-byte type.
+    let opaque = base(&types, 3, type_metatype::TYPE_UNKNOWN);
+    let (text, _) = RUST_SPELLER.declarator_annotated(&ctx(), &opaque, true);
+    assert_eq!(text.text, "[u8; 3]");
+    assert!(text.spans.is_empty());
+}
+
+#[test]
 fn void_is_the_unit_type() {
-    assert_eq!(spell(&base(0, type_metatype::TYPE_VOID)), "()");
-    assert_eq!(spell(&ptr_to(base(0, type_metatype::TYPE_VOID))), "*mut ()");
+    let types = TypeFactoryImpl::new();
+    assert_eq!(spell(&base(&types, 0, type_metatype::TYPE_VOID)), "()");
+    assert_eq!(spell(&ptr_to(&types, base(&types, 0, type_metatype::TYPE_VOID))), "*mut ()");
 }
 
 /// `code` only reaches the output through a pointer, and the recovered prototype
-/// is not carried down this path -- an `fn()` of the wrong arity would be worse
-/// than an honest opaque pointer.
+/// may not have a supported Rust ABI -- an invented `fn()` would be worse than
+/// an honest opaque pointer.
 #[test]
 fn code_is_an_opaque_pointer() {
-    assert_eq!(spell(&base(1, type_metatype::TYPE_CODE)), "*const ()");
+    let types = TypeFactoryImpl::new();
+    assert_eq!(spell(&base(&types, 1, type_metatype::TYPE_CODE)), "*const ()");
 }
 
 /// A recovered aggregate name is spelled in *type* position, so a generic
 /// argument list survives; only what Rust's type grammar cannot accept collapses.
 #[test]
 fn aggregate_names_are_spelled_as_types() {
-    let s = named(8, type_metatype::TYPE_STRUCT, "std::pair<int,int>");
+    let types = TypeFactoryImpl::new();
+    let s = named(&types, 8, type_metatype::TYPE_STRUCT, "std::pair<int,int>");
     assert_eq!(spell(&s), "std::pair<int,int>");
-    let closure = named(8, type_metatype::TYPE_STRUCT, "{closure#0}");
+    let closure = named(&types, 8, type_metatype::TYPE_STRUCT, "{closure#0}");
     assert_eq!(spell(&closure), "_closure_0_");
-    let leading_digit = named(4, type_metatype::TYPE_STRUCT, "2big");
+    let leading_digit = named(&types, 4, type_metatype::TYPE_STRUCT, "2big");
     assert_eq!(spell(&leading_digit), "_2big");
 }
 
@@ -137,9 +181,10 @@ fn aggregate_names_are_spelled_as_types() {
 /// terminate rather than recurse to the stack limit.
 #[test]
 fn deep_pointer_chains_terminate() {
-    let mut t = named(4, type_metatype::TYPE_INT, "int4");
+    let types = TypeFactoryImpl::new();
+    let mut t = named(&types, 4, type_metatype::TYPE_INT, "int4");
     for _ in 0..40 {
-        t = ptr_to(t);
+        t = ptr_to(&types, t);
     }
     let out = spell(&t);
     assert!(out.contains("*mut"));
@@ -151,9 +196,10 @@ fn deep_pointer_chains_terminate() {
 /// Rust has no such vocabulary to preserve.
 #[test]
 fn rust_ignores_the_realtypes_gates() {
+    let types = TypeFactoryImpl::new();
     let off = SpellCtx { lang: OutLang::Rust, ..SpellCtx::OFF };
     let on = SpellCtx { lang: OutLang::Rust, enabled: true, ctypes: true, ..SpellCtx::OFF };
-    let t = base(4, type_metatype::TYPE_UNKNOWN);
+    let t = base(&types, 4, type_metatype::TYPE_UNKNOWN);
     assert_eq!(
         RUST_SPELLER.declarator(&off, &t).0,
         RUST_SPELLER.declarator(&on, &t).0

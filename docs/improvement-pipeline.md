@@ -228,8 +228,8 @@ opt-in:
 
 | Ablation (option ON) | Speed (`timeit`) | Ship as |
 |---|---|---|
-| 0/675 assertions change | within budget (≤5%) | **default-ON**: keep the flipped `default =`, and say "On by default" plus what that default now does in the row's `use_when` prose |
-| 0/675 assertions change | over budget / unmeasured | default-OFF opt-in, `speed_forced_off: true` |
+| 0/674 assertions change | within budget (≤5%) | **default-ON**: keep the flipped `default =`, and say "On by default" plus what that default now does in the row's `use_when` prose |
+| 0/674 assertions change | over budget / unmeasured | default-OFF opt-in, `speed_forced_off: true` |
 | >0 assertions change | — | default-OFF opt-in |
 
 **Never re-pin `docs/baseline.json`.** The speed gate can only demote default-ON to
@@ -241,7 +241,7 @@ python3 -m scripts.pipeline.timeit --record docs/features/<slug>/record.json \
 ```
 
 **The four gates, all green, before commit**:
-`make test` (**PARITY OK** 675/675) · `make test-stages` (**PARITY OK**) ·
+`make test` (**PARITY OK** 674/674) · `make test-stages` (**PARITY OK**) ·
 `make rust-test` · `make check-spec`. Plus `kuna catalog --check` → `catalog OK`.
 
 **The PR** carries the per-feature bundle `docs/features/<slug>/`:

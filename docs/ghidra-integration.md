@@ -28,9 +28,46 @@ see `docs/history.md`).
 
 **kuna reimplements exactly that glue group**: a new **`kuna-ghidra`** crate producing a
 binary that speaks the full decompiler-process protocol, backed by kuna's engine. The
-stock Ghidra GUI and its entire Java side stay byte-for-byte untouched; the only
-Ghidra-side artifact is a tiny extension (`integrations/ghidra/KunaDecompiler/`, §7)
-that points the spawn at our binary.
+stock Ghidra GUI, analyzers, scripts and `DecompInterface` remain the consumers.
+The extension (`integrations/ghidra/KunaDecompiler/`, §7) points the spawn at our
+binary and packages narrow Java producer and consumer deltas built against the target Ghidra
+release. Its installer creates a separate complete Ghidra distribution, loading the
+producer through the supported `Ghidra/patch` bootstrap path; the original installation
+is never modified. This avoids both a forked callback chain and missing authoritative
+metadata in otherwise ordinary consumers.
+
+Java lowers an explicit `FlowOverride.CALL_RETURN` before returning instruction
+p-code. The maintained `PcodeEmit`/`PcodeEmitPacked` delta marks only its synthesized
+RETURN with unsigned per-op attribute `kuna_callreturn` (ID 4002), naming the exact
+paired CALL/CALLIND ordinal in the same instruction. Ordinary RETURNs and authored
+trap CALL/RETURN-zero sequences are unmarked. Kuna validates and consumes that origin
+without applying the override twice. An unextended producer supplies no such evidence;
+compilable C or operation adjacency cannot waive a callable-transport refusal. The
+stock native decoder skips the optional attribute. The packaged producer is bound to
+the exact application properties, SoftwareModeling and Decompiler JARs and source
+archives, and the callable-support protocol revision; rebuild against another
+distribution rather than using an extension-version override.
+
+The second maintained delta, `producer/callable-support.patch`, carries source-type
+identity from `PcodeDataTypeManager` and decodes the native `callable_support` sibling
+into an immutable value exposed by `DecompileResults.getCallableSupport()` and
+`DecompiledFunction.getCallableSupport()`. Genuine stock absence is `Optional.empty()`;
+explicit refusal is not absence. Malformed or duplicate records fail decoding and
+clear the result rather than falling back to a legacy fragment. Existing `getC()`
+and `getSignature()` remain the current function fragment with linked markup intact;
+they do not silently append wrappers or claim a complete compilation unit.
+
+The ordinary `CppExporter` collects all chunks into one invocation-local publication.
+It validates exact declarations, actual body receipts, provider dependencies, and
+source ownership before publishing staged C/header files. Native-owned type
+definitions suppress only matching source identities in `DataTypeWriter`, not
+same-named or structurally equivalent host types; unrelated Program definitions
+remain available. Source declarations and editing semantics are retained. Failed
+decompilation, refusal, malformed support, missing providers, stale source identity,
+or cancellation fails the export without replacing its existing destinations.
+Successful stock exports retain the legacy path, but their fragments cannot satisfy
+native callable-provider dependencies. The two final file moves are not an atomic
+filesystem transaction.
 
 Rejected alternatives, for the record:
 
@@ -45,6 +82,30 @@ Rejected alternatives, for the record:
   `kuna decompile-all` wrapper cannot answer; and the response is not C text but a
   typed dual-document (`HighFunction` + token markup with cross-referenced ids, §6)
   over live program state. There is no shim-shaped solution.
+
+### Shared engine, frontend adapters
+
+CLI declarations and Ghidra signatures/overrides are producers of the same core
+feature. Type completion, model resolution, ABI assignment, callsite precedence
+and rendering authority belong in the shared engine. Adapters translate syntax,
+wire records and lifecycle; they must not implement competing analysis semantics.
+Host storage and independent locks remain authoritative facts, not differences
+to erase in pursuit of byte-identical output or identical interfaces.
+
+Intentional Kuna defaults should remain reasonably aligned across frontends,
+while explicit supported choices must work. Java's sparse option packet means
+"omitted = Java default", not "unchanged" or "Kuna default". The adapter
+overlays the known sparse-baseline differences through
+shared setters: NULL and inplace printing off, function braces on the next line.
+It retains Kuna's engine presets and naming policy instead of replacing all
+core defaults with stock defaults. Omission cannot distinguish an untouched
+preference from a deliberately selected Java default.
+
+The development host does not select supported target architectures. Keep
+Linux and other target/compiler coverage when developing on macOS/AppleSilicon:
+decoding and ABI-model checks are cross-target. Gate only target-code execution
+that actually needs a compatible host or emulator, and report unexecuted ABI
+witnesses rather than dropping those targets.
 
 ## 2. Architecture and session lifecycle
 
@@ -117,7 +178,7 @@ after the name is the decimal archid in a string burst, *except* `registerProgra
 | `registerProgram` | *(no archid)* pspec, cspec, tspec, coretypes — 4 XML string bursts (`ghidra_process.cc:162-173`) | new archid, ASCII decimal | **yes** |
 | `deregisterProgram` | — | `1`/`0` decimal; then process exit | no |
 | `flushNative` | — | `0` decimal | no |
-| `decompileAt` | packed `<addr>` of the entry | packed `<doc>` (§6); empty 14/15 if incomplete | **yes** |
+| `decompileAt` | packed `<addr>` of the entry | packed `<doc>` (§6); no document frame on analysis failure | **yes** |
 | `structureGraph` | packed block graph | packed restructured block graph | **yes** |
 | `setAction` | actionstring, printstring (2 string bursts) | `t`/`f` | no |
 | `setOptions` | packed `<optionslist>` | `t`/`f` | no |
@@ -134,6 +195,14 @@ The "queries legal" column is a **hard constraint**: Java nulls its callback
 decoder/encoder for all other commands (`DecompileProcess.java:512-513,536-537,618-619,
 657-658,686-687` vs `:472-473,571-572`) — a query issued during `setOptions` desyncs
 the protocol.
+
+Analysis errors propagate through `GhidraCommand::doit` before the result's 14/15
+frame opens, matching stock `DecompileAt::rawAction`. Low-level errors use the
+16/17 native-message frame and the normal response closer; Java exceptions use
+the existing exception frame instead. An opened-but-empty document is not equivalent
+to an absent document: Java attempts to decode it and replaces the native diagnostic
+with a packed-decoder error. Stock's separate, nonthrowing `!isProcComplete` path
+can emit an empty frame; it is not the contract for an analysis exception.
 
 **The 19 callback queries** (native → Java; element ids `ghidra_arch.cc:30-48` =
 `ElementId.java:371-427`; framing: `4, 14 <packed command element> 15, 5, flush`, then
@@ -237,13 +306,39 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   `Architecture` at registerProgram and threaded into every per-function `ArchContext`
   by `build_arch_handle`; every global-scope read (`query_global_properties`,
   `name_for_global_varnode*`, `query_container_global`, `query_callee_proto`,
-  `query_function`, `callee_proto_pieces`) and the flow environment's callee
+  `query_function`) and the flow environment's callee
   name/no-return queries resolve through `effective_global_query`/`function_at` —
   query-through with `<hole>` negative caching, decoded-entry positive caching,
   readonly/volatile property paints over a `lockDefaultProperties` snapshot, and
   namespace paths via getNamespacePath.  The wire is reached through the
   `RemoteProviderFetch` trait (implemented in `kuna-ghidra/src/provider.rs` over the
   shared client); the standalone path installs nothing and stays byte-identical.
+  Function-specific prototypes live in entry-address-keyed `RemoteFunctionFacts`,
+  not structurally interned callable types. Current functions, callees and resolved
+  function-backed slots copy exact committed storage and independent locks from
+  these facts; ordinary local symbols remain a separate channel. The same facts
+  preserve the host's inline designation and supply its body to the inline path.
+  A wider physical execution input does not replace the host formal: the encoded
+  prototype and category-zero symbols retain its original name, type and storage.
+  A live source projection may be a `HighParam`; its raw execution carrier is
+  not, and carrier tokens carry neither varnode nor operation edit references.
+  Printed C, including Java's `getC()`, uses the physical execution header rather
+  than a source-only header over a body that needs additional bits. Rename,
+  retype and flush/reopen rebuild the derived view from the host facts.
+  This source edit authority is unchanged by generated callback execution views;
+  those views and their export dependencies are derived, not new host declarations.
+  Named source callback types replaced in the execution header remain navigable
+  through explicit source-type comments. Their type tokens retain the original
+  host datatype IDs without assigning those IDs or editable variable references
+  to execution carriers.
+  Host C documents include required callable declarations and, where a validated
+  generated adapter is needed, the target-owned definition. These support
+  declarations use the active namespace spelling and the same queued layout as
+  the function; line width is a soft margin at indivisible identifiers, not
+  permission to emit an entire support definition as one token.
+  Successful compilation of the rendered body does not waive a callable-transport
+  refusal: the diagnostic still marks unfulfilled execution/export obligations.
+  Host consumers check this separately from actual C behavior.
 - **`TypeFactoryGhidra`**: the wire `<coretypes>` decode replaces the default core
   types at registerProgram (so kuna's type ids match the host's), and
   `TypeFactoryImpl::find_by_id_or_remote` fetches unknown types with getDataType
@@ -267,6 +362,18 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   registerProgram baseline (`Architecture::reset_wire_defaults` + the DIV-77
   ghidra-mode preset layer) and then applies the deltas — a previously-sent
   non-default option reverts when the user sets it back to default.
+  This also discards derived action trees and custom groups and selects
+  `decompile`; subsequent `setAction` requests select the executable root,
+  not just the response envelope. Java replays its cached style after options
+  on process initialization, not after every options packet. Program facts
+  and immutable host prototypes are not option state and are retained.
+- **Action selection and toggles** share `ActionDatabase` with CLI/console.
+  Group edits invalidate affected derived roots; temporary jumptable/named
+  drives restore the prior root on success, error, or unwind. The seeded host
+  drive executes the selected root; the console's full-decompile boundary
+  explicitly selects `decompile`.
+  With bitfield simplification disabled, retained load/shift/mask operations
+  can render an invalid aggregate-to-integer C cast.
 - **The `Kuna v…` banner**: ghidra-mode prints a one-line plate comment
   (`/* Kuna v<MAJOR.MINOR> */`, the release `KUNA_VERSION` bake) at the top of
   every decompiled function so it is visible in the GUI that kuna is the active
@@ -276,6 +383,155 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   (`Architecture::flush_remote_caches`): the lazy symbol cache + property rollback
   + the per-address tracked-register cache, the non-core types, the comment
   database, the decoded strings.
+
+### Caller-owned callsite overrides
+
+Function answers retain `<override><protooverride>` signatures by callpoint,
+inside that caller's facts. They are materialized once as complete prototypes
+and installed before flow; neither a global callee prototype nor a shared
+function-pointer datatype is rewritten. Clearing/restarting analysis preserves
+the caller's live override store, while a host edit followed by `flushNative`
+loads a fresh seed.
+
+The internal-list `first` value controls ABI assignment, not open-ended arity.
+A closed three-argument `printf`/`scanf` override remains three arguments even
+when `first=1`. The completed physical boundary is retained separately so a
+CALLIND's C callable view can use the fixed prefix plus ellipsis without
+reopening argument recovery. Variadic argument casts preserve the supplied
+types and floating literal bits.
+
+Supplied signatures remain visible in callable conversions, even in the
+legacy `code *` vocabulary. Only genuinely inferred, uncommitted interfaces
+may use generic callable spelling. The shared rendering policy is documented in
+[the emission specification](spec/09-emission.md).
+
+### Shared datatype graph and callable declarations
+
+CLI declarations and host `TYPE_CODE` decoding use the same production datatype
+graph. `substrate/dtype_graph.rs` owns generation-local `TypeId` edges;
+`TypeRoot` retains the generation for scopes, varnodes and frontend results.
+Pointers, arrays, aliases, fields, bitfields, partial/relative types and logical
+callable signatures contain IDs, not owning links back into the generation.
+Core roots retain only the target's core store. Retaining a non-core root retains
+its whole generation; dropping the last owner reclaims recursive cycles.
+
+`root.read()` borrows a `ReadView`; field and signature references cannot escape
+that guard. Readers do not clone datatype bodies. Classifiers release guards
+before interning effective pointers or other ABI-generated types.
+`dtype_factory.rs` reads alias/terminal headers and reserves their identities
+before descending into recursive bodies; `dtype_ops.rs` implements guarded
+traversal and comparison. The raw host token is immutable and separate from both
+the graph ID and the fixed/sized instance key. Callback-derived variable-length
+metadata and later alias completion therefore cannot alter the ID echoed to
+Java. Graph IDs are never serialized as host datatype or field identities.
+
+Publication stages only the reverse-dependency closure affected by a definition.
+Layout and derived pointer/union/bitfield metadata are distinct from immutable
+shape keys. A provisional nominal body may remain `Pending` and be corrected
+explicitly; finalized definitions cannot be replaced. An array's element/count
+shape can be interned before element layout completes, allowing pointer-broken
+recursive arrays. Failed dependencies produce errors, not indefinite waits.
+An unresolved callable slot may wait on a live unbound alias without suppressing
+validation of the other slots. Later completion revalidates affected callables;
+logical completion never substitutes for ready by-value ABI layout.
+Public lookup hides failed declarations while an explicit retry can reuse their
+reservation. Inferred refinement creates a new revision; retired revisions no
+longer accept corrections or dependency-driven updates. Variant metadata is
+owned by its type generation, including payload IDs.
+
+`LogicalCallable` retains declared result/input IDs, variadic and closed-arity
+facts, boundary and semantic flags. Its `ModelBinding` captures the actual
+architecture context and model at declaration time. Later default-model changes
+affect new declarations only. CLI nested callback conventions and ellipses are
+retained; explicit CLI `(void)` remains distinct from an intentionally open
+empty host FunctionDefinition.
+
+`fspec::materialize_callable` uses the real graph in the existing ABI classifiers.
+Required by-value layouts must be ready; pointer layout does not wait for a
+pointee's body. Successful ordinary declarations are cached as immutable
+`AbiView`s outside the generation, with exact effective types, ordered storage
+pieces and source roles. A cache hit does not reassign the prototype. Supplied
+lists and committed entry/site facts bypass this cache. Flush validates core
+completion, releases cached views and freezes the old non-core generation;
+retained results remain readable.
+
+`ActionDefaultParams` and `ActionDeindirect` consume these declarations through
+the shared engine. Exact function-entry facts take precedence over a structural
+Code declaration even through an indirect function-symbol slot. Existing
+site-pinned facts win independently of the first parameter's lock. `force_set`
+commits compatible operands/results, or persists the complete site fact before
+requesting restart. Those analysis-local pins survive `Funcdata::clear`, not a
+fresh frontend analysis. A required ABI still waiting at setup produces an
+action error before `FuncLink`, rather than a fabricated default prototype.
+The original error crosses ordinary and jump-table action pipelines unchanged.
+
+When a late-resolved custom parameter occupies only part of an existing
+argument trial, transfer preserves its endian-correct physical slice through
+commit. It does not truncate every reused SSA value to its low bytes. The
+direct and indirect forms of the same custom-register call therefore select
+the same argument bits, including upper-register storage supplied by Java.
+
+C rendering retains the logical declaration instead of inventing a signature
+from physical slots. It omits hidden-result operands, dereferences indirect
+by-value arguments and orders declared arguments by their source roles.
+A hidden aggregate result captures its destination once, assigns the returned
+aggregate through that pointer, and yields the physical pointer only where an
+IR consumer requires it. This works inside nested expressions without
+duplicating destination side effects. Existing C/Rust spellers share graph
+access; unsupported Rust callable forms remain opaque, without invented ABI or
+borrowing claims.
+
+### Aggregate override contract
+
+The supplied datatype list is a declaration to lower, not a request to recover
+an earlier signature. Explicit pointer parameters stay explicit. No Java fork,
+signature-basis metadata, or migration by parameter names/counts is needed.
+
+Two source contracts differ at the host boundary. `HighFunctionDBUtil.getFirstVarArg`
+returns the referenced variadic callee's `Function.getParameterCount()`, which
+includes automatic parameters. `FunctionPrototype.encodePrototype` sends that
+index beside the override's types with blank storage. Native model rules,
+however, classify variadic arguments by their index in the supplied declaration.
+Kuna marks this known host-override boundary as effective-coordinate; ordinary
+CLI/declaration boundaries retain their declared-coordinate meaning.
+
+Shared ABI assignment lowers the result first, translates the boundary using
+the generated hidden-result position, then assigns inputs once. This accounts
+for this-before-return markup without subtracting an explicit `this` argument
+or an indirect-by-value parameter. For a variadic target with one fixed `int`:
+
+| Supplied override | Wire `first` / input count | Declared fixed prefix | Completed inputs / physical boundary |
+|---|---|---|---|
+| `Big24(tag, value, number)` | 2 / 3 | 1 | 4 / 2 |
+| `Big24 *(retptr, tag, value, number)` | 2 / 4 | 2 | 4 / 2 |
+
+AppleSilicon has a second important case: the aggregate result uses hidden
+`x8` storage and a **void physical output**, with no result-register address.
+That is successful lowering, not an unassigned result. Its result lock and
+hidden-input lock must survive; losing slot zero's lock previously caused
+the entire override argument list to be discarded.
+
+Fully locked, known declarations retain their semantic types and generated
+input roles separately from committed site storage, names, effects and locks.
+A closed expanded list remains closed for analysis, while its callable C view
+uses the variadic fixed prefix. Emission omits the hidden result argument,
+assigns the returned aggregate into its destination, and preserves any used
+physical result pointer. Internal replay preserves existing explicit
+`hiddenretparm`/`indirectstorage` role attributes, including result
+`indirectstorage`; coherent, fully locked role metadata can restore the semantic
+view without reassigning committed storage. Untagged or incomplete facts are
+not treated as evidence of a missing declaration.
+
+This does not recover intent that the producer discarded. On AArch64, a
+literal `void(Big24 *, int)` declaration assigns `x0/w1`, not hidden `x8/w0`.
+Likewise, `FunctionDefinitionDataType(fn, false)` can retain the formal
+aggregate return while including an automatic pointer input; that mixed list
+is indistinguishable from an intentional additional pointer parameter.
+Java's formal-list wrapper also injects `this`, whereas native assignment marks
+an existing input. None of these cases authorizes deleting or inventing inputs.
+An independently pinned variadic boundary or preserved custom storage would
+require an explicit producer contract; they are not prerequisites for this fix.
+The existing boundary remains derived from the current callee/reference.
 
 ## 6. Response contracts that make the GUI work
 
@@ -309,6 +565,70 @@ Printing correct C is not enough. The `decompileAt` response is a packed `<doc>`
   Decompiler Parameter ID and calling-convention analyzers
   (`DecompilerParameterIdCmd.java:325-345`).
 
+### Native callable-support publication
+
+Alongside the current function's analysis and markup, Kuna emits a
+`callable_support` sibling. Protocol **2** uses element IDs 4030–4039 and attribute
+IDs 4030–4048; the bootstrap JAR and isolated installer bind this revision as
+`2-e4030-4039-a4030-4048`. The override-origin attribute 4002 is unchanged. An
+unsupported support version fails decoding; there is no protocol-1 compatibility
+fallback. A stock native process genuinely omits the sibling and retains its
+ordinary legacy path.
+
+`DecompileResults` and `DecompiledFunction` expose an immutable
+`Optional<CallableSupport>`. `complete` and `refused` are explicit native statuses,
+not inferred from whether the fragment compiles. A complete result has exactly
+one current receipt bound to the requested native space index and **byte** entry
+offset. Every included body, including the current one, has its actual native
+plain rendering and canonical declaration. The current linked markup remains
+separate: `getC()` and `getSignature()` neither append adapters nor promise a
+self-contained translation unit. A callable refusal can therefore preserve
+useful analysis and source-editing metadata without certifying executable C.
+
+A `CallableSupport.Publication` joins the exact body and artifact observations.
+It requires matching declarations and actual owning bodies, rejects conflicting
+receipts and missing providers, and checks the full required dependency graph.
+A strongly connected component with an internal deferred assumption is refused;
+a complete cycle without a deferred assumption is not. Protocol-2 `bodyproof`
+artifacts carry `kuna_provider` (4048), naming their concrete wrapper or
+existing-target provider. Their canonical single-role key extends that exact
+family with `_internal_<space>_<byte>_<size>`. The provider must belong to the
+same body and have the same declaration; proof chains are forbidden. Required
+proof edges must remain deferred. These records emit no extra C declaration or
+definition, and retaining a qualified proof also retains its concrete provider.
+The Java checks enforce these protocol joins, not the native instruction proof
+that authorizes the qualified receipt.
+
+Native type ownership is a complete source dependency closure, not a list of
+names to suppress. Receipts retain the Program identity, original revision,
+source kind and ID, and the actual encoded instance size. Transient identities
+are request-scoped and cannot suppress persisted Program roots. Builtins require
+an exact producer witness; ordinary pointer/array shapes and bare void nodes do
+not acquire invented source IDs. Inline shapes are accepted only through their
+actual decode provenance, with independent child receipts still checked and
+ancestor authority invalidated by dependency mutation. Callable inputs/results
+and relative-pointer parents are part of that graph. This preserves host source
+identity even when the execution view uses a different ABI carrier.
+
+The ordinary `CppExporter` spools all chunks into one publication, authenticates
+source ownership, then emits the native prelude and type closure before the
+remaining Program datatypes. Unrelated host definitions remain available; a
+same-named or structurally equivalent datatype is not an ownership substitute.
+The native global inventory includes named and unnamed referenced globals.
+Declarations for genuine external native functions remain separate from the
+option controlling referenced object globals. Analysis failure, cancellation,
+malformed support, unresolved obligations, or stale source ownership prevents
+publication of the staged C/header pair. Stock fragments cannot discharge native
+provider obligations. The final two file moves are not a filesystem-wide atomic
+transaction.
+
+Real integrated consumer scenarios exercise direct result publication and the
+ordinary exporter by compiling and executing their unchanged native C/header
+output, while preserving source signatures/storage and rejecting retained
+support after a nested source-type edit. Synthetic packed-codec scenarios test
+malformed records and dependency joins separately; they do not establish native
+body or internal-role preservation.
+
 ## 7. The extension seam (decided)
 
 Primary mechanism — **reflection swap of `DecompileProcessFactory.exepath` from a
@@ -327,16 +647,25 @@ path — the kuna binary shipped in the extension's **own** module `os/` dir und
 class's module first and `DecompileProcessFactory` lives in the Decompiler module,
 which ships its own (`Application.java:1013-1026`).
 
-Documented fallbacks (no code, release installs): **build/os file-drop** — a binary at
-`<install>/Ghidra/Features/Decompiler/build/os/<platform>/decompile` shadows the stock
-`os/` copy because `getModuleOSFile` checks `build/os/` first unconditionally; and the
-**patch-dir class shadow** — `<install>/Ghidra/patch` jars precede module jars in
-release mode only (`GhidraLauncher.java:182-183`).
+For native selection without the plugin, **build/os file-drop** remains available:
+a binary at `<install>/Ghidra/Features/Decompiler/build/os/<platform>/decompile`
+shadows the stock `os/` copy because `getModuleOSFile` checks `build/os/` first.
+Native selection does not itself supply additional Java provenance. The integrated
+installer separately places the version-bound producer JAR on **Ghidra/patch**,
+which precedes module JARs in release mode (`GhidraLauncher.java:182-183`). Both
+ordinary Java launchers and PyGhidra use that bootstrap path. Development-mode
+Ghidra builds must incorporate both maintained source patches in SoftwareModeling
+and Decompiler instead.
 
 ## 8. Version policy (decided)
 
-`kuna-ghidra` targets a **pinned Ghidra release** (the 12.2 vintage). There is no
-protocol handshake — the interface version (major=6/minor=1,
+The release workflow pins the Ghidra distribution used to build the integration;
+its asset filename identifies that version. Local builds use `GHIDRA_INSTALL_DIR`
+and bind the bootstrap producer/consumer JAR to that distribution's application
+properties, both module JARs and source-archive hashes, and the callable-support
+protocol revision. Historical source
+citations in this document are not a declaration of the installed runtime version.
+There is no protocol handshake — the interface version (major=6/minor=1,
 `cpp/architecture.cc:35-36`) is exposed only through `getSignatureSettings` and only
 BSim reads it. The real skew risk is **option drift**, already live between kuna's
 `GHIDRA_REV` (`cef869af`) and the 12.2-DEV head (`f9e13846`): upstream added a
@@ -349,6 +678,13 @@ skipped with a warning instead of failing the command** — one stale option mus
 brick the decompiler view. This is output-invariant for known options; it shipped
 with Phase 3 (`OptionDatabase::decode_lenient` behind the real `setOptions`) and is
 recorded as **DIV-76** in `docs/history.md`.
+
+Only unknown option elements receive that compatibility treatment, including
+their entire nested subtree. Malformed known options, unsupported languages,
+unknown roots/models, and rejected values return `f` with a diagnostic. Options
+apply in wire order: a later failure does not roll back earlier entries.
+A valid replacement snapshot recovers the session. `protoeval=default`
+selects the compiler specification's default model.
 
 A second, smaller **deliberate divergence** hardens the process against a malformed
 archid. Upstream reads the id with `sin >> dec >> id` (`ghidra_process.cc:89-96`); on a
@@ -389,15 +725,15 @@ The engine-seam inventory, with honest difficulty:
 | `ContextDatabase` | trait ready | **trivial** — `ContextGhidra` implements `getTrackedSet` only (upstream throws on the rest, `ghidra_context.hh:36-47`) | 2 |
 | `Translate` | trait exists; `Architecture.translate: Sleigh` concrete (`architecture.rs:836`) | **enum seam** `{Sleigh, GhidraTranslate}` + the Sleigh-only call surface audit | 2 |
 | `Funcdata::encode` | **DONE (Phase 4)** — the FULL `<function>` in upstream child order: `<addr>` + `<localdb>` + `<ast>` + `<highlist>` + `<jumptablelist>` + `<prototype>` (`substrate/funcdata_encode.rs`), over the `Datatype::encodeRef` / `FuncProto::encode` / `Symbol`/`SymbolEntry`/scope encode ports and the encode-time symbol-link pass | `<override>`/child-`<scope>` statics deferred (Java skips both) | 4 ✔ |
-| PrintC → `EmitMarkup` | back-end ported, front-end hardwired (`printc.rs:1015`) | generalize PrintC's `emit` field; wire `doc_function` (`printc.rs:1102`) to the markup path | 2 |
+| PrintC → host markup | `doc_function_markup` uses the queued pretty-printer with persistent width/indent settings and token references; plain CLI/provenance output retains its unwrapped sink | C and existing Rust grammar work through packed markup; no Java renderer | ✔ |
 | Scope / symbol table | **DONE (Phase 3)** — `RemoteScope` (`infra/remote_provider.rs`): query-through + `<hole>` negatives + property paints + namespace paths, at the GlobalQuery/flow seams; **Phase 4** echoes the delivered DB symbol ids back (`GlobalEntry::symbol_id` → `<high symref>`) | — | 3 ✔ / 4 ✔ |
-| `TypeFactory` | **DONE (Phase 3)** — wire `<coretypes>` decode + `decode_type`/`<typeref>` + `find_by_id_or_remote` getDataType miss-hook + `clear_noncore` (`substrate/dtype.rs`); **Phase 4** adds the marshal-OUT (`Datatype::encode_ref`/`encode`) | function-definition `<prototype>` bodies inside `<type metatype="code">` are skipped (FuncProto::decode unported) | 3 ✔ / 4 ✔ |
+| `TypeFactory` | Wire core/nominal types and recursive callable declarations use the shared generation graph (`substrate/dtype_factory.rs`, `substrate/dtype_graph.rs`); ordinary ABI views are materialized after required layouts complete | Aggregate overrides follow the explicit source/committed contract above; untagged physical pointers are not guessed into source roles | 3 ✔ / 4 ✔ |
 | `CommentDatabase` | **DONE (Phase 3)** — `RemoteScope::fill_comments` (getComments, printer-filtered, fill-once-per-flush) into the `Architecture.commentdb` sink | the printer renders PRE/warning + header comments; EOL/POST placement is a printer gap, not a wire gap | 3 ✔ |
 | `ParamIDAnalysis` | **DONE (Phase 4)** — `<parammeasures>` encode + the paramid-action doc shape (`infra/paramid.rs`; the justproto constructor reads the real recovered `FuncProto`) | — | 4 ✔ |
 | `StringManager` | concrete, no trait (`stringmanage.rs:83`); cleared by flushNative | one-method extraction for Java-side charset-faithful decode | deferred |
 | Inject library | **DONE** — payloads register from the wire-fed cspec, but nothing compiles them without a local `.sla`, so each injection fetches already-lifted p-code for that call site via getPcodeInject (`EngineTranslate::fetch_inject_pcode`, `kuna-ghidra/src/translate.rs`); never cached, since the answer is bound to the site | `CALLMECHANISM`/`EXECUTABLEPCODE` payloads are unreachable from the live engine and stay unwired. The call-fixup arm is wired but also unreachable: `remote_provider.rs` decodes every remote function with `func_inject_id: -1` and the remote `<prototype>` has no `<inject>` arm, so a Ghidra-side `setCallFixup` never arrives | ✔ |
 | `ConstantPool` | trait ready (`infra/cpool.rs:470`) but **unwired** into `Architecture` | wiring + `CPOOLREF` path; JVM/Dalvik only | deferred |
-| ArchSeam snapshot | **DONE (Phase 3)** — the three frozen tables read through live seams when a `RemoteScope` is installed (`ArchContext::effective_global_query`/`callee_proto_pieces`; tracked sets decode from the wire pspec `<tracked_set>`) | — | 3 ✔ |
+| ArchSeam snapshot | **DONE (Phase 3)** — global reads and canonical callee prototypes use live seams when a `RemoteScope` is installed (`ArchContext::effective_global_query`/`query_callee_proto`; tracked sets decode from the wire pspec `<tracked_set>`) | — | 3 ✔ |
 
 ## 10. Graceful degradation
 
@@ -407,21 +743,20 @@ What breaks when a partial core omits pieces — all failure modes are clean:
 |---|---|---|
 | signature commands | answered "Bad command" (the `6, 16 "Bad command: <name>" 17, 7` pattern, `ghidra_process.cc:476-484`); Java shows "not built with signature module" (`DecompInterface.java:341-347`) | **BSim only** — GUI unaffected |
 | `structureGraph` | same "Bad command" path | FunctionGraph **nested-layout** view only |
-| empty `decompileAt` payload (function failed) | `decompileCompleted()` false; the 16/17 warnings text becomes the error message | that one function — clean GUI error |
+| absent `decompileAt` document after a low-level failure | `decompileCompleted()` false; no HighFunction or C; the native diagnostic remains the error message | that one function; later requests can use the same process |
 | second `<function>` (markup) | HighFunction decodes; GUI panel refuses to render (`DecompileData.java:56`) | GUI blank for that function; analyzers/scripts on HighFunction still work |
 | `<parammeasures>` | param-ID / convention analyzers get nothing | those analyzers no-op |
 | `<jumptablelist>` | switch analyzer finds no tables | unrecovered switches in the listing |
 
 **Load-time analysis facts are the other half of this.** A wire session never loads
 the image on kuna's side — the program database is Ghidra's — so every kuna analysis
-pass that reads the file itself contributes nothing to the GUI path. The largest one
-today is `formatstring static`, the load-time printf/scanf format resolver: through
-the CLI a `printf("%s %d", …)` call has its variadic arguments typed from the format
-constant read out of `.rodata`, and through the wire it does not. Ghidra ships its own
-`FormatStringAnalyzer` for this, so the fact is available on the host side; carrying it
-across the wire (or having kuna open the file alongside the session) is future work.
-The ghidra-sim differential in §11 therefore runs its CLI arm with `formatstring off`,
-so the pinned line-diff band measures markup fidelity rather than this known gap.
+pass that reads the file itself contributes nothing to the GUI path. The CLI's
+`formatstring static` resolver and Ghidra's `FormatStringAnalyzer` are separate
+producers: host analyzer-created callsite overrides now cross the wire into the
+shared callsite contract. The live override smoke exercises actual printf/scanf
+analyzer production and unchanged emitted-C behavior. The ghidra-sim oracle is not
+that analyzer; its CLI comparison disables `formatstring` to reduce producer
+differences. Its text-diff metrics are diagnostic, not correctness gates.
 
 ## 11. Testing strategy
 
@@ -441,20 +776,30 @@ so the pinned line-diff band measures markup fidelity rather than this known gap
   answered from **kuna's own analysis** (`ghidra_sim/oracle.rs`:
   `bootstrap_from_object` for bytes/labels, the real Sleigh re-encoded as wire
   `<inst>` documents for getPcode, a tspec *generated* from the Sleigh's space
-  manager so packed space indices agree by construction; getMappedSymbols answers
-  empty — the Phase-2 reality). It asserts the §6 response contracts (dual
+  manager so packed space indices agree by construction; mapped-symbol answers
+  come from the oracle's committed program facts). It asserts the §6 response contracts (dual
   `<function>` decode, name/entry echo, markup opref/varref ⊆ ast, the 19-query
   legality and query-legal-command placement), flattens the Clang markup to C with
   Java's `getC()` token cleaning applied (`IllegalCharCppTransformer` — the reason
-  over-wide type tokens read back as `unsigned_long__a1`), and **pins today's
-  GUI-path quality numbers**: raw-register identifier leaks, `Unique<hex>` tokens,
+  over-wide type tokens read back as `unsigned_long__a1`), and checks
+  raw-register identifier leaks, `Unique<hex>` tokens,
   `sub_`/`dat_` placeholder rate vs what the loader knows, `getC()`-mangled token
-  counts, query traffic (getPcode totals, getMappedSymbols == 0), and the
-  normalized line-diff ratio against the SAME functions through the in-process CLI
-  path. The pins are inline consts in `ghidra_sim_e2e.rs`; they move only with the
-  provider/emitter change that earns the move — Phase 3/4 land by flipping them
-  downward. Run: `make test-ghidra` (release; also part of the CI `gates` job on
+  counts, and query traffic. Typed markup checks retain token hierarchy, layout,
+  engine references, and matched delimiter topology. Unchanged-host flush checks
+  compare decoded consumer facts rather than raw bytes: document-local delimiter
+  IDs need not repeat across documents. Changed-host checks require fresh symbol
+  names after cache invalidation. Line counts and normalized CLI/host text-diff
+  ratios remain informational, not thresholds to re-pin when presentation changes.
+  Run: `make test-ghidra` (release; also part of the CI `gates` job on
   every PR, which matters because the workspace suite is skipped on internal PRs).
+- **Error recovery:** `kuna-ghidra/tests/decompile_at_e2e.rs` exercises an actual
+  instruction-limit failure followed by successful decompilation in the same
+  session, asserting exact outer framing and preserved native diagnostics. It also
+  covers malformed p-code and host p-code exceptions; `inject_e2e.rs` checks failed
+  injection responses and subsequent-function recovery.
+  `tests/ghidra/error_recovery.py` checks the corresponding real
+  Java results against stock and kuna, including repeated recovery without PID
+  changes.
 - **Phase 3+: DecompileDebug captures as fixtures.** Ghidra's "Debug Function
   Decompilation" action (`DecompInterface.enableDebug`, `DebugDecompilerAction.java:38-73`)
   records every callback answer into an `<xml_savefile>` — exactly the document kuna's
@@ -462,14 +807,19 @@ so the pinned line-diff band measures markup fidelity rather than this known gap
   to replay against `kuna-ghidra` without a live Ghidra (de-risking the sim's
   synthesized `<mapsym>` shapes), and `DecompileDebugXmlLoader` (Features/Base) can
   import them as Programs for the reverse direction.
-- **Live smoke** (manual, per phase): `integrations/ghidra/live-smoke/` — a
-  pyghidra rig that swaps `DecompileProcessFactory.exepath` to `kuna_ghidra` inside
-  a real Ghidra, decompiles the same functions with both cores, and writes a
-  side-by-side report with the same scanner counts the sim pins (see its README
-  for the offline-pyghidra setup). For the full extension path: build the
-  extension, install into a Ghidra 12.2 release (or `-Dghidra.external.modules=`
-  in a dev checkout), enable the plugin, verify the spawned PID is `kuna_ghidra`
-  and that the C, click-to-address, and rename round-trip behave.
+- **Real-Ghidra consumer suite** (manual): `make test-ghidra-live`, with setup
+  and suite selection in `tests/ghidra/README.md`. One runner
+  isolates JVM-backed probes, aggregates their exit status and preserves their
+  consumer artifacts. It covers host facts, lifecycle, names, address spaces,
+  and unchanged emitted-C execution; integer boundary cases exercise the CLI
+  independently as well. Stock is diagnostic control, not a correctness oracle.
+  Supplied-binary comparison is an opt-in suite. For the full integration path: build
+  the extension against the intended release and run its `KunaIntegratedInstall`
+  installer to create a separate distribution. Launch that copy, enable the plugin,
+  verify the p-code/source-identity producers and result/export consumers load from
+  its `Ghidra/patch` JAR and the spawned PID is `kuna_ghidra`, and exercise C,
+  callable-support export, click-to-address, and rename round-trips. A development
+  checkout must build both source deltas as well as the extension.
 - **Regression floors**: the standing gates (`make test`, `make test-stages`,
   `make rust-test`, now plus the `gates`-job ghidra-sim step) must stay green —
   `kuna-ghidra` is additive and must not perturb the standalone engine.
@@ -527,8 +877,8 @@ pins now hold the Phase-3 level.
       `<hole>` negative caching, readonly/volatile property paints over the
       `lockDefaultProperties` snapshot, namespace paths via getNamespacePath, and
       wire symbol-id capture (`RemoteSymbolRecord::symbol_id`, the Phase-4 echo seed).
-      decompileAt resolves the current function's identity (name + locked prototype
-      pieces) through it, getCodeLabel demoted to fallback.
+      decompileAt resolves the current function's identity and canonical prototype
+      through it, getCodeLabel demoted to fallback.
 - [x] `TypeFactory` wire decode + lazy `findById`
       (`decode_core_types`/`decode_type`/`find_by_id_or_remote` + `RemoteTypeFetch`,
       `clear_noncore`); comments rewiring (`fill_comments`, printer-filtered);
@@ -573,6 +923,13 @@ pins now hold the Phase-3 level.
       declarator into base-word `<type>` tokens + `<syntax>` separators, so
       Java's `getC()` (`IllegalCharCppTransformer`) no longer mangles
       `unsigned long *` to `unsigned_long__` (ghidra-sim mangled pins → 0).
+      Composite declarators carry the source IDs of their nominal leaves,
+      including pointees, named typedefs and nested callback slots. Original
+      non-core nominal C names remain atomic even when they contain spaces or
+      punctuation, so Java sanitizes a generated relative-pointer typedef name
+      as one identifier. This is distinct from splitting composed type spelling.
+      Raw token capture keeps its original text/kind/positions instead of recording the
+      internal packed-token split.
 - [x] The rename/retype PERSISTENCE loop: the function `<localdb>` answer's
       non-parameter locals (what Java sends after
       `HighFunctionDBUtil.updateDBVariable` committed a user edit) seed the
@@ -596,9 +953,10 @@ pins now hold the Phase-3 level.
 **Phase-4 deferred (follow-ups, graceful degradation per §10):**
 - [ ] `structureGraph` (FunctionGraph nested layout only).
 - [ ] The four signature commands (engine already ported) for BSim.
-- [ ] Overlay spaces (Java swaps in overlay codecs transparently —
-      `DecompInterface.java:84-127,896-909`); `getStringData` charset fidelity
-      (Java-side decode instead of `GhidraLoadImage` bytes).
+- [ ] Broader overlay and live-debugger lifecycle coverage; native wire fixtures
+      do not test Java event delivery or target breakpoint installation.
+- [ ] `getStringData` charset fidelity (Java-side decode instead of
+      `GhidraLoadImage` bytes).
 - [ ] `<override>` / child-`<scope>` statics (Java skips both); the C++
       `collectNameRecs` harvest (standalone symbols → recommendations).
 - [ ] `kuna_apply_dynamic_recommendations` runs BEFORE the naming walk rather

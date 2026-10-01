@@ -50,8 +50,9 @@ use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::expression::TermOrder;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 
@@ -98,11 +99,8 @@ impl RuleEarlyRemoval {
 }
 
 impl Rule for RuleEarlyRemoval {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleEarlyRemoval::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleEarlyRemoval::new(self.group.clone()))
     }
 
     // This rule applies to all ops (default get_op_list).
@@ -194,11 +192,8 @@ impl RuleCollectTerms {
 }
 
 impl Rule for RuleCollectTerms {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleCollectTerms::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleCollectTerms::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -319,6 +314,19 @@ impl Rule for RuleCollectTerms {
         let vn1 = termorder.term(order[lastconst]).get_varnode();
         let vn1sz = data.vbank().get(vn1).expect("RuleCollectTerms: stale lastconst vn").get_size();
         coef1 &= calc_mask(vn1sz);
+        let (op_lc, slot_lc) = {
+            let e = termorder.term(order[lastconst]);
+            (e.get_op(), e.get_slot())
+        };
+        let receipt = if branch_receipt::has_candidate(data) {
+            let slots = order[i..].iter().filter_map(|&edge_idx| {
+                let edge = termorder.term(edge_idx);
+                edge.get_multiplier().is_none().then_some((edge.get_op(), edge.get_slot() as usize))
+            }).collect();
+            branch_receipt::begin_collect(data, op, slots, (op_lc, slot_lc as usize), coef1)
+        } else {
+            None
+        };
         // Lump all the non-zero constants into one varnode
         for &edge_idx in &order[(lastconst + 1)..] {
             if termorder.term(edge_idx).get_multiplier().is_none() {
@@ -331,11 +339,8 @@ impl Rule for RuleCollectTerms {
             }
         }
         let lumped = data.new_constant(vn1sz, coef1);
-        let (op_lc, slot_lc) = {
-            let e = termorder.term(order[lastconst]);
-            (e.get_op(), e.get_slot())
-        };
         data.op_set_input(op_lc, lumped, slot_lc).expect("RuleCollectTerms: lumped constant");
+        branch_receipt::finish(data, receipt);
 
         1
     }
@@ -359,11 +364,8 @@ impl RuleSelectCse {
 }
 
 impl Rule for RuleSelectCse {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSelectCse::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSelectCse::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -435,11 +437,8 @@ impl RulePiece2Zext {
 }
 
 impl Rule for RulePiece2Zext {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePiece2Zext::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePiece2Zext::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -485,11 +484,8 @@ impl RulePiece2Sext {
 }
 
 impl Rule for RulePiece2Sext {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePiece2Sext::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePiece2Sext::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -557,11 +553,8 @@ impl RuleBxor2NotEqual {
 }
 
 impl Rule for RuleBxor2NotEqual {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleBxor2NotEqual::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBxor2NotEqual::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -591,11 +584,8 @@ impl RuleOrMask {
 }
 
 impl Rule for RuleOrMask {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleOrMask::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOrMask::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -646,11 +636,8 @@ impl RuleAndMask {
 }
 
 impl Rule for RuleAndMask {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleAndMask::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndMask::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -732,11 +719,8 @@ impl RuleOrConsume {
 }
 
 impl Rule for RuleOrConsume {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleOrConsume::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOrConsume::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -793,11 +777,8 @@ impl RuleOrCollapse {
 }
 
 impl Rule for RuleOrCollapse {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleOrCollapse::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOrCollapse::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -854,11 +835,8 @@ impl RuleAndOrLump {
 }
 
 impl Rule for RuleAndOrLump {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleAndOrLump::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndOrLump::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -935,11 +913,8 @@ impl RuleNegateIdentity {
 }
 
 impl Rule for RuleNegateIdentity {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleNegateIdentity::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleNegateIdentity::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -999,11 +974,8 @@ impl RuleShiftBitops {
 }
 
 impl Rule for RuleShiftBitops {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleShiftBitops::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShiftBitops::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1143,11 +1115,8 @@ impl RuleRightShiftAnd {
 }
 
 impl Rule for RuleRightShiftAnd {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleRightShiftAnd::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleRightShiftAnd::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1222,11 +1191,8 @@ impl RuleIntLessEqual {
 }
 
 impl Rule for RuleIntLessEqual {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleIntLessEqual::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleIntLessEqual::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1260,11 +1226,8 @@ impl RuleEquality {
 }
 
 impl Rule for RuleEquality {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleEquality::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleEquality::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1299,11 +1262,8 @@ impl RuleTermOrder {
 }
 
 impl Rule for RuleTermOrder {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleTermOrder::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTermOrder::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1622,11 +1582,8 @@ impl RulePullsubMulti {
 }
 
 impl Rule for RulePullsubMulti {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePullsubMulti::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePullsubMulti::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -1785,11 +1742,8 @@ impl RulePullsubIndirect {
 }
 
 impl Rule for RulePullsubIndirect {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePullsubIndirect::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePullsubIndirect::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2019,11 +1973,8 @@ impl RulePushMulti {
 }
 
 impl Rule for RulePushMulti {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RulePushMulti::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePushMulti::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2202,11 +2153,8 @@ impl RuleNotDistribute {
 }
 
 impl Rule for RuleNotDistribute {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleNotDistribute::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleNotDistribute::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2281,11 +2229,8 @@ impl RuleHighOrderAnd {
 }
 
 impl Rule for RuleHighOrderAnd {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleHighOrderAnd::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleHighOrderAnd::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2421,11 +2366,8 @@ impl RuleAndDistribute {
 }
 
 impl Rule for RuleAndDistribute {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleAndDistribute::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndDistribute::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2544,11 +2486,8 @@ impl RuleLessOne {
 }
 
 impl Rule for RuleLessOne {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleLessOne::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLessOne::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2599,11 +2538,8 @@ impl RuleRangeMeld {
 }
 
 impl Rule for RuleRangeMeld {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleRangeMeld::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleRangeMeld::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -2747,36 +2683,35 @@ impl Rule for RuleRangeMeld {
 /// order** (`RuleEarlyRemoval` .. `RuleRangeMeld`).  The W8 universal-action
 /// builder pushes these into the appropriate pools.  Each ctor builds the rule
 /// with the `"analysis"` group — the group most of these expression rules belong
-/// to in `coreaction.cc`'s `universalAction`; W8 supplies the real group when it
-/// assembles the registration, exactly like the worked example in the action.rs
-/// module docs (`RuleSpec { group, ctor }`).
+/// to in `coreaction.cc`'s `universalAction`. The owning pool's registration
+/// state, rather than the concrete rule, determines group membership.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleEarlyRemoval::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleCollectTerms::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSelectCse::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RulePiece2Zext::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RulePiece2Sext::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleBxor2NotEqual::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleOrMask::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleAndMask::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleOrConsume::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleOrCollapse::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleAndOrLump::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleNegateIdentity::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleShiftBitops::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleRightShiftAnd::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleIntLessEqual::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleEquality::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleTermOrder::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RulePullsubMulti::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RulePullsubIndirect::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RulePushMulti::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleNotDistribute::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleHighOrderAnd::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleAndDistribute::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleLessOne::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleRangeMeld::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleEarlyRemoval::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleCollectTerms::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSelectCse::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePiece2Zext::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePiece2Sext::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleBxor2NotEqual::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleOrMask::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleAndMask::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleOrConsume::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleOrCollapse::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleAndOrLump::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleNegateIdentity::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleShiftBitops::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleRightShiftAnd::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleIntLessEqual::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleEquality::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTermOrder::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePullsubMulti::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePullsubIndirect::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RulePushMulti::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleNotDistribute::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleHighOrderAnd::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleAndDistribute::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleLessOne::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleRangeMeld::new("analysis")) },
     ]
 }
 

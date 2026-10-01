@@ -1,7 +1,8 @@
 //! Port of the C++ unit tests in `decompiler/unittests/testfloatemu.cc`.
 //!
-//! One C++ `TEST(name)` -> one `#[test] fn name()`, assertion for
-//! assertion, same constants, same order.  The C++ TEST names (e.g.
+//! The arithmetic cases retain the C++ assertions and constants. Decimal
+//! printing instead checks target-value preservation, not host-specific
+//! stream spellings. The C++ TEST names (e.g.
 //! `float_opNan`) are kept exactly for the port-audit gate, hence the
 //! file-level `non_snake_case` allow.
 //!
@@ -21,10 +22,9 @@
 //!   with); `min()`/`max()`/`infinity()` map to
 //!   `MIN_POSITIVE`/`MAX`/`INFINITY`.
 //!
-//! Like the C++ original, these tests compare `FloatFormat` results against
-//! the *host's* floating-point semantics; NaN sign/payload propagation
-//! follows the x86 host lowering -- the same caveat documented in the
-//! kuna-num `float.rs` module docs.
+//! Non-NaN results retain the C++ tests' native floating-point references.
+//! NaN results use literal bits for the pinned-oracle compatibility policy,
+//! not Rust's unspecified arithmetic or cast NaN signs.
 
 #![allow(non_snake_case)] // C++ TEST(name) fn names are preserved exactly
 
@@ -55,22 +55,12 @@ fn double_to_raw_bits(f: f64) -> u64 {
     f.to_bits()
 }
 
-/// Pin a NaN *generated* from non-NaN inputs to the x86 "real indefinite"
-/// (`0xffc00000`), mirroring [`FloatFormat::encode_generated`] (see the float.rs
-/// module header).  These are host-parity tests: they compare `FloatFormat`
-/// against the build host's native FP, which agree everywhere EXCEPT the sign of
-/// an invalid-operation-generated NaN — the x86 FPU sets it, Apple-Silicon/ARM
-/// clears it.  The engine canonicalizes generated NaNs to the x86 sign for
-/// cross-host determinism, so the host reference is canonicalized the same way
-/// to keep the test meaningful off-x86.  On the x86 oracle host this is a no-op
-/// (the host already yields `0xffc00000`).  `inputs_nan` marks a *propagated*
-/// NaN (host-deterministic sign), which is left untouched.
-fn canon_generated_nan4(raw: u64, inputs_nan: bool) -> u64 {
-    let is_nan = (raw & 0x7f80_0000) == 0x7f80_0000 && (raw & 0x007f_ffff) != 0;
-    if !inputs_nan && is_nan {
-        0xffc0_0000
-    } else {
-        raw
+/// The fixture's only NaN is positive canonical quiet NaN. Supply explicit
+/// host bits rather than depending on Rust's unspecified NaN cast behavior.
+fn fixture_host(f: f32) -> f64 {
+    match f.to_bits() {
+        0x7fc0_0000 => f64::from_bits(0x7ff8_0000_0000_0000),
+        _ => f64::from(f),
     }
 }
 
@@ -84,7 +74,14 @@ fn assert_float_encoding(f: f64) {
     let format = FloatFormat::new(4);
 
     // C++ floatToRawBits(f) implicitly narrows double -> float
-    let true_encoding = float_to_raw_bits(f as f32);
+    let true_encoding = if f.is_nan() {
+        match f.to_bits() >> 63 {
+            0 => 0x7fc0_0000,
+            _ => 0xffc0_0000,
+        }
+    } else {
+        float_to_raw_bits(f as f32)
+    };
     let encoding = format.get_encoding(f);
 
     assert_eq!(true_encoding, encoding);
@@ -94,7 +91,14 @@ fn assert_float_encoding(f: f64) {
 fn assert_double_encoding(f: f64) {
     let format = FloatFormat::new(8);
 
-    let true_encoding = double_to_raw_bits(f);
+    let true_encoding = if f.is_nan() {
+        match f.to_bits() >> 63 {
+            0 => 0x7ff8_0000_0000_0000,
+            _ => 0xfff8_0000_0000_0000,
+        }
+    } else {
+        double_to_raw_bits(f)
+    };
     let encoding = format.get_encoding(f);
 
     assert_eq!(true_encoding, encoding);
@@ -158,14 +162,14 @@ fn double_encoding_normal() {
 
 #[test]
 fn float_encoding_nan() {
-    assert_float_encoding(f64::from(FLOAT_QNAN));
-    assert_float_encoding(f64::from(-FLOAT_QNAN));
+    assert_float_encoding(f64::from_bits(0x7ff8_0000_0000_0000));
+    assert_float_encoding(f64::from_bits(0xfff8_0000_0000_0000));
 }
 
 #[test]
 fn double_encoding_nan() {
     assert_double_encoding(DOUBLE_QNAN);
-    assert_double_encoding(-DOUBLE_QNAN);
+    assert_double_encoding(f64::from_bits(0xfff8_0000_0000_0000));
 }
 
 #[test]
@@ -207,45 +211,36 @@ fn double_encoding_infinity() {
 #[test]
 fn float_decimal_precision() {
     let ff = FloatFormat::new(4);
-    let f0 = float_from_raw_bits(0x34000001);
-    assert_eq!(ff.print_decimal(f64::from(f0), false), "1.192093e-07");
-    let f1 = float_from_raw_bits(0x34800000);
-    assert_eq!(ff.print_decimal(f64::from(f1), false), "2.3841858e-07");
-    let f2 = float_from_raw_bits(0x3eaaaaab);
-    assert_eq!(ff.print_decimal(f64::from(f2), false), "0.33333334");
-    let f3 = float_from_raw_bits(0x3e800000);
-    assert_eq!(ff.print_decimal(f64::from(f3), false), "0.25");
-    let f4 = float_from_raw_bits(0x3de3ee46);
-    assert_eq!(ff.print_decimal(f64::from(f4), false), "0.111294314");
+    for magnitude in [
+        0, 1, 0x007fffff, 0x00800000, 0x00800001, 0x7f7ffffe, 0x7f7fffff,
+        0x34000001, 0x34800000, 0x3eaaaaab, 0x3e800000, 0x3de3ee46,
+    ] {
+        for sign in [0, 0x80000000] {
+            let bits = magnitude | sign;
+            for scientific in [false, true] {
+                let text = ff.print_decimal(f64::from(f32::from_bits(bits)), scientific);
+                assert_eq!(text.parse::<f32>().unwrap().to_bits(), bits, "{bits:08x}: {text}");
+            }
+        }
+    }
 }
 
-// IGNORED pending a fix in kuna-num src/float.rs (owned by item
-// w1-num-float-multiprec, not this harness item): the f1 = DBL_MAX row
-// (0x7fefffffffffffff) fails.  C++ printDecimal's istream readback
-// (float.cc:465-473) follows C++11 num_get overflow semantics -- on ERANGE
-// it stores numeric_limits<double>::max() (verified against g++/libstdc++ on
-// this host: "1.79769313486232e+308" reads back as max with failbit set), so
-// the precision-15 roundtrip equals DBL_MAX and the loop breaks with
-// "1.79769313486232e+308".  Rust's parse::<f64>() returns +inf on overflow
-// instead, so the port's roundtrip never matches and it falls through to
-// decimal_max_precision, yielding "1.7976931348623157e+308".  The same gap
-// exists on the size<=4 path (parse::<f32>() -> inf vs FLT_MAX).
 #[test]
-#[ignore = "kuna-num float.rs print_decimal roundtrip diverges from C++11 num_get overflow semantics at DBL_MAX; see comment above"]
 fn double_decimal_precision() {
     let ff = FloatFormat::new(8);
-    let f0 = double_from_raw_bits(0x3fc5555555555555);
-    assert_eq!(ff.print_decimal(f0, false), "0.16666666666666666");
-    let f1 = double_from_raw_bits(0x7fefffffffffffff);
-    assert_eq!(ff.print_decimal(f1, false), "1.79769313486232e+308");
-    let f2 = double_from_raw_bits(0x3fd555555c7dda4b);
-    assert_eq!(ff.print_decimal(f2, false), "0.33333334");
-    let f3 = double_from_raw_bits(0x3fd0000000000000);
-    assert_eq!(ff.print_decimal(f3, false), "0.25");
-    let f4 = double_from_raw_bits(0x3fb999999999999a);
-    assert_eq!(ff.print_decimal(f4, false), "0.1");
-    let f5 = double_from_raw_bits(0x3fbf7ced916872b0);
-    assert_eq!(ff.print_decimal(f5, true), "1.23000000000000e-01");
+    for magnitude in [
+        0, 1, 0x000fffffffffffff, 0x0010000000000000, 0x0010000000000001,
+        0x7feffffffffffffe, 0x7fefffffffffffff, 0x3fc5555555555555,
+        0x3fd555555c7dda4b, 0x3fd0000000000000, 0x3fb999999999999a, 0x3fbf7ced916872b0,
+    ] {
+        for sign in [0, 0x8000000000000000] {
+            let bits = magnitude | sign;
+            for scientific in [false, true] {
+                let text = ff.print_decimal(f64::from_bits(bits), scientific);
+                assert_eq!(text.parse::<f64>().unwrap().to_bits(), bits, "{bits:016x}: {text}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -312,7 +307,7 @@ fn float_opNan() {
 
     for f in float_test_values() {
         let true_result = u64::from(f.is_nan()); // C++ bool -> uintb
-        let encoding = format.get_encoding(f64::from(f));
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_nan(encoding);
 
         assert_eq!(true_result, result);
@@ -324,8 +319,12 @@ fn float_opNeg() {
     let format = FloatFormat::new(4);
 
     for f in float_test_values() {
-        let true_result = float_to_raw_bits(-f);
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0xffc0_0000
+        } else {
+            float_to_raw_bits(-f)
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_neg(encoding);
 
         assert_eq!(true_result, result);
@@ -337,8 +336,12 @@ fn float_opAbs() {
     let format = FloatFormat::new(4);
 
     for f in float_test_values() {
-        let true_result = float_to_raw_bits(f.abs());
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7fc0_0000
+        } else {
+            float_to_raw_bits(f.abs())
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_abs(encoding);
 
         assert_eq!(true_result, result);
@@ -350,8 +353,14 @@ fn float_opSqrt() {
     let format = FloatFormat::new(4);
 
     for f in float_test_values() {
-        let true_result = canon_generated_nan4(float_to_raw_bits(f.sqrt()), f.is_nan());
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7fc0_0000
+        } else if f < 0.0 {
+            0xffc0_0000
+        } else {
+            float_to_raw_bits(f.sqrt())
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_sqrt(encoding);
 
         assert_eq!(true_result, result);
@@ -363,8 +372,12 @@ fn float_opCeil() {
     let format = FloatFormat::new(4);
 
     for f in float_test_values() {
-        let true_result = float_to_raw_bits(f.ceil());
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7fc0_0000
+        } else {
+            float_to_raw_bits(f.ceil())
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_ceil(encoding);
 
         assert_eq!(true_result, result);
@@ -376,8 +389,12 @@ fn float_opFloor() {
     let format = FloatFormat::new(4);
 
     for f in float_test_values() {
-        let true_result = float_to_raw_bits(f.floor());
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7fc0_0000
+        } else {
+            float_to_raw_bits(f.floor())
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_floor(encoding);
 
         assert_eq!(true_result, result);
@@ -390,8 +407,12 @@ fn float_opRound() {
 
     for f in float_test_values() {
         // C++ std::round(float): round half away from zero, same as f32::round
-        let true_result = float_to_raw_bits(f.round());
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7fc0_0000
+        } else {
+            float_to_raw_bits(f.round())
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_round(encoding);
 
         assert_eq!(true_result, result);
@@ -421,8 +442,12 @@ fn float_to_double_opFloat2Float() {
 
     for f in float_test_values() {
         // C++ (double)f: exact float -> double promotion
-        let true_result = double_to_raw_bits(f64::from(f));
-        let encoding = format.get_encoding(f64::from(f));
+        let true_result = if f.is_nan() {
+            0x7ff8_0000_0000_0000
+        } else {
+            double_to_raw_bits(f64::from(f))
+        };
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_float2float(encoding, &format8);
 
         assert_eq!(true_result, result);
@@ -467,7 +492,7 @@ fn float_opTrunc_to_int() {
         // in int32 range, so `as i32` (truncate toward zero) matches the C++
         // host cast; int32_t -> uintb sign-extends, hence `as i64 as u64`.
         let true_result = (f as i32 as i64 as u64) & 0xffffffff;
-        let encoding = format.get_encoding(f64::from(f));
+        let encoding = format.get_encoding(fixture_host(f));
         let result = format.op_trunc(encoding, 4);
 
         assert_eq!(true_result, result);
@@ -481,10 +506,10 @@ fn float_opEqual() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
             let true_result = u64::from(f1 == f2); // C++ bool -> uintb
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_equal(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -497,10 +522,10 @@ fn float_opNotEqual() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
             let true_result = u64::from(f1 != f2); // C++ bool -> uintb
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_not_equal(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -513,10 +538,10 @@ fn float_opLess() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
             let true_result = u64::from(f1 < f2); // C++ bool -> uintb
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_less(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -529,10 +554,10 @@ fn float_opLessEqual() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
             let true_result = u64::from(f1 <= f2); // C++ bool -> uintb
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_less_equal(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -545,11 +570,16 @@ fn float_opAdd() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
-            let true_result =
-                canon_generated_nan4(float_to_raw_bits(f1 + f2), f1.is_nan() || f2.is_nan());
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let true_result = if f1.is_nan() || f2.is_nan() {
+                0x7fc0_0000
+            } else if f1.is_infinite() && f2 == -f1 {
+                0xffc0_0000
+            } else {
+                float_to_raw_bits(f1 + f2)
+            };
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_add(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -562,11 +592,16 @@ fn float_opDiv() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
-            let true_result =
-                canon_generated_nan4(float_to_raw_bits(f1 / f2), f1.is_nan() || f2.is_nan());
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let true_result = if f1.is_nan() || f2.is_nan() {
+                0x7fc0_0000
+            } else if (f1 == 0.0 && f2 == 0.0) || (f1.is_infinite() && f2.is_infinite()) {
+                0xffc0_0000
+            } else {
+                float_to_raw_bits(f1 / f2)
+            };
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_div(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -579,11 +614,16 @@ fn float_opMult() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
-            let true_result =
-                canon_generated_nan4(float_to_raw_bits(f1 * f2), f1.is_nan() || f2.is_nan());
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let true_result = if f1.is_nan() || f2.is_nan() {
+                0x7fc0_0000
+            } else if (f1 == 0.0 && f2.is_infinite()) || (f1.is_infinite() && f2 == 0.0) {
+                0xffc0_0000
+            } else {
+                float_to_raw_bits(f1 * f2)
+            };
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_mult(encoding1, encoding2);
 
             assert_eq!(true_result, result);
@@ -596,11 +636,16 @@ fn float_opSub() {
     let format = FloatFormat::new(4);
 
     for f1 in float_test_values() {
-        let encoding1 = format.get_encoding(f64::from(f1));
+        let encoding1 = format.get_encoding(fixture_host(f1));
         for f2 in float_test_values() {
-            let true_result =
-                canon_generated_nan4(float_to_raw_bits(f1 - f2), f1.is_nan() || f2.is_nan());
-            let encoding2 = format.get_encoding(f64::from(f2));
+            let true_result = if f1.is_nan() || f2.is_nan() {
+                0x7fc0_0000
+            } else if f1.is_infinite() && f1 == f2 {
+                0xffc0_0000
+            } else {
+                float_to_raw_bits(f1 - f2)
+            };
+            let encoding2 = format.get_encoding(fixture_host(f2));
             let result = format.op_sub(encoding1, encoding2);
 
             assert_eq!(true_result, result);

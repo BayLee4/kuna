@@ -3,22 +3,22 @@
 //! accesses the declared object may share its storage with.
 
 use super::*;
-use crate::dtype::flags;
+use crate::dtype::{flags, Datatype, TypeFactoryImpl};
 
-fn core(size: i32, m: type_metatype, nm: &str) -> Rc<Datatype> {
+fn core(f: &TypeFactoryImpl, size: i32, m: type_metatype, nm: &str) -> TypeRoot {
     let mut t = Datatype::new_with_align(size, -1, m);
     t.name = nm.to_string();
     t.display_name = nm.to_string();
     t.id = Datatype::hash_name(nm);
     t.flags |= flags::coretype;
-    Rc::new(t)
+    f.intern(t).unwrap()
 }
 
-fn void() -> Rc<Datatype> {
-    core(0, type_metatype::TYPE_VOID, "void")
+fn void(f: &TypeFactoryImpl) -> TypeRoot {
+    core(f, 0, type_metatype::TYPE_VOID, "void")
 }
 
-fn direct(start: u64, size: u64, ty: Rc<Datatype>) -> Direct {
+fn direct(start: u64, size: u64, ty: TypeRoot) -> Direct {
     Direct { start, size, ty, unnamed: true }
 }
 
@@ -36,56 +36,66 @@ fn an_address_is_in_range_only_inside_a_section() {
 
 #[test]
 fn a_void_use_yields_to_the_one_type_the_function_names() {
-    let uint = core(4, type_metatype::TYPE_UINT, "uint4");
-    let seen = Seen::merge(Some(Seen::merge(None, void())), Rc::clone(&uint));
-    assert!(matches!(&seen, Seen::One(t) if Rc::ptr_eq(t, &uint)));
-    let seen = Seen::merge(Some(seen), void());
-    assert!(matches!(&seen, Seen::One(t) if Rc::ptr_eq(t, &uint)), "a later void use keeps it");
-    assert!(matches!(Seen::merge(None, void()), Seen::Void(_)));
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let uint = core(f, 4, type_metatype::TYPE_UINT, "uint4");
+    let seen = Seen::merge(Some(Seen::merge(None, void(f))), Clone::clone(&uint));
+    assert!(matches!(&seen, Seen::One(t) if TypeRoot::eq(t, &uint)));
+    let seen = Seen::merge(Some(seen), void(f));
+    assert!(matches!(&seen, Seen::One(t) if TypeRoot::eq(t, &uint)), "a later void use keeps it");
+    assert!(matches!(Seen::merge(None, void(f)), Seen::Void(_)));
 }
 
 #[test]
 fn two_types_at_one_address_name_nothing() {
-    let uint = core(4, type_metatype::TYPE_UINT, "uint4");
-    let long = core(8, type_metatype::TYPE_INT, "int8");
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let uint = core(f, 4, type_metatype::TYPE_UINT, "uint4");
+    let long = core(f, 8, type_metatype::TYPE_INT, "int8");
     let seen = Seen::merge(Some(Seen::merge(None, uint)), long);
     assert!(matches!(seen, Seen::Conflict));
-    assert!(Seen::merge(Some(Seen::Conflict), void()).object().is_none());
+    assert!(Seen::merge(Some(Seen::Conflict), void(f)).object().is_none());
 }
 
 #[test]
 fn a_direct_access_shares_storage_only_as_the_same_c_type() {
-    let uint = core(4, type_metatype::TYPE_UINT, "uint4");
-    let int = core(4, type_metatype::TYPE_INT, "int4");
-    let unk = core(4, type_metatype::TYPE_UNKNOWN, "xunknown4");
-    assert!(same_object(&direct(0x10, 4, Rc::clone(&uint)), 0x10, 4, &uint));
-    assert!(same_object(&direct(0x10, 4, Rc::clone(&unk)), 0x10, 4, &uint), "undefined4 is unsigned int");
-    assert!(!same_object(&direct(0x10, 4, Rc::clone(&int)), 0x10, 4, &uint), "signedness moves a compare");
-    assert!(!same_object(&direct(0x10, 4, Rc::clone(&unk)), 0x10, 4, &int));
-    assert!(!same_object(&direct(0x14, 4, Rc::clone(&uint)), 0x10, 4, &uint), "another start");
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let uint = core(f, 4, type_metatype::TYPE_UINT, "uint4");
+    let int = core(f, 4, type_metatype::TYPE_INT, "int4");
+    let unk = core(f, 4, type_metatype::TYPE_UNKNOWN, "xunknown4");
+    assert!(same_object(&direct(0x10, 4, Clone::clone(&uint)), 0x10, 4, &uint));
+    assert!(same_object(&direct(0x10, 4, Clone::clone(&unk)), 0x10, 4, &uint), "undefined4 is unsigned int");
+    assert!(!same_object(&direct(0x10, 4, Clone::clone(&int)), 0x10, 4, &uint), "signedness moves a compare");
+    assert!(!same_object(&direct(0x10, 4, Clone::clone(&unk)), 0x10, 4, &int));
+    assert!(!same_object(&direct(0x14, 4, Clone::clone(&uint)), 0x10, 4, &uint), "another start");
     assert!(!same_object(&direct(0x10, 8, unk), 0x10, 4, &uint), "another width");
-    let ubyte = core(1, type_metatype::TYPE_UINT, "uint1");
-    let unk1 = core(1, type_metatype::TYPE_UNKNOWN, "xunknown1");
+    let ubyte = core(f, 1, type_metatype::TYPE_UINT, "uint1");
+    let unk1 = core(f, 1, type_metatype::TYPE_UNKNOWN, "xunknown1");
     assert!(!same_object(&direct(0x10, 1, unk1), 0x10, 1, &ubyte), "a byte unknown may print as char");
 }
 
 #[test]
 fn only_overlapping_storage_is_a_direct_access() {
-    let b = core(1, type_metatype::TYPE_INT, "int1");
-    assert!(overlaps(&direct(0x13, 1, Rc::clone(&b)), 0x10, 8));
-    assert!(overlaps(&direct(0x0c, 8, Rc::clone(&b)), 0x10, 1), "a wider read that starts below");
-    assert!(!overlaps(&direct(0x18, 1, Rc::clone(&b)), 0x10, 8));
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let b = core(f, 1, type_metatype::TYPE_INT, "int1");
+    assert!(overlaps(&direct(0x13, 1, Clone::clone(&b)), 0x10, 8));
+    assert!(overlaps(&direct(0x0c, 8, Clone::clone(&b)), 0x10, 1), "a wider read that starts below");
+    assert!(!overlaps(&direct(0x18, 1, Clone::clone(&b)), 0x10, 8));
     assert!(!overlaps(&direct(0x13, 1, b), 0x10, 1), "a byte past a one-byte object");
 }
 
 #[test]
 fn a_void_only_address_adopts_the_one_type_it_is_read_at() {
-    let long = core(8, type_metatype::TYPE_INT, "int8");
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let long = core(f, 8, type_metatype::TYPE_INT, "int8");
     let mut plan = Plan::default();
-    plan.direct.push(direct(0x40, 8, Rc::clone(&long)));
-    assert!(plan.direct_type_at(0x40).is_some_and(|t| Rc::ptr_eq(&t, &long)));
+    plan.direct.push(direct(0x40, 8, Clone::clone(&long)));
+    assert!(plan.direct_type_at(0x40).is_some_and(|t| TypeRoot::eq(&t, &long)));
     assert!(plan.direct_type_at(0x48).is_none());
-    plan.direct.push(direct(0x3c, 8, core(8, type_metatype::TYPE_UINT, "uint8")));
+    plan.direct.push(direct(0x3c, 8, core(f, 8, type_metatype::TYPE_UINT, "uint8")));
     assert!(plan.direct_type_at(0x40).is_none(), "a second access over it from another start");
 }
 

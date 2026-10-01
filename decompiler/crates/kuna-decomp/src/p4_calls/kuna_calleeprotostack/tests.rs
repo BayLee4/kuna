@@ -1,8 +1,6 @@
 //! Unit tests for [`super`] — the declared-callee stack contract.
 
-use std::rc::Rc;
-
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{TypeFactory, TypeFactoryImpl};
 
 use super::*;
 
@@ -16,7 +14,7 @@ use super::*;
 /// null store (see [`store_less_prototype_declines`]).
 fn void_store_proto() -> FuncProto {
     let mut fp = FuncProto::new();
-    fp.attach_internal_store(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+    fp.attach_internal_store(TypeFactoryImpl::new().get_type_void().unwrap());
     fp
 }
 

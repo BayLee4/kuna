@@ -18,6 +18,8 @@
 
 use std::path::PathBuf;
 
+mod common;
+
 use kuna_base::address::Address;
 use kuna_console::assertions::{self, Body, Directive};
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram, EntrySelector};
@@ -33,9 +35,6 @@ const LINK_RETS: [u64; 3] = [0x0804_9019, 0x0804_9025, 0x0804_9031];
 /// The plain epilogue after the last link, and an ordinary leaf's own `ret`.
 const EPILOGUE_RET: u64 = 0x0804_9032;
 const FIRST_LINK: u64 = 0x0804_a000;
-
-/// The three callees the chain reaches, by the global each `ret` pops.
-const CALLS: [&str; 3] = ["(*dat_804a000)()", "(*dat_804a004)()", "(*dat_804a008)()"];
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
@@ -103,9 +102,7 @@ fn sites(prog: &ConsoleProgram, at: u64) -> Vec<u64> {
 #[test]
 fn the_default_recovers_the_whole_entry_chain() {
     let Some(code) = decompile_with(Vec::new()) else { return };
-    for call in CALLS {
-        assert!(code.contains(call), "the default chain stopped before {call}:\n{code}");
-    }
+    common::c_behavior::assert_three_call_chain("console-default-chain", &code, "chain_entry");
 }
 
 #[test]
@@ -182,9 +179,7 @@ fn immediate_ret_transfer_never_registers_the_encrypted_target_as_a_function() {
 #[test]
 fn overriding_the_first_link_recovers_the_whole_chain() {
     let Some(code) = decompile_with(vec![flow(LINK_RETS[0], "call")]) else { return };
-    for call in CALLS {
-        assert!(code.contains(call), "the chain stopped before {call}:\n{code}");
-    }
+    common::c_behavior::assert_three_call_chain("console-first-link-override", &code, "chain_entry");
 }
 
 /// Every link names the other two, whichever one the caller happened to find.

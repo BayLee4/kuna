@@ -19,6 +19,7 @@
 use super::*;
 
 use std::rc::Rc;
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
 
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
@@ -28,7 +29,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use crate::varnode::{varnode_flags, DefOpInfo, VarnodeBank};
 
@@ -57,7 +58,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(16);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -67,8 +73,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -92,14 +99,14 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 /// A free (input-style) Varnode at a distinct ram address.
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
 }
 
 /// Make `op` define a fresh written output Varnode at ram `off` (size `size`),
 /// returning that output.  Mirrors funcdata_varnode's `make_written`.
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -455,7 +462,10 @@ fn move_sign_bit_extraction_ignores_non_signbit_shift() {
 #[test]
 fn spanning_range_out_of_bounds_is_false() {
     // offset+size > ct->getSize() -> false.
-    let ct = Rc::new(Datatype::new(8, type_metatype::TYPE_UNKNOWN));
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let ct = types.intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap();
     assert!(!RulePieceStructure::spanning_range(&ct, 4, 8).unwrap());
 }
 
@@ -463,7 +473,10 @@ fn spanning_range_out_of_bounds_is_false() {
 fn spanning_range_no_subtype_is_true() {
     // A non-structured base type has no sub-type -> getSubType returns None
     // -> "assume multiple".
-    let ct = Rc::new(Datatype::new(8, type_metatype::TYPE_UNKNOWN));
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let ct = types.intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap();
     assert!(RulePieceStructure::spanning_range(&ct, 0, 4).unwrap());
 }
 
@@ -858,10 +871,23 @@ fn specs_lists_all_fourteen_in_definition_order() {
 }
 
 #[test]
-fn clone_rule_filters_on_group() {
-    let rule = RuleMultNegOne::new("analysis");
-    let gl = ActionGroupList::from_names(["analysis"]);
-    assert!(rule.clone_rule(&gl).is_some());
-    let other = ActionGroupList::from_names(["somethingelse"]);
-    assert!(rule.clone_rule(&other).is_none());
+fn registered_group_controls_multnegone_transform() {
+    let mut fd = build_fd();
+    let op = mk_op(&mut fd, 2, 0x100, OpCode::CPUI_INT_MULT);
+    let x = mk_const(&mut fd, 4, 7);
+    let minus_one = mk_const(&mut fd, 4, 0xffff_ffff);
+    set_in(&mut fd, op, x, 0);
+    set_in(&mut fd, op, minus_one, 1);
+    give_output(&mut fd, op, 0x20, 4);
+    let mut pool = ActionPool::new(0, "cleanup");
+    pool.add_rule(
+        RuleState::new("registered", 0, "multnegone"),
+        Box::new(RuleMultNegOne::new("analysis")),
+    );
+    assert!(pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).is_none());
+    let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["registered"])).unwrap();
+    assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
+    assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_2COMP);
+    assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(x));
+    assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
 }

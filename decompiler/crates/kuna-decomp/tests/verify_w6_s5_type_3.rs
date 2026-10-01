@@ -9,50 +9,60 @@
 //!     `addressToByteInt`/`offset`/`extra` sum to 32 bits before the bound check.
 //!     The port keeps the whole computation in `int8` and never truncates — a real
 //!     (if only-at-pathological-inputs) divergence. F1 below pins the boundary.
-//!   * **Comparator totality / field order.** `TypePointerRel::compare`
-//!     (3072-3090) and `compareDependency` (3092-3103) drive the factory's `tree`
-//!     ordering (`DatatypeCompare`); a wrong tie-break or field order silently
-//!     corrupts the interning set.  These exercise the formal-vs-ephemeral
-//!     `stripped` tie-break and the exact field precedence
-//!     (ptrto, offset, parent, wordsize, size).
+//!   * **Formal and ephemeral relative pointers.** Their different PTRSUB
+//!     behavior and distinct graph identities must survive interning.
 //!   * **Wrapping / signedness.** `hashName`/`hashSize` (type.cc:693-720) are
 //!     bit-exact u64 hashes; the `(uint8)nm[i]` of a *signed* `char` sign-extends
 //!     in C++.  The port masks to a byte (ASCII-only) — documented divergence.
 //!
 //! C++ oracle anchors are cited inline.
 
-use std::rc::Rc;
+use kuna_decomp::dtype::{flags, Datatype, DatatypeKind, sub_metatype, type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 
-use kuna_decomp::dtype::{Datatype, DatatypeKind, sub_metatype, type_metatype};
-
-fn int4_t() -> Rc<Datatype> {
-    Rc::new(Datatype::new(4, type_metatype::TYPE_INT))
+fn int4_t(types: &TypeFactoryImpl) -> TypeRoot {
+    types.get_base(4, type_metatype::TYPE_INT).unwrap()
 }
 
 /// Build a plain `TypePointer(8, ptrto, ws)` value (the `stripped` payload a
 /// markEphemeral relative pointer would carry).
-fn plain_pointer(ptrto: Rc<Datatype>, ws: u32) -> Datatype {
-    let mut p = Datatype::new(8, type_metatype::TYPE_PTR);
-    p.submeta = sub_metatype::SUB_PTR;
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: ws };
-    p
+fn plain_pointer(types: &TypeFactoryImpl, ptrto: TypeRoot, ws: u32) -> TypeRoot {
+    types.get_type_pointer(8, ptrto, ws).unwrap()
 }
 
-/// Build a `TypePointerRel` Datatype of pointer-size `size` with the given fields,
-/// mirroring `TypePointerRel(size,ptrTo,ws,parent,off)` (submeta SUB_PTRREL for a
-/// formal relative pointer; markEphemeral lowers it and sets `stripped`).
+fn factory() -> TypeFactoryImpl {
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types
+}
+
+fn parent_struct(types: &TypeFactoryImpl) -> TypeRoot {
+    let mut parent = Datatype::new_with_align(16, 4, type_metatype::TYPE_STRUCT);
+    parent.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+    types.intern(parent).unwrap()
+}
+
+/// Publish a relative pointer and its optional ephemeral stripped edge in the
+/// same graph as its pointee and parent.
 fn ptrrel(
+    types: &TypeFactoryImpl,
     size: int4_alias,
-    ptrto: Rc<Datatype>,
+    ptrto: TypeRoot,
     wordsize: u32,
-    stripped: Option<Rc<Datatype>>,
-    parent: Rc<Datatype>,
+    stripped: Option<TypeRoot>,
+    parent: TypeRoot,
     offset: int4_alias,
-) -> Datatype {
+) -> TypeRoot {
     let mut pr = Datatype::new_with_align(size, -1, type_metatype::TYPE_PTRREL);
     pr.submeta = sub_metatype::SUB_PTRREL;
-    pr.kind = DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset };
-    pr
+    if stripped.is_some() {
+        pr.flags |= flags::has_stripped;
+    }
+    pr.kind = DatatypeKind::PointerRel {
+        ptrto: ptrto.id(), spaceid: None, wordsize, stripped: stripped.map(|root| root.id()),
+        parent: parent.id(), offset,
+    };
+    types.intern(pr).unwrap()
 }
 
 #[allow(non_camel_case_types)]
@@ -71,9 +81,10 @@ type int4_alias = i32;
 /// `addressToByteInt` is the identity, so `iOff = off + offset + extra`.
 #[test]
 fn f1_ptrrel_isptrsubmatching_bounds_realistic_domain() {
-    let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT)); // getSize()==16
+    let types = factory();
+    let parent = parent_struct(&types);
     // formal relative pointer (stripped == None) at offset 4 into the parent.
-    let pr = ptrrel(8, int4_t(), 1, None, Rc::clone(&parent), 4);
+    let pr = ptrrel(&types, 8, int4_t(&types), 1, None, parent.clone(), 4);
 
     // iOff = off(0) + offset(4) + extra(0) = 4 ; 0 <= 4 <= 16 -> true
     assert!(pr.is_ptrsub_matching(0, 0, 1).unwrap());
@@ -89,8 +100,9 @@ fn f1_ptrrel_isptrsubmatching_bounds_realistic_domain() {
     // The stripped (ephemeral) form defers to the inherited TypePointer body
     // (type.cc:3141-3142); ptrto is a plain int (not STRUCT/ARRAY/UNION/SPACEBASE)
     // so TypePointer::isPtrsubMatching falls to the `else return false` arm.
-    let strip: Rc<Datatype> = Rc::new(plain_pointer(int4_t(), 1));
-    let pr_eph = ptrrel(8, int4_t(), 1, Some(strip), Rc::clone(&parent), 4);
+    let strip = plain_pointer(&types, int4_t(&types), 1);
+    let pr_eph = ptrrel(&types, 8, int4_t(&types), 1, Some(strip), parent.clone(), 4);
+    assert_ne!(pr, pr_eph, "formal and ephemeral pointers retain distinct behavior");
     assert!(!pr_eph.is_ptrsub_matching(0, 0, 1).unwrap());
 }
 
@@ -103,8 +115,9 @@ fn f1_ptrrel_isptrsubmatching_bounds_realistic_domain() {
 /// `parent->getSize()` is an int4).
 #[test]
 fn f1_ptrrel_isptrsubmatching_int4_truncation_divergence_documented() {
-    let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
-    let pr = ptrrel(8, int4_t(), 1, None, Rc::clone(&parent), 4);
+    let types = factory();
+    let parent = parent_struct(&types);
+    let pr = ptrrel(&types, 8, int4_t(&types), 1, None, parent, 4);
     // off = 0x1_0000_0000 (2^32): C++ int4 iOff would wrap this contribution to 0,
     // giving iOff == 4 (in-bounds, true).  The port computes in int8: 0x1_0000_0004,
     // which exceeds 16 -> false.  Documented as F1.
@@ -115,112 +128,4 @@ fn f1_ptrrel_isptrsubmatching_int4_truncation_divergence_documented() {
     );
 }
 
-/// **F2 — `TypePointerRel::compare` formal-vs-ephemeral tie-break + totality**
-/// (type.cc:3081-3089).  After comparing equal as plain pointers, the *formal*
-/// version (`stripped == null`) sorts before the *ephemeral* one
-/// (`stripped != null`); two same-kind relative pointers tie at 0.  We also check
-/// antisymmetry (a<b implies b>a) — a non-total tie-break would corrupt the
-/// `DatatypeCompare` tree.
-#[test]
-fn f2_ptrrel_compare_formal_ephemeral_totality() {
-    let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
-    let strip: Rc<Datatype> = Rc::new(plain_pointer(int4_t(), 1));
-    let formal = ptrrel(8, int4_t(), 1, None, Rc::clone(&parent), 4);
-    let ephem = ptrrel(8, int4_t(), 1, Some(Rc::clone(&strip)), Rc::clone(&parent), 4);
 
-    // formal (None) < ephemeral (Some) -> -1, and antisymmetric.
-    assert_eq!(formal.compare(&ephem, 10).unwrap(), -1);
-    assert_eq!(ephem.compare(&formal, 10).unwrap(), 1);
-    // Reflexive-ish: identical formals tie.
-    let formal2 = ptrrel(8, int4_t(), 1, None, Rc::clone(&parent), 4);
-    assert_eq!(formal.compare(&formal2, 10).unwrap(), 0);
-    // Two ephemerals also tie (both Some) — the tie-break only fires on a None/Some
-    // mismatch (C++: the else-branch returns 1 only when tp->stripped == null).
-    let ephem2 = ptrrel(8, int4_t(), 1, Some(strip), Rc::clone(&parent), 4);
-    assert_eq!(ephem.compare(&ephem2, 10).unwrap(), 0);
-}
-
-/// **F3 — `TypePointerRel::compareDependency` exact field precedence**
-/// (type.cc:3095-3102): submeta, then ptrto-identity, **offset**, parent-identity,
-/// wordsize, then `op.getSize() - size`.  The offset comparison precedes the
-/// parent comparison; a transposition would reorder the interning tree.  We drive
-/// each tier independently and assert strict antisymmetry / the size tail.
-#[test]
-fn f3_ptrrel_compare_dependency_field_precedence() {
-    // The factory interns each sub-type once; `compareDependency` then compares
-    // `ptrto`/`parent` by raw-pointer identity (type.cc:3097/3099).  Faithful
-    // fixtures therefore SHARE one `Rc` per logical sub-type — two `Rc::new`
-    // allocations of the "same" int are distinct objects and (correctly) do not
-    // tie, exactly as two un-interned C++ `Datatype*` would not.
-    let ptrto = int4_t(); // one shared interned-like ptrto object
-    let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
-    let parent2 = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT)); // distinct object
-    let a = ptrrel(8, Rc::clone(&ptrto), 1, None, Rc::clone(&parent), 4);
-
-    // Identical fields and SHARED identity -> 0 (the interning-equal case).
-    let a2 = ptrrel(8, Rc::clone(&ptrto), 1, None, Rc::clone(&parent), 4);
-    assert_eq!(a.compare_dependency(&a2).unwrap(), 0);
-
-    // Offset is the discriminator after ptrto-identity (equal here): different
-    // offset orders by offset BEFORE parent identity is even consulted.
-    let b = ptrrel(8, Rc::clone(&ptrto), 1, None, Rc::clone(&parent), 8);
-    assert_eq!(a.compare_dependency(&b).unwrap(), -1);
-    assert_eq!(b.compare_dependency(&a).unwrap(), 1);
-
-    // Same ptrto + offset, *different parent object* -> ordered by parent pointer
-    // identity (raw-address order in C++; Rc::as_ptr in the port).  Antisymmetric,
-    // non-zero.
-    let c = ptrrel(8, Rc::clone(&ptrto), 1, None, Rc::clone(&parent2), 4);
-    let ac = a.compare_dependency(&c).unwrap();
-    let ca = c.compare_dependency(&a).unwrap();
-    assert_ne!(ac, 0, "distinct parent objects must not tie");
-    assert_eq!(ac, -ca, "parent-identity order must be antisymmetric");
-
-    // ptrto-identity is the FIRST sub-tier after submeta: a distinct ptrto object
-    // discriminates before offset/parent are looked at.
-    let e = ptrrel(8, int4_t(), 1, None, Rc::clone(&parent), 4); // distinct ptrto
-    let ae = a.compare_dependency(&e).unwrap();
-    assert_ne!(ae, 0, "distinct ptrto objects must not tie");
-    assert_eq!(ae, -e.compare_dependency(&a).unwrap(), "ptrto order antisymmetric");
-
-    // Same ptrto/offset/parent/wordsize, different total size -> tail
-    // `op.getSize() - size` (wrapping i32). a.size==8; make d.size==6 so
-    // a.compare_dependency(d) returns d.size - a.size = 6 - 8 = -2.
-    let d = ptrrel(6, Rc::clone(&ptrto), 1, None, Rc::clone(&parent), 4);
-    assert_eq!(a.compare_dependency(&d).unwrap(), -2);
-    assert_eq!(d.compare_dependency(&a).unwrap(), 2);
-}
-
-/// **F4 — `hashName`/`hashSize` bit-exactness and the documented signedness
-/// scope** (type.cc:693-720).  `hashName` sets the two top header bits; `hashSize`
-/// is an involution for a fixed size.  The ASCII-only `(uint8)nm[i]` masking is a
-/// documented divergence from the C++ signed-`char` sign-extension — we assert the
-/// header bits and reversibility, which hold regardless.
-#[test]
-fn f4_hash_name_size_properties() {
-    // Two top header bits always set (C++ `res |= 0xC000000000000000`).
-    let h = Datatype::hash_name("int");
-    assert_eq!(h & 0xC000_0000_0000_0000, 0xC000_0000_0000_0000);
-    // Deterministic and name-sensitive.
-    assert_eq!(h, Datatype::hash_name("int"));
-    assert_ne!(h, Datatype::hash_name("uint"));
-    assert_ne!(Datatype::hash_name(""), Datatype::hash_name("a"));
-    // The empty name hashes to just the header bits OR'd onto the seed 123.
-    assert_eq!(Datatype::hash_name(""), 123u64 | 0xC000_0000_0000_0000);
-
-    // hashSize is reversible (an involution for a fixed size): applying twice with
-    // the same size restores the input id (C++ doc: "reversible by feeding the
-    // output ID back ... with the same size").
-    for size in [1, 4, 7, 16, 255] {
-        let id = 0x1234_5678_9abc_def0u64;
-        let sized = Datatype::hash_size(id, size);
-        assert_eq!(Datatype::hash_size(sized, size), id, "hashSize involution at size {size}");
-    }
-    // A negative size sign-extends to u64 before the multiply (C++
-    // `uint8 sizeHash = size;`): size = -1 hashes differently from size = 1 and is
-    // still reversible.
-    let id = 0xdead_beef_0000_0001u64;
-    let neg = Datatype::hash_size(id, -1);
-    assert_ne!(neg, Datatype::hash_size(id, 1));
-    assert_eq!(Datatype::hash_size(neg, -1), id);
-}

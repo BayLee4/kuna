@@ -26,7 +26,7 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, TypeOp};
 
@@ -58,7 +58,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -72,8 +77,9 @@ fn ram_of(m: &AddrSpaceManager) -> Rc<AddrSpace> {
     Rc::clone(m.get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn opcode_flags(opc: OpCode) -> kuna_base::types::uint4 {
@@ -92,7 +98,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(4, Address::new(ram, off), dt(4))
+    let datatype = dt(fd, 4);
+    fd.vbank_mut().create(4, Address::new(ram, off), datatype)
 }
 
 fn mk_const(fd: &mut Funcdata, val: u64) -> VarnodeId {

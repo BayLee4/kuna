@@ -21,7 +21,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use super::{BitFieldNodeState, BitFieldTransform, BitRange, ALLOWED_FINAL_WRITES};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::expression::{pointer_equality, root_pointer};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
@@ -52,7 +52,7 @@ struct InsertRecord {
     /// Constant value being inserted (C++ `constVal`).
     const_val: uintb,
     /// Data-type associated with value, or `None` (C++ `dt`).
-    dt: Option<Rc<Datatype>>,
+    dt: Option<TypeRoot>,
     /// Position being inserted to (C++ `pos`).
     pos: int4,
     /// Number of bits being inserted (C++ `numBits`).
@@ -64,13 +64,13 @@ struct InsertRecord {
 impl InsertRecord {
     /// Constructor for a Varnode value (C++ `InsertRecord(Varnode*,Datatype*,int4,
     /// int4,int4)`, bitfield.hh:78).
-    fn from_vn(vn: VarnodeId, dt: Option<Rc<Datatype>>, p: int4, sz: int4, sa: int4) -> InsertRecord {
+    fn from_vn(vn: VarnodeId, dt: Option<TypeRoot>, p: int4, sz: int4, sa: int4) -> InsertRecord {
         InsertRecord { vn: Some(vn), const_val: 0, dt, pos: p, num_bits: sz, shift_amount: sa }
     }
 
     /// Constructor for a constant value (C++ `InsertRecord(uintb,Datatype*,int4,
     /// int4)`, bitfield.hh:79).
-    fn from_const(val: uintb, dt: Option<Rc<Datatype>>, p: int4, sz: int4) -> InsertRecord {
+    fn from_const(val: uintb, dt: Option<TypeRoot>, p: int4, sz: int4) -> InsertRecord {
         InsertRecord { vn: None, const_val: val, dt, pos: p, num_bits: sz, shift_amount: 0 }
     }
 }
@@ -95,7 +95,7 @@ impl BitFieldInsertTransform {
     pub fn new(
         data: &Funcdata,
         op: OpId,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         off: int4,
         big_endian: bool,
     ) -> Option<BitFieldInsertTransform> {
@@ -268,12 +268,12 @@ impl BitFieldInsertTransform {
         let mask = state.bits_field.get_mask();
         value &= mask;
         value >>= state.bits_field.least_sig_bit;
-        if field.field_type.get_metatype() == type_metatype::TYPE_INT {
+        if state.field_type().unwrap().get_metatype() == type_metatype::TYPE_INT {
             value = extend_signbit(value, state.bits_field.num_bits, state.bits_field.byte_size);
         }
         self.insert_list.push(InsertRecord::from_const(
             value,
-            Some(Rc::clone(&field.field_type)),
+            state.field_type().cloned(),
             state.orig_least_sig_bit,
             field.num_bits,
         ));
@@ -290,7 +290,7 @@ impl BitFieldInsertTransform {
         };
         self.insert_list.push(InsertRecord::from_const(
             0,
-            Some(Rc::clone(&field.field_type)),
+            state.field_type().cloned(),
             state.orig_least_sig_bit,
             field.num_bits,
         ));
@@ -301,9 +301,9 @@ impl BitFieldInsertTransform {
     /// bitfield.cc:234-242).
     fn add_field_write(&mut self, data: &Funcdata, state: &mut BitFieldNodeState) {
         let field = state.field().unwrap().clone();
-        let mut dt: Option<Rc<Datatype>> = Some(Rc::clone(&field.field_type));
+        let mut dt = state.field_type().cloned();
         let node_size = data.vbank().get(state.node).unwrap().get_size();
-        if field.field_type.get_size() != node_size {
+        if state.field_type().unwrap().get_size() != node_size {
             dt = None;
         }
         self.insert_list.push(InsertRecord::from_vn(
@@ -538,7 +538,7 @@ impl BitFieldInsertTransform {
             return false;
         }
         let parent = self.base.parent_struct.as_ref().unwrap();
-        if !Rc::ptr_eq(&dt, parent) {
+        if dt.id() != parent.id() {
             return false;
         }
         if off != self.base.initial_offset {
@@ -733,7 +733,7 @@ impl BitFieldInsertTransform {
             None => {
                 if let Some(dt) = &rec.dt {
                     let v = data.new_constant(dt.get_size(), rec.const_val);
-                    data.vbank_mut().get_mut(v).map(|x| x.update_type(Rc::clone(dt)));
+                    data.vbank_mut().get_mut(v).map(|x| x.update_type(dt.clone()));
                     v
                 } else {
                     data.new_constant(self.base.container_size, rec.const_val)
@@ -1036,22 +1036,22 @@ impl BitFieldInsertTransform {
 
     /// Build the (partial) data-type associated with the root bitfield container
     /// (C++ `buildPartialType`, bitfield.cc:556-562).
-    fn build_partial_type(&self, data: &Funcdata) -> Rc<Datatype> {
+    fn build_partial_type(&self, data: &Funcdata) -> TypeRoot {
         let parent = self.base.parent_struct.as_ref().unwrap();
         if self.base.container_size == parent.get_size() {
-            return Rc::clone(parent);
+            return parent.clone();
         }
         let arch = Rc::clone(data.get_arch());
         if let Some(types) = arch.types() {
             if let Ok(t) = types.get_type_partial_struct(
-                Rc::clone(parent),
+                parent.clone(),
                 self.base.initial_offset,
                 self.base.container_size,
             ) {
                 return t;
             }
         }
-        Rc::clone(parent)
+        parent.clone()
     }
 
     /// Transform recovered expressions into INSERT operations (C++ `apply`,
@@ -1070,11 +1070,11 @@ impl BitFieldInsertTransform {
     }
 
     /// STORE-terminated apply (C++ `apply`, bitfield.cc:941-987).
-    fn apply_store(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) {
+    fn apply_store(&mut self, data: &mut Funcdata, partial_type: &TypeRoot, records: &[InsertRecord]) {
         let dead_point = data.obank().get(self.final_write_op).unwrap().get_in(2).unwrap();
         let mut current_store = Some(self.final_write_op);
         let mut load_model: Option<OpId> = None;
-        let mut load_type: Option<Rc<Datatype>> = None;
+        let mut load_type: Option<TypeRoot> = None;
         if self.original_value.is_none() {
             self.original_value = Some(data.new_constant(self.base.container_size, 0));
         } else {
@@ -1103,7 +1103,7 @@ impl BitFieldInsertTransform {
                     data.op_set_input(load_op, l1, 1).ok();
                     let ov = data.new_unique_out(self.base.container_size, load_op).unwrap();
                     if let Some(lt) = &load_type {
-                        data.vbank_mut().get_mut(ov).map(|v| v.update_type(Rc::clone(lt)));
+                        data.vbank_mut().get_mut(ov).map(|v| v.update_type(lt.clone()));
                     }
                     self.original_value = Some(ov);
                     data.op_insert_before(load_op, cs);
@@ -1114,7 +1114,7 @@ impl BitFieldInsertTransform {
             let cs = current_store.unwrap();
             let insert_op = self.set_insert_inputs(data, None, rec);
             let new_out = data.new_unique_out(self.base.container_size, insert_op).unwrap();
-            data.vbank_mut().get_mut(new_out).map(|v| v.update_type(Rc::clone(partial_type)));
+            data.vbank_mut().get_mut(new_out).map(|v| v.update_type(partial_type.clone()));
             let insert_out = data.obank().get(insert_op).unwrap().get_out().unwrap();
             data.op_set_input(cs, insert_out, 2).ok();
             data.op_insert_before(insert_op, cs);
@@ -1133,7 +1133,7 @@ impl BitFieldInsertTransform {
     }
 
     /// Mapped-variable apply (C++ `apply`, bitfield.cc:988-1013).
-    fn apply_mapped(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) {
+    fn apply_mapped(&mut self, data: &mut Funcdata, partial_type: &TypeRoot, records: &[InsertRecord]) {
         let num_in = data.obank().get(self.final_write_op).unwrap().num_input();
         let mut dead_points: Vec<VarnodeId> = Vec::new();
         for i in 0..num_in {
@@ -1150,14 +1150,14 @@ impl BitFieldInsertTransform {
         let first = iter.next().unwrap();
         let mut insert_op = self.set_insert_inputs(data, Some(self.final_write_op), first);
         let insert_out = data.obank().get(insert_op).unwrap().get_out().unwrap();
-        data.vbank_mut().get_mut(insert_out).map(|v| v.update_type(Rc::clone(partial_type)));
+        data.vbank_mut().get_mut(insert_out).map(|v| v.update_type(partial_type.clone()));
         self.add_field_shift(data, insert_op, first);
         for rec in iter {
             let last_op = insert_op;
             data.op_unset_input(last_op, 0);
             insert_op = self.set_insert_inputs(data, None, rec);
             let new_out = data.new_varnode_out(self.base.container_size, &mapped_addr, insert_op).unwrap();
-            data.vbank_mut().get_mut(new_out).map(|v| v.update_type(Rc::clone(partial_type)));
+            data.vbank_mut().get_mut(new_out).map(|v| v.update_type(partial_type.clone()));
             data.op_set_input(last_op, new_out, 0).ok();
             data.op_insert_before(insert_op, last_op);
             self.add_field_shift(data, insert_op, rec);

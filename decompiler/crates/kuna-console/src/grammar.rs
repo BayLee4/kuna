@@ -32,22 +32,12 @@
 //!   `testparamstore` drive (`parse_protopieces` then
 //!   `ProtoModel::assignParameterStorage`).
 //!
-//! # What is stubbed (NOT yet ported — see LOSS-006 / LOSS-090 restoration)
-//!
-//! The struct/union/enum *construction* actions ([`CParse::new_struct`],
-//! [`CParse::new_union`], [`CParse::new_enum`]) and the `parse_C` store-writes
-//! (typedef -> `getTypedef`/`setName`; extern -> `setPrototype`) require
-//! TypeFactory-*mutating* orchestrators (`assignRawFields`, `setEnumValues`,
-//! `getTypedef`, `setName`) and an `Architecture` prototype-model registry
-//! (`getModel` / `defaultfp` / `setPrototype`) that the W6/W4 ports left as
-//! stubs (the kuna `Architecture` has **no** type-factory field or model
-//! registry; `// STUB(w6-fspec-2)`).  The grammar *parses* these forms (the AST
-//! is built and `is_valid` runs), but completing them errs with the same
-//! C++-faithful explain text, deferred to the type-factory/model wave.  The
-//! nested-function-pointer `buildType` path (`FunctionModifier::modType` ->
-//! `getTypeCode(PrototypePieces)`) is likewise a stub for the same reason
-//! (top-level prototypes go through [`TypeDeclarator::get_prototype`], which does
-//! **not** need `getTypeCode`).
+//! Aggregate and typedef construction use the shared datatype factory. Nominal
+//! aggregate identities are reserved before parsing their fields so recursive
+//! declarations retain stable references. Nested callables preserve logical
+//! input/output types, explicit `(void)` closure, variadic boundaries, and the
+//! model bound at declaration time; ABI storage is assigned separately when
+//! the required by-value layouts are complete.
 //!
 //! The interface-command address parsers that share `grammar.cc`
 //! (`parse_machaddr` / `parse_varnode` / `parse_op` / `parse_toseparator`) are
@@ -55,12 +45,11 @@
 //! console surface and are out of scope for this item.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4, uintb};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeBitField, TypeFactory, TypeField};
-use kuna_decomp::fspec::PrototypePieces;
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeBitField, TypeFactory, TypeField, TypeRoot};
+use kuna_decomp::fspec::{LogicalCallable, PrototypePieces};
 
 // =============================================================================
 // Default-data-space context (the `glb->getDefaultDataSpace()` info the C++
@@ -71,10 +60,8 @@ use kuna_decomp::fspec::PrototypePieces;
 /// builds pointers (`PointerModifier::modType`, `grammar.cc:679-686` reads
 /// `getAddrSize()` and `getWordSize()`).
 ///
-/// The kuna `Architecture` (W4) does not yet own a [`TypeFactory`] field, so the
-/// C++ `Architecture *glb` argument is split into the read-mostly factory the
-/// callers pass plus this small data-organization record (the only `glb` state
-/// the C-declaration grammar actually consults).  // STUB(w6-fspec-2)
+/// The architecture supplies its shared factory separately from this pointer
+/// layout context.
 #[derive(Debug, Clone, Copy)]
 pub struct DataOrg {
     /// Byte size of an address in the default data space (C++
@@ -221,26 +208,10 @@ impl GrammarToken {
     }
 }
 
-/// Parse a C integer literal exactly the way the C++ `istringstream` with
-/// `unsetf(dec|hex|oct)` does (`grammar.cc:1796-1804`): the `operator>>(intb&)`
-/// num_get facet performs a `strtoll`-style *leading-prefix* scan — optional
-/// sign, base auto-detected from the prefix (`0x`/`0X` -> hex, leading `0` ->
-/// octal, else decimal), reading the longest run of digits valid for that base
-/// and STOPPING at the first invalid character, then re-tagging unsigned
-/// (`value.integer = (uintb)val`).
-///
-/// The lexer's `number` state (`grammar.cc:2094-2125`, mirrored at
-/// [`LexState::Number`]) accretes ASCII letters and `_` into a NUMBER token, so
-/// inputs like `1z`, `123abc`, `08`, `5_0`, `007_0` are single reachable tokens.
-/// The C++ `>>` parses the valid prefix and discards the rest: `1z`->1,
-/// `123abc`->123, `08`->0 (octal stops at the non-octal `8`), `5_0`->5,
-/// `007_0`->7.  This must NOT full-string-parse (LOSS-124): a trailing letter /
-/// underscore / out-of-base digit truncates the value, it does not invalidate
-/// the literal.
-///
-/// Overflow is the signed saturation the C++11 facet performs on `intb`:
-/// positive overflow leaves `val == INT64_MAX`, negative overflow leaves
-/// `val == INT64_MIN` (e.g. `0xffffffffffffffff` -> `i64::MAX`).
+/// Parse the longest valid digit prefix with C base detection. Nonnegative
+/// literals retain all 64 bits; overflow saturates at UINT64_MAX. Negative
+/// literals retain signed saturation at INT64_MIN and return their bit pattern.
+/// Trailing suffixes and invalid digits retain the upstream prefix-scan policy.
 fn parse_c_integer(bytes: &[u8]) -> uintb {
     // The lexer corpus is ASCII; treat the bytes directly (matches the C++
     // `istringstream` over the raw `char` buffer, which never sees a leading
@@ -279,9 +250,8 @@ fn parse_c_integer(bytes: &[u8]) -> uintb {
         10
     };
 
-    // Accumulate the longest valid-digit prefix with signed saturation, exactly
-    // as the C++11 num_get facet leaves `val`.
-    let mut val: i64 = 0;
+    let limit = if neg { 1u64 << 63 } else { u64::MAX };
+    let mut val: u64 = 0;
     while i < n {
         // cast: ASCII byte to char for digit classification; bytes are the
         // lexer's `number` corpus (ASCII only).
@@ -289,26 +259,13 @@ fn parse_c_integer(bytes: &[u8]) -> uintb {
             Some(d) => d,
             None => break,
         };
-        // cast: `digit` is in `0..radix` (<= 16) and `radix` is one of 8/10/16,
-        // both fit i64 exactly.
-        let d = digit as i64;
-        let base = radix as i64;
-        if neg {
-            val = val
-                .checked_mul(base)
-                .and_then(|v| v.checked_sub(d))
-                .unwrap_or(i64::MIN);
-        } else {
-            val = val
-                .checked_mul(base)
-                .and_then(|v| v.checked_add(d))
-                .unwrap_or(i64::MAX);
-        }
+        val = val.saturating_mul(u64::from(radix))
+            .saturating_add(u64::from(digit))
+            .min(limit);
         i += 1;
     }
 
-    // cast: re-tag the signed `intb` as unsigned, matching `(uintb)val`.
-    val as uintb
+    if neg { val.wrapping_neg() } else { val }
 }
 
 // =============================================================================
@@ -772,10 +729,11 @@ impl TypeModifier {
     /// data-type the inner (already-applied) modifications produced.
     fn mod_type(
         &self,
-        base: Option<Rc<Datatype>>,
+        base: Option<TypeRoot>,
         factory: &dyn TypeFactory,
         org: &DataOrg,
-    ) -> KunaResult<Rc<Datatype>> {
+        model: &str,
+    ) -> KunaResult<TypeRoot> {
         match self {
             TypeModifier::Pointer { .. } => {
                 // PointerModifier::modType (grammar.cc:679-686).
@@ -791,30 +749,21 @@ impl TypeModifier {
                 })?;
                 factory.get_type_array(*arraysize, base)
             }
-            TypeModifier::Function { paramlist, .. } => {
-                // FunctionModifier::modType (grammar.cc:2306-2325): build a
-                // PrototypePieces describing the pointed-to function and intern a
-                // TypeCode for it via glb->types->getTypeCode(proto).
+            TypeModifier::Function { paramlist, dotdotdot } => {
                 let outtype = match base {
                     Some(b) => b,
                     None => factory.get_type_void()?,
                 };
                 let intypes = function_get_in_types(paramlist, factory, org)?;
-                // Varargs is encoded as an extra null pointer in paramlist; the
-                // Rust `paramlist` never holds that null (CParse::newFunc popped it
-                // into the modifier's `dotdotdot`, grammar.cc:2605-2618), so this
-                // C++ `paramlist.back() == 0` check never fires — transcribed
-                // faithfully (firstVarArgSlot stays -1 exactly as upstream).
-                //
-                // proto.model = decl->getModel(glb): a parsed function-pointer
-                // field carries no model name, so getModel returns glb->defaultfp;
-                // the factory supplies it inside getTypeCode(proto).  The kuna
-                // PrototypePieces carries no `model` field (// STUB(w6-fspec-2)).
-                let proto = PrototypePieces {
-                    outtype: Some(outtype),
-                    intypes,
-                    first_var_arg_slot: -1,
-                    ..PrototypePieces::default()
+                // Bind the current model once; ABI slots are assigned separately.
+                let proto = LogicalCallable {
+                    binding: factory.model_binding((!model.is_empty()).then_some(model))?,
+                    output: outtype.id(),
+                    inputs: intypes.iter().map(TypeRoot::id).collect(),
+                    variadic: *dotdotdot,
+                    input_closed: !*dotdotdot,
+                    logical_first: dotdotdot.then_some(intypes.len() as int4),
+                    flags: 0,
                 };
                 factory.get_type_code_proto(&proto)
             }
@@ -843,7 +792,7 @@ fn function_get_in_types(
     paramlist: &[TypeDeclarator],
     factory: &dyn TypeFactory,
     org: &DataOrg,
-) -> KunaResult<Vec<Rc<Datatype>>> {
+) -> KunaResult<Vec<TypeRoot>> {
     let mut intypes = Vec::new();
     for p in paramlist {
         intypes.push(p.build_type(factory, org)?);
@@ -886,7 +835,7 @@ pub struct TypeDeclarator {
     /// Applied in reverse order of binding (C++ `mods`).
     mods: Vec<TypeModifier>,
     /// Base data-type (C++ `basetype`; `None` is the C++ null).
-    basetype: Option<Rc<Datatype>>,
+    basetype: Option<TypeRoot>,
     /// Variable identifier associated with type (C++ `ident`).
     ident: String,
     /// Name of model associated with function pointer (C++ `model`).
@@ -918,7 +867,7 @@ impl TypeDeclarator {
     }
 
     /// C++ `getBaseType` (`grammar.hh:180`).
-    pub fn get_base_type(&self) -> Option<&Rc<Datatype>> {
+    pub fn get_base_type(&self) -> Option<&TypeRoot> {
         self.basetype.as_ref()
     }
 
@@ -955,10 +904,10 @@ impl TypeDeclarator {
 
     /// C++ `TypeDeclarator::buildType` (`grammar.cc:769-780`): apply the
     /// modifications to the basetype in **reverse** order of binding.
-    pub fn build_type(&self, factory: &dyn TypeFactory, org: &DataOrg) -> KunaResult<Rc<Datatype>> {
+    pub fn build_type(&self, factory: &dyn TypeFactory, org: &DataOrg) -> KunaResult<TypeRoot> {
         let mut restype = self.basetype.clone();
         for m in self.mods.iter().rev() {
-            restype = Some(m.mod_type(restype, factory, org)?);
+            restype = Some(m.mod_type(restype, factory, org, &self.model)?);
         }
         restype.ok_or_else(|| KunaError::lowlevel("grammar: declarator has no base type"))
     }
@@ -967,9 +916,9 @@ impl TypeDeclarator {
     ///
     /// Returns `Ok(false)` if the leading modification is not a function
     /// modifier (the C++ `return false`); otherwise fills `pieces` with the
-    /// function's input/return types and names.  The kuna [`PrototypePieces`]
-    /// carries no `model` field (`// STUB(w6-fspec-2)`), so `pieces.model` is not
-    /// set — the model is supplied separately by the proto-model wave.
+    /// function's input/return types and names. The outer declaration's model
+    /// is supplied separately to the entry-prototype consumer; nested callable
+    /// types bind their own model during construction.
     pub fn get_prototype(
         &self,
         pieces: &mut PrototypePieces,
@@ -986,7 +935,6 @@ impl TypeDeclarator {
             _ => unreachable!(),
         };
 
-        // pieces.model = getModel(glb);  // STUB: no model registry on Architecture.
         pieces.name = self.ident.clone();
         pieces.intypes.clear();
         pieces.intypes = function_get_in_types(paramlist, factory, org)?;
@@ -999,7 +947,7 @@ impl TypeDeclarator {
         // function modifier (grammar.cc:812-820).
         let mut outtype = self.basetype.clone();
         for m in self.mods.iter().skip(1).rev() {
-            outtype = Some(m.mod_type(outtype, factory, org)?);
+            outtype = Some(m.mod_type(outtype, factory, org, &self.model)?);
         }
         pieces.outtype = outtype;
         Ok(true)
@@ -1076,7 +1024,7 @@ impl TypeDeclarator {
 /// C++ `TypeSpecifiers` (`grammar.hh:192-197`).
 #[derive(Debug, Clone)]
 struct TypeSpecifiers {
-    type_specifier: Option<Rc<Datatype>>,
+    type_specifier: Option<TypeRoot>,
     function_specifier: String,
     flags: uint4,
 }
@@ -1199,7 +1147,7 @@ enum IdentClass {
     Struct,
     Union,
     Enum,
-    TypeName(Rc<Datatype>),
+    TypeName(TypeRoot),
     /// (kuna) A standard C scalar keyword; a run of them names one base type.
     ScalarSpecifier(ScalarKw),
     Identifier,
@@ -1219,7 +1167,7 @@ enum PToken {
     StorageClassSpecifier(String),
     TypeQualifier(String),
     FunctionSpecifier(String),
-    TypeName(Rc<Datatype>),
+    TypeName(TypeRoot),
     /// (kuna) A standard C scalar keyword ([`ScalarKw`]).
     ScalarSpecifier(ScalarKw),
     Struct,
@@ -1249,7 +1197,7 @@ pub struct CParse<'a> {
     models: &'a [String],
     /// The data-organization record (the `glb` state `build_type`/`get_prototype`
     /// read).  In C++ this is part of the `Architecture *glb` the parser holds; the
-    /// kuna split carries it alongside the factory.  // STUB(w6-fspec-2)
+    /// kuna split carries it alongside the factory.
     org: DataOrg,
     keywords: BTreeMap<String, uint4>,
     lexer: GrammarLexer,
@@ -1534,7 +1482,7 @@ impl<'a> CParse<'a> {
     }
 
     /// C++ `addTypeSpecifier(TypeSpecifiers*,Datatype*)` (`grammar.cc:957-964`).
-    fn add_type_specifier(&mut self, spec: &mut TypeSpecifiers, tp: Rc<Datatype>) {
+    fn add_type_specifier(&mut self, spec: &mut TypeSpecifiers, tp: TypeRoot) {
         if spec.type_specifier.is_some() {
             self.set_error("Multiple type specifiers");
         }
@@ -1562,9 +1510,11 @@ impl<'a> CParse<'a> {
     }
 
     /// C++ `newArray(TypeDeclarator*,uint4,uintb*)` (`grammar.cc:1032-1038`).
-    fn new_array(mut dec: TypeDeclarator, fl: uint4, num: uintb) -> TypeDeclarator {
-        dec.mods.push(TypeModifier::Array { flags: fl, arraysize: num as int4 });
-        dec
+    fn new_array(mut dec: TypeDeclarator, fl: uint4, num: uintb) -> KunaResult<TypeDeclarator> {
+        let arraysize = int4::try_from(num)
+            .map_err(|_| KunaError::parse("Invalid array size"))?;
+        dec.mods.push(TypeModifier::Array { flags: fl, arraysize });
+        Ok(dec)
     }
 
     /// C++ `newFunc(TypeDeclarator*,vector*)` (`grammar.cc:1040-1053`): a trailing
@@ -1706,7 +1656,7 @@ impl<'a> CParse<'a> {
 
     /// `type_specifier: TYPE_NAME | struct_or_union_specifier | enum_specifier`
     /// (`grammar.y:93-97`).
-    fn type_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
+    fn type_specifier(&mut self) -> KunaResult<TypeRoot> {
         match self.peek()? {
             PToken::TypeName(_) => {
                 if let PToken::TypeName(tp) = self.next()? {
@@ -1730,7 +1680,7 @@ impl<'a> CParse<'a> {
     /// `char` and any host-supplied type spelled with a keyword resolve to the
     /// same interned type they always have; only combinations, and the keywords
     /// the type factory does not name, take the width-driven path.
-    fn scalar_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
+    fn scalar_specifier(&mut self) -> KunaResult<TypeRoot> {
         let mut kws: Vec<ScalarKw> = Vec::new();
         while let PToken::ScalarSpecifier(kw) = self.peek()? {
             kws.push(*kw);
@@ -1760,7 +1710,7 @@ impl<'a> CParse<'a> {
     /// The widths come from the compiler spec's `<data_organization>` (the same
     /// source `p9_emit/kuna_ctypes.rs` spells them back out from), never from a
     /// hard-coded table, so `long` is 8 bytes on LP64 and 4 on LLP64.
-    fn resolve_scalar(&self, kws: &[ScalarKw]) -> KunaResult<Option<Rc<Datatype>>> {
+    fn resolve_scalar(&self, kws: &[ScalarKw]) -> KunaResult<Option<TypeRoot>> {
         use type_metatype::{TYPE_BOOL, TYPE_FLOAT, TYPE_INT, TYPE_UINT};
         let n = |k: ScalarKw| kws.iter().filter(|x| **x == k).count();
         let (void, ch, sh, int_, lng) = (
@@ -1858,7 +1808,7 @@ impl<'a> CParse<'a> {
         &self,
         size: int4,
         meta: Option<type_metatype>,
-    ) -> KunaResult<Option<Rc<Datatype>>> {
+    ) -> KunaResult<Option<TypeRoot>> {
         if size <= 0 {
             return Ok(None);
         }
@@ -1885,7 +1835,7 @@ impl<'a> CParse<'a> {
                 _ => unreachable!(),
             },
             PToken::TypeName(_) => match self.next()? {
-                PToken::TypeName(tp) => Ok(tp.get_name().to_string()),
+                PToken::TypeName(tp) => Ok(tp.read().get(tp.id())?.get_name().to_string()),
                 _ => unreachable!(),
             },
             _ => Ok(String::new()),
@@ -1893,19 +1843,33 @@ impl<'a> CParse<'a> {
     }
 
     /// `struct_or_union_specifier` (`grammar.y:99-106`).
-    fn struct_or_union_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
+    fn struct_or_union_specifier(&mut self) -> KunaResult<TypeRoot> {
         let is_struct = matches!(self.next()?, PToken::Struct);
         // optional IDENTIFIER, then optional '{' struct_declaration_list '}'.
         let ident = self.tag_identifier()?;
         if matches!(self.peek()?, PToken::Punct(b'{')) {
             self.next()?;
-            let declist = self.struct_declaration_list()?;
-            self.expect_punct(b'}')?;
-            if is_struct {
-                self.new_struct(&ident, declist)
+            // Publish the identity before parsing any field type. A callback
+            // may mention this record by value without requiring its layout yet.
+            let nominal = if is_struct {
+                self.factory.get_type_struct(&ident)?
             } else {
-                self.new_union(&ident, declist)
+                self.factory.get_type_union(&ident)?
+            };
+            self.factory.begin(&nominal)?;
+            let result = (|| {
+                let declist = self.struct_declaration_list()?;
+                self.expect_punct(b'}')?;
+                if is_struct {
+                    self.new_struct(&nominal, declist)
+                } else {
+                    self.new_union(&nominal, declist)
+                }
+            })();
+            if let Err(error) = &result {
+                self.factory.fail(&nominal, error.explain().to_string())?;
             }
+            result
         } else {
             // `STRUCT IDENTIFIER` (no body) -> oldStruct/oldUnion.  An empty
             // identifier here is a syntax error (no production matches).
@@ -1999,7 +1963,8 @@ impl<'a> CParse<'a> {
         if matches!(self.peek()?, PToken::Punct(b':')) {
             self.next()?;
             match self.next()? {
-                PToken::Number(n) => dec.set_num_bits(n as int4),
+                PToken::Number(n) => dec.set_num_bits(int4::try_from(n)
+                    .map_err(|_| KunaError::parse("Invalid bitfield width"))?),
                 _ => return self.syntax_error(),
             }
         }
@@ -2007,7 +1972,7 @@ impl<'a> CParse<'a> {
     }
 
     /// `enum_specifier` (`grammar.y:134-140`).
-    fn enum_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
+    fn enum_specifier(&mut self) -> KunaResult<TypeRoot> {
         self.next()?; // ENUM
         let ident = self.tag_identifier()?;
         if matches!(self.peek()?, PToken::Punct(b'{')) {
@@ -2051,7 +2016,7 @@ impl<'a> CParse<'a> {
     fn enumerator(&mut self) -> KunaResult<Enumerator> {
         let nm = match self.next()? {
             PToken::Identifier(s) => s,
-            PToken::TypeName(tp) => tp.get_name().to_string(),
+            PToken::TypeName(tp) => tp.read().get(tp.id())?.get_name().to_string(),
             _ => return self.syntax_error(),
         };
         if matches!(self.peek()?, PToken::Punct(b'=')) {
@@ -2146,7 +2111,7 @@ impl<'a> CParse<'a> {
                 }
                 PToken::TypeName(tp) => {
                     name.push_str("::");
-                    name.push_str(tp.get_name());
+                    name.push_str(tp.read().get(tp.id())?.get_name());
                 }
                 _ => return self.syntax_error(),
             }
@@ -2168,7 +2133,7 @@ impl<'a> CParse<'a> {
         match self.next()? {
             PToken::Identifier(s) => self.var_identifier(s),
             PToken::TypeName(tp) => {
-                let nm = tp.get_name().to_string();
+                let nm = tp.read().get(tp.id())?.get_name().to_string();
                 self.var_identifier(nm)
             }
             _ => self.syntax_error(),
@@ -2212,7 +2177,7 @@ impl<'a> CParse<'a> {
                     };
                     let n = self.assignment_expression()?;
                     self.expect_punct(b']')?;
-                    dec = Self::new_array(dec, qual, n);
+                    dec = Self::new_array(dec, qual, n)?;
                 }
                 PToken::Punct(b'(') => {
                     self.next()?; // '('
@@ -2431,22 +2396,14 @@ impl<'a> CParse<'a> {
 
     /// C++ `CParse::newStruct` (`grammar.cc:1055-1085`).
     ///
-    /// Builds the field list and would call `glb->types->assignRawFields(...)`.
-    /// The mutating factory orchestrator (`assignRawFields` re-keys the interned
-    /// stub) is a W6 type-factory boundary, so this errs after validating the
-    /// declarators (preserving the C++ "Invalid structure declarator" message).
-    /// // STUB(w6-fspec-2) — see LOSS-006 restoration.
-    fn new_struct(&mut self, ident: &str, declist: Vec<TypeDeclarator>) -> KunaResult<Rc<Datatype>> {
-        // Create the (incomplete) stub for recursion before any field references
-        // it (C++ getTypeStruct).
-        let res = self.factory.get_type_struct(ident)?;
+    /// Complete the identity reserved before field parsing.
+    fn new_struct(&mut self, res: &TypeRoot, declist: Vec<TypeDeclarator>) -> KunaResult<TypeRoot> {
         let is_big_endian = self.factory.is_big_endian();
         let mut sublist: Vec<TypeField> = Vec::new();
         let mut bitlist: Vec<TypeBitField> = Vec::new();
         for decl in &declist {
             if !decl.is_valid()? {
                 self.set_error("Invalid structure declarator");
-                self.factory.destroy_type(&res)?;
                 return Err(KunaError::parse(self.lasterror.clone()));
             }
             let field_type = decl.build_type(self.factory, &self.org)?;
@@ -2456,29 +2413,29 @@ impl<'a> CParse<'a> {
                     decl.get_num_bits(),
                     is_big_endian,
                     decl.get_identifier(),
-                    field_type,
+                    field_type.id(),
                 ));
             } else {
-                sublist.push(TypeField::new(0, -1, decl.get_identifier(), field_type));
+                sublist.push(TypeField::new(0, -1, decl.get_identifier(), field_type.id()));
             }
         }
-        // On a LowlevelError the C++ records setError + destroyType + returns
-        // null (a parse failure).
-        match self.factory.assign_raw_fields_struct(&res, sublist, bitlist) {
+        match self.factory.assign_raw_fields_struct(res, sublist, bitlist) {
             Ok(completed) => Ok(completed),
             Err(err) => {
                 self.set_error(err.explain());
-                let _ = self.factory.destroy_type(&res);
                 Err(KunaError::parse(self.lasterror.clone()))
             }
         }
     }
 
     /// C++ `CParse::oldStruct` (`grammar.cc:1087-1094`).
-    fn old_struct(&mut self, ident: &str) -> KunaResult<Rc<Datatype>> {
+    fn old_struct(&mut self, ident: &str) -> KunaResult<TypeRoot> {
         let res = self.factory.find_by_name(ident)?;
         match &res {
             Some(tp) if tp.get_metatype() == type_metatype::TYPE_STRUCT => Ok(tp.clone()),
+            // A tag reference can introduce an incomplete nominal type before
+            // any declarator, not just in a standalone `struct Node;`.
+            None => self.factory.get_type_struct(ident),
             _ => {
                 self.set_error("Identifier does not represent a struct as required");
                 Err(KunaError::parse(self.lasterror.clone()))
@@ -2487,34 +2444,31 @@ impl<'a> CParse<'a> {
     }
 
     /// C++ `CParse::newUnion` (`grammar.cc:1096-1121`).
-    fn new_union(&mut self, ident: &str, declist: Vec<TypeDeclarator>) -> KunaResult<Rc<Datatype>> {
-        // The (incomplete) stub (C++ getTypeUnion).
-        let res = self.factory.get_type_union(ident)?;
+    fn new_union(&mut self, res: &TypeRoot, declist: Vec<TypeDeclarator>) -> KunaResult<TypeRoot> {
         let mut sublist: Vec<TypeField> = Vec::new();
         for (i, decl) in declist.iter().enumerate() {
             if !decl.is_valid()? {
                 self.set_error("Invalid union declarator");
-                self.factory.destroy_type(&res)?;
                 return Err(KunaError::parse(self.lasterror.clone()));
             }
             let field_type = decl.build_type(self.factory, &self.org)?;
-            sublist.push(TypeField::new(i as int4, 0, decl.get_identifier(), field_type));
+            sublist.push(TypeField::new(i as int4, 0, decl.get_identifier(), field_type.id()));
         }
-        match self.factory.assign_raw_fields_union(&res, sublist) {
+        match self.factory.assign_raw_fields_union(res, sublist) {
             Ok(completed) => Ok(completed),
             Err(err) => {
                 self.set_error(err.explain());
-                let _ = self.factory.destroy_type(&res);
                 Err(KunaError::parse(self.lasterror.clone()))
             }
         }
     }
 
     /// C++ `CParse::oldUnion` (`grammar.cc:1123-1130`).
-    fn old_union(&mut self, ident: &str) -> KunaResult<Rc<Datatype>> {
+    fn old_union(&mut self, ident: &str) -> KunaResult<TypeRoot> {
         let res = self.factory.find_by_name(ident)?;
         match &res {
             Some(tp) if tp.get_metatype() == type_metatype::TYPE_UNION => Ok(tp.clone()),
+            None => self.factory.get_type_union(ident),
             _ => {
                 self.set_error("Identifier does not represent a union as required");
                 Err(KunaError::parse(self.lasterror.clone()))
@@ -2524,15 +2478,12 @@ impl<'a> CParse<'a> {
 
     /// C++ `CParse::newEnum` (`grammar.cc:1156-1180`).
     ///
-    /// Ports the body up to the factory store-write: build the `(name,value,
-    /// assigned)` lists from the parsed enumerators and run
-    /// `TypeEnum::assignValues` (the duplicate-value check + free-value fill,
-    /// `Datatype::assign_values`).  Installing the resulting value-map into the
-    /// interned enum stub (`glb->types->setEnumValues`) is the W6 type-factory
-    /// boundary, so this errs after the value computation.  // STUB(w6-fspec-2)
-    fn new_enum(&mut self, ident: &str, vecenum: Vec<Enumerator>) -> KunaResult<Rc<Datatype>> {
+    /// Compute enumerator values under a read guard, then complete the reserved
+    /// enum after releasing the guard.
+    fn new_enum(&mut self, ident: &str, vecenum: Vec<Enumerator>) -> KunaResult<TypeRoot> {
         // An interned (incomplete) enum stub (C++ getTypeEnum).
         let res = self.factory.get_type_enum(ident)?;
+        self.factory.begin(&res)?;
         let mut namelist: Vec<String> = Vec::new();
         let mut vallist: Vec<uintb> = Vec::new();
         let mut assignlist: Vec<bool> = Vec::new();
@@ -2543,30 +2494,34 @@ impl<'a> CParse<'a> {
         }
         // Reports duplicate-value errors with the same explain text as the C++
         // (C++ TypeEnum::assignValues).
-        match Datatype::assign_values(res.get_size(), res.get_name(), &namelist, &vallist, &assignlist)
-        {
+        let values = {
+            let view = res.read();
+            let definition = view.get(res.id())?;
+            Datatype::assign_values(
+                definition.get_size(), definition.get_name(), &namelist, &vallist, &assignlist,
+            )
+        };
+        match values {
             Ok(namemap) => {
                 match self.factory.set_enum_values(&res, namemap) {
                     Ok(completed) => Ok(completed),
                     Err(err) => {
                         self.set_error(err.explain());
-                        let _ = self.factory.destroy_type(&res);
+                        self.factory.fail(&res, err.explain().to_string())?;
                         Err(KunaError::parse(self.lasterror.clone()))
                     }
                 }
             }
             Err(err) => {
-                // C++ catches LowlevelError, calls setError(err.explain), destroys
-                // the stub, returns null.
                 self.set_error(err.explain());
-                let _ = self.factory.destroy_type(&res);
+                self.factory.fail(&res, err.explain().to_string())?;
                 Err(KunaError::parse(self.lasterror.clone()))
             }
         }
     }
 
     /// C++ `CParse::oldEnum` (`grammar.cc:1182-1189`).
-    fn old_enum(&mut self, ident: &str) -> KunaResult<Rc<Datatype>> {
+    fn old_enum(&mut self, ident: &str) -> KunaResult<TypeRoot> {
         let res = self.factory.find_by_name(ident)?;
         match &res {
             Some(tp) if tp.is_enum_type() => Ok(tp.clone()),
@@ -2615,13 +2570,12 @@ impl<'a> CParse<'a> {
 /// (via the returned `name`) any declared identifier.
 ///
 /// Drives `doc_parameter_declaration`; the kuna `Architecture` info is supplied
-/// as the [`TypeFactory`] plus the [`DataOrg`] (the only `glb` state the grammar
-/// reads).  // STUB(w6-fspec-2)
+/// as the shared [`TypeFactory`] plus the pointer-layout [`DataOrg`].
 pub fn parse_type(
     input: &str,
     factory: &dyn TypeFactory,
     org: DataOrg,
-) -> KunaResult<(Rc<Datatype>, String)> {
+) -> KunaResult<(TypeRoot, String)> {
     let mut parser = CParse::new(factory, org, 4096);
     if !parser.parse_stream(input.as_bytes().to_vec(), DocType::ParameterDeclaration)? {
         return Err(KunaError::parse(parser.get_error().to_string()));
@@ -2724,11 +2678,7 @@ pub fn parse_c(
         if decl.get_identifier().is_empty() {
             return Err(KunaError::parse("Missing identifier for typedef"));
         }
-        if ct.get_metatype() == type_metatype::TYPE_STRUCT {
-            factory.set_name(&ct, decl.get_identifier())?;
-        } else {
-            factory.get_typedef(&ct, decl.get_identifier(), 0, 0)?;
-        }
+        factory.get_typedef(&ct, decl.get_identifier(), 0, 0)?;
     } else {
         // A bare struct/union/enum declaration is treated as a typedef: the stub
         // was already interned during the construction action (newStruct/...), so

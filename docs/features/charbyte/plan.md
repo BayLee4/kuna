@@ -40,7 +40,7 @@ prints `char v1; ... v1 == 0xe9` - wrong C (analysis.md §3).
 
 ## Tests
 
-* `tests/stages/kuna-charbyte.xml`, two passes (off, on), 21 assertions. The
+* `tests/stages/kuna-charbyte.xml`, two passes (off, on), 20 assertions. The
   review round added four controls that keep `uint1` in both passes:
   `argbyte` (the byte passed to `logit` as a one-byte argument), `sibling`
   (`a0[1]` passed to `logit` while `a0[0]` qualifies), `counter` (gcc -O0
@@ -49,7 +49,7 @@ prints `char v1; ... v1 == 0xe9` - wrong C (analysis.md §3).
   `isdash` (the witness: `v1 == 0x2d` -> `v1 == '-'`, widened copy as
   `(uint4)(uint1)v1`), `isdashu` (an `uint1 *` table byte stays `uint1`),
   `highbit` (an unsigned-compared byte stays `uint1`), `ishigh` (the `0xe9`
-  constant becomes `'\xe9'` with the byte), `dashlen` (a pointer that is `char *`
+  constant retains its signed byte value), `dashlen` (a pointer that is `char *`
   only through `strlen`: off `uint1 *a0` + `strlen((char *)a0)`, on `char *a0`).
 * Unit tests (`kuna_charbyte/tests.rs`): the lattice fact (`uint1` outranks
   `char`), the `char`/`uint1` predicates, one-shot record semantics.

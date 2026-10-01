@@ -19,7 +19,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use super::*;
-use crate::action::{ActionGroupList, Rule};
+use crate::action::{ActionContext, ActionDatabase, ActionPool, Rule, RuleState};
 use crate::context::{ArchContext, BlockId, TypeOp, VarnodeId};
 
 // -----------------------------------------------------------------------------
@@ -72,7 +72,12 @@ fn build_fd() -> Funcdata {
     // addSpacebasePointer(stack, sp_data, SP_SIZE, stack_growth=true)
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
 
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let code = Rc::clone(glb.manage().get_space_by_name("register").unwrap());
     let entry = Address::new(code, 0x1000);
     Funcdata::new("func", "func", glb, entry, 0x1000_0000, 0x40).unwrap()
@@ -155,39 +160,51 @@ fn op_list_is_multiequal() {
     assert_eq!(rule(true).get_op_list(), vec![OpCode::CPUI_MULTIEQUAL]);
 }
 
-#[test]
-fn clone_filters_by_group() {
-    let r = rule(true);
-    let inc = ActionGroupList::from_names(["analysis"]);
-    let exc = ActionGroupList::from_names(["cleanup"]);
-    assert!(r.clone_rule(&inc).is_some());
-    assert!(r.clone_rule(&exc).is_none());
-}
-
 // -----------------------------------------------------------------------------
 // The transformation
 // -----------------------------------------------------------------------------
 
 #[test]
-fn rewrites_multiequal_to_constant_add() {
-    let mut fd = build_fd();
-    let bl = new_block(&mut fd);
-    let limitconst: u64 = 0x3000;
-    let (phi, sp_in) = build_probe_loop(&mut fd, bl, limitconst);
+fn cached_roots_preserve_probe_configuration_across_toggles_and_functions() {
+    for configured_enabled in [false, true] {
+        let mut pool = ActionPool::new(0, "probe-pool");
+        // Registration, not the concrete rule's "analysis" group, owns membership.
+        pool.add_rule(
+            RuleState::new("registered-probe", 0, "stackprobeloop"),
+            Box::new(rule(configured_enabled)),
+        );
+        let mut db = ActionDatabase::new();
+        db.set_universal(Box::new(pool));
+        db.set_group("probe-root", ["analysis", "registered-probe"]);
+        db.set_current("probe-root").unwrap();
 
-    let changed = rule(true).apply_op(phi, &mut fd);
-    assert_eq!(changed, 1, "the canonical probe loop must be rewritten");
+        for (index, selected) in [true, false, true, true].into_iter().enumerate() {
+            db.toggle_action("probe-root", "registered-probe", selected).unwrap();
+            // The last iteration reuses the cached root on a different function.
+            let mut fd = build_fd();
+            let bl = new_block(&mut fd);
+            let limitconst = 0x3000 + index as u64 * PAGE;
+            let (phi, sp_in) = build_probe_loop(&mut fd, bl, limitconst);
+            let action = db.get_current_mut().unwrap();
+            action.reset(&mut fd);
+            let mut ctx = ActionContext::new();
+            assert_eq!(action.perform(&mut fd, &mut ctx), i32::from(selected && configured_enabled));
+            assert!(!ctx.has_error());
 
-    // The MULTIEQUAL became INT_ADD(SP_in, limitconst - PAGE).
-    let o = fd.obank().get(phi).unwrap();
-    assert_eq!(o.code(), OpCode::CPUI_INT_ADD);
-    assert_eq!(o.num_input(), 2);
-    assert_eq!(o.get_in(0), Some(sp_in));
-    let cvn = o.get_in(1).unwrap();
-    let c = fd.vbank().get(cvn).unwrap();
-    assert!(c.is_constant());
-    let expected = limitconst.wrapping_sub(PAGE) & calc_mask(SP_SIZE);
-    assert_eq!(c.get_offset(), expected);
+            let op = fd.obank().get(phi).unwrap();
+            if selected && configured_enabled {
+                assert_eq!(op.code(), OpCode::CPUI_INT_ADD);
+                assert_eq!(op.num_input(), 2);
+                assert_eq!(op.get_in(0), Some(sp_in));
+                let constant = fd.vbank().get(op.get_in(1).unwrap()).unwrap();
+                assert!(constant.is_constant());
+                assert_eq!(constant.get_offset(), (limitconst - PAGE) & calc_mask(SP_SIZE));
+            } else {
+                assert_eq!(op.code(), OpCode::CPUI_MULTIEQUAL);
+                assert_eq!(op.get_in(0), Some(sp_in));
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -200,7 +217,7 @@ fn gate_off_is_inert() {
     let bl = new_block(&mut fd);
     let (phi, _sp_in) = build_probe_loop(&mut fd, bl, 0x3000);
 
-    let changed = rule(false).apply_op(phi, &mut fd);
+    let changed = rule(false).clone_rule().apply_op(phi, &mut fd);
     assert_eq!(changed, 0, "gate-off must decline");
     // The op is still a MULTIEQUAL — untouched.
     assert_eq!(fd.obank().get(phi).unwrap().code(), OpCode::CPUI_MULTIEQUAL);

@@ -37,7 +37,6 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::varnode::{DefOpInfo, VarnodeBank};
@@ -75,10 +74,6 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
     |_: &mut VarnodeBank, _: VarnodeId, _: VarnodeId| -> KunaResult<()> { Ok(()) }
 }
@@ -98,7 +93,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4) -> (VarnodeId, OpId) {
     let pc = Address::new(Rc::clone(&r), off);
     let defop = fd.obank_mut().create_at(1, pc);
     fd.obank_mut().change_opcode(defop, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), None);
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();

@@ -18,7 +18,7 @@ is not needed for day-to-day work.
 | Path | What |
 |---|---|
 | `decompiler/` | The engine — a cargo workspace. `kuna-decomp` is the decompiler (`src/` is phase-foldered: `p0_knowledge/`…`p9_emit/`, plus `substrate/` and `infra/`); `kuna-analysis` the loader/analyzer tier (ELF markup, strings, DWARF, function discovery); `kuna-sleigh`/`kuna-slacomp` the SLEIGH runtime/compiler (binary `slacomp`); `kuna-console` the `decomp_dbg`/`decomp_test_dbg` binaries; `kuna-cli` the user-facing `kuna` binary; `kuna-ghidra` and `kuna-wasm` the Ghidra and browser front-ends; `kuna-base`/`kuna-num`/`kuna-harness`/`kuna-lift-diff` support. |
-| `tests/datatests/` | Vendored XML regression corpus (83 files / 675 assertions) — what `make test` runs. |
+| `tests/datatests/` | Vendored XML regression corpus (83 files / 674 assertions) — what `make test` runs. |
 | `tests/stages/` | kuna-owned issue testcases — `make test-stages`. Conventions: `tests/stages/README.md`. |
 | `tests/golden/` | Differential golden vectors for the workspace suite (`make rust-test`). |
 | `specs/Ghidra/Processors/` | Vendored SLEIGH specs. `.sla` files are built artifacts (gitignored), produced by `slacomp`. |
@@ -41,7 +41,7 @@ make specs      # compile all .slaspec → .sla with slacomp
 
 | Gate | Checks | Expect |
 |---|---|---|
-| `make test` | datatest corpus vs `docs/baseline.json` | **PARITY OK** (675/675) |
+| `make test` | datatest corpus vs `docs/baseline.json` | **PARITY OK** (674/674) |
 | `make test-stages` | stage-issue corpus vs `docs/baseline-stages.json` | **PARITY OK** |
 | `make rust-test` | full cargo workspace suite + `docs/options.md` freshness | green |
 | `make check-spec` | `docs/spec/` anchors + inline code paths resolve; each phase folder owned by exactly one chapter (`--strict` adds option-mention coverage) | green |
@@ -108,7 +108,7 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
   `kuna_phases/tests.rs`, the `tests/catalog_bytecompat.rs` fixture, and the
   `tests/stages/kuna-catalog.xml` count assertions. Grep for the current total, or
   `make rust-test`/`make test-stages` fail opaquely.
-- **Default-ON needs evidence**: only if the flip changes 0/675 datatest assertions and
+- **Default-ON needs evidence**: only if the flip changes 0/674 datatest assertions and
   passes the speed budget. Record what the default now does in the option's `phases.toml`
   row and its `docs/spec/` chapter — there is no separate registry to update.
 - **The spec is live**: every new feature or behavior change is described in natural-language

@@ -32,7 +32,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::VarnodeId;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::infra::architecture::Architecture;
 
@@ -180,16 +180,16 @@ pub fn record_pass(fd: &Funcdata, space: &Rc<AddrSpace>) {
     });
 }
 
-fn declared_type(fd: &Funcdata, arch: &Architecture, vn: VarnodeId) -> Option<Rc<Datatype>> {
+fn declared_type(fd: &Funcdata, arch: &Architecture, vn: VarnodeId) -> Option<TypeRoot> {
     let v = fd.vbank().get(vn)?;
     let rep = v
         .get_high()
         .and_then(|h| crate::printc::decl_type_representative(fd, arch, h))
         .unwrap_or(vn);
-    Some(Rc::clone(fd.vbank().get(rep)?.get_type()))
+    Some(fd.vbank().get(rep)?.get_type().clone())
 }
 
-fn value_type(fd: &Funcdata, arch: &Architecture, store: &SlotStore) -> Option<Rc<Datatype>> {
+fn value_type(fd: &Funcdata, arch: &Architecture, store: &SlotStore) -> Option<TypeRoot> {
     let produced = match store {
         SlotStore::Null | SlotStore::Opaque => return None,
         SlotStore::Input(addr, size) => fd.find_varnode_input(*size, addr)?,
@@ -219,7 +219,7 @@ pub fn slot_pointer_type(
     arch: &Architecture,
     off: i64,
     size: int4,
-) -> Result<Rc<Datatype>, Decline> {
+) -> Result<TypeRoot, Decline> {
     let ev = fd.slot_evidence();
     let stores = ev.stores_at(off, size);
     if stores.is_empty() {
@@ -228,7 +228,7 @@ pub fn slot_pointer_type(
     if ev.foreign_access(off, size) {
         return Err(Decline::Overlap);
     }
-    let mut found: Option<(String, Rc<Datatype>)> = None;
+    let mut found: Option<(String, TypeRoot)> = None;
     for store in stores {
         if *store == SlotStore::Null {
             continue;
@@ -251,7 +251,7 @@ pub fn slot_pointer_type(
 /// pointer to unknown bytes names no type, and a pointer to code is spelled
 /// `void *` by the C printer and came, in every measured case, from a constant
 /// the recovery mistook for a code address.
-pub fn admit(ty: &Datatype, size: int4) -> Result<(), Decline> {
+pub fn admit(ty: &TypeRoot, size: int4) -> Result<(), Decline> {
     if ty.get_metatype() != type_metatype::TYPE_PTR {
         return Err(Decline::NotPointer);
     }

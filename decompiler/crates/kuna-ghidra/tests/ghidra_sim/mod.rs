@@ -158,7 +158,7 @@ pub const SYMBOL_ID_BASE_TOP: u64 = 0x40;
 pub const ATTRIB_FIRST_ID: u32 = 27;
 
 /// One decoded `<localdb>` `<mapsym>` (what `HighSymbol.decodeMapSym` sees).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SimSymbol {
     /// `<symbol id>` — MUST be nonzero (`HighSymbol.decodeHeader` throws).
     pub id: u64,
@@ -168,6 +168,9 @@ pub struct SimSymbol {
     pub index: Option<u64>,
     /// The symbol's name.
     pub name: String,
+    pub type_locked: bool,
+    pub name_locked: bool,
+    pub hidden_return: bool,
     /// Number of SymbolEntry pairs — MUST be >= 1 (`insertSymbol` NPEs on 0).
     pub entries: usize,
     /// Whether every entry carried its uselimit `<rangelist>`.
@@ -192,7 +195,7 @@ pub struct SimSymbol {
 }
 
 /// One decoded `<high>` (what `HighFunction.decodeHigh` sees).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SimHigh {
     /// `class` — REQUIRED, one of other/global/constant/param/local.
     pub class: String,
@@ -204,7 +207,7 @@ pub struct SimHigh {
 
 /// The decoded `<prototype>` header (what `FunctionPrototype.decodePrototype`
 /// requires).
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SimProto {
     /// `model` attribute value.
     pub model: String,
@@ -212,6 +215,8 @@ pub struct SimProto {
     pub has_extrapop: bool,
     /// `<returnsym>` with an `<addr>` first child then a data-type child.
     pub returnsym_ok: bool,
+    pub output_storage: Option<(Address, i32)>,
+    pub output_type_name: Option<String>,
 }
 
 /// The 19 legal callback-query command element ids (ids.rs 239..=257).
@@ -643,14 +648,53 @@ pub fn walk(
     Ok(())
 }
 
+/// A markup node's text and consumer-visible links, independently of the
+/// allocator's document-local parenthesis handles.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SimMarkupToken {
+    pub element: u32,
+    pub parent: Option<usize>,
+    pub content: Option<String>,
+    pub color: Option<u64>,
+    pub indent: i64,
+    pub links: BTreeMap<u32, u64>,
+    pub type_name: Option<String>,
+    pub field_offset: Option<i64>,
+    pub blockref: Option<i64>,
+    pub space: Option<String>,
+    pub unsigned_offset: Option<u64>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SimMarkup {
+    pub tokens: Vec<SimMarkupToken>,
+    /// Opening/closing token positions: the relation Java uses for delimiter
+    /// highlighting, not the arbitrary numeric handles used to encode it.
+    pub pairs: Vec<(usize, usize)>,
+    pending: Vec<(i64, usize)>,
+}
+
+/// Only the operation facts needed to check token addresses and constant returns.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SimAstOp {
+    pub code: i64,
+    pub space: String,
+    pub offset: u64,
+    pub output: Option<u64>,
+    pub inputs: Vec<Option<u64>>,
+}
+
 /// A fully-decoded `decompileAt` response document.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParsedDoc {
     /// `<function name=…>` — must echo the name the mock served.
     pub name: String,
     /// The entry `<addr>` offset — must echo the requested address
     /// (HighFunction.decode throws on mismatch).
     pub entry_offset: Option<u64>,
+    pub entry_space: Option<String>,
+    pub ast_ops: BTreeMap<u64, SimAstOp>,
+    pub ast_constants: BTreeMap<u64, u64>,
     /// `<ast>` op times (`<seqnum uniq=…>`).
     pub ast_op_times: BTreeSet<u64>,
     /// `<ast>` varnode create-indices — collected from the `<varnodes>` child
@@ -670,6 +714,7 @@ pub struct ParsedDoc {
     /// applied ([`illegal_char_cpp_transform`]) — what a script/export user
     /// actually receives from `DecompileResults.getDecompiledFunction()`.
     pub c_text: String,
+    pub markup: SimMarkup,
     /// Tokens whose text the Java-side `IllegalCharCppTransformer` CHANGED —
     /// each is a token kuna emitted with non-identifier characters inside an
     /// identifier-class token (e.g. the whole rendered declarator
@@ -703,6 +748,7 @@ pub struct ParsedDoc {
     /// rename/retype dead on that declaration line and logs once per
     /// decompile.
     pub vardecl_symrefs: BTreeSet<u64>,
+    pub vardecl_text: BTreeMap<u64, String>,
     /// How many of them do NOT resolve (the create-index fallback) — pinned,
     /// so the systemic case stays fixed and the residue can only shrink.
     pub vardecl_symref_unresolved: usize,
@@ -741,8 +787,10 @@ pub fn parse_decompile_doc(doc: &[u8], manager: &AddrSpaceManager) -> ParsedDoc 
             let mut refs = BTreeMap::new();
             let mut ctext = String::new();
             let mut mangled = 0usize;
-            flatten_markup(&mut dec, mid, &mut ctext, &mut refs, &mut mangled)
+            flatten_markup(&mut dec, mid, &mut ctext, &mut refs, &mut mangled,
+                &mut parsed.vardecl_text, &mut parsed.markup, None)
                 .expect("flatten markup <function>");
+            assert!(parsed.markup.pending.is_empty(), "unclosed markup delimiter");
             dec.close_element(mid).expect("close markup <function>");
             parsed.markup_oprefs = refs.get(&ATTRIB_OPREF_ID).cloned().unwrap_or_default();
             parsed.markup_varrefs = refs.get(&ATTRIB_VARREF_ID).cloned().unwrap_or_default();
@@ -768,6 +816,7 @@ fn parse_first_function(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
     if dec.peek_element().expect("peek in <function>") == ELEM_ADDR.get_id() {
         let addr = Address::decode(dec).expect("<function> base <addr>");
         parsed.entry_offset = Some(addr.get_offset());
+        parsed.entry_space = addr.get_space().map(|space| space.get_name().to_string());
     }
     // Walk the remaining children selectively: inside `<ast>`, varnode
     // create-indices come from the `<varnodes>` declarations only (see the
@@ -789,10 +838,20 @@ fn parse_first_function(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
                 let aid = dec.open_element().expect("open <ast> child");
                 let mut got = BTreeMap::new();
                 if aid == ELEM_VARNODES_ID {
-                    walk(dec, &[ATTRIB_REF_ID], &mut got).expect("walk <varnodes>");
-                    parsed
-                        .ast_var_refs
-                        .extend(got.get(&ATTRIB_REF_ID).cloned().unwrap_or_default());
+                    use kuna_base::marshal::{ATTRIB_OFFSET, ATTRIB_REF, ATTRIB_SPACE};
+                    while dec.peek_element().expect("peek varnode") != 0 {
+                        let vid = dec.open_element_id(&ELEM_ADDR).expect("varnode address");
+                        let reference = dec.read_unsigned_integer_id(&ATTRIB_REF).expect("varnode ref");
+                        parsed.ast_var_refs.insert(reference);
+                        let space = dec.read_space_id(&ATTRIB_SPACE).expect("varnode space");
+                        if space.get_type() == kuna_base::space::spacetype::IPTR_CONSTANT {
+                            let value = dec.read_unsigned_integer_id(&ATTRIB_OFFSET).expect("constant");
+                            parsed.ast_constants.insert(reference, value);
+                        }
+                        dec.close_element(vid).expect("close varnode");
+                    }
+                } else if aid == kuna_decomp::block::ELEM_BLOCK.get_id() {
+                    parse_ast_block(dec, parsed);
                 } else {
                     walk(dec, &[ATTRIB_UNIQ_ID], &mut got).expect("walk <ast> child");
                     parsed
@@ -818,6 +877,47 @@ fn parse_first_function(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
             panic!("unknown <function> child element id {cid}");
         }
         dec.close_element(cid).expect("close <function> child");
+    }
+}
+
+fn parse_ast_block(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
+    use kuna_base::marshal::ATTRIB_REF;
+    use kuna_sleigh::translate::{ATTRIB_CODE, ELEM_OP};
+    while dec.peek_element().expect("peek AST block") != 0 {
+        let id = dec.open_element().expect("AST block child");
+        if id != ELEM_OP.get_id() {
+            dec.close_element_skipping(id).expect("skip block cover");
+            continue;
+        }
+        let code = dec.read_signed_integer_id(&ATTRIB_CODE).expect("AST opcode");
+        let seq = kuna_base::address::SeqNum::decode(dec).expect("AST sequence number");
+        let output_element = dec.open_element().expect("AST output slot");
+        let output = if output_element == ELEM_ADDR.get_id() {
+            Some(dec.read_unsigned_integer_id(&ATTRIB_REF).expect("AST output ref"))
+        } else {
+            None
+        };
+        dec.close_element_skipping(output_element).expect("close AST output");
+        let mut inputs = Vec::new();
+        while dec.peek_element().expect("peek AST input") != 0 {
+            let input = dec.open_element().expect("AST input");
+            inputs.push(if input == ELEM_ADDR.get_id() {
+                Some(dec.read_unsigned_integer_id(&ATTRIB_REF).expect("AST input ref"))
+            } else {
+                None
+            });
+            dec.close_element_skipping(input).expect("close AST input");
+        }
+        let time = u64::from(seq.get_time());
+        parsed.ast_op_times.insert(time);
+        assert!(parsed.ast_ops.insert(time, SimAstOp {
+            code,
+            space: seq.get_addr().get_space().expect("operation space").get_name().to_string(),
+            offset: seq.get_addr().get_offset(),
+            output,
+            inputs,
+        }).is_none(), "duplicate AST operation time");
+        dec.close_element(id).expect("close AST operation");
     }
 }
 
@@ -870,6 +970,9 @@ fn parse_mapsym(dec: &mut PackedDecode) -> SimSymbol {
         cat: -1,
         index: None,
         name: String::new(),
+        type_locked: false,
+        name_locked: false,
+        hidden_return: false,
         entries: 0,
         entries_have_rangelists: true,
         has_type: false,
@@ -895,6 +998,12 @@ fn parse_mapsym(dec: &mut PackedDecode) -> SimSymbol {
                     sym.cat = dec.read_signed_integer().expect("symbol cat");
                 } else if aid == ATTRIB_INDEX_ID {
                     sym.index = Some(dec.read_unsigned_integer().expect("symbol index"));
+                } else if aid == kuna_base::marshal::ATTRIB_TYPELOCK.get_id() {
+                    sym.type_locked = dec.read_bool().expect("symbol typelock");
+                } else if aid == kuna_base::marshal::ATTRIB_NAMELOCK.get_id() {
+                    sym.name_locked = dec.read_bool().expect("symbol namelock");
+                } else if aid == kuna_base::marshal::ATTRIB_HIDDENRETPARM.get_id() {
+                    sym.hidden_return = dec.read_bool().expect("symbol hiddenretparm");
                 } else if aid == ATTRIB_NAME.get_id() {
                     sym.name = String::from_utf8_lossy(
                         &dec.read_string().expect("symbol name"),
@@ -1023,7 +1132,10 @@ fn parse_highlist(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
 
 /// `<prototype>` (opened): the model/extrapop header + the `<returnsym>`.
 fn parse_prototype(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
-    let mut proto = SimProto { model: String::new(), has_extrapop: false, returnsym_ok: false };
+    let mut proto = SimProto {
+        model: String::new(), has_extrapop: false, returnsym_ok: false,
+        output_storage: None, output_type_name: None,
+    };
     loop {
         let aid = dec.get_next_attribute_id().expect("prototype attr");
         if aid == 0 {
@@ -1046,6 +1158,12 @@ fn parse_prototype(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
             let mut saw_type = false;
             let mut first = true;
             while dec.peek_element().expect("peek <returnsym> child") != 0 {
+                if first && dec.peek_element().unwrap() == ELEM_ADDR_ID {
+                    proto.output_storage = Some(Address::decode_sized(dec).expect("output storage"));
+                    saw_addr = true;
+                    first = false;
+                    continue;
+                }
                 let b = dec.open_element().expect("open <returnsym> child");
                 if first {
                     saw_addr = b == ELEM_ADDR_ID;
@@ -1056,6 +1174,10 @@ fn parse_prototype(dec: &mut PackedDecode, parsed: &mut ParsedDoc) {
                     || b == ELEM_VOID_ID
                 {
                     saw_type = true;
+                    if b != ELEM_VOID_ID {
+                        proto.output_type_name = dec.read_string_id(&ATTRIB_NAME).ok()
+                            .map(|s| String::from_utf8_lossy(&s).into_owned());
+                    }
                 }
                 let mut sink = BTreeMap::new();
                 walk(dec, &[], &mut sink).expect("walk <returnsym> child");
@@ -1292,7 +1414,17 @@ fn flatten_markup(
     out: &mut String,
     refs: &mut BTreeMap<u32, BTreeSet<u64>>,
     mangled: &mut usize,
+    declarations: &mut BTreeMap<u64, String>,
+    markup: &mut SimMarkup,
+    parent: Option<usize>,
 ) -> Result<(), KunaError> {
+    use kuna_decomp::prettyprint::ids;
+    let start = out.len();
+    let token_index = markup.tokens.len();
+    let mut token = SimMarkupToken { element: elem_id, parent, ..Default::default() };
+    let mut opening = None;
+    let mut closing = None;
+    let mut declaration = None;
     let mut indent: i64 = 0;
     let mut color: Option<u64> = None;
     let mut content: Option<String> = None;
@@ -1304,6 +1436,8 @@ fn flatten_markup(
         if aid == ATTRIB_SYMREF_ID && elem_id == ELEM_VARDECL_ID {
             let v = dec.read_unsigned_integer()?;
             refs.entry(ATTRIB_SYMREF_ID).or_default().insert(v);
+            token.links.insert(aid, v);
+            declaration = Some(v);
             continue;
         }
         if aid == ATTRIB_CONTENT.get_id() {
@@ -1315,7 +1449,42 @@ fn flatten_markup(
         } else if aid == ATTRIB_OPREF_ID || aid == ATTRIB_VARREF_ID {
             let v = dec.read_unsigned_integer()?;
             refs.entry(aid).or_default().insert(v);
+            token.links.insert(aid, v);
+        } else if aid == ATTRIB_ID_ID || aid == ATTRIB_SYMREF_ID {
+            token.links.insert(aid, dec.read_unsigned_integer()?);
+        } else if aid == ids::ATTRIB_NAME.get_id() {
+            token.type_name = Some(String::from_utf8_lossy(&dec.read_string()?).into_owned());
+        } else if aid == ids::ATTRIB_OFF.get_id() {
+            if elem_id == ids::ELEM_FIELD.get_id() || elem_id == ids::ELEM_BITFIELD.get_id() {
+                token.field_offset = Some(dec.read_signed_integer()?);
+            } else {
+                token.unsigned_offset = Some(dec.read_unsigned_integer()?);
+            }
+        } else if aid == ids::ATTRIB_BLOCKREF.get_id() {
+            token.blockref = Some(dec.read_signed_integer()?);
+        } else if aid == ids::ATTRIB_SPACE.get_id() {
+            token.space = Some(dec.read_space()?.get_name().to_string());
+        } else if aid == kuna_base::marshal::ATTRIB_OFFSET.get_id() {
+            token.unsigned_offset = Some(dec.read_unsigned_integer()?);
+        } else if aid == ids::ATTRIB_OPEN.get_id() {
+            opening = Some(dec.read_signed_integer()?);
+        } else if aid == ids::ATTRIB_CLOSE.get_id() {
+            closing = Some(dec.read_signed_integer()?);
         }
+    }
+    token.content = content.clone();
+    token.color = color;
+    token.indent = indent;
+    markup.tokens.push(token);
+    if let Some(id) = opening {
+        assert!(!markup.pending.iter().any(|(pending, _)| *pending == id),
+            "duplicate active delimiter handle {id}");
+        markup.pending.push((id, token_index));
+    }
+    if let Some(id) = closing {
+        let (open_id, open_token) = markup.pending.pop().expect("closing delimiter without opening");
+        assert_eq!(open_id, id, "mismatched markup delimiter handles");
+        markup.pairs.push((open_token, token_index));
     }
     if let Some(text) = content {
         let is_token_to_clean = matches!(
@@ -1344,8 +1513,11 @@ fn flatten_markup(
             break;
         }
         let id = dec.open_element()?;
-        flatten_markup(dec, id, out, refs, mangled)?;
+        flatten_markup(dec, id, out, refs, mangled, declarations, markup, Some(token_index))?;
         dec.close_element(id)?;
+    }
+    if let Some(symref) = declaration {
+        declarations.insert(symref, out[start..].to_string());
     }
     Ok(())
 }

@@ -28,7 +28,6 @@
 //! promotion cannot change it.  Output languages without integer promotion (Rust)
 //! get nothing.
 
-use std::rc::Rc;
 
 use kuna_base::types::{int4, uint4};
 use kuna_num::opcodes::OpCode;
@@ -36,7 +35,7 @@ use kuna_num::opcodes::OpCode;
 use crate::cast::{CastStrategy, CastStrategyC, IntPromotionCode};
 use crate::context::{OpId, VarnodeId};
 use crate::coreaction_casts::FuncdataCastContext;
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 
 /// The cast a narrowed argument in `slot` of the CALL/CALLIND `op` needs so its C
@@ -46,7 +45,7 @@ pub(crate) fn narrowed_arg_cast(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if slot < 1 {
         return None;
     }
@@ -135,7 +134,7 @@ fn retype_truncation(
     data: &mut Funcdata,
     strat: &CastStrategyC,
     invn: VarnodeId,
-    ct: &Rc<Datatype>,
+    ct: &TypeRoot,
 ) -> bool {
     let Some(vn) = data.vbank().get(invn) else {
         return false;
@@ -172,8 +171,8 @@ fn retype_truncation(
     if !strat.is_subpiece_cast(&outtype, &intype, off) || !strat.is_subpiece_cast(ct, &intype, off) {
         return false;
     }
-    data.vn_update_type(invn, Rc::clone(ct));
-    data.vbank().get(invn).is_some_and(|v| Rc::ptr_eq(v.get_type(), ct))
+    data.vn_update_type(invn, Clone::clone(ct));
+    data.vbank().get(invn).is_some_and(|v| TypeRoot::eq(v.get_type(), ct))
 }
 
 /// Is parameter `slot` of the call fixed by a declared prototype?
@@ -197,7 +196,7 @@ fn promotes_as_zext(
     op: OpId,
     invn: VarnodeId,
     meta: type_metatype,
-    char_ty: Option<Rc<Datatype>>,
+    char_ty: Option<TypeRoot>,
 ) -> bool {
     use IntPromotionCode::*;
     let def_code = data

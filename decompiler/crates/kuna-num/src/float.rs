@@ -16,11 +16,18 @@
 //!   the x86 FPU yields the negative "real indefinite" QNaN (`0xffc00000`),
 //!   Apple-Silicon/ARM the positive default NaN (`0x7fc00000`); Ghidra's C++
 //!   inherits whichever the build host produces (float.cc `signbit(host)`).
-//!   To stay deterministic across build hosts *and* byte-identical to the
-//!   Linux/x86 golden oracle everywhere, the arithmetic ops pin the x86 sign
-//!   for a *generated* NaN (see [`FloatFormat::encode_generated`]); a
-//!   *propagated* NaN (an input was already NaN) keeps its host-deterministic
-//!   sign.  The payload is canonicalized by `get_nan_encoding`.
+//!   For portable compatibility with the pinned Linux/x86 oracle, arithmetic
+//!   returns canonical quiet NaNs without relying on host NaN arithmetic:
+//!   binary operations select the first encoded NaN operand's sign, otherwise
+//!   the second's (including subtraction). "First" means the operands received
+//!   here; callers may already have reordered commutative operations. Unary
+//!   operations preserve the source sign except neg (flip) and abs (clear).
+//!   Newly generated invalid NaNs have the negative x86 sign. Payloads and
+//!   signaling distinctions are canonicalized, without exception flags.
+//!   This unconditional compatibility policy extends the golden corpus; it is
+//!   not a universal hardware, target-ISA, or arbitrary Ghidra-build guarantee.
+//!   Explicit-host-bit encoding and float-to-float conversion preserve the
+//!   source NaN sign independently of this arithmetic policy.
 //! - `opTrunc`'s `(intb)double` cast is the host x86 `cvttsd2si` cast, NOT
 //!   Rust's saturating `as`; see [`host_double_to_int64`].
 //! - C++ `ldexp`/`frexp` have no Rust std equivalent; [`ldexp`] / [`frexp`]
@@ -645,7 +652,8 @@ impl FloatFormat {
     /// works for the 32-bit and 64-bit IEEE 754 formats.  If `forcesci` is
     /// true, the string will always be printed using scientific notation.
     /// `host` is the given value already converted to the host's double
-    /// format.
+    /// format. Overflowing decimal candidates must not round-trip by saturation:
+    /// a finite endpoint must remain finite when emitted as a C literal.
     pub fn print_decimal(&self, host: f64, forcesci: bool) -> String {
         let res: String;
         let mut prec = self.decimal_min_precision;
@@ -662,11 +670,6 @@ impl FloatFormat {
             if prec == self.decimal_max_precision {
                 return s;
             }
-            // C++ reads the string back with istream >> float / >> double
-            // (strtof/strtod semantics, correctly rounded, same as
-            // str::parse).  An extraction failure leaves the C++ roundtrip
-            // variable at 0.0; Rust's parse additionally accepts "inf",
-            // which short-circuits to the same final string.
             let roundtrip: f64 = if self.size <= 4 {
                 f64::from(s.parse::<f32>().unwrap_or(0.0))
             } else {
@@ -720,68 +723,92 @@ impl FloatFormat {
         u64::from(tp == floatclass::nan)
     }
 
-    /// Encode a host FP result, pinning the sign of an *invalid-operation-
-    /// generated* NaN to the x86 "real indefinite" (`0xffc00000` / sign set),
-    /// so the engine is deterministic across build hosts and byte-identical to
-    /// the Linux/x86 golden oracle everywhere (see the module header).
-    ///
-    /// `input_was_nan` is true when any operand already decoded to a NaN — then
-    /// the result is a *propagated* NaN whose sign is host-deterministic (it
-    /// follows the operand: the `0x7fc00000` propagation rows of the golden
-    /// vectors), so it is left untouched.  On the x86 oracle host the fixup is a
-    /// no-op (the host already yields `0xffc00000`), so x86 output is unchanged.
-    fn encode_generated(&self, host: f64, input_was_nan: bool) -> u64 {
-        let enc = self.get_encoding(host);
-        if !input_was_nan && self.get_class(enc) == floatclass::nan {
+    /// Encode arithmetic on non-NaN inputs. Newly generated invalid NaNs use
+    /// the pinned oracle's negative "real indefinite" sign.
+    fn encode_generated(&self, host: f64) -> u64 {
+        if host.is_nan() {
             return self.get_nan_encoding(true);
         }
-        enc
+        self.get_encoding(host)
     }
 
     /// Addition (+).
     pub fn op_add(&self, a: u64, b: u64) -> u64 {
         let (val1, t1) = self.get_host_float(a);
+        if t1 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         let (val2, t2) = self.get_host_float(b);
-        self.encode_generated(val1 + val2, t1 == floatclass::nan || t2 == floatclass::nan)
+        if t2 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(b));
+        }
+        self.encode_generated(val1 + val2)
     }
 
     /// Division (/).
     pub fn op_div(&self, a: u64, b: u64) -> u64 {
         let (val1, t1) = self.get_host_float(a);
+        if t1 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         let (val2, t2) = self.get_host_float(b);
-        self.encode_generated(val1 / val2, t1 == floatclass::nan || t2 == floatclass::nan)
+        if t2 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(b));
+        }
+        self.encode_generated(val1 / val2)
     }
 
     /// Multiplication (*).
     pub fn op_mult(&self, a: u64, b: u64) -> u64 {
         let (val1, t1) = self.get_host_float(a);
+        if t1 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         let (val2, t2) = self.get_host_float(b);
-        self.encode_generated(val1 * val2, t1 == floatclass::nan || t2 == floatclass::nan)
+        if t2 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(b));
+        }
+        self.encode_generated(val1 * val2)
     }
 
     /// Subtraction (-).
     pub fn op_sub(&self, a: u64, b: u64) -> u64 {
         let (val1, t1) = self.get_host_float(a);
+        if t1 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         let (val2, t2) = self.get_host_float(b);
-        self.encode_generated(val1 - val2, t1 == floatclass::nan || t2 == floatclass::nan)
+        if t2 == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(b));
+        }
+        self.encode_generated(val1 - val2)
     }
 
     /// Unary negate.
     pub fn op_neg(&self, a: u64) -> u64 {
-        let (val, _type) = self.get_host_float(a);
+        let (val, tp) = self.get_host_float(a);
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(!self.extract_sign(a));
+        }
         self.get_encoding(-val)
     }
 
     /// Absolute value (abs).
     pub fn op_abs(&self, a: u64) -> u64 {
-        let (val, _type) = self.get_host_float(a);
+        let (val, tp) = self.get_host_float(a);
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(false);
+        }
         self.get_encoding(val.abs())
     }
 
     /// Square root (sqrt).
     pub fn op_sqrt(&self, a: u64) -> u64 {
         let (val, tp) = self.get_host_float(a);
-        self.encode_generated(val.sqrt(), tp == floatclass::nan)
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
+        self.encode_generated(val.sqrt())
     }
 
     /// Convert integer to floating-point: `a` is a signed integer value,
@@ -811,19 +838,28 @@ impl FloatFormat {
 
     /// Ceiling (ceil).
     pub fn op_ceil(&self, a: u64) -> u64 {
-        let (val, _type) = self.get_host_float(a);
+        let (val, tp) = self.get_host_float(a);
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         self.get_encoding(val.ceil())
     }
 
     /// Floor (floor).
     pub fn op_floor(&self, a: u64) -> u64 {
-        let (val, _type) = self.get_host_float(a);
+        let (val, tp) = self.get_host_float(a);
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         self.get_encoding(val.floor())
     }
 
     /// Round.
     pub fn op_round(&self, a: u64) -> u64 {
-        let (val, _type) = self.get_host_float(a);
+        let (val, tp) = self.get_host_float(a);
+        if tp == floatclass::nan {
+            return self.get_nan_encoding(self.extract_sign(a));
+        }
         self.get_encoding(val.round()) // round half away from zero
     }
 }
@@ -932,7 +968,7 @@ mod tests {
         // sqrt(-1) is the negative default QNaN; sqrt(-0) is -0.
         assert_eq!(fmt4.op_sqrt(neg_one), NQNAN);
         assert_eq!(fmt4.op_sqrt(0x8000_0000), 0x8000_0000);
-        // NaN propagates (canonicalized, sign preserved through the host)
+        // NaN propagates (canonicalized, sign selected from the encoded input)
         assert_eq!(fmt4.op_add(QNAN, one), QNAN);
         assert_eq!(fmt4.op_nan(QNAN), 1);
         assert_eq!(fmt4.op_nan(PINF), 0);

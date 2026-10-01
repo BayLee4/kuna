@@ -27,12 +27,10 @@
 //! (`sub_1005350` of the `graphy` VM).  So a target carries the representative's
 //! own use point, which is the address `linkSymbol` queries with.
 
-use std::rc::Rc;
-
 use kuna_base::address::Address;
 use kuna_base::space::spacetype::{IPTR_CONSTANT, IPTR_INTERNAL, IPTR_JOIN};
 use kuna_base::types::int4;
-use kuna_decomp::dtype::Datatype;
+use kuna_decomp::dtype::TypeRoot;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::varnode::varnode_flags;
 
@@ -47,7 +45,7 @@ pub struct PrintedLocal {
     pub usepoint: Address,
     /// The type the representative carries today, so a `name` directive can
     /// rename without also restating the type.
-    pub dtype: Rc<Datatype>,
+    pub dtype: TypeRoot,
 }
 
 /// Find the HighVariable the printer declared as `name`.
@@ -79,6 +77,9 @@ pub fn resolve_printed_local(fd: &mut Funcdata, name: &str) -> Result<PrintedLoc
         0 => return Err(format!("No symbol named: {name}")),
         1 => {}
         n => return Err(format!("More than one variable named: {name} ({n})")),
+    }
+    if fd.execution_input_slot_for_high(ids[0]).is_some() {
+        return Err(format!("Derived execution input is not an editable source symbol: {name}"));
     }
     let rep = fd
         .high_name_representative(ids[0])
@@ -173,7 +174,7 @@ pub fn bind_printed_local(
     fd: &mut Funcdata,
     target: &PrintedLocal,
     name: &str,
-    ct: Rc<Datatype>,
+    ct: TypeRoot,
 ) -> Result<(), String> {
     // A Symbol covers `ct.get_size()` bytes from the storage address, so a type
     // wider than the target is a statement about the NEXT variable along: `type

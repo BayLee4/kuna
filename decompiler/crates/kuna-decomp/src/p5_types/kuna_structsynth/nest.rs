@@ -56,7 +56,7 @@ use kuna_base::types::{int4, intb};
 
 use super::{accepts_record, answer, fields_for, ledger, note_uses, points_at_named_composite, vn_type, Evidence};
 use crate::context::VarnodeId;
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeField};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory, TypeField};
 use crate::funcdata::Funcdata;
 
 /// How many records below the parameter a chain of pointer fields is followed.
@@ -91,16 +91,17 @@ pub(super) fn nest_fields(
     let mut selfs = Vec::new();
     for i in 0..fields.len() {
         let field = &own[i];
-        if field.field_type.get_size() != cx.ptr_size || !is_record_pointer(&field.field_type) {
+        let Ok(field_type) = cx.types.root(field.field_type) else { continue };
+        if field_type.get_size() != cx.ptr_size || !is_record_pointer(&field_type) {
             continue;
         }
         let Some(inner) = loaded_record(data, cx, rec, intb::from(field.offset)) else { continue };
-        if !accepts_record(data, &field.field_type, &inner, false, false) {
+        if !accepts_record(data, &field_type, &inner, false, false) {
             continue;
         }
         let Some((mut inner_fields, inner_size)) = fields_for(cx.types, &inner) else { continue };
         let unclaimed = inner.unclaimed_ranges();
-        if is_same_record(&own, size, &inner_fields, inner_size, &unclaimed) {
+        if is_same_record(cx.types, &own, size, &inner_fields, inner_size, &unclaimed) {
             selfs.push(field.offset);
             continue;
         }
@@ -112,14 +113,14 @@ pub(super) fn nest_fields(
             continue;
         };
         let Ok(ptr) = cx.types.get_type_pointer(cx.ptr_size, st, 1) else { continue };
-        fields[i].field_type = ptr;
+        fields[i].field_type = ptr.id();
     }
     selfs
 }
 
 /// Is this field type a pointer a record may be put behind?  A pointer to a
 /// named composite already names its record.
-fn is_record_pointer(ct: &Datatype) -> bool {
+fn is_record_pointer(ct: &TypeRoot) -> bool {
     ct.get_metatype() == type_metatype::TYPE_PTR && !points_at_named_composite(ct)
 }
 
@@ -160,26 +161,25 @@ fn loaded_record(data: &mut Funcdata, cx: &Nesting, rec: &Evidence, off: intb) -
 
 /// Does the enclosing record hold everything the loaded one was seen to hold?
 fn is_same_record(
+    types: &dyn TypeFactory,
     outer: &[TypeField],
     outer_size: int4,
     inner: &[TypeField],
     inner_size: int4,
     unclaimed: &[(int4, int4)],
 ) -> bool {
-    let held = ledger::layout_of_fields(outer, outer_size, &[]);
-    let measured = ledger::layout_of_fields(inner, inner_size, &[]);
+    let held = ledger::layout_of_fields(types, outer, outer_size, &[]);
+    let measured = ledger::layout_of_fields(types, inner, inner_size, &[]);
     if measured.fields.is_empty() || !held.subsumes(&measured) {
         return false;
     }
-    let held_members: Vec<ledger::Member> = outer.iter().map(ledger::Member::of).collect();
-    let own_members: Vec<ledger::Member> = inner.iter().map(ledger::Member::of).collect();
+    let held_members: Vec<ledger::Member> = outer.iter().map(|f| ledger::Member::of(types, f)).collect();
+    let own_members: Vec<ledger::Member> = inner.iter().map(|f| ledger::Member::of(types, f)).collect();
     ledger::keeps_unclaimed(&held_members, &own_members, unclaimed)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use super::*;
     use crate::dtype::TypeFactoryImpl;
 
@@ -190,8 +190,8 @@ mod tests {
         f
     }
 
-    fn field(off: int4, ct: &Rc<Datatype>) -> TypeField {
-        TypeField::new(off, off, format!("field_0x{off:x}"), Rc::clone(ct))
+    fn field(off: int4, ct: &TypeRoot) -> TypeField {
+        TypeField::new(off, off, format!("field_0x{off:x}"), ct.id())
     }
 
     /// grep's `treenext` reads the four fields of a node through its `llink`
@@ -205,20 +205,20 @@ mod tests {
         let long = f.get_base(8, type_metatype::TYPE_INT).unwrap();
         let byte = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
         let node = vec![field(0, &ptr), field(8, &ptr), field(0x10, &long), field(0x18, &byte)];
-        assert!(is_same_record(&node, 0x20, &node, 0x20, &[]));
+        assert!(is_same_record(&f, &node, 0x20, &node, 0x20, &[]));
         let part = vec![field(0, &ptr), field(0x10, &long)];
-        assert!(is_same_record(&node, 0x20, &part, 0x18, &[]));
-        assert!(!is_same_record(&part, 0x18, &node, 0x20, &[]), "the loaded record reads more");
+        assert!(is_same_record(&f, &node, 0x20, &part, 0x18, &[]));
+        assert!(!is_same_record(&f, &part, 0x18, &node, 0x20, &[]), "the loaded record reads more");
 
         let obstack = vec![field(0, &long), field(8, &ptr), field(0x10, &ptr)];
         let chunk = vec![field(0, &ptr), field(8, &ptr)];
-        assert!(!is_same_record(&obstack, 0x18, &chunk, 0x10, &[]), "a pointer where the holder keeps an integer");
+        assert!(!is_same_record(&f, &obstack, 0x18, &chunk, 0x10, &[]), "a pointer where the holder keeps an integer");
 
         // Bytes the loaded record touched without claiming must be laid out alike.
         let ints = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         let split = vec![field(0, &ptr), field(8, &ints), field(0xc, &ints), field(0x10, &long)];
         let whole = vec![field(0, &ptr), field(0x10, &long)];
-        assert!(is_same_record(&split, 0x18, &whole, 0x18, &[]));
-        assert!(!is_same_record(&split, 0x18, &whole, 0x18, &[(8, 8)]));
+        assert!(is_same_record(&f, &split, 0x18, &whole, 0x18, &[]));
+        assert!(!is_same_record(&f, &split, 0x18, &whole, 0x18, &[(8, 8)]));
     }
 }

@@ -46,6 +46,7 @@ use kuna_num::opcodes::OpCode;
 use crate::block::{block_flags, BlockKind};
 use crate::funcdata::Funcdata;
 use crate::context::{BlockId, OpId, VarnodeId};
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 /// The deepest component that performs a conditional split (C++
 /// `FlowBlock::getSplitPoint`), tagged by which arena it lives in.  A leaf
@@ -1601,6 +1602,7 @@ impl Funcdata {
     /// to realize the negation requests the structured collapse recorded against
     /// the underlying `BlockBasic` (the dual-arena `BlockCopy::copy` target).
     pub fn block_basic_negate_lastop(&mut self, bb: BlockId) {
+        let receipt = branch_receipt::begin_invert(self, bb);
         if let Some(lastop) = self.bb_op_tail(bb) {
             let o = self.obank_mut().get_mut(lastop).expect("negate_lastop: stale op");
             o.flip_flag(crate::op::pcodeop_flags::boolean_flip);
@@ -1608,6 +1610,7 @@ impl Funcdata {
         }
         // Flip the out-edge order.
         self.bblocks_mut().swap_edges(bb);
+        branch_receipt::finish(self, receipt);
     }
 
     /// Set the initial ownership range for a basic block (C++
@@ -2462,7 +2465,7 @@ impl Funcdata {
     /// `Funcdata::recoverJumpTable` + `stageJumpTable`, `funcdata_block.cc:680`/
     /// `512`).
     ///
-    /// Returns:
+    /// A fatal pipeline error aborts the function. Otherwise the recovery result is:
     ///   - `Ok(Some(idx))`: the table was recovered; `idx` is its `jumpvec` slot.
     ///   - `Ok(None)`: could not recover (caller truncates to a call).
     ///   - `Err(mode)`: a specific failure mode (thunk/return/callother) — caller
@@ -2475,47 +2478,53 @@ impl Funcdata {
         visited: &crate::flow::VisitedMap,
         run_pipeline: &mut crate::flow::JtPipelineFn<'_>,
         shared: &mut Option<Funcdata>,
-    ) -> Result<Option<usize>, crate::jumptable::RecoveryMode> {
+    ) -> KunaResult<Result<Option<usize>, crate::jumptable::RecoveryMode>> {
         use crate::jumptable::RecoveryMode;
         // linkJumpTable: search for a pre-existing table.
         if let Some(idx) = self.link_jump_table(op) {
             let jt = self.get_jump_table(idx as int4);
             if !jt.is_override() && !jt.is_partial() && jt.num_entries() != 0 {
-                return Ok(Some(idx)); // Previously calculated, complete, non-override
+                return Ok(Ok(Some(idx))); // Previously calculated, complete, non-override
             }
             // Recover empty/override table.
             let mode =
-                self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared);
+                self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared)?;
             if mode != RecoveryMode::Success {
-                return Err(mode);
+                return Ok(Err(mode));
             }
             let addr = self.obank().get(op).unwrap().get_addr().clone();
             self.jumpvec_mut()[idx].set_indirect_op_addr(op, addr);
-            return Ok(Some(idx));
+            return Ok(Ok(Some(idx)));
         }
 
         if (self.flags() & crate::funcdata::funcdata_flags::jumptablerecovery_dont) != 0 {
-            return Ok(None); // Explicitly told not to recover
+            return Ok(Ok(None)); // Explicitly told not to recover
         }
         // earlyJumpTableFail.
         let early = self.early_jump_table_fail(op);
         if early != RecoveryMode::Success {
-            return Err(early);
+            return Ok(Err(early));
         }
         // Trial recovery into a fresh table appended to jumpvec.
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         let trial = crate::jumptable::JumpTable::new(addr);
         self.jumpvec_mut().push(trial);
         let idx = self.num_jump_tables() as usize - 1;
-        let mode = self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared);
+        let mode = match self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared) {
+            Ok(mode) => mode,
+            Err(error) => {
+                self.jumpvec_mut().remove(idx);
+                return Err(error);
+            }
+        };
         if mode != RecoveryMode::Success {
             // Discard the trial table on failure.
             self.jumpvec_mut().remove(idx);
-            return Err(mode);
+            return Ok(Err(mode));
         }
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         self.jumpvec_mut()[idx].set_indirect_op_addr(op, addr);
-        Ok(Some(idx))
+        Ok(Ok(Some(idx)))
     }
 
     /// Run the reduced "jumptable" pipeline on a partial clone and recover the
@@ -2529,7 +2538,7 @@ impl Funcdata {
         visited: &crate::flow::VisitedMap,
         run_pipeline: &mut crate::flow::JtPipelineFn<'_>,
         shared: &mut Option<Funcdata>,
-    ) -> crate::jumptable::RecoveryMode {
+    ) -> KunaResult<crate::jumptable::RecoveryMode> {
         use crate::jumptable::RecoveryMode;
         self.jumpvec_mut()[jt_idx].increment_recovery_count();
 
@@ -2541,15 +2550,19 @@ impl Funcdata {
         if !share || shared.is_none() {
             let mut fresh = match self.build_jumptable_partial() {
                 Ok(p) => p,
-                Err(_) => return RecoveryMode::FailNormal,
+                Err(_) => return Ok(RecoveryMode::FailNormal),
             };
             // Mark the partial as a jump-table-recovery clone, then build its blocks
             // and run the reduced "jumptable" universalAction over it (C++
             // partial.truncatedFlow + allacts.setCurrent("jumptable") + perform).
             fresh.set_flag_raw(crate::funcdata::funcdata_flags::jumptablerecovery_on);
-            if run_pipeline(&mut fresh, visited).is_err() {
-                // C++ catches LowlevelError, warns, and returns fail_normal.
-                return RecoveryMode::FailNormal;
+            match run_pipeline(&mut fresh, visited) {
+                Ok(()) => {}
+                Err(crate::flow::JtPipelineError::Recoverable(_)) => {
+                    // Preserve ordinary jump-table recovery failure policy.
+                    return Ok(RecoveryMode::FailNormal);
+                }
+                Err(crate::flow::JtPipelineError::Fatal(error)) => return Err(error),
             }
             if share {
                 *shared = Some(fresh);
@@ -2568,22 +2581,22 @@ impl Funcdata {
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         let partop = match partial.obank().find_op(&seq) {
             Some(p) => p,
-            None => return RecoveryMode::FailNormal, // Bad partial clone
+            None => return Ok(RecoveryMode::FailNormal), // Bad partial clone
         };
         let partop_ok = partial.obank().get(partop).map(|o| {
             o.code() == OpCode::CPUI_BRANCHIND && *o.get_addr() == addr
         }).unwrap_or(false);
         if !partop_ok {
-            return RecoveryMode::FailNormal;
+            return Ok(RecoveryMode::FailNormal);
         }
         if partial.obank().get(partop).unwrap().is_dead() {
             // Indirect op eliminated as dead code (unreachable).
-            return RecoveryMode::Success;
+            return Ok(RecoveryMode::Success);
         }
         // testForReturnAddress on the partial's BRANCHIND input.
         let in0 = partial.obank().get(partop).unwrap().get_in(0).unwrap();
         if partial.test_for_return_address(in0) {
-            return RecoveryMode::FailReturn;
+            return Ok(RecoveryMode::FailReturn);
         }
 
         // Recover addresses into the table (clone the table out, recover, store).
@@ -2602,7 +2615,7 @@ impl Funcdata {
         // Relink the table to the original op before storing it back.
         jt.set_indirect_op_addr(op, addr);
         self.jumpvec_mut()[jt_idx] = jt;
-        match res {
+        Ok(match res {
             Ok(()) => RecoveryMode::Success,
             Err(e) => {
                 // recoverAddresses throws JumptableThunkError as "Likely thunk".
@@ -2612,7 +2625,7 @@ impl Funcdata {
                     RecoveryMode::FailNormal
                 }
             }
-        }
+        })
     }
 
     /// Build the partial Funcdata for jump-table recovery: a fresh function
@@ -4397,6 +4410,43 @@ mod tests {
         fd.obank_mut().mark_alive(op);
         fd.bb_insert_op(op, bl, None);
         op
+    }
+
+    #[test]
+    fn jumptable_pipeline_fatal_errors_escape_recovery_without_publishing_trial() {
+        use crate::flow::{JtPipelineError, VisitedMap};
+        use crate::jumptable::RecoveryMode;
+        use kuna_base::error::KunaError;
+
+        for fatal in [false, true] {
+            let mut fd = build_fd();
+            let pc = addr(&ramspace(&fd), 0x1000);
+            let op = fd.obank_mut().create_at(1, pc);
+            fd.obank_mut().change_opcode(
+                op, TypeOp::new(OpCode::CPUI_BRANCHIND, pcodeop_flags::branch, "BRANCHIND"),
+            );
+            let target = fd.new_constant(8, 0x2000);
+            fd.op_set_input(op, target, 0).unwrap();
+            let expected = KunaError::Decoder { explain: "invalid callable type".into() };
+            let mut pipeline = |_: &mut Funcdata, _: &VisitedMap| {
+                Err(if fatal {
+                    JtPipelineError::Fatal(expected.clone())
+                } else {
+                    JtPipelineError::Recoverable(expected.clone())
+                })
+            };
+            let mut shared = None;
+            let result = fd.recover_jump_table_flow(
+                op, false, &VisitedMap::new(), &mut pipeline, &mut shared,
+            );
+            if fatal {
+                assert_eq!(result.err(), Some(expected));
+            } else {
+                assert!(matches!(result, Ok(Err(RecoveryMode::FailNormal))));
+            }
+            assert_eq!(fd.num_jump_tables(), 0);
+            assert!(shared.is_none());
+        }
     }
 
     #[test]

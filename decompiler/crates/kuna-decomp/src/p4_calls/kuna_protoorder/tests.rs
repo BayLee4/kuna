@@ -10,8 +10,16 @@ use super::*;
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
 use kuna_base::types::uintb;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl};
 use crate::fspec::{parameter_pieces_flags, ParameterPieces, ProtoModel};
+
+thread_local! {
+    static TYPES: TypeFactoryImpl = TypeFactoryImpl::new();
+}
+
+fn intern(draft: Datatype) -> TypeRoot {
+    TYPES.with(|types| types.intern(draft).unwrap())
+}
 
 fn reg_space() -> Rc<AddrSpace> {
     Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 1, 0, 0, 0))
@@ -25,17 +33,17 @@ fn at(space: &Rc<AddrSpace>, off: uintb) -> Address {
     Address::new(Rc::clone(space), off)
 }
 
-fn int8() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT))
+fn int8() -> TypeRoot {
+    intern(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT))
 }
 
-fn voidt() -> Rc<Datatype> {
-    Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))
+fn voidt() -> TypeRoot {
+    intern(Datatype::new(0, type_metatype::TYPE_VOID))
 }
 
 /// A proto with a model and an internal store: the shape recovery leaves behind
 /// on a decompiled function.
-fn recovered_proto(params: &[(Address, Rc<Datatype>)], out: Rc<Datatype>) -> FuncProto {
+fn recovered_proto(params: &[(Address, TypeRoot)], out: TypeRoot) -> FuncProto {
     let mgr = AddrSpaceManager::new();
     let model = Rc::new(ProtoModel::new(&mgr));
     let mut fp = FuncProto::new();
@@ -43,7 +51,7 @@ fn recovered_proto(params: &[(Address, Rc<Datatype>)], out: Rc<Datatype>) -> Fun
     for (i, (addr, ct)) in params.iter().enumerate() {
         let piece = ParameterPieces {
             addr: addr.clone(),
-            type_: Some(Rc::clone(ct)),
+            type_: Some(ct.clone()),
             flags: 0,
         };
         fp.set_param(i as int4, &format!("a{i}"), &piece);
@@ -303,14 +311,14 @@ fn decline_tokens_are_stable() {
 
 // --- `types`: the storage-and-position agreement the vote rests on -----------
 
-fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr_to(ptrto: TypeRoot) -> TypeRoot {
     let mut p = Datatype::new(8, type_metatype::TYPE_PTR);
     p.submeta = crate::dtype::sub_metatype::SUB_PTR;
-    p.kind = crate::dtype::DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(p)
+    p.kind = crate::dtype::DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    intern(p)
 }
 
-fn stated(params: &[(Address, int4, Rc<Datatype>)]) -> RecoveredTypes {
+fn stated(params: &[(Address, int4, TypeRoot)]) -> RecoveredTypes {
     RecoveredTypes { inputs: params.to_vec(), arity_sound: false, output: None, vararg_tail: Vec::new() }
 }
 
@@ -345,7 +353,7 @@ fn only_cycles_states_inside_a_cycle_and_it_never_locks() {
 fn a_matching_slot_takes_the_callees_type() {
     let reg = reg_space();
     let ct = ptr_to(int8());
-    let st = stated(&[(at(&reg, 0x38), 8, Rc::clone(&ct))]);
+    let st = stated(&[(at(&reg, 0x38), 8, ct.clone())]);
     let got = st.param_type_at(0, &at(&reg, 0x38), 8).expect("stated");
     assert_eq!(got.get_metatype(), type_metatype::TYPE_PTR);
 }
@@ -389,10 +397,10 @@ fn a_recovered_void_return_is_never_stated() {
 fn a_vote_is_classed_as_pointer_integer_or_float() {
     assert!(class_of(&ptr_to(int8())) == Some(Class::Pointer));
     assert!(class_of(&int8()) == Some(Class::Integer));
-    assert!(class_of(&Datatype::new(4, type_metatype::TYPE_FLOAT)) == Some(Class::Float));
+    assert!(class_of(&intern(Datatype::new(4, type_metatype::TYPE_FLOAT))) == Some(Class::Float));
     // An unknown or void type says nothing a call argument does not already
     // default to, so it is never offered as a vote.
-    assert!(class_of(&Datatype::new(8, type_metatype::TYPE_UNKNOWN)).is_none());
+    assert!(class_of(&intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN))).is_none());
     assert!(class_of(&voidt()).is_none());
 }
 
@@ -440,23 +448,23 @@ fn integer_arithmetic_comparison_and_bit_extraction_are_neutral_to_a_pointer_but
 
 // --- pointer votes: what the caller does through the pointer -----------------
 
-fn prim(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn prim(size: int4, meta: type_metatype) -> TypeRoot {
+    intern(Datatype::new_with_align(size, size, meta))
 }
 
 /// `struct M { int i; float f; double d; char s[4]; }`, 20 bytes.
-fn struct_m() -> Rc<Datatype> {
+fn struct_m() -> TypeRoot {
     let mut chars = Datatype::new(4, type_metatype::TYPE_ARRAY);
-    chars.kind = crate::dtype::DatatypeKind::Array { arrayof: prim(1, type_metatype::TYPE_INT), arraysize: 4 };
+    chars.kind = crate::dtype::DatatypeKind::Array { arrayof: prim(1, type_metatype::TYPE_INT).id(), arraysize: 4 };
     let field = vec![
-        crate::dtype::TypeField::new(0, 0, "i", prim(4, type_metatype::TYPE_INT)),
-        crate::dtype::TypeField::new(1, 4, "f", prim(4, type_metatype::TYPE_FLOAT)),
-        crate::dtype::TypeField::new(2, 8, "d", prim(8, type_metatype::TYPE_FLOAT)),
-        crate::dtype::TypeField::new(3, 16, "s", Rc::new(chars)),
+        crate::dtype::TypeField::new(0, 0, "i", prim(4, type_metatype::TYPE_INT).id()),
+        crate::dtype::TypeField::new(1, 4, "f", prim(4, type_metatype::TYPE_FLOAT).id()),
+        crate::dtype::TypeField::new(2, 8, "d", prim(8, type_metatype::TYPE_FLOAT).id()),
+        crate::dtype::TypeField::new(3, 16, "s", intern(chars).id()),
     ];
     let mut s = Datatype::new(20, type_metatype::TYPE_STRUCT);
     s.kind = crate::dtype::DatatypeKind::Struct { field, bitfield: Vec::new() };
-    Rc::new(s)
+    intern(s)
 }
 
 #[test]
@@ -478,12 +486,12 @@ fn an_access_lands_on_one_member_or_is_split() {
     let mut sparse = Datatype::new(24, type_metatype::TYPE_STRUCT);
     sparse.kind = crate::dtype::DatatypeKind::Struct {
         field: vec![
-            crate::dtype::TypeField::new(0, 0, "a", prim(8, type_metatype::TYPE_INT)),
-            crate::dtype::TypeField::new(1, 16, "c", prim(8, type_metatype::TYPE_INT)),
+            crate::dtype::TypeField::new(0, 0, "a", prim(8, type_metatype::TYPE_INT).id()),
+            crate::dtype::TypeField::new(1, 16, "c", prim(8, type_metatype::TYPE_INT).id()),
         ],
         bitfield: Vec::new(),
     };
-    assert!(matches!(member_at(&Rc::new(sparse), 8, 4), Member::Gap));
+    assert!(matches!(member_at(&intern(sparse), 8, 4), Member::Gap));
 }
 
 #[test]
@@ -494,10 +502,12 @@ fn strides_combine_by_their_common_divisor() {
     assert_eq!(gcd(0, 0), 0);
 }
 
-fn named_struct(name: &str) -> Rc<Datatype> {
+fn named_struct(name: &str) -> TypeRoot {
     let mut t = Datatype::new(0x28, type_metatype::TYPE_STRUCT);
     t.name = name.to_string();
-    Rc::new(t)
+    t.id = Datatype::hash_name(name);
+    t.kind = crate::dtype::DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
+    intern(t)
 }
 
 /// The convergence sweep forgets a statement that names a superseded structure

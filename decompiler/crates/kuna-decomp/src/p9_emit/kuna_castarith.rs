@@ -42,14 +42,13 @@
 //! address-like beside an integer cast to a pointer (`table[i]` compiles to the
 //! same `INT_ADD`, with the table as the constant).
 
-use std::rc::Rc;
 
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::cast::{CastStrategy, CastStrategyC};
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 
 /// Why an `INT_ADD` keeps its integer form.
@@ -109,13 +108,12 @@ pub(crate) struct Plan {
     ptr_slot: int4,
     index: i64,
     elem: int4,
-    target: Rc<Datatype>,
+    target: TypeRoot,
     base: Base,
 }
 
-fn strip_typedefs(mut dt: Rc<Datatype>) -> Rc<Datatype> {
+fn strip_typedefs(mut dt: TypeRoot) -> TypeRoot {
     while let Some(td) = dt.get_typedef() {
-        let td = Rc::clone(td);
         dt = td;
     }
     dt
@@ -180,11 +178,11 @@ fn cast_def_read_only_here(data: &Funcdata, vn: VarnodeId, op: OpId) -> bool {
 /// them keeps every bit and the cast pass already moves a loaded or stored value
 /// between them without a token.  A float never counts: converting it changes
 /// the bits.
-fn same_element(pointee: &Rc<Datatype>, target: &Rc<Datatype>) -> bool {
-    if Rc::ptr_eq(pointee, target) {
+fn same_element(pointee: &TypeRoot, target: &TypeRoot) -> bool {
+    if TypeRoot::eq(pointee, target) {
         return true;
     }
-    let int = |t: &Rc<Datatype>| {
+    let int = |t: &TypeRoot| {
         matches!(
             t.get_metatype(),
             type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN
@@ -200,7 +198,7 @@ fn same_element(pointee: &Rc<Datatype>, target: &Rc<Datatype>) -> bool {
 /// model's pointer size.  `long double` is not one (its `sizeof` is 16, 12 or 8
 /// by target, never the 10 bytes of the value), and neither is an integer of a
 /// width C names no type for.
-fn c_sizeof_is_size(types: &crate::dtype::TypeFactoryImpl, target: &Rc<Datatype>) -> bool {
+fn c_sizeof_is_size(types: &crate::dtype::TypeFactoryImpl, target: &TypeRoot) -> bool {
     let size = target.get_size();
     let model = crate::kuna_ctypes::CDataModel::from_types(types);
     match target.get_metatype() {
@@ -219,8 +217,8 @@ fn c_sizeof_is_size(types: &crate::dtype::TypeFactoryImpl, target: &Rc<Datatype>
 /// PTRADD input cast (its own type is `ptype`) and the declaration a reader sees
 /// -- a parameter's prototype type, or a local's declared type -- must point at
 /// the same element.
-fn declared_as(data: &Funcdata, vn: VarnodeId, op: OpId, ptype: &Rc<Datatype>) -> bool {
-    if !Rc::ptr_eq(&data.vn_type_read_facing(vn, op), ptype) {
+fn declared_as(data: &Funcdata, vn: VarnodeId, op: OpId, ptype: &TypeRoot) -> bool {
+    if !TypeRoot::eq(&data.vn_type_read_facing(vn, op), ptype) {
         return false;
     }
     let Some(decl) =
@@ -228,10 +226,10 @@ fn declared_as(data: &Funcdata, vn: VarnodeId, op: OpId, ptype: &Rc<Datatype>) -
     else {
         return false;
     };
-    let elem = |t: &Rc<Datatype>| t.get_ptr_to().map(strip_typedefs);
+    let elem = |t: &TypeRoot| t.get_ptr_to().map(strip_typedefs);
     decl.get_metatype() == type_metatype::TYPE_PTR
         && decl.get_size() == ptype.get_size()
-        && matches!((elem(&decl), elem(ptype)), (Some(a), Some(b)) if Rc::ptr_eq(&a, &b))
+        && matches!((elem(&decl), elem(ptype)), (Some(a), Some(b)) if TypeRoot::eq(&a, &b))
 }
 
 /// Is `vn` an integer the cast pass has already turned into a pointer?  With an
@@ -364,7 +362,7 @@ fn runs_before(data: &Funcdata, a: OpId, b: OpId) -> bool {
 /// What a lone LOAD or STORE moves through the implied address `out`.
 enum Access {
     /// The value type, final by the time the reader is cast.
-    Value(Rc<Datatype>),
+    Value(TypeRoot),
     /// A STORE of a temporary whose defining op the pass has not reached: its
     /// type can still change there (a float op's result is retyped `float`), so
     /// no element type chosen now is safe.
@@ -422,7 +420,7 @@ fn access_type(data: &mut Funcdata, out: VarnodeId, op: OpId) -> Access {
 /// arithmetic and to an integer (or a pointer, printed with a bit-preserving cast)
 /// for the integer ops, where a `bool` element would convert rather than keep
 /// the bits; any other op could produce anything.
-fn store_value_settled(data: &Funcdata, value: VarnodeId, op: OpId, t: &Rc<Datatype>) -> bool {
+fn store_value_settled(data: &Funcdata, value: VarnodeId, op: OpId, t: &TypeRoot) -> bool {
     let Some(v) = data.vbank().get(value) else {
         return false;
     };
@@ -517,8 +515,8 @@ fn element(
     data: &mut Funcdata,
     op: OpId,
     out: VarnodeId,
-    ptype: &Rc<Datatype>,
-) -> Result<(Rc<Datatype>, Rc<Datatype>, SumUse), Leave> {
+    ptype: &TypeRoot,
+) -> Result<(TypeRoot, TypeRoot, SumUse), Leave> {
     let out_size = data.vbank().get(out).map(|v| v.get_size()).unwrap_or(0);
     if ptype.get_word_size() != Some(1) || ptype.get_size() != out_size {
         return Err(Leave::WordAddressed);
@@ -533,7 +531,7 @@ fn element(
     let (target, target_ptr, used) = match access_type(data, out, op) {
         Access::Unsettled => return Err(Leave::UnsettledStore),
         Access::Value(a) => {
-            let a_elem = strip_typedefs(Rc::clone(&a));
+            let a_elem = strip_typedefs(Clone::clone(&a));
             match out_pointee {
                 Some(p) if p.get_size() == a_elem.get_size() && same_element(&p, &a_elem) => {
                     (p, outty, SumUse::Access)
@@ -564,7 +562,7 @@ fn element(
                     .get_base(1, type_metatype::TYPE_INT)
                     .map_err(|_| Leave::VoidTarget)?;
                 let ptr = tlst
-                    .get_type_pointer(out_size, Rc::clone(&byte), 1)
+                    .get_type_pointer(out_size, Clone::clone(&byte), 1)
                     .map_err(|_| Leave::VoidTarget)?;
                 (byte, ptr, SumUse::Bytes)
             } else {
@@ -619,7 +617,7 @@ pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
             ],
         )
     };
-    let mut found: Option<(int4, Rc<Datatype>)> = None;
+    let mut found: Option<(int4, TypeRoot)> = None;
     let mut saw_pointer = false;
     for slot in 0..2 {
         let vn = ins[slot];
@@ -710,7 +708,7 @@ pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> Option<()> {
     let base = match plan.base {
         Base::Direct => base_vn,
         Base::Retype => {
-            let _ = data.vn_update_type(base_vn, Rc::clone(&plan.target));
+            let _ = data.vn_update_type(base_vn, Clone::clone(&plan.target));
             base_vn
         }
         Base::Cast | Base::Recast(_) => {
@@ -720,7 +718,7 @@ pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> Option<()> {
             };
             let cast = data.new_op(1, addr);
             let cvn = data.new_unique_out(ptrsize, cast).ok()?;
-            let _ = data.vn_update_type(cvn, Rc::clone(&plan.target));
+            let _ = data.vn_update_type(cvn, Clone::clone(&plan.target));
             if let Some(v) = data.vbank_mut().get_mut(cvn) {
                 v.set_implied();
             }
@@ -891,7 +889,7 @@ fn sum_saved(
     data: &mut Funcdata,
     strat: &CastStrategyC,
     out: VarnodeId,
-    target_ptr: &Rc<Datatype>,
+    target_ptr: &TypeRoot,
     used: SumUse,
 ) -> i32 {
     if used == SumUse::Access {
@@ -931,7 +929,7 @@ fn bytes_taken(
     strat: &CastStrategyC,
     r: OpId,
     slot: int4,
-    byte_ptr: &Rc<Datatype>,
+    byte_ptr: &TypeRoot,
 ) -> bool {
     let Some((code, out, other, addr)) = data.obank().get(r).map(|o| {
         (
@@ -972,7 +970,7 @@ pub(crate) struct IndexPlan {
     index: VarnodeId,
     by: Option<OpId>,
     elem: int4,
-    target: Rc<Datatype>,
+    target: TypeRoot,
     base: Base,
 }
 
@@ -1078,7 +1076,7 @@ pub(crate) fn apply_index(data: &mut Funcdata, op: OpId, plan: &IndexPlan) -> Op
     let base = match plan.base {
         Base::Direct => base_vn,
         Base::Retype => {
-            let _ = data.vn_update_type(base_vn, Rc::clone(&plan.target));
+            let _ = data.vn_update_type(base_vn, Clone::clone(&plan.target));
             base_vn
         }
         Base::Cast | Base::Recast(_) => {
@@ -1088,7 +1086,7 @@ pub(crate) fn apply_index(data: &mut Funcdata, op: OpId, plan: &IndexPlan) -> Op
             };
             let cast = data.new_op(1, addr);
             let cvn = data.new_unique_out(ptrsize, cast).ok()?;
-            let _ = data.vn_update_type(cvn, Rc::clone(&plan.target));
+            let _ = data.vn_update_type(cvn, Clone::clone(&plan.target));
             if let Some(v) = data.vbank_mut().get_mut(cvn) {
                 v.set_implied();
             }
@@ -1122,7 +1120,7 @@ pub(crate) fn rewrite_index(data: &mut Funcdata, strat: &CastStrategyC, op: OpId
 /// form retypes that cast when only `op` reads it (one), reads the cast's own
 /// input when that is already the `long` it wants (none), and otherwise casts
 /// the cast (two).
-fn operand_saved(data: &mut Funcdata, vn: VarnodeId, op: OpId, long: &Rc<Datatype>) -> i32 {
+fn operand_saved(data: &mut Funcdata, vn: VarnodeId, op: OpId, long: &TypeRoot) -> i32 {
     let Some(v) = data.vbank().get(vn) else { return 0 };
     let cast_in = v
         .get_def()
@@ -1134,7 +1132,7 @@ fn operand_saved(data: &mut Funcdata, vn: VarnodeId, op: OpId, long: &Rc<Datatyp
     };
     if data.lone_descend(vn) == Some(op) {
         0
-    } else if data.vbank().get(src).is_some_and(|s| Rc::ptr_eq(s.get_type(), long)) {
+    } else if data.vbank().get(src).is_some_and(|s| TypeRoot::eq(s.get_type(), long)) {
         -1
     } else {
         1
@@ -1149,7 +1147,7 @@ fn operand_saved(data: &mut Funcdata, vn: VarnodeId, op: OpId, long: &Rc<Datatyp
 /// cast both operands to.  The cast pass then leaves both operands as they are,
 /// and casts the result from the returned token, that signed integer, exactly as
 /// it cast the integer form's.
-pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Datatype>, Leave> {
+pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<TypeRoot, Leave> {
     let (out, a, b) = {
         let o = data.obank().get(op).ok_or(Leave::DiffNotPointers)?;
         if o.code() != OpCode::CPUI_INT_SUB || o.num_input() != 2 {
@@ -1162,7 +1160,7 @@ pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Dat
         )
     };
     let tlst = data.get_arch().types_rc().ok_or(Leave::DiffNotPointers)?;
-    let mut pointee: Option<Rc<Datatype>> = None;
+    let mut pointee: Option<TypeRoot> = None;
     let mut width = 0;
     for vn in [a, b] {
         if data.vbank().get(vn).is_none_or(|v| v.is_constant() || v.is_annotation()) {
@@ -1180,7 +1178,7 @@ pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Dat
         ) && !p.is_enum_type()
             && p.get_size() == 1
             && c_sizeof_is_size(&tlst, &p);
-        if !byte || pointee.as_ref().is_some_and(|q| !Rc::ptr_eq(q, &p)) {
+        if !byte || pointee.as_ref().is_some_and(|q| !TypeRoot::eq(q, &p)) {
             return Err(Leave::DiffPointee);
         }
         pointee = Some(p);

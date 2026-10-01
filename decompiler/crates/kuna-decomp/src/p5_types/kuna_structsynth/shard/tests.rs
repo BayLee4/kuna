@@ -34,7 +34,7 @@ enum Ty {
     Bytes(int4),
 }
 
-fn ty(f: &TypeFactoryImpl, t: Ty) -> Rc<Datatype> {
+fn ty(f: &TypeFactoryImpl, t: Ty) -> TypeRoot {
     match t {
         Ty::CharPtr => {
             f.get_type_pointer(8, f.get_base(1, type_metatype::TYPE_INT).unwrap(), 1).unwrap()
@@ -51,13 +51,13 @@ fn ty(f: &TypeFactoryImpl, t: Ty) -> Rc<Datatype> {
 fn fields(f: &TypeFactoryImpl, spec: &[(int4, Ty)]) -> Vec<TypeField> {
     spec.iter()
         .enumerate()
-        .map(|(i, &(off, t))| TypeField::new(i as int4, off, format!("field_0x{off:x}"), ty(f, t)))
+        .map(|(i, &(off, t))| TypeField::new(i as int4, off, format!("field_0x{off:x}"), ty(f, t).id()))
         .collect()
 }
 
 /// A request as a worker records it, every core type held at load.
-fn req(fs: &[TypeField], size: int4, unclaimed: &[(int4, int4)]) -> SynthRequest {
-    SynthRequest::of(fs, size, unclaimed, &[], &AtLoad::of(&factory()))
+fn req(f: &TypeFactoryImpl, fs: &[TypeField], size: int4, unclaimed: &[(int4, int4)]) -> SynthRequest {
+    SynthRequest::of(f, fs, size, unclaimed, &[], &AtLoad::of(f))
 }
 
 fn at_load() -> Rc<AtLoad> {
@@ -91,9 +91,13 @@ fn a_replay_names_every_structure_as_the_ledger_does() {
     let mut named = Vec::new();
     for (spec, size, unclaimed) in script() {
         let fs = fields(&live, &spec);
-        let request = req(&fs, size, &unclaimed);
+        let request = req(&live, &fs, size, &unclaimed);
         let real =
-            ledger::lookup_or_mint(&live, fs, size, &unclaimed, &[], crate::kuna_structmerge::StructMergeMode::Off).map(|t| t.get_name().to_string());
+            ledger::lookup_or_mint(&live, fs, size, &unclaimed, &[], crate::kuna_structmerge::StructMergeMode::Off)
+                .map(|t| {
+                    let view = t.read();
+                    view.get(t.id()).unwrap().get_name().to_string()
+                });
         assert_eq!(replay.lookup_or_mint(&request), real);
         named.push(real.unwrap());
     }
@@ -110,8 +114,9 @@ fn a_replay_names_every_structure_as_the_ledger_does() {
 fn a_lookup_after_the_batch_answers_without_minting() {
     let f = factory();
     let mut replay = Replay::probe(&factory());
-    let pair = req(&fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]);
+    let pair = req(&f, &fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]);
     let four = req(
+        &f,
         &fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long), (0x10, Ty::Uint), (0x14, Ty::Uint)]),
         24,
         &[],
@@ -120,23 +125,26 @@ fn a_lookup_after_the_batch_answers_without_minting() {
     assert_eq!(replay.lookup_or_mint(&four).as_deref(), Some("struct_1"));
     assert_eq!(replay.lookup(&pair), Ok(Some("struct_1".to_string())));
     let other =
-        req(&fields(&f, &[(0, Ty::Long), (8, Ty::Uint), (0xc, Ty::Uint)]), 16, &[]);
+        req(&f, &fields(&f, &[(0, Ty::Long), (8, Ty::Uint), (0xc, Ty::Uint)]), 16, &[]);
     assert_eq!(replay.lookup(&other), Err(WouldMint));
     assert_eq!(replay.table().len(), 2);
 }
 
-/// A name another type already holds is skipped, exactly as the ledger's scan
-/// skips it, and a held synthesized shape answers like one the run minted.
+/// An authoritative type is skipped even when its shape matches the request;
+/// a held inferred shape answers like one the run minted.
 #[test]
 fn a_held_name_is_never_minted_over() {
     let live = factory();
     let foreign = live.get_type_struct("struct_0").unwrap();
-    let named = vec![TypeField::new(0, 0, "flags", ty(&live, Ty::Long))];
-    live.set_fields_struct_raw(&foreign, named, Vec::new(), 8, 1, 0).unwrap();
-    let mut replay = Replay::probe(&live);
     let fs = fields(&live, &[(0, Ty::CharPtr), (8, Ty::Long)]);
-    let request = req(&fs, 16, &[]);
-    let real = ledger::lookup_or_mint(&live, fs, 16, &[], &[], crate::kuna_structmerge::StructMergeMode::Off).map(|t| t.get_name().to_string());
+    live.set_fields_struct_raw(&foreign, fs.clone(), Vec::new(), 16, 1, 0).unwrap();
+    let mut replay = Replay::probe(&live);
+    let request = req(&live, &fs, 16, &[]);
+    let real = ledger::lookup_or_mint(&live, fs, 16, &[], &[], crate::kuna_structmerge::StructMergeMode::Off)
+        .map(|t| {
+            let view = t.read();
+            view.get(t.id()).unwrap().get_name().to_string()
+        });
     assert_eq!(real.as_deref(), Some("struct_1"));
     assert_eq!(replay.lookup_or_mint(&request), real);
     let again = Replay::probe(&live);
@@ -149,7 +157,7 @@ fn a_table_rebuilds_the_same_structures_in_another_factory() {
     let mut replay = Replay::probe(&factory());
     for (spec, size, unclaimed) in script() {
         let fs = fields(&live, &spec);
-        replay.lookup_or_mint(&req(&fs, size, &unclaimed));
+        replay.lookup_or_mint(&req(&live, &fs, size, &unclaimed));
         ledger::lookup_or_mint(&live, fs, size, &unclaimed, &[], crate::kuna_structmerge::StructMergeMode::Off);
     }
     let other = factory();
@@ -169,7 +177,7 @@ fn a_table_rebuilds_the_same_structures_in_another_factory() {
     // before it takes the table.
     let worker = factory();
     let foreign = worker.get_type_struct("struct_0").unwrap();
-    let named = vec![TypeField::new(0, 0, "flags", ty(&worker, Ty::Long))];
+    let named = vec![TypeField::new(0, 0, "flags", ty(&worker, Ty::Long).id())];
     worker.set_fields_struct_raw(&foreign, named, Vec::new(), 8, 1, 0).unwrap();
     let held = held_names(&worker);
     assert_eq!(held, ["struct_0"]);
@@ -199,9 +207,50 @@ fn a_table_rebuilds_the_same_structures_in_another_factory() {
         .dependent_order()
         .iter()
         .filter(|t| ledger::minted_number(t).is_some())
-        .map(|t| t.get_name().to_string())
+        .map(|t| t.read().get(t.id()).unwrap().get_name().to_string())
         .collect();
     assert_eq!(minted.len(), 3, "each replayed name exactly once: {minted:?}");
+}
+
+#[test]
+fn retirement_preserves_held_names_and_readable_old_revisions() {
+    let f = factory();
+    let fs = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
+    let authoritative = f.get_type_struct("struct_0").unwrap();
+    f.set_fields_struct_raw(&authoritative, fs.clone(), Vec::new(), 16, 1, 0).unwrap();
+    let held_revision = ledger::mint(&f, "struct_1", fs.clone(), 16, &[]).unwrap();
+    let held = held_names(&f);
+    let request = req(&f, &fs, 16, &[]);
+    let retired = ledger::mint(&f, "struct_2", fs.clone(), 16, &[]).unwrap();
+    let retired_ptr = f.get_type_pointer(8, retired.clone(), 1).unwrap();
+    let retired_array = f.get_type_array(3, retired_ptr.clone()).unwrap();
+    let authoritative_ptr = f.get_type_pointer(8, authoritative.clone(), 1).unwrap();
+    // Even an authoritative name installed after the snapshot is not inferred.
+    let late_authoritative = f.get_type_struct("struct_3").unwrap();
+    f.set_fields_struct_raw(&late_authoritative, fs, Vec::new(), 16, 1, 0).unwrap();
+
+    forget_minted(&f, &held).unwrap();
+    assert_eq!(held_names(&f), ["struct_0", "struct_1", "struct_3"]);
+    assert_eq!(f.find_by_name("struct_0").unwrap(), Some(authoritative.clone()));
+    assert_eq!(f.find_by_name("struct_1").unwrap(), Some(held_revision));
+    assert_eq!(f.find_by_name("struct_3").unwrap(), Some(late_authoritative));
+    let indexed = f.dependent_order();
+    for old in [&retired, &retired_ptr, &retired_array] {
+        assert!(!indexed.contains(old), "retired dependency remains indexed: {old:?}");
+    }
+    assert_eq!(f.get_type_pointer(8, authoritative, 1).unwrap(), authoritative_ptr);
+
+    install_table(&f, &[("struct_2".to_string(), request.clone())]).unwrap();
+    let replacement = f.find_by_name("struct_2").unwrap().unwrap();
+    assert_ne!(replacement, retired);
+    assert!(replacement.is_inferred());
+    assert_eq!(ledger::layout_of(&replacement), Some(request.want.clone()));
+    assert_eq!(ledger::layout_of(&retired), Some(request.want));
+    assert_eq!(ledger::members_of(&retired), request.own);
+    assert_eq!(retired.read().get(retired.id()).unwrap().get_name(), "struct_2");
+    assert_eq!(retired_ptr.get_ptr_to(), Some(retired));
+    assert_eq!(retired_array.get_array_base(), Some(retired_ptr.clone()));
+    assert_ne!(f.get_type_pointer(8, replacement, 1).unwrap(), retired_ptr);
 }
 
 #[test]
@@ -232,6 +281,7 @@ fn a_field_type_is_rebuilt_only_when_it_is_the_same_type() {
         id: 7,
         meta: type_metatype::TYPE_STRUCT.as_i32(),
         size: 216,
+        instance: Some(TypeInstance::Fixed),
     };
     assert!(missing.build(&g).is_none());
 }
@@ -242,12 +292,12 @@ fn a_record_survives_the_wire() {
     let record = FunctionRecord {
         requests: script()
             .into_iter()
-            .map(|(spec, size, unclaimed)| req(&fields(&f, &spec), size, &unclaimed))
+            .map(|(spec, size, unclaimed)| req(&f, &fields(&f, &spec), size, &unclaimed))
             .collect(),
         answers: vec![
             None,
             Some(("struct_3".into(), None)),
-            Some(("struct_4".into(), Some(req(&fields(&f, &[(0, Ty::Long)]), 8, &[])))),
+            Some(("struct_4".into(), Some(req(&f, &fields(&f, &[(0, Ty::Long)]), 8, &[])))),
         ],
         off_script: true,
     };
@@ -261,6 +311,33 @@ fn a_record_survives_the_wire() {
 }
 
 #[test]
+fn named_recipe_preserves_source_instance_and_load_boundary() {
+    let f = factory();
+    let named = |size, variable| {
+        let mut draft = crate::dtype::Datatype::new_with_align(size, 1, type_metatype::TYPE_CODE);
+        draft.name = "CallableSource".into();
+        draft.display_name = draft.name.clone();
+        draft.id = 0x600000000000000;
+        draft.kind = DatatypeKind::Code { proto: None };
+        if variable { draft.flags |= crate::dtype::flags::variable_length; }
+        f.intern(draft).unwrap()
+    };
+    let one = named(1, true);
+    let at_load = AtLoad::of(&f);
+    let two = named(2, true);
+    let fixed = named(1, false);
+    assert!(TypeRecipe::of(&one).unwrap().held_at_load(&at_load));
+    assert!(!TypeRecipe::of(&two).unwrap().held_at_load(&at_load));
+    assert!(!TypeRecipe::of(&fixed).unwrap().held_at_load(&at_load));
+    for root in [&one, &two, &fixed] {
+        let mut wire = Vec::new();
+        put_recipe(&mut wire, &TypeRecipe::of(root).unwrap());
+        let recipe = read_recipe(&mut Reader { bytes: &wire, pos: 0 }, 0).unwrap();
+        assert_eq!(recipe.build(&f).unwrap().id(), root.id());
+    }
+}
+
+#[test]
 fn a_forced_hook_answers_in_order_and_notices_a_changed_script() {
     let f = factory();
     let first = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
@@ -268,18 +345,19 @@ fn a_forced_hook_answers_in_order_and_notices_a_changed_script() {
     let hook = ShardHook::forcing(at_load());
 
     let second = fields(&f, &[(0, Ty::Long), (8, Ty::Long), (0x10, Ty::Long)]);
-    hook.borrow_mut().begin(&[Some(minted.get_name().to_string()), None]);
+    let name = minted.read().get(minted.id()).unwrap().get_name().to_string();
+    hook.borrow_mut().begin(&[Some(name.clone()), None]);
     let a = lookup(&hook, &f, first.clone(), 16, &[], &[]);
-    assert!(a.is_some_and(|t| Rc::ptr_eq(&t, &minted)));
+    assert_eq!(a, Some(minted.clone()));
     assert!(lookup(&hook, &f, second, 24, &[], &[]).is_none());
     let record = hook.borrow_mut().take();
     assert_eq!(record.requests.len(), 2);
     assert!(!record.off_script);
 
     // A repeated lookup is answered as the first one was and takes no answer.
-    hook.borrow_mut().begin(&[Some(minted.get_name().to_string())]);
+    hook.borrow_mut().begin(&[Some(name)]);
     assert!(lookup(&hook, &f, first.clone(), 16, &[], &[]).is_some());
-    assert!(lookup(&hook, &f, first.clone(), 16, &[], &[]).is_some_and(|t| Rc::ptr_eq(&t, &minted)));
+    assert_eq!(lookup(&hook, &f, first.clone(), 16, &[], &[]), Some(minted));
     let record = hook.borrow_mut().take();
     assert!(!record.off_script);
     assert_eq!(record.requests.len(), 2);
@@ -306,10 +384,10 @@ fn a_recording_hook_lets_the_ledger_answer() {
     let fs = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
     let a = lookup(&hook, &f, fs.clone(), 16, &[], &[]).unwrap();
     let b = lookup(&hook, &f, fs.clone(), 16, &[], &[]).unwrap();
-    assert!(Rc::ptr_eq(&a, &b));
-    assert_eq!(a.get_name(), "struct_0");
+    assert_eq!(a, b);
+    assert_eq!(a.read().get(a.id()).unwrap().get_name(), "struct_0");
     let record = hook.borrow_mut().take();
-    assert_eq!(record.requests, vec![req(&fs, 16, &[]); 2]);
+    assert_eq!(record.requests, vec![req(&f, &fs, 16, &[]); 2]);
     assert!(record.requests.iter().all(SynthRequest::portable));
 }
 
@@ -318,7 +396,7 @@ fn a_recording_hook_lets_the_ledger_answer() {
 #[test]
 fn minted_structures_are_rendered_by_number() {
     let f = factory();
-    let minted: Vec<Rc<Datatype>> = [
+    let minted: Vec<TypeRoot> = [
         (vec![(0, Ty::CharPtr), (8, Ty::Long)], 16),
         (vec![(0, Ty::Long), (8, Ty::Long), (0x10, Ty::Long)], 24),
         (vec![(0, Ty::Uint), (4, Ty::Uint), (8, Ty::Long)], 16),
@@ -327,14 +405,11 @@ fn minted_structures_are_rendered_by_number() {
     .map(|(spec, size)| ledger::lookup_or_mint(&f, fields(&f, &spec), size, &[], &[], crate::kuna_structmerge::StructMergeMode::Off).unwrap())
     .collect();
     let long = ty(&f, Ty::Long);
-    let order = vec![
-        Rc::clone(&minted[2]),
-        Rc::clone(&long),
-        Rc::clone(&minted[0]),
-        Rc::clone(&minted[1]),
-    ];
-    let names: Vec<String> =
-        ledger::in_name_order(order).iter().map(|t| t.get_name().to_string()).collect();
+    let order = vec![minted[2].clone(), long, minted[0].clone(), minted[1].clone()];
+    let names: Vec<String> = ledger::in_name_order(order)
+        .iter()
+        .map(|t| t.read().get(t.id()).unwrap().get_name().to_string())
+        .collect();
     assert_eq!(names, ["int8", "struct_0", "struct_1", "struct_2"]);
 }
 
@@ -346,16 +421,16 @@ fn a_type_interned_after_the_load_does_not_travel() {
     let f = factory();
     let loaded = AtLoad::of(&f);
     let peb = f.get_type_struct("PEB").unwrap();
-    let named = vec![TypeField::new(0, 2, "BeingDebugged", ty(&f, Ty::Uint))];
+    let named = vec![TypeField::new(0, 2, "BeingDebugged", ty(&f, Ty::Uint).id())];
     let peb = f.set_fields_struct_raw(&peb, named, Vec::new(), 8, 1, 0).unwrap();
     let peb_ptr = f.get_type_pointer(8, peb, 1).unwrap();
     let fs = vec![
-        TypeField::new(0, 0, "field_0x0", ty(&f, Ty::Uint)),
-        TypeField::new(1, 8, "field_0x8", peb_ptr),
+        TypeField::new(0, 0, "field_0x0", ty(&f, Ty::Uint).id()),
+        TypeField::new(1, 8, "field_0x8", peb_ptr.id()),
     ];
-    assert!(!SynthRequest::of(&fs, 16, &[], &[], &loaded).portable());
-    assert!(SynthRequest::of(&fs, 16, &[], &[], &AtLoad::of(&f)).portable());
-    assert!(req(&fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]).portable());
+    assert!(!SynthRequest::of(&f, &fs, 16, &[], &[], &loaded).portable());
+    assert!(SynthRequest::of(&f, &fs, 16, &[], &[], &AtLoad::of(&f)).portable());
+    assert!(req(&f, &fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]).portable());
 }
 
 /// A recording worker reports its own ledger's answer to every lookup, with
@@ -367,7 +442,7 @@ fn a_recording_hook_reports_its_own_answers() {
     ledger::lookup_or_mint(&f, flags.clone(), 8, &[], &[], crate::kuna_structmerge::StructMergeMode::Off).unwrap();
     let hook = ShardHook::recording(Rc::new(AtLoad::of(&f)));
     let pair = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
-    let minting = req(&pair, 16, &[]);
+    let minting = req(&f, &pair, 16, &[]);
 
     hook.borrow_mut().begin(&[]);
     lookup(&hook, &f, pair.clone(), 16, &[], &[]).unwrap();
@@ -397,8 +472,8 @@ fn a_recording_hook_reports_its_own_answers() {
 #[test]
 fn a_renaming_pairs_structures_with_the_same_members() {
     let f = factory();
-    let pair = req(&fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]);
-    let wide = req(&fields(&f, &[(0, Ty::CharPtr), (8, Ty::Uint)]), 16, &[]);
+    let pair = req(&f, &fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]);
+    let wide = req(&f, &fields(&f, &[(0, Ty::CharPtr), (8, Ty::Uint)]), 16, &[]);
     let a = |name: &str, def: &SynthRequest| Some((name.to_string(), Some(def.clone())));
     let base = Some(("struct_0".to_string(), None));
     assert_eq!(
@@ -446,11 +521,11 @@ fn a_rename_touches_whole_identifiers_outside_literals() {
 fn the_replay_knows_the_names_held_before_the_run() {
     let live = factory();
     let foreign = live.get_type_struct("struct_1").unwrap();
-    let named = vec![TypeField::new(0, 0, "flags", ty(&live, Ty::Long))];
+    let named = vec![TypeField::new(0, 0, "flags", ty(&live, Ty::Long).id())];
     live.set_fields_struct_raw(&foreign, named, Vec::new(), 8, 1, 0).unwrap();
     let mut replay = Replay::probe(&live);
     assert_eq!(replay.held(), ["struct_1"]);
-    replay.lookup_or_mint(&req(&fields(&live, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]));
+    replay.lookup_or_mint(&req(&live, &fields(&live, &[(0, Ty::CharPtr), (8, Ty::Long)]), 16, &[]));
     assert_eq!(replay.table()[0].0, "struct_0");
     assert_eq!(replay.held(), ["struct_1"]);
 }
@@ -462,9 +537,9 @@ fn the_replay_knows_the_names_held_before_the_run() {
 fn a_self_pointing_request_is_not_portable() {
     let f = factory();
     let fs = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
-    let plain = SynthRequest::of(&fs, 16, &[], &[], &AtLoad::of(&f));
+    let plain = SynthRequest::of(&f, &fs, 16, &[], &[], &AtLoad::of(&f));
     assert!(plain.portable());
-    let selfish = SynthRequest::of(&fs, 16, &[], &[0], &AtLoad::of(&f));
+    let selfish = SynthRequest::of(&f, &fs, 16, &[], &[0], &AtLoad::of(&f));
     assert!(!selfish.portable());
     assert_eq!(selfish.want.fields[0].ty, ledger::SELF_KEY);
     assert_eq!(selfish.own[0].claim.as_ref().map(|k| k.ty.as_str()), Some(ledger::SELF_KEY));

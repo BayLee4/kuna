@@ -88,7 +88,7 @@ fn callback_body(prog: &mut ConsoleProgram) -> String {
         entry,
         declared,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the callback decompiles");
     kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)

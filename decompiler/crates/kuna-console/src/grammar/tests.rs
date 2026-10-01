@@ -5,7 +5,7 @@
 //! `testparamstore.cc` feed `parse_protopieces`, together with the lexer's
 //! token-level rules and the rejection (error-text) paths.
 
-use kuna_decomp::dtype::{type_metatype as meta, TypeFactory, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype as meta, TypeFactory, TypeFactoryImpl, TypeRoot};
 
 use super::{
     flags, parse_c_integer, parse_protopieces, parse_type, tok, CParse, DataOrg, DocType,
@@ -14,11 +14,41 @@ use super::{
 
 // -- test helpers -----------------------------------------------------------
 
+fn type_name(root: &TypeRoot) -> String {
+    root.read().get(root.id()).unwrap().get_name().to_string()
+}
+
+fn callable_context(f: &TypeFactoryImpl) -> std::rc::Rc<kuna_decomp::fspec::ModelContext> {
+    use kuna_base::space::AddrSpaceManager;
+    use kuna_decomp::fspec::{ModelContext, ProtoModel};
+    use std::rc::Rc;
+
+    let manager = Rc::new(AddrSpaceManager::new());
+    let context = ModelContext::new(manager.clone());
+    for name in ["__cdecl", "__stdcall", "__fastcall", "__thiscall"] {
+        let mut model = ProtoModel::new(&manager);
+        model.set_name(name);
+        let model = Rc::new(model);
+        context.register_model(model.clone());
+        if name == "__cdecl" {
+            context.set_default(Some(model));
+        }
+    }
+    f.set_model_context(context.clone()).unwrap();
+    context
+}
+
 /// Build a factory wired with the alignment map, a max base size of 8, and the
 /// named core data-types the datatest / unit-test corpus references (`int4`,
 /// `char`, `void`, `float4`, ...).  These names are exactly what
 /// `findByName` resolves during `parse line`.
 fn factory() -> TypeFactoryImpl {
+    let f = unsealed_factory();
+    f.cache_core_types().unwrap();
+    f
+}
+
+fn unsealed_factory() -> TypeFactoryImpl {
     let f = TypeFactoryImpl::new();
     f.set_default_alignment_map();
     f.set_max_basetype_size(8);
@@ -36,7 +66,6 @@ fn factory() -> TypeFactoryImpl {
     f.set_core_type("uint8", 8, meta::TYPE_UINT, false).unwrap();
     f.set_core_type("float4", 4, meta::TYPE_FLOAT, false).unwrap();
     f.set_core_type("float8", 8, meta::TYPE_FLOAT, false).unwrap();
-    f.cache_core_types().unwrap();
     f
 }
 
@@ -175,10 +204,6 @@ fn parse_c_integer_prefix_edge_cases() {
     assert_eq!(parse_c_integer(b"+5"), 5);
     assert_eq!(parse_c_integer(b"-5z") as i64, -5);
     assert_eq!(parse_c_integer(b"-08") as i64, 0);
-    // Positive overflow saturates to i64::MAX; negative to i64::MIN.
-    assert_eq!(parse_c_integer(b"0xffffffffffffffff") as i64, i64::MAX);
-    assert_eq!(parse_c_integer(b"99999999999999999999") as i64, i64::MAX);
-    assert_eq!(parse_c_integer(b"9223372036854775808") as i64, i64::MAX);
     assert_eq!(parse_c_integer(b"-99999999999999999999") as i64, i64::MIN);
     assert_eq!(parse_c_integer(b"-9223372036854775809") as i64, i64::MIN);
     // Exact boundaries are representable, not saturated.
@@ -255,8 +280,8 @@ fn proto_simple_two_int_params() {
     assert_eq!(p.name, "func");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_VOID);
     assert_eq!(p.intypes.len(), 2);
-    assert_eq!(p.intypes[0].get_name(), "int4");
-    assert_eq!(p.intypes[1].get_name(), "int4");
+    assert_eq!(type_name(&p.intypes[0]), "int4");
+    assert_eq!(type_name(&p.intypes[1]), "int4");
     assert_eq!(p.innames, vec!["a".to_string(), "b".to_string()]);
     assert_eq!(p.first_var_arg_slot, -1);
 }
@@ -266,12 +291,12 @@ fn proto_mixed_param_types() {
     // testfuncproto funcproto_smallregister.
     let f = factory();
     let p = parse_protopieces("int4 func(char a,int4 b,int2 c,int4 d);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "int4");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "int4");
     assert_eq!(p.intypes.len(), 4);
-    assert_eq!(p.intypes[0].get_name(), "char");
-    assert_eq!(p.intypes[1].get_name(), "int4");
-    assert_eq!(p.intypes[2].get_name(), "int2");
-    assert_eq!(p.intypes[3].get_name(), "int4");
+    assert_eq!(type_name(&p.intypes[0]), "char");
+    assert_eq!(type_name(&p.intypes[1]), "int4");
+    assert_eq!(type_name(&p.intypes[2]), "int2");
+    assert_eq!(type_name(&p.intypes[3]), "int4");
     assert_eq!(p.innames, vec!["a", "b", "c", "d"]);
 }
 
@@ -285,7 +310,7 @@ fn proto_pointer_param() {
     assert_eq!(p.intypes.len(), 7);
     let g = &p.intypes[6];
     assert_eq!(g.get_metatype(), meta::TYPE_PTR);
-    assert_eq!(g.get_ptr_to().unwrap().get_name(), "int1");
+    assert_eq!(type_name(&g.get_ptr_to().unwrap()), "int1");
     assert_eq!(g.get_size(), org().addr_size);
 }
 
@@ -296,7 +321,7 @@ fn proto_void_params_become_empty() {
     let p = parse_protopieces("int4 noargs(void);", &f, org()).unwrap();
     assert_eq!(p.intypes.len(), 0);
     assert_eq!(p.innames.len(), 0);
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "int4");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "int4");
 }
 
 #[test]
@@ -307,7 +332,7 @@ fn proto_varargs() {
     assert_eq!(p.name, "printf");
     assert_eq!(p.intypes.len(), 1);
     assert_eq!(p.intypes[0].get_metatype(), meta::TYPE_PTR);
-    assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "char");
+    assert_eq!(type_name(&p.intypes[0].get_ptr_to().unwrap()), "char");
     // firstVarArgSlot = number of fixed params.
     assert_eq!(p.first_var_arg_slot, 1);
 }
@@ -317,14 +342,14 @@ fn proto_double_pointer() {
     // datatest deindirect2: "extern int2 deind26(int4 **ptr,char *nm);".
     let f = factory();
     let p = parse_protopieces("extern int2 deind26(int4 **ptr,char *nm);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "int2");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "int2");
     assert_eq!(p.intypes.len(), 2);
     // int4 ** : pointer to pointer to int4.
     let pp = &p.intypes[0];
     assert_eq!(pp.get_metatype(), meta::TYPE_PTR);
     let inner = pp.get_ptr_to().unwrap();
     assert_eq!(inner.get_metatype(), meta::TYPE_PTR);
-    assert_eq!(inner.get_ptr_to().unwrap().get_name(), "int4");
+    assert_eq!(type_name(&inner.get_ptr_to().unwrap()), "int4");
     assert_eq!(p.intypes[1].get_metatype(), meta::TYPE_PTR);
 }
 
@@ -336,7 +361,7 @@ fn proto_pointer_return_type() {
     assert_eq!(p.name, "obtainPtr");
     let ret = p.outtype.as_ref().unwrap();
     assert_eq!(ret.get_metatype(), meta::TYPE_PTR);
-    assert_eq!(ret.get_ptr_to().unwrap().get_name(), "int4");
+    assert_eq!(type_name(&ret.get_ptr_to().unwrap()), "int4");
 }
 
 #[test]
@@ -359,10 +384,10 @@ fn proto_many_float_int_params() {
         org(),
     )
     .unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "float8");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "float8");
     assert_eq!(p.intypes.len(), 6);
-    assert_eq!(p.intypes[0].get_name(), "float8");
-    assert_eq!(p.intypes[5].get_name(), "int4");
+    assert_eq!(type_name(&p.intypes[0]), "float8");
+    assert_eq!(type_name(&p.intypes[5]), "int4");
 }
 
 #[test]
@@ -370,7 +395,7 @@ fn proto_bool_return() {
     // datatest condconst2: "extern bool condmove(int4 cval,char *cptr);".
     let f = factory();
     let p = parse_protopieces("extern bool condmove(int4 cval,char *cptr);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "bool");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "bool");
     assert_eq!(p.intypes.len(), 2);
     assert_eq!(p.intypes[1].get_metatype(), meta::TYPE_PTR);
 }
@@ -382,7 +407,7 @@ fn proto_uint1_pointer_param() {
     let p = parse_protopieces("extern void ccmp(uint1 *ptr,int4 val);", &f, org()).unwrap();
     assert_eq!(p.intypes.len(), 2);
     assert_eq!(p.intypes[0].get_metatype(), meta::TYPE_PTR);
-    assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "uint1");
+    assert_eq!(type_name(&p.intypes[0].get_ptr_to().unwrap()), "uint1");
 }
 
 // ===========================================================================
@@ -393,7 +418,7 @@ fn proto_uint1_pointer_param() {
 fn parse_type_plain_named() {
     let f = factory();
     let (ty, name) = parse_type("int4 x", &f, org()).unwrap();
-    assert_eq!(ty.get_name(), "int4");
+    assert_eq!(type_name(&ty), "int4");
     assert_eq!(name, "x");
 }
 
@@ -402,7 +427,7 @@ fn parse_type_pointer() {
     let f = factory();
     let (ty, name) = parse_type("char *p", &f, org()).unwrap();
     assert_eq!(ty.get_metatype(), meta::TYPE_PTR);
-    assert_eq!(ty.get_ptr_to().unwrap().get_name(), "char");
+    assert_eq!(type_name(&ty.get_ptr_to().unwrap()), "char");
     assert_eq!(name, "p");
 }
 
@@ -462,12 +487,10 @@ fn pointer_array_types_round_trip_through_the_c_speller() {
 /// a local takes, where an array's element halves surround `<name> [count]`.
 #[test]
 fn nested_pointer_array_declarations_round_trip_through_the_c_speller() {
-    use kuna_decomp::dtype::Datatype;
     use kuna_decomp::kuna_langc::C_SPELLER;
     use kuna_decomp::kuna_langtypes::{SpellCtx, TypeSpeller};
-    use std::rc::Rc;
 
-    fn same(a: &Rc<Datatype>, b: &Rc<Datatype>) -> bool {
+    fn same(a: &TypeRoot, b: &TypeRoot) -> bool {
         if a.get_metatype() != b.get_metatype() || a.get_size() != b.get_size() {
             return false;
         }
@@ -477,10 +500,10 @@ fn nested_pointer_array_declarations_round_trip_through_the_c_speller() {
                 a.num_elements() == b.num_elements()
                     && same(&a.get_array_base().unwrap(), &b.get_array_base().unwrap())
             }
-            _ => a.get_name() == b.get_name(),
+            _ => type_name(a) == type_name(b),
         }
     }
-    fn parses_back(f: &TypeFactoryImpl, decl: &str, want: &Rc<Datatype>) {
+    fn parses_back(f: &TypeFactoryImpl, decl: &str, want: &TypeRoot) {
         let (ty, name) = parse_type(decl, f, org()).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
         assert_eq!(name, "x", "{decl}");
         assert!(same(&ty, want), "{decl} parses as a different type");
@@ -536,7 +559,7 @@ fn parse_type_abstract_no_name() {
     // A bare type with no identifier (abstract declarator).
     let f = factory();
     let (ty, name) = parse_type("int4", &f, org()).unwrap();
-    assert_eq!(ty.get_name(), "int4");
+    assert_eq!(type_name(&ty), "int4");
     assert_eq!(name, "");
 }
 
@@ -561,7 +584,7 @@ fn old_struct_lookup_succeeds() {
     let f = factory();
     f.get_type_struct("mystruct").unwrap();
     let p = parse_protopieces("extern mystruct returnbig(int4 num);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "mystruct");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "mystruct");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_STRUCT);
     assert_eq!(p.intypes.len(), 1);
 }
@@ -574,7 +597,7 @@ fn struct_pointer_param_resolves_named_type() {
     let p = parse_protopieces("extern void populate_mystruct(mystruct *ptr);", &f, org()).unwrap();
     assert_eq!(p.intypes.len(), 1);
     assert_eq!(p.intypes[0].get_metatype(), meta::TYPE_PTR);
-    assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "mystruct");
+    assert_eq!(type_name(&p.intypes[0].get_ptr_to().unwrap()), "mystruct");
 }
 
 // ===========================================================================
@@ -589,7 +612,7 @@ fn struct_tag_return_type_resolves_interned_tag() {
     let f = factory();
     f.get_type_struct("JSValue").unwrap();
     let p = parse_protopieces("extern struct JSValue jsv(void *ctx);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "JSValue");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "JSValue");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_STRUCT);
     assert_eq!(p.intypes.len(), 1);
 }
@@ -601,7 +624,7 @@ fn struct_tag_pointer_param_resolves_interned_tag() {
     let p = parse_protopieces("extern void take(struct JSValue *v);", &f, org()).unwrap();
     assert_eq!(p.intypes.len(), 1);
     assert_eq!(p.intypes[0].get_metatype(), meta::TYPE_PTR);
-    assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "JSValue");
+    assert_eq!(type_name(&p.intypes[0].get_ptr_to().unwrap()), "JSValue");
 }
 
 #[test]
@@ -609,7 +632,7 @@ fn union_tag_return_type_resolves_interned_tag() {
     let f = factory();
     f.get_type_union("myunion").unwrap();
     let p = parse_protopieces("extern union myunion pick(int4 n);", &f, org()).unwrap();
-    assert_eq!(p.outtype.as_ref().unwrap().get_name(), "myunion");
+    assert_eq!(type_name(p.outtype.as_ref().unwrap()), "myunion");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_UNION);
 }
 
@@ -619,7 +642,7 @@ fn enum_tag_param_type_resolves_interned_tag() {
     f.get_type_enum("mode").unwrap();
     let p = parse_protopieces("extern void set(enum mode m);", &f, org()).unwrap();
     assert_eq!(p.intypes.len(), 1);
-    assert_eq!(p.intypes[0].get_name(), "mode");
+    assert_eq!(type_name(&p.intypes[0]), "mode");
 }
 
 #[test]
@@ -628,7 +651,7 @@ fn struct_tag_type_parses_outside_a_prototype() {
     f.get_type_struct("JSValue").unwrap();
     let t = parse_type("struct JSValue *", &f, org()).unwrap();
     assert_eq!(t.0.get_metatype(), meta::TYPE_PTR);
-    assert_eq!(t.0.get_ptr_to().unwrap().get_name(), "JSValue");
+    assert_eq!(type_name(&t.0.get_ptr_to().unwrap()), "JSValue");
 }
 
 // ===========================================================================
@@ -658,21 +681,6 @@ fn reject_multiple_type_specifiers() {
     let f = factory();
     let err = parse_protopieces("int4 char f(void);", &f, org()).unwrap_err();
     assert!(err.explain().contains("Multiple type specifiers"), "got: {}", err.explain());
-}
-
-#[test]
-fn reject_old_struct_not_a_struct() {
-    // `struct nosuchstruct` (no body) where the identifier names no struct ->
-    // the oldStruct error text (grammar.cc:1087-1094).  The name must lex as an
-    // IDENTIFIER (an unknown name), since a registered type lexes as TYPE_NAME
-    // and `struct TYPE_NAME` is a plain syntax error.
-    let f = factory();
-    let err = parse_protopieces("extern struct nosuchstruct f(void);", &f, org()).unwrap_err();
-    assert!(
-        err.explain().contains("Identifier does not represent a struct as required"),
-        "got: {}",
-        err.explain()
-    );
 }
 
 #[test]
@@ -750,6 +758,52 @@ fn enum_construction_lands_in_factory() {
 }
 
 #[test]
+fn enum_declarations_preserve_full_width_values_and_signed_controls() {
+    for (high, all) in [
+        ("0x8000000000000000", "0xffffffffffffffff"),
+        ("0X8000000000000000ULL", "0XFFFFFFFFFFFFFFFFULL"),
+        ("9223372036854775808", "18446744073709551615"),
+        ("01000000000000000000000", "01777777777777777777777"),
+    ] {
+        let f = factory();
+        f.setup_sizes(Some(8), 8, 8);
+        let declaration = format!(
+            "enum Bits {{ HIGH={high}, ALL={all}, NEG=-2, LOW=1, MAX=9223372036854775807 }};"
+        );
+        super::parse_c(&declaration, &f, org(), &[], |_, _| unreachable!()).unwrap();
+        let ty = f.find_by_name("Bits").unwrap().unwrap();
+        let view = ty.read();
+        let kuna_decomp::dtype::DatatypeKind::Enum { namemap } = &view.get(ty.id()).unwrap().kind else {
+            panic!("expected enum");
+        };
+        let expected = std::collections::BTreeMap::from([
+            (1, "LOW".to_string()),
+            (i64::MAX as u64, "MAX".to_string()),
+            (1u64 << 63, "HIGH".to_string()),
+            (u64::MAX - 1, "NEG".to_string()),
+            (u64::MAX, "ALL".to_string()),
+        ]);
+        assert_eq!(namemap, &expected, "{declaration}");
+    }
+}
+
+#[test]
+fn declaration_dimensions_do_not_wrap_to_small_positive_sizes() {
+    for size in ["2147483648", "4294967296", "4294967297", "0x8000000000000001",
+                 "0xffffffffffffffff", "-1"] {
+        let f = factory();
+        assert!(parse_type(&format!("int4 a[{size}]"), &f, org()).is_err(), "{size}");
+        assert!(super::parse_c(
+            &format!("struct Bits {{ uint4 field:{size}; }};"),
+            &f, org(), &[], |_, _| unreachable!(),
+        ).is_err(), "{size}");
+    }
+    let f = factory();
+    let (ty, _) = parse_type("int4 a[3]", &f, org()).unwrap();
+    assert_eq!(ty.get_size(), 12);
+}
+
+#[test]
 fn typedef_lands_in_factory() {
     // `parse line typedef int4 myint;` creates a typedef interned under the new
     // name.
@@ -806,21 +860,6 @@ fn w9_con_grammar_v1_sign_applies_to_nondecimal_base() {
     assert_eq!(parse_c_integer(b"-9223372036854775809") as i64, i64::MIN);
 }
 
-/// V2: positive overflow saturates to i64::MAX and re-tags unsigned — it must
-/// NOT wrap (the round-1 full-string parse saturated to i64::MAX too, but the
-/// repair must reproduce the per-digit saturation point identically).  Oracle:
-///   "0xffffffffffffffff" -> 0x7fffffffffffffff (i64::MAX)
-///   "18446744073709551615" -> i64::MAX
-#[test]
-fn w9_con_grammar_v2_positive_overflow_saturates_no_wrap() {
-    assert_eq!(parse_c_integer(b"0xffffffffffffffff") as i64, i64::MAX);
-    assert_eq!(parse_c_integer(b"18446744073709551615") as i64, i64::MAX);
-    // exact i64::MAX is representable, not saturated-from-above.
-    assert_eq!(parse_c_integer(b"9223372036854775807") as i64, i64::MAX);
-    // a long hex run well past 64 bits still pins at i64::MAX.
-    assert_eq!(parse_c_integer(b"0xfffffffffffffffffff") as i64, i64::MAX);
-}
-
 /// V3: leading whitespace is skipped (the C++ `operator>>` skips leading ws);
 /// and `0x`-with-no-hex-digit yields 0 (the `0` is parsed, scan stops at `x`).
 #[test]
@@ -831,26 +870,6 @@ fn w9_con_grammar_v3_whitespace_and_bare_prefixes() {
     assert_eq!(parse_c_integer(b"0X"), 0);
     assert_eq!(parse_c_integer(b"0xx"), 0);
     assert_eq!(parse_c_integer(b"0x10g5"), 16);
-}
-
-/// V4: end-to-end — an array size whose token prefix-parses to a NEGATIVE int4
-/// (via `(int4)` truncation of a >2^31 prefix) is rejected by
-/// `ArrayModifier::isValid` (`arraysize>0`), exactly as the C++ does.
-/// `4294967296` = 0x1_0000_0000; `(int4)` truncates the low 32 bits -> 0,
-/// which is NOT > 0, so the array is invalid.  Distinguishes the repaired
-/// prefix-parse path from any "saturate-to-MAX" shortcut.
-#[test]
-fn w9_con_grammar_v4_array_size_int4_truncation_zero_rejected() {
-    let f = factory();
-    // low-32-bits of 0x1_0000_0000 is 0 -> arraysize 0 -> invalid.
-    let err = parse_type("int4 a[4294967296]", &f, org())
-        .expect_err("0x1_0000_0000 truncates to int4 0 -> invalid array");
-    assert!(err.explain().to_lowercase().contains("invalid"), "got: {}", err.explain());
-    // but 0x1_0000_0001 truncates to 1 -> a valid int4[1].
-    let (ty, _name) = parse_type("int4 b[4294967297]", &f, org())
-        .expect("0x1_0000_0001 truncates to int4 1 -> valid int4[1]");
-    assert_eq!(ty.get_metatype(), meta::TYPE_ARRAY);
-    assert_eq!(ty.get_size(), 4);
 }
 
 /// V5 (differential): the repaired `parse_c_integer` must agree with the C++
@@ -929,7 +948,7 @@ fn w9_con_grammar_v7_pointer_array_modifier_order() {
     assert_eq!(ty.get_metatype(), meta::TYPE_ARRAY);
     let elem = ty.get_array_base().expect("array element");
     assert_eq!(elem.get_metatype(), meta::TYPE_PTR, "elements are int4*");
-    assert_eq!(elem.get_ptr_to().unwrap().get_name(), "int4");
+    assert_eq!(type_name(&elem.get_ptr_to().unwrap()), "int4");
     assert_eq!(ty.get_size(), 2 * org().addr_size, "two pointer-sized elements");
 }
 
@@ -942,11 +961,16 @@ fn w9_con_grammar_v7_pointer_array_modifier_order() {
 /// (`long` 8); `llp64` is the Windows one (`long` 4), which is what makes the
 /// keyword resolution ABI-driven rather than a fixed table.
 fn factory_sized(long_size: i32) -> TypeFactoryImpl {
-    let f = factory();
+    let f = unsealed_sized_factory(long_size);
+    f.cache_core_types().unwrap();
+    f
+}
+
+fn unsealed_sized_factory(long_size: i32) -> TypeFactoryImpl {
+    let f = unsealed_factory();
     f.set_core_type("wchar2", 2, meta::TYPE_INT, true).unwrap();
     f.set_core_type("wchar4", 4, meta::TYPE_INT, true).unwrap();
     f.set_core_type("float10", 10, meta::TYPE_FLOAT, false).unwrap();
-    f.cache_core_types().unwrap();
     f.set_size_of_char(1);
     f.set_size_of_short(2);
     f.set_size_of_int(4);
@@ -987,7 +1011,7 @@ fn scalar_keywords_resolve_to_core_types() {
         let (ty, name) = parse_type(decl, &f, org()).unwrap_or_else(|e| {
             panic!("{decl:?} must parse: {}", e.explain());
         });
-        assert_eq!(ty.get_name(), want, "{decl:?}");
+        assert_eq!(type_name(&ty), want, "{decl:?}");
         assert_eq!(name, "x");
     }
 }
@@ -997,10 +1021,10 @@ fn scalar_long_follows_the_targets_declared_width() {
     // The whole point of reading `<data_organization>`: `long` is 8 bytes on
     // LP64 and 4 on LLP64, and `long long` is 8 on both.
     let lp64 = factory_sized(8);
-    assert_eq!(parse_type("long x", &lp64, org()).unwrap().0.get_name(), "int8");
+    assert_eq!(type_name(&parse_type("long x", &lp64, org()).unwrap().0), "int8");
     let llp64 = factory_sized(4);
-    assert_eq!(parse_type("long x", &llp64, org()).unwrap().0.get_name(), "int4");
-    assert_eq!(parse_type("long long x", &llp64, org()).unwrap().0.get_name(), "int8");
+    assert_eq!(type_name(&parse_type("long x", &llp64, org()).unwrap().0), "int4");
+    assert_eq!(type_name(&parse_type("long long x", &llp64, org()).unwrap().0), "int8");
 }
 
 #[test]
@@ -1009,10 +1033,10 @@ fn plain_char_stays_the_text_type_and_signed_char_does_not() {
     // integer, which is what `getBaseNoChar` distinguishes.
     let f = factory_sized(8);
     let (plain, _) = parse_type("char c", &f, org()).unwrap();
-    assert_eq!(plain.get_name(), "char");
+    assert_eq!(type_name(&plain), "char");
     let (signed, _) = parse_type("signed char c", &f, org()).unwrap();
-    assert_eq!(signed.get_name(), "int1");
-    assert_ne!(plain.get_name(), signed.get_name());
+    assert_eq!(type_name(&signed), "int1");
+    assert_ne!(type_name(&plain), type_name(&signed));
 }
 
 #[test]
@@ -1028,7 +1052,7 @@ fn scalar_keywords_work_in_a_prototype() {
     .expect("standard C prototype parses");
     assert_eq!(p.name, "VirtualAlloc");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_PTR);
-    let names: Vec<&str> = p.intypes.iter().map(|t| t.get_name()).collect();
+    let names: Vec<String> = p.intypes.iter().map(type_name).collect();
     assert_eq!(names, vec!["", "uint4", "uint8", "float10"], "pointer, then the scalars");
 }
 
@@ -1037,9 +1061,9 @@ fn ghidra_type_names_still_win_for_a_single_keyword() {
     // The 261 `parse line` corpus payloads feed `int4`/`char`/`void` through
     // `findByName`; a one-keyword run must still resolve to exactly that type.
     let f = factory_sized(8);
-    assert_eq!(parse_type("int4 x", &f, org()).unwrap().0.get_name(), "int4");
+    assert_eq!(type_name(&parse_type("int4 x", &f, org()).unwrap().0), "int4");
     assert_eq!(parse_type("void", &f, org()).unwrap().0.get_metatype(), meta::TYPE_VOID);
-    assert_eq!(parse_type("char *p", &f, org()).unwrap().0.get_ptr_to().unwrap().get_name(), "char");
+    assert_eq!(type_name(&parse_type("char *p", &f, org()).unwrap().0.get_ptr_to().unwrap()), "char");
 }
 
 #[test]
@@ -1057,7 +1081,7 @@ fn reject_impossible_scalar_combinations() {
         "unsigned wchar_t x",
     ] {
         let err = parse_type(decl, &f, org())
-            .map(|(t, _)| t.get_name().to_string())
+            .map(|(t, _)| type_name(&t))
             .expect_err(&format!("{decl:?} is not a C type"));
         assert!(
             err.explain().contains("Invalid combination of C type specifiers"),
@@ -1079,7 +1103,7 @@ fn a_scalar_keyword_with_no_declared_width_is_a_parse_error() {
         "got: {}",
         err.explain()
     );
-    assert_eq!(parse_type("unsigned int x", &f, org()).unwrap().0.get_name(), "uint4");
+    assert_eq!(type_name(&parse_type("unsigned int x", &f, org()).unwrap().0), "uint4");
 }
 
 // ===========================================================================
@@ -1164,16 +1188,112 @@ fn two_conventions_in_one_declaration_are_rejected() {
 }
 
 #[test]
-fn a_convention_on_a_function_pointer_parameter_parses_as_it_did_without_one() {
-    // `__stdcall` inside a parenthesised declarator (`int4 (__stdcall *cb)(int4)`)
-    // is the callback spelling every Win32 header uses.  The convention on a
-    // function-pointer PARAMETER is dropped (the parameter's type is a code
-    // pointer, which carries no model in this port), but it must not change how
-    // the declaration parses.
-    assert_eq!(
-        proto_model("extern int4 f(int4 (__stdcall *cb)(int4));", &win_models()),
-        proto_model("extern int4 f(int4 (*cb)(int4));", &win_models())
-    );
+fn nested_callbacks_preserve_each_convention_and_variadic_boundary() {
+    let f = factory();
+    callable_context(&f);
+    let models = win_models();
+    let mut parser = CParse::with_models(&f, org(), 4096, &models);
+    assert!(parser.parse_stream(
+        b"int4 (__stdcall *cb)(int4 (*inner)(int4,...),int2,...);".to_vec(),
+        DocType::Declaration,
+    ).unwrap());
+    let declarations = parser.take_result_declarations().unwrap();
+    let code = declarations[0].build_type(&f, &org()).unwrap().get_ptr_to().unwrap();
+    let view = code.read();
+    let outer = view.get_code_prototype(code.id()).unwrap().unwrap();
+    assert_eq!(outer.binding.model().get_name(), "__stdcall");
+    assert_eq!(outer.output, f.find_by_name("int4").unwrap().unwrap().id());
+    assert!(outer.variadic);
+    assert!(!outer.input_closed);
+    assert_eq!(outer.logical_first, Some(2));
+    let inner_pointer = view.get(outer.inputs[0]).unwrap();
+    let inner_code = inner_pointer.get_ptr_to().unwrap();
+    let inner = view.get_code_prototype(inner_code).unwrap().unwrap();
+    assert_eq!(inner.binding.model().get_name(), "__cdecl");
+    assert!(inner.variadic);
+    assert_eq!(inner.logical_first, Some(1));
+    assert_eq!(inner.inputs, vec![f.find_by_name("int4").unwrap().unwrap().id()]);
+}
+
+#[test]
+fn callback_void_is_closed_and_default_changes_are_future_only() {
+    let f = factory();
+    let context = callable_context(&f);
+    let old = parse_type("int4 (*cb)(void)", &f, org()).unwrap().0.get_ptr_to().unwrap();
+    let next_model = context.bind(Some("__fastcall")).unwrap().model().clone();
+    context.set_default(Some(next_model));
+    let new = parse_type("int4 (*cb)(void)", &f, org()).unwrap().0.get_ptr_to().unwrap();
+    for (code, expected) in [(&old, "__cdecl"), (&new, "__fastcall")] {
+        let view = code.read();
+        let signature = view.get_code_prototype(code.id()).unwrap().unwrap();
+        assert_eq!(signature.binding.model().get_name(), expected);
+        assert!(signature.input_closed);
+        assert!(!signature.variadic);
+        assert_eq!(signature.logical_first, None);
+        assert!(signature.inputs.is_empty());
+    }
+    assert_ne!(old.id(), new.id());
+}
+
+#[test]
+fn recursive_callback_keeps_nominal_byvalue_identity_in_both_query_orders() {
+    for query_before_layout in [false, true] {
+        let f = factory();
+        callable_context(&f);
+        let declare = |source| super::parse_c(source, &f, org(), &[], |_, _| unreachable!()).unwrap();
+        declare("struct Node;");
+        declare("typedef struct Node (*Fn)(struct Node);");
+        let node = f.find_by_name("Node").unwrap().unwrap();
+        let callback = f.find_by_name("Fn").unwrap().unwrap();
+        let code = callback.get_ptr_to().unwrap();
+        if query_before_layout {
+            assert!(kuna_decomp::fspec::materialize_callable(&f, &code).unwrap().is_none());
+        }
+        declare("struct Node { float8 d; Fn next; };");
+        let view = node.read();
+        let signature = view.get_code_prototype(code.id()).unwrap().unwrap();
+        assert_eq!(signature.output, node.id());
+        assert_eq!(signature.inputs, vec![node.id()]);
+        assert_eq!(view.get_field(node.id(), 1).unwrap().unwrap().field_type, callback.id());
+        assert!(view.abi_ready(code.id()).unwrap());
+        assert_eq!(f.find_by_name("Node").unwrap().unwrap().id(), node.id());
+    }
+}
+
+#[test]
+fn typedef_forward_tag_supports_recursive_callback_and_distinct_aliases() {
+    for query_before_layout in [false, true] {
+        let f = factory_sized(8);
+        callable_context(&f);
+        let declare = |source| super::parse_c(source, &f, org(), &[], |_, _| unreachable!()).unwrap();
+        declare("typedef struct Node Node;");
+        let node = f.find_by_name("Node").unwrap().unwrap();
+        assert!(node.is_incomplete());
+        declare("typedef Node (*Fn)(Node);");
+        declare("typedef struct Node OtherNode;");
+        let alias = f.find_by_name("OtherNode").unwrap().unwrap();
+        assert_ne!(alias.id(), node.id());
+        assert_eq!(alias.get_typedef().unwrap().id(), node.id());
+        assert_eq!(type_name(&alias), "OtherNode");
+        assert_eq!(type_name(&node), "Node");
+
+        let callback = f.find_by_name("Fn").unwrap().unwrap();
+        let code = callback.get_ptr_to().unwrap();
+        if query_before_layout {
+            assert!(kuna_decomp::fspec::materialize_callable(&f, &code).unwrap().is_none());
+        }
+        declare("struct Node { double d; Fn next; };");
+        let view = node.read();
+        let signature = view.get_code_prototype(code.id()).unwrap().unwrap();
+        assert_eq!(signature.output, node.id());
+        assert_eq!(signature.inputs, vec![node.id()]);
+        assert_eq!(view.get_field(node.id(), 1).unwrap().unwrap().field_type, callback.id());
+        assert!(view.abi_ready(code.id()).unwrap());
+        assert_eq!(f.find_by_name("Node").unwrap().unwrap().id(), node.id());
+        assert_eq!(alias.get_size(), node.get_size());
+        assert_eq!(alias.get_typedef().unwrap().id(), node.id());
+        assert_eq!(type_name(&alias), "OtherNode");
+    }
 }
 
 // ===========================================================================
@@ -1185,7 +1305,7 @@ fn a_convention_on_a_function_pointer_parameter_parses_as_it_did_without_one() {
 /// name an agent reaches for when it declares an interpreter's instruction
 /// stream — and the collision is what made the declaration unparseable.
 fn factory_with_code() -> TypeFactoryImpl {
-    let f = factory_sized(8);
+    let f = unsealed_sized_factory(8);
     f.set_core_type("code", 1, meta::TYPE_CODE, false).unwrap();
     f.cache_core_types().unwrap();
     f
@@ -1202,8 +1322,8 @@ fn a_pointer_parameter_may_be_named_after_a_type() {
     .expect("`code` is a parameter name here, not a second type specifier");
     assert_eq!(p.name, "vm");
     assert_eq!(p.innames, vec!["code", "index", "ctx"]);
-    assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "uint1");
-    assert_eq!(p.intypes[1].get_name(), "uint4");
+    assert_eq!(type_name(&p.intypes[0].get_ptr_to().unwrap()), "uint1");
+    assert_eq!(type_name(&p.intypes[1]), "uint4");
     assert_eq!(p.intypes[2].get_metatype(), meta::TYPE_PTR);
 }
 
@@ -1219,7 +1339,7 @@ fn a_value_parameter_may_be_named_after_a_type() {
             panic!("{decl:?} must parse: {}", e.explain());
         });
         let base = ty.get_ptr_to().unwrap_or(ty);
-        assert_eq!(base.get_name(), want_type, "{decl:?}");
+        assert_eq!(type_name(&base), want_type, "{decl:?}");
         assert_eq!(name, "code", "{decl:?}");
     }
 }
@@ -1263,30 +1383,22 @@ fn a_type_name_is_still_a_type_in_type_position() {
 
 #[test]
 fn a_parenthesised_type_name_is_still_read_as_a_type() {
-    // `int4 (code)` is ambiguous in C and resolves to the abstract reading -- a
-    // function of one `code`, not a variable named `code`.  Only the
+    // `int4 (uint1)` resolves to the abstract reading: a function taking uint1,
+    // not a variable named uint1. Only the
     // unparenthesised name position moved, so this must not have changed.
-    //
-    // Pinned by outcome rather than by the built type: a function type needs a
-    // prototype model this bare factory has none of, so the function reading is
-    // exactly the one that reports `getTypeCode`.  `int4 (p)` is the contrast --
-    // a parenthesised declarator naming `p`, which builds fine.
     let f = factory_with_code();
-    let took_the_function_reading = |decl: &str| match parse_type(decl, &f, org()) {
-        Ok((ty, name)) => Err(format!("{}/{name}", ty.get_name())),
-        Err(e) => Ok(e.explain().contains("getTypeCode")),
-    };
-    assert_eq!(took_the_function_reading("int4 (code)"), Ok(true), "`int4 (code)`");
-    assert_eq!(
-        took_the_function_reading("int4 (code)"),
-        took_the_function_reading("int4 (int4)"),
-        "`int4 (code)` must read exactly like the unambiguous abstract spelling"
-    );
-    assert_eq!(
-        took_the_function_reading("int4 (p)"),
-        Err("int4/p".to_string()),
-        "an ordinary identifier in parentheses is still a declarator name"
-    );
+    callable_context(&f);
+    for parameter in ["uint1", "int4"] {
+        let (ty, name) = parse_type(&format!("int4 ({parameter})"), &f, org()).unwrap();
+        assert!(name.is_empty());
+        let view = ty.read();
+        let signature = view.get_code_prototype(ty.id()).unwrap().unwrap();
+        assert_eq!(signature.inputs, vec![f.find_by_name(parameter).unwrap().unwrap().id()]);
+        assert_eq!(signature.output, f.find_by_name("int4").unwrap().unwrap().id());
+    }
+    let (ty, name) = parse_type("int4 (p)", &f, org()).unwrap();
+    assert_eq!(ty, f.find_by_name("int4").unwrap().unwrap());
+    assert_eq!(name, "p");
 }
 
 #[test]

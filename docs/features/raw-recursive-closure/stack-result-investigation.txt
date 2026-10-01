@@ -1,0 +1,29 @@
+UNAPPLIED INVESTIGATION — CUSTOM STACK OUTPUT RESULTS
+
+Status: source investigation only; no implementation or production change.
+
+Observed fixture and diagnostics
+- tests/datatests/stackreturn.xml declares exact output-only custom storage:
+  perfect@0x100120 -> stack 0x10 int8;
+  small@0x100121 -> stack 0x10 int8;
+  big@0x100122 -> stack 0x12 int2.
+- All three actual callee bodies are one-byte x86 RET instructions (c3c3c3); there is no body store to the declared result bytes.
+- Focused decomp_test_dbg diagnostics preserved the caller's exact output lvalues but emitted raw CPUI_CALL expressions rather than callable publication. The expected lvalues are local, local, and local._2_2_.
+- Raw child diagnostics reported complete=false and execution=None for all three. The register effects were SP read and SP/instruction-pointer writes; SP was bookkeeping.
+
+Current source boundaries
+- p4_calls/kuna_physicalinputs.rs: analyze_flow synthesizes reads of locked output storage at normal RETURN. Register outputs and register JOIN pieces are supported; other output spaces currently mark incomplete_flow. EntryRequirements has register-byte reads/writes/restoration plus broad memory flags, but no exact stack-memory result obligation.
+- p4_calls/kuna_registerrestore.rs: State tracks affine stack pointers, exact saved byte origins, and definitely stored offsets. Private-store provenance is restricted to negative entry-frame intervals. call_stack_interval also requires a negative private interval with every byte already stored. Those contracts cannot simply be widened to treat positive callee result storage as a proven write.
+- Existing ExecutionMemoryDefinition and ExecutionIndirectResult represent authenticated generated/native hidden-result destinations. They do not establish that these RET-only custom-output functions write a result.
+- kuna-console/src/ifacedecomp.rs: IfcMapReturn/bind_func_return retain exact output-only PrototypePieces through park_partial_prototype, deliberately without inventing a closed logical input shape.
+- p4_calls/coreaction_protos.rs: ActionDefaultParams recognizes output-only pieces and retains model-driven input recovery while locking the custom output.
+- p4_calls/fspec.rs: seed_locked_from_pieces has a distinct output-only branch that supplies outtype from output_storage before set_pieces. Its input-lock behavior was identified for further precise inspection, not proven defective.
+- Caller stack-output SSA placement already survives in the observed output. Merely changing rendering would conceal the missing raw result obligation.
+
+Unresolved design requirements
+1. A real exact memory/result obligation must distinguish bytes supplied by incoming stack memory from bytes genuinely defined by the callee on every normal return. Declared output storage is not proof of a write.
+2. An honest RET-only pass-through result would require preservation of the incoming stack-memory demand and exact caller-frame translation; if executable C cannot supply that demand, publication must remain refused.
+3. Preserve output-only source authority and open/model-driven inputs. Do not infer a default empty parameter tuple.
+4. No unconditional incomplete-flow suppression, broad adapter_supported waiver, native/no-code assumption, or source declaration promoted to must-write.
+5. Further review needed: callable family_identity/raw_boundary/family_proto/requirements_fit; FuncCallSpecs stack-offset translation; Heritage custom-stack-output handling; exact seed_locked_from_pieces flag effects.
+

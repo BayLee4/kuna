@@ -30,7 +30,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_6::RuleDivOpt;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
@@ -62,7 +62,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -72,8 +77,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -96,12 +102,12 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 /// case that GUARD A at ruleaction.cc:8113 specifically rejects.
 fn mk_free(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
 }
 
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();

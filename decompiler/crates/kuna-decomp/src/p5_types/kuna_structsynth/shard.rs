@@ -41,7 +41,7 @@ use std::rc::Rc;
 use kuna_base::types::int4;
 
 use super::ledger::{self, FieldKey, Layout, Member};
-use crate::dtype::{Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField};
+use crate::dtype::{DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField, TypeInstance, TypeRoot};
 
 /// How a field type is rebuilt in another process's factory.
 ///
@@ -52,8 +52,8 @@ use crate::dtype::{Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeFie
 /// replayed in another process.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TypeRecipe {
-    /// A type the factory holds by name.
-    Named { name: String, id: u64, meta: i32, size: int4 },
+    /// A type the factory holds by name and portable host token, never graph ID.
+    Named { name: String, id: u64, meta: i32, size: int4, instance: Option<TypeInstance> },
     /// `ptrto *`, of `size` bytes, addressing `wordsize` units.
     Pointer { size: int4, wordsize: u32, to: Box<TypeRecipe> },
     /// `elem[count]`.
@@ -66,28 +66,30 @@ const MAX_RECIPE_DEPTH: u32 = 8;
 
 impl TypeRecipe {
     /// The recipe for `ct`, or `None` when another factory cannot rebuild it.
-    pub fn of(ct: &Datatype) -> Option<TypeRecipe> {
+    pub fn of(ct: &TypeRoot) -> Option<TypeRecipe> {
         Self::of_depth(ct, 0)
     }
 
-    fn of_depth(ct: &Datatype, depth: u32) -> Option<TypeRecipe> {
+    fn of_depth(ct: &TypeRoot, depth: u32) -> Option<TypeRecipe> {
         if depth > MAX_RECIPE_DEPTH {
             return None;
         }
-        match &ct.kind {
+        let view = ct.read();
+        let node = view.get(ct.id()).ok()?;
+        match &node.kind {
             DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize }
-                if ct.get_name().is_empty() =>
+                if node.get_name().is_empty() =>
             {
                 Some(TypeRecipe::Pointer {
-                    size: ct.get_size(),
+                    size: node.get_size(),
                     wordsize: *wordsize,
-                    to: Box::new(Self::of_depth(ptrto, depth + 1)?),
+                    to: Box::new(Self::of_depth(&ct.related(*ptrto).ok()?, depth + 1)?),
                 })
             }
-            DatatypeKind::Array { arrayof, arraysize } if ct.get_name().is_empty() => {
+            DatatypeKind::Array { arrayof, arraysize } if node.get_name().is_empty() => {
                 Some(TypeRecipe::Array {
                     count: *arraysize,
-                    elem: Box::new(Self::of_depth(arrayof, depth + 1)?),
+                    elem: Box::new(Self::of_depth(&ct.related(*arrayof).ok()?, depth + 1)?),
                 })
             }
             DatatypeKind::Pointer { .. } | DatatypeKind::Array { .. } => None,
@@ -96,14 +98,15 @@ impl TypeRecipe {
             | DatatypeKind::PartialUnion { .. }
             | DatatypeKind::PartialEnum { .. }
             | DatatypeKind::Spacebase { .. } => None,
-            _ if ct.get_name().is_empty() => None,
+            _ if node.get_name().is_empty() => None,
             // A synthesized structure is named by the process that minted it.
             _ if ledger::minted_number(ct).is_some() => None,
             _ => Some(TypeRecipe::Named {
-                name: ct.get_name().to_string(),
-                id: ct.get_id(),
-                meta: ct.get_metatype().as_i32(),
-                size: ct.get_size(),
+                name: node.get_name().to_string(),
+                id: node.get_id(),
+                meta: node.get_metatype().as_i32(),
+                size: node.get_size(),
+                instance: node.get_instance(),
             }),
         }
     }
@@ -111,7 +114,8 @@ impl TypeRecipe {
     /// Does every named type the recipe reaches belong to `at_load`?
     fn held_at_load(&self, at_load: &AtLoad) -> bool {
         match self {
-            TypeRecipe::Named { id, .. } => at_load.ids.contains(id),
+            TypeRecipe::Named { name, id, meta, size, instance } =>
+                at_load.types.get(name).is_some_and(|instances| instances.contains(&(*id, *meta, *size, *instance))),
             TypeRecipe::Pointer { to, .. } => to.held_at_load(at_load),
             TypeRecipe::Array { elem, .. } => elem.held_at_load(at_load),
         }
@@ -119,9 +123,13 @@ impl TypeRecipe {
 
     /// Rebuild the type in `types`, or `None` when the factory does not hold
     /// exactly what the recipe names.
-    pub fn build(&self, types: &dyn TypeFactory) -> Option<Rc<Datatype>> {
+    pub fn build(&self, types: &dyn TypeFactory) -> Option<TypeRoot> {
         let ct = match self {
-            TypeRecipe::Named { name, .. } => types.find_by_name(name).ok().flatten()?,
+            TypeRecipe::Named { name, id, instance, .. } => match instance {
+                Some(TypeInstance::Fixed) => types.find_by_instance(name, *id, None)?,
+                Some(TypeInstance::Sized(size)) => types.find_by_instance(name, *id, Some(*size))?,
+                None => types.find_by_source_id(name, *id).ok().flatten()?,
+            },
             TypeRecipe::Pointer { size, wordsize, to } => {
                 types.get_type_pointer(*size, to.build(types)?, *wordsize).ok()?
             }
@@ -135,20 +143,23 @@ impl TypeRecipe {
 /// run holds alike: the named types, and the `struct_N` names.
 #[derive(Clone, Debug, Default)]
 pub struct AtLoad {
-    ids: HashSet<u64>,
+    types: HashMap<String, HashSet<(u64, i32, int4, Option<TypeInstance>)>>,
     held: Vec<String>,
 }
 
 impl AtLoad {
     /// Take the snapshot, before any decompile.
     pub fn of(types: &TypeFactoryImpl) -> AtLoad {
-        let ids = types
-            .dependent_order()
-            .iter()
-            .filter(|t| !t.get_name().is_empty() && t.get_id() != 0)
-            .map(|t| t.get_id())
-            .collect();
-        AtLoad { ids, held: held_names(types) }
+        let mut instances: HashMap<String, HashSet<(u64, i32, int4, Option<TypeInstance>)>> = HashMap::new();
+        for root in types.dependent_order() {
+            let view = root.read();
+            let node = view.get(root.id()).expect("factory owns its datatype");
+            if !node.get_name().is_empty() && node.get_id() != 0 {
+                instances.entry(node.get_name().to_owned()).or_default()
+                    .insert((node.get_id(), node.get_metatype().as_i32(), node.get_size(), node.get_instance()));
+            }
+        }
+        AtLoad { types: instances, held: held_names(types) }
     }
 
     /// The `struct_N` names held at load, which [`forget_minted`] keeps.
@@ -182,6 +193,7 @@ impl SynthRequest {
     /// recipe only when every named type it reaches was held at load, and a
     /// field pointing at its own structure (`selfs`) never gets one.
     fn of(
+        types: &dyn TypeFactory,
         fields: &[TypeField],
         size: int4,
         unclaimed: &[(int4, int4)],
@@ -190,8 +202,8 @@ impl SynthRequest {
     ) -> SynthRequest {
         SynthRequest {
             size,
-            want: ledger::layout_of_fields(fields, size, selfs),
-            own: fields.iter().map(|f| Member::of_with(f, selfs)).collect(),
+            want: ledger::layout_of_fields(types, fields, size, selfs),
+            own: fields.iter().map(|f| Member::of_with(types, f, selfs)).collect(),
             unclaimed: unclaimed.to_vec(),
             fields: fields
                 .iter()
@@ -199,7 +211,7 @@ impl SynthRequest {
                     ident: f.ident,
                     offset: f.offset,
                     name: f.name.clone(),
-                    ty: TypeRecipe::of(&f.field_type)
+                    ty: types.root(f.field_type).ok().and_then(|ct| TypeRecipe::of(&ct))
                         .filter(|r| r.held_at_load(at_load) && !selfs.contains(&f.offset)),
                 })
                 .collect(),
@@ -330,11 +342,12 @@ impl ShardHook {
 
     /// Remember what a recording worker's own ledger answered `request` with,
     /// and, the first time a name comes back, that `request` minted it.
-    fn own_answer(&mut self, answer: Option<&Datatype>, request: SynthRequest) {
+    fn own_answer(&mut self, answer: Option<&TypeRoot>, request: SynthRequest) {
         let Mode::Record(minted) = &mut self.mode else { return };
         let held = &self.at_load.held;
         let answer = answer.map(|ct| {
-            let name = ct.get_name().to_string();
+            let view = ct.read();
+            let name = view.get(ct.id()).expect("a ledger answer is a live root").get_name().to_string();
             let def = (!held.contains(&name)).then(|| minted.entry(name.clone()).or_insert(request).clone());
             (name, def)
         });
@@ -360,9 +373,9 @@ pub(super) fn lookup(
     size: int4,
     unclaimed: &[(int4, int4)],
     selfs: &[int4],
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let mut hook = handle.borrow_mut();
-    let request = SynthRequest::of(&fields, size, unclaimed, selfs, &hook.at_load);
+    let request = SynthRequest::of(types, &fields, size, unclaimed, selfs, &hook.at_load);
     hook.record.requests.push(request.clone());
     if matches!(hook.mode, Mode::Record(_)) {
         drop(hook);
@@ -376,7 +389,7 @@ pub(super) fn lookup(
             selfs,
             crate::kuna_structmerge::StructMergeMode::Off,
         );
-        handle.borrow_mut().own_answer(answer.as_deref(), request);
+        handle.borrow_mut().own_answer(answer.as_ref(), request);
         return answer;
     }
     // A decompile can ask the same thing twice -- a restarted pass measures the
@@ -447,10 +460,12 @@ fn slot_name(n: usize) -> String {
 
 impl Replay {
     /// The ledger as `types` holds it now: the state a run starts from.
+    /// Authoritative names occupy slots but never answer inferred lookups.
     pub fn probe(types: &dyn TypeFactory) -> Replay {
         let slots = (0..ledger::MAX_LEDGER_SLOTS as usize)
             .map(|n| match types.find_by_name(&slot_name(n)) {
                 Ok(None) => Slot::Free,
+                Ok(Some(t)) if !t.is_inferred() => Slot::Foreign,
                 Ok(Some(t)) => match ledger::layout_of(&t) {
                     Some(layout) => Slot::Synth {
                         size: t.get_size(),
@@ -681,62 +696,30 @@ pub fn held_names(types: &dyn TypeFactory) -> Vec<String> {
         .collect()
 }
 
-/// Destroy every structure this process minted since `held` was taken, and
-/// every type built on one, so a replayed table can take the names.
+/// Retire every inferred structure this process minted since `held` was
+/// taken, and its derived dependency closure, so a replayed table can take
+/// the names.
 ///
-/// The types built on a minted structure go too -- the pointer a parameter was
-/// typed with, an array or a partial of it -- because a pointer keeps its
-/// pointee alive, and a header rendered from this factory would otherwise
-/// reach the old structure through it and declare a name twice.
+/// Retirement removes lookup indices, not definitions: retained roots and
+/// pointers still read their immutable old revisions. Authoritative types
+/// and names held at load are never selected for retirement.
 pub fn forget_minted(types: &TypeFactoryImpl, held: &[String]) -> Result<(), String> {
-    let mut gone: Vec<Rc<Datatype>> = Vec::new();
+    let mut gone = Vec::new();
     for name in (0..ledger::MAX_LEDGER_SLOTS as usize).map(slot_name) {
         if held.contains(&name) {
             continue;
         }
-        // Completing a structure leaves its incomplete shell under the same
-        // name, so a name is destroyed until nothing minted answers to it.
-        while let Some(ct) = types.find_by_name(&name).ok().flatten() {
-            if ledger::minted_number(&ct).is_none() {
-                break;
+        if let Some(ct) = types.find_by_name(&name).map_err(|e| e.explain().to_string())? {
+            if ledger::minted_number(&ct).is_some() {
+                gone.push(ct);
             }
-            types.destroy_type(&ct).map_err(|e| format!("{name}: {}", e.explain()))?;
-            gone.push(ct);
         }
     }
     if gone.is_empty() {
         return Ok(());
     }
-    let mut built_on: std::collections::HashMap<*const Datatype, bool> =
-        gone.iter().map(|ct| (Rc::as_ptr(ct), true)).collect();
-    for ct in types.dependent_order() {
-        if reaches(&ct, &mut built_on, 0) && !ct.is_core_type() {
-            types.destroy_type(&ct).map_err(|e| format!("{}: {}", ct.get_name(), e.explain()))?;
-        }
-    }
+    types.retire_inferred(&gone).map_err(|e| e.explain().to_string())?;
     Ok(())
-}
-
-/// Is `ct` a minted structure of `seen`, or built on one?
-fn reaches(ct: &Rc<Datatype>, seen: &mut std::collections::HashMap<*const Datatype, bool>, depth: u32) -> bool {
-    if let Some(&known) = seen.get(&Rc::as_ptr(ct)) {
-        return known;
-    }
-    if depth > MAX_RECIPE_DEPTH * 4 {
-        return false;
-    }
-    let parts: Vec<Rc<Datatype>> = match &ct.kind {
-        DatatypeKind::Pointer { ptrto, .. } => vec![Rc::clone(ptrto)],
-        DatatypeKind::PointerRel { ptrto, parent, .. } => vec![Rc::clone(ptrto), Rc::clone(parent)],
-        DatatypeKind::Array { arrayof, .. } => vec![Rc::clone(arrayof)],
-        DatatypeKind::PartialStruct { container, .. } | DatatypeKind::PartialUnion { container, .. } => {
-            vec![Rc::clone(container)]
-        }
-        _ => ct.get_typedef().map(|t| vec![Rc::clone(t)]).unwrap_or_default(),
-    };
-    let hit = parts.iter().any(|p| reaches(p, seen, depth + 1));
-    seen.insert(Rc::as_ptr(ct), hit);
-    hit
 }
 
 /// Mint every structure of `table` into `types`, in order, exactly as the
@@ -749,17 +732,15 @@ pub fn install_table(types: &dyn TypeFactory, table: &[(String, SynthRequest)]) 
             .iter()
             .map(|f| {
                 let ct = f.ty.as_ref().and_then(|r| r.build(types))?;
-                Some(TypeField::new(f.ident, f.offset, f.name.clone(), ct))
+                Some(TypeField::new(f.ident, f.offset, f.name.clone(), ct.id()))
             })
             .collect::<Option<Vec<TypeField>>>()
             .ok_or_else(|| format!("{name}: a field type this process cannot rebuild"))?;
         if types.find_by_name(name).ok().flatten().is_some() {
             return Err(format!("{name}: the name is already held"));
         }
-        let shell = types.get_type_struct(name).map_err(|e| format!("{name}: {}", e.explain()))?;
-        let ct = types
-            .set_fields_struct_raw(&shell, fields, Vec::new(), req.size, 1, 0)
-            .map_err(|e| format!("{name}: {}", e.explain()))?;
+        let ct = ledger::mint(types, name, fields, req.size, &[])
+            .ok_or_else(|| format!("{name}: could not mint the replayed inferred revision"))?;
         if ledger::layout_of(&ct).as_ref() != Some(&req.want) || ledger::members_of(&ct) != req.own {
             return Err(format!("{name}: the rebuilt layout differs from the recorded one"));
         }
@@ -826,12 +807,17 @@ impl Reader<'_> {
 
 fn put_recipe(out: &mut Vec<u8>, r: &TypeRecipe) {
     match r {
-        TypeRecipe::Named { name, id, meta, size } => {
+        TypeRecipe::Named { name, id, meta, size, instance } => {
             out.push(0);
             put_str(out, name);
             out.extend_from_slice(&id.to_le_bytes());
             put_i32(out, *meta);
             put_i32(out, *size);
+            match instance {
+                None => out.push(0),
+                Some(TypeInstance::Fixed) => out.push(1),
+                Some(TypeInstance::Sized(size)) => { out.push(2); put_i32(out, *size); }
+            }
         }
         TypeRecipe::Pointer { size, wordsize, to } => {
             out.push(1);
@@ -852,7 +838,15 @@ fn read_recipe(r: &mut Reader, depth: u32) -> Option<TypeRecipe> {
         return None;
     }
     Some(match r.u8()? {
-        0 => TypeRecipe::Named { name: r.string()?, id: r.u64()?, meta: r.i32()?, size: r.i32()? },
+        0 => TypeRecipe::Named {
+            name: r.string()?, id: r.u64()?, meta: r.i32()?, size: r.i32()?,
+            instance: match r.u8()? {
+                0 => None,
+                1 => Some(TypeInstance::Fixed),
+                2 => Some(TypeInstance::Sized(r.i32()?)),
+                _ => return None,
+            },
+        },
         1 => TypeRecipe::Pointer {
             size: r.i32()?,
             wordsize: r.u32()?,

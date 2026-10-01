@@ -20,7 +20,7 @@ use kuna_base::space::{
 };
 use kuna_base::types::{int4, uint4};
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
@@ -46,7 +46,11 @@ fn build_manager(big: bool) -> AddrSpaceManager {
 
 fn build_fd(big: bool) -> Funcdata {
     let manage = build_manager(big);
-    let glb = Rc::new(ArchContext::new(manage));
+    let arch = ArchContext::new(manage);
+    let types = arch.types_impl().unwrap();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -56,8 +60,8 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn char1(_fd: &Funcdata) -> Rc<Datatype> {
-    Rc::new(Datatype::new(1, type_metatype::TYPE_INT))
+fn char1(fd: &Funcdata) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(1, type_metatype::TYPE_INT).unwrap()
 }
 
 fn op_flags_for(opc: OpCode) -> uint4 {
@@ -305,9 +309,9 @@ fn w6s5_form_byte_array_huge_bytepos_diverges_debug_panic() {
 fn w6s5_form_byte_array_little_endian_multibyte_shift() {
     let mut fd = build_fd(false);
     let bl = mk_block(&mut fd);
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(2, type_metatype::TYPE_INT));
+    let ct = fd.get_arch().types().unwrap().get_base(2, type_metatype::TYPE_INT).unwrap();
     let vals = [0x4142u64, 0x4344, 0x4546, 0x4748];
-    let mut seq = ArraySequence::new(Rc::clone(&ct));
+    let mut seq = ArraySequence::new(ct.clone());
     for (i, &v) in vals.iter().enumerate() {
         let op = mk_op_in_block(&mut fd, bl, 0x10 + i as u64 * 4, OpCode::CPUI_COPY);
         let c = fd.new_constant(2, v);
@@ -328,10 +332,10 @@ fn form_byte_array_big_endian_multibyte() {
     let mut fd = build_fd(true);
     let bl = mk_block(&mut fd);
     // Use a 2-byte char type so the big-endian byte unpacking matters.
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(2, type_metatype::TYPE_INT));
+    let ct = fd.get_arch().types().unwrap().get_base(2, type_metatype::TYPE_INT).unwrap();
     // four 2-byte values 0x4142, 0x4344, 0x4546, 0x4748 at byte offsets 0,2,4,6.
     let vals = [0x4142u64, 0x4344, 0x4546, 0x4748];
-    let mut seq = ArraySequence::new(Rc::clone(&ct));
+    let mut seq = ArraySequence::new(ct.clone());
     for (i, &v) in vals.iter().enumerate() {
         let op = mk_op_in_block(&mut fd, bl, 0x10 + i as u64 * 4, OpCode::CPUI_COPY);
         let c = fd.new_constant(2, v);
@@ -350,12 +354,12 @@ fn form_byte_array_big_endian_multibyte() {
 // --- RuleStringCopy / RuleStringStore ----------------------------------------
 //
 // The drivers' deep bodies are stub-blocked (W4 symbol table + W6 type-facing),
-// so these cover the reachable surface: getOpList, group-filtered clone, the
+// so these cover the reachable surface: getOpList, the
 // constant-input guard, and the stub decline (a constant-input COPY/STORE still
 // returns 0 because the build/transform is deferred — byte-identical to the
 // rule being disabled).
 
-use crate::action::{ActionGroupList, Rule};
+use crate::action::Rule;
 
 #[test]
 fn string_copy_op_list_is_copy() {
@@ -365,16 +369,6 @@ fn string_copy_op_list_is_copy() {
 #[test]
 fn string_store_op_list_is_store() {
     assert_eq!(RuleStringStore::new("analysis").get_op_list(), vec![OpCode::CPUI_STORE]);
-}
-
-#[test]
-fn string_rules_clone_filters_by_group() {
-    let inc = ActionGroupList::from_names(["analysis"]);
-    let exc = ActionGroupList::from_names(["cleanup"]);
-    assert!(RuleStringCopy::new("analysis").clone_rule(&inc).is_some());
-    assert!(RuleStringCopy::new("analysis").clone_rule(&exc).is_none());
-    assert!(RuleStringStore::new("analysis").clone_rule(&inc).is_some());
-    assert!(RuleStringStore::new("analysis").clone_rule(&exc).is_none());
 }
 
 #[test]

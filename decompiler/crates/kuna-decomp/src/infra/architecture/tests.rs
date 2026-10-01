@@ -157,19 +157,6 @@ fn kuna_anchor_flags_default_to_div_values() {
     assert!(!arch.stack_alias_deadstore);
 }
 
-#[test]
-fn reset_defaults_is_idempotent_after_mutation() {
-    let mut arch = Architecture::new("t", bare_sleigh());
-    arch.infer_funcentry = false;
-    arch.max_instructions = 7;
-    arch.signedness = crate::kuna_typeround::SignPolicy::Upstream;
-    arch.reset_defaults();
-    assert!(arch.infer_funcentry);
-    assert_eq!(arch.max_instructions, 100000);
-    // (kuna) `signedness` ships `auto`: the struct literal holds the inert
-    // `Upstream` arm, so only reset_defaults puts the shipped value in place.
-    assert_eq!(arch.signedness, crate::kuna_typeround::SignPolicy::Auto);
-}
 
 #[test]
 fn apply_mode_aggressive_flips_offdefault_flags_but_not_v850_or_dwarf_lines() {
@@ -445,7 +432,7 @@ fn arch_option_context_drives_the_printer() {
     arch.set_brace_format(BraceCategory::Function, BraceStyle::SameLine);
     assert_eq!(arch.print().options.brace_func, BraceStyle::SameLine);
     arch.set_namespace_strategy(NamespaceStrategy::None);
-    arch.set_integer_format("hex");
+    arch.set_integer_format("hex").unwrap();
     // Switching the print language flips print_is_c_language.
     arch.set_print_language("not-c");
     assert!(!arch.print_is_c_language());

@@ -10,7 +10,7 @@ use kuna_num::opcodes::OpCode;
 
 use super::*;
 use crate::context::ArchContext;
-use crate::dtype::{Datatype, TypeFactoryImpl};
+use crate::dtype::{TypeRoot, TypeFactoryImpl};
 
 struct Fx {
     fd: Funcdata,
@@ -54,16 +54,16 @@ impl Fx {
         tf.set_max_basetype_size(8);
         let tf = Rc::new(tf);
         let mut arch = ArchContext::new(m);
-        arch.types = Some(Rc::clone(&tf));
+        arch.types = Some(Clone::clone(&tf));
         arch.cast_arith = cast_arith;
         arch.cast_index = cast_index;
         let glb = Rc::new(arch);
-        let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+        let ram = Clone::clone(glb.manage().get_space_by_name("ram").unwrap());
         let mut fd = Funcdata::new(
             "f",
             "f",
             glb,
-            Address::new(Rc::clone(&ram), 0x1000),
+            Address::new(Clone::clone(&ram), 0x1000),
             0x1000_0000,
             0x40,
         )
@@ -81,21 +81,21 @@ impl Fx {
         }
     }
 
-    fn base(&self, size: int4, m: type_metatype) -> Rc<Datatype> {
+    fn base(&self, size: int4, m: type_metatype) -> TypeRoot {
         self.tf.get_base(size, m).unwrap()
     }
 
-    fn ptr(&self, to: Rc<Datatype>) -> Rc<Datatype> {
+    fn ptr(&self, to: TypeRoot) -> TypeRoot {
         self.tf.get_type_pointer(8, to, 1).unwrap()
     }
 
-    fn void_ptr(&self) -> Rc<Datatype> {
+    fn void_ptr(&self) -> TypeRoot {
         self.ptr(self.tf.get_type_void().unwrap())
     }
 
     fn pc(&mut self) -> Address {
         self.next += 4;
-        Address::new(Rc::clone(&self.ram), self.next)
+        Address::new(Clone::clone(&self.ram), self.next)
     }
 
     fn op(&mut self, n: int4, opc: OpCode) -> OpId {
@@ -106,15 +106,15 @@ impl Fx {
         op
     }
 
-    fn var(&mut self, size: int4, ty: Rc<Datatype>) -> VarnodeId {
+    fn var(&mut self, size: int4, ty: TypeRoot) -> VarnodeId {
         self.next += 0x10;
-        let at = Address::new(Rc::clone(&self.ram), 0x10_0000 + self.next);
+        let at = Address::new(Clone::clone(&self.ram), 0x10_0000 + self.next);
         let vn = self.fd.new_varnode(size, &at, Some(ty));
         self.fd.set_input_varnode(vn).unwrap()
     }
 
     /// `out = INT_ADD(p, #k)`, `out` a fresh implied temporary typed `outty`.
-    fn add(&mut self, p: VarnodeId, k: i64, outty: Rc<Datatype>) -> (OpId, VarnodeId) {
+    fn add(&mut self, p: VarnodeId, k: i64, outty: TypeRoot) -> (OpId, VarnodeId) {
         let op = self.op(2, OpCode::CPUI_INT_ADD);
         let c = self.fd.new_constant(8, k as uintb);
         self.fd.op_set_input(op, p, 0).unwrap();
@@ -126,7 +126,7 @@ impl Fx {
     }
 
     /// `val = LOAD(ram, addr)`, `val` explicit and typed `ty`.
-    fn load(&mut self, addr: VarnodeId, ty: Rc<Datatype>) -> OpId {
+    fn load(&mut self, addr: VarnodeId, ty: TypeRoot) -> OpId {
         let op = self.op(2, OpCode::CPUI_LOAD);
         let spc = self.fd.new_constant(8, 0);
         self.fd.op_set_input(op, spc, 0).unwrap();
@@ -149,7 +149,7 @@ impl Fx {
     }
 
     /// `out = <opc>(a, b)`, `out` explicit and typed `ty`.
-    fn binary(&mut self, opc: OpCode, a: VarnodeId, b: VarnodeId, ty: Rc<Datatype>) -> OpId {
+    fn binary(&mut self, opc: OpCode, a: VarnodeId, b: VarnodeId, ty: TypeRoot) -> OpId {
         let op = self.op(2, opc);
         self.fd.op_set_input(op, a, 0).unwrap();
         self.fd.op_set_input(op, b, 1).unwrap();
@@ -230,7 +230,7 @@ fn every_width_and_sign_becomes_an_element_of_that_width() {
         let mut fx = Fx::new();
         let vp = fx.void_ptr();
         let t = fx.base(size, meta);
-        let tp = fx.ptr(Rc::clone(&t));
+        let tp = fx.ptr(Clone::clone(&t));
         let p = fx.var(8, vp);
         let k = 0xa8;
         let (add, out) = fx.add(p, k, tp.clone());
@@ -242,7 +242,7 @@ fn every_width_and_sign_becomes_an_element_of_that_width() {
             Some(p),
             "size {size}: the base is a cast of p"
         );
-        assert!(Rc::ptr_eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
+        assert!(TypeRoot::eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
     }
 }
 
@@ -251,7 +251,7 @@ fn a_negative_offset_is_a_negative_index() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let t = fx.base(2, type_metatype::TYPE_INT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
     let (add, out) = fx.add(p, -0x1a, tp);
     fx.load(out, t);
@@ -277,7 +277,7 @@ fn a_negative_index_c_would_read_as_unsigned_keeps_the_integer_form() {
         let mut fx = Fx::new();
         let vp = fx.void_ptr();
         let t = fx.base(width, type_metatype::TYPE_INT);
-        let tp = fx.ptr(Rc::clone(&t));
+        let tp = fx.ptr(Clone::clone(&t));
         let p = fx.var(8, vp);
         let (add, out) = fx.add(p, k, tp);
         fx.load(out, t);
@@ -293,7 +293,7 @@ fn a_negative_index_c_would_read_as_unsigned_keeps_the_integer_form() {
         let mut fx = Fx::new();
         let vp = fx.void_ptr();
         let t = fx.base(width, type_metatype::TYPE_INT);
-        let tp = fx.ptr(Rc::clone(&t));
+        let tp = fx.ptr(Clone::clone(&t));
         let p = fx.var(8, vp);
         let (add, out) = fx.add(p, k, tp);
         fx.load(out, t);
@@ -307,7 +307,7 @@ fn an_offset_that_is_not_whole_elements_keeps_the_integer_form() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
     let (add, out) = fx.add(p, 0x6a, tp);
     fx.load(out, t);
@@ -321,9 +321,9 @@ fn an_offset_that_is_not_whole_elements_keeps_the_integer_form() {
 fn a_base_that_already_points_at_the_element_needs_no_cast() {
     let mut fx = Fx::new();
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
-    let p = fx.var(8, Rc::clone(&tp));
-    let (add, out) = fx.add(p, 0x3c, Rc::clone(&tp));
+    let tp = fx.ptr(Clone::clone(&t));
+    let p = fx.var(8, Clone::clone(&tp));
+    let (add, out) = fx.add(p, 0x3c, Clone::clone(&tp));
     fx.load(out, t);
     fx.high();
     let base = rewritten(&mut fx, add, 0x3c, 4, 0xf);
@@ -339,7 +339,7 @@ fn a_base_of_another_width_is_cast_to_the_element_pointer() {
     let long = fx.base(8, type_metatype::TYPE_INT);
     let lp = fx.ptr(long);
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, lp);
     let (add, out) = fx.add(p, 0x3c, tp);
     fx.load(out, t);
@@ -354,14 +354,14 @@ fn a_base_that_is_itself_a_cast_read_only_here_is_retargeted() {
     let long = fx.base(8, type_metatype::TYPE_INT);
     let vp = fx.void_ptr();
     let t = fx.base(4, type_metatype::TYPE_INT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let x = fx.var(8, long);
     let cast = fx.op(1, OpCode::CPUI_CAST);
     fx.fd.op_set_input(cast, x, 0).unwrap();
     let p = fx.fd.new_unique_out(8, cast).unwrap();
     fx.fd.vn_update_type(p, vp);
     fx.fd.vbank_mut().get_mut(p).unwrap().set_implied();
-    let (add, out) = fx.add(p, 0x14, Rc::clone(&tp));
+    let (add, out) = fx.add(p, 0x14, Clone::clone(&tp));
     fx.load(out, t);
     fx.high();
     assert!(matches!(
@@ -373,7 +373,7 @@ fn a_base_that_is_itself_a_cast_read_only_here_is_retargeted() {
     ));
     let base = rewritten(&mut fx, add, 0x14, 4, 5);
     assert_eq!(base, p, "no second cast is stacked on the first");
-    assert!(Rc::ptr_eq(fx.fd.vbank().get(p).unwrap().get_type(), &tp));
+    assert!(TypeRoot::eq(fx.fd.vbank().get(p).unwrap().get_type(), &tp));
     assert_eq!(cast_input_of(&fx, p), Some(x));
 }
 
@@ -384,14 +384,14 @@ fn a_base_that_is_a_cast_other_ops_read_is_recast_from_its_input() {
     let ulong = fx.base(8, type_metatype::TYPE_UINT);
     let up = fx.ptr(ulong);
     let t = fx.base(1, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let x = fx.var(8, long);
     let cast = fx.op(1, OpCode::CPUI_CAST);
     fx.fd.op_set_input(cast, x, 0).unwrap();
     let p = fx.fd.new_unique_out(8, cast).unwrap();
-    fx.fd.vn_update_type(p, Rc::clone(&up));
+    fx.fd.vn_update_type(p, Clone::clone(&up));
     fx.fd.vbank_mut().get_mut(p).unwrap().set_implied();
-    let (add, out) = fx.add(p, 10, Rc::clone(&tp));
+    let (add, out) = fx.add(p, 10, Clone::clone(&tp));
     fx.load(out, t);
     fx.load(p, fx.base(8, type_metatype::TYPE_UINT));
     fx.high();
@@ -405,8 +405,8 @@ fn a_base_that_is_a_cast_other_ops_read_is_recast_from_its_input() {
     let base = rewritten(&mut fx, add, 10, 1, 10);
     assert_ne!(base, p, "the shared cast is not retyped under its other reader");
     assert_eq!(cast_input_of(&fx, base), Some(x), "no cast is stacked on the shared one");
-    assert!(Rc::ptr_eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
-    assert!(Rc::ptr_eq(fx.fd.vbank().get(p).unwrap().get_type(), &up));
+    assert!(TypeRoot::eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
+    assert!(TypeRoot::eq(fx.fd.vbank().get(p).unwrap().get_type(), &up));
 }
 
 #[test]
@@ -428,15 +428,15 @@ fn a_pointer_that_is_stored_or_compared_keeps_its_type_and_a_subtracted_one_stay
         let mut fx = Fx::new();
         let vp = fx.void_ptr();
         let t = fx.base(4, type_metatype::TYPE_UINT);
-        let tp = fx.ptr(Rc::clone(&t));
+        let tp = fx.ptr(Clone::clone(&t));
         let long = fx.base(8, type_metatype::TYPE_INT);
         let boolt = fx.base(1, type_metatype::TYPE_BOOL);
         let p = fx.var(8, vp);
-        let q = fx.var(8, Rc::clone(&tp));
-        let (add, out) = fx.add(p, 0x28, Rc::clone(&tp));
+        let q = fx.var(8, Clone::clone(&tp));
+        let (add, out) = fx.add(p, 0x28, Clone::clone(&tp));
         match consumer {
             "store" => {
-                let slot = fx.var(8, fx.ptr(Rc::clone(&tp)));
+                let slot = fx.var(8, fx.ptr(Clone::clone(&tp)));
                 fx.store(slot, out);
             }
             "compare" => {
@@ -457,7 +457,7 @@ fn a_pointer_that_is_stored_or_compared_keeps_its_type_and_a_subtracted_one_stay
         fx.high();
         let base = rewritten(&mut fx, add, 0x28, 4, 0xa);
         assert!(
-            Rc::ptr_eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp),
+            TypeRoot::eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp),
             "{consumer}"
         );
     }
@@ -487,7 +487,7 @@ fn a_void_sum_passed_to_a_call_keeps_the_integer_form() {
     let call = fx.op(2, OpCode::CPUI_CALL);
     let target = fx
         .fd
-        .new_code_ref(&Address::new(Rc::clone(&fx.ram), 0x9000));
+        .new_code_ref(&Address::new(Clone::clone(&fx.ram), 0x9000));
     fx.fd.op_set_input(call, target, 0).unwrap();
     fx.fd.op_set_input(call, out, 1).unwrap();
     fx.high();
@@ -516,11 +516,11 @@ fn a_store_through_a_sum_of_the_other_signedness_keeps_the_sum_type() {
     let ushort = fx.base(2, type_metatype::TYPE_UINT);
     let p = fx.var(8, vp);
     let v = fx.var(2, ushort);
-    let (add, out) = fx.add(p, 0x6c, Rc::clone(&sp));
+    let (add, out) = fx.add(p, 0x6c, Clone::clone(&sp));
     fx.store(out, v);
     fx.high();
     let base = rewritten(&mut fx, add, 0x6c, 2, 0x36);
-    assert!(Rc::ptr_eq(fx.fd.vbank().get(base).unwrap().get_type(), &sp));
+    assert!(TypeRoot::eq(fx.fd.vbank().get(base).unwrap().get_type(), &sp));
 }
 
 #[test]
@@ -545,12 +545,12 @@ fn an_integer_sum_or_an_integer_base_keeps_the_integer_form() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let p = fx.var(8, vp);
-    let n = fx.var(8, Rc::clone(&long));
-    let (add, out) = fx.add(p, 0x10, Rc::clone(&long));
-    fx.binary(OpCode::CPUI_INT_SUB, n, out, Rc::clone(&long));
-    let x = fx.var(8, Rc::clone(&long));
+    let n = fx.var(8, Clone::clone(&long));
+    let (add, out) = fx.add(p, 0x10, Clone::clone(&long));
+    fx.binary(OpCode::CPUI_INT_SUB, n, out, Clone::clone(&long));
+    let x = fx.var(8, Clone::clone(&long));
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let (add2, out2) = fx.add(x, 0x10, tp);
     fx.load(out2, t);
     fx.high();
@@ -564,7 +564,7 @@ fn a_variable_index_keeps_the_integer_form() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
     let i = fx.var(8, long);
     let add = fx.op(2, OpCode::CPUI_INT_ADD);
@@ -583,7 +583,7 @@ fn the_option_off_leaves_the_add_alone() {
     let mut fx = Fx::with(false);
     let vp = fx.void_ptr();
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
     let (add, out) = fx.add(p, 8, tp);
     fx.load(out, t);
@@ -599,7 +599,7 @@ fn a_base_of_the_other_signedness_and_the_same_width_needs_no_cast() {
     let long = fx.base(8, type_metatype::TYPE_INT);
     let lp = fx.ptr(long);
     let ulong = fx.base(8, type_metatype::TYPE_UINT);
-    let p = fx.var(8, Rc::clone(&lp));
+    let p = fx.var(8, Clone::clone(&lp));
     let v = fx.var(8, ulong);
     let (add, out) = fx.add(p, 0x20, lp);
     fx.store(out, v);
@@ -617,7 +617,7 @@ fn a_float_element_through_an_integer_base_is_still_cast() {
     let int = fx.base(4, type_metatype::TYPE_INT);
     let ip = fx.ptr(int);
     let fl = fx.base(4, type_metatype::TYPE_FLOAT);
-    let p = fx.var(8, Rc::clone(&ip));
+    let p = fx.var(8, Clone::clone(&ip));
     let (add, out) = fx.add(p, 8, ip);
     fx.load(out, fl);
     fx.high();
@@ -634,7 +634,7 @@ fn the_cast_pass_rewrites_the_add_when_the_option_is_on() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let t = fx.base(4, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
     let (add, out) = fx.add(p, 8, tp);
     fx.load(out, t);
@@ -648,10 +648,10 @@ fn a_store_of_a_value_the_pass_has_not_reached_keeps_the_integer_form() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let u = fx.base(4, type_metatype::TYPE_UINT);
-    let up = fx.ptr(Rc::clone(&u));
+    let up = fx.ptr(Clone::clone(&u));
     let f = fx.base(4, type_metatype::TYPE_FLOAT);
     let p = fx.var(8, vp);
-    let a = fx.var(4, Rc::clone(&f));
+    let a = fx.var(4, Clone::clone(&f));
     let b = fx.var(4, f);
     let (add, out) = fx.add(p, 8, up);
     let mul = fx.op(2, OpCode::CPUI_FLOAT_MULT);
@@ -670,10 +670,10 @@ fn a_store_of_a_value_computed_before_the_address_is_rewritten() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let f = fx.base(4, type_metatype::TYPE_FLOAT);
-    let fp = fx.ptr(Rc::clone(&f));
+    let fp = fx.ptr(Clone::clone(&f));
     let p = fx.var(8, vp);
-    let a = fx.var(4, Rc::clone(&f));
-    let b = fx.var(4, Rc::clone(&f));
+    let a = fx.var(4, Clone::clone(&f));
+    let b = fx.var(4, Clone::clone(&f));
     let mul = fx.op(2, OpCode::CPUI_FLOAT_MULT);
     fx.fd.op_set_input(mul, a, 0).unwrap();
     fx.fd.op_set_input(mul, b, 1).unwrap();
@@ -700,9 +700,9 @@ fn an_enum_element_keeps_the_integer_form() {
                 .tf
                 .get_type_enum_sized(&format!("e{size}"), size, type_metatype::TYPE_ENUM_UINT)
                 .unwrap();
-            let ep = fx.ptr(Rc::clone(&e));
+            let ep = fx.ptr(Clone::clone(&e));
             let vp = fx.void_ptr();
-            let p = fx.var(8, Rc::clone(&vp));
+            let p = fx.var(8, Clone::clone(&vp));
             match via {
                 "load-void-sum" => {
                     let (add, out) = fx.add(p, k, vp);
@@ -717,7 +717,7 @@ fn an_enum_element_keeps_the_integer_form() {
                     assert_refused(&mut fx, add, Leave::EnumTarget, size, via);
                 }
                 "compare" => {
-                    let q = fx.var(8, Rc::clone(&ep));
+                    let q = fx.var(8, Clone::clone(&ep));
                     let boolt = fx.base(1, type_metatype::TYPE_BOOL);
                     let (add, out) = fx.add(p, k, ep);
                     fx.binary(OpCode::CPUI_INT_EQUAL, out, q, boolt);
@@ -729,7 +729,7 @@ fn an_enum_element_keeps_the_integer_form() {
                     let call = fx.op(2, OpCode::CPUI_CALL);
                     let target = fx
                         .fd
-                        .new_code_ref(&Address::new(Rc::clone(&fx.ram), 0x9000));
+                        .new_code_ref(&Address::new(Clone::clone(&fx.ram), 0x9000));
                     fx.fd.op_set_input(call, target, 0).unwrap();
                     fx.fd.op_set_input(call, out, 1).unwrap();
                     fx.high();
@@ -759,7 +759,7 @@ fn an_element_c_sizes_differently_keeps_the_integer_form() {
     let u = fx.base(4, type_metatype::TYPE_UINT);
     let narrow = fx.tf.get_type_pointer(4, u, 1).unwrap();
     let vp = fx.void_ptr();
-    let p = fx.var(8, Rc::clone(&vp));
+    let p = fx.var(8, Clone::clone(&vp));
     let (add, out) = fx.add(p, 0x10, vp);
     fx.load(out, narrow);
     fx.high();
@@ -770,7 +770,7 @@ fn an_element_c_sizes_differently_keeps_the_integer_form() {
     let f16 = fx.base(16, type_metatype::TYPE_FLOAT);
     assert_eq!(f16.get_size(), 16);
     let vp = fx.void_ptr();
-    let p = fx.var(8, Rc::clone(&vp));
+    let p = fx.var(8, Clone::clone(&vp));
     let (add, out) = fx.add(p, 0x20, vp);
     fx.load(out, f16);
     fx.high();
@@ -785,7 +785,7 @@ fn an_element_c_sizes_differently_keeps_the_integer_form() {
             fx.base(size, meta)
         };
         let vp = fx.void_ptr();
-        let p = fx.var(8, Rc::clone(&vp));
+        let p = fx.var(8, Clone::clone(&vp));
         let (add, out) = fx.add(p, 0x18, vp);
         fx.load(out, t);
         fx.high();
@@ -797,11 +797,11 @@ fn an_element_c_sizes_differently_keeps_the_integer_form() {
 
 impl Fx {
     fn strat(&self) -> CastStrategyC {
-        CastStrategyC::new(Rc::clone(&self.tf) as Rc<dyn TypeFactory>)
+        CastStrategyC::new(Clone::clone(&self.tf) as Rc<dyn TypeFactory>)
     }
 
     /// `out = <opc>(ins..)`, `out` an implied temporary typed `ty`.
-    fn implied(&mut self, opc: OpCode, ins: &[VarnodeId], ty: Rc<Datatype>) -> (OpId, VarnodeId) {
+    fn implied(&mut self, opc: OpCode, ins: &[VarnodeId], ty: TypeRoot) -> (OpId, VarnodeId) {
         let op = self.op(ins.len() as int4, opc);
         for (k, &vn) in ins.iter().enumerate() {
             self.fd.op_set_input(op, vn, k as int4).unwrap();
@@ -824,13 +824,13 @@ impl Fx {
         i: VarnodeId,
         ext: OpCode,
         scale: u64,
-        t: Rc<Datatype>,
+        t: TypeRoot,
     ) -> (OpId, VarnodeId, OpId) {
         let long = self.base(8, type_metatype::TYPE_INT);
-        let (_, x) = self.implied(ext, &[i], Rc::clone(&long));
+        let (_, x) = self.implied(ext, &[i], Clone::clone(&long));
         let k = self.konst(8, scale);
         let (mul, iv) = self.implied(OpCode::CPUI_INT_MULT, &[x, k], long);
-        let tp = self.ptr(Rc::clone(&t));
+        let tp = self.ptr(Clone::clone(&t));
         let (add, out) = self.implied(OpCode::CPUI_INT_ADD, &[p, iv], tp);
         self.load(out, t);
         (add, x, mul)
@@ -869,12 +869,12 @@ fn a_scaled_index_becomes_a_subscript_of_that_element() {
         let it = fx.base(isize, imeta);
         let p = fx.var(8, vp);
         let i = fx.var(isize, it);
-        let (add, x, mul) = fx.scaled(p, i, ext, size as u64, Rc::clone(&t));
+        let (add, x, mul) = fx.scaled(p, i, ext, size as u64, Clone::clone(&t));
         fx.high();
         let base = index_rewritten(&mut fx, add, x, size as u64);
         assert_eq!(cast_input_of(&fx, base), Some(p), "size {size}: the base is a cast of p");
         let tp = fx.ptr(t);
-        assert!(Rc::ptr_eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
+        assert!(TypeRoot::eq(fx.fd.vbank().get(base).unwrap().get_type(), &tp));
         assert!(fx.fd.obank().get(mul).unwrap().is_dead(), "size {size}: the multiply is gone");
     }
 }
@@ -886,9 +886,9 @@ fn a_shifted_index_becomes_a_subscript() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let t = fx.base(8, type_metatype::TYPE_UINT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
-    let i = fx.var(8, Rc::clone(&long));
+    let i = fx.var(8, Clone::clone(&long));
     let three = fx.konst(4, 3);
     let (_, iv) = fx.implied(OpCode::CPUI_INT_LEFT, &[i, three], long);
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, iv], tp);
@@ -904,9 +904,9 @@ fn a_byte_element_is_indexed_by_the_variable_itself() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let c = fx.base(1, type_metatype::TYPE_INT);
-    let cp = fx.ptr(Rc::clone(&c));
+    let cp = fx.ptr(Clone::clone(&c));
     let p = fx.var(8, vp);
-    let i = fx.var(8, Rc::clone(&long));
+    let i = fx.var(8, Clone::clone(&long));
     let six = fx.konst(8, 6);
     let (_, iv) = fx.implied(OpCode::CPUI_INT_MULT, &[i, six], long);
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, iv], cp);
@@ -934,9 +934,9 @@ fn a_scale_that_is_not_the_element_keeps_the_integer_form() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
-    let lp = fx.ptr(Rc::clone(&long));
+    let lp = fx.ptr(Clone::clone(&long));
     let p = fx.var(8, vp);
-    let off = fx.var(8, Rc::clone(&long));
+    let off = fx.var(8, Clone::clone(&long));
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, off], lp);
     fx.load(out, long);
     fx.high();
@@ -950,11 +950,11 @@ fn an_index_that_is_not_a_plain_integer_keeps_the_integer_form() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let c = fx.base(1, type_metatype::TYPE_INT);
-    let cp = fx.ptr(Rc::clone(&c));
-    let p = fx.var(8, Rc::clone(&vp));
+    let cp = fx.ptr(Clone::clone(&c));
+    let p = fx.var(8, Clone::clone(&vp));
     let q = fx.var(8, vp);
-    let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, q], Rc::clone(&cp));
-    fx.load(out, Rc::clone(&c));
+    let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, q], Clone::clone(&cp));
+    fx.load(out, Clone::clone(&c));
     fx.high();
     assert!(matches!(index_plan(&mut fx, add), Err(Leave::TwoPointers)));
 
@@ -962,7 +962,7 @@ fn an_index_that_is_not_a_plain_integer_keeps_the_integer_form() {
     let vp = fx.void_ptr();
     let dbl = fx.base(8, type_metatype::TYPE_FLOAT);
     let c = fx.base(1, type_metatype::TYPE_INT);
-    let cp = fx.ptr(Rc::clone(&c));
+    let cp = fx.ptr(Clone::clone(&c));
     let p = fx.var(8, vp);
     let f = fx.var(8, dbl);
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, f], cp);
@@ -974,8 +974,8 @@ fn an_index_that_is_not_a_plain_integer_keeps_the_integer_form() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let c = fx.base(1, type_metatype::TYPE_INT);
-    let cp = fx.ptr(Rc::clone(&c));
-    let p = fx.var(8, Rc::clone(&vp));
+    let cp = fx.ptr(Clone::clone(&c));
+    let p = fx.var(8, Clone::clone(&vp));
     let q = fx.var(8, vp);
     let (_, cast) = fx.implied(OpCode::CPUI_CAST, &[q], long);
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, cast], cp);
@@ -991,12 +991,12 @@ fn a_sum_used_as_a_subscript_keeps_the_integer_form() {
     let mut fx = Fx::new();
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
-    let lp = fx.ptr(Rc::clone(&long));
+    let lp = fx.ptr(Clone::clone(&long));
     let c = fx.base(1, type_metatype::TYPE_INT);
     let cp = fx.ptr(c);
     let p = fx.var(8, vp);
-    let i = fx.var(8, Rc::clone(&long));
-    let arr = fx.var(8, Rc::clone(&lp));
+    let i = fx.var(8, Clone::clone(&long));
+    let arr = fx.var(8, Clone::clone(&lp));
     let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, i], cp);
     let eight = fx.konst(8, 8);
     let (_, elt) = fx.implied(OpCode::CPUI_PTRADD, &[arr, out, eight], lp);
@@ -1012,9 +1012,9 @@ fn a_scale_after_the_add_keeps_the_integer_form() {
     let vp = fx.void_ptr();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let t = fx.base(8, type_metatype::TYPE_INT);
-    let tp = fx.ptr(Rc::clone(&t));
+    let tp = fx.ptr(Clone::clone(&t));
     let p = fx.var(8, vp);
-    let i = fx.var(8, Rc::clone(&long));
+    let i = fx.var(8, Clone::clone(&long));
     let add = fx.op(2, OpCode::CPUI_INT_ADD);
     let out = fx.fd.new_unique_out(8, add).unwrap();
     fx.fd.vn_update_type(out, tp);
@@ -1038,13 +1038,13 @@ fn a_value_use_is_rewritten_only_where_it_saves_a_cast() {
         let vp = fx.void_ptr();
         let long = fx.base(8, type_metatype::TYPE_INT);
         let u = fx.base(4, type_metatype::TYPE_UINT);
-        let up = fx.ptr(Rc::clone(&u));
-        let lp = fx.ptr(Rc::clone(&long));
+        let up = fx.ptr(Clone::clone(&u));
+        let lp = fx.ptr(Clone::clone(&long));
         let p = fx.var(8, vp);
-        let i = fx.var(8, Rc::clone(&long));
+        let i = fx.var(8, Clone::clone(&long));
         let four = fx.konst(8, 4);
         let (_, iv) = fx.implied(OpCode::CPUI_INT_MULT, &[i, four], long);
-        let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, iv], Rc::clone(&up));
+        let (add, out) = fx.implied(OpCode::CPUI_INT_ADD, &[p, iv], Clone::clone(&up));
         fx.binary(OpCode::CPUI_COPY, out, out, if same { up } else { lp });
         fx.high();
         let strat = fx.strat();
@@ -1069,7 +1069,7 @@ fn the_cast_pass_rewrites_a_scaled_index_only_when_the_option_is_on() {
 }
 
 /// `sub = a - b` of two pointers typed `pa` and `pb`, `sub` an explicit `long`.
-fn difference(fx: &mut Fx, pa: Rc<Datatype>, pb: Rc<Datatype>, out: Rc<Datatype>) -> (OpId, VarnodeId, VarnodeId) {
+fn difference(fx: &mut Fx, pa: TypeRoot, pb: TypeRoot, out: TypeRoot) -> (OpId, VarnodeId, VarnodeId) {
     let a = fx.var(8, pa);
     let b = fx.var(8, pb);
     let op = fx.binary(OpCode::CPUI_INT_SUB, a, b, out);
@@ -1086,11 +1086,11 @@ fn a_difference_of_two_byte_pointers_keeps_its_operands() {
             let c = fx.base(1, meta);
             let cp = fx.ptr(c);
             let out = fx.base(8, out_meta);
-            let (op, _, _) = difference(&mut fx, Rc::clone(&cp), cp, out);
+            let (op, _, _) = difference(&mut fx, Clone::clone(&cp), cp, out);
             fx.high();
             let long = fx.base(8, type_metatype::TYPE_INT);
             let tok = pointer_difference(&mut fx.fd, op).expect("a byte-pointer difference");
-            assert!(Rc::ptr_eq(&tok, &long), "the result is a ptrdiff_t");
+            assert!(TypeRoot::eq(&tok, &long), "the result is a ptrdiff_t");
         }
     }
 }
@@ -1102,8 +1102,8 @@ fn a_difference_of_two_byte_pointers_keeps_its_operands() {
 fn other_differences_keep_the_integer_form() {
     let mut fx = Fx::new();
     let long = fx.base(8, type_metatype::TYPE_INT);
-    let lp = fx.ptr(Rc::clone(&long));
-    let (op, _, _) = difference(&mut fx, Rc::clone(&lp), lp, Rc::clone(&long));
+    let lp = fx.ptr(Clone::clone(&long));
+    let (op, _, _) = difference(&mut fx, Clone::clone(&lp), lp, Clone::clone(&long));
     fx.high();
     assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
 
@@ -1112,21 +1112,21 @@ fn other_differences_keep_the_integer_form() {
     let c = fx.base(1, type_metatype::TYPE_INT);
     let uc = fx.base(1, type_metatype::TYPE_UINT);
     let (pc, puc) = (fx.ptr(c), fx.ptr(uc));
-    let (op, _, _) = difference(&mut fx, pc, puc, Rc::clone(&long));
+    let (op, _, _) = difference(&mut fx, pc, puc, Clone::clone(&long));
     fx.high();
     assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
 
     let mut fx = Fx::new();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let vp = fx.void_ptr();
-    let (op, _, _) = difference(&mut fx, Rc::clone(&vp), vp, long);
+    let (op, _, _) = difference(&mut fx, Clone::clone(&vp), vp, long);
     fx.high();
     assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
 
     let mut fx = Fx::new();
     let c = fx.base(1, type_metatype::TYPE_INT);
     let cp = fx.ptr(c);
-    let (op, _, _) = difference(&mut fx, Rc::clone(&cp), Rc::clone(&cp), cp);
+    let (op, _, _) = difference(&mut fx, Clone::clone(&cp), Clone::clone(&cp), cp);
     fx.high();
     assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffResult)));
 
@@ -1134,7 +1134,7 @@ fn other_differences_keep_the_integer_form() {
     let long = fx.base(8, type_metatype::TYPE_INT);
     let c = fx.base(1, type_metatype::TYPE_INT);
     let cp = fx.ptr(c);
-    let b = fx.var(8, Rc::clone(&cp));
+    let b = fx.var(8, Clone::clone(&cp));
     let k = fx.konst(8, 0x1000);
     let op = fx.binary(OpCode::CPUI_INT_SUB, b, k, long);
     fx.high();
@@ -1150,12 +1150,12 @@ fn a_difference_that_saves_no_cast_keeps_the_integer_form() {
     let long = fx.base(8, type_metatype::TYPE_INT);
     let c = fx.base(1, type_metatype::TYPE_INT);
     let cp = fx.ptr(c);
-    let n = fx.var(8, Rc::clone(&long));
-    let (_, a) = fx.implied(OpCode::CPUI_CAST, &[n], Rc::clone(&cp));
-    fx.binary(OpCode::CPUI_COPY, a, a, Rc::clone(&cp));
-    let (_, b2) = fx.implied(OpCode::CPUI_CAST, &[n], Rc::clone(&cp));
-    fx.binary(OpCode::CPUI_COPY, b2, b2, Rc::clone(&cp));
-    let op = fx.binary(OpCode::CPUI_INT_SUB, a, b2, Rc::clone(&long));
+    let n = fx.var(8, Clone::clone(&long));
+    let (_, a) = fx.implied(OpCode::CPUI_CAST, &[n], Clone::clone(&cp));
+    fx.binary(OpCode::CPUI_COPY, a, a, Clone::clone(&cp));
+    let (_, b2) = fx.implied(OpCode::CPUI_CAST, &[n], Clone::clone(&cp));
+    fx.binary(OpCode::CPUI_COPY, b2, b2, Clone::clone(&cp));
+    let op = fx.binary(OpCode::CPUI_INT_SUB, a, b2, Clone::clone(&long));
     fx.high();
     assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::NoCastSaved)));
 }
@@ -1167,7 +1167,7 @@ fn the_cast_pass_leaves_a_byte_pointer_difference_uncast_only_when_the_option_is
         let long = fx.base(8, type_metatype::TYPE_INT);
         let c = fx.base(1, type_metatype::TYPE_INT);
         let cp = fx.ptr(c);
-        let (op, a, b) = difference(&mut fx, Rc::clone(&cp), cp, long);
+        let (op, a, b) = difference(&mut fx, Clone::clone(&cp), cp, long);
         fx.high();
         let _ = fx.fd.action_set_casts();
         let uncast = fx.input(op, 0) == a && fx.input(op, 1) == b;

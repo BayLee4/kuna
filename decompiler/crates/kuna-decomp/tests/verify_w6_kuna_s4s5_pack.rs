@@ -34,7 +34,6 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 
 use kuna_decomp::action::{Action, ActionContext};
-use kuna_decomp::dtype::{type_metatype, Datatype};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::kuna_compareform::{parse_compare_form, ActionPresentCompareForm, CompareForm};
 use kuna_decomp::kuna_memsetsequence::{parse_memset_recover_form, MemsetRecoverForm};
@@ -80,10 +79,6 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 fn no_replace(
 ) -> impl FnMut(&mut VarnodeBank, kuna_decomp::context::VarnodeId, kuna_decomp::context::VarnodeId) -> kuna_base::error::KunaResult<()>
 {
@@ -119,7 +114,7 @@ fn wire(fd: &mut Funcdata, vn: kuna_decomp::context::VarnodeId, op: kuna_decomp:
 fn mk_var(fd: &mut Funcdata, off: u64, size: int4) -> kuna_decomp::context::VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), None);
     set_def(fd, vn, defop)
 }
 
@@ -157,7 +152,7 @@ fn mk_cmp_with_const(
         wire(fd, v, op, 0);
         wire(fd, c, op, 1);
     }
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, None);
     let _ = set_def(fd, out, op);
     op
 }

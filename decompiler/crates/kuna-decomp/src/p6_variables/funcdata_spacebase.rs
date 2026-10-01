@@ -145,7 +145,7 @@ impl Funcdata {
     /// which must NOT undo a valid stack-frame `PTRSUB(sp, off)`.
     pub fn is_ptrsub_matching_scope(
         &self,
-        ptrtype: &Rc<crate::dtype::Datatype>,
+        ptrtype: &crate::dtype::TypeRoot,
         off: int8,
         extra: int8,
         multiplier: int8,
@@ -176,7 +176,7 @@ impl Funcdata {
                     let extra_b =
                         kuna_base::space::AddrSpace::address_to_byte_int(extra, word_size);
                     if extra_b < 0 || extra_b >= sub_type.get_size() as i64 {
-                        match crate::dtype::Datatype::test_for_array_slack(&sub_type, extra_b) {
+                        match sub_type.test_for_array_slack(extra_b) {
                             Ok(true) => {}
                             _ => return false,
                         }
@@ -208,9 +208,9 @@ impl Funcdata {
     /// the C++ `getSubType` receives from `TypePointer::downChain`).
     pub fn spacebase_get_sub_type(
         &self,
-        sb_type: &Rc<crate::dtype::Datatype>,
+        sb_type: &crate::dtype::TypeRoot,
         off: int8,
-    ) -> Option<(Rc<crate::dtype::Datatype>, int8)> {
+    ) -> Option<(crate::dtype::TypeRoot, int8)> {
         use crate::dtype::type_metatype;
         let (spaceid, localframe) = sb_type.spacebase_parts()?;
         let spaceid = spaceid?;
@@ -298,7 +298,7 @@ impl Funcdata {
             };
             // newop = newOp(numinput, opaddr); newvn = newVarnode(size, addr, type);
             let newop = self.new_op(numinput, opaddr.clone());
-            let newvn = self.new_varnode(vnsize, &vnaddr, Some(Rc::clone(&vntype)));
+            let newvn = self.new_varnode(vnsize, &vnaddr, Some(vntype.clone()));
             // opSetOutput(newop, newvn);
             let _ = self.op_set_output(newop, newvn);
             // opSetOpcode(newop, op->code());  -- the only opcode `spacebase`
@@ -743,11 +743,11 @@ impl Funcdata {
     /// the `this`-pointer collection (`collectNameRecs`/`prepareThisPointer`); on a
     /// recommendation-free function this is a no-op.
     pub fn apply_type_recommendations(&mut self) {
-        let recs: Vec<(int4, Address, Rc<crate::dtype::Datatype>)> = match self.get_scope_local() {
+        let recs: Vec<(int4, Address, crate::dtype::TypeRoot)> = match self.get_scope_local() {
             Some(lm) => lm
                 .type_recommendations()
                 .iter()
-                .map(|tr| (tr.data_type.get_size(), tr.addr.clone(), Rc::clone(&tr.data_type)))
+                .map(|tr| (tr.data_type.get_size(), tr.addr.clone(), tr.data_type.clone()))
                 .collect(),
             None => return,
         };
@@ -759,7 +759,7 @@ impl Funcdata {
                 let changed = self
                     .vbank_mut()
                     .get_mut(vn)
-                    .map(|v| v.update_type_locked(Rc::clone(&dt), true, false))
+                    .map(|v| v.update_type_locked(dt.clone(), true, false))
                     .unwrap_or(false);
                 if changed {
                     if let Some(h) = high {
@@ -855,7 +855,7 @@ impl Funcdata {
                 continue;
             }
             let offset = v.get_offset();
-            let vtype = Rc::clone(v.get_type());
+            let vtype = v.get_type().clone();
             if !v.is_written() {
                 if self.is_read_active(vn) {
                     state.add_fixed_type_pub(offset, vtype, 0, types);
@@ -920,7 +920,7 @@ impl Funcdata {
                     let (first_addr, first_sz, first_ty) = match in_first
                         .and_then(|iv| self.vbank().get(iv))
                     {
-                        Some(fv) => (fv.get_addr().clone(), fv.get_size(), Rc::clone(fv.get_type())),
+                        Some(fv) => (fv.get_addr().clone(), fv.get_size(), fv.get_type().clone()),
                         None => {
                             // Degenerate: fall back to the output hint (C++ would
                             // dereference a null here; the IR never produces it).
@@ -935,7 +935,7 @@ impl Funcdata {
                     let in_second = self.obank().get(op).and_then(|o| o.get_in(1 - slot));
                     if let Some(sv) = in_second.and_then(|iv| self.vbank().get(iv)) {
                         let sv_addr = sv.get_addr().clone();
-                        let sv_ty = Rc::clone(sv.get_type());
+                        let sv_ty = sv.get_type().clone();
                         if !addr_eq(&sv_addr, &second_addr) {
                             state.add_fixed_type_pub(second_addr.get_offset(), sv_ty, 0, types);
                         }
@@ -1068,8 +1068,8 @@ impl Funcdata {
         };
         for (offset, index, base) in addbase {
             // ct = base->getType(); if PTR -> getPtrTo, strip arrays; else None.
-            let mut ct: Option<Rc<crate::dtype::Datatype>> =
-                self.vbank().get(base).map(|v| Rc::clone(v.get_type()));
+            let mut ct: Option<crate::dtype::TypeRoot> =
+                self.vbank().get(base).map(|v| v.get_type().clone());
             if let Some(c) = &ct {
                 if c.get_metatype() == crate::dtype::type_metatype::TYPE_PTR {
                     let mut inner = c.get_ptr_to();
@@ -1127,8 +1127,8 @@ impl Funcdata {
             Some(v) => v,
             None => return,
         };
-        let mut ct: Rc<crate::dtype::Datatype> = match self.vbank().get(in1) {
-            Some(v) => Rc::clone(v.get_type_read_facing(op)),
+        let mut ct: crate::dtype::TypeRoot = match self.vbank().get(in1) {
+            Some(v) => v.get_type_read_facing(op).clone(),
             None => return,
         };
         if ct.get_metatype() == crate::dtype::type_metatype::TYPE_PTR {
@@ -1279,7 +1279,7 @@ impl Funcdata {
                     .and_then(|t| lm.sync_overlap(&ex_addr, ex_size, t))
             });
 
-            let mut ct: Option<Rc<crate::dtype::Datatype>> = None;
+            let mut ct: Option<crate::dtype::TypeRoot> = None;
             let fl: uint4;
             // Whether the resolved SymbolEntry is a join-piece sub-entry (precislo/
             // precishi extra-flags, NOT `mapped`) — the extra maps `Scope::addMap`
@@ -1300,7 +1300,7 @@ impl Funcdata {
                     if update_datatypes {
                         if let Some(t) = &ov.sized_type {
                             if t.get_metatype() != crate::dtype::type_metatype::TYPE_UNKNOWN {
-                                ct = Some(Rc::clone(t));
+                                ct = Some(t.clone());
                             }
                         }
                     }
@@ -1379,7 +1379,7 @@ impl Funcdata {
         &mut self,
         group: &[VarnodeId],
         fl: uint4,
-        ct: Option<&Rc<crate::dtype::Datatype>>,
+        ct: Option<&crate::dtype::TypeRoot>,
         entry_is_join_piece: bool,
     ) -> bool {
         // (kuna pre-tie) The merged tree has no pass that pre-ties stack storage:
@@ -1449,7 +1449,7 @@ impl Funcdata {
                 let changed = self
                     .vbank_mut()
                     .get_mut(vn)
-                    .map(|v| v.update_type(Rc::clone(ct)))
+                    .map(|v| v.update_type(ct.clone()))
                     .unwrap_or(false);
                 if changed {
                     update_occurred = true;

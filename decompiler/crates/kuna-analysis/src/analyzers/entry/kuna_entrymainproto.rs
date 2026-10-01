@@ -315,7 +315,7 @@ fn prototype_for(arch: &Architecture, main: u64, slots: &[Slot]) -> Option<Proto
         (Slot::Envp, "envp", &uintp),
     ] {
         if slots.contains(&slot) {
-            intypes.push(std::rc::Rc::clone(ty));
+            intypes.push(ty.clone());
             innames.push(slot_name.to_string());
         }
     }

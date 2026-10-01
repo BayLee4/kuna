@@ -56,7 +56,7 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::int4;
 
 use crate::action::{
-    ruleflags, Action, ActionDatabase, ActionGroup, ActionPool, ActionRestartGroup, Rule,
+    rule_group_enabled, ruleflags, Action, ActionDatabase, ActionGroup, ActionPool, ActionRestartGroup, Rule,
     RuleState, UNIVERSAL_NAME,
 };
 
@@ -102,6 +102,8 @@ pub struct RuleRow {
     pub name: &'static str,
     /// The `universalAction` group argument (the [`RuleState`] basegroup).
     pub group: &'static str,
+    /// Explicit alternative registration groups, in addition to the primary group.
+    pub aliases: &'static [&'static str],
     /// Construct a fresh boxed Rule.
     pub ctor: fn() -> Box<dyn Rule>,
 }
@@ -135,7 +137,7 @@ impl SchedNode {
                 let mut pool = ActionPool::new(flags, name);
                 for row in rules {
                     let rule = (row.ctor)();
-                    pool.add_rule(RuleState::new(row.group, 0, row.name), rule);
+                    pool.add_rule(RuleState::new(row.group, 0, row.name).with_aliases(row.aliases), rule);
                 }
                 Box::new(pool)
             }
@@ -165,7 +167,7 @@ impl SchedNode {
         match self {
             SchedNode::Action(ctor) => grouplist.contains(ctor().get_group()),
             SchedNode::Pool { rules, .. } => {
-                rules.iter().any(|r| grouplist.contains(r.group))
+                rules.iter().any(|r| rule_group_enabled(r.group, r.aliases, |group| grouplist.contains(group)))
             }
             SchedNode::Group { children, .. } | SchedNode::RestartGroup { children, .. } => {
                 children.iter().any(|c| c.survives(grouplist))
@@ -197,7 +199,7 @@ impl SchedNode {
                 let mut num = print_action_line(out, num, *flags, 0, depth, name);
                 out.push('\n');
                 let rdepth = depth + 1;
-                for r in rules.iter().filter(|r| grouplist.contains(r.group)) {
+                for r in rules.iter().filter(|r| rule_group_enabled(r.group, r.aliases, |group| grouplist.contains(group))) {
                     print_rule_line(out, num, false, false, rdepth, r.name);
                     out.push('\n');
                     num += 1;
@@ -326,8 +328,11 @@ macro_rules! act {
     };
 }
 macro_rules! rrow {
+    ($name:expr, $group:expr, $aliases:expr, $ctor:expr) => {
+        RuleRow { name: $name, group: $group, aliases: $aliases, ctor: || Box::new($ctor) }
+    };
     ($name:expr, $group:expr, $ctor:expr) => {
-        RuleRow { name: $name, group: $group, ctor: || Box::new($ctor) }
+        RuleRow { name: $name, group: $group, aliases: &[], ctor: || Box::new($ctor) }
     };
 }
 
@@ -397,7 +402,7 @@ pub fn universal_sched(
         rrow!("scarry", "analysis", crate::ruleaction_3::RuleScarry),
         rrow!("intlessequal", "canonicalcompare", crate::ruleaction_1::RuleIntLessEqual::new("canonicalcompare")),
         rrow!("trivialarith", "analysis", crate::ruleaction_2::RuleTrivialArith),
-        rrow!("trivialbool", "analysis", crate::ruleaction_2::RuleTrivialBool),
+        rrow!("trivialbool", "analysis", &["trivialbool"], crate::ruleaction_2::RuleTrivialBool),
         rrow!("trivialshift", "analysis", crate::ruleaction_3::RuleTrivialShift),
         rrow!("signshift", "analysis", crate::ruleaction_3::RuleSignShift),
         rrow!("testsign", "analysis", crate::ruleaction_3::RuleTestSign),
@@ -412,21 +417,21 @@ pub fn universal_sched(
         rrow!("notdistribute", "analysis", crate::ruleaction_1::RuleNotDistribute::new("analysis")),
         rrow!("highorderand", "analysis", crate::ruleaction_1::RuleHighOrderAnd::new("analysis")),
         rrow!("anddistribute", "analysis", crate::ruleaction_1::RuleAndDistribute::new("analysis")),
-        rrow!("andcommute", "analysis", crate::ruleaction_2::RuleAndCommute),
-        rrow!("andpiece", "analysis", crate::ruleaction_2::RuleAndPiece),
-        rrow!("andzext", "analysis", crate::ruleaction_2::RuleAndZext),
-        rrow!("andcompare", "analysis", crate::ruleaction_2::RuleAndCompare),
-        rrow!("doublesub", "analysis", crate::ruleaction_2::RuleDoubleSub),
-        rrow!("doubleshift", "analysis", crate::ruleaction_2::RuleDoubleShift),
-        rrow!("doublearithshift", "analysis", crate::ruleaction_2::RuleDoubleArithShift),
-        rrow!("concatshift", "analysis", crate::ruleaction_2::RuleConcatShift),
-        rrow!("leftright", "analysis", crate::ruleaction_2::RuleLeftRight),
+        rrow!("andcommute", "analysis", &["andcommute"], crate::ruleaction_2::RuleAndCommute),
+        rrow!("andpiece", "analysis", &["andpiece"], crate::ruleaction_2::RuleAndPiece),
+        rrow!("andzext", "analysis", &["andzext"], crate::ruleaction_2::RuleAndZext),
+        rrow!("andcompare", "analysis", &["andcompare"], crate::ruleaction_2::RuleAndCompare),
+        rrow!("doublesub", "analysis", &["doublesub"], crate::ruleaction_2::RuleDoubleSub),
+        rrow!("doubleshift", "analysis", &["doubleshift"], crate::ruleaction_2::RuleDoubleShift),
+        rrow!("doublearithshift", "analysis", &["doublearithshift"], crate::ruleaction_2::RuleDoubleArithShift),
+        rrow!("concatshift", "analysis", &["concatshift"], crate::ruleaction_2::RuleConcatShift),
+        rrow!("leftright", "analysis", &["leftright"], crate::ruleaction_2::RuleLeftRight),
         rrow!("boolsignshift", "analysis", crate::kuna_booleanmask::RuleBoolSignShift::with_group(false, "analysis")),
         rrow!("simdshufflelane", "analysis", crate::kuna_simdlane::RuleSimdShuffleLane::with_group(false, "analysis")),
         rrow!("constspaceload", "analysis", crate::kuna_constspaceload::RuleConstSpaceLoad::with_group(false, "analysis")),
         rrow!("boolsignless", "analysis", crate::kuna_flagcompare::RuleBoolSignLess::with_group(false, "analysis")),
         rrow!("sborrowge", "analysis", crate::kuna_flagcompare::RuleSborrowGe::with_group(false, "analysis")),
-        rrow!("shiftcompare", "analysis", crate::ruleaction_2::RuleShiftCompare),
+        rrow!("shiftcompare", "analysis", &["shiftcompare"], crate::ruleaction_2::RuleShiftCompare),
         rrow!("shift2mult", "analysis", crate::ruleaction_3::RuleShift2Mult),
         rrow!("shiftpiece", "analysis", crate::ruleaction_3::RuleShiftPiece),
         rrow!("addcarrychain", "analysis", crate::kuna_addcarrychain::RuleAddCarryChain::with_group(false, "analysis")),
@@ -448,11 +453,11 @@ pub fn universal_sched(
         rrow!("collapseconstants", "analysis", crate::ruleaction_3::RuleCollapseConstants),
         rrow!("transformcpool", "analysis", crate::ruleaction_3::RuleTransformCpool),
         rrow!("propagatecopy", "analysis", crate::ruleaction_3::RulePropagateCopy),
-        rrow!("zexteliminate", "analysis", crate::ruleaction_2::RuleZextEliminate),
-        rrow!("slesstoless", "analysis", crate::ruleaction_2::RuleSlessToLess),
-        rrow!("zextsless", "analysis", crate::ruleaction_2::RuleZextSless),
-        rrow!("bitundistribute", "analysis", crate::ruleaction_2::RuleBitUndistribute),
-        rrow!("booleanundistribute", "analysis", crate::ruleaction_2::RuleBooleanUndistribute),
+        rrow!("zexteliminate", "analysis", &["zexteliminate"], crate::ruleaction_2::RuleZextEliminate),
+        rrow!("slesstoless", "analysis", &["slesstoless"], crate::ruleaction_2::RuleSlessToLess),
+        rrow!("zextsless", "analysis", &["zextsless"], crate::ruleaction_2::RuleZextSless),
+        rrow!("bitundistribute", "analysis", &["bitundistribute"], crate::ruleaction_2::RuleBitUndistribute),
+        rrow!("booleanundistribute", "analysis", &["booleanundistribute"], crate::ruleaction_2::RuleBooleanUndistribute),
         rrow!("booleandedup", "analysis", crate::ruleaction_3::RuleBooleanDedup),
         rrow!("boolzext", "analysis", crate::ruleaction_3::RuleBoolZext),
         rrow!("booleannegate", "analysis", crate::ruleaction_3::RuleBooleanNegate),
@@ -490,12 +495,12 @@ pub fn universal_sched(
         rrow!("switchsingle", "analysis", crate::ruleaction_4::RuleSwitchSingle),
         rrow!("condnegate", "analysis", crate::ruleaction_4::RuleCondNegate),
         rrow!("boolnegate", "analysis", crate::ruleaction_5::RuleBoolNegate::new("analysis")),
-        rrow!("lessequal", "analysis", crate::ruleaction_2::RuleLessEqual),
-        rrow!("lessnotequal", "analysis", crate::ruleaction_2::RuleLessNotEqual),
+        rrow!("lessequal", "analysis", &["lessequal"], crate::ruleaction_2::RuleLessEqual),
+        rrow!("lessnotequal", "analysis", &["lessnotequal"], crate::ruleaction_2::RuleLessNotEqual),
         rrow!("lessone", "analysis", crate::ruleaction_1::RuleLessOne::new("analysis")),
         rrow!("rangemeld", "analysis", crate::ruleaction_1::RuleRangeMeld::new("analysis")),
         rrow!("ovlesssimplify", "analysis", crate::kuna_ovlesssimplify::RuleOvLessSimplify::with_group(false, "analysis")),
-        rrow!("floatrange", "analysis", crate::ruleaction_2::RuleFloatRange),
+        rrow!("floatrange", "analysis", &["floatrange"], crate::ruleaction_2::RuleFloatRange),
         rrow!("piece2zext", "analysis", crate::ruleaction_1::RulePiece2Zext::new("analysis")),
         rrow!("piece2sext", "analysis", crate::ruleaction_1::RulePiece2Sext::new("analysis")),
         rrow!("popcountboolxor", "analysis", crate::ruleaction_8::RulePopcountBoolXor),
@@ -523,7 +528,7 @@ pub fn universal_sched(
         rrow!("ptraddundo", "typerecovery", crate::ruleaction_6::RulePtraddUndo::new("typerecovery")),
         rrow!("ptrsubundo", "typerecovery", crate::ruleaction_6::RulePtrsubUndo::new("typerecovery")),
         rrow!("segment", "segment", crate::ruleaction_7::RuleSegment),
-        rrow!("piecepathology", "protorecovery", crate::ruleaction_8::RulePiecePathology),
+        rrow!("piecepathology", "protorecovery", &["piecepathology"], crate::ruleaction_8::RulePiecePathology),
         rrow!("doubleload", "doubleload", crate::double::RuleDoubleLoad::new("doubleload")),
         rrow!("doublestore", "doubleprecis", crate::double::RuleDoubleStore::new("doubleprecis")),
         rrow!("doublein", "doubleprecis", crate::double::RuleDoubleIn::new("doubleprecis")),
@@ -555,8 +560,8 @@ pub fn universal_sched(
         rrow!("2comp2sub", "cleanup", crate::ruleaction_6::Rule2Comp2Sub::new("cleanup")),
         rrow!("dumptyhumplate", "cleanup", crate::subflow::RuleDumptyHumpLate::new("cleanup")),
         rrow!("subright", "cleanup", crate::ruleaction_6::RuleSubRight::new("cleanup")),
-        rrow!("floatsigncleanup", "cleanup", crate::ruleaction_8::RuleFloatSignCleanup),
-        rrow!("expandload", "cleanup", crate::ruleaction_8::RuleExpandLoad),
+        rrow!("floatsigncleanup", "cleanup", &["floatsigncleanup"], crate::ruleaction_8::RuleFloatSignCleanup),
+        rrow!("expandload", "cleanup", &["expandload"], crate::ruleaction_8::RuleExpandLoad),
         rrow!("ptrsubcharconstant", "cleanup", crate::ruleaction_6::RulePtrsubCharConstant::new("cleanup")),
         rrow!("extensionpush", "cleanup", crate::ruleaction_6::RuleExtensionPush::new("cleanup")),
         rrow!("piecestructure", "cleanup", crate::ruleaction_6::RulePieceStructure::new("cleanup")),

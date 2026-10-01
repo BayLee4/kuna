@@ -1926,6 +1926,21 @@ moves.
   `quotearg_style(shell_escape_always_quoting_style, …)`; the enum is looked up
   before it is built, because the same declaration recurs in every compilation
   unit that includes its header;
+  character base types preserve their DWARF encoding in both the C and C++
+  prototype paths: explicit signed characters use a numeric signed type,
+  unsigned characters use an unsigned type, and only a signed-encoded type
+  actually named `char` retains plain-character spelling. This preserves input
+  and return signedness without inferring register extension from a compiler
+  name or a source declaration;
+  `DW_TAG_subroutine_type` preserves a callback's logical return and formal
+  types in a Code node bound to the selected shared prototype model. The importer
+  reserves the source identity before descending, so recursive callback pointers
+  retain that same node. For C-family compilation units, `DW_AT_prototyped`
+  distinguishes an open, nonvariadic `int()` declaration from closed `int(void)`;
+  prototyped declarations with `DW_TAG_unspecified_parameters` retain a variadic
+  boundary after their fixed formals. An absent prototyped flag in other languages
+  does not by itself open a fixed signature. These declarations supply logical
+  types, not evidence of physical register extension;
   (3) stack locals — direct `DW_OP_fbreg` children become typelock|namelock stack
   symbols at `call_frame_cfa + fbreg`, re-seeded per decompile (§1.1); nested
   lexical-block locals and composite locations are a documented loss. (ida) The
@@ -2019,17 +2034,20 @@ moves.
   `struct node { struct node *next; }` reaches its own DIE while its fields are
   being built, so the shell is interned **before** the members are walked and the
   inner resolution finds it by name, with the walk guard refusing a re-entrant
-  population. LOSS: because an interned type is immutable in kuna, completing one
-  mints a new handle, so the pointer the inner frame captured still refers to the
-  pre-completion shell — the name renders but the chain is one level shorter.
+  population. Completion preserves the reserved graph identity: an early
+  pointer or typedef observes the completed members without reconstruction.
   `DW_TAG_variant_part`/`DW_TAG_variant`/`DW_AT_discr`, the Rust tagged-enum
   encoding, are not read by this arm; the sibling `dwarfvariants` increment below
   reads them, and with it off a Rust enum recovers its width and no fields. Same
   load-time shape as `typedepth` below: the layout is installed inside
   `load file`, so the live gate is the process env var
   (`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfstructs.rs`) that the
-  CLI exports before the load, and `dwarfstructs off` is the name-only mapping byte
-  for byte.
+  CLI exports before the load. `dwarfstructs off` retains nominal opaque
+  declarations usable through pointers. Both plain and C++ DWARF importers omit
+  signatures whose required by-value return or input layout is unavailable,
+  leaving instruction-based signature recovery in place rather than inventing
+  scalar storage or a hidden return parameter. Explicit CLI declarations and
+  committed host facts retain their stricter error/authority contracts.
 - **Discriminated unions** (`dwarfvariants`, default-on,
   `decompiler/crates/kuna-analysis/src/analyzers/dwarf/kuna_dwarfvariants.rs`) is
   the arm for the aggregates the member walk above cannot see at all. A Rust
@@ -2133,8 +2151,8 @@ moves.
   overlay union's name being unmintable or any of the three completions being
   refused by the factory. Same load-time env-var gate as `dwarfstructs`, and
   gated on `dwarfstructs` itself as well — this arm extends that one, so
-  `dwarfstructs off` stays exactly the pre-DIV-86 name-only mapping its own row
-  promises.
+  `dwarfstructs off` retains the opaque declaration and signature-admissibility
+  behavior described above.
 
   **The limitation is the channel.** This needs full debug info
   (`-C debuginfo=2`, cargo `debug = true`). Where a binary's DWARF carries no type

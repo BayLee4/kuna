@@ -26,7 +26,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::unionresolve_run::ScoreUnionFields;
@@ -67,27 +67,27 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// A pointer (TYPE_PTR, 8 bytes) to `ptrto`; align_size taken from `ptrto`.
-fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr_to(types: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
     let mut p = Datatype::new_with_align(8, 8, type_metatype::TYPE_PTR);
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(p)
+    p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    types.intern(p).unwrap()
 }
 
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(types: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
     u.flags |= 0x800; // needs_resolution
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    types.intern(u).unwrap()
 }
 
 fn new_op_code(fd: &mut Funcdata, inputs: int4, opc: OpCode, name: &str) -> OpId {
@@ -103,7 +103,7 @@ fn wire_input(
     slot: int4,
     off: u64,
     size: int4,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
 ) -> VarnodeId {
     let r = ram(fd);
     let m = Address::new(r, off);
@@ -118,7 +118,7 @@ fn const_vn(fd: &mut Funcdata, val: uintb, size: int4) -> VarnodeId {
     fd.new_varnode(size, &m, None)
 }
 
-fn set_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4, ty: Rc<Datatype>) {
+fn set_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4, ty: TypeRoot) {
     let r = ram(fd);
     let m = Address::new(r, off);
     let out = fd.new_varnode(size, &m, Some(ty));
@@ -136,12 +136,12 @@ fn set_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4, ty: Rc<Datatype
 fn w10r2_ptradd_up_align_mismatch_still_scores_positive() {
     let (mut fd, tf) = build_fd();
     // union { int8 f0; void* f1; }  — ptrto align_size = 1.
-    let int8t = base(8, type_metatype::TYPE_INT);
-    let ptrt = ptr_to(base(1, type_metatype::TYPE_UNKNOWN)); // align_size(ptrto)=1
-    let u = make_union(8, &[(0, Rc::clone(&int8t)), (0, Rc::clone(&ptrt))]);
+    let int8t = base(&tf, 8, type_metatype::TYPE_INT);
+    let ptrt = ptr_to(&tf, base(&tf, 1, type_metatype::TYPE_UNKNOWN)); // align_size(ptrto)=1
+    let u = make_union(&tf, 8, &[(0, int8t), (0, ptrt.clone())]);
 
     let op = new_op_code(&mut fd, 3, OpCode::CPUI_PTRADD, "PTRADD");
-    let _arrbase = wire_input(&mut fd, op, 0, 0x400, 8, Rc::clone(&ptrt));
+    let _arrbase = wire_input(&mut fd, op, 0, 0x400, 8, ptrt);
     let _index = {
         let c = const_vn(&mut fd, 2, 8);
         fd.op_set_input(op, c, 1).unwrap();
@@ -153,10 +153,10 @@ fn w10r2_ptradd_up_align_mismatch_still_scores_positive() {
         fd.op_set_input(op, c, 2).unwrap();
         c
     };
-    set_output(&mut fd, op, 0x500, 8, Rc::clone(&u));
+    set_output(&mut fd, op, 0x500, 8, u.clone());
 
     let result = {
-        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1).unwrap();
+        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), u, op, -1).unwrap();
         scorer.into_result()
     };
     // +2 for the pointer field > -1 union baseline (and the int field, fitting up
@@ -187,12 +187,12 @@ fn w10r2_ptradd_up_align_mismatch_still_scores_positive() {
 fn w10r2_ptradd_up_ptr_field_beats_float_field() {
     let (mut fd, tf) = build_fd();
     // union { float8 f0; void* f1; } — float scores -5, ptr scores +10 up PTRADD.
-    let float8t = base(8, type_metatype::TYPE_FLOAT);
-    let ptrt = ptr_to(base(1, type_metatype::TYPE_UNKNOWN)); // align_size(ptrto)=1
-    let u = make_union(8, &[(0, Rc::clone(&float8t)), (0, Rc::clone(&ptrt))]);
+    let float8t = base(&tf, 8, type_metatype::TYPE_FLOAT);
+    let ptrt = ptr_to(&tf, base(&tf, 1, type_metatype::TYPE_UNKNOWN)); // align_size(ptrto)=1
+    let u = make_union(&tf, 8, &[(0, float8t), (0, ptrt.clone())]);
 
     let op = new_op_code(&mut fd, 3, OpCode::CPUI_PTRADD, "PTRADD");
-    let _arrbase = wire_input(&mut fd, op, 0, 0xA00, 8, Rc::clone(&ptrt));
+    let _arrbase = wire_input(&mut fd, op, 0, 0xA00, 8, ptrt);
     let _index = {
         let c = const_vn(&mut fd, 1, 8);
         fd.op_set_input(op, c, 1).unwrap();
@@ -204,10 +204,10 @@ fn w10r2_ptradd_up_ptr_field_beats_float_field() {
         fd.op_set_input(op, c, 2).unwrap();
         c
     };
-    set_output(&mut fd, op, 0xB00, 8, Rc::clone(&u));
+    set_output(&mut fd, op, 0xB00, 8, u.clone());
 
     let result = {
-        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1).unwrap();
+        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), u, op, -1).unwrap();
         scorer.into_result()
     };
     // float field f0 = -5 (the "doesn't fit" branch); ptr field f1 = +10.  The
@@ -233,23 +233,23 @@ fn w10r2_ptradd_up_ptr_field_beats_float_field() {
 fn w10r2_subpiece_up_int_field_scores_likely_truncation() {
     let (mut fd, tf) = build_fd();
     // union { int4 f0; float4 f1; } — 4 bytes each.
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let float4t = base(4, type_metatype::TYPE_FLOAT);
-    let u = make_union(4, &[(0, Rc::clone(&int4t)), (0, Rc::clone(&float4t))]);
+    let int4t = base(&tf, 4, type_metatype::TYPE_INT);
+    let float4t = base(&tf, 4, type_metatype::TYPE_FLOAT);
+    let u = make_union(&tf, 4, &[(0, int4t), (0, float4t)]);
 
     // out = SUBPIECE(src, 0) ; out typed as the union (slot = -1 up-trials).
     let op = new_op_code(&mut fd, 2, OpCode::CPUI_SUBPIECE, "SUBPIECE");
-    let _src = wire_input(&mut fd, op, 0, 0xC00, 8, base(8, type_metatype::TYPE_INT));
+    let _src = wire_input(&mut fd, op, 0, 0xC00, 8, base(&tf, 8, type_metatype::TYPE_INT));
     // in(1) = truncation offset 0  -> C++ SUBPIECE-up gives +3 for INT/UINT/BOOL.
     let _off = {
         let c = const_vn(&mut fd, 0, 8);
         fd.op_set_input(op, c, 1).unwrap();
         c
     };
-    set_output(&mut fd, op, 0xD00, 4, Rc::clone(&u));
+    set_output(&mut fd, op, 0xD00, 4, u.clone());
 
     let result = {
-        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1).unwrap();
+        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), u, op, -1).unwrap();
         scorer.into_result()
     };
     // int field: +3 (SUBPIECE-up, offset 0, INT). float field: -5. union baseline

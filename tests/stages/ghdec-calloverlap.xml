@@ -70,15 +70,20 @@ c3
   <com>lo fu f</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>print raw</com>
   <com>option calloverlap full</com>
   <com>decompile</com>
   <com>print C</com>
   <com>quit</com>
 </script>
-<stringmatch name="CALLOVERLAP #1: off, the call is emitted with no arguments at all (the CVTSI2SD result never reaches it)" min="1" max="1">sub_1170\(\);</stringmatch>
+<stringmatch name="CALLOVERLAP #1: off, the machine CALL still lacks arguments and a result, so native C is refused" min="1" max="1">^0x00001155:[0-9a-f]+:\s+call fsub_1170\(free\)$</stringmatch>
 <stringmatch name="CALLOVERLAP #2: off, f loses its own parameter list because the argument chain dies with the trial" min="1" max="1">float8 f\(void\)</stringmatch>
 <stringmatch name="CALLOVERLAP #3: off, the call result is read from a local that nothing ever assigns" min="1" max="1">dat_4018 = v1;</stringmatch>
 <stringmatch name="CALLOVERLAP #4: full, guardCallOverlappingInput recovers the truncated XMM0 argument and tryOutputOverlapGuard the return value" min="1" max="1">dat_4018 = \(float8\)sub_1170\(\(float8\)a0\);</stringmatch>
 <stringmatch name="CALLOVERLAP #5: full, f regains its own parameter" min="1" max="1">float8 f\(int8 a0\)</stringmatch>
 <stringmatch name="CALLOVERLAP #6: full, the epilogue adds 1.0 to the recovered call result, not to a stale pre-call read" min="1" max="1">return dat_4018 \+ dat_2008;</stringmatch>
+<stringmatch name="CALLOVERLAP #7: off, the unrepresented boundary is explicit rather than a fabricated C call" min="1" max="1">^  CPUI_CALL \[.*\] effects=.*$</stringmatch>
+<stringmatch name="CALLOVERLAP #8: off, XMM0 still comes from the unrecovered CALL result" min="1" max="1">^0x00001155:[0-9a-f]+:\s+XMM0_Qa\(0x00001155:[0-9a-f]+\) = \[create\] i0x00001155:[0-9a-f]+\(free\)$</stringmatch>
+<stringmatch name="CALLOVERLAP #9: off, that call-created XMM0 is consumed by the real global store and addition" min="1" max="1">^0x0000115a:[0-9a-f]+:\s+r0x00004018\([^\n]*\) = XMM0_Qa\(0x00001155:[0-9a-f]+\)$
+^0x00001162:[0-9a-f]+:\s+XMM0_Qa\([^\n]*\) = XMM0_Qa\(0x00001155:[0-9a-f]+\) \+ r0x00002008\([^\n]*\)$</stringmatch>
 </decompilertest>

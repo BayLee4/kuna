@@ -59,12 +59,11 @@ pub struct SymFact {
 /// A `SymFact{Data}` is installed with a size-1 code type, so a 4-/8-byte
 /// memory access (`mov [max_width], eax`) queries `queryContainer(addr, 4)` and
 /// finds nothing — the global renders `dat_<addr>` instead of `max_width`. This
-/// fact maps the symbol with an `undefined<size>` type so the container query
-/// matches at the real access width. Matches how **IDA Pro / Ghidra** name data
-/// globals from the symbol table (`ApplyDataArchiveAnalyzer` / the symtab import).
+/// fact retains the recovered source graph root and top-level volatile property
+/// so committing a named global does not discard its declaration. An unresolved
+/// source type keeps the existing size-only unknown fallback.
 ///
-/// Produced by the DWARF pass (top-level `DW_TAG_variable` with `DW_OP_addr`),
-/// which resolves the variable's `DW_AT_type` to its byte size.
+/// Produced by the DWARF pass (top-level `DW_TAG_variable` with `DW_OP_addr`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DataObjectFact {
     /// Virtual address of the data object.
@@ -73,6 +72,10 @@ pub struct DataObjectFact {
     pub name: String,
     /// Byte size of the object's storage (from `DW_AT_type`), `>= 1`.
     pub size: u32,
+    /// Actual source root, retaining its original graph generation and aliases.
+    pub type_: Option<kuna_decomp::dtype::TypeRoot>,
+    /// Qualifies this stored object, not an object reached through its pointer.
+    pub volatile: bool,
 }
 
 /// A detected NUL-terminated string literal: a `char[len]` data object at `addr`.
@@ -169,9 +172,9 @@ pub struct LocalFact {
     pub func_addr: u64,
     /// The DWARF source name of the local (e.g. `file`, `elf_header`).
     pub name: String,
-    /// The recovered kuna [`Datatype`] (mapped from the variable's `DW_AT_type` DIE
-    /// by the same DIE→Datatype mapper the typed-signature path uses).
-    pub type_: std::rc::Rc<kuna_decomp::dtype::Datatype>,
+    /// The recovered graph root (mapped from the variable's `DW_AT_type` DIE
+    /// by the same mapper the typed-signature path uses).
+    pub type_: kuna_decomp::dtype::TypeRoot,
     /// The stack offset in kuna stack-space coordinates (`call_frame_cfa + fbreg`),
     /// signed; the commit wraps it to the unsigned stack address.
     pub stack_offset: i64,
@@ -181,9 +184,8 @@ pub struct LocalFact {
 /// the address, the name it is installed under, and the recovered type.
 ///
 /// The one producer today is
-/// [`crate::protos::kuna_libctypes::LibcTypesPass`]'s stdio-stream step. Where
-/// [`DataObjectFact`] and the loader's `.dynsym` data stream give an object a
-/// NAME and leave its type to propagation, a stream slot's type is a
+/// [`crate::protos::kuna_libctypes::LibcTypesPass`]'s stdio-stream step. Unlike
+/// the loader's untyped `.dynsym` data stream, a stream slot's type is a
 /// declaration: a `stdout` the dynamic linker fills is a `FILE *`, whatever the
 /// one function in front of the analyst happens to do with it.
 ///
@@ -197,8 +199,8 @@ pub struct TypedDataFact {
     pub addr: u64,
     /// The name the symbol is installed under.
     pub name: String,
-    /// The recovered kuna [`Datatype`] for the object AT that address.
-    pub type_: std::rc::Rc<kuna_decomp::dtype::Datatype>,
+    /// The recovered graph root for the object AT that address.
+    pub type_: kuna_decomp::dtype::TypeRoot,
 }
 
 /// A source-line annotation to attach to a decompiled instruction: at `addr`,
@@ -300,9 +302,9 @@ pub struct FidMatch {
 pub struct AnalysisOutput {
     /// `(addr, name, kind)` -> seed `Database::add_function` / symbol map.
     pub symbols: Vec<SymFact>,
-    /// Named, sized data globals (the symbol-table / DWARF data objects). Mapped
-    /// into the global scope with an `undefined<size>` type so a memory access of
-    /// the object renders its NAME (`max_width`) not `dat_<addr>`. See
+    /// Named, sized DWARF data globals. Mapped into the global scope with their
+    /// source root and storage properties when recovered; unresolved types keep
+    /// an `undefined<size>` fallback. Container queries retain the object's name. See
     /// [`DataObjectFact`]. Produced by the DWARF pass; empty otherwise.
     pub data_objects: Vec<DataObjectFact>,
     /// Discovered function entry points (for stripped targets).

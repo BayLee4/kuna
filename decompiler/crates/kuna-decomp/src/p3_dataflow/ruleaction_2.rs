@@ -40,7 +40,7 @@ use kuna_base::address::{calc_mask, leastsigbit_set, signbit_negative, Address};
 use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::op::is_cse_match;
 use crate::context::{OpId, TypeOp, VarnodeId};
@@ -239,11 +239,8 @@ impl Rule for RuleFloatRange {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_BOOL_OR, OpCode::CPUI_BOOL_AND]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("floatrange") {
-            return None;
-        }
-        Some(Box::new(RuleFloatRange))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleFloatRange)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vn1 = op_in(data, op, 0);
@@ -347,11 +344,8 @@ impl Rule for RuleAndCommute {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_AND]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("andcommute") {
-            return None;
-        }
-        Some(Box::new(RuleAndCommute))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndCommute)
     }
     // The `sa`/`opc` initializers are the C++ "Unnecessary initialization"
     // placeholders; each is overwritten before any read inside the loop.
@@ -533,11 +527,8 @@ impl Rule for RuleAndPiece {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_AND]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("andpiece") {
-            return None;
-        }
-        Some(Box::new(RuleAndPiece))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndPiece)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let mut highvn: Option<VarnodeId> = None;
@@ -637,11 +628,8 @@ impl Rule for RuleAndZext {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_AND]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("andzext") {
-            return None;
-        }
-        Some(Box::new(RuleAndZext))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndZext)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let cvn1 = op_in(data, op, 1);
@@ -691,11 +679,8 @@ impl Rule for RuleAndCompare {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("andcompare") {
-            return None;
-        }
-        Some(Box::new(RuleAndCompare))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAndCompare)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         if !vn_constant(data, op_in(data, op, 1)) {
@@ -783,11 +768,8 @@ impl Rule for RuleDoubleSub {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_SUBPIECE]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("doublesub") {
-            return None;
-        }
-        Some(Box::new(RuleDoubleSub))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleSub)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vn = op_in(data, op, 0);
@@ -824,17 +806,8 @@ impl Rule for RuleDoubleShift {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_MULT]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // (kuna) C++ `new RuleDoubleShift("analysis")` — the rule's runtime group
-        // is "analysis" (coreaction.cc:5807), so the live `universalAction` pool
-        // clone must test "analysis"; checking only the per-op placeholder name
-        // ("doubleshift") dropped this rule from every cloned pool, so `(x>>a)>>b`
-        // collapses never ran — the div/mod reconstruction depends on them.  Both
-        // are accepted so the placeholder-`specs()` contract still holds.
-        if !grouplist.contains("analysis") && !grouplist.contains("doubleshift") {
-            return None;
-        }
-        Some(Box::new(RuleDoubleShift))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleShift)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let sa1: int4;
@@ -969,18 +942,8 @@ impl Rule for RuleDoubleArithShift {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_SRIGHT]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // (kuna) C++ `new RuleDoubleArithShift("analysis")` — the rule's runtime
-        // group is "analysis" (coreaction.cc:5808), so the live `universalAction`
-        // pool clone must test "analysis"; checking only the per-op placeholder
-        // name ("doublearithshift") dropped this rule from every cloned pool, so
-        // `(x s>> a) s>> b` collapses never ran — the signed div/mod
-        // reconstruction (RuleModOpt on `x % C`) depends on them.  Both are
-        // accepted so the placeholder-`specs()` contract still holds.
-        if !grouplist.contains("analysis") && !grouplist.contains("doublearithshift") {
-            return None;
-        }
-        Some(Box::new(RuleDoubleArithShift))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleArithShift)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let const_d = op_in(data, op, 1);
@@ -1030,11 +993,8 @@ impl Rule for RuleConcatShift {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("concatshift") {
-            return None;
-        }
-        Some(Box::new(RuleConcatShift))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConcatShift)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         if !vn_constant(data, op_in(data, op, 1)) {
@@ -1100,11 +1060,8 @@ impl Rule for RuleLeftRight {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("leftright") {
-            return None;
-        }
-        Some(Box::new(RuleLeftRight))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLeftRight)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         if !vn_constant(data, op_in(data, op, 1)) {
@@ -1182,11 +1139,8 @@ impl Rule for RuleShiftCompare {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("shiftcompare") {
-            return None;
-        }
-        Some(Box::new(RuleShiftCompare))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShiftCompare)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let mut sa: int4;
@@ -1325,11 +1279,8 @@ impl Rule for RuleLessEqual {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_BOOL_OR]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("lessequal") {
-            return None;
-        }
-        Some(Box::new(RuleLessEqual))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLessEqual)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vnout1 = op_in(data, op, 0);
@@ -1409,11 +1360,8 @@ impl Rule for RuleLessNotEqual {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_BOOL_AND]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("lessnotequal") {
-            return None;
-        }
-        Some(Box::new(RuleLessNotEqual))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLessNotEqual)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         // Convert [(s)lessequal AND notequal] to (s)less
@@ -1502,24 +1450,8 @@ impl Rule for RuleTrivialArith {
             OpCode::CPUI_FLOAT_LESSEQUAL,
         ]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `RuleTrivialArith::clone` (ruleaction.hh:493) gates on
-        // `grouplist.contains(getGroup())`, where `getGroup()` is the group this
-        // rule was constructed with: `new RuleTrivialArith("analysis")`
-        // (coreaction.cc:5786) -- it is NOT the rule's `name` ("trivialarith").
-        // This unit struct is registered under the "analysis" group
-        // (universalaction.rs:399); the owning pool's `clone_filtered` consults
-        // exactly this gate, so it must test the GROUP, or the rule is silently
-        // dropped (it would not survive the "decompile"/"jumptable" grouplists,
-        // which list "analysis" but never the literal "trivialarith").  The
-        // `V & V => V` / `V ^ V => 0` folds it performs are what let the loaded
-        // byte in a `*ptr` / signed-compare cluster type as `char` (the signed
-        // compare then reads the byte directly rather than a dead self-AND
-        // output) -- matching the C++ `char v1` rendering.
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleTrivialArith))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTrivialArith)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         // LOCAL STUB(jumptable-recovery): C++ keeps this fold active during the
@@ -1606,11 +1538,8 @@ impl Rule for RuleTrivialBool {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_BOOL_AND, OpCode::CPUI_BOOL_OR, OpCode::CPUI_BOOL_XOR]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("trivialbool") {
-            return None;
-        }
-        Some(Box::new(RuleTrivialBool))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleTrivialBool)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vnconst = op_in(data, op, 1);
@@ -1661,11 +1590,8 @@ impl Rule for RuleZextEliminate {
             OpCode::CPUI_INT_LESSEQUAL,
         ]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("zexteliminate") {
-            return None;
-        }
-        Some(Box::new(RuleZextEliminate))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleZextEliminate)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         // vn1 equals ZEXTed input; vn2 = other input
@@ -1730,11 +1656,8 @@ impl Rule for RuleSlessToLess {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_SLESS, OpCode::CPUI_INT_SLESSEQUAL]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("slesstoless") {
-            return None;
-        }
-        Some(Box::new(RuleSlessToLess))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSlessToLess)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vn = op_in(data, op, 0);
@@ -1766,11 +1689,8 @@ impl Rule for RuleZextSless {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_SLESS, OpCode::CPUI_INT_SLESSEQUAL]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("zextsless") {
-            return None;
-        }
-        Some(Box::new(RuleZextSless))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleZextSless)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let mut vn1 = op_in(data, op, 0);
@@ -1837,11 +1757,8 @@ impl Rule for RuleBitUndistribute {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_AND, OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("bitundistribute") {
-            return None;
-        }
-        Some(Box::new(RuleBitUndistribute))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBitUndistribute)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vn1 = op_in(data, op, 0);
@@ -1978,11 +1895,8 @@ impl Rule for RuleBooleanUndistribute {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") && !grouplist.contains("booleanundistribute") {
-            return None;
-        }
-        Some(Box::new(RuleBooleanUndistribute))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBooleanUndistribute)
     }
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let vn0 = op_in(data, op, 0);
@@ -2087,34 +2001,31 @@ impl Rule for RuleBooleanUndistribute {
 // =============================================================================
 
 /// The rules ported in this file, in C++ definition order (`ruleaction.cc`
-/// 1444-2810).  Each `group` is the rule's stage group (its C++ constructor
-/// argument), matched against [`ActionGroupList`] in `clone_rule`.
+/// 1444-2810). The primary group is `"analysis"`; established per-rule group
+/// aliases are explicit registration metadata, filtered by the owning pool.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "floatrange", ctor: || Box::new(RuleFloatRange) },
-        RuleSpec { group: "andcommute", ctor: || Box::new(RuleAndCommute) },
-        RuleSpec { group: "andpiece", ctor: || Box::new(RuleAndPiece) },
-        RuleSpec { group: "andzext", ctor: || Box::new(RuleAndZext) },
-        RuleSpec { group: "andcompare", ctor: || Box::new(RuleAndCompare) },
-        RuleSpec { group: "doublesub", ctor: || Box::new(RuleDoubleSub) },
-        RuleSpec { group: "doubleshift", ctor: || Box::new(RuleDoubleShift) },
-        RuleSpec { group: "doublearithshift", ctor: || Box::new(RuleDoubleArithShift) },
-        RuleSpec { group: "concatshift", ctor: || Box::new(RuleConcatShift) },
-        RuleSpec { group: "leftright", ctor: || Box::new(RuleLeftRight) },
-        RuleSpec { group: "shiftcompare", ctor: || Box::new(RuleShiftCompare) },
-        RuleSpec { group: "lessequal", ctor: || Box::new(RuleLessEqual) },
-        RuleSpec { group: "lessnotequal", ctor: || Box::new(RuleLessNotEqual) },
-        // C++ `new RuleTrivialArith("analysis")` (coreaction.cc:5786): the group
-        // is "analysis", NOT the rule name -- `clone_rule` now gates on it so the
-        // rule survives the "decompile"/"jumptable" grouplists (which list
-        // "analysis" but never the literal "trivialarith").
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleTrivialArith) },
-        RuleSpec { group: "trivialbool", ctor: || Box::new(RuleTrivialBool) },
-        RuleSpec { group: "zexteliminate", ctor: || Box::new(RuleZextEliminate) },
-        RuleSpec { group: "slesstoless", ctor: || Box::new(RuleSlessToLess) },
-        RuleSpec { group: "zextsless", ctor: || Box::new(RuleZextSless) },
-        RuleSpec { group: "bitundistribute", ctor: || Box::new(RuleBitUndistribute) },
-        RuleSpec { group: "booleanundistribute", ctor: || Box::new(RuleBooleanUndistribute) },
+        RuleSpec { group: "analysis", aliases: &["floatrange"], ctor: || Box::new(RuleFloatRange) },
+        RuleSpec { group: "analysis", aliases: &["andcommute"], ctor: || Box::new(RuleAndCommute) },
+        RuleSpec { group: "analysis", aliases: &["andpiece"], ctor: || Box::new(RuleAndPiece) },
+        RuleSpec { group: "analysis", aliases: &["andzext"], ctor: || Box::new(RuleAndZext) },
+        RuleSpec { group: "analysis", aliases: &["andcompare"], ctor: || Box::new(RuleAndCompare) },
+        RuleSpec { group: "analysis", aliases: &["doublesub"], ctor: || Box::new(RuleDoubleSub) },
+        RuleSpec { group: "analysis", aliases: &["doubleshift"], ctor: || Box::new(RuleDoubleShift) },
+        RuleSpec { group: "analysis", aliases: &["doublearithshift"], ctor: || Box::new(RuleDoubleArithShift) },
+        RuleSpec { group: "analysis", aliases: &["concatshift"], ctor: || Box::new(RuleConcatShift) },
+        RuleSpec { group: "analysis", aliases: &["leftright"], ctor: || Box::new(RuleLeftRight) },
+        RuleSpec { group: "analysis", aliases: &["shiftcompare"], ctor: || Box::new(RuleShiftCompare) },
+        RuleSpec { group: "analysis", aliases: &["lessequal"], ctor: || Box::new(RuleLessEqual) },
+        RuleSpec { group: "analysis", aliases: &["lessnotequal"], ctor: || Box::new(RuleLessNotEqual) },
+        // TrivialArith has no historical per-rule group alias.
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleTrivialArith) },
+        RuleSpec { group: "analysis", aliases: &["trivialbool"], ctor: || Box::new(RuleTrivialBool) },
+        RuleSpec { group: "analysis", aliases: &["zexteliminate"], ctor: || Box::new(RuleZextEliminate) },
+        RuleSpec { group: "analysis", aliases: &["slesstoless"], ctor: || Box::new(RuleSlessToLess) },
+        RuleSpec { group: "analysis", aliases: &["zextsless"], ctor: || Box::new(RuleZextSless) },
+        RuleSpec { group: "analysis", aliases: &["bitundistribute"], ctor: || Box::new(RuleBitUndistribute) },
+        RuleSpec { group: "analysis", aliases: &["booleanundistribute"], ctor: || Box::new(RuleBooleanUndistribute) },
     ]
 }
 

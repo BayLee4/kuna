@@ -29,7 +29,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uint8};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
 
@@ -54,7 +54,12 @@ fn build_manager(big: bool) -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager(false);
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -64,8 +69,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
@@ -77,7 +83,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.vbank_mut().create(size, Address::new(r, off), unk(size))
+    let datatype = unk(fd, size);
+    fd.vbank_mut().create(size, Address::new(r, off), datatype)
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {
@@ -349,6 +356,63 @@ fn unique_hash_position_zero_for_singleton() {
 }
 
 #[test]
+fn unique_operation_hash_recovers_the_operation_and_operand_slot() {
+    let (mut fd, _, _, _, result) = build_add_graph();
+    let operation = fd.vbank().get(result).unwrap().get_def().unwrap();
+    for slot in [-1, 0, 1] {
+        let mut hash = DynamicHash::new();
+        hash.unique_hash_op(operation, slot, 8, &mut fd);
+        let address = hash.get_address().clone();
+        assert_eq!(DynamicHash::new().find_op(&mut fd, &address, hash.get_hash()), Some(operation));
+        assert_eq!(DynamicHash::get_slot_from_hash(hash.get_hash()), slot,
+            "recovering an operation must not redirect an input annotation to another operand");
+    }
+}
+
+#[test]
+fn unique_operation_hash_retains_an_earlier_collision_winner() {
+    let mut fd = build_fd();
+    let block = mk_block(&mut fd);
+    let constant = fd.new_constant(8, 0x11);
+    let other_constant = fd.new_constant(8, 0x22);
+    let other = copy(&mut fd, block, 0x08, other_constant, 0x80, 8);
+    let mut operations = Vec::new();
+    for i in 0..9 {
+        let input_pc = if i < 8 { 0x10 } else { 0x14 };
+        let input = copy(&mut fd, block, input_pc, constant, 0x100 + i * 8, 8);
+        let result = binop(
+            &mut fd, block, 0x20, OpCode::CPUI_INT_ADD,
+            input, other, 0x200 + i * 8, 8,
+        );
+        operations.push(fd.vbank().get(result).unwrap().get_def().unwrap());
+    }
+    let mut collisions = Vec::new();
+    for method in 4..7 {
+        let mut root_hash = DynamicHash::new();
+        root_hash.calc_hash_op(operations[0], -1, method, &mut fd);
+        let comparable = DynamicHash::get_comparable(root_hash.get_hash());
+        let count = operations.iter().filter(|operation| {
+            let mut candidate = DynamicHash::new();
+            candidate.calc_hash_op(**operation, -1, method, &mut fd);
+            DynamicHash::get_comparable(candidate.get_hash()) == comparable
+        }).count();
+        collisions.push(count);
+    }
+    assert!(collisions[1] > 1 && collisions[1] < collisions[2],
+        "fixture must select method5 before method6: {collisions:?}");
+    for operation in operations {
+        let mut hash = DynamicHash::new();
+        hash.unique_hash_op(operation, -1, 8, &mut fd);
+        let address = hash.get_address().clone();
+        assert_eq!(
+            DynamicHash::new().find_op(&mut fd, &address, hash.get_hash()), Some(operation),
+            "the selected neighborhood and collision position must identify this exact operation",
+        );
+        assert_eq!(DynamicHash::get_slot_from_hash(hash.get_hash()), -1);
+    }
+}
+
+#[test]
 fn wide_budget_matches_narrow_when_no_overflow() {
     // With no real >8 collision, the 16-budget and 8-budget hashes are identical
     // (the cap only matters when a collision list overflows the narrow budget).
@@ -423,17 +487,98 @@ fn colliding_roots_get_distinct_positions() {
 }
 
 #[test]
-fn budget_cap_bounds_total_field() {
-    // The collision total is encoded in 3 bits (+1) => max representable 8.  Even
-    // under the wide budget the position/total fields stay within their bit
-    // widths; here we assert getTotalFromHash never exceeds the chosen budget.
-    let (mut fd, outs) = build_collision_graph(4);
-    for &vn in &outs {
-        let mut dh = DynamicHash::new();
-        dh.unique_hash(vn, 8, &mut fd);
-        let h = dh.get_hash();
-        if h != 0 {
-            assert!(DynamicHash::get_total_from_hash(h) <= 8);
+fn unique_hash_preserves_the_descriptor_of_the_best_collision_method() {
+    let mut manager = build_manager(false);
+    manager.insert_space(Rc::new(kuna_base::space::IopSpace::new(3))).unwrap();
+    let mut context = ArchContext::new(manager);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let arch = Rc::new(context);
+    let memory = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
+    let mut fd = Funcdata::new(
+        "collision_methods", "collision_methods", arch,
+        Address::new(memory, 0x1000), 0x10000000, 0x40,
+    ).unwrap();
+    let block = mk_block(&mut fd);
+    let target = mk_op(&mut fd, 1, 0x80, OpCode::CPUI_CALL);
+    let destination = fd.new_constant(8, 0x2000);
+    fd.op_set_input(target, destination, 0).unwrap();
+    fd.op_insert_end(target, block);
+    let mut roots = Vec::new();
+    for i in 0..9 {
+        let root = mk_vn(&mut fd, 0x100 + i * 8, 8);
+        let root = fd.set_input_varnode(root).unwrap();
+        roots.push(root);
+        let op = mk_op(&mut fd, 2, 0x10, OpCode::CPUI_INDIRECT);
+        fd.op_set_input(op, root, 0).unwrap();
+        let reference = fd.new_varnode_iop(target);
+        fd.op_set_input(op, reference, 1).unwrap();
+        let output = mk_vn(&mut fd, 0x200 + i * 8, 8);
+        fd.op_set_output(op, output).unwrap();
+        fd.op_insert_end(op, block);
+        let consumer_pc = if i < 8 { 0x20 } else { 0x30 };
+        copy(&mut fd, block, consumer_pc, output, 0x300 + i * 8, 8);
+    }
+
+    // Looking down one more level separates the ninth root from the other
+    // eight; looking up instead cannot. This forces unique_hash to retain an
+    // earlier winner at the Java collision budget without a singleton exit.
+    let mut collisions = Vec::new();
+    for method in 0..4 {
+        let mut probe = DynamicHash::new();
+        probe.calc_hash(roots[0], method, &mut fd);
+        let comparable = DynamicHash::get_comparable(probe.get_hash());
+        let mut candidates = Vec::new();
+        DynamicHash::gather_first_level_vars(
+            &mut candidates, &mut fd, probe.get_address(), probe.get_hash(),
+        );
+        let count = candidates.into_iter().filter(|candidate| {
+            let mut candidate_hash = DynamicHash::new();
+            candidate_hash.calc_hash(*candidate, method, &mut fd);
+            DynamicHash::get_comparable(candidate_hash.get_hash()) == comparable
+        }).count();
+        collisions.push(count);
+    }
+    assert!(collisions[2] > 1 && collisions[2] < collisions[3],
+        "fixture must select an earlier non-singleton neighborhood: {collisions:?}");
+    for root in roots {
+        let mut hash = DynamicHash::new();
+        hash.unique_hash(root, 8, &mut fd);
+        let address = hash.get_address().clone();
+        assert_eq!(
+            DynamicHash::new().find_varnode(&mut fd, &address, hash.get_hash()),
+            Some(root),
+            "the chosen method/address/CRC and collision position must describe the same neighborhood",
+        );
+    }
+}
+
+#[test]
+fn wide_collision_budget_allows_rendering_without_rebinding_oversized_lists() {
+    // dynamichashmax deliberately avoids a fatal build_dynamic_symbol error
+    // for 9–16 collisions although the wire position/count fields hold only
+    // eight. Its documented tradeoff is dormant rebinding, not a durable
+    // identity. Exercise the unchanged graph, not arbitrary graph mutations.
+    for count in [9, 16] {
+        let (mut fd, roots) = build_collision_graph(count);
+        for root in roots {
+            let mut narrow = DynamicHash::new();
+            narrow.unique_hash(root, 8, &mut fd);
+            assert_eq!(narrow.get_hash(), 0,
+                "the Java-compatible budget must refuse all {count} equivalent roots");
+
+            let mut wide = DynamicHash::new();
+            wide.unique_hash(root, 16, &mut fd);
+            assert_ne!(wide.get_hash(), 0,
+                "the opt-in wider budget must let build_dynamic_symbol continue rendering");
+            let address = wide.get_address().clone();
+            assert_eq!(
+                DynamicHash::new().find_varnode(&mut fd, &address, wide.get_hash()),
+                None,
+                "an oversized {count}-root descriptor must remain unbound, not choose another root",
+            );
         }
     }
 }

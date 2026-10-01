@@ -59,7 +59,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(kuna_decomp::dtype::TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, kuna_decomp::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()

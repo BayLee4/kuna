@@ -1,0 +1,15 @@
+*** Begin Patch
+*** Update File: decompiler/crates/kuna-decomp/src/p4_calls/kuna_physicalinputs.rs
+@@
+     loop {
+         let mut changed = false;
+-        for id in fd.obank().iter_code(OpCode::CPUI_COPY) {
++        for (_, id) in fd.obank().iter_all() {
+             if flow.is_some_and(|view| !view.op_reachable(fd, id)) { continue; }
+             let operation = fd.obank().get(id).expect("raw COPY");
+-            if operation.num_input() != 1 { continue; }
++            if operation.code() != OpCode::CPUI_COPY || operation.num_input() != 1 { continue; }
+             let Some(output) = operation.get_out().and_then(storage) else { continue; };
+             if !return_candidates.contains_key(&output) { continue; }
+             let Some(input) = operation.get_in(0) else { continue; };
+*** End Patch

@@ -29,7 +29,7 @@ upstream GH issue that inspired it, per its `phases.toml` row).
 
 The type *data model* lives in the substrate —
 `decompiler/crates/kuna-decomp/src/substrate/dtype.rs` — not under `p5_types`,
-because it is shared IR: every Varnode carries a `Datatype` from the moment it
+because it is shared IR: every Varnode carries a `TypeRoot` from the moment it
 is created, and every phase from lift to emission reads it. What lives in
 `p5_types` is the *inference* — the passes that decide which type a Varnode
 carries.
@@ -43,8 +43,8 @@ through struct/enum/array/pointer/float down to `TYPE_UNKNOWN` (15),
 never compare metatypes directly; they go through the 24-value refinement
 `sub_metatype` (same file), which splits e.g. `TYPE_PTR` into
 plain/relative/into-struct pointer ranks and `TYPE_INT` into
-char/unicode/enum/plain ranks. `Datatype::type_order` — the single gate the
-inference engine uses (§5.2) — resolves to `Datatype::compare` with a recursion
+char/unicode/enum/plain ranks. `TypeRoot::type_order` — the single gate the
+inference engine uses (§5.2) — resolves to borrowed `TypeRef::compare` with a recursion
 budget of 10 levels; past the budget, identity falls back to the interned type
 id, so comparison of deep recursive structures terminates. A separate
 `type_order_formal` de-prioritizes partial unions and `bool` when *choosing a
@@ -80,11 +80,10 @@ dispatch. The variants worth knowing:
   explicit width and signedness, for an enum whose declaration states its own
   (a C `enum` is normally `int`-sized, and DWARF records it; a type whose size
   disagrees with the storage it describes will not bind to it, and a wrong size
-  is worse than a missing name). Filling the map is a re-intern
-  (`set_enum_values`), so the value map must be complete before installation:
-  constructing a same-named enum a second time is rejected as an altered
-  definition, not treated as a no-op, and a recovery pass that sees the same
-  declaration once per compilation unit has to look before it builds.
+  is worse than a missing name). An enum is reserved before its value map is
+  completed (`set_enum_values`); completion preserves the original identity.
+  A repeated identical definition is idempotent, while an incompatible
+  definition under the same nominal key requires a new source generation.
 - The `Partial*` variants (`PartialStruct`/`PartialUnion`/`PartialEnum`) stand
   for a byte-slice of a container — the type a Varnode gets when it holds only
   part of a struct/union/enum — each carrying the container, the byte offset,
@@ -97,17 +96,32 @@ dispatch. The variants worth knowing:
   recovery (§5.2) and stack-frame typing: a `TYPE_PTR` to `TYPE_SPACEBASE` is
   "pointer into the frame/globals", and member lookup on it is symbol-table
   lookup.
-- `Code` optionally carries a full `FuncProto`, so a function-pointer call
-  through it can type its arguments.
+- `Alias` preserves its own name, host token and display format while its
+  immediate `typedef_imm` edge names the target. The decoder reads alias and
+  terminal headers before reserving their identities, then reserves them before
+  descending into the terminal's recursive body. A target whose instance
+  metadata is not known yet leaves the alias bound to that exact target identity.
+- `Code` optionally carries a root-free `LogicalCallable`: context-bound model
+  identity, result/input `TypeId`s, explicit arity and declaration semantics.
+  Materialized ABI storage and per-function/callsite `FuncProto` facts remain
+  outside the generation-owned datatype graph.
 
 **The factory.** All types are interned:
-`decompiler/crates/kuna-decomp/src/substrate/dtype.rs (TypeFactoryImpl)` is the
+`decompiler/crates/kuna-decomp/src/substrate/dtype_factory.rs (TypeFactoryImpl)` is the
 per-architecture container behind the `TypeFactory` trait handle. Every
 constructor (`get_base`, `get_type_pointer`, `get_type_array`, …) builds a
-candidate and de-duplicates it through a `BTreeSet` ordered by
-`compare_dependency`-then-id (`TreeKey` in the same file) — the C++
-`DatatypeCompare` semantics, which is why structurally identical types are
-pointer-equal and `Rc::ptr_eq` is a valid fast-path everywhere. A 9×8 cache
+candidate and publishes it through `dtype_graph.rs`. Named definitions use
+name/host-token plus explicit fixed-or-sized instance keys; the host token itself
+never changes when size or variable-length metadata becomes known. Generic
+reservations initially have no instance constraint. A compatible declaration
+claims that reservation without replacing its `TypeId`; established fixed and
+distinct sized instances cannot be conflated. Exact instance lookup is separate
+from source-only host lookup, which rejects multiple live instances as ambiguous.
+Anonymous definitions use immutable intrinsic shape hashes with exact collision
+comparison. Array layout and pointer
+submetatypes are derived metadata, not live index keys. Graph `TypeId` equality
+replaces Rc pointer equality and is distinct from the host token used on the
+wire. A 9×8 cache
 matrix holds the atomic types (sizes 0–8 × the eight meta-types from
 `TYPE_FLOAT` up), with special slots for 10- and 16-byte floats and the char
 types. Two policy knobs are read from the compiler spec's data-organization:
@@ -118,21 +132,78 @@ known. `get_exact_piece` answers "what type is the size-N slice at offset K of
 this type" (the symbol-piece seed of §5.2); `concretize` maps residual
 `TYPE_UNKNOWN` onto concrete integer types where a formal type is forced.
 
-The interning tree's order is a dependency *comparison*, not a dependency
-*ordering*: `compare_dependency` ranks by sub-metatype then **descending**
-size, so a struct contained by value sorts *after* the struct that contains
-it — walking the tree front to back is not definition-before-use. The
-explicit fix is `decompiler/crates/kuna-decomp/src/substrate/dtype.rs
-(TypeFactoryImpl::dependent_order)`, the C++
-`TypeFactory::dependentOrder`/`orderRecurse` port: a postorder DFS over each
-type's typedef base (`get_typedef`) then its component sub-types
-(`get_depend`), marked on `Rc` identity so a pointer cycle
+**Ownership, completion and readiness.** Generation-owned nodes contain only
+non-owning `TypeId` dependencies; external `TypeRoot`s retain their generation.
+Core roots retain the immutable core directly, not an unrelated active
+generation. A flush freezes and replaces the active generation, leaving old
+roots coherent until the final root drops. Self/mutual structure and callable
+cycles therefore do not create reference-count cycles.
+
+`root.read()` holds a `ReadView`; field, name, kind and logical-prototype
+accessors borrow data under that guard without allocating datatype snapshots.
+Exact nominal lookup preserves alias presentation; `effective()` or
+`resolve_alias` explicitly follows semantic targets. Private write commits
+never invoke readers or external callbacks. Callers release read guards before
+synthesizing types; a semantic write under an existing guard reports Busy.
+A flush follows the same rule, including views of core types or retained retired
+generations. It checks the active and shared core stores before sealing or
+replacing a generation. A refused flush leaves the current generation writable
+and its ABI cache intact; after the guard drops, retry can retire it normally.
+
+Reservation distinguishes Opaque, Loading, Failed, Pending and Complete.
+An explicitly incomplete aggregate may expose its declared size and alignment
+while remaining Pending. Its width alone does not make by-value ABI layout
+ready; pointers remain usable, while aliases, arrays and by-value parents wait
+for a valid body. Completing that body updates the same identity and its
+affected dependencies.
+Failed declarations are hidden from successful name/host lookup, while an
+explicit reservation retry retains the original identity. Anonymous array
+shapes may be Pending on their element layout, allowing a pointer to break a
+recursive array/record layout cycle without changing the array's identity.
+Completion stages validation and metadata for the reverse-dependency affected
+closure, not a whole-graph clone or rescan. This includes derived instance keys
+of already-Complete aliases: a completed alias body does not imply finalized
+target metadata. Key collisions are checked before publishing any affected
+body, dependency or index update. A valid child that exposes an invalid
+pending parent is not poisoned: the parent can be explicitly corrected and
+the child retried. Finalized nominal bodies remain immutable; inferred changes
+publish distinct revisions and selectively retire their lookup/dependent
+indices while retained old roots remain readable. Retired identities reject
+further mutation and are excluded from dependency-driven metadata updates,
+including revisions that were Pending when retired. Pointer storage can be
+ready before pointee metadata, and a callable's logical shape can be complete
+before its required by-value layouts permit ABI assignment. Failed required
+dependencies propagate errors rather than becoming generic code or a
+successful incomplete layout.
+
+Callable slot validation follows staged alias targets individually. An unbound
+Opaque or Loading alias defers only that slot; it does not hide a known-invalid
+input later in the signature. Completion revalidates affected callables and
+rejects void inputs, callable values and by-value cycles. A deferred logical
+declaration does not permit ABI assignment before its required layouts are ready.
+
+**Presentation exception.** Integer display format is a separate `Cell`
+override, excluded from semantic flags and structural identity. Core and
+active types may change this presentation setting, including while borrowed,
+so existing named-core display commands need not replace roots. This does not
+change edges, layout or logical callable facts. Retired noncore presentation
+is frozen. Variant geometry is not presentation: it is generation-owned,
+identity-keyed semantic metadata whose union and payload edges are also IDs.
+
+The [shared callable/type contract](../ghidra-integration.md#shared-datatype-graph-and-callable-declarations)
+describes the production graph, ABI materialization and frontend boundaries.
+
+Semantic type comparison is not definition-before-use ordering.
+`TypeFactoryImpl::dependent_order` in `dtype_factory.rs` walks the complete
+borrowed graph dependency inventory, including callable, alias, field,
+bitfield, partial/relative/truncation and variant payload edges. It marks graph
+identity so a pointer cycle
 (`struct A { struct B *b; }` / `struct B { struct A *a; }`) terminates with
 each type listed exactly once. Its consumer is emission — chapter
 [09](09-emission.md) §9.7's `doc_type_definitions` walks the list front to
-back — and the two inline unit tests (`dependent_order_nested_struct`,
-`dependent_order_pointer_cycle`) pin both facts: the raw tree order really is
-container-first, and the DFS reorders it.
+back. Nested-dependency tests cover definition order; graph lifetime/completion
+tests separately cover real recursive visibility and reclamation rather than
+mistaking traversal termination for completed identity.
 
 **The data organization.** The factory also carries the target's C scalar
 widths, decoded from the compiler spec's `<data_organization>` by
@@ -161,15 +232,17 @@ exception.
 
 **The wire marshal.** Types cross the ghidra-mode wire in both directions.
 Inbound, registerProgram's `<coretypes>` and per-miss getDataType answers
-decode through `decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+decode through `decompiler/crates/kuna-decomp/src/substrate/dtype_factory.rs
 (decode_core_types, decode_type, find_by_id_or_remote)`. Outbound — the
 Phase-4 `decompileAt` response — every type reference marshals through the
-`Datatype::encodeRef` port (`decompiler/crates/kuna-decomp/src/substrate/dtype.rs
+`Datatype::encodeRef` port (`decompiler/crates/kuna-decomp/src/substrate/dtype_ops.rs
 (Datatype::encode_ref)`): a type with a nonzero id (and non-void metatype)
 travels as the compact `<typeref name id>` — a variable-length base emits the
-size-independent id (`Datatype::hash_size` is reversible, and both
-`get_unsized_id` and `has_same_variable_base` now complete through it) plus
-the instance size — and Java's `PcodeDataTypeManager.decodeDataType` resolves
+unchanged source id plus its instance size. Callback prototypes imply
+variable length even when the incoming header omits that flag. This metadata
+is determined before reservation, not by rewriting the source id afterward.
+A requested typeref size constrains only the fetched root definition, never
+nested fields or callable slots. Java's `PcodeDataTypeManager.decodeDataType` resolves
 the (name,id) pair, which for wire-delivered types originally CAME from Java,
 so the echo is exact by construction. An id-less type (a derived
 pointer/array, an invented unknown) travels as the full `<type>` form
@@ -182,9 +255,9 @@ metatype `enum_int`/`enum_uint` with one `<val>` child per name, a typedef
 collapses to `<def name id>` + the referent's reference, and `PointerRel`
 encodes its pointed-to type in FULL (the one place the C++ does) plus the
 parent by reference and the `<off>` child. The differential guard is the
-decode side itself: `wire_encode_roundtrips_through_decode_type` (same file's
-tests) asserts that whatever `encode_ref` emits, `decode_type` resolves back
-to the *identical interned `Rc`* — the same intern-equality contract §5.1's
+decode side itself: `wire_encode_roundtrips_through_decode_type` in the factory
+tests asserts that whatever `encode_ref` emits, `decode_type` resolves back
+to the same graph `TypeId` — the same intern-equality contract §5.1's
 factory provides in-process.
 
 ## 5.2 Inference
@@ -206,7 +279,11 @@ pass with inference live.
    hard wall — nothing propagates over it). A Varnode covered by a type-locked
    symbol gets the exact byte-slice of the symbol's type
    (`decompiler/crates/kuna-decomp/src/p6_variables/varmap.rs
-   (build_localtype_seed)` → the factory's `get_exact_piece`). Everything else
+   (build_localtype_seed)` → the factory's `get_exact_piece`). Coverage must
+   contain the entire Varnode and be valid at its usepoint: an input parameter's
+   entry-minus-one mapping does not type later writes to the same register.
+   Char-byte refinement uses the same scoped lookup for its locked-type veto.
+   Everything else
    asks its defining op and each reading op for a suggestion
    (`output_type_local` / `input_type_local`, same module) and keeps the most
    specific by `type_order`. The suggestions come from the per-opcode table
@@ -1696,24 +1773,13 @@ between. A record whose types only nearly agree (an unrolling one level deep
 reads the inner node's links as `unsigned long` because they are only passed to
 calls) gets a record of its own with the same offsets: correct, but a second name.
 
-A structure that points at itself cannot be completed first, because its own
-field names it, and completing a structure mints a fresh `Rc`. The ledger
-therefore mints it around its incomplete shell
-(`decompiler/crates/kuna-decomp/src/p5_types/kuna_structsynth/ledger.rs (mint)`):
-`get_type_struct`, a pointer to the shell, then the members. That is the model
-a DWARF `struct node { struct node *next; }` already lives with (chapter 01), and
-it costs the same thing there: a value loaded through the self pointer has a type
-with no members, and every read through it printed as
-`*(long **)((long)v1 + 8)`. For a synthesized structure the shell is resolved.
-Where a `LOAD` or `STORE` value type is a pointer to such a shell, and the
-completed structure of that name is a synthesized one that itself points at that
-exact shell,
-`decompiler/crates/kuna-decomp/src/p5_types/kuna_structsynth.rs (resolve_self_pointer)`
-gives the pointer to the completed structure instead. It is called from the
-propagation edge (`coreaction_infertypes.rs (propagate_load_store)`) and from the
-load and store cast tokens of chapter 09. A DWARF forward declaration, or any
-other incomplete type, is left alone. A node three links down then reads
-`v3->field_0x18`, not `*(uint1 *)&v3[3]`. In the ledger a self pointer is keyed
+A self-pointing structure reserves its identity before its fields are built.
+The ledger (`decompiler/crates/kuna-decomp/src/p5_types/kuna_structsynth/ledger.rs
+(mint)`) obtains that identity with `get_type_struct`, creates the pointer and
+then completes the members. Completion preserves the identity, so propagation
+and LOAD/STORE cast tokens follow the same edge to the completed body without
+a synthesized-type-specific shell repair. DWARF and CLI recursive declarations
+use the same rule. In the ledger a self pointer is keyed
 `SELF` rather than by its pointee's name (`ledger.rs (SELF_KEY)`), so two
 self-pointing layouts of one shape are one record whatever each was going to be
 called. Every other nested pointer is keyed by its pointee, which makes the
@@ -2239,7 +2305,12 @@ from a load and re-express the extractions as sign/zero `PULL` ops
 container so each field renders as its own `ptr->field = …` statement. All
 geometry runs through the endian-aware `bitfield.rs (BitRange)` value type —
 bit numbering is where big/little endian diverge, and getting it wrong scrambles
-adjacent fields. Failure mode: any trace step the transform cannot prove
+adjacent fields. Host bitfield records use a normalized least-significant bit
+within the component storage; the decoded container spans
+`ceil((first + size) / 8)` bytes, including fields that cross a byte boundary.
+The host byte offset and bit index remain unchanged for either endianness,
+and the container must still fit the enclosing structure.
+Failure mode: any trace step the transform cannot prove
 (e.g. a masked value escaping to an op outside the recognized web) declines
 before mutation, leaving the raw shift/mask expressions in the output; the
 type is never consulted speculatively, so untyped code is untouched.

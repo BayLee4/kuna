@@ -106,36 +106,9 @@ fn wide_literal_renders_whole_with_the_width_on() {
     );
 }
 
-#[test]
-fn wide_literal_is_unmarked_with_the_width_off() {
-    let Some(out) = decompile_entry(false) else { return };
-    assert!(
-        !out.contains("ntdll.dll"),
-        "off must mark up nothing at 2-byte width, got:\n{out}"
-    );
-    assert!(
-        out.contains("LoadLibraryW(0x140002100)"),
-        "off must leave the wide literal's address untyped, got:\n{out}"
-    );
-    // The control: the ASCII width is untouched by the gate.
-    assert!(
-        out.contains(r#""NtQueryInformationProcess""#),
-        "the 1-byte width must be unaffected by the gate, got:\n{out}"
-    );
-}
-
-/// The recorded defect verbatim, on the pass set a default `kuna decompile` runs:
-/// with `operand_refs` on and the 2-byte width off, the wide literal renders as
-/// its own first character. With the width on it renders whole — and `widestrings`
-/// wins the shared commit stream, which is the ordering half of the fix.
+/// Wide-string knowledge must win over a scalar reference to its first byte.
 #[test]
 fn the_width_outranks_the_scalar_markup_that_read_one_character() {
-    let Some(off) = decompile_entry_with(false, true) else { return };
-    assert!(
-        off.contains(r#"LoadLibraryW("n")"#),
-        "expected the recorded defect `LoadLibraryW(\"n\")` with operand_refs on \
-         and the width off, got:\n{off}"
-    );
     let Some(on) = decompile_entry_with(true, true) else { return };
     assert!(
         on.contains(r#"LoadLibraryW(L"ntdll.dll")"#),

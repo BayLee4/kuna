@@ -89,34 +89,24 @@ fn exact_address_selection_preserves_nondefault_space() {
     let document = store
         .parse_document(
             br#"<binaryimage arch="8051:BE:16:default:default">
-<bytechunk space="CODE" offset="0x100">22</bytechunk>
-<bytechunk space="INTMEM" offset="0x100">22</bytechunk>
-<symbol space="CODE" offset="0x100" name="code_entry"/>
-<symbol space="INTMEM" offset="0x100" name="intmem_entry"/>
+<bytechunk space="CODE" offset="0x80">22</bytechunk>
+<bytechunk space="INTMEM" offset="0x80">22</bytechunk>
+<symbol space="CODE" offset="0x80" name="code_entry"/>
+<symbol space="INTMEM" offset="0x80" name="intmem_entry"/>
 </binaryimage>"#,
         )
         .expect("parse synthetic multi-space XML");
-    let program = match bootstrap_from_root(&document.get_root().clone(), &specs) {
-        Ok(program) => program,
-        Err(error) => {
-            eprintln!(
-                "verify_entry_selectors: skipping multi-space bootstrap (build `.sla` with make specs): {}",
-                error.explain()
-            );
-            return;
-        }
+    let program = bootstrap_from_root(&document.get_root().clone(), &specs)
+        .expect("valid multi-space fixture must bootstrap");
+    let select = |space_name, expected_name| {
+        let space = program.arch().manage().get_space_by_name(space_name).unwrap();
+        let requested = Address::new(std::rc::Rc::clone(space), 0x80);
+        let selected = program.resolve_address(&requested).expect("mapped address must resolve");
+        assert_eq!(selected.name, expected_name);
+        assert_eq!(selected.addr, requested);
+        selected.addr
     };
-    let intmem = program
-        .arch()
-        .manage()
-        .get_space_by_name("INTMEM")
-        .expect("8051 INTMEM space");
-    let requested = Address::new(std::rc::Rc::clone(intmem), 0x100);
-    let selected = program
-        .resolve_address(&requested)
-        .expect("mapped non-default address must resolve in its parsed space");
-    assert_eq!(selected.name, "intmem_entry");
-    assert_eq!(selected.addr, requested);
+    assert_ne!(select("CODE", "code_entry"), select("INTMEM", "intmem_entry"));
 }
 
 #[test]

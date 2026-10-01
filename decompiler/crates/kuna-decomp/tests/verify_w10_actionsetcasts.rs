@@ -1,11 +1,8 @@
 //! VERIFIER adversarial fences for item `w10-actionsetcasts` (round 1).
 //!
-//! Scope note: this branch lands only the **prerequisite** `Funcdata`
-//! union-field resolution cache (`kuna_decomp::funcdata_union`, C++
-//! `decompiler/cpp/funcdata.cc:915-1115`).  The `ActionSetCasts::apply` body
-//! itself is still a seam stub that returns 0 (no CAST/PTRSUB ops emitted), so
-//! there is no new datatest parity to fence here.  These tests therefore attack
-//! the union-cache accessors at the *edges the porter's own test punted on*:
+//! Exercises the `Funcdata` union-field resolution cache
+//! (`kuna_decomp::funcdata_union`, C++ `decompiler/cpp/funcdata.cc:915-1115`)
+//! with one factory-owned datatype graph shared by the IR and its resolutions:
 //!
 //!   * the `getUnionField` SIZE guard producing a genuine MISS where the edge
 //!     key still HITS (the in-tree test used a tautology there);
@@ -31,7 +28,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeRoot, TypeFactoryImpl, TypeField};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::unionresolve::ResolvedUnion;
@@ -57,32 +54,38 @@ fn build_manager() -> AddrSpaceManager {
     m
 }
 
-fn build_fd() -> Funcdata {
+fn build_fd() -> (Funcdata, Rc<TypeFactoryImpl>) {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
-    let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.setup_sizes(Some(4), 8, 8);
+    let mut arch = ArchContext::new(manage);
+    arch.types = Some(types.clone());
+    let glb = Rc::new(arch);
+    let ram = Clone::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
-    Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
+    (Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap(), types)
 }
 
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
-    Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
+    Clone::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(f: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// A union of (offset, type) fields (C++ `TypeUnion`).
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(f: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    f.intern(u).unwrap()
 }
 
 fn new_op_code(fd: &mut Funcdata, inputs: int4, opc: OpCode, name: &str, off: int4) -> OpId {
@@ -108,9 +111,8 @@ fn new_op_code_flags(
     op
 }
 
-fn resolve_field(u: &Rc<Datatype>, fld: int4) -> ResolvedUnion {
-    let factory = TypeFactoryImpl::new();
-    ResolvedUnion::new_field(Rc::clone(u), fld, &factory).expect("resolve field")
+fn resolve_field(f: &TypeFactoryImpl, u: &TypeRoot, fld: int4) -> ResolvedUnion {
+    ResolvedUnion::new_field(Clone::clone(u), fld, f).expect("resolve field")
 }
 
 // ===========================================================================
@@ -125,14 +127,15 @@ fn resolve_field(u: &Rc<Datatype>, fld: int4) -> ResolvedUnion {
 
 #[test]
 fn w10_get_union_field_size_guard_rejects_but_resolution_still_hits() {
-    let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    // Union of size 8 whose field-0 is a size-4 int.  resolve_field(.,0) ->
+    let (mut fd, types) = build_fd();
+    let f = types.as_ref();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    // Union of size 8 whose field-0 is a size-4 int.  resolve_field(f, .,0) ->
     // resolve dt is the size-4 int field; the union itself is size 8.
-    let u8 = make_union(8, &[(0, Rc::clone(&int4t))]);
+    let u8 = make_union(f, 8, &[(0, Clone::clone(&int4t))]);
     let op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY", 0);
 
-    let res = resolve_field(&u8, 0);
+    let res = resolve_field(f, &u8, 0);
     assert_eq!(res.get_datatype().get_size(), 4, "resolved field dt is size 4");
     assert_eq!(u8.get_size(), 8, "the union being resolved is size 8");
     assert!(fd.set_union_field(&u8, op, 0, res), "unlocked first set");
@@ -159,19 +162,20 @@ fn w10_get_union_field_size_guard_rejects_but_resolution_still_hits() {
 
 #[test]
 fn w10_multiequal_output_edge_does_not_fan_out() {
-    let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, int4t)]);
+    let (mut fd, types) = build_fd();
+    let f = types.as_ref();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let u = make_union(f, 4, &[(0, int4t)]);
 
     let phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x10);
     let r = ram(&fd);
-    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x300), None);
+    let same: VarnodeId = fd.new_varnode(4, &Address::new(Clone::clone(&r), 0x300), None);
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), 0);
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), 1);
 
     // Set on the OUTPUT edge (slot -1): the `slot >= 0` guard is false, so NO
     // fan-out happens to slots 0/1 even though both hold `same`.
-    let res = resolve_field(&u, 0);
+    let res = resolve_field(f, &u, 0);
     assert!(fd.set_union_field(&u, phi, -1, res));
 
     assert!(fd.get_union_resolution(&u, phi, -1).is_some(), "output edge is set");
@@ -194,20 +198,21 @@ fn w10_multiequal_output_edge_does_not_fan_out() {
 
 #[test]
 fn w10_multiequal_fanout_is_op_local() {
-    let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, int4t)]);
+    let (mut fd, types) = build_fd();
+    let f = types.as_ref();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let u = make_union(f, 4, &[(0, int4t)]);
 
     let phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x20);
     let other_phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x28);
     let r = ram(&fd);
-    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x400), None);
+    let same: VarnodeId = fd.new_varnode(4, &Address::new(Clone::clone(&r), 0x400), None);
     for slot in 0..2 {
         fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), slot);
         fd.obank_mut().get_mut(other_phi).unwrap().set_input(Some(same), slot);
     }
 
-    let res = resolve_field(&u, 0);
+    let res = resolve_field(f, &u, 0);
     assert!(fd.set_union_field(&u, phi, 0, res));
 
     // phi's own slots 0 and 1 are populated...
@@ -232,19 +237,20 @@ fn w10_multiequal_fanout_is_op_local() {
 
 #[test]
 fn w10_unlocked_overwrite_changes_field_number() {
-    let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let floatt = base(4, type_metatype::TYPE_FLOAT);
-    let u = make_union(4, &[(0, int4t), (0, floatt)]);
+    let (mut fd, types) = build_fd();
+    let f = types.as_ref();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let floatt = base(f, 4, type_metatype::TYPE_FLOAT);
+    let u = make_union(f, 4, &[(0, int4t), (0, floatt)]);
     let op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY", 0x30);
 
-    let f0 = resolve_field(&u, 0);
+    let f0 = resolve_field(f, &u, 0);
     assert!(fd.set_union_field(&u, op, 0, f0), "first set true");
     assert_eq!(fd.get_union_resolution(&u, op, 0).unwrap().get_field_num(), 0);
 
     // Overwrite with a DIFFERENT field on an UNLOCKED entry: update() returns
     // true, setUnionField returns true, and field number flips to 1.
-    let f1 = resolve_field(&u, 1);
+    let f1 = resolve_field(f, &u, 1);
     assert!(
         fd.set_union_field(&u, op, 0, f1),
         "unlocked overwrite returns true (funcdata.cc:984-987 update()==true arm)"
@@ -257,7 +263,7 @@ fn w10_unlocked_overwrite_changes_field_number() {
 
     // Re-setting the SAME field is a no-op update (update() returns false) but
     // still returns true (not locked) — funcdata.cc:985-986.
-    let f1_again = resolve_field(&u, 1);
+    let f1_again = resolve_field(f, &u, 1);
     assert!(fd.set_union_field(&u, op, 0, f1_again), "no-op same-field set still returns true");
     assert_eq!(fd.get_union_resolution(&u, op, 0).unwrap().get_field_num(), 1);
 }
@@ -270,10 +276,11 @@ fn w10_unlocked_overwrite_changes_field_number() {
 
 #[test]
 fn w10_inherit_marker_rewrites_write_slot_to_zero() {
-    let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let floatt = base(4, type_metatype::TYPE_FLOAT);
-    let u = make_union(4, &[(0, int4t), (0, floatt)]);
+    let (mut fd, types) = build_fd();
+    let f = types.as_ref();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let floatt = base(f, 4, type_metatype::TYPE_FLOAT);
+    let u = make_union(f, 4, &[(0, int4t), (0, floatt)]);
 
     // old_op is a MULTIEQUAL (isMarker() == true); seed its slot-0 read edge.
     // The marker bit must be set explicitly (the seam does not derive it).
@@ -286,7 +293,7 @@ fn w10_inherit_marker_rewrites_write_slot_to_zero() {
         kuna_decomp::op::pcodeop_flags::marker,
     );
     let new_op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY", 0x48);
-    let seed = resolve_field(&u, 1);
+    let seed = resolve_field(f, &u, 1);
     assert!(fd.set_union_field(&u, old_op, 0, seed));
 
     // Inherit onto new_op with slot == -1.  Because old_op is a marker, the slot

@@ -61,6 +61,11 @@
 
 use std::path::PathBuf;
 
+#[path = "common/call_facts.rs"]
+mod call_facts;
+
+use kuna_decomp::funcdata::Funcdata;
+use kuna_num::opcodes::OpCode;
 use kuna_analysis::listing::{Listing, ListingDetail};
 use kuna_console::engine::bootstrap_from_object;
 use kuna_console::ifacedecomp::{execute, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
@@ -121,7 +126,7 @@ fn bootstrap(mode: Mode) -> Option<kuna_console::engine::ConsoleProgram> {
 }
 
 /// Decompile `func` in the already-bootstrapped program and return the captured C.
-fn decompile(prog: kuna_console::engine::ConsoleProgram, func: &str) -> String {
+fn decompile(prog: kuna_console::engine::ConsoleProgram, func: &str) -> (String, Funcdata) {
     let cmds: Vec<String> =
         [format!("load function {func}"), "decompile".into(), "print C".into()].to_vec();
     let count = cmds.len();
@@ -135,7 +140,12 @@ fn decompile(prog: kuna_console::engine::ConsoleProgram, func: &str) -> String {
     for _ in 0..count {
         execute(&mut status);
     }
-    status.optr.clone()
+    let output = status.optr.clone();
+    let data = status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+        .downcast_mut::<IfaceDecompData>().unwrap();
+    let fd = data.fd.take().expect("decompiled function");
+    assert!(fd.kuna_pipeline_failure().is_none());
+    (output, fd)
 }
 
 /// THE PAYOFF: with AIF on, the hidden function — reachable only through the
@@ -167,7 +177,7 @@ fn aif_recovers_function_reachable_only_via_data_path() {
     );
 
     // ...and it is decompilable by name, producing its real body (`x + 64) * 2 + 9`).
-    let body = decompile(on, HIDDEN_FN);
+    let (body, _) = decompile(on, HIDDEN_FN);
     eprintln!("---- {HIDDEN_FN} (AIF on) ----\n{body}");
     assert!(
         body.contains(HIDDEN_FN),
@@ -280,8 +290,7 @@ fn a_text_free_listing_fingerprints_exactly_like_a_text_carrying_one() {
 }
 
 /// The default path is unchanged by AIF: with NO flags the hidden function is not
-/// registered (the deferred Listing build + gap-walk never fire by default). This
-/// is the parity guarantee — default-off ⇒ byte-identical to today.
+/// registered (the deferred Listing build + gap-walk never fire by default).
 #[test]
 fn flags_off_does_not_discover_the_gap_function() {
     let Some(off) = bootstrap(Mode::Off) else {
@@ -294,17 +303,21 @@ fn flags_off_does_not_discover_the_gap_function() {
     // The directly-called handlers are still discovered (entry/CALL reachability),
     // and `main` (0x13c9, the address crt1 hands `__libc_start_main`) still
     // decompiles, with the indirect call unresolved.
-    let main_body = decompile(off, "main");
+    let (main_body, fd) = decompile(off, "main");
     eprintln!("---- main @0x13c9 (AIF off / default) ----\n{main_body}");
-    assert!(
-        main_body.contains("(**(code **)") && main_body.contains("0x3df0"),
-        "default main must still render the call through the 0x3df0 table as an \
-         unresolved (code **) deref:\n{main_body}"
-    );
-    // The hidden function is NOT named in the default main body (the indirect call
-    // resolves to a `(code **)` deref, not a `sub_13ae(` call).
-    assert!(
-        !main_body.contains("sub_13ae("),
-        "default main must NOT resolve the indirect call to sub_13ae():\n{main_body}"
-    );
+    let mut table_calls = 0;
+    for index in 0..fd.num_calls() {
+        let call = fd.get_call_specs(index);
+        assert_ne!(call.get_name(), HIDDEN_FN,
+            "AIF-off must not bind an undiscovered callee");
+        let op = fd.obank().get(call.get_op()).unwrap();
+        if op.code() == OpCode::CPUI_CALLIND
+            && call_facts::target_reads(&fd, op.get_in(0).unwrap(), 0x3df0)
+        {
+            assert!(call.get_entry_address().is_invalid());
+            table_calls += 1;
+        }
+    }
+    assert_eq!(table_calls, 1,
+        "default main must retain its indirect read from the function table:\n{main_body}");
 }

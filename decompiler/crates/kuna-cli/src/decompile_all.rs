@@ -1108,7 +1108,10 @@ pub fn run(argv: &[String]) -> i32 {
                     &run.assertions,
                 )
             } else {
-                render_c(&run.funcs)
+                match render_c(&run.funcs) {
+                    Ok(text) => text,
+                    Err(error) => { eprintln!("error: {error}"); return 1; }
+                }
             };
             report_unstructured_gotos(&run.funcs);
             // A rejected assertion is reported and the run continues (an agent
@@ -3259,6 +3262,7 @@ fn result_json(
     total: Option<usize>,
     assertions: &[kuna_console::assertions::Outcome],
 ) -> Json {
+    let required_callables = kuna_console::project::required_callable_keys(funcs);
     let functions = Json::Array(
         funcs
             .iter()
@@ -3267,7 +3271,7 @@ fn result_json(
                 let line_mappings =
                     Json::Array(f.line_mappings.iter().map(line_mapping_json).collect());
                 let types = Json::Array(f.types.iter().map(type_json).collect());
-                Json::Object(vec![
+                let mut fields = vec![
                     ("name".into(), Json::Str(f.name.clone())),
                     ("address".into(), Json::Number(f.address.to_string())),
                     ("address_hex".into(), Json::Str(format!("0x{:x}", f.address))),
@@ -3299,7 +3303,41 @@ fn result_json(
                     // the composites this function's C names, as records.
                     // Always present, `[]` unless the option is on.
                     ("types".into(), types),
-                ])
+                ];
+                let mut artifacts = f.callable_artifacts.iter()
+                    .filter(|artifact| required_callables.contains(artifact.key.as_str())).peekable();
+                if artifacts.peek().is_some() {
+                    fields.push(("callable_artifacts".into(), Json::Array(artifacts.map(|artifact| {
+                        use kuna_decomp::kuna_callabletransport::CallableDefinition;
+                        let definition = match &artifact.definition {
+                            None => Json::Null,
+                            Some(CallableDefinition::Wrapper(code)) => Json::Object(vec![
+                                ("kind".into(), Json::Str("wrapper".into())),
+                                ("code".into(), Json::Str(code.clone())),
+                            ]),
+                            Some(CallableDefinition::ExistingTarget { space, byte_address }) => Json::Object(vec![
+                                ("kind".into(), Json::Str("existing_target".into())),
+                                ("space".into(), Json::Number(space.to_string())),
+                                ("byte_address".into(), Json::Str(format!("0x{byte_address:x}"))),
+                            ]),
+                            Some(CallableDefinition::BodyProof { provider }) => Json::Object(vec![
+                                ("kind".into(), Json::Str("body_proof".into())),
+                                ("provider".into(), Json::Str(provider.clone())),
+                            ]),
+                        };
+                        Json::Object(vec![
+                            ("key".into(), Json::Str(artifact.key.clone())),
+                            ("declaration".into(), Json::Str(artifact.declaration.clone())),
+                            ("definition".into(), definition),
+                            ("required".into(), Json::Bool(artifact.required)),
+                            ("deferred".into(), Json::Bool(artifact.deferred)),
+                        ])
+                    }).collect())));
+                }
+                if let Some(error) = &f.callable_export_error {
+                    fields.push(("callable_export_error".into(), Json::Str(error.clone())));
+                }
+                Json::Object(fields)
             })
             .collect(),
     );
@@ -3534,6 +3572,8 @@ mod provenance_json_tests {
             object_location: None,
             callee_hints: Vec::new(),
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         };
 

@@ -7,8 +7,8 @@
 //! When a HighVariable needs a storage-independent identity (a \e dynamic
 //! Symbol keyed on a hash of its local data-flow),
 //! [`DynamicHash::unique_hash`](crate::dynamic::DynamicHash::unique_hash)
-//! cycles through hash methods and keeps the first whose same-address collision
-//! list has size `<= maxduplicates` (hard-coded 8 upstream, `dynamic.cc:433`
+//! cycles through hash methods and keeps the smallest same-address collision
+//! list with size `<= maxduplicates` (hard-coded 8 upstream, `dynamic.cc:433`
 //! and `:494`).  On dense, highly-repetitive code -- a fully unrolled AArch64
 //! NEON byte-search loop -- more than 8 structurally identical Varnodes share
 //! the same address with colliding hashes, so every method's collision list
@@ -18,22 +18,14 @@
 //!
 //! ## The option
 //!
-//! The decision is a P0 assertion: `option dynamichashmax on|off`.  Default
-//! `off` = upstream collision budget 8, byte-identical output.  When `on`, the
-//! budget rises to 16 -- large enough to admit a unique hash for these dense
-//! cases while still fitting the existing 3-bit total/position encoding (16 is
-//! the exact ceiling of that range).  `unique_hash` reads the live flag
-//! [`Architecture::dynamic_hash_maxdup_high`](crate::architecture::Architecture).
-//!
-//! ## What this port covers (and the boundary it cannot)
-//!
-//! The whole upstream `kuna_dynamichashmax.cc` IS the option class
-//! `OptionDynamicHashMax::apply`, which parses on/off and writes
-//! `glb->dynamic_hash_maxdup_high`.  This module ports that decision body as
-//! [`DynamicHashMaxOption`].  Wiring a new `ArchOption` subclass into the option
-//! database / console dispatch is a later wave (the `options.rs`/console surface
-//! this pack does not own); the live flag is already threaded through
-//! [`Architecture::dynamic_hash_maxdup_high`].  Noted in the structured losses.
+//! `option dynamichashmax off` selects budget 8; `on` selects 16. The wider
+//! budget permits symbol creation instead of aborting, but only groups of up
+//! to 8 fit the three-bit position/total fields. Groups of 9–16 do not rebind
+//! on the unchanged graph. This is a rendering-versus-rebinding tradeoff, not
+//! an extension of the identity format. Ghidra wire-only symbols always use 8.
+//! Callers resolve the live
+//! [`Architecture::dynamic_hash_maxdup_high`](crate::architecture::Architecture)
+//! flag into the generator's budget.
 
 /// (kuna GH-8467) The dynamic-hash same-address collision budget toggle
 /// (C++ `OptionDynamicHashMax`).

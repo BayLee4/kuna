@@ -2041,11 +2041,11 @@ mod tests {
     };
     use kuna_base::types::int4;
 
-    use crate::dtype::{type_metatype, Datatype};
+    use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
     use crate::varnode::VarnodeBank;
 
-    fn dt(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn dt(types: &TypeFactoryImpl, size: int4) -> TypeRoot {
+        types.get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
     }
 
     /// const(0), unique(1), ram(2, 8-byte addressable).
@@ -2427,16 +2427,17 @@ mod tests {
     #[test]
     fn get_slot_and_input_mutation() {
         let m = build_manager();
+        let types = TypeFactoryImpl::new();
         let mut vbank = VarnodeBank::new(&m, 0).unwrap();
-        let v0 = vbank.create(4, ram(&m, 0x10), dt(4));
-        let v1 = vbank.create(4, ram(&m, 0x20), dt(4));
+        let v0 = vbank.create(4, ram(&m, 0x10), dt(&types, 4));
+        let v1 = vbank.create(4, ram(&m, 0x20), dt(&types, 4));
         let mut op = PcodeOp::new(2, SeqNum::new(ram(&m, 0x100), 0));
         op.set_input(Some(v0), 0);
         op.set_input(Some(v1), 1);
         assert_eq!(op.get_slot(v0), 0);
         assert_eq!(op.get_slot(v1), 1);
         // absent varnode -> numInput (C++ returns i==n, not -1)
-        let vx = vbank.create(4, ram(&m, 0x30), dt(4));
+        let vx = vbank.create(4, ram(&m, 0x30), dt(&types, 4));
         assert_eq!(op.get_slot(vx), 2);
         // removeInput renumbers
         op.remove_input(0);
@@ -2492,9 +2493,10 @@ mod tests {
     #[test]
     fn get_repeat_slot_handles_duplicate_inputs() {
         let m = build_manager();
+        let types = TypeFactoryImpl::new();
         let mut vbank = VarnodeBank::new(&m, 0).unwrap();
-        let v = vbank.create(4, ram(&m, 0x10), dt(4));
-        let w = vbank.create(4, ram(&m, 0x20), dt(4));
+        let v = vbank.create(4, ram(&m, 0x10), dt(&types, 4));
+        let w = vbank.create(4, ram(&m, 0x20), dt(&types, 4));
         // op with v in slots 0 and 2, w in slot 1
         let mut op = PcodeOp::new(3, SeqNum::new(ram(&m, 0x100), 0));
         op.set_input(Some(v), 0);
@@ -2517,13 +2519,14 @@ mod tests {
     #[test]
     fn gather_pieces_single_level_two_leaves() {
         let m = build_manager();
+        let types = TypeFactoryImpl::new();
         let mut vbank = VarnodeBank::new(&m, 0).unwrap();
         let mut obank = PcodeOpBank::new();
 
         // out @ ram:0 (8 bytes), built from hi @ ram:4 (4b) and lo @ ram:0 (4b).
-        let lo = vbank.create(4, ram(&m, 0x0), dt(4));
-        let hi = vbank.create(4, ram(&m, 0x4), dt(4));
-        let out = vbank.create(8, ram(&m, 0x0), dt(8));
+        let lo = vbank.create(4, ram(&m, 0x0), dt(&types, 4));
+        let hi = vbank.create(4, ram(&m, 0x4), dt(&types, 4));
+        let out = vbank.create(8, ram(&m, 0x0), dt(&types, 8));
 
         let pieceop = obank.create_at(2, ram(&m, 0x100));
         {
@@ -2560,10 +2563,11 @@ mod tests {
     #[test]
     fn piece_is_leaf_free_is_leaf() {
         let m = build_manager();
+        let types = TypeFactoryImpl::new();
         let mut vbank = VarnodeBank::new(&m, 0).unwrap();
         let obank = PcodeOpBank::new();
-        let root = vbank.create(8, ram(&m, 0x0), dt(8));
-        let free = vbank.create(4, ram(&m, 0x0), dt(4));
+        let root = vbank.create(8, ram(&m, 0x0), dt(&types, 8));
+        let free = vbank.create(4, ram(&m, 0x0), dt(&types, 4));
         assert!(piece_is_leaf(&obank, &vbank, root, free, 0));
     }
 }

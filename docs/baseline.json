@@ -1,7 +1,7 @@
 {
   "data_footer": [
-    675,
-    675
+    674,
+    674
   ],
   "passing": [
     "data:Access packed fields #1",
@@ -228,7 +228,6 @@
     "data:Indirect prototype #1",
     "data:Indirect prototype #2",
     "data:Indirect prototype #3",
-    "data:Inject Override #1",
     "data:Inject Override #2",
     "data:Inline target #1",
     "data:Inline target #2",

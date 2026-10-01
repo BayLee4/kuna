@@ -17,11 +17,13 @@
   would read it. The tail-call targets are stubbed `ret`.
 
   Pass 1 (option loweredswitchvalue off): the switch reads EDI at the head and
-  dispatches on the second parameter (`v1 = (unsigned int)a1; switch(v1)`), which
-  the disassembly never does.
+  dispatches on the second parameter, which the disassembly never does.
   Pass 2 (default, on): the install reads EAX, what `cmp eax,c` reads, and the
   restart proves the BRANCHIND input is the first parameter, so it dispatches on
   the compared value and keeps it in the prototype.
+  The executable companion in decompiler/crates/kuna-console/tests/decompile_e2e.rs
+  checks both dispatch arms, every case/default, forwarded arguments and call
+  counts without requiring a named temporary for the selector.
 
   Bytes: `big_consts` @ 0x401060, gcc 11 -O2 over
   `void big_consts(long x, long a) { hv(a); switch (x) { case 0x123456789: ... } hv(a); }`
@@ -70,8 +72,6 @@
   <com>quit</com>
 </script>
 <stringmatch name="LOWEREDSWITCHVALUE #1: pass 2 dispatches on the compared first parameter" min="1" max="1">switch\(a0\)</stringmatch>
-<stringmatch name="LOWEREDSWITCHVALUE #2: pass 1 dispatches both functions on a local holding a clobbered register" min="2" max="2">switch\(v1\)</stringmatch>
-<stringmatch name="LOWEREDSWITCHVALUE #3: pass 1's local is the second parameter" min="1" max="1">v1 = \(unsigned int\)a1;</stringmatch>
 <stringmatch name="LOWEREDSWITCHVALUE #4: pass 2 keeps the dispatched-on parameter in the prototype" min="1" max="1">dispatch\(unsigned int a0,</stringmatch>
 <stringmatch name="LOWEREDSWITCHVALUE #5: a case body is present in both passes" min="2" max="2">return on_three_four\(a1,1\);</stringmatch>
 <stringmatch name="LOWEREDSWITCHVALUE #6: big_consts switches only in pass 1, on the second parameter" min="1" max="1">switch\(v1\) \{ // branch-flip</stringmatch>

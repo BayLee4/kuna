@@ -52,7 +52,7 @@ use kuna_num::pcoderaw::VarnodeData;
 use kuna_sleigh::globalcontext::{ContextDatabase, ContextInternal};
 use kuna_sleigh::loadimage::LoadImage;
 use kuna_sleigh::translate::{
-    register_translate_ids, varnode_data_from_storage, AssemblyEmit, PcodeEmit, Translate,
+    register_translate_ids, varnode_data_from_storage, AssemblyEmit, PcodeDecodeContext, PcodeEmit, Translate,
     TranslateBase, TruncationTag, ATTRIB_UNIQBASE, ELEM_SLEIGH,
 };
 
@@ -538,9 +538,12 @@ impl<R: Read, W: Write> Translate for GhidraTranslate<R, W> {
             return Err(KunaError::unimpl(msg, offset));
         }
         let pc = Address::decode(&mut decoder)?;
+        if &pc != baseaddr {
+            return Err(KunaError::decoder("Instruction callback address mismatch"));
+        }
         // The <inst> element is never closed; peek returns 0 at </inst>.
         while decoder.peek_element()? != 0 {
-            emit.decode_op(&pc, &mut decoder)?;
+            emit.decode_op(&pc, &mut decoder, PcodeDecodeContext::HostInstruction)?;
         }
         Ok(offset)
     }
@@ -687,7 +690,7 @@ impl<R: Read, W: Write> EngineTranslate for GhidraTranslate<R, W> {
         }
         let addr = Address::decode(&mut decoder)?;
         while decoder.peek_element()? != 0 {
-            emit.decode_op(&addr, &mut decoder)?;
+            emit.decode_op(&addr, &mut decoder, PcodeDecodeContext::Raw)?;
         }
         decoder.close_element(elem)?;
         Ok(())

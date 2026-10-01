@@ -34,6 +34,10 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd(every_head: bool, exact: bool) -> Funcdata {
     let mut ctx = ArchContext::new(build_manager());
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.lowered_switch_every_head = every_head;
     ctx.lowered_switch_exact = exact;
     let glb = Rc::new(ctx);

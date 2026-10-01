@@ -333,8 +333,9 @@ use kuna_base::types::int4;
 use crate::architecture::Architecture;
 use crate::context::BlockId;
 use crate::funcdata::Funcdata;
-use crate::prettyprint::{Emit, MarkupRef, SyntaxHighlight};
-use crate::printc::{declarator_parts, display_format, to_emit_brace, PrintC};
+use crate::prettyprint::{Emit, MarkupRef, SyntaxHighlight, TypeTextOrigin};
+use crate::printc::{display_format, to_emit_brace, PrintC};
+use crate::kuna_langtypes::TypeText;
 use crate::printlanguage::modifiers;
 
 impl PrintC {
@@ -355,15 +356,14 @@ impl PrintC {
         arch: &Architecture,
         markup: &MarkupRef,
     ) {
-        let display = fd.get_display_name().to_string();
-        let rt = self.rt_ctx;
+        let display = self.emitted_function_name(fd, fd.get_display_name(), fd.get_address(), true);
         let ret_type = if fd.get_func_proto().has_store() {
             fd.get_func_proto()
                 .get_output_type()
-                .map(|t| declarator_parts(t, rt).0)
-                .unwrap_or_else(|| "()".to_string())
+                .map(|t| self.declarator_text(t).0)
+                .unwrap_or_else(|| TypeText::plain("()"))
         } else {
-            "()".to_string()
+            TypeText::plain("()")
         };
 
         // The recovered name is often a demangled Rust path, which is not an
@@ -400,12 +400,12 @@ impl PrintC {
         self.emit_prototype_inputs_rust(fd, arch, markup);
         self.emit.close_paren(")", id2);
         self.emit.close_group(id1g);
-        if ret_type != "()" {
+        if ret_type.text != "()" {
             self.emit.spaces(1, 0);
             self.emit.print("->", SyntaxHighlight::NoColor);
             self.emit.spaces(1, 0);
             let idret = self.emit.begin_return_type(markup);
-            self.emit.tag_type(&ret_type, SyntaxHighlight::TypeColor, markup);
+            self.emit_type_text(ret_type, markup, TypeTextOrigin::Type);
             self.emit.end_return_type(idret);
         }
         self.emit.end_func_proto(idp);
@@ -443,15 +443,15 @@ impl PrintC {
                 name = default_name.as_str();
             }
             let ty = match param.get_type() {
-                Some(ty) => declarator_parts(ty, self.rt_ctx).0,
-                None => "()".to_string(),
+                Some(ty) => self.declarator_text(ty).0,
+                None => TypeText::plain("()"),
             };
             self.emit.print("mut", SyntaxHighlight::KeywordColor);
             self.emit.spaces(1, 0);
             self.emit.tag_variable(name, SyntaxHighlight::VarColor, markup);
             self.emit.print(":", SyntaxHighlight::NoColor);
             self.emit.spaces(1, 0);
-            self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+            self.emit_type_text(ty, markup, TypeTextOrigin::Type);
         }
         if proto.is_dotdotdot() {
             if sz != 0 {
@@ -565,7 +565,7 @@ impl PrintC {
     pub(crate) fn emit_var_decl_rust(
         &mut self,
         name: &str,
-        decl_type: &str,
+        mut decl_type: TypeText,
         array_count: Option<i32>,
         markup: &MarkupRef,
     ) {
@@ -576,10 +576,14 @@ impl PrintC {
         self.emit.spaces(1, 0);
         match array_count {
             Some(n) => {
-                let ty = format!("[{decl_type}; {n}]");
-                self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+                decl_type.text = format!("[{}; {n}]", decl_type.text);
+                for span in &mut decl_type.spans {
+                    span.start += 1;
+                    span.end += 1;
+                }
+                self.emit_type_text(decl_type, markup, TypeTextOrigin::Type);
             }
-            None => self.emit.tag_type(decl_type, SyntaxHighlight::TypeColor, markup),
+            None => self.emit_type_text(decl_type, markup, TypeTextOrigin::Type),
         }
     }
 }

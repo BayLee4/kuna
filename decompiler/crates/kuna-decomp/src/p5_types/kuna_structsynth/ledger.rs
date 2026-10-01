@@ -61,9 +61,9 @@
 //!
 //! When the containment runs the other way -- the new layout strictly contains
 //! one already minted -- the minted one cannot be widened, because
-//! `TypeFactory::find_add` refuses a second, different definition of a name it
-//! already holds and a completed structure is shared by every function that
-//! took a pointer to it. So the new layout is minted under a fresh name and the
+//! completed graph definitions are immutable and shared by every function that
+//! took a pointer to them. So the new layout is minted as an explicitly inferred
+//! revision under a fresh name and the
 //! older one is SUPERSEDED: still defined, and handed out again only to a
 //! layout no live structure answers for.
 //!
@@ -101,10 +101,11 @@
 //! structure it sits in, whose number a layout measured in another function
 //! cannot know in advance, and two self-pointing layouts of the same shape are
 //! the same record whatever they are called. A structure holding such a field is
-//! minted around its own incomplete shell -- `get_type_struct`, a pointer to the
-//! shell, then the members -- since a completed structure is a fresh `Rc` and
-//! cannot hold a pointer to itself. The pointer keeps naming the shell, which is
-//! the model a DWARF `struct node { struct node *next; }` already lives with.
+//! reserved with `reserve_inferred`, then its self pointers are wired to that
+//! same graph ID before its members are completed. Completion preserves the
+//! identity seen by every pointer. Fields and pointer edges store IDs, not
+//! owning roots, so recursive records introduce no owning backedges. Retiring
+//! an inferred revision removes lookup entries without changing retained roots.
 //!
 //! # Order
 //!
@@ -123,11 +124,9 @@
 //! own shape. Either way the record has two names, and which one `fa` gets
 //! depends on the order.
 
-use std::rc::Rc;
-
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeField};
+use crate::dtype::{type_metatype, ReadView, TypeFactory, TypeField, TypeId, TypeRef, TypeRoot};
 
 /// The highest `struct_N` the ledger will probe.
 pub(super) const MAX_LEDGER_SLOTS: u32 = 1024;
@@ -135,9 +134,8 @@ pub(super) const MAX_LEDGER_SLOTS: u32 = 1024;
 /// How far a pointer chain is followed when a field type is spelled.
 const MAX_POINTEE_DEPTH: u32 = 3;
 
-/// The prefix every synthesized member carries, and the guard that keeps a
-/// same-named type from somewhere else (DWARF, a parsed header) out of the
-/// ledger.
+/// The prefix every synthesized member carries. The graph's inferred marker
+/// separately keeps authoritative same-named types out of the ledger.
 const FIELD_PREFIX: &str = "field_0x";
 
 /// How a field that points at its own structure is spelled in a [`FieldKey`].
@@ -225,11 +223,12 @@ pub(crate) struct FieldKey {
 /// A pointer type has no name of its own, so comparing names alone makes every
 /// `T **` the same field; the chain is followed instead, to the depth
 /// `structsynth` can produce.
-fn type_key(ct: &Datatype) -> String {
+fn type_key(view: &ReadView<'_>, ct: TypeRef<'_>) -> String {
     let mut key = format!("{:?}:{}:{}", ct.get_metatype(), ct.get_size(), ct.get_name());
     let mut next = ct.get_ptr_to();
     for _ in 0..MAX_POINTEE_DEPTH {
-        let Some(p) = next else { break };
+        let Some(id) = next else { break };
+        let p = view.get(id).expect("pointer edge belongs to the type graph");
         key.push_str(&format!(">{:?}:{}:{}", p.get_metatype(), p.get_size(), p.get_name()));
         next = p.get_ptr_to();
     }
@@ -324,11 +323,12 @@ impl Layout {
 }
 
 /// Does this pointer chain end in code, `void` or an undefined type?
-fn opaque_pointee(ct: &Datatype) -> bool {
+fn opaque_pointee(view: &ReadView<'_>, ct: TypeRef<'_>) -> bool {
     let mut next = ct.get_ptr_to();
     let mut last = None;
     for _ in 0..MAX_POINTEE_DEPTH {
-        let Some(p) = next else { break };
+        let Some(id) = next else { break };
+        let p = view.get(id).expect("pointer edge belongs to the type graph");
         next = p.get_ptr_to();
         last = Some(p);
     }
@@ -345,24 +345,25 @@ fn self_key(offset: int4, width: int4) -> FieldKey {
     FieldKey { offset, width, ty: SELF_KEY.to_string(), pointer: true, opaque: false }
 }
 
-/// Does this field point at the structure named `owner`?
-fn points_at(f: &TypeField, owner: &str) -> bool {
-    f.field_type.get_ptr_to().is_some_and(|p| {
-        p.get_metatype() == type_metatype::TYPE_STRUCT && !owner.is_empty() && p.get_name() == owner
-    })
+/// Does this field point at the exact graph node holding it?
+fn points_at(view: &ReadView<'_>, f: &TypeField, owner: TypeId) -> bool {
+    view.get(f.field_type)
+        .expect("field edge belongs to the type graph")
+        .get_ptr_to() == Some(owner)
 }
 
 /// The key of one field of a completed structure, or `None` for a filler member.
-fn key_of(f: &TypeField) -> Option<FieldKey> {
-    if f.field_type.get_metatype() == type_metatype::TYPE_ARRAY {
+fn key_of(view: &ReadView<'_>, f: &TypeField) -> Option<FieldKey> {
+    let ct = view.get(f.field_type).expect("field edge belongs to the type graph");
+    if ct.get_metatype() == type_metatype::TYPE_ARRAY {
         return None;
     }
-    let is_ptr = f.field_type.get_ptr_to().is_some();
-    let opaque = is_ptr && opaque_pointee(&f.field_type);
+    let is_ptr = ct.get_ptr_to().is_some();
+    let opaque = is_ptr && opaque_pointee(view, ct);
     Some(FieldKey {
         offset: f.offset,
-        width: f.field_type.get_size(),
-        ty: type_key(&f.field_type),
+        width: ct.get_size(),
+        ty: type_key(view, ct),
         pointer: is_ptr && !opaque,
         opaque,
     })
@@ -375,7 +376,9 @@ fn key_of(f: &TypeField) -> Option<FieldKey> {
 /// member named anything else says the name `struct_N` is held by a type that
 /// came from somewhere else -- a DWARF record, a parsed header -- and such a
 /// type is never handed out as the answer to an access pattern.
-pub(crate) fn layout_of(ct: &Datatype) -> Option<Layout> {
+pub(crate) fn layout_of(root: &TypeRoot) -> Option<Layout> {
+    let view = root.read();
+    let ct = view.get(root.id()).ok()?;
     if ct.get_metatype() != type_metatype::TYPE_STRUCT {
         return None;
     }
@@ -385,9 +388,9 @@ pub(crate) fn layout_of(ct: &Datatype) -> Option<Layout> {
         if !f.name.starts_with(FIELD_PREFIX) {
             return None;
         }
-        if points_at(f, ct.get_name()) {
-            fields.push(self_key(f.offset, f.field_type.get_size()));
-        } else if let Some(k) = key_of(f) {
+        if points_at(&view, f, root.id()) {
+            fields.push(self_key(f.offset, view.get(f.field_type).ok()?.get_size()));
+        } else if let Some(k) = key_of(&view, f) {
             fields.push(k);
         }
     }
@@ -396,16 +399,29 @@ pub(crate) fn layout_of(ct: &Datatype) -> Option<Layout> {
 
 /// The same reading for a field list that has not been completed yet, the
 /// fields at `selfs` pointing at the structure they will belong to.
-pub(crate) fn layout_of_fields(fields: &[TypeField], size: int4, selfs: &[int4]) -> Layout {
-    Layout { size, fields: fields.iter().filter_map(|f| field_key(f, selfs)).collect() }
+pub(crate) fn layout_of_fields(
+    types: &dyn TypeFactory,
+    fields: &[TypeField],
+    size: int4,
+    selfs: &[int4],
+) -> Layout {
+    Layout {
+        size,
+        fields: fields.iter().filter_map(|f| {
+            let root = types.root(f.field_type).expect("draft field belongs to the type factory");
+            let view = root.read();
+            field_key(&view, f, selfs)
+        }).collect(),
+    }
 }
 
 /// [`key_of`], with a field at one of `selfs` spelled as a self pointer.
-fn field_key(f: &TypeField, selfs: &[int4]) -> Option<FieldKey> {
+fn field_key(view: &ReadView<'_>, f: &TypeField, selfs: &[int4]) -> Option<FieldKey> {
     if selfs.contains(&f.offset) {
-        return Some(self_key(f.offset, f.field_type.get_size()));
+        let ct = view.get(f.field_type).expect("field edge belongs to the type graph");
+        return Some(self_key(f.offset, ct.get_size()));
     }
-    key_of(f)
+    key_of(view, f)
 }
 
 /// One member of a structure as a body sees it: where it starts, how many bytes
@@ -421,23 +437,33 @@ pub(crate) struct Member {
 }
 
 impl Member {
-    pub(super) fn of(f: &TypeField) -> Member {
-        Member::of_with(f, &[])
+    pub(super) fn of(types: &dyn TypeFactory, f: &TypeField) -> Member {
+        Member::of_with(types, f, &[])
     }
 
     /// [`Member::of`], with a field at one of `selfs` claimed as a self pointer.
-    pub(crate) fn of_with(f: &TypeField, selfs: &[int4]) -> Member {
-        Member { offset: f.offset, size: f.field_type.get_size(), claim: field_key(f, selfs) }
+    pub(crate) fn of_with(types: &dyn TypeFactory, f: &TypeField, selfs: &[int4]) -> Member {
+        let root = types.root(f.field_type).expect("draft field belongs to the type factory");
+        let view = root.read();
+        let ct = view.get(f.field_type).expect("field edge belongs to the type graph");
+        Member { offset: f.offset, size: ct.get_size(), claim: field_key(&view, f, selfs) }
     }
 }
 
 /// Every member of a completed structure, filler included.
-pub(super) fn members_of(ct: &Datatype) -> Vec<Member> {
+pub(super) fn members_of(root: &TypeRoot) -> Vec<Member> {
+    let view = root.read();
+    let ct = view.get(root.id()).expect("root belongs to the type graph");
     (0..ct.num_depend())
         .filter_map(|i| ct.get_field(i))
         .map(|f| {
-            let own = if points_at(f, ct.get_name()) { vec![f.offset] } else { Vec::new() };
-            Member::of_with(f, &own)
+            let size = view.get(f.field_type).expect("field edge belongs to the type graph").get_size();
+            let claim = if points_at(&view, f, root.id()) {
+                Some(self_key(f.offset, size))
+            } else {
+                key_of(&view, f)
+            };
+            Member { offset: f.offset, size, claim }
         })
         .collect()
 }
@@ -461,7 +487,7 @@ pub(crate) fn keeps_unclaimed(held: &[Member], own: &[Member], unclaimed: &[(int
 /// One minted entry.
 struct Entry {
     /// The completed type.
-    ct: Rc<Datatype>,
+    ct: TypeRoot,
     /// Its claimed layout.
     layout: Layout,
 }
@@ -487,7 +513,7 @@ fn entries(
                 break;
             }
             Ok(Some(t)) => {
-                if !sizes.contains(&i64::from(t.get_size())) {
+                if !t.is_inferred() || !sizes.contains(&i64::from(t.get_size())) {
                     continue;
                 }
                 if let Some(layout) = layout_of(&t) {
@@ -553,11 +579,10 @@ pub(super) fn lookup_window(size: int4) -> std::ops::RangeInclusive<i64> {
 /// members over those bytes ([`keeps_unclaimed`]).
 ///
 /// `selfs` are the offsets of the fields that point at the structure itself;
-/// minting one around its shell is [`mint`].
+/// reserving and completing its stable graph identity is [`mint`].
 ///
-/// `find_add` rejects a second, different definition of a held name with a hard
-/// `Err`, so the mint declines rather than propagating and the caller keeps the
-/// parameter untyped.
+/// A failed reservation or completion declines rather than propagating and the
+/// caller keeps the parameter untyped.
 pub(crate) fn lookup_or_mint(
     types: &dyn TypeFactory,
     fields: Vec<TypeField>,
@@ -565,14 +590,14 @@ pub(crate) fn lookup_or_mint(
     unclaimed: &[(int4, int4)],
     selfs: &[int4],
     merge: crate::kuna_structmerge::StructMergeMode,
-) -> Option<Rc<Datatype>> {
-    let want = layout_of_fields(&fields, size, selfs);
+) -> Option<TypeRoot> {
+    let want = layout_of_fields(types, &fields, size, selfs);
     let (held, free) = entries(types, lookup_window(size));
     let layouts: Vec<&Layout> = held.iter().map(|e| &e.layout).collect();
-    let own: Vec<Member> = fields.iter().map(|f| Member::of_with(f, selfs)).collect();
+    let own: Vec<Member> = fields.iter().map(|f| Member::of_with(types, f, selfs)).collect();
     let fits = |i: usize| unclaimed.is_empty() || keeps_unclaimed(&members_of(&held[i].ct), &own, unclaimed);
     if let Some(i) = best_of(&layouts, &want, fits) {
-        return Some(Rc::clone(&held[i].ct));
+        return Some(held[i].ct.clone());
     }
     let free = free?;
     // Nothing held answers for this layout. Under `structmerge` a held
@@ -581,7 +606,7 @@ pub(crate) fn lookup_or_mint(
     // the convergence sweep moves its readers onto it.
     if merge.fires() {
         let (wide, _) = entries(types, merge_window(size));
-        let pairs: Vec<(Rc<Datatype>, Layout)> =
+        let pairs: Vec<(TypeRoot, Layout)> =
             wide.into_iter().map(|e| (e.ct, e.layout)).collect();
         if let Some((mfields, msize, mselfs)) =
             crate::kuna_structmerge::merge(types, &pairs, &want, &fields, size, selfs, unclaimed)
@@ -613,25 +638,31 @@ fn merge_window(size: int4) -> std::ops::RangeInclusive<i64> {
 }
 
 /// Complete `struct <name>` from `fields`, the fields at `selfs` retyped as a
-/// pointer to the structure itself. A completed structure is a fresh `Rc`, so
-/// such a pointer names the incomplete shell the members are installed on.
+/// pointer to the structure itself. Reservation and completion use the same
+/// inferred graph node; pointer edges contain its ID rather than an owning root.
 pub(super) fn mint(
     types: &dyn TypeFactory,
     name: &str,
     mut fields: Vec<TypeField>,
     size: int4,
     selfs: &[int4],
-) -> Option<Rc<Datatype>> {
-    let shell = types.get_type_struct(name).ok()?;
+) -> Option<TypeRoot> {
+    let shell = types.reserve_inferred(name, 0, type_metatype::TYPE_STRUCT).ok()?;
     for f in fields.iter_mut().filter(|f| selfs.contains(&f.offset)) {
-        f.field_type = types.get_type_pointer(f.field_type.get_size(), Rc::clone(&shell), 1).ok()?;
+        let width = types.root(f.field_type).ok()?.get_size();
+        f.field_type = types.get_type_pointer(width, shell.clone(), 1).ok()?.id();
     }
     types.set_fields_struct_raw(&shell, fields, Vec::new(), size, 1, 0).ok()
 }
 
 /// The number `N` of a structure this pass minted, or `None` for any other type.
-pub(super) fn minted_number(ct: &Datatype) -> Option<u32> {
-    let n = ct.get_name().strip_prefix("struct_")?;
+pub(super) fn minted_number(ct: &TypeRoot) -> Option<u32> {
+    if !ct.is_inferred() {
+        return None;
+    }
+    let view = ct.read();
+    let node = view.get(ct.id()).ok()?;
+    let n = node.get_name().strip_prefix("struct_")?;
     if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) || layout_of(ct).is_none() {
         return None;
     }
@@ -652,8 +683,8 @@ pub(super) fn minted_number(ct: &Datatype) -> Option<u32> {
 /// declarations already name -- and nothing holds one by value, so it may be
 /// defined anywhere after the forward declarations; after everything else, in
 /// ascending `N`, is the same place every run and in every process.
-pub fn in_name_order(order: Vec<Rc<Datatype>>) -> Vec<Rc<Datatype>> {
-    let (mut minted, mut rest): (Vec<Rc<Datatype>>, Vec<Rc<Datatype>>) =
+pub fn in_name_order(order: Vec<TypeRoot>) -> Vec<TypeRoot> {
+    let (mut minted, mut rest): (Vec<TypeRoot>, Vec<TypeRoot>) =
         order.into_iter().partition(|ct| minted_number(ct).is_some());
     minted.sort_by_key(|ct| minted_number(ct));
     rest.append(&mut minted);
@@ -670,13 +701,78 @@ pub fn superseded_names(types: &dyn TypeFactory) -> Vec<String> {
     let layouts: Vec<&Layout> = held.iter().map(|e| &e.layout).collect();
     (0..held.len())
         .filter(|&i| is_superseded(&layouts, i))
-        .map(|i| held[i].ct.get_name().to_string())
+        .map(|i| {
+            let root = &held[i].ct;
+            let view = root.read();
+            view.get(root.id()).expect("root belongs to the type graph").get_name().to_string()
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authoritative_same_shape_is_not_an_inferred_ledger_entry() {
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let word = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let fields = vec![TypeField::new(0, 0, "field_0x0", word.id())];
+        let authority = types.get_type_struct("struct_0").unwrap();
+        let authority = types
+            .set_fields_struct_raw(&authority, fields.clone(), Vec::new(), 8, 1, 0)
+            .unwrap();
+        assert_eq!(minted_number(&authority), None);
+        let inferred = lookup_or_mint(
+            &types,
+            fields,
+            8,
+            &[],
+            &[],
+            crate::kuna_structmerge::StructMergeMode::Off,
+        ).unwrap();
+        assert_ne!(inferred.id(), authority.id());
+        assert_eq!(minted_number(&inferred), Some(1));
+        assert_eq!(layout_of(&inferred), layout_of(&authority));
+        assert_eq!(types.find_by_name("struct_0").unwrap(), Some(authority));
+    }
+
+    #[test]
+    fn retired_recursive_revision_keeps_its_identity_and_definition() {
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let word = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let pointer = types.get_type_pointer(8, word.clone(), 1).unwrap();
+        let fields = vec![TypeField::new(0, 0, "field_0x0", pointer.id())];
+        let old = mint(&types, "struct_0", fields.clone(), 8, &[0]).unwrap();
+        let old_pointer = {
+            let view = old.read();
+            let node = view.get(old.id()).unwrap();
+            let field = node.get_field(0).unwrap();
+            let pointer = field.field_type;
+            assert_eq!(view.get(pointer).unwrap().get_ptr_to(), Some(old.id()));
+            pointer
+        };
+        types.retire_inferred(&[old.clone()]).unwrap();
+        let mut wider = fields;
+        wider.push(TypeField::new(1, 8, "field_0x8", word.id()));
+        let new = mint(&types, "struct_0", wider, 16, &[0]).unwrap();
+        assert_ne!(old.id(), new.id());
+        assert_eq!(layout_of(&old), Some(layout(8, vec![self_key(0, 8)])));
+        assert_eq!(new.get_size(), 16);
+        assert_eq!(new.num_depend(), 2);
+        let view = new.read();
+        let new_node = view.get(new.id()).unwrap();
+        let new_field = new_node.get_field(0).unwrap();
+        assert!(points_at(&view, new_field, new.id()));
+        assert!(!points_at(&view, new_field, old.id()));
+        assert_eq!(view.get(old_pointer).unwrap().get_ptr_to(), Some(old.id()));
+        assert_eq!(minted_number(&old), Some(0));
+        assert_eq!(minted_number(&new), Some(0));
+    }
 
     /// A claimed scalar field.
     fn f(offset: int4, width: int4, meta: type_metatype) -> FieldKey {

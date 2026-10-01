@@ -203,15 +203,6 @@ fn rule_gate_on_without_symbol_declines() {
     assert_eq!(rule.apply_op(op, &mut fd), 0);
 }
 
-/// The rule matches on CPUI_COPY and clone-filters by group.
-#[test]
-fn rule_oplist_and_clone() {
-    let rule = RuleRodataStringCopy::new(true);
-    assert_eq!(rule.get_op_list(), vec![OpCode::CPUI_COPY]);
-    assert!(rule.clone_rule(&ActionGroupList::from_names(["analysis"])).is_some());
-    assert!(rule.clone_rule(&ActionGroupList::from_names(["other"])).is_none());
-}
-
 // --- option parse -----------------------------------------------------------
 
 #[test]
@@ -241,14 +232,3 @@ fn parse_garbage_is_error() {
     assert!(parse_rodata_string_form("maybe").is_err());
 }
 
-// --- specs ------------------------------------------------------------------
-
-#[test]
-fn specs_ship_default_on() {
-    let s = specs();
-    assert_eq!(s.len(), 1);
-    assert_eq!(s[0].group, "analysis");
-    let rule = (s[0].ctor)();
-    assert_eq!(rule.get_op_list(), vec![OpCode::CPUI_COPY]);
-    assert!(rule.clone_rule(&ActionGroupList::from_names(["analysis"])).is_some());
-}

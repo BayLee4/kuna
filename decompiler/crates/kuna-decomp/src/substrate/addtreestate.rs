@@ -22,14 +22,12 @@
 //! not part of the transform); those are STUB-noted no-ops, only reachable on a
 //! distribution failure that does not occur on the targeted corpus.
 
-use std::rc::Rc;
-
 use kuna_base::address::{calc_mask, sign_extend, uintb_negate};
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, uint4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 
@@ -48,11 +46,11 @@ pub struct AddTreeState<'a> {
     /// The pointer Varnode (C++ `ptr`).
     ptr: VarnodeId,
     /// The pointer's data-type (C++ `ct`, a TypePointer).
-    ct: Rc<Datatype>,
+    ct: TypeRoot,
     /// The base data-type pointed to (C++ `baseType`).
-    base_type: Rc<Datatype>,
+    base_type: TypeRoot,
     /// Non-null when `ct` is a formal relative pointer (C++ `pRelType`).
-    p_rel_type: Option<Rc<Datatype>>,
+    p_rel_type: Option<TypeRoot>,
     /// Size of the pointer Varnode in bytes (C++ `ptrsize`).
     ptrsize: int4,
     /// Mask covering the pointer's bytes (C++ `ptrmask`).
@@ -103,9 +101,9 @@ impl<'a> AddTreeState<'a> {
         let ptrmask = calc_mask(ptrsize);
         let mut base_type = ct.get_ptr_to()?;
         let mut nonmultsum: uintb = 0;
-        let mut p_rel_type: Option<Rc<Datatype>> = None;
+        let mut p_rel_type: Option<TypeRoot> = None;
         if ct.is_formal_pointer_rel() {
-            p_rel_type = Some(Rc::clone(&ct));
+            p_rel_type = Some(ct.clone());
             base_type = ct.get_rel_parent()?;
             nonmultsum = (ct.get_address_offset()? as uintb) & ptrmask;
         }
@@ -227,7 +225,7 @@ impl<'a> AddTreeState<'a> {
     /// `Datatype` method cannot reach — see [`ScopeLocal::spacebase_get_sub_type`]).
     /// Returns `(Some(type), newoff)`; for a spacebase the type is always non-null
     /// (C++ falls back to `TYPE_UNKNOWN(1)`), matching `hasMatchingSubType`.
-    fn base_get_sub_type(&self, off: int8) -> (Option<Rc<Datatype>>, int8) {
+    fn base_get_sub_type(&self, off: int8) -> (Option<TypeRoot>, int8) {
         if self.base_type.get_metatype() == type_metatype::TYPE_SPACEBASE {
             if let (Some(lm), Some(types)) =
                 (self.data.get_scope_local(), self.data.get_arch().types_rc())
@@ -725,7 +723,7 @@ impl<'a> AddTreeState<'a> {
             // When ptr's type needs union resolution: hold off resolving
             // before indexing (forceFacingType) when ptrto size == base size,
             // else inheritUnionField.
-            let ptr_ty = Rc::clone(self.data.vbank().get(self.ptr).expect("build_tree: stale ptr").get_type());
+            let ptr_ty = self.data.vbank().get(self.ptr).expect("build_tree: stale ptr").get_type().clone();
             if ptr_ty.needs_resolution() {
                 let ptrto_size = ptr_ty.get_ptr_to().map(|p| p.get_size());
                 if ptrto_size == Some(self.base_type.get_size()) {
@@ -753,9 +751,8 @@ impl<'a> AddTreeState<'a> {
                 off_const,
                 None,
             );
-            let mult_ty = Rc::clone(
-                self.data.vbank().get(mult_node).expect("build_tree: stale multNode").get_type(),
-            );
+            let mult_ty = self.data.vbank().get(mult_node)
+                .expect("build_tree: stale multNode").get_type().clone();
             if mult_ty.needs_resolution() {
                 self.data.inherit_union_field(&mult_ty, op, 0, self.base_op, self.base_slot);
             }

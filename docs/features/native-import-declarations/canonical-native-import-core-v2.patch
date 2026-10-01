@@ -1,0 +1,389 @@
+--- a/decompiler/crates/kuna-decomp/src/p0_knowledge/mod.rs
++++ b/decompiler/crates/kuna-decomp/src/p0_knowledge/mod.rs
+@@ -29,6 +29,7 @@
+ // (kuna) Named libc/POSIX aggregate types in the prototype tables option gate
+ // (load-time, env-bridged).
+ pub mod kuna_libctypes;
++pub mod kuna_nativeimport;
+ // (kuna) DWARF variant-part (discriminated-union) import option gate
+ // (load-time, env-bridged) plus the recovered-layout side table.
+ pub mod kuna_dwarfvariants;
+--- a/decompiler/crates/kuna-decomp/src/substrate/context.rs
++++ b/decompiler/crates/kuna-decomp/src/substrate/context.rs
+@@ -1494,6 +1494,8 @@
+     /// `callee_protos` snapshots.  `None` on the standalone path, which stays
+     /// byte-identical.
+     pub remote_scope: Option<Rc<crate::remote_provider::RemoteScope>>,
++    /// Exact loader-owned imported entry identities, never by-name model hints.
++    pub native_imports: Rc<std::collections::BTreeMap<(i32, u64), Rc<crate::kuna_nativeimport::NativeImportIdentity>>>,
+     /// Infer pointers from likely-address constants (C++ `glb->infer_pointers`),
+     /// shared from the real [`crate::architecture::Architecture`] through
+     /// `build_arch_handle`.  Read by [`ActionConstantPtr`](crate::coreaction_render::
+@@ -1778,6 +1780,7 @@
+                 | crate::options::split_datatype::OPTION_POINTER,
+             global_query: None,
+             remote_scope: None,
++            native_imports: Default::default(),
+             // C++ Architecture default: infer_pointers = true (resetDefaults);
+             // a hand-built fixture never exercises constant-pointer recovery, but
+             // the real lift+analyze path overwrites this from the real arch.
+@@ -2222,6 +2225,12 @@
+             symbol_offset: e.symbol_offset,
+             symbol_id: e.symbol_id,
+         })
++    }
++
++    /// Exact imported provider at an entry, never a name-based prototype hint.
++    pub fn native_import_at(&self, entry: &Address) -> Option<Rc<crate::kuna_nativeimport::NativeImportIdentity>> {
++        if let Some(remote) = &self.remote_scope { return remote.native_import_at(entry); }
++        self.native_imports.get(&(entry.get_space()?.get_index(), entry.get_offset())).cloned()
+     }
+ 
+     /// C++ `data.getScopeLocal()->getParent()->queryFunction(entry)->getFuncProto()`
+--- a/decompiler/crates/kuna-decomp/src/infra/architecture.rs
++++ b/decompiler/crates/kuna-decomp/src/infra/architecture.rs
+@@ -2038,6 +2038,8 @@
+     /// `ArchContext` by `build_arch_handle` and consulted by the flow
+     /// environment's callee-name/no-return queries.
+     pub remote_scope: Option<Rc<crate::remote_provider::RemoteScope>>,
++    /// Exact loader-owned imported entry identities, never by-name model hints.
++    pub native_imports: Rc<std::collections::BTreeMap<(i32, u64), Rc<crate::kuna_nativeimport::NativeImportIdentity>>>,
+     /// The two whole-`symboltab` derivations [`Architecture::build_arch_handle`]
+     /// hands every `Funcdata`, memoized on the symbol table's mutation
+     /// generation (no C++ analogue -- the C++ `glb` *is* the live symbol table
+@@ -2587,6 +2589,7 @@
+ 
+             symboltab,
+             remote_scope: None,
++            native_imports: Default::default(),
+             options: OptionDatabase::new(),
+             allacts: ActionDatabase::new(),
+             restart_log: crate::kuna_restartlog::RestartLog::new(),
+@@ -4466,6 +4469,7 @@
+         // (kuna, Phase 3) the ghidra-mode lazy provider rides the handle so the
+         // global reads above query through it; None on the standalone path.
+         ctx.remote_scope = self.remote_scope.clone();
++        ctx.native_imports = Rc::clone(&self.native_imports);
+         // Snapshot every source-declared callee prototype (parked on the global
+         // FunctionSymbols by `set_function_prototype_pieces`) so the per-function
+         // `ActionDefaultParams` copies a known callee's locked `FuncProto` into the
+--- a/decompiler/crates/kuna-decomp/src/infra/remote_provider.rs
++++ b/decompiler/crates/kuna-decomp/src/infra/remote_provider.rs
+@@ -47,6 +47,7 @@
+ use kuna_base::types::{int4, uint4};
+ 
+ use crate::context::{GlobalEntry, GlobalQuery};
++use crate::kuna_nativeimport::{ImportPlatform, NativeImportIdentity};
+ use crate::dtype::{TypeFactory, TypeFactoryImpl, TypeRoot};
+ use crate::funcdata_encode::ATTRIB_VOLATILE;
+ use crate::fspec::{EffectRecord, FuncProto, ProtoModel, parameter_pieces_flags};
+@@ -115,9 +116,17 @@
+ /// the value is either a signed integer or the string "unknown").
+ pub const ATTRIB_EXTRAPOP: AttributeId = AttributeId::new("extrapop", 6);
+ 
++const IMPORT_LIBRARY: AttributeId = AttributeId::new("kuna_import_library", 4050);
++const IMPORT_SYMBOL: AttributeId = AttributeId::new("kuna_import_symbol", 4051);
++const IMPORT_PLATFORM: AttributeId = AttributeId::new("kuna_import_platform", 4052);
++const IMPORT_ID: AttributeId = AttributeId::new("kuna_import_id", 4053);
++
+ /// Register the symbol-family wire ids (XML-form documents only; the packed
+ /// wire form matches by number).
+ pub fn register_remote_provider_ids(reg: &mut IdRegistry) {
++    for attribute in [&IMPORT_LIBRARY, &IMPORT_SYMBOL, &IMPORT_PLATFORM, &IMPORT_ID] {
++        reg.register_attribute(attribute);
++    }
+     for e in [
+         &ELEM_EQUATESYMBOL,
+         &ELEM_EXTERNREFSYMBOL,
+@@ -277,6 +286,8 @@
+     pub no_return: bool,
+     /// `Function.isInline()`.
+     pub inline: bool,
++    /// Exact host-import identity delivered alongside this function's source prototype.
++    pub native_import: Option<Rc<NativeImportIdentity>>,
+     /// The decoded `<prototype>` (+ `<localdb>` cat-0 params), when present.
+     pub proto: Option<RemoteProto>,
+     /// Caller-owned call-site signatures, never facts about the global callee.
+@@ -650,9 +661,12 @@
+         no_return: false,
+         inline: false,
+         proto: None,
++        native_import: None,
+         proto_overrides: Vec::new(),
+         locals: Vec::new(),
+     };
++    let mut import_fields: [Option<String>; 3] = Default::default();
++    let mut import_id = None;
+     loop {
+         let aid = decoder.get_next_attribute_id()?;
+         if aid == 0 {
+@@ -670,7 +684,27 @@
+             func.no_return = decoder.read_bool()?;
+         } else if aid == ATTRIB_INLINE.get_id() {
+             func.inline = decoder.read_bool()?;
+-        }
++        } else if aid == IMPORT_ID.get_id() {
++            if import_id.replace(decoder.read_unsigned_integer()?).is_some() {
++                return Err(KunaError::lowlevel("Duplicate native import symbol identity"));
++            }
++        } else if let Some(slot) = [&IMPORT_LIBRARY, &IMPORT_SYMBOL, &IMPORT_PLATFORM].iter()
++            .position(|attribute| attribute.get_id() == aid) {
++            let value = String::from_utf8(decoder.read_string()?)
++                .map_err(|_| KunaError::lowlevel("Native import identity is not UTF-8"))?;
++            if value.is_empty() || value.chars().any(char::is_control) || import_fields[slot].replace(value).is_some() {
++                return Err(KunaError::lowlevel("Invalid or duplicate native import identity"));
++            }
++        }
++    }
++    if import_id.is_some() || import_fields.iter().any(Option::is_some) {
++        let [Some(library), Some(symbol), Some(platform)] = import_fields else {
++            return Err(KunaError::lowlevel("Incomplete native import identity"));
++        };
++        if import_id.is_none_or(|id| id == 0) { return Err(KunaError::lowlevel("Missing native import symbol identity")); }
++        let platform = ImportPlatform::from_wire(&platform)
++            .ok_or_else(|| KunaError::lowlevel("Unknown native import platform"))?;
++        func.native_import = Some(Rc::new(NativeImportIdentity { platform, library, symbol }));
+     }
+     if func.display_name.is_empty() {
+         func.display_name = func.name.clone();
+@@ -1086,6 +1120,8 @@
+     pub display_name: String,
+     /// `Function.hasNoReturn()` (or the prototype's noreturn).
+     pub no_return: bool,
++    /// Host import authority belongs to this exact function, not its spelling.
++    pub native_import: Option<Rc<NativeImportIdentity>>,
+     /// Authoritative function-specific prototype, never structurally interned.
+     pub prototype: Option<Rc<FuncProto>>,
+     /// Immutable caller-owned call-site facts, cloned before following flow.
+@@ -1474,6 +1510,7 @@
+                         func.display_name.clone()
+                     },
+                     no_return: func_no_return,
++                    native_import: func.native_import.clone(),
+                     prototype,
+                     overrides,
+                     locals: func.locals.clone(),
+@@ -1592,6 +1629,13 @@
+             .cloned()
+     }
+ 
++    /// Exact imported provider at this entry; a cache flush also drops its receipt.
++    pub fn native_import_at(&self, entry: &Address) -> Option<Rc<NativeImportIdentity>> {
++        self.ensure_queried(entry);
++        let space = entry.get_space()?;
++        self.state.borrow().functions.get(&(space.get_index(), entry.get_offset()))?.native_import.clone()
++    }
++
+     /// The authoritative prototype at this exact function entry (query-through).
+     pub fn prototype_at(&self, entry: &Address) -> Option<Rc<FuncProto>> {
+         self.ensure_queried(entry);
+--- a/decompiler/crates/kuna-decomp/src/p4_calls/kuna_callabletransport.rs
++++ b/decompiler/crates/kuna-decomp/src/p4_calls/kuna_callabletransport.rs
+@@ -1277,7 +1277,8 @@
+ 
+ #[derive(Clone, Debug)]
+ pub enum NativeTargetContract {
+-    Direct { entry: Address, declaration: Rc<FuncProto> },
++    Direct { entry: Address, declaration: Rc<FuncProto>,
++        native_import: Option<Rc<crate::kuna_nativeimport::NativeImportIdentity>> },
+     Indirect { pointer_code: TypeRoot },
+ }
+ 
+@@ -1592,10 +1593,13 @@
+     }
+     let (target, declaration) = if operation.code() == OpCode::CPUI_CALL {
+         if !body_unavailable || call.get_entry_address().is_invalid() { return Ok(None); }
+-        let Some((_, entry, declaration)) = fd.get_arch().query_function(call.get_entry_address())? else { return Ok(None) };
++        let Some((name, entry, declaration)) = fd.get_arch().query_function(call.get_entry_address())? else { return Ok(None) };
+         if entry != *call.get_entry_address() { return Ok(None); }
+         let declaration = Rc::new(declaration.source_prototype());
+-        (NativeTargetContract::Direct { entry, declaration: declaration.clone() }, declaration)
++        let native_import = fd.get_arch().native_import_at(&entry);
++        if native_import.as_ref().is_some_and(|identity| crate::kuna_nativeimport::known_declaration(identity).is_some())
++            && canonical_native_import(fd, &entry, &name)?.is_none() { return Ok(None); }
++        (NativeTargetContract::Direct { entry, declaration: declaration.clone(), native_import }, declaration)
+     } else {
+         let Some(input) = operation.get_in(0).and_then(|input| fd.vbank().get(input)) else { return Ok(None) };
+         let Some(code) = input.get_type_read_facing(op).get_ptr_to()
+@@ -1749,10 +1753,11 @@
+             || !preservation_fits(call.proto(), call.proto(), raw, None, &[], false, fd.get_arch().manage()) { return Ok(false); }
+     }
+     match &expected.target {
+-        NativeTargetContract::Direct { entry, declaration } => {
++        NativeTargetContract::Direct { entry, declaration, native_import } => {
+             if operation.code() != OpCode::CPUI_CALL || call.get_entry_address() != entry { return Ok(false); }
+             let Some((_, actual_entry, actual)) = fd.get_arch().query_function(entry)? else { return Ok(false) };
+-            Ok(actual_entry == *entry && native_source_abi_equal(&actual, declaration))
++            Ok(actual_entry == *entry && native_source_abi_equal(&actual, declaration)
++                && fd.get_arch().native_import_at(entry).as_deref() == native_import.as_deref())
+         }
+         NativeTargetContract::Indirect { pointer_code } => {
+             if operation.code() != OpCode::CPUI_CALLIND { return Ok(false); }
+@@ -3293,9 +3298,23 @@
+     Ok(format!("{};", declaration_with_convention(fd.get_func_proto(), &name, arch, printer.options.convention, printer)?))
+ }
+ 
++/// Canonical C spelling is independent of the retained, qualifier-erased source
++/// graph. Only a genuine imported target and its current complete native ABI
++/// can select a standard-library descriptor.
++pub(crate) fn canonical_native_import(fd: &Funcdata, entry: &Address, name: &str)
++    -> KunaResult<Option<crate::kuna_nativeimport::CanonicalNativeDeclaration>>
++{
++    let Some(identity) = fd.get_arch().native_import_at(entry) else { return Ok(None) };
++    let Some((current_name, target, prototype)) = fd.get_arch().query_function(entry)? else { return Ok(None) };
++    if target != *entry || name != current_name || !native_default_model(&prototype, fd) { return Ok(None); }
++    let Some(types) = fd.get_arch().types() else { return Ok(None) };
++    Ok(crate::kuna_nativeimport::canonical_declaration(&identity, name, &prototype, types.get_size_of_pointer()))
++}
++
+ fn native_declaration(proto: &FuncProto, name: &str, arch: &Architecture,
+-    printer: &crate::printc::PrintC) -> KunaResult<String>
+-{
++    printer: &crate::printc::PrintC, canonical: Option<crate::kuna_nativeimport::CanonicalNativeDeclaration>) -> KunaResult<String>
++{
++    if let Some(canonical) = canonical { return Ok(canonical.declaration()); }
+     let Some(code) = proto.logical_callable() else {
+         return declaration_with_convention(proto, name, arch, printer.options.convention, printer);
+     };
+@@ -3426,16 +3445,19 @@
+         // A mapped machine body is never a native declaration waiver. Even an
+         // unchanged direct family requires its real emitted provider receipt.
+         if let Some(native) = fd.native_execution_contracts().get(&call.get_op()) {
+-            if let NativeTargetContract::Direct { entry, declaration: prototype } = &native.target {
++            if let NativeTargetContract::Direct { entry, declaration: prototype, .. } = &native.target {
+                 if !native_contract_matches(fd, call.get_op(), native)? {
+                     return Err(KunaError::lowlevel("Native direct declaration lost its ABI proof"));
+                 }
+                 let name = if call.get_name().is_empty() {
+                     call.fspec_printed_name(fd.get_arch().kuna_name_style())
+                 } else { call.get_name().to_string() };
++                let canonical = canonical_native_import(fd, entry, &name)?;
+                 let name = printer.emitted_function_name(fd, &name, entry, true);
+-                let key = format!("native:{}", adapter_key(entry, prototype));
+-                let declaration = format!("{};", native_declaration(prototype, &name, arch, printer)?);
++                let key = if let Some(canonical) = canonical {
++                    format!("native:{}:{}", canonical.model_key, adapter_key(entry, prototype))
++                } else { format!("native:{}", adapter_key(entry, prototype)) };
++                let declaration = format!("{};", native_declaration(prototype, &name, arch, printer, canonical)?);
+                 if let Some(previous) = artifacts.get(&key) {
+                     if previous.declaration != declaration {
+                         return Err(KunaError::lowlevel("Conflicting authenticated native declarations"));
+@@ -3517,6 +3539,11 @@
+             let Some(space) = fd.get_address().get_space() else { continue };
+             let entry = Address::new(space.clone(), kuna_base::space::AddrSpace::address_to_byte(
+                 value.get_offset(), space.get_word_size()));
++            if let Some((name, target, _)) = fd.get_arch().query_function(&entry)? {
++                if canonical_native_import(fd, &target, &name)?.is_some() {
++                    return Err(KunaError::lowlevel("Canonical imported function address needs a qualifier-aware callable projection"));
++                }
++            }
+             let Some((key, family)) = pointer_adapter_inner(fd, &entry, true)? else { continue };
+             let target = if family.has_execution_signature() { key.clone() } else {
+                 let Some((name, target, _)) = fd.get_arch().query_function(&entry)? else {
+--- a/decompiler/crates/kuna-decomp/src/p9_emit/printc.rs
++++ b/decompiler/crates/kuna-decomp/src/p9_emit/printc.rs
+@@ -3527,6 +3527,11 @@
+         entry: &kuna_base::address::Address,
+         declaration: bool,
+     ) -> String {
++        if self.out_lang == crate::kuna_lang::OutLang::C {
++            if let Ok(Some(canonical)) = crate::kuna_callabletransport::canonical_native_import(fd, entry, name) {
++                return canonical.c_name.to_string();
++            }
++        }
+         // The CLI's cross-scope lookup supplies a deliberately fully-qualified
+         // display label, not a bare symbol plus optional ancestry. Preserve that
+         // chosen spelling unless namespaces were explicitly disabled. Host
+--- /dev/null
++++ b/decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_nativeimport.rs
+@@ -0,0 +1,90 @@
++//! Source-C declarations attached to exact imported library identities.
++//! Recovered source datatypes remain unchanged; these facts are not raw effects.
++
++use crate::dtype::{type_metatype, TypeRoot};
++use crate::fspec::FuncProto;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum ImportPlatform { Elf, MachO, Pe }
++
++impl ImportPlatform {
++    pub fn wire_name(self) -> &'static str {
++        match self { Self::Elf => "elf", Self::MachO => "macho", Self::Pe => "pe" }
++    }
++
++    pub fn from_wire(value: &str) -> Option<Self> {
++        match value { "elf" => Some(Self::Elf), "macho" => Some(Self::MachO), "pe" => Some(Self::Pe), _ => None }
++    }
++}
++
++/// Loader/host-owned identity at one concrete imported entry. Never created by
++/// a by-name prototype model, a local definition, or a user function-name hint.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct NativeImportIdentity {
++    pub platform: ImportPlatform,
++    pub library: String,
++    pub symbol: String,
++}
++
++/// The erased ABI of these measured declarations is the existing single-format
++/// variadic model. The canonical declaration independently retains pointee const.
++/// glibc __isoc99_scanf is its real exported symbol, not a renamed scanf call.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct CanonicalNativeDeclaration {
++    pub c_name: &'static str,
++    pub model_key: &'static str,
++}
++
++impl CanonicalNativeDeclaration {
++    pub fn declaration(self) -> String {
++        format!("int {}(const char *p0, ...)", self.c_name)
++    }
++}
++
++fn primitive(ty: &TypeRoot, names: &[&str], size: i32, metas: &[type_metatype]) -> bool {
++    let view = ty.read();
++    let Ok(id) = view.resolve_alias(ty.id()) else { return false };
++    let Ok(node) = view.get(id) else { return false };
++    node.get_size() == size && metas.contains(&node.get_metatype()) && names.contains(&node.get_name())
++}
++
++/// Canonical library knowledge exists only for these exact imported bindings.
++pub fn known_declaration(identity: &NativeImportIdentity) -> Option<CanonicalNativeDeclaration> {
++    let (c_name, model_key) = match (identity.platform, identity.library.as_str(), identity.symbol.as_str()) {
++        (ImportPlatform::MachO, "/usr/lib/libSystem.B.dylib", "_printf") => ("printf", "darwin-system-printf"),
++        (ImportPlatform::MachO, "/usr/lib/libSystem.B.dylib", "_scanf") => ("scanf", "darwin-system-scanf"),
++        (ImportPlatform::Elf, "libc.so.6", "printf") => ("printf", "glibc-printf"),
++        (ImportPlatform::Elf, "libc.so.6", "scanf") => ("scanf", "glibc-scanf"),
++        (ImportPlatform::Elf, "libc.so.6", "__isoc99_scanf") => ("__isoc99_scanf", "glibc-isoc99-scanf"),
++        (ImportPlatform::Pe, library, "printf") if library.eq_ignore_ascii_case("msvcrt.dll") => ("printf", "msvcrt-printf"),
++        (ImportPlatform::Pe, library, "scanf") if library.eq_ignore_ascii_case("msvcrt.dll") => ("scanf", "msvcrt-scanf"),
++        (ImportPlatform::Pe, library, "printf") if library.eq_ignore_ascii_case("ucrtbase.dll") => ("printf", "ucrt-printf"),
++        (ImportPlatform::Pe, library, "scanf") if library.eq_ignore_ascii_case("ucrtbase.dll") => ("scanf", "ucrt-scanf"),
++        _ => return None,
++    };
++    Some(CanonicalNativeDeclaration { c_name, model_key })
++}
++
++/// This matches canonical source shape only. The caller must additionally prove
++/// the actual default native calling model and invocation ABI. Neither an import
++/// name alone nor an ABI-compatible user edit grants canonical source authority.
++pub fn canonical_declaration(identity: &NativeImportIdentity, current_name: &str,
++    proto: &FuncProto, pointer_size: i32) -> Option<CanonicalNativeDeclaration>
++{
++    let descriptor = known_declaration(identity)?;
++    let c_name = descriptor.c_name;
++    // Mach-O's single leading underscore is the known platform C decoration,
++    // not a general rename rule; current arbitrary host labels remain untouched.
++    if current_name != identity.symbol && current_name != c_name { return None; }
++    if !proto.has_store() || !proto.is_input_locked() || !proto.is_output_locked()
++        || proto.has_custom_storage() || !proto.is_dotdotdot() || proto.num_params() != 1
++        || proto.get_abi_first_vararg() != 1 || proto.has_this_pointer()
++        || proto.is_constructor() || proto.is_destructor() { return None; }
++    let output = proto.get_output().get_type()?;
++    if !primitive(output, &["int", "int4"], 4, &[type_metatype::TYPE_INT]) { return None; }
++    let input = proto.get_param(0)?.get_type()?;
++    if input.get_metatype() != type_metatype::TYPE_PTR || input.get_size() != pointer_size { return None; }
++    let pointed = input.get_ptr_to()?;
++    if !primitive(&pointed, &["char"], 1, &[type_metatype::TYPE_INT, type_metatype::TYPE_UINT]) { return None; }
++    Some(descriptor)
++}

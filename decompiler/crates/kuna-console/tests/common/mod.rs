@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[allow(dead_code)]
+pub mod c_behavior;
+
 static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A unique generated-fixture path under cargo's own per-target scratch

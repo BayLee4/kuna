@@ -1011,8 +1011,8 @@ fn live_from_arch_matches_cpp_ternaries() {
     );
 }
 
-// --- Catalog JSON emitter byte-shape (full byte-compat is in the integration
-//     test catalog_bytecompat.rs against the C++ binary's captured output) ----
+// --- Catalog JSON emitter shape (consumer schema and registration coverage
+//     are checked by catalog_bytecompat.rs without pinning catalog prose) ----
 
 #[test]
 fn emit_settable_json_first_row_shape() {

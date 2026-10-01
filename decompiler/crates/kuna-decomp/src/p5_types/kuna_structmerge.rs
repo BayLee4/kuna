@@ -98,12 +98,11 @@
 //! non-transitivity already does.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeField};
+use crate::dtype::{type_metatype, TypeFactory, TypeField, TypeRoot};
 use crate::p5_types::kuna_structsynth::ledger::{self, Layout, Member};
 
 /// How many claims two layouts must share before the union is evidence, when one
@@ -154,31 +153,34 @@ impl OptionStructMerge {
 
 /// The claimed members of a minted structure by offset, its self-pointer offsets
 /// and its size. Filler is array-typed and is not a claim.
-fn claims_of(ct: &Datatype) -> Option<(BTreeMap<int4, Rc<Datatype>>, Vec<int4>, int4)> {
+fn claims_of(ct: &TypeRoot) -> Option<(BTreeMap<int4, TypeRoot>, Vec<int4>, int4)> {
+    let view = ct.read();
     let mut claims = BTreeMap::new();
     let mut selfs = Vec::new();
     for i in 0..ct.num_depend() {
-        let f = ct.get_field(i)?;
-        if f.field_type.get_metatype() == type_metatype::TYPE_ARRAY {
+        let f = view.get_field(ct.id(), i).ok()??;
+        let field_type = view.get(f.field_type).ok()?.effective().ok()?;
+        if field_type.get_metatype() == type_metatype::TYPE_ARRAY {
             continue;
         }
-        if f.field_type.get_ptr_to().is_some_and(|p| {
-            p.get_metatype() == type_metatype::TYPE_STRUCT && p.get_name() == ct.get_name()
-        }) {
+        if field_type.get_ptr_to() == Some(ct.id()) {
             selfs.push(f.offset);
         }
-        claims.insert(f.offset, Rc::clone(&f.field_type));
+        claims.insert(f.offset, ct.related(f.field_type).ok()?);
     }
     Some((claims, selfs, ct.get_size()))
 }
 
 /// The claimed members of a field list the pass has just built.
-fn claims_of_fields(fields: &[TypeField]) -> BTreeMap<int4, Rc<Datatype>> {
-    fields
-        .iter()
-        .filter(|f| f.field_type.get_metatype() != type_metatype::TYPE_ARRAY)
-        .map(|f| (f.offset, Rc::clone(&f.field_type)))
-        .collect()
+fn claims_of_fields(types: &dyn TypeFactory, fields: &[TypeField]) -> Option<BTreeMap<int4, TypeRoot>> {
+    let mut claims = BTreeMap::new();
+    for field in fields {
+        let ty = types.root(field.field_type).ok()?;
+        if ty.get_metatype() != type_metatype::TYPE_ARRAY {
+            claims.insert(field.offset, ty);
+        }
+    }
+    Some(claims)
 }
 
 /// How many claims two layouts share, or `None` when one contradicts the other:
@@ -216,11 +218,11 @@ fn agreement_is_evidence(a: &Layout, b: &Layout, shared: usize) -> bool {
 /// reader, over two readers' claims.
 fn plan(
     types: &dyn TypeFactory,
-    claims: &BTreeMap<int4, Rc<Datatype>>,
+    claims: &BTreeMap<int4, TypeRoot>,
     min_size: int4,
 ) -> Option<(Vec<TypeField>, int4)> {
     let byte = types.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?;
-    let mut out: Vec<(int4, int4, Option<Rc<Datatype>>)> = Vec::new();
+    let mut out: Vec<(int4, int4, Option<TypeRoot>)> = Vec::new();
     let mut next: int4 = 0;
     let mut align: int4 = 1;
     for (off, ct) in claims.iter() {
@@ -232,7 +234,7 @@ fn plan(
             out.push((next, off - next, None));
         }
         let width = ct.get_size();
-        out.push((off, width, Some(Rc::clone(ct))));
+        out.push((off, width, Some(ct.clone())));
         align = align.max(width);
         next = off.checked_add(width)?;
     }
@@ -245,9 +247,9 @@ fn plan(
     for (i, (off, width, ct)) in out.into_iter().enumerate() {
         let ct = match ct {
             Some(t) => t,
-            None => types.get_type_array(width, Rc::clone(&byte)).ok()?,
+            None => types.get_type_array(width, byte.clone()).ok()?,
         };
-        fields.push(TypeField::new(i as int4, off, format!("field_0x{off:x}"), ct));
+        fields.push(TypeField::new(i as int4, off, format!("field_0x{off:x}"), ct.id()));
     }
     Some((fields, size))
 }
@@ -261,15 +263,15 @@ fn plan(
 /// so the answer does not depend on how the factory happens to store them.
 pub(crate) fn merge(
     types: &dyn TypeFactory,
-    candidates: &[(Rc<Datatype>, Layout)],
+    candidates: &[(TypeRoot, Layout)],
     want: &Layout,
     fields: &[TypeField],
     size: int4,
     selfs: &[int4],
     unclaimed: &[(int4, int4)],
 ) -> Option<(Vec<TypeField>, int4, Vec<int4>)> {
-    let own: Vec<Member> = fields.iter().map(|f| Member::of_with(f, selfs)).collect();
-    let mine = claims_of_fields(fields);
+    let own: Vec<Member> = fields.iter().map(|f| Member::of_with(types, f, selfs)).collect();
+    let mine = claims_of_fields(types, fields)?;
     let mut best: Option<((usize, std::cmp::Reverse<(int4, usize)>), Vec<TypeField>, int4, Vec<int4>)> =
         None;
     for (rank, (ct, layout)) in candidates.iter().enumerate() {
@@ -294,7 +296,7 @@ pub(crate) fn merge(
             trace(ct, want, shared, "overlapping-claims");
             continue;
         };
-        let merged = ledger::layout_of_fields(&mfields, msize, &merged_selfs);
+        let merged = ledger::layout_of_fields(types, &mfields, msize, &merged_selfs);
         if !merged.answers_for(want) {
             trace(ct, want, shared, "union-too-far-for-the-reader");
             continue;
@@ -304,7 +306,7 @@ pub(crate) fn merge(
             continue;
         }
         let members: Vec<Member> =
-            mfields.iter().map(|f| Member::of_with(f, &merged_selfs)).collect();
+            mfields.iter().map(|f| Member::of_with(types, f, &merged_selfs)).collect();
         if !unclaimed.is_empty() && !ledger::keeps_unclaimed(&members, &own, unclaimed) {
             trace(ct, want, shared, "unclaimed-bytes");
             continue;
@@ -337,14 +339,16 @@ pub(crate) fn trace_mint_failed(name: &str, want: &Layout) {
 /// `KUNA_STRUCTMERGE_TRACE=1`: which held structure was considered for a
 /// freshly measured layout, how many claims the two agree on, and what came of
 /// it. Silent, and free, when the variable is not set.
-fn trace(ct: &Datatype, want: &Layout, shared: usize, verdict: &str) {
+fn trace(ct: &TypeRoot, want: &Layout, shared: usize, verdict: &str) {
     if std::env::var_os("KUNA_STRUCTMERGE_TRACE").is_none() {
         return;
     }
+    let view = ct.read();
+    let Ok(definition) = view.get(ct.id()) else { return };
     eprintln!(
         "structmerge: {} ({} claims, {} bytes) vs a layout of {} claims and {} bytes: \
          {shared} shared -- {verdict}",
-        ct.get_name(),
+        definition.get_name(),
         ledger::layout_of(ct).map(|l| l.fields.len()).unwrap_or(0),
         ct.get_size(),
         want.fields.len(),

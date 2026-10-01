@@ -303,7 +303,7 @@ pub fn final_input_check(fc: &mut FuncCallSpecs, data: &mut Funcdata) {
 pub fn build_input_from_trials(
     fc: &mut FuncCallSpecs,
     data: &mut Funcdata,
-) -> PendingCallFixup {
+) -> kuna_base::error::KunaResult<PendingCallFixup> {
     let op = fc.get_op();
     // (kuna) `passthrough`: capture the forwarded registers the call may still
     // take, and retire the trials the pass registered, before any other rule
@@ -421,7 +421,7 @@ pub fn build_input_from_trials(
             pass_through,
         }
     };
-    let _ = data.op_set_all_input(op, &newparam);
+    fc.set_input_operands(data, &mut newparam)?;
     // (kuna) `calleearity`: remember WHERE each recovered argument lived before
     // the trials are dropped -- `newparam` holds values, not locations.
     let storage: Vec<(Address, int4)> = (0..fc.get_active_input().get_num_trials())
@@ -432,7 +432,7 @@ pub fn build_input_from_trials(
         .collect();
     fc.set_final_input_storage(storage);
     fc.get_active_input().delete_unused_trials();
-    pending
+    Ok(pending)
 }
 
 /// C++ `FuncCallSpecs::collectOutputTrialVarnodes` (`fspec.cc:5543`).

@@ -3,11 +3,18 @@
 //! Stage-aligned module group; declared flatly at the crate root via re-export in
 //! `lib.rs` so public paths (`kuna_decomp::<module>`) are unchanged.
 
+pub mod kuna_callabletransport;
+pub(crate) mod kuna_branchreachability;
+pub(crate) mod kuna_logicalresultbody;
 pub mod funcdata_callsite;
 pub mod fspec;
+mod kuna_prototypeimport;
 pub mod modelrules;
 pub mod coreaction_protos;
 pub mod kuna_calleedeadarg;
+pub mod kuna_physicalinputs;
+mod kuna_registerrestore;
+mod kuna_flowreturn;
 pub mod kuna_calleepreserves; // (kuna) the decoded callee's writes narrow the cspec killedbycall set
 pub mod kuna_callretpair; // (kuna) complete the two-register CALL output arm on any image, not just a Rust one
 pub mod kuna_calleeprotostack; // (kuna) a declared callee's prototype states its stack contract

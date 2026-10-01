@@ -28,9 +28,9 @@
 //! instead would be exact, but it would also miss the struct behind
 //! `p->field_0x8`, whose tag name is never printed at all.
 //!
-//! From those roots the walk descends through typedef bases and component
-//! types ([`Datatype::get_depend`]) — a pointer's pointee, an array's element,
-//! a struct's fields — so a struct whose field is another struct pulls in both,
+//! From those roots the walk follows the graph's complete dependency edges,
+//! including typedef bases, callable inputs/results, and relative-pointer parents.
+//! A struct whose field is another struct pulls in both,
 //! and the postorder push is definition-before-use by construction (the same
 //! order [`TypeFactoryImpl::dependent_order`](crate::dtype::TypeFactoryImpl::dependent_order)
 //! produces, computed over the
@@ -48,12 +48,11 @@
 //! that already holds it.
 
 use std::collections::HashSet;
-use std::rc::Rc;
 
 use kuna_base::error::KunaResult;
 use kuna_base::marshal::ElementId;
 
-use crate::dtype::{Datatype, DatatypeKind};
+use crate::dtype::{DatatypeKind, ReadView, TypeId, TypeRef, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::kuna_langtypes::SpellCtx;
 use crate::options::on_or_off;
@@ -89,26 +88,33 @@ impl OptionStructDefs {
 /// Is `ct` a type this preamble defines?
 ///
 /// The predicate `render_type_definitions` applies to the `.h`: a user-defined
-/// (non-core), named, non-partial typedef / struct / union / enum.  Core types
+/// (non-core), named, non-partial scalar, callable, typedef, struct, union or enum. Core types
 /// (`int4`, `undefined8`, `char`) are never defined — they are the language's,
 /// and the project export declares them once in its recompile prelude.
-pub fn is_definable(ct: &Rc<Datatype>) -> bool {
+pub fn is_definable(ct: &TypeRoot) -> bool {
+    let view = ct.read();
+    let node = view.get(ct.id()).expect("retained datatype");
+    is_definable_node(&node)
+}
+
+fn is_definable_node(node: &TypeRef<'_>) -> bool {
     let composite = matches!(
-        &ct.kind,
+        &node.kind,
         DatatypeKind::Struct { .. } | DatatypeKind::Union { .. }
     );
-    !ct.is_core_type()
-        && !ct.get_name().is_empty()
-        && !ct.has_stripped()
-        && (ct.get_typedef().is_some() || composite || ct.is_enum_type())
+    let declared = matches!(&node.kind, DatatypeKind::Base | DatatypeKind::Code { proto: Some(_) });
+    !node.is_core_type()
+        && !node.get_name().is_empty()
+        && !node.has_stripped()
+        && (node.get_typedef().is_some() || composite || declared || node.is_enum_type())
 }
 
 /// The definable types `fd`'s printed C can name, in definition-before-use
 /// order (see the module header for the roots and why they are a superset of
 /// what the printer spells).
-pub fn referenced_types(fd: &Funcdata) -> Vec<Rc<Datatype>> {
-    let mut order: Vec<Rc<Datatype>> = Vec::new();
-    let mut seen: HashSet<*const Datatype> = HashSet::new();
+pub fn referenced_types(fd: &Funcdata) -> Vec<TypeRoot> {
+    let mut order: Vec<TypeRoot> = Vec::new();
+    let mut seen: HashSet<TypeId> = HashSet::new();
 
     let proto = fd.get_func_proto();
     if proto.has_store() {
@@ -118,6 +124,21 @@ pub fn referenced_types(fd: &Funcdata) -> Vec<Rc<Datatype>> {
         for i in 0..proto.num_params() {
             if let Some(ty) = proto.get_param(i).and_then(|p| p.get_type()) {
                 visit(ty, &mut seen, &mut order);
+            }
+        }
+    }
+    // External native declarations are emitted support, even when their
+    // retained logical types do not occur on any concrete machine operand.
+    for contract in fd.native_execution_contracts().values() {
+        let crate::kuna_callabletransport::NativeTargetContract::Direct { declaration, .. } = &contract.target
+            else { continue };
+        if let Some(code) = declaration.logical_callable() { visit(code, &mut seen, &mut order); }
+        if declaration.has_store() {
+            if let Some(output) = declaration.get_output_type() { visit(output, &mut seen, &mut order); }
+            for slot in 0..declaration.num_params() {
+                if let Some(input) = declaration.get_param(slot).and_then(|parameter| parameter.get_type()) {
+                    visit(input, &mut seen, &mut order);
+                }
             }
         }
     }
@@ -138,24 +159,23 @@ pub fn referenced_types(fd: &Funcdata) -> Vec<Rc<Datatype>> {
 /// Postorder DFS over one type's dependency cone (C++
 /// `TypeFactory::orderRecurse`, type.cc, restricted to a root set): the typedef
 /// base and every component sub-type first, then the type itself if it is one
-/// the preamble defines.  The mark set keys on `Rc` object identity, so a
+/// the preamble defines. The mark set keys on graph identity, so a
 /// pointer cycle (`struct A { struct B *b; }; struct B { struct A *a; };`)
 /// terminates with each data-type visited once.
-fn visit(ct: &Rc<Datatype>, seen: &mut HashSet<*const Datatype>, order: &mut Vec<Rc<Datatype>>) {
-    if !seen.insert(Rc::as_ptr(ct)) {
+fn visit(ct: &TypeRoot, seen: &mut HashSet<TypeId>, order: &mut Vec<TypeRoot>) {
+    visit_id(&ct.read(), ct.id(), seen, order);
+}
+
+fn visit_id(view: &ReadView<'_>, id: TypeId, seen: &mut HashSet<TypeId>, order: &mut Vec<TypeRoot>) {
+    if !seen.insert(id) {
         return;
     }
-    if let Some(base) = ct.get_typedef() {
-        let base = Rc::clone(base);
-        visit(&base, seen, order);
+    for &dependency in view.dependencies(id).expect("retained datatype dependencies") {
+        visit_id(view, dependency, seen, order);
     }
-    for i in 0..ct.num_depend() {
-        if let Some(dep) = ct.get_depend(i) {
-            visit(&dep, seen, order);
-        }
-    }
-    if is_definable(ct) {
-        order.push(Rc::clone(ct));
+    let node = view.get(id).expect("retained datatype");
+    if is_definable_node(&node) {
+        order.push(node.root());
     }
 }
 
@@ -174,18 +194,23 @@ fn visit(ct: &Rc<Datatype>, seen: &mut HashSet<*const Datatype>, order: &mut Vec
 /// size it was created at (a `libctypes` `FILE` shell is 216 bytes with no
 /// member known), so the two records would agree on `size` and disagree on
 /// everything else.
-pub fn dedup_by_name(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
+pub fn dedup_by_name(types: &[TypeRoot]) -> Vec<TypeRoot> {
+    let views: Vec<_> = types.iter().map(TypeRoot::read).collect();
     let complete: HashSet<&str> = types
         .iter()
-        .filter(|ct| !ct.is_incomplete())
-        .map(|ct| ct.get_name())
+        .zip(&views)
+        .filter(|(ct, _)| !ct.is_incomplete())
+        .map(|(ct, view)| view.definition(ct.id()).expect("retained datatype").get_name())
         .collect();
-    let mut taken: HashSet<String> = HashSet::new();
+    let mut taken: HashSet<&str> = HashSet::new();
     types
         .iter()
-        .filter(|ct| !(ct.is_incomplete() && complete.contains(ct.get_name())))
-        .filter(|ct| taken.insert(ct.get_name().to_string()))
-        .map(Rc::clone)
+        .zip(&views)
+        .filter(|(ct, view)| {
+            let name = view.definition(ct.id()).expect("retained datatype").get_name();
+            !(ct.is_incomplete() && complete.contains(name)) && taken.insert(name)
+        })
+        .map(|(ct, _)| ct.clone())
         .collect()
 }
 
@@ -198,15 +223,17 @@ pub fn dedup_by_name(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
 /// per-function `types` array), so a consumer reads the recovered layout
 /// without parsing C out of the body.  Returns `""` for a type the preamble does
 /// not define.
-pub fn definition_text(ct: &Rc<Datatype>, rt: SpellCtx) -> String {
-    let raw = ct.get_name();
+pub fn definition_text(ct: &TypeRoot, rt: SpellCtx) -> String {
+    let view = ct.read();
+    let node = view.get(ct.id()).expect("retained datatype");
+    let raw = node.get_name();
     let name = sanitize_type_name(raw);
     if let Some(base) = ct.get_typedef() {
-        return compose_typedef_line(base, &name, rt);
+        return compose_typedef_line(&base, &name, rt);
     }
-    match &ct.kind {
+    match &node.kind {
         DatatypeKind::Struct { .. } | DatatypeKind::Union { .. } => {
-            let kw = if matches!(&ct.kind, DatatypeKind::Union { .. }) { "union" } else { "struct" };
+            let kw = if matches!(&node.kind, DatatypeKind::Union { .. }) { "union" } else { "struct" };
             if ct.is_incomplete() {
                 format!("typedef {kw} {name} {name}; /* opaque */\n")
             } else {
@@ -214,6 +241,9 @@ pub fn definition_text(ct: &Rc<Datatype>, rt: SpellCtx) -> String {
             }
         }
         _ if ct.is_enum_type() => compose_enum_body(ct, &name),
+        DatatypeKind::Code { proto: Some(_) } =>
+            crate::kuna_langc::C_SPELLER.callable_typedef(&rt, ct, &name),
+        DatatypeKind::Base => crate::printc::compose_scalar_definition(ct, &name, rt),
         _ => String::new(),
     }
 }

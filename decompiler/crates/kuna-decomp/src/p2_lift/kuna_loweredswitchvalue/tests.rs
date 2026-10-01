@@ -36,6 +36,10 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd_with(check: bool) -> Funcdata {
     let mut ctx = ArchContext::new(build_manager());
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.lowered_switch_value_check = check;
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());

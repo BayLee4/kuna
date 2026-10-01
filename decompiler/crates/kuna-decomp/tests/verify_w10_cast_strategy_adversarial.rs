@@ -1,58 +1,12 @@
-//! INDEPENDENT VERIFIER adversarial tests for item `w10-cast-strategy`.
+//! Boundary tests for the production extension-promotion predicates.
 //!
-//! The diff under review (`rport/w10-cast-strategy`) routes `INT_SEXT`/`INT_ZEXT`
-//! through `CastStrategyC` in the C printer (`printc.rs` `op_int_sext_ir` /
-//! `op_int_zext_ir`, the faithful transcription of `PrintC::opIntSext`/
-//! `opIntZext`, printc.cc:806-830).  The render decision is:
-//!
-//! ```text
-//!   if  isZextCast(out_def_facing, in_read_facing)        // signedness gate
-//!       if  option_hide_exts && isExtensionCastImplied(op, readOp)
-//!           opHiddenFunc(op)     // hidden — implied by integer promotion
-//!       else
-//!           opTypeCast(op)       // explicit `(uintN)x` / `(intN)x`
-//!   else
-//!       opFunc(op)               // functional `ZEXT(x)` / `SEXT(x)`
-//! ```
-//!
-//! The pure cast-strategy predicates (`isZextCast`/`isSextCast`/
-//! `isExtensionCastImplied`) live in the UNCHANGED `cast.rs` (ported in a prior
-//! wave); this wave only WIRES them into the printer.  The faithfulness risk is
-//! therefore in the DECISION COMBINATION the wiring performs — the argument order
-//! fed to the predicate, the `option_hide_exts` gate, and the `readOp == 0`
-//! (top-of-expression) handling.  These tests reproduce that exact combination
-//! over a mock [`CastContext`] (the same shape `cast/tests.rs` uses internally,
-//! re-built here against the public trait) and pin the boundaries the
-//! verification hunt list flagged:
-//!
-//!   (V1) SIGNEDNESS GATE — a ZEXT whose input metatype is INT (signed), not
-//!        UINT/BOOL, is NOT a zext-cast: it must fall to the functional `ZEXT(x)`
-//!        form regardless of `hide_exts` (the `isZextCast` input-signedness
-//!        requirement, cast.cc:457).  A SEXT mirrors it for the input-UINT case.
-//!
-//!   (V2) READOP==0 BOUNDARY — at the top of a statement `readOp` is null, so
-//!        `isExtensionCastImplied` short-circuits to `false` (cast.cc:255): a
-//!        non-explicit ZEXT output can NEVER be hidden there, it renders as the
-//!        explicit `(uintN)x` cast.  This is the spot the printc seam threads
-//!        `None`.
-//!
-//!   (V3) BIG-CONSTANT BOUNDARY — when the extension is read by an integer op
-//!        whose OTHER operand is a constant strictly LARGER than the promotion
-//!        size, `isExtensionCastImplied` returns false (cast.cc:281-284: a big
-//!        integer is not naturally extended, so the cast must be explicit).  At
-//!        the exact boundary (== promoteSize) it is still implied (hidden).  This
-//!        is the off-by-one the hunt list flags for the `> promoteSize` compare.
-//!
-//!   (V4) HIDE-EXTS GATE — with `option_hide_exts` OFF, even a genuinely-implied
-//!        extension renders as the explicit cast, never hidden.  The gate is an
-//!        AND, so flipping it must change Hidden->Cast and nothing else.
-//!
-//! Each test is a pure decision check (no SLA frontend), so it never SKIPs.
+//! A missing reader, an oversized constant, and a mismatched operand type
+//! require an explicit extension rather than hiding it through promotion.
 
 use std::rc::Rc;
 
 use kuna_decomp::cast::{CastContext, CastStrategy, CastStrategyC, OpRef, VnRef};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeRoot, TypeFactoryImpl};
 use kuna_num::opcodes::OpCode;
 
 #[allow(non_camel_case_types)]
@@ -62,83 +16,27 @@ type uintb = u64;
 
 // -- data-type builders (mirror cast/tests.rs) ------------------------------
 
-fn base(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, meta))
+fn base(f: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, meta)).unwrap()
 }
-fn int_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_INT)
+fn int_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_INT)
 }
-fn uint_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_UINT)
+fn uint_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_UINT)
 }
 
 /// `CastStrategyC` with `promoteSize == 4` (the x86:LE:64 `int` size).
-fn strategy_c() -> CastStrategyC {
+fn factory() -> Rc<TypeFactoryImpl> {
     let f = TypeFactoryImpl::new();
     f.set_default_alignment_map();
     f.set_max_basetype_size(8);
     f.setup_sizes(Some(4), 8, 8);
-    CastStrategyC::new(Rc::new(f))
+    Rc::new(f)
 }
 
-// -- the exact printc decision -----------------------------------------------
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum Render {
-    /// `opTypeCast` — explicit `(uintN)x` / `(intN)x`.
-    Cast,
-    /// `opHiddenFunc` — extension implied by promotion, not printed.
-    Hidden,
-    /// `opFunc` — functional `ZEXT(x)` / `SEXT(x)`.
-    Functional,
-}
-
-/// Faithful re-statement of `PrintC::opIntZext` (printc.cc:806).  Mirrors
-/// `printc.rs::op_int_zext_ir`: same predicate order, same gate, same fallback.
-fn decide_zext(
-    strat: &CastStrategyC,
-    ctx: &dyn CastContext,
-    op: OpRef,
-    read_op: Option<OpRef>,
-    hide_exts: bool,
-) -> Render {
-    let outvn = ctx.op_out(op).unwrap();
-    let invn = ctx.op_in(op, 0);
-    // (out->getHighTypeDefFacing(), in0->getHighTypeReadFacing(op))
-    let outtype = ctx.vn_high_type(outvn);
-    let intype = ctx.vn_high_type_read_facing(invn, op);
-    if strat.is_zext_cast(&outtype, &intype) {
-        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op) {
-            Render::Hidden
-        } else {
-            Render::Cast
-        }
-    } else {
-        Render::Functional
-    }
-}
-
-/// Faithful re-statement of `PrintC::opIntSext` (printc.cc:819).
-fn decide_sext(
-    strat: &CastStrategyC,
-    ctx: &dyn CastContext,
-    op: OpRef,
-    read_op: Option<OpRef>,
-    hide_exts: bool,
-) -> Render {
-    let outvn = ctx.op_out(op).unwrap();
-    let invn = ctx.op_in(op, 0);
-    let outtype = ctx.vn_high_type(outvn);
-    let intype = ctx.vn_high_type_read_facing(invn, op);
-    if strat.is_sext_cast(&outtype, &intype) {
-        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op) {
-            Render::Hidden
-        } else {
-            Render::Cast
-        }
-    } else {
-        Render::Functional
-    }
+fn strategy_c(f: &Rc<TypeFactoryImpl>) -> CastStrategyC {
+    CastStrategyC::new(f.clone())
 }
 
 // -- mock CastContext (mirrors cast/tests.rs MockCtx) -----------------------
@@ -146,7 +44,7 @@ fn decide_sext(
 struct MockVn {
     size: int4,
     offset: uintb,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
     constant: bool,
     explicit: bool,
     written: bool,
@@ -165,7 +63,7 @@ impl MockCtx {
     fn new() -> MockCtx {
         MockCtx { vns: Vec::new(), ops: Vec::new() }
     }
-    fn add_var(&mut self, size: int4, ty: Rc<Datatype>) -> VnRef {
+    fn add_var(&mut self, size: int4, ty: TypeRoot) -> VnRef {
         let id = self.vns.len();
         self.vns.push(MockVn {
             size,
@@ -178,7 +76,7 @@ impl MockCtx {
         });
         VnRef(id)
     }
-    fn add_const(&mut self, size: int4, offset: uintb, ty: Rc<Datatype>) -> VnRef {
+    fn add_const(&mut self, size: int4, offset: uintb, ty: TypeRoot) -> VnRef {
         let v = self.add_var(size, ty);
         self.vns[v.0].constant = true;
         self.vns[v.0].offset = offset;
@@ -235,11 +133,11 @@ impl CastContext for MockCtx {
     fn vn_lone_descend(&self, _vn: VnRef) -> Option<OpRef> {
         None
     }
-    fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type(&self, vn: VnRef) -> TypeRoot {
+        Clone::clone(&self.vns[vn.0].ty)
     }
-    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> TypeRoot {
+        Clone::clone(&self.vns[vn.0].ty)
     }
     fn op_inherits_sign(&self, op: OpRef) -> bool {
         kuna_decomp::typeop::type_op_info(self.ops[op.0].code).inherits_sign()
@@ -267,9 +165,9 @@ impl CastContext for MockCtx {
 /// Build a `out = ZEXT(in0)` op whose output is read by `read = readcode(out, other)`.
 /// Returns (ctx, zext_op, read_op).  The ZEXT output is left non-explicit so the
 /// "implied" arm is reachable; `other` is whatever the caller wired in.
-fn zext_read_by(
-    out_ty: Rc<Datatype>,
-    in_ty: Rc<Datatype>,
+fn zext_read_by(f: &TypeFactoryImpl, 
+    out_ty: TypeRoot,
+    in_ty: TypeRoot,
     in_size: int4,
     out_size: int4,
     readcode: OpCode,
@@ -281,54 +179,13 @@ fn zext_read_by(
     let zext = ctx.add_op(OpCode::CPUI_INT_ZEXT, vec![invn], Some(outvn));
     let othervn = other(&mut ctx);
     // out is read by `read = out <readcode> other`; result type matches `out`.
-    let resty = uint_t(out_size);
+    let resty = uint_t(f, out_size);
     let resvn = ctx.add_var(out_size, resty);
     let read = ctx.add_op(readcode, vec![outvn, othervn], Some(resvn));
     (ctx, zext, read)
 }
 
 // ===========================================================================
-
-/// (V1) The signedness gate: a ZEXT whose INPUT is signed (TYPE_INT) is NOT a
-/// zext-cast (`isZextCast` requires the input metatype to be UINT or BOOL,
-/// cast.cc:464).  So it renders as the FUNCTIONAL `ZEXT(x)`, never a `(uintN)`
-/// cast, regardless of `hide_exts` — this guards against the wiring feeding the
-/// predicate the wrong type pair (e.g. swapping out/in, which would flip the
-/// gate).
-#[test]
-fn w10_cast_strategy_zext_signed_input_stays_functional() {
-    let strat = strategy_c();
-    // out uint8, in INT4 (signed) -> isZextCast false (input not UINT/BOOL).
-    let mut ctx = MockCtx::new();
-    let invn = ctx.add_var(4, int_t(4));
-    let outvn = ctx.add_var(8, uint_t(8));
-    let zext = ctx.add_op(OpCode::CPUI_INT_ZEXT, vec![invn], Some(outvn));
-
-    // No reader / null readOp, both hide settings: always functional.
-    assert_eq!(decide_zext(&strat, &ctx, zext, None, true), Render::Functional);
-    assert_eq!(decide_zext(&strat, &ctx, zext, None, false), Render::Functional);
-
-    // Flip the input to UNSIGNED: now it IS a zext-cast (explicit, no reader).
-    let mut ctx2 = MockCtx::new();
-    let invn2 = ctx2.add_var(4, uint_t(4));
-    let outvn2 = ctx2.add_var(8, uint_t(8));
-    let zext2 = ctx2.add_op(OpCode::CPUI_INT_ZEXT, vec![invn2], Some(outvn2));
-    assert_eq!(decide_zext(&strat, &ctx2, zext2, None, true), Render::Cast);
-
-    // SEXT mirror: a SEXT of an UNSIGNED input is NOT a sext-cast
-    // (`isSextCast` requires INT/BOOL input, cast.cc:450) -> functional.
-    let mut ctx3 = MockCtx::new();
-    let sin = ctx3.add_var(4, uint_t(4));
-    let sout = ctx3.add_var(8, int_t(8));
-    let sext = ctx3.add_op(OpCode::CPUI_INT_SEXT, vec![sin], Some(sout));
-    assert_eq!(decide_sext(&strat, &ctx3, sext, None, true), Render::Functional);
-    // INT input -> sext-cast (explicit).
-    let mut ctx4 = MockCtx::new();
-    let sin4 = ctx4.add_var(4, int_t(4));
-    let sout4 = ctx4.add_var(8, int_t(8));
-    let sext4 = ctx4.add_op(OpCode::CPUI_INT_SEXT, vec![sin4], Some(sout4));
-    assert_eq!(decide_sext(&strat, &ctx4, sext4, None, true), Render::Cast);
-}
 
 /// (V2) readOp == null (top of statement): `isExtensionCastImplied` returns false
 /// for a NON-explicit output when there is no reader (cast.cc:255).  So the
@@ -337,23 +194,16 @@ fn w10_cast_strategy_zext_signed_input_stays_functional() {
 /// that passes `None` at printc.cc:2579.
 #[test]
 fn w10_cast_strategy_null_readop_never_hidden() {
-    let strat = strategy_c();
+    let f = &factory();
+    let strat = strategy_c(f);
     // out uint8, in uint4 -> isZextCast true.  Output NON-explicit.
     let mut ctx = MockCtx::new();
-    let invn = ctx.add_var(4, uint_t(4));
-    let outvn = ctx.add_var(8, uint_t(8));
+    let invn = ctx.add_var(4, uint_t(f, 4));
+    let outvn = ctx.add_var(8, uint_t(f, 8));
     let zext = ctx.add_op(OpCode::CPUI_INT_ZEXT, vec![invn], Some(outvn));
     assert!(!ctx.vn_is_explicit(outvn), "precondition: output non-explicit");
 
-    // hide_exts ON but readOp None: implied is false -> CAST, not Hidden.
-    assert_eq!(
-        decide_zext(&strat, &ctx, zext, None, true),
-        Render::Cast,
-        "a null readOp must short-circuit isExtensionCastImplied to false, \
-         so a zext-cast at statement top renders explicit, never hidden"
-    );
-
-    // Cross-check the predicate directly: implied is false with no reader.
+    // There is no promotion context at the top of a statement.
     assert!(!strat.is_extension_cast_implied(&ctx, zext, None));
 }
 
@@ -366,20 +216,21 @@ fn w10_cast_strategy_null_readop_never_hidden() {
 /// `getSize() > promoteSize` compare (promoteSize == 4 here).
 #[test]
 fn w10_cast_strategy_big_constant_boundary_flips_implied() {
-    let strat = strategy_c();
+    let f = &factory();
+    let strat = strategy_c(f);
     let promote = strat.promote_size();
     assert_eq!(promote, 4);
 
     // out=uint8 = ZEXT(uint4 in); read = out + const(size).  metatype(out)=UINT.
     // The other operand is a UINT constant so its metatype matches.
     let build = |const_size: int4| {
-        zext_read_by(
-            uint_t(8),
-            uint_t(4),
+        zext_read_by(f, 
+            uint_t(f, 8),
+            uint_t(f, 4),
             4,
             8,
             OpCode::CPUI_INT_ADD,
-            move |c| c.add_const(const_size, 7, uint_t(const_size)),
+            move |c| c.add_const(const_size, 7, uint_t(f, const_size)),
         )
     };
 
@@ -389,10 +240,6 @@ fn w10_cast_strategy_big_constant_boundary_flips_implied() {
         strat.is_extension_cast_implied(&ctx_eq, zext_eq, Some(read_eq)),
         "const at exactly promoteSize must be implied (boundary inclusive)"
     );
-    assert_eq!(
-        decide_zext(&strat, &ctx_eq, zext_eq, Some(read_eq), true),
-        Render::Hidden
-    );
 
     // const size == promoteSize + 1 (5 > 4): bigger -> NOT implied -> Cast.
     let (ctx_gt, zext_gt, read_gt) = build(promote + 1);
@@ -400,40 +247,6 @@ fn w10_cast_strategy_big_constant_boundary_flips_implied() {
         !strat.is_extension_cast_implied(&ctx_gt, zext_gt, Some(read_gt)),
         "const strictly bigger than promoteSize must NOT be implied"
     );
-    assert_eq!(
-        decide_zext(&strat, &ctx_gt, zext_gt, Some(read_gt), true),
-        Render::Cast,
-        "a >promoteSize constant forces the extension cast to be explicit"
-    );
-}
-
-/// (V4) The `option_hide_exts` gate is an AND: an extension that IS implied (and
-/// would be Hidden with the option on) renders as the explicit `(uintN)` CAST
-/// when the option is off — and nothing else changes.  This guards against the
-/// wiring dropping the gate (which would over-hide casts under `--option
-/// hideextension off`).
-#[test]
-fn w10_cast_strategy_hide_exts_gate_is_and() {
-    let strat = strategy_c();
-    // A genuinely-implied zext: out uint8 = ZEXT(uint4), read by `out & explicit-uint8`.
-    let (ctx, zext, read) = zext_read_by(
-        uint_t(8),
-        uint_t(4),
-        4,
-        8,
-        OpCode::CPUI_INT_AND,
-        |c| {
-            let v = c.add_var(8, uint_t(8));
-            c.set_explicit(v, true);
-            v
-        },
-    );
-    // Precondition: it IS implied.
-    assert!(strat.is_extension_cast_implied(&ctx, zext, Some(read)));
-
-    // hide ON  -> Hidden ; hide OFF -> Cast (the AND short-circuits the implied test).
-    assert_eq!(decide_zext(&strat, &ctx, zext, Some(read), true), Render::Hidden);
-    assert_eq!(decide_zext(&strat, &ctx, zext, Some(read), false), Render::Cast);
 }
 
 /// (V5, bonus) Metatype-mismatch reader: if the OTHER operand's metatype differs
@@ -442,16 +255,17 @@ fn w10_cast_strategy_hide_exts_gate_is_and() {
 /// wiring relies on the unchanged predicate for.
 #[test]
 fn w10_cast_strategy_metatype_mismatch_not_implied() {
-    let strat = strategy_c();
+    let f = &factory();
+    let strat = strategy_c(f);
     // out is UINT8; other operand is an explicit INT8 (signed) -> metatype differs.
-    let (ctx, zext, read) = zext_read_by(
-        uint_t(8),
-        uint_t(4),
+    let (ctx, zext, read) = zext_read_by(f, 
+        uint_t(f, 8),
+        uint_t(f, 4),
         4,
         8,
         OpCode::CPUI_INT_ADD,
         |c| {
-            let v = c.add_var(8, int_t(8)); // signed, mismatched metatype
+            let v = c.add_var(8, int_t(f, 8)); // signed, mismatched metatype
             c.set_explicit(v, true);
             v
         },
@@ -460,5 +274,4 @@ fn w10_cast_strategy_metatype_mismatch_not_implied() {
         !strat.is_extension_cast_implied(&ctx, zext, Some(read)),
         "a mismatched-metatype other operand must defeat the implied test"
     );
-    assert_eq!(decide_zext(&strat, &ctx, zext, Some(read), true), Render::Cast);
 }

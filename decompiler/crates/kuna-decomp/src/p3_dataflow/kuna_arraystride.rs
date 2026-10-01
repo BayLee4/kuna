@@ -38,14 +38,12 @@
 //! W6 typeop `inst` table); the op-shell is built with the [`TypeOp`] skeleton
 //! (zero flag word) until W6 lands.  Noted in the structured losses.
 
-use std::rc::Rc;
-
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::type_metatype;
 use crate::funcdata::Funcdata;
 use crate::context::{BlockId, OpId, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
@@ -76,11 +74,8 @@ impl Rule for RuleArrayStride {
         vec![OpCode::CPUI_MULTIEQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleArrayStride { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleArrayStride { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleArrayStride::applyOp` (`kuna_arraystride.cc:88`) — transcribed.
@@ -172,6 +167,7 @@ impl Rule for RuleArrayStride {
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option arraystride on` (recover_array_stride = true;
         // kuna DIV-3 default-on, GH-8724).
         ctor: || Box::new(RuleArrayStride::with_group(true, "analysis")),
@@ -264,7 +260,7 @@ fn kuna_is_induction_phi(
 /// Reproduce `Funcdata::newUniqueOut(size, op)` for a fresh unique output (see
 /// `kuna_addcarrychain` module docs for the `op_set_output` stub rationale).
 fn new_unique_out(data: &mut Funcdata, size: int4, op: OpId) -> KunaResult<VarnodeId> {
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN));
+    let ct = data.get_arch().types().expect("type factory").get_base(size, type_metatype::TYPE_UNKNOWN)?;
     let seqnum = data.obank().get(op).expect("new_unique_out: stale op").get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum };
     let mut never = |_: &mut VarnodeBank, _: VarnodeId, _: VarnodeId| -> KunaResult<()> {

@@ -12,7 +12,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{ArchContext, TypeOp};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 
 use super::*;
@@ -50,14 +50,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn space_of(fd: &Funcdata, name: &str) -> Rc<AddrSpace> {
@@ -70,17 +76,20 @@ fn sp_loc(fd: &Funcdata) -> VarnodeStorage {
 
 fn sp_vn(fd: &mut Funcdata) -> crate::context::VarnodeId {
     let reg = space_of(fd, "register");
-    fd.vbank_mut().create(8, Address::new(reg, 0x20), unk_type(8))
+    let datatype = unk_type(fd, 8);
+    fd.vbank_mut().create(8, Address::new(reg, 0x20), datatype)
 }
 
 fn const_vn(fd: &mut Funcdata, val: u64) -> crate::context::VarnodeId {
     let cst = space_of(fd, "const");
-    fd.vbank_mut().create(8, Address::new(cst, val), unk_type(8))
+    let datatype = unk_type(fd, 8);
+    fd.vbank_mut().create(8, Address::new(cst, val), datatype)
 }
 
 fn reg_vn(fd: &mut Funcdata, off: u64, size: int4) -> crate::context::VarnodeId {
     let reg = space_of(fd, "register");
-    fd.vbank_mut().create(size, Address::new(reg, off), unk_type(size))
+    let datatype = unk_type(fd, size);
+    fd.vbank_mut().create(size, Address::new(reg, off), datatype)
 }
 
 fn at(fd: &Funcdata, off: u64) -> Address {
@@ -106,7 +115,8 @@ fn emit_store(fd: &mut Funcdata, addr: u64, ptr: crate::context::VarnodeId, size
     let op = fd.obank_mut().create_at(3, Address::new(Rc::clone(&ram), addr));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_STORE, 0, "op"));
     let cst = space_of(fd, "const");
-    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), datatype);
     let val = reg_vn(fd, 0x08, size);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(spc), 0);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(ptr), 1);
@@ -119,7 +129,8 @@ fn emit_load(fd: &mut Funcdata, addr: u64, ptr: crate::context::VarnodeId, size:
     let op = fd.obank_mut().create_at(2, Address::new(Rc::clone(&ram), addr));
     fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_LOAD, 0, "op"));
     let cst = space_of(fd, "const");
-    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), unk_type(8));
+    let datatype = unk_type(fd, 8);
+    let spc = fd.vbank_mut().create(8, Address::new(cst, ram.get_index() as u64), datatype);
     let out = reg_vn(fd, 0x08, size);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(spc), 0);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(ptr), 1);

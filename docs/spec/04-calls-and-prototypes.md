@@ -138,6 +138,250 @@ each trial is mapped to a resource slot; holes in slot coverage are penalized
 or an unmappable trial costs 20, lowest total wins, starting threshold 500
 (`ScoreProtoModel::do_score`).
 
+### Committed host prototypes
+
+Ghidra function facts are not declarations to be assigned an ABI again. The
+function's full entry address owns an immutable `FuncProto`
+(`decompiler/crates/kuna-decomp/src/infra/remote_provider.rs
+(RemoteFunctionFacts, RemoteScope::prototype_at)`). Structural `TypeCode`
+interning remains separate: two functions with the same `int(int)` type may
+have different registers, locks, names, or effects.
+
+The function/localdb importer
+(`decompiler/crates/kuna-decomp/src/p4_calls/kuna_prototypeimport.rs`) preserves
+committed parameter order, storage, names, and independent name/type locks;
+the output's storage and lock are independent of the inputs. In particular,
+locked inputs with an unlocked void output still permit return recovery after
+a debug-capture import. Host-assigned hidden-return parameters and compound
+storage are imported once, not stripped and re-derived. Model effect deltas
+merge with defaults, rejecting partial overlaps; explicit unknown extra-pop
+remains distinct from omission.
+
+Fresh current functions and reflow copy these facts rather than mutate the
+cache. Direct calls, late prototype fallback, resolved function addresses,
+and function-backed indirect slots use the same authoritative prototype.
+The indirect-slot classifier still enforces exact address, width, usepoint,
+and data-symbol precedence; callable data types remain a separate source.
+Late external-reference deindirection reuses that same slot classification:
+an explicit callable supplies its signature, and noncallable data shadows
+loader signature evidence. Imported naming and independent no-return or
+injection facts survive; resolving a direct function address is unchanged.
+Host edits take effect after the normal remote-cache flush. Standalone CLI
+declarations retain their existing assignment and locking semantics.
+
+### Source formals and physical execution inputs
+
+A declared byte is not proof that the other bytes of its containing register
+are dead. `kuna_physicalinputs.rs` derives entry requirements from the lifted
+control-flow graph and actual consumed SSA inputs. Reads after calls and
+implicit reads of declared return storage participate in the analysis. Callee
+may-writes remain distinct from definitions guaranteed on every normal return;
+only the latter discharge a later incoming-state dependency. Missing bodies,
+cycles and bounded dependency cuts remain explicitly incomplete.
+
+Implicit result-storage reads and restoration guarantees use only normal RETURN
+operations. Synthetic bad-instruction, unimplemented, missing-body and no-return
+halts do not consume a declared ABI result merely because they are represented as
+RETURN; they remain incomplete boundaries. Explicit machine reads before such a
+halt remain positive requirements.
+
+`FuncProto` retains the authentic source parameter descriptors, including
+storage and independent locks, while a derived execution slot can carry a
+wider containing register. Separate source slots are never coalesced. A live
+source projection may bind the original parameter symbol; an unused formal
+remains metadata rather than acquiring invented SSA uses. Boolean declarations
+also need a numeric carrier when the machine observes noncanonical byte values.
+Genuine model-valid inputs absent from a closed source signature are execution
+slots only, not additional source parameters.
+
+A complete raw body can justify a finite register-only execution interface for a
+source variadic function. Its authentic open declaration and variadic ABI boundary
+remain available for editing and replay. Unknown stack tails, an escaping stack
+base, and unavailable bodies cannot close that interface. A typed address escape
+that still demands the open native interface is refused rather than assigned an
+incompatible generated definition.
+
+Final executable export covers consumed incoming stack state as well as registers.
+Declared stack parameters and proved bookkeeping can cover those ranges; an
+unrepresented incoming stack value cannot become an uninitialized C local.
+It also requires a complete raw or independently validated conditional execution
+summary for the whole body. An unresolved operation cannot pass certification
+merely because it has no observed writes to preserved registers. Refusal retains
+the diagnostic body and its real operations; it does not invent an implementation
+for an unknown user operation or interrupt handler.
+
+These requirements belong to a drive and flow epoch, not to the immutable ABI
+view or the explicit `Override` store. Source edits invalidate and reconstruct
+them. Calls retain positive machine-state operands as real SSA uses, including
+state outside the source interface. Placeholder removal, late restriction and
+trial reconstruction preserve those operands; an unsupported machine boundary
+must not silently narrow them or invent a C helper.
+Its raw diagnostic records the instruction address, numbered operand storage and
+values, and compact effect ranges. Known direct targets use their entry address,
+not a process-local call-specification handle; SSA arena identifiers and debug
+representations of shared architecture objects are not part of this output.
+Sibling-call use scoring resolves an operand through its actual CALL slot and
+recorded physical storage, not a speculative-trial vector index; retained raw
+state does not create a parameter trial.
+
+Raw machine requirements remain authoritative: positive reads, may-writes and
+incomplete boundaries are retained even when a separate conditional execution
+summary describes generated C. Each conditional use carries exact call-operation
+and callable-family obligations. A normalized callback producer and compatible
+state effects must be proved before redundant raw operands can be discharged;
+source declarations and raw effect facts are not rewritten by that proof.
+
+An ordinary native call can supply a separate default-ABI execution premise only
+when its actual arguments, result, effects and stack adjustment match the assigned
+layout and survive final replay at the same raw call site. Without a retained,
+locked or overridden input declaration, that layout uses the settled SSA operands
+and their physical storage rather than an empty inferred prototype. An unprinted
+unknown model is eligible only through its recorded default-model compatibility
+and the same layout and effect checks. This premise cannot stand in for a mapped
+generated target's body dependency or erase positive raw demands.
+
+A private-frame restoration premise is conditional on the actual generated body
+and every selected direct child's exact target, input/output storage, model,
+effects and stack adjustment. Publication rechecks the live call and matching
+body receipt; an unchanged source ABI still requires that receipt. Frame-pointer
+escape is persistent, including before a slot is saved and across partial or
+uncertain call clobbers. Raw summaries retain their original reads, writes and
+incompleteness.
+
+This target-owned dependency is also needed when a child's raw control flow is
+complete but its raw register effects do not yet prove the exposed preservation
+contract. For example, an actual readonly-branch reduction can establish that a
+callee preserves a register which the unreduced machine body may write. The
+caller may use that separately certified body only when the source family
+covers its selected input demands and final publication includes the actual
+target definition. The raw summary is not upgraded or replaced. Ordinary body
+receipts cannot cover an unproved model-internal register role: each originally
+written internal byte must already have raw or independently selected
+restoration, or the caller must use the stronger role-qualified mechanism.
+Omitting the required target body still refuses the export.
+
+A mapped direct call-site override can retain a different source signature from
+its target without replacing either declaration. When the target's declared
+inputs cover its actual machine demands, a caller-owned forwarding adapter keeps
+every site argument and maps storage into the target's declared inputs. The
+adapter requires a separate receipt from the real target body; its own wrapper
+is not a target-body proof. Results must retain identical type and storage.
+Integer storage slices and conversions require integer carriers; exact pointer
+or floating types are forwarded without numeric reinterpretation. An omitted
+scalar register formal can receive zero only when the target's complete original
+raw summary proves its entire storage unobserved, including partial overlaps.
+Unknown summaries and unexpanded JOIN reads cannot justify that substitution.
+Where the target's source declaration itself omits consumed machine state, the
+existing physical execution family remains necessary instead.
+
+A model-declared internal register can instead have an owning-body representation
+proof; that proof is not machine preservation. The raw analysis considers every
+original call and path, including arms a later readonly decision removes. Full
+role geometry and disjoint source inputs/results are required. First-SSA replay
+checks the original full-role definitions and their actual uses: eventual
+constants, materialized memory accesses, or an isolated private-frame spill
+whose exact root, offset, size and STORE were authenticated. A reload or escaped
+frame address does not qualify as an isolated spill. Final replay requires that
+no live role value remains and that every retained terminal obligation still
+matches; erased ordinary stores cannot be treated as erased private spills.
+
+The real MIPS32 `dirty_gp` and `private_gp_spill` bodies exercised this distinction:
+the original machine changes GP, while their unchanged exported C/H compiled and
+ran at `-O0` and `-O2`; the spill body returned 11. The spill certificate observed
+the actual four-byte STORE at entry-SP minus eight before its later removal.
+Overlapping reload and escaped-frame controls lacked that certificate and were
+refused by executable export. These standalone results do not prove inherited
+callee-role publication, and do not create unused qualified callable providers
+or claim native GP preservation.
+
+Unique-space temporaries belong to the current function, so implicit native ABI
+clobbers cannot invalidate their saved-frame pointer provenance merely because
+hardware preservation ranges omit them. Explicit outputs and pointer escape
+still invalidate that provenance; hardware-register aliases retain the ordinary
+preservation and future-read checks.
+
+Raw frame-offset arithmetic may resolve a literal through earlier pure
+unique-space definitions in the same instruction. The bounded backward walk
+requires an exact, nearest storage definition and uses the existing opcode
+evaluator; partial writes, memory or control boundaries, and unknown register
+inputs stop it. Pointer widths must match and offset arithmetic must not
+overflow. This recognizes lowered immediate operands without importing tracked
+registers, loader values or optimized SSA into the raw frame proof.
+
+An explicit CALL_RETURN override can authorize unwinding the generated C
+activation at the exact return created by that override. The conditional proof
+retains its call/return identities, source model, stack root and observed raw
+delta. Final publication rechecks the override, normal-return topology and
+returned call value. Other normal returns still meet their actual stack deltas,
+and register restoration remains independent; neither raw stack facts nor an
+ordinary mismatched return acquire the override's unwind premise.
+
+Local lifting and authoritative host instruction decoding retain distinct origins
+for that premise. In the integrated Ghidra path, the Java producer marks only the
+RETURN it synthesizes for `FlowOverride.CALL_RETURN`; unsigned per-op attribute
+`kuna_callreturn` (4002) identifies the actual paired CALL/CALLIND ordinal in the
+same instruction, including preceding dynamic-operand operations in the count.
+The native instruction decoder validates the pair in that instruction's fresh
+operation stream. Injection payloads and generic raw decode buffers cannot supply
+a host-instruction origin. Java has already applied the override, so consuming
+this evidence does not apply it again or fabricate a local override declaration.
+The host origin belongs to the current lift and is rebuilt after host edits,
+flush, reset or reopen; final publication still checks the original operation
+identities and the separate activation obligations. A CALL followed by RETURN-zero,
+or an unmarked authored trap sequence, does not establish this source origin.
+
+### Logical declarations and ABI views
+
+`LogicalCallable` (`decompiler/crates/kuna-decomp/src/p4_calls/fspec.rs`)
+stores semantic result/input datatype identities and explicit arity separately
+from physical slots. Its model binding captures the architecture context and
+selected convention when the declaration is created; later default changes
+affect new declarations only. Recursive callable edges are non-owning graph
+IDs, not prototypes retaining their own datatype generation.
+
+`materialize_callable` waits for required by-value layouts while accepting a
+pointer whose pointee is still incomplete. It classifies the real datatype
+graph and records effective types, ordered storage pieces and source roles in
+an immutable `AbiView`. The factory caches ordinary views outside the graph.
+Supplied lists, committed host prototypes and site overrides retain their
+separate storage/locking authority and do not enter that cache. An assignment
+boundary such as `first=1` does not by itself open a supplied list for argument
+recovery. Its callable source view can still require variadic ABI passing.
+
+Callsite transfer uses those roles to preserve the logical declaration while
+matching existing physical operands. Failed locked-storage transfer retains
+the authoritative prototype for restart instead of discarding its locks.
+A required declaration still waiting for layout at call setup fails before
+`FuncLink`; it is not replaced with a generic prototype.
+
+Parsed full declarations retain their original `LogicalCallable` and the
+`AbiInputOrigin` map produced by the same successful storage assignment that
+populates the owning prototype. A generated hidden result pointer therefore
+remains distinct from declared inputs, even when the physical result is void;
+the source aggregate result is not reconstructed from an effective pointer.
+The logical variadic boundary stays in declared-input coordinates, with its
+physical boundary translated through those actual origins. Input-only
+signatures use temporary void solely for storage assignment and leave the
+output unlocked: they do not acquire a fabricated void source signature.
+Raw type updates and explicit storage commits likewise do not manufacture
+missing declaration origins or rerun assignment to guess them.
+
+For supported indirect aggregate results, executable C export keeps the real
+storage-writing function as a separately named physical body and publishes a
+wrapper with the original logical result and declared inputs. The wrapper
+allocates the result object, passes its address in the recorded hidden slot,
+passes each declared input in its recorded physical order, and returns the
+object. Compile-time size, member-offset and member-size checks require the C
+layout to match the certified datatype layout. This is not an ABI cast or a
+replacement implementation of the function: the actual physical body performs
+the writes. Its certificate must prove complete result-byte initialization on
+every normal return, initialized stored values and non-escaping hidden storage
+in raw flow, then replay the actual store/return identities, destinations and
+coverage against final SSA. The owning flow/effect and publication obligations
+remain required. Missing origins, unsupported layout or a lost body certificate
+refuse logical-result publication rather than inventing a result or accepting
+an ordinary pointer as a hidden role.
+
 ### ParamEntry: the storage atoms
 
 A `ParamEntry` (`decompiler/crates/kuna-decomp/src/p4_calls/fspec.rs
@@ -852,7 +1096,8 @@ that machinery.
   assumed extension op materialized at the entry block (`extend_input`), so a
   partially-used wide parameter still exists to take a SUBPIECE.
 - **`ActionDefaultParams`** (`coreaction_protos.rs (ActionDefaultParams)`)
-  gives every call spec a model: a callee with a source-declared prototype
+  gives every call spec a model: a host callee supplies its canonical
+  prototype above; a standalone callee with a source-declared prototype
   gets a locked copy re-built from the pieces parked on its global symbol
   (`decompiler/crates/kuna-decomp/src/infra/architecture.rs
   (Architecture::callee_proto_pieces)`); everything else gets the
@@ -1288,9 +1533,10 @@ to the spec (`decompiler/crates/kuna-decomp/src/p2_lift/flow.rs
 the upstream pointer-cast-into-offset trick. A CALLIND keeps the computed
 target Varnode in slot 0, which is exactly what the printer renders as
 `(*fptr)(...)`. Spec construction consults P0 immediately: a call-site
-prototype override is copied on first (before the callee-name query, so
-inline/inject effects are not clobbered), then the callee symbol's
-inline/no-return flow effects — inline queues the site for body injection, and
+prototype override is copied on first. Callee flow effects are copied only
+when the site has no model or the callee is inline; a returning override must
+not inherit a non-inline callee's `noreturn` flag. Explicit instruction flow
+overrides remain authoritative. Inline queues the site for body injection, and
 no-return plants an artificial halt after the call plus the "Subroutine does
 not return" warning (`decompiler/crates/kuna-decomp/src/p2_lift/flow.rs
 (FlowInfo::check_for_flow_modification)`; the fact-producing analyses are
@@ -1298,6 +1544,55 @@ chapter 01 §1.7, the lift-time behavior chapter 02 §2.4). Because that overrid
 already gives the call spec a model, the later exact-slot query in
 `ActionDefaultParams` declines, preserving the per-call-site priority for both
 direct and indirect calls.
+
+### Caller-owned completed overrides
+
+`decompiler/crates/kuna-decomp/src/p0_knowledge/overrides.rs (Override)`
+owns complete immutable prototypes by full callpoint address. The host seed
+belongs to the caller, not the callee's global facts or an interned callable
+datatype. It is installed before flow, copied directly into CALL/CALLIND
+specs, and retained across reflow, including later analysis-local changes.
+A host edit and cache flush load a fresh seed. Console declarations and the
+standalone format analyzer materialize their source declarations once into
+the same store; their format-origin marker remains separate from host ABI
+metadata.
+
+An internal signature is a different input contract from committed
+function/localdb storage. If any input address or a nonvoid output address is
+missing, `kuna_prototypeimport.rs` assigns the whole signature under its own
+resolved model. Otherwise it preserves the supplied addresses and flags
+exactly. A void output legitimately has no address: it must not trigger
+reassignment of completed custom inputs or an already assigned hidden-return
+pointer.
+
+`internallist first` is an assignment boundary, not `dotdotdot`. A closed
+format-string override therefore keeps its exact argument count. The
+completed physical boundary is retained independently as
+`FuncProto::get_abi_first_vararg`, including through copy, restart and internal
+serialization. The Ghidra host-override adapter explicitly marks its incoming
+index as effective-coordinate: Java derives it from an auto-inclusive callee
+parameter count. Shared assignment lowers the result first, translates past
+the actually generated hidden-result position, and lowers inputs once.
+Ordinary declarations retain declared-coordinate boundaries. An explicit
+pointer, an existing `this`, and an indirect-by-value input do not add an
+automatic slot; this-before-return placement is accounted for separately.
+
+A successful indirect aggregate result can have a void physical output and
+no output address, as on AppleSilicon. This preserves its output lock and the
+generated hidden input's lock. An ignored nonvoid output-assignment failure
+does not acquire those locks merely because it also yields physical void.
+
+Fully locked, known supplied types retain a `LogicalCallable` and actual
+`AbiInputOrigin` map. Its inputs include the expanded tail, its `logical_first`
+marks the fixed prefix, and its variadic source ABI is independent of the
+site's closed recovery arity. Unlocked or unknown types do not become an
+authoritative source signature. Committed replay never runs assignment again:
+complete explicit hidden/indirect role tags, including result
+`indirectstorage`, can retain the semantic pointee types and source order.
+Conflicting or incomplete tags leave the exact facts intact without inventing
+a source view. Untagged effective pointers are never guessed to be hidden.
+Producer limits and the native runtime witness are described in
+[`docs/ghidra-integration.md`](../ghidra-integration.md#aggregate-override-contract).
 
 ### Effect lists
 
@@ -1406,15 +1701,35 @@ already committed guards and trials under the wrong prototype; edits cannot be
 made backwards, but the Override survives `Funcdata::clear`, so the re-run
 lifts the truth.
 
+For returning, non-inlined targets, a narrow source signature with no target
+physical summary requests this reflow before locked narrowing when a load image
+is available, even for a site override. A no-load-image IR context cannot recover
+target machine facts by restarting; it retains normal override precedence and
+validated physical-slice transfer instead.
+
+Locked-input transfer retains the selected physical slice as a
+`CallInputTransfer`, rather than only remembering its old CALL operand. The
+offset is measured in least-significant bytes using the matched trial's storage
+and endianness; JOIN pieces use their recorded significance order. Commit uses
+that offset for `SUBPIECE`, so a custom upper-register argument cannot become
+the lower word when its target resolves late. The SSA operand's own address is
+not evidence of physical placement: it may be a unique temporary or constant.
+A wider operand follows the existing low-justified trial convention; an operand
+narrower than its trial or an unavailable slice declines transfer and uses the
+persisted restart path. Validation constructs no input Pcode before output
+compatibility is known. Exact-width inputs are reused, and stack parameters
+retain the existing placeholder/load path.
+
 The sibling `FuncCallSpecs::force_set` — forcing a *recovered* function-pointer
 prototype onto a call site, upstream's other deindirect arm — carries the same
-restart contract ((kuna) reason `ProtoForced`) and input-lock tail, but its
-override-persist and success-commit halves are documented port seams, and the
-`ActionDeindirect` arm that would invoke it (a typed function-pointer reaching
-the CALLIND after type recovery starts) is not wired; such a site today keeps
-its model-recovered argument list. This does not include the literal import-slot
-case above: `ActionDefaultParams` consumes that already-present global type
-before input trials start and needs no target rewrite or restart. Restarts triggered here are refused during
+restart contract ((kuna) reason `ProtoForced`) and slice-aware input transfer.
+`ActionDeindirect` invokes it for a typed callable declaration after ABI
+materialization. It preserves existing site authority, otherwise pins the
+complete declaration before attempting transfer: success commits the CALL
+operands/results immediately, while failure restarts from the pinned fact.
+The literal import-slot case above is earlier: `ActionDefaultParams` consumes
+that already-present global type before input trials start and needs no target
+rewrite or restart. Restarts triggered here are refused during
 jump-table sub-decompilation like every other feedback edge (00 §0.7).
 
 **The prototype wire encode.** The recovered prototype marshals out for the
@@ -1432,6 +1747,12 @@ them, so they matter only to a native decoder.  Input parameters are
 deliberately NOT here: on the wire they travel as `<localdb>` category-0
 symbols (chapter [06](06-variables-and-merge.md) §6.2), matching upstream's
 symbol-backed `ProtoStoreSymbol::encode`, which writes nothing.
+Completed override and callable signatures instead use `FuncProto::encode_internal`:
+one `<returnsym>` followed by an input-only `<internallist>`, with assigned
+storage, flags and the retained physical ABI boundary. The decoder also accepts
+legacy `<retparam>` output records, which refine the preceding return record
+without consuming an input ordinal. This internal form does not change the
+ordinary function/localdb response shape.
 
 ## 4.4 kuna extensions
 
@@ -1455,6 +1776,28 @@ latches a stack pointer too high into every later reference. The option asks
 the model states no extrapop of its own; a model that states one already has the
 exact value and is left alone, so `__cdecl`, x86-64 and every RISC spec are
 inert.
+
+The same option-gated resolution also runs when a parsed declaration is
+committed to the function being decompiled, before its symbols and parameter
+varnodes are reconciled. The owning body therefore checks its return stack
+delta against the same declared cleanup as its callers, rather than against
+`EXTRAPOP_UNKNOWN`. On 32-bit Windows, one stack-passed `__stdcall` argument
+means eight bytes including the return address; one register-passed
+`__fastcall` argument means four, while a third fastcall argument on the stack
+raises that to eight. This does not guess cleanup from the body or overwrite
+committed host storage facts. Turning `calleeprotostack` off leaves an unknown
+model cleanup unknown at both declaration consumers; an already-known
+`__cdecl` cleanup remains unchanged. Calling-convention printing is independent
+of this semantic contract.
+
+An ordinary immutable callable ABI view can still carry the model's unknown
+cleanup. Consumers of such a view use the same read-only declaration calculation
+when `calleeprotostack` is enabled, without mutating the cached view or copying
+and rewriting committed entry/site facts. This applies to the exposed ABI of a
+returned callable as well as a materialized indirect-call family. The calculated
+cleanup is only an expectation: register preservation still requires the actual
+raw or independently validated conditional stack-adjustment receipt to match
+it exactly. The option-off path does not perform this calculation.
 
 The same park is read a second time, at de-indirection. `ActionDefaultParams`
 runs once at the head of the function, when a `call dword ptr [IAT slot]` is
@@ -2167,7 +2510,13 @@ is refused outright wherever the caller holds evidence the fold cannot weigh
   an integer, and the float vote printed `(int)v1 + 3`, `v1 == 1.5000001`,
   `(short)((unsigned int)v1 >> 0x10)` and `a2[1] = (int)v1` — value conversions
   where the machine works on bits, which compute different numbers (the fixture
-  `protoorder_floatgpr_mipsel`). The store is not particular to those ABIs: on
+  `protoorder_floatgpr_mipsel`). Its regression compiles seven unchanged emitted
+  callers against a bit-preserving call adapter and compares their values and
+  stored bytes with source helpers, including comparison-boundary inputs.
+  Generated-side storage follows the emitted array or record interface;
+  separate source-side storage retains the source array type. This checks the
+  callers' integer-use invariant, not exact source-type recovery or whole-program
+  MIPS ABI equivalence. The store is not particular to those ABIs: on
   x86-64 a float loaded, passed in `xmm0` and stored beside an int in a struct
   kuna types as `int *` printed `v1[1] = (int)v3` (the fixture
   `protoorder_floatstore_x86_64`). Two more sources refuse a float vote: a

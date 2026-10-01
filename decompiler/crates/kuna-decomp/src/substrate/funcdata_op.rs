@@ -77,6 +77,7 @@ use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{OpId, TypeOp, VarnodeId};
 use crate::varnode::DefOpInfo;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 impl Funcdata {
     // -----------------------------------------------------------------------
@@ -308,15 +309,30 @@ impl Funcdata {
     /// SymbolEntry binding is the `kuna_symbol_entry` Symbol id parked on the
     /// Varnode (and, for an equate, mirrored on its HighVariable so the printer's
     /// `vn_high_equate_symbol` lookup finds it).  The C++ also copies the type and
-    /// the type/name locks; the equate's type is `getBase(1,TYPE_UNKNOWN)` and the
-    /// forced display format is carried by the Symbol itself, so reusing the
-    /// existing binding (without retyping `dst`) preserves the render facet while
-    /// avoiding a spurious size-1 retype of the collapsed constant.
+    /// the type/name locks even without a symbol. Same-size copies preserve the
+    /// source Varnode's type, never the equate Symbol's one-byte placeholder type.
+    /// Cross-size equate folds retain the destination's width/type and transfer
+    /// only the binding and display facet.
     pub(crate) fn copy_symbol(&mut self, dst: VarnodeId, src: VarnodeId) {
-        let sym = match self.vbank().get(src).and_then(|v| v.kuna_symbol_entry()) {
-            Some(s) => s,
+        let (size, dtype, flags, sym) = match self.vbank().get(src) {
+            Some(v) => (v.get_size(), v.get_type().clone(), v.get_flags(), v.kuna_symbol_entry()),
             None => return,
         };
+        let high = if let Some(v) = self.vbank_mut().get_mut(dst) {
+            if v.get_size() == size {
+                v.copy_symbol_fields(dtype, flags);
+                v.get_high()
+            } else {
+                None
+            }
+        } else {
+            return;
+        };
+        if let Some(high) = high.and_then(|id| self.high_bank_mut().get_mut(id)) {
+            high.type_dirty();
+            high.flags_dirty();
+        }
+        let Some(sym) = sym else { return };
         // dst->setSymbolEntry-equivalent: park the binding on the Varnode (this
         // marks it `Varnode::mapped`), then mirror onto its High for the printer.
         if let Some(v) = self.vbank_mut().get_mut(dst) {
@@ -379,13 +395,8 @@ impl Funcdata {
     /// read.  Now that the funcdata_varnode factory has landed, the
     /// re-duplication is ported faithfully.
     ///
-    /// STUB(W4): `cvn->copySymbol(vn)` propagates the original constant's
-    /// data-type and `SymbolEntry`/`typelock|namelock` markup onto the duplicate.
-    /// The type-/symbol-propagation machinery (mapentry, `HighVariable`,
-    /// `TypeFactory`) is W4/W6; until it lands the duplicate carries the unknown
-    /// base of its size (exactly what `newConstant` builds — and what the original
-    /// `vn` itself carries in the W3 IR, where no symbol is attached yet), so the
-    /// `copySymbol` is currently a structural no-op.  Recorded as a (latent) loss.
+    /// `copySymbol` preserves the original constant's type and locks even when
+    /// no symbol is bound, so introducing a new edge cannot reinterpret its bits.
     pub fn op_set_input(&mut self, op: OpId, vn: VarnodeId, slot: int4) -> KunaResult<()> {
         let mut vn = vn;
         // C++ `opSetInput` takes `Varnode *vn`, which may be `(Varnode *)0`
@@ -473,12 +484,22 @@ impl Funcdata {
     pub fn op_remove_input(&mut self, op: OpId, slot: int4) {
         self.op_unset_input(op, slot);
         self.obank_mut().get_mut(op).expect("op_remove_input: stale op").remove_input(slot);
+        if matches!(self.obank().get(op).expect("removed input").code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) {
+            if let Some(index) = self.get_call_specs_index(op) {
+                self.get_call_specs_mut(index).physical_input_removed(slot);
+            }
+        }
     }
 
     /// Insert space for a new input Varnode before the given slot, then set it
     /// (C++ `Funcdata::opInsertInput`, `funcdata_op.cc:308`).
     pub fn op_insert_input(&mut self, op: OpId, vn: VarnodeId, slot: int4) -> KunaResult<()> {
         self.obank_mut().get_mut(op).expect("op_insert_input: stale op").insert_input(slot);
+        if matches!(self.obank().get(op).expect("inserted input").code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) {
+            if let Some(index) = self.get_call_specs_index(op) {
+                self.get_call_specs_mut(index).physical_input_inserted(slot);
+            }
+        }
         self.op_set_input(op, vn, slot)
     }
 
@@ -1003,6 +1024,7 @@ impl Funcdata {
         if opc == OpCode::CPUI_MAX {
             return Ok(false);
         }
+        let receipt = branch_receipt::begin_normalize(self, cbranch);
         self.op_set_opcode(cond_op, crate::typeop::type_op_for(opc));
         if flipyes {
             self.op_swap_input(cond_op, 0, 1);
@@ -1014,6 +1036,7 @@ impl Funcdata {
         if opc == OpCode::CPUI_INT_LESSEQUAL || opc == OpCode::CPUI_INT_SLESSEQUAL {
             self.replace_lessequal(cond_op)?;
         }
+        branch_receipt::finish(self, receipt);
         Ok(true)
     }
 
@@ -2360,6 +2383,8 @@ impl Funcdata {
                 let zero = self.new_constant(1, 0);
                 self.op_set_input(new_return, zero, 0)?;
                 self.op_dead_insert_after(new_return, op);
+                self.record_flow_return_origin(new_return, op,
+                    crate::p4_calls::kuna_physicalinputs::FlowReturnOrigin::LocalOverride);
             }
         } else if type_ == flow_type::RETURN {
             match opc {

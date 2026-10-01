@@ -320,7 +320,7 @@ fn verify_w2translate_decode_op_seventeen_inputs() {
     dec.ingest_stream(xml.as_bytes()).unwrap();
     let mut emit = Collect(Vec::new());
     let addr = Address::new(Rc::clone(&ram), 0x400000);
-    emit.decode_op(&addr, &mut dec).unwrap();
+    emit.decode_op(&addr, &mut dec, kuna_sleigh::translate::PcodeDecodeContext::Raw).unwrap();
     assert_eq!(emit.0.len(), 1);
     let (opc, out, ins) = &emit.0[0];
     assert_eq!(*opc, OpCode::CPUI_CALLOTHER);

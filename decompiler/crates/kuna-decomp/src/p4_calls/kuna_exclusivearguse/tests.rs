@@ -15,7 +15,6 @@ use kuna_base::types::int4;
 use kuna_base::error::KunaResult;
 
 use crate::context::{ArchContext, TypeOp};
-use crate::dtype::{type_metatype, Datatype};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
 use super::*;
@@ -56,10 +55,6 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 fn mk_block(fd: &mut Funcdata) -> BlockId {
     let root = fd.bblocks_ref().root.expect("bblocks root");
     fd.bblocks_mut().new_block_basic(root)
@@ -75,7 +70,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, inputs: int4, off: u64, opc: OpCode) ->
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), None)
 }
 
 fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
@@ -95,7 +90,7 @@ fn mk_defined_ptr(fd: &mut Funcdata, bl: BlockId, off: u64) -> VarnodeId {
     wire(fd, base, op, 0);
     wire(fd, disp, op, 1);
     let r = ram(fd);
-    let out = fd.new_varnode(8, &Address::new(r, 0x40), Some(unk(8)));
+    let out = fd.new_varnode(8, &Address::new(r, 0x40), None);
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();

@@ -39,7 +39,7 @@ use kuna_base::types::{int4, uint4};
 use kuna_num::opcodes::OpCode;
 
 use kuna_decomp::coreaction_infertypes::propagate_type_pub;
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::op::pcodeop_flags;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
@@ -69,7 +69,9 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut glb = ArchContext::new(manage);
+    glb.types = Some(Rc::new(factory()));
+    let glb = Rc::new(glb);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -79,8 +81,8 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode, flags: uint4) -> OpId {
@@ -92,7 +94,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode, flags: uint4) -
 
 fn mk_input(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(1, Address::new(ram, off), unk(1));
+    let ty = unk(fd, 1);
+    let vn = fd.vbank_mut().create(1, Address::new(ram, off), ty);
     fd.vbank_mut()
         .set_input(vn, &mut |_: &mut kuna_decomp::varnode::VarnodeBank, _, _| Ok(()))
         .unwrap()
@@ -107,15 +110,13 @@ fn mk_compare(fd: &mut Funcdata, opc: OpCode) -> (OpId, VarnodeId, VarnodeId) {
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     let ram = ram_space(fd);
-    let out = fd.new_varnode(1, &Address::new(ram, 0x40), Some(unk(1)));
+    let ty = unk(fd, 1);
+    let out = fd.new_varnode(1, &Address::new(ram, 0x40), Some(ty));
     fd.op_set_output(op, out).unwrap();
     (op, a, b)
 }
 
-/// A standalone, populated type factory (the SLESS/SLESSEQUAL arm only inspects
-/// `alttype.get_metatype()`, so the data-types can come from any factory —
-/// matching the in-module `propagate_type_tests` setup, which builds types from
-/// a free `TypeFactoryImpl` rather than the (seam) architecture's).
+/// The shared factory for the function's varnodes and propagation candidates.
 fn factory() -> TypeFactoryImpl {
     let f = TypeFactoryImpl::new();
     f.set_default_alignment_map();
@@ -130,7 +131,7 @@ fn factory() -> TypeFactoryImpl {
 }
 
 /// A real signed 1-byte `char` (TypeChar -> TypeBase(1,TYPE_INT)).
-fn make_char(f: &TypeFactoryImpl) -> Rc<Datatype> {
+fn make_char(f: &TypeFactoryImpl) -> TypeRoot {
     f.get_type_char(1).expect("char type")
 }
 
@@ -145,14 +146,13 @@ fn make_char(f: &TypeFactoryImpl) -> Rc<Datatype> {
 #[test]
 fn w10_charptr_slesss_propagates_a_signed_char() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     let chr = make_char(&f);
-    assert_eq!(chr.get_metatype(), type_metatype::TYPE_INT, "a char must be TYPE_INT");
     // Propagate FROM input slot 0 (a) TO input slot 1 (b).
-    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, chr.clone(), op, a, b, 0, 1);
     let out = out.expect("a signed char propagates across INT_SLESS");
-    assert!(Rc::ptr_eq(&out, &chr), "the SLESS arm returns the incoming type unchanged");
+    assert_eq!(out, chr, "signed comparison preserves the character type");
 }
 
 /// A `uint1` (TYPE_UINT) read by an INT_SLESS does NOT propagate — "Only
@@ -161,10 +161,9 @@ fn w10_charptr_slesss_propagates_a_signed_char() {
 #[test]
 fn w10_charptr_sless_declines_an_unsigned_byte() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
-    assert_eq!(u1.get_metatype(), type_metatype::TYPE_UINT);
     let out = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1);
     assert!(out.is_none(), "a uint1 must NOT propagate across a signed compare");
 }
@@ -175,11 +174,10 @@ fn w10_charptr_sless_declines_an_unsigned_byte() {
 #[test]
 fn w10_charptr_sless_declines_a_pointer() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     let chr = make_char(&f);
     let cptr = f.get_type_pointer(8, chr, 1).expect("char *");
-    assert_eq!(cptr.get_metatype(), type_metatype::TYPE_PTR);
     let out = propagate_type_pub(&mut fd, cptr, op, a, b, 0, 1);
     assert!(out.is_none(), "a pointer must NOT propagate across a signed compare");
 }
@@ -189,11 +187,11 @@ fn w10_charptr_sless_declines_a_pointer() {
 #[test]
 fn w10_charptr_slessequal_matches_sless_exactly() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESSEQUAL);
     let chr = make_char(&f);
-    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1);
-    assert!(out.is_some(), "char propagates across INT_SLESSEQUAL");
+    let out = propagate_type_pub(&mut fd, chr.clone(), op, a, b, 0, 1);
+    assert_eq!(out, Some(chr), "char propagates across INT_SLESSEQUAL");
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
     let out_u = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1);
     assert!(out_u.is_none(), "uint1 declines across INT_SLESSEQUAL");
@@ -210,13 +208,13 @@ fn w10_charptr_slessequal_matches_sless_exactly() {
 #[test]
 fn w10_charptr_sless_declines_when_a_slot_is_the_output() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, _b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     let out = fd.obank().get(op).unwrap().get_out().unwrap();
     let chr = make_char(&f);
     // input(0) -> output(-1): declines.
     assert!(
-        propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, out, 0, -1).is_none(),
+        propagate_type_pub(&mut fd, chr.clone(), op, a, out, 0, -1).is_none(),
         "char must not flow from an input to the boolean output"
     );
     // output(-1) -> input(1): declines.
@@ -239,10 +237,10 @@ fn w10_charptr_sless_declines_when_a_slot_is_the_output() {
 #[test]
 fn w10_charptr_unsigned_int_less_still_propagates_a_uint1() {
     let mut fd = build_fd();
-    let f = factory();
+    let f = fd.get_arch().types_rc().unwrap();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_LESS);
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
-    let out = propagate_type_pub(&mut fd, Rc::clone(&u1), op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, u1.clone(), op, a, b, 0, 1);
     let out = out.expect("INT_LESS (unsigned) propagates a uint1 via propagateAcrossCompare");
     assert_eq!(
         out.get_metatype(),

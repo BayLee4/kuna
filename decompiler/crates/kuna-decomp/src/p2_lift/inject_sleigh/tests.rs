@@ -493,7 +493,12 @@ fn emit_funcdata() -> (Funcdata, Rc<AddrSpace>) {
     )))
     .unwrap();
     let const_space = Rc::clone(m.get_constant_space().unwrap());
-    let glb = Rc::new(ArchContext::new(m));
+    let mut context = ArchContext::new(m);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let entry = Address::new(Rc::clone(&ram), 0x1000);
     let fd = Funcdata::new("inj", "inj", glb, entry, 0x10000000, 0x40).unwrap();

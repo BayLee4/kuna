@@ -1,0 +1,269 @@
+*** Begin Patch
+*** Update File: decompiler/crates/kuna-decomp/src/infra/decompile_drive.rs
+@@ -993,14 +993,16 @@
+         Ok(())
+     }
+ 
+-    fn generated_targets(&mut self, arch: &mut Architecture, data: &Funcdata)
++    fn generated_targets(&mut self, arch: &mut Architecture, data: &Funcdata, raw_owner: bool)
+         -> KunaResult<BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_callabletransport::GeneratedBodyTarget>>>
+     {
+         let entries = std::mem::take(&mut self.generated_entries);
+         let result = (|| {
++            for entry in &entries { self.summary(arch, entry)?; }
++            self.close_recursive_graph(raw_owner.then_some(data))?;
+             let mut targets = BTreeMap::new();
+             for entry in &entries {
+-                let raw = self.summary(arch, entry)?;
++                let raw = self.summaries.get(entry).expect("discovered raw target").clone();
+                 let witness = self.mapped_bodies.get(entry).cloned();
+                 if std::env::var_os("KUNA_GENERATED_TRACE").is_some() {
+                     eprintln!("GENERATED probe entry={:?}:{} raw={:p} complete={} conditional={} mapped={}",
+@@ -1087,7 +1089,7 @@
+         self.branch_replays = crate::p4_calls::kuna_branchreachability::completed_replays(data);
+         self.generated_entries = generated_target_requests(data)?;
+         self.active.insert(data.get_address().clone());
+-        let targets = self.generated_targets(arch, data);
++        let targets = self.generated_targets(arch, data, false);
+         self.active.remove(data.get_address());
+         let targets = targets?;
+         let trace = std::env::var_os("KUNA_GENERATED_TRACE").is_some();
+@@ -1161,6 +1163,8 @@
+ struct PhysicalInputDrive {
+     summaries: std::collections::BTreeMap<Address, std::rc::Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>,
+     active: std::collections::BTreeSet<Address>,
++    recursive_entries: BTreeSet<Address>,
++    raw_probes: BTreeMap<Address, Funcdata>,
+     decoded: usize,
+     native_sites: BTreeMap<kuna_base::address::SeqNum, RawNativeSite>,
+     native_replays: BTreeMap<kuna_base::address::SeqNum, NativeReplay>,
+@@ -1174,6 +1178,123 @@
+ }
+ 
+ impl PhysicalInputDrive {
++    fn mapped_raw_body(data: &Funcdata) -> bool {
++        data.get_arch().execution_callable_c && data.bblocks_get_size() > 0
++            && !data.has_bad_data() && !data.has_unimplemented()
++            && data.flags() & crate::funcdata::funcdata_flags::jumptablerecovery_on == 0
++            && data.obank().iter_all().next().is_some()
++            && data.obank().iter_all().all(|(_, id)| data.obank().get(id).is_some_and(|operation|
++                operation.get_halt_type() == 0 && (operation.code() != OpCode::CPUI_BRANCHIND
++                    || data.find_jump_table_index(id).is_some_and(|index|
++                        data.get_jump_table(index as int4).num_entries() != 0))))
++    }
++
++    /// Close only actual raw bodies retained in this flow epoch. At the settled
++    /// SSA checkpoint `owner` is absent: that graph is not a substitute raw body.
++    fn close_recursive_graph(&mut self, owner: Option<&Funcdata>) -> KunaResult<()> {
++        use crate::p4_calls::kuna_physicalinputs::{
++            analyze_raw_recursive_component, from_raw_flow, MappedBodyWitness,
++        };
++        if self.recursive_entries.is_empty() { return Ok(()); }
++        let owner = owner.filter(|data| Self::mapped_raw_body(data));
++        let mut bodies = self.raw_probes.values()
++            .filter(|body| owner.is_none_or(|owner| body.get_address() != owner.get_address()))
++            .collect::<Vec<_>>();
++        if let Some(owner) = owner { bodies.push(owner); }
++        if bodies.is_empty() { return Ok(()); }
++        // Discovery admits at most32 probes plus the actual borrowed owner.
++        // A wider graph remains unresolved rather than truncating its edges.
++        if bodies.len() > 64 { return Ok(()); }
++        let positions = bodies.iter().enumerate().map(|(index, body)|
++            (body.get_address().clone(), index)).collect::<BTreeMap<_, _>>();
++        let mut edges = vec![0u64; bodies.len()];
++        for (index, body) in bodies.iter().enumerate() {
++            for slot in 0..body.num_calls() {
++                let call = body.get_call_specs(slot);
++                if body.obank().get(call.get_op()).is_none_or(|operation|
++                    operation.is_dead() || operation.code() != OpCode::CPUI_CALL) { continue; }
++                if let Some(target) = positions.get(call.get_entry_address()) {
++                    edges[index] |= 1u64 << *target;
++                }
++            }
++        }
++        // Bitset transitive closure is bounded by the existing probe limit and
++        // keeps member ordering deterministic without another graph abstraction.
++        let mut reach = edges.clone();
++        for via in 0..bodies.len() {
++            let through = reach[via];
++            for from in &mut reach {
++                if *from & (1u64 << via) != 0 { *from |= through; }
++            }
++        }
++        let mut grouped = 0u64;
++        let mut components = Vec::new();
++        for index in 0..bodies.len() {
++            if grouped & (1u64 << index) != 0 { continue; }
++            let mut component = 1u64 << index;
++            for other in index + 1..bodies.len() {
++                if reach[index] & (1u64 << other) != 0 && reach[other] & (1u64 << index) != 0 {
++                    component |= 1u64 << other;
++                }
++            }
++            grouped |= component;
++            components.push(component);
++        }
++        let mut pending = grouped;
++        while pending != 0 {
++            let mut advanced = false;
++            for &component in &components {
++                if pending & component == 0 { continue; }
++                let indices = (0..bodies.len()).filter(|index| component & (1u64 << index) != 0);
++                let outgoing = indices.clone().fold(0, |outgoing, index| outgoing | edges[index]);
++                if outgoing & pending & !component != 0 { continue; }
++                let members = indices.clone().map(|index| bodies[index]).collect::<Vec<_>>();
++                let recursive = members.len() > 1 || outgoing & component != 0;
++                let completed = if recursive {
++                    analyze_raw_recursive_component(&members, &self.summaries)?
++                } else {
++                    let body = members[0];
++                    let mut callees = BTreeMap::new();
++                    for slot in 0..body.num_calls() {
++                        let call = body.get_call_specs(slot);
++                        if let Some(raw) = self.summaries.get(call.get_entry_address()) {
++                            callees.insert(call.get_op(), raw.clone());
++                        }
++                    }
++                    let raw = from_raw_flow(body, &callees, None).requirements;
++                    raw.is_complete().then(|| vec![raw])
++                };
++                if let Some(completed) = completed {
++                    if completed.len() != members.len() || completed.iter().any(|raw|
++                        !raw.is_complete() || (recursive && !raw.has_normal_return)) {
++                        return Err(KunaError::lowlevel("Recursive raw analysis returned an unclosed component"));
++                    }
++                    // Stage every exact Rc/witness before updating either cache.
++                    // No consumer can observe a partially installed component.
++                    let staged = members.iter().zip(completed).map(|(body, raw)| {
++                        let entry = body.get_address().clone();
++                        let raw = Rc::new(raw);
++                        let witness = Rc::new(MappedBodyWitness::new(entry.clone(), raw.clone()));
++                        (entry, raw, witness)
++                    }).collect::<Vec<_>>();
++                    for (entry, raw, witness) in staged {
++                        self.summaries.insert(entry.clone(), raw);
++                        self.mapped_bodies.insert(entry, witness);
++                    }
++                }
++                pending &= !component;
++                advanced = true;
++            }
++            if !advanced {
++                return Err(KunaError::lowlevel("Recursive raw component ordering did not close"));
++            }
++        }
++        drop(bodies);
++        let summaries = &self.summaries;
++        self.raw_probes.retain(|entry, _| summaries.get(entry).is_none_or(|raw| !raw.is_complete()));
++        Ok(())
++    }
++
+     fn summary(&mut self, arch: &mut Architecture, entry: &Address)
+         -> KunaResult<std::rc::Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>
+     {
+@@ -1182,9 +1303,13 @@
+             return Err(KunaError::lowlevel("Physical call analysis exceeded function deadline"));
+         }
+         if let Some(summary) = self.summaries.get(entry) { return Ok(summary.clone()); }
+-        if self.decoded >= 32 || !self.active.insert(entry.clone()) {
+-            return Ok(std::rc::Rc::new(EntryRequirements::default()));
+-        }
++        if self.active.contains(entry) || self.decoded >= 32 {
++            if self.active.contains(entry) { self.recursive_entries.insert(entry.clone()); }
++            let cut = std::rc::Rc::new(EntryRequirements::default());
++            self.summaries.insert(entry.clone(), cut.clone());
++            return Ok(cut);
++        }
++        self.active.insert(entry.clone());
+         self.decoded += 1;
+         let lifted = (|| {
+             let mut probe = arch.new_funcdata("", entry.clone(), 0)?;
+@@ -1209,13 +1334,7 @@
+                 if no_real_body { self.no_real_bodies.insert(entry.clone()); }
+                 // This witnesses only a real, closed target-own CFG. Nested call
+                 // cuts remain in its raw requirements and need actual bodies.
+-                mapped = probe.get_arch().execution_callable_c && !no_real_body
+-                    && probe.bblocks_get_size() > 0 && !probe.has_bad_data() && !probe.has_unimplemented()
+-                    && probe.flags() & crate::funcdata::funcdata_flags::jumptablerecovery_on == 0
+-                    && probe.obank().iter_all().all(|(_, id)| probe.obank().get(id).is_some_and(|operation|
+-                        operation.get_halt_type() == 0 && (operation.code() != OpCode::CPUI_BRANCHIND
+-                            || probe.find_jump_table_index(id).is_some_and(|index|
+-                                probe.get_jump_table(index as int4).num_entries() != 0))));
++                mapped = Self::mapped_raw_body(&probe);
+                 let mut callees = std::collections::BTreeMap::new();
+                 for index in 0..probe.num_calls() {
+                     let call = probe.get_call_specs(index);
+@@ -1225,7 +1344,11 @@
+                     }
+                 }
+                 // Probe-local operation identities never enter cross-target caches.
+-                from_raw_flow(&probe, &callees, None).requirements
++                let requirements = from_raw_flow(&probe, &callees, None).requirements;
++                if mapped && !requirements.is_complete() && !self.recursive_entries.is_empty() {
++                    self.raw_probes.insert(entry.clone(), probe);
++                }
++                requirements
+             }
+             Err(_) => EntryRequirements { incomplete_flow: true, ..Default::default() },
+         };
+@@ -1303,11 +1426,13 @@
+         // A reflow can install authoritative indirect/flow overrides. Summaries
+         // belong to this flow epoch; never reuse a previous epoch's proof.
+         self.summaries.clear();
++        self.recursive_entries.clear();
++        self.raw_probes.clear();
+         self.no_real_bodies.clear();
+         self.mapped_bodies.clear();
+         self.decoded = 0;
+         self.active.insert(data.get_address().clone());
+-        if callable_boundary {
++        let physical_targets = if callable_boundary {
+             let mut targets = std::collections::BTreeSet::new();
+             if let Some(space) = data.get_address().get_space() {
+                 for id in data.vbank().iter_loc() {
+@@ -1320,21 +1445,29 @@
+                     }
+                 }
+             }
+-            for entry in targets {
+-                let summary = self.summary(arch, &entry)?;
+-                data.set_physical_target_requirements(entry, summary);
+-            }
++            for entry in &targets { self.summary(arch, entry)?; }
++            targets
++        } else { BTreeSet::new() };
++        for index in 0..data.num_calls() {
++            let entry = data.get_call_specs(index).get_entry_address();
++            if !entry.is_invalid() { self.summary(arch, entry)?; }
++        }
++        // All discovery precedes closure; all site/target bindings follow it.
++        // This supplies the actual raw owner, never its later settled SSA body.
++        let generated = self.generated_targets(arch, data, true)?;
++        for entry in physical_targets {
++            let summary = self.summaries.get(&entry).expect("discovered callable target").clone();
++            data.set_physical_target_requirements(entry, summary);
+         }
+         let mut callees = std::collections::BTreeMap::new();
+         for index in 0..data.num_calls() {
+             let entry = data.get_call_specs(index).get_entry_address().clone();
+             if entry.is_invalid() { continue; }
+-            let summary = self.summary(arch, &entry)?;
++            let summary = self.summaries.get(&entry).expect("discovered direct target").clone();
+             callees.insert(data.get_call_specs(index).get_op(), summary.clone());
+             data.set_physical_target_requirements(entry, summary.clone());
+             data.get_call_specs_mut(index).set_physical_requirements(summary);
+         }
+-        let generated = self.generated_targets(arch, data)?;
+         self.active.remove(data.get_address());
+         self.seed_native(arch, data)?;
+         self.seed_generated(data, &generated)?;
+@@ -1345,7 +1478,7 @@
+         }
+         let flow = crate::p4_calls::kuna_physicalinputs::ConditionalFlowView::from_receipts(data)?;
+         // Scan the caller's actual raw IR, including its request-local Override.
+-        // A recursive edge is an explicit incomplete cut, not a fresh unoverridden body.
++        // Only the grounded raw component solver can close a recursive cut.
+         let own = from_raw_flow(data, &callees, flow);
+         data.set_entry_physical_analysis(own);
+         if data.get_arch().execution_callable_c {
+*** End Patch

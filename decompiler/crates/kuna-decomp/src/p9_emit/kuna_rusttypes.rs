@@ -15,9 +15,9 @@
 //! - A residual `TYPE_UNKNOWN` of a width Rust has no integer for (3/5/6/7,
 //!   10, 16) spells `[u8; N]`, which is *more* faithful than C's `undefined3` —
 //!   it names the storage exactly and does not pretend to be a scalar.
-//! - `TYPE_CODE` spells `*const ()` rather than a real `fn` type: the recovered
-//!   prototype is not carried through this path, and an `unsafe extern "C" fn()`
-//!   with the wrong arity would be worse than an honest opaque pointer.
+//! - `TYPE_CODE` spells `*const ()` rather than a real `fn` type. The graph
+//!   preserves its logical signature, but this speller does not map recovered
+//!   calling conventions to Rust ABIs; inventing `extern "C"` would be unsound.
 //! - Pointers spell `*mut T` — raw, and uniformly `mut`. Not references: kuna
 //!   recovers no borrow information, and `&T` would assert an aliasing invariant
 //!   that is not known to hold. Uniformly `mut` because const-qualification is
@@ -30,12 +30,11 @@
 //! always spells.
 
 use std::borrow::Cow;
-use std::rc::Rc;
 
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype};
-use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+use crate::dtype::type_metatype;
+use crate::kuna_langtypes::{SpellCtx, TypeSpeller, TypeText, TypeTokenPolicy};
 
 /// The rust-language type speller.
 pub struct RustSpeller;
@@ -79,41 +78,61 @@ fn byte_array(size: int4) -> String {
 
 impl RustSpeller {
     /// The full prefix spelling of `ct`, built inward-out.
-    fn type_expr(&self, cx: &SpellCtx, ct: &Rc<Datatype>, depth: u32) -> String {
+    fn type_expr(
+        &self, cx: &SpellCtx, ct: &crate::dtype::TypeRoot, depth: u32, annotate: bool,
+    ) -> TypeText {
         // A recovered type graph can be cyclic through a struct pointer; the C
         // declarator walk stops at the first NAMED type, and this one needs the
         // same guard because it recurses through pointees.
         if depth > 16 {
-            return "*const ()".to_string();
+            return TypeText::plain("*const ()");
         }
         match ct.get_metatype() {
             type_metatype::TYPE_PTR => {
-                let inner = match ct.get_ptr_to() {
-                    Some(p) => self.type_expr(cx, &p, depth + 1),
-                    None => "()".to_string(),
+                let mut inner = match ct.get_ptr_to() {
+                    Some(p) => self.type_expr(cx, &p, depth + 1, annotate),
+                    None => TypeText::plain("()"),
                 };
-                format!("*mut {inner}")
+                inner.prefix("*mut ");
+                inner
             }
             type_metatype::TYPE_ARRAY => {
                 let base = ct.get_array_base();
-                let elem = match &base {
-                    Some(b) => self.type_expr(cx, b, depth + 1),
-                    None => "u8".to_string(),
+                let mut elem = match &base {
+                    Some(b) => self.type_expr(cx, b, depth + 1, annotate),
+                    None => TypeText::plain("u8"),
                 };
                 let n = ct.num_elements().unwrap_or_else(|| {
                     let w = base.map(|b| b.get_size()).unwrap_or(1).max(1);
                     ct.get_size() / w
                 });
-                format!("[{elem}; {n}]")
+                elem.text = format!("[{}; {n}]", elem.text);
+                for span in &mut elem.spans {
+                    span.start += 1;
+                    span.end += 1;
+                }
+                elem
             }
             _ => match self.relabel(cx, ct, false) {
-                Some(n) => n.into_owned(),
+                Some(n) => {
+                    // Opaque code and storage-array fallbacks do not contain a
+                    // spelled leaf of the original datatype.
+                    let leaf = annotate
+                        && !matches!(ct.get_metatype(), type_metatype::TYPE_CODE | type_metatype::TYPE_VOID)
+                        && !n.starts_with('[');
+                    TypeText::leaf(n.into_owned(), ct, leaf, TypeTokenPolicy::SpelledWords)
+                }
                 None => {
-                    let name = ct.get_name();
+                    let view = ct.read();
+                    let node = view.get(ct.id()).expect("retained datatype");
+                    let name = node.get_name();
                     if name.is_empty() {
-                        self.anonymous(ct)
+                        TypeText::plain(self.anonymous(ct))
                     } else {
-                        type_path(ct.get_display_name())
+                        // type_path deliberately emits Rust type grammar, not
+                        // an opaque C identifier for the host to sanitize.
+                        TypeText::leaf(type_path(node.get_display_name()), ct, annotate,
+                            TypeTokenPolicy::SpelledWords)
                     }
                 }
             },
@@ -220,7 +239,7 @@ impl TypeSpeller for RustSpeller {
     fn relabel(
         &self,
         _cx: &SpellCtx,
-        dt: &Rc<Datatype>,
+        dt: &crate::dtype::TypeRoot,
         _under_pointer: bool,
     ) -> Option<Cow<'static, str>> {
         let size = dt.get_size();
@@ -258,7 +277,7 @@ impl TypeSpeller for RustSpeller {
         }
     }
 
-    fn anonymous(&self, dt: &Rc<Datatype>) -> String {
+    fn anonymous(&self, dt: &crate::dtype::TypeRoot) -> String {
         match dt.get_metatype() {
             type_metatype::TYPE_VOID => "()".to_string(),
             _ => match int_name(dt.get_size(), false) {
@@ -269,12 +288,16 @@ impl TypeSpeller for RustSpeller {
     }
 
     /// Rust types are pure prefixes, so `back` is always empty.
-    fn declarator(&self, cx: &SpellCtx, ct: &Rc<Datatype>) -> (String, String) {
-        (self.type_expr(cx, ct, 0), String::new())
+    fn declarator_annotated(
+        &self, cx: &SpellCtx, ct: &crate::dtype::TypeRoot, annotate: bool,
+    ) -> (TypeText, TypeText) {
+        (self.type_expr(cx, ct, 0, annotate), TypeText::default())
     }
 
-    fn type_name(&self, cx: &SpellCtx, t: &Rc<Datatype>) -> (String, String) {
-        (self.type_expr(cx, t, 0), String::new())
+    fn type_name_annotated(
+        &self, cx: &SpellCtx, t: &crate::dtype::TypeRoot, annotate: bool,
+    ) -> (TypeText, TypeText) {
+        (self.type_expr(cx, t, 0, annotate), TypeText::default())
     }
 
     fn unknown_base(

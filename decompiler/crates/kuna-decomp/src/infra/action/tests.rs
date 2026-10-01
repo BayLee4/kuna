@@ -86,12 +86,8 @@ impl Rule for LogRule {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains(self.group) {
-            Some(Box::new(LogRule { tag: self.tag.clone(), log: self.log.clone(), group: self.group }))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(LogRule { tag: self.tag.clone(), log: self.log.clone(), group: self.group })
     }
 }
 
@@ -116,8 +112,8 @@ impl Rule for MorphRule {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
     }
-    fn clone_rule(&self, _g: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(MorphRule { log: self.log.clone(), fired: self.fired.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(MorphRule { log: self.log.clone(), fired: self.fired.clone() })
     }
 }
 
@@ -204,6 +200,36 @@ impl Action for RestartOnceAction {
     }
 }
 
+struct FatalAction {
+    base: ActionBase,
+    log: Log,
+}
+
+impl Action for FatalAction {
+    fn base(&self) -> &ActionBase {
+        &self.base
+    }
+
+    fn base_mut(&mut self) -> &mut ActionBase {
+        &mut self.base
+    }
+
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+        self.log.borrow_mut().push("fatal".into());
+        data.set_restart_pending(true);
+        self.base.count += 1;
+        ctx.fail(KunaError::Decoder { explain: "invalid declared callable".into() });
+        ctx.fail(KunaError::lowlevel("secondary failure"));
+        1
+    }
+
+    fn clone_filtered(&self, groups: &ActionGroupList) -> Option<Box<dyn Action>> {
+        groups.contains(&self.base.basegroup).then(|| {
+            Box::new(Self { base: self.base.clone(), log: self.log.clone() }) as Box<dyn Action>
+        })
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Worked dummy rule for the module docs (a real, minimal const-fold shape)
 // -----------------------------------------------------------------------------
@@ -220,12 +246,8 @@ impl Rule for DummyConstFold {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_ADD]
     }
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(DummyConstFold))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(DummyConstFold)
     }
 }
 
@@ -396,6 +418,38 @@ fn restart_group_reruns_on_restart_pending() {
         ]
     );
     assert!(!fd.has_restart_pending());
+}
+
+#[test]
+fn fatal_error_stops_repeat_siblings_and_both_restart_paths() {
+    for can_reflow in [false, true] {
+        let mut fd = build_fd();
+        let original_op = make_op(&mut fd, 0x1000, OpCode::CPUI_COPY);
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut repeat = ActionGroup::new(ruleflags::rule_repeatapply, "repeat");
+        repeat.add_action(Box::new(FatalAction {
+            base: ActionBase::new(ruleflags::rule_repeatapply, "fatal", "base"),
+            log: log.clone(),
+        }));
+        repeat.add_action(CountdownAction::boxed(
+            "base", "must_not_run", Rc::new(RefCell::new(0)), log.clone(),
+        ));
+        let mut root = ActionRestartGroup::new(ruleflags::rule_onceperfunc, "root", 5);
+        root.add_action(Box::new(repeat));
+        let mut ctx = ActionContext::new();
+        ctx.can_reflow = can_reflow;
+
+        assert_eq!(root.perform(&mut fd, &mut ctx), -1);
+        assert_eq!(root.perform(&mut fd, &mut ctx), -1);
+        assert_eq!(*log.borrow(), vec!["fatal"]);
+        assert!(fd.obank().get(original_op).is_some(), "failure must not clear analysis");
+        assert!(fd.has_restart_pending());
+        assert!(!ctx.reflow_requested);
+        assert_eq!(
+            ctx.take_error(),
+            Some(KunaError::Decoder { explain: "invalid declared callable".into() }),
+        );
+    }
 }
 
 #[test]
@@ -601,6 +655,103 @@ fn set_current_caches_and_exposes_the_root() {
     // A second set_current reuses the cache (deriveAction's "already derived").
     db.set_current("root_g").unwrap();
     assert!(db.get_current().is_some());
+}
+
+fn mask_database() -> ActionDatabase {
+    let mut pool = ActionPool::new(0, "maskpool");
+    pool.add_rule(
+        RuleState::new("analysis", 0, "ormask"),
+        Box::new(crate::ruleaction_1::RuleOrMask::new("analysis")),
+    );
+    let mut db = ActionDatabase::new();
+    db.set_universal(Box::new(pool));
+    db.reset_defaults().unwrap();
+    db
+}
+
+/// Execute a genuine constant-mask simplification, not a schedule listing.
+fn run_mask_root(db: &mut ActionDatabase, transforms: bool) {
+    let mut context = ArchContext::new(build_manager());
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
+    let pc = Address::new(Rc::clone(glb.manage().get_space_by_name("ram").unwrap()), 0x1000);
+    let mut fd = Funcdata::new("mask", "mask", glb, pc.clone(), 0x10000000, 0x40).unwrap();
+    let op = fd.obank_mut().create_at(2, pc);
+    fd.obank_mut().mark_alive(op);
+    fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_INT_OR, 0, "INT_OR"));
+    let left = fd.new_constant(4, 0x1234);
+    let mask = fd.new_constant(4, 0xffff_ffff);
+    fd.op_set_input(op, left, 0).unwrap();
+    fd.op_set_input(op, mask, 1).unwrap();
+    fd.new_unique_out(4, op).unwrap();
+    let root = db.get_current_mut().expect("selected executable");
+    root.reset(&mut fd);
+    root.perform(&mut fd, &mut ActionContext::new());
+    let result = fd.obank().get(op).unwrap();
+    assert_eq!(result.code(), if transforms { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_OR });
+    assert_eq!(result.num_input(), if transforms { 1 } else { 2 });
+    if transforms {
+        assert_eq!(fd.vbank().get(result.get_in(0).unwrap()).unwrap().get_offset(), 0xffff_ffff);
+    }
+}
+
+#[test]
+fn failed_root_selection_preserves_executable_and_recovers() {
+    let mut db = mask_database();
+    run_mask_root(&mut db, true);
+    assert!(db.set_current("missing").is_err());
+    assert_eq!(db.get_current_name(), "decompile");
+    run_mask_root(&mut db, true);
+    db.set_current("firstpass").unwrap();
+    run_mask_root(&mut db, false);
+    db.set_current("decompile").unwrap();
+    run_mask_root(&mut db, true);
+}
+
+#[test]
+fn cached_root_toggles_apply_to_transform_and_reset_removes_custom_roots() {
+    let mut db = mask_database();
+    run_mask_root(&mut db, true);
+    for enabled in [false, true, false] {
+        db.toggle_action("decompile", "analysis", enabled).unwrap();
+        assert_eq!(db.get_current_name(), "decompile");
+        run_mask_root(&mut db, enabled);
+    }
+    db.clone_group("decompile", "custom").unwrap();
+    db.set_current("custom").unwrap();
+    run_mask_root(&mut db, false);
+    db.toggle_action("custom", "future-subgroup", true).unwrap();
+    run_mask_root(&mut db, false);
+    assert!(db.toggle_action("missing", "analysis", true).is_err());
+    assert_eq!(db.get_current_name(), "custom");
+    db.reset_defaults().unwrap();
+    assert_eq!(db.get_current_name(), "decompile");
+    assert!(db.get_group("custom").is_err());
+    assert!(db.set_current("custom").is_err(), "discard custom cached executable too");
+    run_mask_root(&mut db, true);
+}
+
+#[test]
+fn inactive_group_mutation_and_active_group_replacement_refresh_cached_rules() {
+    let mut db = mask_database();
+    db.set_current("normalize").unwrap();
+    run_mask_root(&mut db, true);
+    db.set_current("decompile").unwrap();
+    db.toggle_action("normalize", "analysis", false).unwrap();
+    run_mask_root(&mut db, true);
+    db.set_current("normalize").unwrap();
+    run_mask_root(&mut db, false);
+    db.clone_group("decompile", "normalize").unwrap();
+    assert_eq!(db.get_current_name(), "normalize");
+    run_mask_root(&mut db, true);
+    db.set_group("normalize", ["base"]);
+    run_mask_root(&mut db, false);
+    build_default_groups(&mut db);
+    assert_eq!(db.get_current_name(), "decompile");
+    run_mask_root(&mut db, true);
 }
 
 #[test]

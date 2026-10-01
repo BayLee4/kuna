@@ -36,6 +36,9 @@
     Pass 2 (default, asserts #2/#3): the merged model resolves per function
     against the trials that are actually active, picks __fastcall, and the
     function takes its three arguments.
+
+    Convention printing is explicitly disabled in both passes so these checks
+    isolate recovered parameters; convention visibility is tested separately.
 -->
 <bytechunk space="ram" offset="0x401000" readonly="true">
 568b7424088d0c4901d131c085f60f49c601c85ec20400
@@ -44,6 +47,7 @@
 </binaryimage>
 <script>
   <com>lo fu fc</com>
+  <com>option conventionprinting off</com>
   <com>option evalcurrentproto off</com>
   <com>decompile</com>
   <com>print C</com>

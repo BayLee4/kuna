@@ -13,6 +13,7 @@
 //! `konst` (a fresh constant).  `op_of` reads back an op's current opcode.
 
 use std::rc::Rc;
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool};
 
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
@@ -22,7 +23,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
@@ -54,7 +55,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -64,8 +70,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -76,7 +83,7 @@ fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaRes
 /// `isFree()` negative-guard tests.
 fn free_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
 }
 
 /// A formal input varnode at (off,size).
@@ -105,7 +112,7 @@ fn make_op(
     let op = fd.obank_mut().create_at(num_in, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, opcode_flags(opc), format!("{opc:?}")));
     // Output varnode at a distinct address (off) so set_def doesn't dedup.
-    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize)));
+    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(fd, outsize)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();
@@ -508,8 +515,15 @@ fn floatcast_float2float_superfluous_identity() {
     let root = make_op(&mut fd, 0x210, OpCode::CPUI_FLOAT_FLOAT2FLOAT, 1, 4).0;
     wire(&mut fd, innerout, root, 0);
 
-    let mut rule = RuleFloatCast::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    fd.obank_mut().mark_alive(inner);
+    fd.obank_mut().mark_alive(root);
+    let mut pool = ActionPool::new(0, "floatprecision");
+    for spec in specs().into_iter().filter(|spec| spec.group == "floatprecision") {
+        pool.add_spec(&spec, "floatprecision");
+    }
+    assert!(pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).is_none());
+    let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["floatprecision"])).unwrap();
+    assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
     assert_eq!(op_of(&fd, root), OpCode::CPUI_COPY, "outsize==insize2 -> COPY identity");
     assert_eq!(in_vn(&fd, root, 0), vn2, "input0 = vn2");
 }
@@ -672,28 +686,12 @@ fn oplists_match_cpp() {
 }
 
 #[test]
-fn clone_respects_group_membership() {
-    let analysis = ActionGroupList::from_names(["analysis"]);
-    let empty = ActionGroupList::new();
-    assert!(RuleSignDiv2::new().clone_rule(&analysis).is_some(), "in analysis");
-    assert!(RuleSignDiv2::new().clone_rule(&empty).is_none(), "not in empty");
-
-    // RuleConditionalMove belongs to "conditionalexe".
-    let condexe = ActionGroupList::from_names(["conditionalexe"]);
-    assert!(RuleConditionalMove::new().clone_rule(&condexe).is_some());
-    assert!(RuleConditionalMove::new().clone_rule(&analysis).is_none());
-
-    // RuleFloatCast / RuleIgnoreNan belong to "floatprecision".
-    let fp = ActionGroupList::from_names(["floatprecision"]);
-    assert!(RuleFloatCast::new().clone_rule(&fp).is_some());
-    assert!(RuleIgnoreNan::new().clone_rule(&fp).is_some());
-    assert!(RuleFloatCast::new().clone_rule(&analysis).is_none());
-
-    // RulePtrFlow belongs to "subvar"; RuleSegment to "segment".
-    let subvar = ActionGroupList::from_names(["subvar"]);
-    assert!(RulePtrFlow::new().clone_rule(&subvar).is_some());
-    let segment = ActionGroupList::from_names(["segment"]);
-    assert!(RuleSegment::new().clone_rule(&segment).is_some());
+fn ptrflow_clone_preserves_truncation_dispatch_state() {
+    for has_truncations in [false, true] {
+        let rule = RulePtrFlow { has_truncations };
+        let cloned = rule.clone_rule();
+        assert_eq!(cloned.get_op_list().contains(&OpCode::CPUI_COPY), has_truncations);
+    }
 }
 
 #[test]

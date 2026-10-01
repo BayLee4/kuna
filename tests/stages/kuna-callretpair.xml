@@ -52,9 +52,11 @@ d05bc348c7c0ffffffff5bc3488d35750f000031ffe88effffff4889c7e8c6ffffffb83c0000000f
   <com>lo fu read_tag</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>print raw</com>
   <com>lo fu read_tag_clobber</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>print raw</com>
   <com>option callretpair on</com>
   <com>lo fu read_tag</com>
   <com>decompile</com>
@@ -62,12 +64,18 @@ d05bc348c7c0ffffffff5bc3488d35750f000031ffe88effffff4889c7e8c6ffffffb83c0000000f
   <com>lo fu read_tag_clobber</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>print raw</com>
   <com>quit</com>
 </script>
-<stringmatch name="CALLRETPAIR #1: off, the call is a bare statement and its JSValue is discarded" min="1" max="1">^  read_value\(a0,a1,0x10,1\);$</stringmatch>
+<stringmatch name="CALLRETPAIR #1: off, the machine CALL retains its arguments but neither result half" min="1" max="1">^0x0040102b:[0-9a-f]+:\s+RAX\(0x0040102b:[0-9a-f]+\) = \[create\] i0x0040102b:[0-9a-f]+\(free\)$
+^0x0040102b:[0-9a-f]+:\s+RDX\(0x0040102b:[0-9a-f]+\) = \[create\] i0x0040102b:[0-9a-f]+\(free\)$
+^0x0040102b:[0-9a-f]+:\s+call fread_value\(free\)\(RDI\(i\),RSI\(i\),#0x10,#0x1\)$</stringmatch>
 <stringmatch name="CALLRETPAIR #2: on, the call gains the 16-byte join output the cspec output rule asked for" min="1" max="1">v1 = read_value\(a0,a1,0x10,1\);</stringmatch>
 <stringmatch name="CALLRETPAIR #3: on, both halves are SUBPIECEs of the call output instead of locals with no definition" min="1" max="1">return \*SUB168\(v1,0\) \+ SUB168\(v1,8\);</stringmatch>
 <stringmatch name="CALLRETPAIR #4: the unassigned rdx local survives in three of the four renderings, and is gone only where the pair formed" min="3" max="3">int8 v2; // rdx</stringmatch>
-<stringmatch name="CALLRETPAIR #5: the control keeps its bare call in BOTH passes, because the bounded callee decode proves no_payload never writes rdx" min="2" max="2">^  no_payload\(a0,a1,7\);$</stringmatch>
+<stringmatch name="CALLRETPAIR #5: the control still lacks a recovered CALL result in BOTH passes" min="2" max="2">^0x00401066:[0-9a-f]+:\s+call fno_payload\(free\)\(RDI\(i\),RSI\(i\),#0x7\)$</stringmatch>
 <stringmatch name="CALLRETPAIR #6: on, the recovered return stops being the garbage pointer the discarded half left behind" min="1" max="1">int8 read_tag\(unsigned long a0,unsigned long a1\)</stringmatch>
+<stringmatch name="CALLRETPAIR #7: the three unrecovered machine boundaries are explicit, not fabricated C calls" min="3" max="3">^  CPUI_CALL \[.*\] effects=.*$</stringmatch>
+<stringmatch name="CALLRETPAIR #8: off, the call-created RAX and RDX values reach the real load and result arithmetic" min="1" max="1">^0x00401038:[0-9a-f]+:\s+[^\n]+ = \*\(ram,RAX\(0x0040102b:[0-9a-f]+\)\)$
+^0x0040103b:[0-9a-f]+:\s+[^\n]+ = [^\n]+ \+ RDX\(0x0040102b:[0-9a-f]+\)$</stringmatch>
 </decompilertest>

@@ -198,16 +198,13 @@ pub struct JumpAssistOp {
 /// \brief Generic user-op providing input/output data-types
 /// (C++ `DatatypeUserOp`).
 ///
-/// STUB(W6): the C++ holds `Datatype *outType` / `vector<Datatype*> inTypes`,
-/// consumed by `getOutputLocal`/`getInputLocal`. The W6 `TypeFactory` builds
-/// those; until then this variant carries the type handles as
-/// [`Rc<Datatype>`](crate::dtype::Datatype) stub skeletons.
+/// Factory-owned graph roots retain the input and output types.
 #[derive(Debug, Clone)]
 pub struct DatatypeUserOp {
-    /// Data-type of the output (C++ `outType`). STUB(W6).
-    pub out_type: Option<Rc<crate::dtype::Datatype>>,
-    /// Data-types of the inputs (C++ `inTypes`). STUB(W6).
-    pub in_types: Vec<Rc<crate::dtype::Datatype>>,
+    /// Data-type of the output (C++ `outType`).
+    pub out_type: Option<crate::dtype::TypeRoot>,
+    /// Data-types of the inputs (C++ `inTypes`).
+    pub in_types: Vec<crate::dtype::TypeRoot>,
 }
 
 /// The per-kind payload of a [`UserPcodeOp`] (the data members of each C++
@@ -295,13 +292,13 @@ impl UserPcodeOp {
     pub fn new_datatype(
         nm: &[u8],
         ind: int4,
-        out: Option<Rc<crate::dtype::Datatype>>,
-        ins: &[Option<Rc<crate::dtype::Datatype>>],
+        out: Option<crate::dtype::TypeRoot>,
+        ins: &[Option<crate::dtype::TypeRoot>],
     ) -> UserPcodeOp {
         let mut in_types = Vec::new();
         // C++ pushes each of the up-to-4 input data-types iff non-null, in order.
         for t in ins.iter().flatten() {
-            in_types.push(Rc::clone(t));
+            in_types.push(t.clone());
         }
         UserPcodeOp {
             base: UserOpBase::new(nm, userop_type::datatype, ind),
@@ -757,32 +754,31 @@ pub trait UseropArchitecture: InjectArchitecture {
     fn payload_io_sizes(&self, injectid: int4) -> KunaResult<(int4, int4, int4, int4)>;
 }
 
-/// STUB(W6): the type-factory slice that builds the BUILTIN_MEM* DatatypeUserOp
+/// The type-factory slice that builds the BUILTIN_MEM* DatatypeUserOp
 /// types and the volatile-op local types.
 ///
-/// `TypeFactory` is W6, so [`UserOpManage::register_builtin`] takes this as a
-/// distinct trait: a caller that has W6 wired can register the typed builtins;
-/// the others (string/volatile) need no type factory.
+/// [`UserOpManage::register_builtin`] takes this distinct architecture slice
+/// to register typed builtins; string and volatile registration need no factory.
 pub trait UseropTypeArchitecture {
     /// C++ `glb->types->getSizeOfPointer()`.
     fn get_size_of_pointer(&self) -> int4;
     /// C++ `glb->getDefaultDataSpace()->getWordSize()`.
     fn get_default_data_space_word_size(&self) -> int4;
     /// C++ `glb->types->getTypeVoid()`.
-    fn get_type_void(&self) -> Rc<crate::dtype::Datatype>;
+    fn get_type_void(&self) -> crate::dtype::TypeRoot;
     /// C++ `glb->types->getTypePointer(ptrSize,baseType,wordSize)`.
     fn get_type_pointer(
         &self,
         ptr_size: int4,
-        base: Rc<crate::dtype::Datatype>,
+        base: crate::dtype::TypeRoot,
         word_size: int4,
-    ) -> Rc<crate::dtype::Datatype>;
+    ) -> crate::dtype::TypeRoot;
     /// C++ `glb->types->getBase(size,TYPE_INT)`.
-    fn get_base_int(&self, size: int4) -> Rc<crate::dtype::Datatype>;
+    fn get_base_int(&self, size: int4) -> crate::dtype::TypeRoot;
     /// C++ `glb->types->getTypeChar(glb->types->getSizeOfChar())`.
-    fn get_type_char(&self) -> Rc<crate::dtype::Datatype>;
+    fn get_type_char(&self) -> crate::dtype::TypeRoot;
     /// C++ `glb->types->getTypeChar(glb->types->getSizeOfWChar())`.
-    fn get_type_wchar(&self) -> Rc<crate::dtype::Datatype>;
+    fn get_type_wchar(&self) -> crate::dtype::TypeRoot;
 }
 
 // ---------------------------------------------------------------------------
@@ -937,8 +933,8 @@ impl UserOpManage {
                 UserPcodeOp::new_datatype(
                     b"builtin_memcpy",
                     BUILTIN_MEMCPY as int4,
-                    Some(Rc::clone(&ptr_type)),
-                    &[Some(Rc::clone(&ptr_type)), Some(ptr_type), Some(int_type)],
+                    Some(ptr_type.clone()),
+                    &[Some(ptr_type.clone()), Some(ptr_type), Some(int_type)],
                 )
             }
             BUILTIN_STRNCPY => {
@@ -950,8 +946,8 @@ impl UserOpManage {
                 UserPcodeOp::new_datatype(
                     b"builtin_strncpy",
                     BUILTIN_STRNCPY as int4,
-                    Some(Rc::clone(&ptr_type)),
-                    &[Some(Rc::clone(&ptr_type)), Some(ptr_type), Some(int_type)],
+                    Some(ptr_type.clone()),
+                    &[Some(ptr_type.clone()), Some(ptr_type), Some(int_type)],
                 )
             }
             BUILTIN_WCSNCPY => {
@@ -963,8 +959,8 @@ impl UserOpManage {
                 UserPcodeOp::new_datatype(
                     b"builtin_wcsncpy",
                     BUILTIN_WCSNCPY as int4,
-                    Some(Rc::clone(&ptr_type)),
-                    &[Some(Rc::clone(&ptr_type)), Some(ptr_type), Some(int_type)],
+                    Some(ptr_type.clone()),
+                    &[Some(ptr_type.clone()), Some(ptr_type), Some(int_type)],
                 )
             }
             BUILTIN_MEMSET => {
@@ -977,8 +973,8 @@ impl UserOpManage {
                 UserPcodeOp::new_datatype(
                     b"builtin_memset",
                     BUILTIN_MEMSET as int4,
-                    Some(Rc::clone(&ptr_type)),
-                    &[Some(ptr_type), Some(Rc::clone(&int_type)), Some(int_type)],
+                    Some(ptr_type.clone()),
+                    &[Some(ptr_type), Some(int_type.clone()), Some(int_type)],
                 )
             }
             _ => return Err(KunaError::lowlevel("Bad built-in userop id")),

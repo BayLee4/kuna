@@ -31,7 +31,7 @@ use std::rc::Rc;
 use kuna_base::address::{Address, RangeList};
 use kuna_base::partmap::PartMap;
 use kuna_base::space::{spacetype, AddrSpace};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::context::{GlobalEntry, GlobalQuery};
 use kuna_decomp::varnode::varnode_flags;
 
@@ -55,12 +55,13 @@ fn addr(space: &Rc<AddrSpace>, off: u64) -> Address {
 
 /// A named integer Datatype with a forced display format (the `octint4`/`uint8_t`
 /// of the `displayformat` datatest: an int4 carrying a forced `oct`/`hex` format).
-fn fmt_int(size: i32, name: &str, format: u32) -> Rc<Datatype> {
+fn fmt_int(size: i32, name: &str, format: u32) -> TypeRoot {
     let mut dt = Datatype::new(size, type_metatype::TYPE_INT);
     dt.name = name.to_string();
     dt.display_name = name.to_string();
+    dt.id = Datatype::hash_name(name);
     dt.set_display_format(format);
-    Rc::new(dt)
+    TypeFactoryImpl::new().intern(dt).unwrap()
 }
 
 /// A global Symbol entry covering `[first, last]` carrying `symbol_type`, with
@@ -73,7 +74,7 @@ fn typed_entry(
     name: &str,
     offset: i32,
     all_flags: u32,
-    symbol_type: Option<Rc<Datatype>>,
+    symbol_type: Option<TypeRoot>,
 ) -> GlobalEntry {
     GlobalEntry {
         space_index: space.get_index(),
@@ -126,7 +127,7 @@ fn tf1_typelocked_symbol_forces_its_formatted_type() {
     let (dt, off) = gq
         .sized_type_geometry(&addr(&ram, 0x301018), 4, &up)
         .expect("a type-locked global must force its data-type");
-    assert_eq!(dt.get_name(), "octint4", "the Symbol's data-type flows");
+    assert_eq!(dt.read().get(dt.id()).unwrap().get_name(), "octint4", "the Symbol's data-type flows");
     assert_eq!(off, 0, "(0x301018 - 0x301018) + entry.offset(0) == 0");
     assert_eq!(
         dt.get_display_format(),

@@ -1228,13 +1228,13 @@ pub trait ArchOptionContext {
     /// `PrintC::setHideImpliedExts(val)` (options.cc:504).  // STUB(W8)
     fn set_hide_implied_exts(&mut self, val: bool);
     /// `glb->print->setMaxLineSize(val)` (options.cc:524).  // STUB(W8)
-    fn set_max_line_size(&mut self, val: int4);
+    fn set_max_line_size(&mut self, val: int4) -> KunaResult<()>;
     /// `glb->print->setIndentIncrement(val)` (options.cc:541).  // STUB(W8)
     fn set_indent_increment(&mut self, val: int4);
     /// `glb->print->setLineCommentIndent(val)` (options.cc:559).  // STUB(W8)
-    fn set_line_comment_indent(&mut self, val: int4);
+    fn set_line_comment_indent(&mut self, val: int4) -> KunaResult<()>;
     /// `glb->print->setCommentStyle(p1)` (options.cc:570).  // STUB(W8)
-    fn set_comment_style(&mut self, style: &str);
+    fn set_comment_style(&mut self, style: &str) -> KunaResult<()>;
     /// `glb->print->getHeaderComment()` (options.cc:583).  // STUB(W8)
     fn header_comment_flags(&self) -> uint4;
     /// `glb->print->setHeaderComment(flags)` (options.cc:589).  // STUB(W8)
@@ -1244,7 +1244,7 @@ pub trait ArchOptionContext {
     /// `glb->print->setInstructionComment(flags)` (options.cc:610).  // STUB(W8)
     fn set_instruction_comment_flags(&mut self, flags: uint4);
     /// `glb->print->setIntegerFormat(p1)` (options.cc:623).  // STUB(W8)
-    fn set_integer_format(&mut self, fmt: &str);
+    fn set_integer_format(&mut self, fmt: &str) -> KunaResult<()>;
     /// `glb->print->setNamespaceStrategy(strategy)` (options.cc:1014).
     /// // STUB(W8)
     fn set_namespace_strategy(&mut self, strategy: NamespaceStrategy);
@@ -1254,21 +1254,19 @@ pub trait ArchOptionContext {
     /// `glb->setPrintLanguage(p1)` (options.cc:865).  // STUB(W8)
     fn set_print_language(&mut self, language: &str);
 
-    // --- action database (STUB W5: action / coreaction) --------------------
+    // --- action database ------------------------------------------------
 
     /// `glb->allacts.getCurrent()->setWarning(val,p1)`; `false` => bad
     /// action/rule specifier (options.cc:427).  // STUB(W5)
     fn set_action_warning(&mut self, val: bool, name: &str) -> bool;
-    /// `glb->allacts.cloneGroup(p1,p2); setCurrent(p2)` (options.cc:682-683).
-    /// // STUB(W5)
-    fn clone_action_group(&mut self, from: &str, to: &str);
-    /// `glb->allacts.setCurrent(p1)` (options.cc:686/707).  // STUB(W5)
-    fn set_current_action(&mut self, name: &str);
+    /// Clone a root's groups without selecting it.
+    fn clone_action_group(&mut self, from: &str, to: &str) -> KunaResult<()>;
+    /// Select a successfully derived root.
+    fn set_current_action(&mut self, name: &str) -> KunaResult<()>;
     /// `glb->allacts.getCurrentName()` (options.cc:714/715).  // STUB(W5)
     fn current_action_name(&self) -> String;
     /// `glb->allacts.toggleAction(grp,sub,val)` (options.cc:709/714).
-    /// // STUB(W5)
-    fn toggle_action(&mut self, group: &str, sub: &str, val: bool);
+    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) -> KunaResult<()>;
     /// `root->enableRule(path)` on the current action (options.cc:938).
     /// // STUB(W5)
     fn enable_rule(&mut self, path: &str) -> bool;
@@ -1695,7 +1693,7 @@ impl ArchOption for OptionMaxLineWidth {
         if val == -1 {
             return Err(KunaError::parse("Must specify integer linewidth"));
         }
-        glb.set_max_line_size(val);
+        glb.set_max_line_size(val)?;
         Ok(format!("Maximum line width set to {p1}"))
     }
 }
@@ -1743,7 +1741,7 @@ impl ArchOption for OptionCommentIndent {
         if val == -1 {
             return Err(KunaError::parse("Must specify integer comment indent"));
         }
-        glb.set_line_comment_indent(val);
+        glb.set_line_comment_indent(val)?;
         Ok(format!("Comment indent set to {p1}"))
     }
 }
@@ -1763,7 +1761,7 @@ impl ArchOption for OptionCommentStyle {
         _p2: &str,
         _p3: &str,
     ) -> KunaResult<String> {
-        glb.set_comment_style(p1);
+        glb.set_comment_style(p1)?;
         Ok(format!("Comment style set to {p1}"))
     }
 }
@@ -1841,7 +1839,7 @@ impl ArchOption for OptionIntegerFormat {
         _p2: &str,
         _p3: &str,
     ) -> KunaResult<String> {
-        glb.set_integer_format(p1);
+        glb.set_integer_format(p1)?;
         Ok(format!("Integer format set to {p1}"))
     }
 }
@@ -1901,11 +1899,11 @@ impl ArchOption for OptionSetAction {
             return Err(KunaError::parse("Must specify preexisting action"));
         }
         if !p2.is_empty() {
-            glb.clone_action_group(p1, p2);
-            glb.set_current_action(p2);
+            glb.clone_action_group(p1, p2)?;
+            glb.set_current_action(p2)?;
             return Ok(format!("Created {p2} by cloning {p1} and made it current"));
         }
-        glb.set_current_action(p1);
+        glb.set_current_action(p1)?;
         Ok(format!("Set current action to {p1}"))
     }
 }
@@ -1930,14 +1928,14 @@ impl ArchOption for OptionCurrentAction {
         }
         let mut res = "Toggled ".to_string();
         if !p3.is_empty() {
-            glb.set_current_action(p1);
+            glb.set_current_action(p1)?;
             let val = on_or_off(p3)?;
-            glb.toggle_action(p1, p2, val);
+            glb.toggle_action(p1, p2, val)?;
             res += &format!("{p2} in action {p1}");
         } else {
             let val = on_or_off(p2)?;
             let cur = glb.current_action_name();
-            glb.toggle_action(&cur, p1, val);
+            glb.toggle_action(&cur, p1, val)?;
             res += &format!("{p1} in action {cur}");
         }
         Ok(res)
@@ -2375,12 +2373,12 @@ impl ArchOption for OptionSplitDatatypes {
 
         let cur = glb.current_action_name();
         if (config & (split_datatype::OPTION_STRUCT | split_datatype::OPTION_ARRAY)) == 0 {
-            glb.toggle_action(&cur, "splitcopy", false);
-            glb.toggle_action(&cur, "splitpointer", false);
+            glb.toggle_action(&cur, "splitcopy", false)?;
+            glb.toggle_action(&cur, "splitpointer", false)?;
         } else {
             let pointers = (config & split_datatype::OPTION_POINTER) != 0;
-            glb.toggle_action(&cur, "splitcopy", true);
-            glb.toggle_action(&cur, "splitpointer", pointers);
+            glb.toggle_action(&cur, "splitcopy", true)?;
+            glb.toggle_action(&cur, "splitpointer", pointers)?;
         }
 
         if old_config == config {
@@ -2563,23 +2561,27 @@ impl OptionDatabase {
         let mut p3 = String::new();
 
         let elem_id = decoder.open_element()?;
-        let mut sub_id = decoder.open_element()?;
-        if sub_id == ELEM_PARAM1 {
+        if decoder.peek_element()? == 0 {
             p1 = read_content_string(decoder)?;
-            decoder.close_element(sub_id)?;
-            sub_id = decoder.open_element()?;
-            if sub_id == ELEM_PARAM2 {
-                p2 = read_content_string(decoder)?;
-                decoder.close_element(sub_id)?;
-                sub_id = decoder.open_element()?;
-                if sub_id == ELEM_PARAM3 {
-                    p3 = read_content_string(decoder)?;
-                    decoder.close_element(sub_id)?;
+        } else {
+            for (expected, value) in [
+                (&ELEM_PARAM1, &mut p1),
+                (&ELEM_PARAM2, &mut p2),
+                (&ELEM_PARAM3, &mut p3),
+            ] {
+                if decoder.peek_element()? == 0 {
+                    break;
                 }
+                let sub_id = decoder.open_element_id(expected)?;
+                *value = read_content_string(decoder)?;
+                if decoder.peek_element()? != 0 {
+                    return Err(KunaError::parse("Nested option parameter"));
+                }
+                decoder.close_element(sub_id)?;
             }
-        } else if sub_id == 0 {
-            // No children: the content is param1.
-            p1 = read_content_string(decoder)?;
+            if decoder.peek_element()? != 0 {
+                return Err(KunaError::parse("Unexpected option parameter"));
+            }
         }
         decoder.close_element(elem_id)?;
         self.set(glb, elem_id, &p1, &p2, &p3)?;
@@ -2601,20 +2603,9 @@ impl OptionDatabase {
         Ok(())
     }
 
-    /// (kuna, ghidra-mode) Parse an `<optionslist>` like [`decode`](Self::decode),
-    /// but skip any option element that cannot be parsed or applied instead of
-    /// failing the list — the documented ghidra-mode divergence
-    /// (`docs/ghidra-integration.md` §8): upstream throws on the first unknown
-    /// element, `setOptions` answers `f`, and Java fails the whole program open
-    /// ("Did not accept decompiler options"), so one option from a newer Java
-    /// vocabulary (e.g. 12.2's `baddatacount`, element 290) bricks the decompiler
-    /// view.  kuna applies what it knows and reports each skipped element as a
-    /// returned warning line (each begins with "Warning", which Java's
-    /// `isErrorMessage` treats as non-fatal).
-    ///
-    /// Structurally hardened: every child of an option element is consumed with
-    /// `close_element_skipping`, so an unknown parameter shape leaves the stream
-    /// element-aligned and the remaining options still apply.
+    /// Skip unknown future options, preserving their compatibility warnings.
+    /// Known options use the strict parser and apply sequentially: a failure
+    /// stops the list without rolling back earlier successful entries.
     pub fn decode_lenient(
         &self,
         decoder: &mut dyn Decoder,
@@ -2623,70 +2614,20 @@ impl OptionDatabase {
         let elem_id = decoder.open_element_id(&ELEM_OPTIONSLIST)?;
         let mut warnings = Vec::new();
         while decoder.peek_element()? != 0 {
-            let opt_id = decoder.open_element()?;
-            if let Err(e) = self.decode_one_lenient(decoder, glb, opt_id) {
+            let opt_id = decoder.peek_element()?;
+            if self.optionmap.contains_key(&opt_id) {
+                self.decode_one(decoder, glb)?;
+            } else {
+                decoder.open_element()?;
+                decoder.close_element_skipping(opt_id)?;
                 let name = option_element_name(opt_id)
                     .map(|n| format!("<{n}>"))
                     .unwrap_or_else(|| format!("element {opt_id}"));
-                warnings.push(format!(
-                    "Warning: decompiler option {name} not applied: {}",
-                    e.explain()
-                ));
+                warnings.push(format!("Warning: unknown decompiler option {name} skipped"));
             }
         }
         decoder.close_element(elem_id)?;
         Ok(warnings)
-    }
-
-    /// One already-opened option element of the lenient list: parse the
-    /// `<param1>`/`<param2>`/`<param3>` children (any other child is skipped
-    /// whole), close the element, and dispatch to [`set`](Self::set).  The
-    /// element is fully consumed on ANY return, error included.
-    fn decode_one_lenient(
-        &self,
-        decoder: &mut dyn Decoder,
-        glb: &mut dyn ArchOptionContext,
-        opt_id: uint4,
-    ) -> KunaResult<String> {
-        let mut p1 = String::new();
-        let mut p2 = String::new();
-        let mut p3 = String::new();
-        let mut saw_child = false;
-        let mut content_err: Option<KunaError> = None;
-        loop {
-            let sub_id = decoder.open_element()?;
-            if sub_id == 0 {
-                break;
-            }
-            saw_child = true;
-            let target = if sub_id == ELEM_PARAM1 {
-                Some(&mut p1)
-            } else if sub_id == ELEM_PARAM2 {
-                Some(&mut p2)
-            } else if sub_id == ELEM_PARAM3 {
-                Some(&mut p3)
-            } else {
-                None
-            };
-            if let Some(slot) = target {
-                match read_content_string(decoder) {
-                    Ok(v) => *slot = v,
-                    Err(e) => content_err = Some(e),
-                }
-            }
-            decoder.close_element_skipping(sub_id)?;
-        }
-        if !saw_child {
-            match read_content_string(decoder) {
-                Ok(v) => p1 = v,
-                Err(e) => content_err = Some(e),
-            }
-        }
-        decoder.close_element(opt_id)?;
-        if let Some(e) = content_err {
-            return Err(e);
-        }
-        self.set(glb, opt_id, &p1, &p2, &p3)
     }
 }
 

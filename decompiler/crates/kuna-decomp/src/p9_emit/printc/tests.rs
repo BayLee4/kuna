@@ -13,6 +13,256 @@
 use super::*;
 use crate::printlanguage::{parentheses, ReversePolish};
 
+mod comment_consumers {
+    use super::*;
+    use crate::comment::comment_type as ct;
+    use crate::context::ArchContext;
+    use crate::dtype::{type_metatype, TypeFactory};
+    use crate::fspec::ProtoModel;
+    use kuna_base::address::Address;
+    use kuna_base::error::{KunaError, KunaResult};
+    use kuna_base::space::{
+        addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
+    };
+    use kuna_sleigh::globalcontext::ContextInternal;
+    use kuna_sleigh::loadimage::LoadImage;
+    use kuna_sleigh::sleigh::Sleigh;
+    use std::rc::Rc;
+
+    struct Image;
+    impl LoadImage for Image {
+        fn get_file_name(&self) -> &str { "comments" }
+        fn load_fill(&mut self, _: &mut [u8], _: &Address) -> KunaResult<()> {
+            Err(KunaError::data_unavail("no instruction bytes needed"))
+        }
+        fn get_arch_type(&self) -> Vec<u8> { Vec::new() }
+        fn adjust_vma(&mut self, _: i64) {}
+    }
+
+    fn fixture() -> (Funcdata, Architecture, Address) {
+        let mut arch = Architecture::new("comments",
+            Sleigh::new(Box::new(Image), Box::new(ContextInternal::new())));
+        arch.realtypes = false;
+        arch.ctypes = false;
+        let types = arch.types_rc();
+        types.setup_sizes(Some(4), 8, 8);
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+        let ram = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "ram", false,
+            8, 1, 2, addrspace_flags::hasphysical, 1, 1));
+        manager.insert_space(ram.clone()).unwrap();
+        manager.set_default_code_space(2).unwrap();
+        manager.set_default_data_space(2).unwrap();
+        let manager = Rc::new(manager);
+        let mut model = ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        let mut context = ArchContext::new_shared(manager);
+        context.types = Some(types.clone());
+        context.global_query = Some(Rc::new(crate::context::GlobalQuery::default()));
+        let mut fd = Funcdata::new("comments", "comments", Rc::new(context),
+            Address::new(ram.clone(), 0x1000), 0x1000_0000, 0x40).unwrap();
+        fd.get_func_proto_mut().set_internal(Rc::new(model), types.get_type_void().unwrap());
+        fd.set_high_level();
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+        let address = Address::new(ram, 0x1010);
+        let op = fd.new_op(1, address.clone());
+        fd.op_set_opcode(op, crate::context::TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
+        let input = fd.new_constant(4, 7);
+        fd.op_set_input(op, input, 0).unwrap();
+        let output = fd.new_unique_out(4, op).unwrap();
+        fd.vn_update_type(output, types.get_base(4, type_metatype::TYPE_INT).unwrap());
+        fd.vbank_mut().get_mut(output).unwrap().set_explicit();
+        let high = fd.vbank().get(output).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("value");
+        fd.op_insert_end(op, block);
+        fd.seed_sblocks_copy();
+        (fd, arch, address)
+    }
+
+    #[test]
+    fn named_calls_without_addresses_preserve_known_names_and_scope() {
+        let (mut fd, arch, address) = fixture();
+        fd.set_display_name("platform::comments");
+        let anchor = fd.obank().iter_alive().next().unwrap();
+        for name in ["builtin", "platform::intrinsic"] {
+            let op = fd.new_op(1, address.clone());
+            fd.op_set_opcode(op, crate::context::TypeOp::new(OpCode::CPUI_CALL, 0, "CALL"));
+            let target = fd.new_constant(8, 0);
+            fd.op_set_input(op, target, 0).unwrap();
+            let mut call = crate::fspec::FuncCallSpecs::new(op, Address::new_invalid());
+            call.set_funcdata(Address::new_invalid(), name).unwrap();
+            call.proto_mut().copy(fd.get_func_proto());
+            fd.push_call_specs(call);
+            fd.op_insert_before(op, anchor);
+        }
+        let mut printer = PrintC::new();
+        for (strategy, intrinsic) in [
+            (NamespaceStrategy::Minimal, "platform::intrinsic"),
+            (NamespaceStrategy::None, "intrinsic"),
+            (NamespaceStrategy::All, "platform::intrinsic"),
+        ] {
+            printer.set_namespace_strategy(strategy);
+            let text = printer.doc_function_full(&fd, &arch);
+            assert!(text.contains("builtin();"), "{text}");
+            assert!(text.contains(&format!("{intrinsic}();")), "{text}");
+            assert!(!text.contains("::builtin"), "{text}");
+        }
+    }
+
+    #[test]
+    fn convention_policy_uses_the_committed_models_declaration_visibility() {
+        let (mut fd, arch, _) = fixture();
+        let model = ProtoModel::copy_named("__regparm3", fd.get_func_proto().model());
+        fd.get_func_proto_mut().set_model(Some(Rc::new(model.clone())));
+        let mut printer = PrintC::new();
+        for enabled in [false, true, false] {
+            printer.set_convention_printing(enabled);
+            let text = printer.doc_function_full(&fd, &arch);
+            let declaration = if enabled {
+                "void __regparm3 comments(void)"
+            } else {
+                "void comments(void)"
+            };
+            assert!(text.contains(declaration), "{text}");
+            assert_eq!(text.contains("__regparm3"), enabled, "{text}");
+            assert!(text.contains("value = 7;"), "{text}");
+        }
+        // The architecture suppresses its default model independently of the
+        // user's convention setting; enabling display cannot override that.
+        model.set_print_in_decl(false);
+        fd.get_func_proto_mut().set_model(Some(Rc::new(model)));
+        printer.set_convention_printing(true);
+        let text = printer.doc_function_full(&fd, &arch);
+        assert!(text.contains("void comments(void)"), "{text}");
+        assert!(!text.contains("__regparm3"), "{text}");
+    }
+
+    #[test]
+    fn namespace_policy_changes_spelling_without_changing_global_binding() {
+        let (mut fd, arch, _) = fixture();
+        fd.set_display_name("outer::comments");
+        let high = fd.high_bank().iter()
+            .find(|(_, high)| high.kuna_name() == Some("value"))
+            .map(|(id, _)| id).unwrap();
+        let binding = fd.high_bank_mut().get_mut(high).unwrap();
+        binding.set_kuna_name("kept_alias");
+        binding.set_kuna_symbol_scope(vec!["inner".into(), "outer".into()]);
+        binding.set_kuna_global(true);
+        let mut printer = PrintC::new();
+        for (strategy, spelling, function) in [
+            (NamespaceStrategy::Minimal, "inner::kept_alias", "outer::comments"),
+            (NamespaceStrategy::None, "kept_alias", "comments"),
+            (NamespaceStrategy::All, "outer::inner::kept_alias", "outer::comments"),
+            (NamespaceStrategy::Minimal, "inner::kept_alias", "outer::comments"),
+        ] {
+            printer.set_namespace_strategy(strategy);
+            let text = printer.doc_function_full(&fd, &arch);
+            assert!(text.contains(&format!("{function}(void)")), "{text}");
+            assert!(text.lines().any(|line| line.trim() == format!("{spelling} = 7;")), "{text}");
+        }
+        assert_eq!(fd.high_bank().get(high).unwrap().kuna_name(), Some("kept_alias"));
+    }
+
+    #[test]
+    fn user_visibility_masks_do_not_turn_ordinary_comments_into_warnings() {
+        let (fd, mut arch, address) = fixture();
+        let mut printer = PrintC::new();
+        // IfcCommentInstr stores the current selection mask, not a single
+        // category. Its ordinary comment must not become an inline warning.
+        arch.commentdb.add_comment(printer.instruction_comment_flags(),
+            fd.get_address(), &address, "instructionnote");
+        arch.commentdb.add_comment(printer.header_comment_flags(),
+            fd.get_address(), fd.get_address(), "headernote");
+        arch.commentdb.add_comment(ct::WARNING,
+            fd.get_address(), &address, "generated");
+        let text = printer.doc_function_full(&fd, &arch);
+        for note in ["instructionnote", "headernote"] {
+            assert!(text.lines().any(|line| line.trim() == format!("/* {note} */")), "{text}");
+            assert!(!text.contains(&format!("warn: {note}")), "{text}");
+        }
+        assert!(text.contains("value = 7; // warn: generated"), "{text}");
+    }
+
+    #[test]
+    fn each_instruction_comment_category_obeys_its_mask_across_documents() {
+        let (fd, mut arch, address) = fixture();
+        let categories = [
+            (ct::USER1, "userone"), (ct::USER2, "usertwo"), (ct::USER3, "userthree"),
+            (ct::HEADER, "bodyheader"), (ct::WARNING, "bodywarning"),
+            (ct::WARNINGHEADER, "bodywarningheader"),
+        ];
+        for (category, marker) in categories {
+            arch.commentdb.add_comment(category, fd.get_address(), &address, marker);
+        }
+        let mut printer = PrintC::new();
+        printer.options.set_warn_inline(false);
+        printer.set_header_comment_flags(0);
+        for selected in categories.iter().map(|(category, _)| *category).chain([0, ct::USER2]) {
+            printer.set_instruction_comment_flags(selected);
+            let text = printer.doc_function_full(&fd, &arch);
+            for (category, marker) in categories {
+                // Include delimiters so bodywarning cannot match bodywarningheader.
+                assert_eq!(text.contains(&format!("/* {marker} */")), selected & category != 0,
+                    "mask {selected}, category {category}:\n{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn header_masks_and_inline_warning_precedence_survive_style_changes() {
+        let (fd, mut arch, address) = fixture();
+        arch.commentdb.add_comment(ct::HEADER, fd.get_address(), fd.get_address(), "plate");
+        arch.commentdb.add_comment(ct::WARNINGHEADER, fd.get_address(), fd.get_address(), "headeralert");
+        arch.commentdb.add_comment(ct::USER2, fd.get_address(), &address, "instruction");
+        arch.commentdb.add_comment(ct::WARNING, fd.get_address(), &address, "bodyalert");
+        let mut printer = PrintC::new();
+        for style in ["c", "cplusplus", "c"] {
+            printer.set_comment_style(style).unwrap();
+            printer.set_header_comment_flags(ct::HEADER | ct::WARNINGHEADER);
+            printer.set_instruction_comment_flags(ct::USER2 | ct::WARNING);
+            let text = printer.doc_function_full(&fd, &arch);
+            let prefix = if style == "c" { "/* " } else { "// " };
+            assert!(text.contains(&format!("{prefix}plate")), "{text}");
+            assert!(text.contains(&format!("{prefix}instruction")), "{text}");
+            assert!(text.contains("// warn: headeralert"), "{text}");
+            assert!(text.contains("// warn: bodyalert"), "{text}");
+            printer.set_header_comment_flags(ct::HEADER);
+            printer.set_instruction_comment_flags(ct::USER2);
+            let masked = printer.doc_function_full(&fd, &arch);
+            assert!(!masked.contains("headeralert") && !masked.contains("bodyalert"), "{masked}");
+            printer.set_header_comment_flags(ct::WARNINGHEADER);
+            let header_only = printer.doc_function_full(&fd, &arch);
+            assert!(!header_only.contains("plate") && header_only.contains("headeralert"), "{header_only}");
+        }
+    }
+
+    #[test]
+    fn comment_style_escapes_multiline_text_and_resets_without_leaking_fill() {
+        let (fd, mut arch, address) = fixture();
+        arch.commentdb.add_comment(ct::USER2, fd.get_address(), &address,
+            "first\nsecond */\nthird\\");
+        let mut printer = PrintC::new();
+        printer.set_line_comment_indent(6).unwrap();
+        printer.set_comment_style("cplusplus").unwrap();
+        let cpp = printer.doc_function_full(&fd, &arch);
+        assert!(cpp.contains("\n      // first\n      // second */\n      // third\\ //"), "{cpp}");
+        assert!(printer.set_comment_style("unknown").is_err());
+        assert_eq!(printer.doc_function_full(&fd, &arch), cpp);
+        printer.set_comment_style("/*").unwrap();
+        let c = printer.doc_function_full(&fd, &arch);
+        assert!(c.contains("\n      /* first\n         second * /\n         third\\ */"), "{c}");
+        printer.context.reset_defaults_internal();
+        printer.set_comment_style("//").unwrap();
+        let reset = printer.doc_function_full(&fd, &arch);
+        assert!(reset.contains(&format!("\n{}// first", " ".repeat(20))), "{reset}");
+        printer.context.reset_defaults_internal();
+        let default = printer.doc_function_full(&fd, &arch);
+        assert!(default.contains(&format!("\n{}/* first", " ".repeat(20))), "{default}");
+    }
+}
+
 #[test]
 fn case_labels_without_ops_keep_their_numeric_value() {
     let mut print = PrintC::new();
@@ -133,8 +383,9 @@ mod stack_pointer_high_leaf {
         (fd, register)
     }
 
-    fn unknown8() -> Rc<Datatype> {
-        Rc::new(Datatype::new(8, type_metatype::TYPE_UNKNOWN))
+    fn unknown8() -> crate::dtype::TypeRoot {
+        use crate::dtype::TypeFactoryImpl;
+        TypeFactoryImpl::new().intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap()
     }
 
     fn merge_highs(fd: &mut Funcdata, first: VarnodeId, rest: &[VarnodeId]) {
@@ -237,7 +488,10 @@ mod stack_pointer_high_leaf {
         let partial = fd.new_varnode(
             4,
             &Address::new(Rc::clone(&register), 0x20),
-            Some(Rc::new(Datatype::new(4, type_metatype::TYPE_UNKNOWN))),
+            Some({
+                use crate::dtype::TypeFactoryImpl;
+                TypeFactoryImpl::new().intern(Datatype::new(4, type_metatype::TYPE_UNKNOWN)).unwrap()
+            }),
         );
         let reference = fd.new_constant(8, 0xffff_ffff_ffff_fff0);
         let whole = fd.new_varnode(
@@ -287,31 +541,31 @@ fn rpn(tok: &'static OpToken, visited: int4) -> ReversePolish {
 // parenthesisation the RPN ptr_expr/array_expr tokens encode.
 // ===========================================================================
 mod w10_input_prototype_declarator {
-    use crate::dtype::{type_metatype, Datatype, DatatypeKind};
+    use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeRoot};
     use crate::printc::declarator_parts;
-    use std::rc::Rc;
 
-    fn named(size: i32, m: type_metatype, nm: &str) -> Rc<Datatype> {
+    fn named(types: &TypeFactoryImpl, size: i32, m: type_metatype, nm: &str) -> TypeRoot {
         // C++ TypeBase sets displayName = name; mirror that (declarator_parts
         // reads get_display_name() for the base but get_name() for the
         // base-detection loop — both must be the identifier).
         let mut t = Datatype::new_with_align(size, -1, m);
         t.name = nm.to_string();
         t.display_name = nm.to_string();
-        Rc::new(t)
+        t.id = Datatype::hash_name(nm);
+        types.intern(t).unwrap()
     }
 
-    fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+    fn ptr_to(types: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
         let mut p = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-        p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-        Rc::new(p)
+        p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+        types.intern(p).unwrap()
     }
 
-    fn array_of(arrayof: Rc<Datatype>, n: i32) -> Rc<Datatype> {
+    fn array_of(types: &TypeFactoryImpl, arrayof: TypeRoot, n: i32) -> TypeRoot {
         let elt = arrayof.get_size().max(1);
         let mut a = Datatype::new_with_align(elt * n, -1, type_metatype::TYPE_ARRAY);
-        a.kind = DatatypeKind::Array { arrayof, arraysize: n };
-        Rc::new(a)
+        a.kind = DatatypeKind::Array { arrayof: arrayof.id(), arraysize: n };
+        types.intern(a).unwrap()
     }
 
     /// A bare named base type renders `("<name>", "")` with no trailing space
@@ -319,7 +573,8 @@ mod w10_input_prototype_declarator {
     /// `noident && typestack.size()==1` -> type_expr_nospace path.
     #[test]
     fn base_type_no_modifier() {
-        let t = named(8, type_metatype::TYPE_INT, "int8");
+        let types = TypeFactoryImpl::new();
+        let t = named(&types, 8, type_metatype::TYPE_INT, "int8");
         assert_eq!(
             declarator_parts(&t, crate::printc::RealTypeCtx::OFF),
             ("int8".to_string(), String::new())
@@ -331,8 +586,11 @@ mod w10_input_prototype_declarator {
     /// caller suppresses a second space after `*`.
     #[test]
     fn pointer_front_star() {
-        let base = named(8, type_metatype::TYPE_STRUCT, "twostruct");
-        let p = ptr_to(base);
+        let types = TypeFactoryImpl::new();
+        let base = types.reserve(
+            "twostruct", Datatype::hash_name("twostruct"), type_metatype::TYPE_STRUCT,
+        ).unwrap();
+        let p = ptr_to(&types, base);
         assert_eq!(
             declarator_parts(&p, crate::printc::RealTypeCtx::OFF),
             ("twostruct *".to_string(), String::new())
@@ -343,8 +601,9 @@ mod w10_input_prototype_declarator {
     /// No parenthesisation since there is no pending pointer.
     #[test]
     fn array_tail_no_paren() {
-        let base = named(4, type_metatype::TYPE_INT, "int4");
-        let a = array_of(base, 4);
+        let types = TypeFactoryImpl::new();
+        let base = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let a = array_of(&types, base, 4);
         assert_eq!(
             declarator_parts(&a, crate::printc::RealTypeCtx::OFF),
             ("int4".to_string(), "[4]".to_string())
@@ -357,15 +616,16 @@ mod w10_input_prototype_declarator {
     /// output as invalid `*(char *[16])` for a pointer to a SIMD-sized array.
     #[test]
     fn pointer_to_array_parentheses_follow_c_precedence() {
-        let base = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let base = named(&types, 4, type_metatype::TYPE_INT, "int4");
         // pointer-to-array int4 (*)[1]
-        let pta = ptr_to(array_of(base.clone(), 1));
+        let pta = ptr_to(&types, array_of(&types, base.clone(), 1));
         assert_eq!(
             declarator_parts(&pta, crate::printc::RealTypeCtx::OFF),
             ("int4 (*".to_string(), ")[1]".to_string())
         );
         // array-of-pointer int4 *[1]
-        let aop = array_of(ptr_to(base), 1);
+        let aop = array_of(&types, ptr_to(&types, base), 1);
         assert_eq!(
             declarator_parts(&aop, crate::printc::RealTypeCtx::OFF),
             ("int4 *".to_string(), "[1]".to_string())
@@ -378,10 +638,11 @@ mod w10_input_prototype_declarator {
     /// one-level pointer/array fix can accidentally corrupt.
     #[test]
     fn nested_pointer_array_parentheses_group_the_complete_declarator() {
-        let base = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let base = named(&types, 4, type_metatype::TYPE_INT, "int4");
 
         // pointer to array[2] of pointer to int4: int4 *(*x)[2]
-        let pointer_to_array_of_pointer = ptr_to(array_of(ptr_to(base.clone()), 2));
+        let pointer_to_array_of_pointer = ptr_to(&types, array_of(&types, ptr_to(&types, base.clone()), 2));
         assert_eq!(
             declarator_parts(
                 &pointer_to_array_of_pointer,
@@ -391,7 +652,7 @@ mod w10_input_prototype_declarator {
         );
 
         // array[2] of pointer to array[3] of int4: int4 (*x[2])[3]
-        let array_of_pointer_to_array = array_of(ptr_to(array_of(base, 3)), 2);
+        let array_of_pointer_to_array = array_of(&types, ptr_to(&types, array_of(&types, base, 3)), 2);
         assert_eq!(
             declarator_parts(&array_of_pointer_to_array, crate::printc::RealTypeCtx::OFF),
             ("int4 (*".to_string(), "[2])[3]".to_string())
@@ -405,30 +666,33 @@ mod w10_input_prototype_declarator {
     fn declaration_type_position_keeps_the_pointer_to_array_suffix() {
         use crate::printc::{array_decl_parts, type_name_for_decl, RealTypeCtx};
 
-        let base = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let base = named(&types, 4, type_metatype::TYPE_INT, "int4");
         let rt = RealTypeCtx::OFF;
         let parts = |front: &str, back: &str| (front.to_string(), back.to_string());
 
         assert_eq!(
-            type_name_for_decl(&ptr_to(array_of(base.clone(), 16)), rt),
+            type_name_for_decl(&ptr_to(&types, array_of(&types, base.clone(), 16)), rt),
             parts("int4 (*", ")[16]")
         );
         assert_eq!(
-            type_name_for_decl(&ptr_to(array_of(ptr_to(base.clone()), 3)), rt),
+            type_name_for_decl(&ptr_to(&types, array_of(&types, ptr_to(&types, base.clone()), 3)), rt),
             parts("int4 *(*", ")[3]")
         );
-        // array[2] of pointer to array[16]: `int4 (*v [2])[16]`
+        // array[2] of pointer to array[16]: `int4 (*x [2])[16]`
         assert_eq!(
-            array_decl_parts(&array_of(ptr_to(array_of(base.clone(), 16)), 2), rt),
+            array_decl_parts(&array_of(&types, ptr_to(&types, array_of(&types, base.clone(), 16)), 2), rt, false)
+                .map(|((front, back), count)| ((front.text, back.text), count)),
             Some((parts("int4 (*", ")[16]"), 2))
         );
 
         // Near-misses carry no suffix: a named base, a plain pointer, and an array
         // of pointers.
         assert_eq!(type_name_for_decl(&base, rt), parts("int4", ""));
-        assert_eq!(type_name_for_decl(&ptr_to(ptr_to(base.clone())), rt), parts("int4 **", ""));
+        assert_eq!(type_name_for_decl(&ptr_to(&types, ptr_to(&types, base.clone())), rt), parts("int4 **", ""));
         assert_eq!(
-            array_decl_parts(&array_of(ptr_to(base), 5), rt),
+            array_decl_parts(&array_of(&types, ptr_to(&types, base), 5), rt, false)
+                .map(|((front, back), count)| ((front.text, back.text), count)),
             Some((parts("int4 *", ""), 5))
         );
     }
@@ -438,32 +702,33 @@ mod w10_input_prototype_declarator {
     /// they exercise the same spelling consumed by JSON variable metadata.
     #[test]
     fn corpus_exported_type_strings_preserve_modifier_order() {
-        fn abstract_spelling(dt: &Rc<Datatype>) -> String {
+        fn abstract_spelling(dt: &TypeRoot) -> String {
             let (front, back) = declarator_parts(dt, crate::printc::RealTypeCtx::OFF);
             format!("{front}{back}")
         }
 
-        let char_ty = named(1, type_metatype::TYPE_INT, "char");
-        let uchar_ty = named(1, type_metatype::TYPE_UINT, "unsigned char");
+        let types = TypeFactoryImpl::new();
+        let char_ty = named(&types, 1, type_metatype::TYPE_INT, "char");
+        let uchar_ty = named(&types, 1, type_metatype::TYPE_UINT, "unsigned char");
 
         // arraycoverwidth_x86_64::vm v3: outer [2], inner [16].
         assert_eq!(
-            abstract_spelling(&array_of(array_of(char_ty.clone(), 16), 2)),
+            abstract_spelling(&array_of(&types, array_of(&types, char_ty.clone(), 16), 2)),
             "char[2][16]"
         );
         // katavm_level1_x86_64::sub_12d0 v32 and ptx.o's v16 are
         // arrays of pointers, not pointers to arrays.
         assert_eq!(
-            abstract_spelling(&array_of(ptr_to(uchar_ty), 2)),
+            abstract_spelling(&array_of(&types, ptr_to(&types, uchar_ty), 2)),
             "unsigned char *[2]"
         );
         assert_eq!(
-            abstract_spelling(&array_of(ptr_to(char_ty.clone()), 5)),
+            abstract_spelling(&array_of(&types, ptr_to(&types, char_ty.clone()), 5)),
             "char *[5]"
         );
         // structreturn_x86_64::passthru param_1 is the mirror type.
         assert_eq!(
-            abstract_spelling(&ptr_to(array_of(char_ty, 16))),
+            abstract_spelling(&ptr_to(&types, array_of(&types, char_ty, 16))),
             "char (*)[16]"
         );
     }
@@ -473,13 +738,14 @@ mod w10_input_prototype_declarator {
     /// 4-byte type renders `undefined4 *`.
     #[test]
     fn anonymous_base_generic_name() {
-        let anon = Rc::new(Datatype::new_with_align(4, -1, type_metatype::TYPE_UNKNOWN));
-        let p = ptr_to(anon);
+        let types = TypeFactoryImpl::new();
+        let anon = types.intern(Datatype::new_with_align(4, -1, type_metatype::TYPE_UNKNOWN)).unwrap();
+        let p = ptr_to(&types, anon);
         assert_eq!(
             declarator_parts(&p, crate::printc::RealTypeCtx::OFF),
             ("undefined4 *".to_string(), String::new())
         );
-        let v = Rc::new(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID));
+        let v = types.intern(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID)).unwrap();
         assert_eq!(
             declarator_parts(&v, crate::printc::RealTypeCtx::OFF),
             ("void".to_string(), String::new())
@@ -490,8 +756,9 @@ mod w10_input_prototype_declarator {
     /// `char **` -> `("char **", "")`.
     #[test]
     fn pointer_to_pointer() {
-        let base = named(1, type_metatype::TYPE_INT, "char");
-        let pp = ptr_to(ptr_to(base));
+        let types = TypeFactoryImpl::new();
+        let base = named(&types, 1, type_metatype::TYPE_INT, "char");
+        let pp = ptr_to(&types, ptr_to(&types, base));
         assert_eq!(
             declarator_parts(&pp, crate::printc::RealTypeCtx::OFF),
             ("char **".to_string(), String::new())
@@ -506,7 +773,8 @@ mod w10_input_prototype_declarator {
     #[test]
     fn realtypes_relabels_unknown_bases() {
         let on = crate::printc::RealTypeCtx { enabled: true, long_is_8: true, ..crate::printc::RealTypeCtx::OFF };
-        let unk = |sz: i32| Rc::new(Datatype::new_with_align(sz, -1, type_metatype::TYPE_UNKNOWN));
+        let types = TypeFactoryImpl::new();
+        let unk = |sz: i32| types.intern(Datatype::new_with_align(sz, -1, type_metatype::TYPE_UNKNOWN)).unwrap();
         // Scalars: 1->char, 2->unsigned short, 4->unsigned int, 8->unsigned long.
         assert_eq!(declarator_parts(&unk(1), on).0, "char");
         assert_eq!(declarator_parts(&unk(2), on).0, "unsigned short");
@@ -520,22 +788,22 @@ mod w10_input_prototype_declarator {
         // Pointer-to-unknown relabels the pointee through the same size table, so
         // the declared stride matches the one `opLoad`/`opPtradd` index with.
         assert_eq!(
-            declarator_parts(&ptr_to(unk(8)), on),
+            declarator_parts(&ptr_to(&types, unk(8)), on),
             ("unsigned long *".to_string(), String::new())
         );
         assert_eq!(
-            declarator_parts(&ptr_to(unk(4)), on),
+            declarator_parts(&ptr_to(&types, unk(4)), on),
             ("unsigned int *".to_string(), String::new())
         );
         assert_eq!(
-            declarator_parts(&ptr_to(ptr_to(unk(1))), on),
+            declarator_parts(&ptr_to(&types, ptr_to(&types, unk(1))), on),
             ("char **".to_string(), String::new())
         );
         // Only a residual size with no natural C type degrades to `void` under a
         // pointer (as a scalar it still keeps the placeholder).
-        assert_eq!(declarator_parts(&ptr_to(unk(3)), on), ("void *".to_string(), String::new()));
+        assert_eq!(declarator_parts(&ptr_to(&types, unk(3)), on), ("void *".to_string(), String::new()));
         // Array of unknown -> `char [8]` (element relabelled, count preserved).
-        assert_eq!(declarator_parts(&array_of(unk(1), 8), on), ("char".to_string(), "[8]".to_string()));
+        assert_eq!(declarator_parts(&array_of(&types, unk(1), 8), on), ("char".to_string(), "[8]".to_string()));
         // Gate OFF leaves the placeholder untouched.
         assert_eq!(declarator_parts(&unk(4), crate::printc::RealTypeCtx::OFF).0, "undefined4");
     }
@@ -546,12 +814,13 @@ mod w10_input_prototype_declarator {
     #[test]
     fn realtypes_keeps_genuine_void_pointers() {
         let on = crate::printc::RealTypeCtx { enabled: true, long_is_8: true, ..crate::printc::RealTypeCtx::OFF };
-        let void = || Rc::new(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID));
+        let types = TypeFactoryImpl::new();
+        let void = || types.intern(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID)).unwrap();
         for rt in [on, crate::printc::RealTypeCtx::OFF] {
             assert_eq!(declarator_parts(&void(), rt), ("void".to_string(), String::new()));
-            assert_eq!(declarator_parts(&ptr_to(void()), rt), ("void *".to_string(), String::new()));
+            assert_eq!(declarator_parts(&ptr_to(&types, void()), rt), ("void *".to_string(), String::new()));
             assert_eq!(
-                declarator_parts(&ptr_to(ptr_to(void())), rt),
+                declarator_parts(&ptr_to(&types, ptr_to(&types, void())), rt),
                 ("void **".to_string(), String::new())
             );
         }
@@ -565,37 +834,35 @@ mod w10_input_prototype_declarator {
 // same pattern as `w10_input_prototype_declarator` above).
 // ===========================================================================
 mod decompile_project_type_render {
-    use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeField};
+    use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeField, TypeFactory, TypeFactoryImpl, TypeRoot};
     use crate::printc::{
         compose_enum_body, compose_type_body, render_type_definitions, sanitize_type_name,
         RealTypeCtx,
     };
-    use std::rc::Rc;
-
-    fn named(size: i32, m: type_metatype, nm: &str) -> Rc<Datatype> {
+    fn named(types: &TypeFactoryImpl, size: i32, m: type_metatype, nm: &str) -> TypeRoot {
         let mut t = Datatype::new_with_align(size, -1, m);
         t.name = nm.to_string();
         t.display_name = nm.to_string();
         t.id = Datatype::hash_name(nm);
-        Rc::new(t)
+        types.intern(t).unwrap()
     }
 
-    fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+    fn ptr_to(types: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
         let mut p = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-        p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-        Rc::new(p)
+        p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+        types.intern(p).unwrap()
     }
 
-    fn array_of(arrayof: Rc<Datatype>, n: i32) -> Rc<Datatype> {
+    fn array_of(types: &TypeFactoryImpl, arrayof: TypeRoot, n: i32) -> TypeRoot {
         let elt = arrayof.get_size().max(1);
         let mut a = Datatype::new_with_align(elt * n, -1, type_metatype::TYPE_ARRAY);
-        a.kind = DatatypeKind::Array { arrayof, arraysize: n };
-        Rc::new(a)
+        a.kind = DatatypeKind::Array { arrayof: arrayof.id(), arraysize: n };
+        types.intern(a).unwrap()
     }
 
     /// A complete named struct with the given (offset, name, type) fields and
     /// total size.
-    fn struct_of(nm: &str, size: i32, fields: &[(i32, &str, Rc<Datatype>)]) -> Rc<Datatype> {
+    fn struct_of(types: &TypeFactoryImpl, nm: &str, size: i32, fields: &[(i32, &str, TypeRoot)]) -> TypeRoot {
         let mut s = Datatype::new_with_align(size, -1, type_metatype::TYPE_STRUCT);
         s.name = nm.to_string();
         s.display_name = nm.to_string();
@@ -604,14 +871,14 @@ mod decompile_project_type_render {
             field: fields
                 .iter()
                 .enumerate()
-                .map(|(i, (off, fnm, ft))| TypeField::new(i as i32, *off, *fnm, Rc::clone(ft)))
+                .map(|(i, (off, fnm, ft))| TypeField::new(i as i32, *off, *fnm, ft.id()))
                 .collect(),
             bitfield: vec![],
         };
-        Rc::new(s)
+        types.intern(s).unwrap()
     }
 
-    fn make_enum(nm: &str, size: i32, m: type_metatype, entries: &[(u64, &str)]) -> Rc<Datatype> {
+    fn make_enum(types: &TypeFactoryImpl, nm: &str, size: i32, m: type_metatype, entries: &[(u64, &str)]) -> TypeRoot {
         let mut dt = Datatype::new_with_align(size, size, m);
         dt.name = nm.to_string();
         dt.display_name = nm.to_string();
@@ -622,24 +889,26 @@ mod decompile_project_type_render {
             namemap.insert(*v, (*n).to_string());
         }
         dt.kind = DatatypeKind::Enum { namemap };
-        Rc::new(dt)
+        types.intern(dt).unwrap()
     }
 
     /// Struct body with a scalar, a pointer, an array, an interior padding gap
     /// AND trailing padding: every member/padding shape at once.
     #[test]
     fn struct_body_scalar_pointer_array_gap_trailing_pad() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
-        let ch = named(1, type_metatype::TYPE_INT, "char");
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let ch = named(&types, 1, type_metatype::TYPE_INT, "char");
         // struct mystruct { int4 a@0; <gap 4>; char *p@8; int4 arr[4]@16;
         //                   <trailing pad 8> } size 40.
         let s = struct_of(
+            &types,
             "mystruct",
             40,
             &[
-                (0, "a", Rc::clone(&i4)),
-                (8, "p", ptr_to(ch)),
-                (16, "arr", array_of(i4, 4)),
+                (0, "a", i4.clone()),
+                (8, "p", ptr_to(&types, ch)),
+                (16, "arr", array_of(&types, i4, 4)),
             ],
         );
         let body = compose_type_body(&s, "mystruct", RealTypeCtx::OFF);
@@ -659,19 +928,20 @@ mod decompile_project_type_render {
     /// Union body: every field at offset 0, NO padding members.
     #[test]
     fn union_body_no_padding() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
-        let f8 = named(8, type_metatype::TYPE_FLOAT, "float8");
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let f8 = named(&types, 8, type_metatype::TYPE_FLOAT, "float8");
         let mut u = Datatype::new_with_align(8, -1, type_metatype::TYPE_UNION);
         u.name = "myunion".to_string();
         u.display_name = "myunion".to_string();
         u.id = Datatype::hash_name("myunion");
         u.kind = DatatypeKind::Union {
             field: vec![
-                TypeField::new(0, 0, "as_int", i4),
-                TypeField::new(1, 0, "as_float", f8),
+                TypeField::new(0, 0, "as_int", i4.id()),
+                TypeField::new(1, 0, "as_float", f8.id()),
             ],
         };
-        let u = Rc::new(u);
+        let u = types.intern(u).unwrap();
         let body = compose_type_body(&u, "myunion", RealTypeCtx::OFF);
         assert_eq!(
             body,
@@ -687,8 +957,10 @@ mod decompile_project_type_render {
     /// SIGNED decimal sign-extended by the enum size; the TYPE_UINT form hex.
     #[test]
     fn enum_signed_and_unsigned_value_forms() {
+        let types = TypeFactoryImpl::new();
         // Signed 4-byte enum: 0xffffffff sign-extends to -1.
         let se = make_enum(
+            &types,
             "serrs",
             4,
             type_metatype::TYPE_INT,
@@ -704,6 +976,7 @@ mod decompile_project_type_render {
         );
         // Unsigned 4-byte enum: hex values.
         let ue = make_enum(
+            &types,
             "uflags",
             4,
             type_metatype::TYPE_UINT,
@@ -723,30 +996,33 @@ mod decompile_project_type_render {
     /// typedef and a pointer typedef both lay out correctly.
     #[test]
     fn typedef_renders_via_declarator() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
         let td = {
-            let mut t = (*i4).clone();
+            let mut t = Datatype::new_with_align(4, -1, type_metatype::TYPE_INT);
+            t.kind = DatatypeKind::Alias;
             t.name = "myint".to_string();
             t.display_name = "myint".to_string();
             t.id = Datatype::hash_name("myint");
-            t.typedef_imm = Some(Rc::clone(&i4));
-            Rc::new(t)
+            t.typedef_imm = Some(i4.id());
+            types.intern(t).unwrap()
         };
-        let out = render_type_definitions(&[Rc::clone(&i4), Rc::clone(&td)], RealTypeCtx::OFF);
+        let out = render_type_definitions(&[i4.clone(), td.clone()], RealTypeCtx::OFF);
         assert!(
             out.contains("typedef int4 myint;\n"),
             "scalar typedef line missing:\n{out}"
         );
         // Pointer typedef: `typedef char *mystr;` (the `*` glues to the name).
-        let ch = named(1, type_metatype::TYPE_INT, "char");
-        let pstr = ptr_to(ch);
+        let ch = named(&types, 1, type_metatype::TYPE_INT, "char");
+        let pstr = ptr_to(&types, ch);
         let tdp = {
-            let mut t = (*pstr).clone();
+            let mut t = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
+            t.kind = DatatypeKind::Alias;
             t.name = "mystr".to_string();
             t.display_name = "mystr".to_string();
             t.id = Datatype::hash_name("mystr");
-            t.typedef_imm = Some(Rc::clone(&pstr));
-            Rc::new(t)
+            t.typedef_imm = Some(pstr.id());
+            types.intern(t).unwrap()
         };
         let out = render_type_definitions(&[tdp], RealTypeCtx::OFF);
         assert!(
@@ -760,19 +1036,12 @@ mod decompile_project_type_render {
     /// (un-annotated) FIRST, then its body.
     #[test]
     fn incomplete_struct_forward_decl_only() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
-        let complete = struct_of("solid", 4, &[(0, "a", i4)]);
-        let opaque = {
-            let mut s = Datatype::new_with_align(1, -1, type_metatype::TYPE_STRUCT);
-            s.name = "mystery".to_string();
-            s.display_name = "mystery".to_string();
-            s.id = Datatype::hash_name("mystery");
-            s.flags |= flags::type_incomplete;
-            s.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
-            Rc::new(s)
-        };
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let complete = struct_of(&types, "solid", 4, &[(0, "a", i4)]);
+        let opaque = types.reserve("mystery", Datatype::hash_name("mystery"), type_metatype::TYPE_STRUCT).unwrap();
         let out =
-            render_type_definitions(&[Rc::clone(&opaque), Rc::clone(&complete)], RealTypeCtx::OFF);
+            render_type_definitions(&[opaque.clone(), complete.clone()], RealTypeCtx::OFF);
         assert!(
             out.contains("typedef struct mystery mystery; /* opaque */\n"),
             "opaque forward decl missing:\n{out}"
@@ -802,8 +1071,9 @@ mod decompile_project_type_render {
         assert_eq!(sanitize_type_name("9lives"), "_9lives");
         assert_eq!(sanitize_type_name("std::vector<int>"), "std__vector_int_");
 
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
-        let s = struct_of("bad-name$1", 4, &[(0, "a", i4)]);
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let s = struct_of(&types, "bad-name$1", 4, &[(0, "a", i4)]);
         let out = render_type_definitions(&[s], RealTypeCtx::OFF);
         assert!(
             out.contains(
@@ -821,10 +1091,11 @@ mod decompile_project_type_render {
     /// quotes, and nothing that could not break a comment is touched.
     #[test]
     fn renamed_from_note_cannot_be_escaped_by_the_raw_name() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
         for raw in ["ev*/il", "ev\nil", "ev/*il"] {
             let out = render_type_definitions(
-                &[struct_of(raw, 4, &[(0, "a", Rc::clone(&i4))])],
+                &[struct_of(&types, raw, 4, &[(0, "a", i4.clone())])],
                 RealTypeCtx::OFF,
             );
             for line in out.lines().filter(|l| l.contains("renamed from")) {
@@ -839,7 +1110,7 @@ mod decompile_project_type_render {
         }
         // A name with no comment delimiter and no control byte is quoted verbatim.
         let plain = render_type_definitions(
-            &[struct_of("bad-name$1", 4, &[(0, "a", i4)])],
+            &[struct_of(&types, "bad-name$1", 4, &[(0, "a", i4)])],
             RealTypeCtx::OFF,
         );
         assert!(plain.contains("/* renamed from \"bad-name$1\" */"), "{plain}");
@@ -849,10 +1120,12 @@ mod decompile_project_type_render {
     /// complete type emits only the `/* duplicate type name skipped */` note.
     #[test]
     fn duplicate_type_name_first_wins() {
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
-        let i8t = named(8, type_metatype::TYPE_INT, "int8");
-        let first = struct_of("dup", 4, &[(0, "a", i4)]);
-        let second = struct_of("dup", 8, &[(0, "b", i8t)]);
+        let types = TypeFactoryImpl::new();
+        let other_types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let i8t = named(&other_types, 8, type_metatype::TYPE_INT, "int8");
+        let first = struct_of(&types, "dup", 4, &[(0, "a", i4)]);
+        let second = struct_of(&other_types, "dup", 8, &[(0, "b", i8t)]);
         let out = render_type_definitions(&[first, second], RealTypeCtx::OFF);
         assert_eq!(
             out.matches("typedef struct dup dup;").count(),
@@ -878,26 +1151,39 @@ mod decompile_project_type_render {
     #[test]
     fn core_unnamed_and_cross_kind_collisions_skipped() {
         // A core type (flagged) is skipped even though it is a composite.
-        let i4 = named(4, type_metatype::TYPE_INT, "int4");
+        let types = TypeFactoryImpl::new();
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
         let core_struct = {
-            let s = struct_of("sys", 4, &[(0, "a", Rc::clone(&i4))]);
-            let mut c = (*s).clone();
+            let core_types = TypeFactoryImpl::new();
+            core_types.setup_sizes(Some(4), 8, 8);
+            core_types.set_core_type("int4", 4, type_metatype::TYPE_INT, false).unwrap();
+            let core_i4 = core_types.find_by_name("int4").unwrap().unwrap();
+            let mut c = Datatype::new_with_align(4, 4, type_metatype::TYPE_STRUCT);
+            c.name = "sys".to_string();
+            c.display_name = "sys".to_string();
+            c.id = Datatype::hash_name("sys");
+            c.kind = DatatypeKind::Struct {
+                field: vec![TypeField::new(0, 0, "a", core_i4.id())],
+                bitfield: vec![],
+            };
             c.flags |= flags::coretype;
-            Rc::new(c)
+            let core_struct = core_types.intern(c).unwrap();
+            core_types.cache_core_types().unwrap();
+            core_struct
         };
         // An unnamed struct is skipped.
         let anon = {
-            let mut s = Datatype::new_with_align(4, -1, type_metatype::TYPE_STRUCT);
+            let mut s = Datatype::new_with_align(4, 4, type_metatype::TYPE_STRUCT);
             s.kind = DatatypeKind::Struct {
-                field: vec![TypeField::new(0, 0, "a", Rc::clone(&i4))],
+                field: vec![TypeField::new(0, 0, "a", i4.id())],
                 bitfield: vec![],
             };
-            Rc::new(s)
+            types.intern(s).unwrap()
         };
-        let named_struct = struct_of("tagged", 4, &[(0, "a", Rc::clone(&i4))]);
-        let colliding_enum = make_enum("tagged", 4, type_metatype::TYPE_UINT, &[(1, "ONE")]);
+        let named_struct = struct_of(&types, "tagged", 4, &[(0, "a", i4.clone())]);
+        let colliding_enum = make_enum(&TypeFactoryImpl::new(), "tagged", 4, type_metatype::TYPE_UINT, &[(1, "ONE")]);
         let out = render_type_definitions(
-            &[core_struct, anon, Rc::clone(&named_struct), colliding_enum],
+            &[core_struct, anon, named_struct.clone(), colliding_enum],
             RealTypeCtx::OFF,
         );
         assert!(!out.contains("sys"), "core types must be skipped:\n{out}");
@@ -1681,7 +1967,8 @@ mod w10_enum_render {
 
     /// Build an enum (value -> name) the way `TypeEnum` looks after decode:
     /// metatype TYPE_UINT plus the `enumtype` flag (dtype.rs:5244-5247).
-    fn make_enum(size: i32, entries: &[(u64, &str)]) -> Datatype {
+    fn make_enum(size: i32, entries: &[(u64, &str)]) -> crate::dtype::TypeRoot {
+        use crate::dtype::TypeFactoryImpl;
         let mut dt = Datatype::new_with_align(size, size, type_metatype::TYPE_UINT);
         dt.flags |= flags::enumtype;
         let mut namemap: BTreeMap<u64, String> = BTreeMap::new();
@@ -1689,13 +1976,16 @@ mod w10_enum_render {
             namemap.insert(*v, (*n).to_string());
         }
         dt.kind = DatatypeKind::Enum { namemap };
-        dt
+        TypeFactoryImpl::new().intern(dt).unwrap()
     }
 
     /// Render a single enum constant through the live RPN/emit driver.
-    fn render_enum(ct: &Datatype, val: u64) -> String {
+    fn render_enum(ct: &crate::dtype::TypeRoot, val: u64) -> String {
         emit_expr(|p| {
-            p.push_enum_constant_ir(ct, val, OpId::default(), VarnodeId::default());
+            p.push_enum_constant_ir(
+                &crate::dtype::TypeFactoryImpl::new(), ct, val, OpId::default(), VarnodeId::default(),
+                false,
+            );
         })
     }
 
@@ -1746,19 +2036,6 @@ mod w10_enum_render {
             "remainder must render as a raw integer, got {out:?}"
         );
         assert_eq!(out, "0x10", "raw integer fallback: {out:?}");
-    }
-
-    /// The complement path: a value better represented as `~(flags)` emits a
-    /// leading `~` (C++ printc.cc:1744-1745).  For enum3 {EIGHT=8} (size 8) the
-    /// value `~8` (= 0xfffffffffffffff7) is `~EIGHT`.
-    #[test]
-    fn complement_emits_tilde() {
-        let e = make_enum(8, &[(0, "ZERO"), (1, "ONE"), (2, "TWO"), (4, "FOUR"), (8, "EIGHT")]);
-        let val = 0x8u64 ^ kuna_base::address::calc_mask(8); // ~8 in the 8-byte mask
-        let rep = e.get_matches(val).unwrap();
-        assert_eq!(rep.match_name, vec!["EIGHT".to_string()]);
-        assert!(rep.complement, "the ~ path must be taken");
-        assert_eq!(render_enum(&e, val), "~EIGHT");
     }
 
     /// NO SPECIAL-CASING: the arm is generic over the namemap.  The SAME value
@@ -1930,8 +2207,8 @@ mod w10_float_family {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
     }
 
-    fn unk(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn unk(size: int4) -> crate::dtype::TypeRoot {
+        crate::dtype::TypeFactoryImpl::new().intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
     }
 
     fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> super::super::OpId {
@@ -2039,7 +2316,9 @@ mod w10_float_family {
         let mut t = Datatype::new_with_align(8, -1, type_metatype::TYPE_FLOAT);
         t.name = "float8".to_string();
         t.display_name = "float8".to_string();
-        let t = Rc::new(t);
+        t.id = Datatype::hash_name("float8");
+        let types = crate::dtype::TypeFactoryImpl::new();
+        let t = types.intern(t).unwrap();
         let (front, back) = declarator_parts(&t, crate::printc::RealTypeCtx::OFF);
         assert_eq!(front, "float8");
         assert_eq!(back, "");
@@ -2047,7 +2326,8 @@ mod w10_float_family {
         let mut t4 = Datatype::new_with_align(4, -1, type_metatype::TYPE_FLOAT);
         t4.name = "float4".to_string();
         t4.display_name = "float4".to_string();
-        let (f4, b4) = declarator_parts(&Rc::new(t4), crate::printc::RealTypeCtx::OFF);
+        t4.id = Datatype::hash_name("float4");
+        let (f4, b4) = declarator_parts(&types.intern(t4).unwrap(), crate::printc::RealTypeCtx::OFF);
         assert_eq!((f4.as_str(), b4.as_str()), ("float4", ""));
     }
 }
@@ -2151,11 +2431,12 @@ mod w10_printc_cast_render {
     }
 
     /// A named base type whose `display_name` is `nm` (what `(nm)` must spell).
-    fn named(nm: &str, size: int4, meta: type_metatype) -> Rc<Datatype> {
+    fn named(nm: &str, size: int4, meta: type_metatype) -> crate::dtype::TypeRoot {
         let mut t = Datatype::new_with_align(size, -1, meta);
         t.name = nm.to_string();
         t.display_name = nm.to_string();
-        Rc::new(t)
+        t.id = Datatype::hash_name(nm);
+        crate::dtype::TypeFactoryImpl::new().intern(t).unwrap()
     }
 
     fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> super::super::OpId {
@@ -2171,7 +2452,7 @@ mod w10_printc_cast_render {
         fd: &mut Funcdata,
         opc: OpCode,
         k: u64,
-        out_ty: Rc<Datatype>,
+        out_ty: crate::dtype::TypeRoot,
     ) -> super::super::OpId {
         let r = ram(fd);
         let op = mk_op(fd, 1, 0x20, opc);
@@ -2193,6 +2474,605 @@ mod w10_printc_cast_render {
         p.set_output_stream();
         p.op_type_cast_ir(fd, &arch, op);
         p.emit_mut().output_str().to_string()
+    }
+
+    fn apply_callable_authority(
+        proto: &mut crate::fspec::FuncProto, fd: &Funcdata,
+        int_type: &crate::dtype::TypeRoot, authority: &str,
+    ) {
+        use crate::fspec::{parameter_pieces_flags, ParameterPieces};
+        match authority {
+            "override" => proto.set_override(true),
+            "model" => proto.set_model_lock(true),
+            "custom" => proto.set_custom_storage(true),
+            "voidlock" => proto.set_void_input_lock(true),
+            "output" => {
+                proto.set_output_lock(true);
+                // Isolate output authority from the setter's model-lock side effect.
+                proto.set_model_lock(false);
+            }
+            "input" | "later" | "later_name" | "later_size" => {
+                let locked_slot = int4::from(authority.starts_with("later"));
+                let lock = match authority {
+                    "later_name" => parameter_pieces_flags::NAMELOCK,
+                    "later_size" => parameter_pieces_flags::SIZELOCK,
+                    _ => parameter_pieces_flags::TYPELOCK,
+                };
+                for slot in 0..=locked_slot {
+                    proto.set_param(slot, "argument", &ParameterPieces {
+                        addr: Address::new(ram(fd), 0x80 + slot as u64 * 8),
+                        type_: Some(int_type.clone()),
+                        flags: if slot == locked_slot { lock } else { 0 },
+                    });
+                }
+                assert!(!proto.is_model_locked(), "independent parameter lock witness");
+                if locked_slot == 1 {
+                    assert!(!proto.is_input_locked(), "aggregate first-input query misses this authority");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
+        use crate::dtype::{DatatypeKind, TypeFactory, TypeFactoryImpl};
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::prettyprint::TokenKind;
+
+        for case in [
+            "plain", "call_abi", "view_abi", "call_open", "view_open",
+            "argument", "ordinary_reader", "void_pointer", "object_pointer",
+            "explicit_space", "truncated", "width_mismatch", "null",
+            "call_override", "call_input", "call_later", "call_output",
+            "call_model", "call_custom", "call_voidlock",
+            "call_later_name", "call_later_size",
+        ] {
+            let mut fd = build_fd();
+            let types = TypeFactoryImpl::new();
+            types.setup_sizes(Some(4), 8, 8);
+            for (name, size, meta) in [
+                ("void", 1, type_metatype::TYPE_VOID),
+                ("code", 1, type_metatype::TYPE_CODE),
+                ("int4", 4, type_metatype::TYPE_INT),
+            ] {
+                types.set_core_type(name, size, meta, false).unwrap();
+            }
+            types.cache_core_types().unwrap();
+            let void = types.get_type_void().unwrap();
+            let mut model = ProtoModel::new(fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let model = Rc::new(model);
+            types.set_proto_context(Some(model.clone()), fd.get_arch().manage.clone()).unwrap();
+            let mut signature = FuncProto::new();
+            signature.set_internal(model, void.clone());
+            let int_type = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            if let Some(authority) = case.strip_prefix("call_") {
+                apply_callable_authority(&mut signature, &fd, &int_type, authority);
+            }
+            if case == "call_abi" { signature.set_abi_first_vararg(Some(0)); }
+            signature.set_dotdotdot(case == "call_open");
+            let declaration = crate::fspec::LogicalCallable {
+                binding: types.model_binding(None).unwrap(),
+                output: void.id(),
+                inputs: vec![],
+                variadic: case == "view_open",
+                input_closed: true,
+                logical_first: (case == "view_abi").then_some(0),
+                flags: 0,
+            };
+            let base = match case {
+                "void_pointer" => void.clone(),
+                "object_pointer" => types.get_base(4, type_metatype::TYPE_INT).unwrap(),
+                _ => types.get_type_code_proto(&declaration).unwrap(),
+            };
+            let mut pointer = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
+            pointer.kind = DatatypeKind::Pointer {
+                ptrto: base.id(),
+                spaceid: (case == "explicit_space").then(|| ram(&fd)),
+                truncate: (case == "truncated").then(|| types.get_type_pointer(4, base, 1).unwrap().id()),
+                wordsize: 1,
+            };
+            let pointer = types.intern(pointer).unwrap();
+            if case == "argument" {
+                signature.set_param(0, "callback", &ParameterPieces {
+                    addr: Address::new(ram(&fd), 0x80),
+                    type_: Some(pointer.clone()),
+                    flags: parameter_pieces_flags::TYPELOCK,
+                });
+            }
+            let value = fd.new_constant(
+                if case == "width_mismatch" { 4 } else { 8 },
+                if case == "null" { 0 } else { 0x200000 },
+            );
+            let reader = mk_op(&mut fd, signature.num_params() + 1, 0x1000,
+                if case == "ordinary_reader" { OpCode::CPUI_COPY } else { OpCode::CPUI_CALLIND });
+            let slot = if case == "argument" { 1 } else { 0 };
+            if case == "argument" {
+                let other_target = fd.new_constant(8, 0x100000);
+                fd.op_set_input(reader, other_target, 0).unwrap();
+            }
+            fd.op_set_input(reader, value, slot).unwrap();
+            if case != "argument" {
+                for slot in 0..signature.num_params() {
+                    let argument = fd.new_constant(4, slot as u64 + 7);
+                    fd.op_set_input(reader, argument, slot + 1).unwrap();
+                }
+            }
+            fd.vn_update_type(value, pointer.clone());
+            if case != "ordinary_reader" {
+                let mut specs = FuncCallSpecs::new(reader, Address::new_invalid());
+                specs.proto_mut().copy(&signature);
+                fd.push_call_specs(specs);
+            }
+            fd.set_high_level();
+            let mut arch = bare_arch();
+            arch.types_impl().setup_sizes(Some(4), 8, 8);
+            arch.types_impl().set_core_type("code", 1, type_metatype::TYPE_CODE, false).unwrap();
+            arch.types_impl().cache_core_types().unwrap();
+            for native in [false, true, false] {
+                arch.ctypes = native;
+                let mut print = PrintC::new();
+                print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
+                print.options.null = case == "null";
+                print.set_markup(true);
+                print.emit_mut().set_capture_tokens(true);
+                print.push_vn_explicit_ir(&fd, &arch, value, reader);
+                print.recurse();
+                let tokens = print.emit_mut().take_markup_tokens();
+                let conversions: Vec<_> = tokens.iter()
+                    .filter(|token| token.kind == TokenKind::Type).collect();
+                if case == "null" {
+                    assert!(conversions.is_empty(), "NULL handling precedes callable projection");
+                    assert!(tokens.iter().any(|token| token.text == "NULL"));
+                } else {
+                    assert_eq!(conversions.len(), 1, "{case}, ctypes={native}");
+                    let spelling = &conversions[0].text;
+                    match case {
+                        "void_pointer" => assert_eq!(spelling, "void *"),
+                        "object_pointer" => assert!(!spelling.contains("code") && !spelling.contains('('),
+                            "object pointer must not become a callable view: {spelling}"),
+                        _ => assert!(spelling.contains('('),
+                            "{case}, ctypes={native}: concrete callable view was erased: {spelling}"),
+                    }
+                }
+                let unchanged = fd.vbank().get(value).unwrap();
+                assert!(unchanged.is_constant());
+                assert!(unchanged.get_def().is_none());
+                assert_eq!(unchanged.get_type(), &pointer,
+                    "{case}: rendering must not replace the semantic constant datatype");
+                assert_eq!(fd.obank().get(reader).unwrap().get_in(slot), Some(value));
+            }
+        }
+    }
+
+    #[test]
+    fn recovered_callable_projection_retains_cast_provenance_and_authority() {
+        use crate::cast::CastStrategyC;
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        use crate::fspec::{FuncCallSpecs, LogicalCallable, ParameterPieces, ProtoModel};
+        use crate::p9_emit::coreaction_casts::get_input_cast;
+        use crate::prettyprint::TokenKind;
+
+        for source_kind in ["generic", "integer", "declared"] {
+            let mut context = ContextArch::new(build_manager());
+            let types = Rc::new(TypeFactoryImpl::new());
+            types.setup_sizes(Some(4), 8, 8);
+            for (name, size, meta) in [
+                ("void", 1, type_metatype::TYPE_VOID),
+                ("code", 1, type_metatype::TYPE_CODE),
+                ("int4", 4, type_metatype::TYPE_INT),
+                ("uint8", 8, type_metatype::TYPE_UINT),
+            ] {
+                types.set_core_type(name, size, meta, false).unwrap();
+            }
+            types.cache_core_types().unwrap();
+            let mut model = ProtoModel::new(context.manage());
+            model.build_param_list("standard").unwrap();
+            let model = Rc::new(model);
+            types.set_proto_context(Some(model.clone()), context.manage.clone()).unwrap();
+            context.types = Some(types.clone());
+            let entry = Address::new(context.manage().get_space_by_name("ram").unwrap().clone(), 0x1000);
+            let mut fd = Funcdata::new("func", "func", Rc::new(context), entry, 0x1000_0000, 0x40).unwrap();
+            let void = types.get_type_void().unwrap();
+            let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let generic = types.get_type_pointer(8, types.get_type_code().unwrap(), 1).unwrap();
+            let source_type = match source_kind {
+                "integer" => types.get_base(8, type_metatype::TYPE_UINT).unwrap(),
+                "declared" => {
+                    let code = types.get_type_code_proto(&LogicalCallable {
+                        binding: types.model_binding(None).unwrap(), output: int4.id(),
+                        inputs: vec![], variadic: false, input_closed: true,
+                        logical_first: None, flags: 0,
+                    }).unwrap();
+                    types.get_type_pointer(8, code, 1).unwrap()
+                }
+                _ => generic,
+            };
+            let address = Address::new(ram(&fd), 0x400);
+            let source = fd.new_varnode(8, &address, Some(source_type.clone()));
+            let source = fd.set_input_varnode(source).unwrap();
+            fd.get_func_proto_mut().set_internal(model.clone(), void.clone());
+            fd.get_func_proto_mut().set_param(0, "target", &ParameterPieces {
+                addr: address, type_: Some(source_type), flags: 0,
+            });
+            let call = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_CALLIND);
+            let argument = fd.new_constant(4, 7);
+            fd.vn_update_type(argument, int4);
+            fd.op_set_input(call, source, 0).unwrap();
+            fd.op_set_input(call, argument, 1).unwrap();
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().set_internal(model, void);
+            let index = fd.num_calls();
+            fd.push_call_specs(specs);
+            fd.set_high_level();
+            let strategy = CastStrategyC::new(types);
+            let destination = get_input_cast(&mut fd, &strategy, call, 0).unwrap();
+            let cast = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_CAST);
+            fd.op_set_input(cast, source, 0).unwrap();
+            let output = fd.new_unique(8, Some(destination.clone()));
+            fd.op_set_output(cast, output).unwrap();
+            fd.op_set_input(call, output, 0).unwrap();
+
+            let mut arch = bare_arch();
+            arch.types_impl().setup_sizes(Some(4), 8, 8);
+            arch.types_impl().set_core_type("code", 1, type_metatype::TYPE_CODE, false).unwrap();
+            arch.types_impl().cache_core_types().unwrap();
+            for repeat in [false, true] {
+                if repeat {
+                    assert!(get_input_cast(&mut fd, &strategy, call, 0).is_none());
+                }
+                for native in [false, true] {
+                    arch.ctypes = native;
+                    let mut print = PrintC::new();
+                    print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
+                    print.set_markup(true);
+                    print.emit_mut().set_capture_tokens(true);
+                    print.op_type_cast_ir(&fd, &arch, cast);
+                    let tokens = print.emit_mut().take_markup_tokens();
+                    let conversions: Vec<_> = tokens.iter().filter(|t| t.kind == TokenKind::Type).collect();
+                    if !native && source_kind == "generic" {
+                        assert!(conversions.is_empty(), "inferred generic target needs no visible conversion: {tokens:?}");
+                    } else if !native && source_kind == "integer" {
+                        assert_eq!(conversions.len(), 1);
+                        assert_eq!(conversions[0].text, "code *");
+                    } else {
+                        assert_eq!(conversions.len(), 1);
+                        assert!(conversions[0].text.contains('('), "concrete signature conversion lost: {tokens:?}");
+                    }
+                    assert_eq!(fd.vbank().get(output).unwrap().get_type(), &destination);
+                }
+            }
+            assert!(fd.get_call_specs(index).clone_for_op(call).inferred_target_view().is_none());
+            fd.get_call_specs_mut(index).proto_mut().set_override(true);
+            arch.ctypes = false;
+            let mut print = PrintC::new();
+            print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
+            assert!(print.callable_dialect_code(&fd, &arch, call, output, &destination).is_none());
+        }
+    }
+
+    #[test]
+    fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::prettyprint::TokenKind;
+
+        for case in [
+            "plain", "second_use", "narrow_pointer", "word_addressed",
+            "abi_boundary", "open_tail", "concrete_source", "declared_void",
+            "call_abi", "view_abi", "call_open", "view_open",
+            "scalar", "scalar_constant", "scalar_unknown", "scalar_callother",
+            "scalar_narrow", "scalar_abi", "scalar_open",
+            "call_override", "call_input", "call_later", "call_output",
+            "call_model", "call_custom", "call_later_name", "call_later_size",
+        ] {
+            let scalar_source = case.starts_with("scalar");
+            let mut fd = build_fd();
+            let types = TypeFactoryImpl::new();
+            types.setup_sizes(Some(4), 8, 8);
+            for (name, size, meta) in [
+                ("void", 1, type_metatype::TYPE_VOID),
+                ("code", 1, type_metatype::TYPE_CODE),
+                ("int4", 4, type_metatype::TYPE_INT),
+                ("uint4", 4, type_metatype::TYPE_UINT),
+                ("uint8", 8, type_metatype::TYPE_UINT),
+                ("xunknown1", 1, type_metatype::TYPE_UNKNOWN),
+                ("xunknown8", 8, type_metatype::TYPE_UNKNOWN),
+            ] {
+                types.set_core_type(name, size, meta, false).unwrap();
+            }
+            types.cache_core_types().unwrap();
+            let void = types.get_type_void().unwrap();
+            let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let mut model = ProtoModel::new(fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let model = Rc::new(model);
+            types.set_proto_context(Some(model.clone()), fd.get_arch().manage.clone()).unwrap();
+            let mut signature = FuncProto::new();
+            signature.set_internal(Rc::clone(&model), void.clone());
+            signature.set_param(0, "argument", &ParameterPieces {
+                addr: Address::new(ram(&fd), 0x80), type_: Some(int4.clone()),
+                flags: 0,
+            });
+            if matches!(case, "abi_boundary" | "scalar_abi" | "call_abi") {
+                signature.set_abi_first_vararg(Some(1));
+            }
+            signature.set_dotdotdot(matches!(case, "open_tail" | "scalar_open" | "call_open"));
+            if let Some(authority) = case.strip_prefix("call_") {
+                apply_callable_authority(&mut signature, &fd, &int4, authority);
+            }
+            let declaration = crate::fspec::LogicalCallable {
+                binding: types.model_binding(None).unwrap(),
+                output: void.id(),
+                inputs: vec![int4.id()],
+                variadic: matches!(case, "open_tail" | "scalar_open" | "view_open"),
+                input_closed: true,
+                logical_first: matches!(case, "abi_boundary" | "scalar_abi" | "view_abi").then_some(1),
+                flags: 0,
+            };
+            let destination = types.get_type_pointer(
+                8, types.get_type_code_proto(&declaration).unwrap(), 1).unwrap();
+            let source_base = if case == "concrete_source" {
+                let concrete = crate::fspec::LogicalCallable {
+                    inputs: vec![], variadic: false, logical_first: None, ..declaration.clone()
+                };
+                types.get_type_code_proto(&concrete).unwrap()
+            } else {
+                types.get_type_code().unwrap()
+            };
+            let source_type = if scalar_source {
+                types.get_base(
+                    if case == "scalar_narrow" { 4 } else { 8 },
+                    if case == "scalar_unknown" || case == "scalar_callother" {
+                        type_metatype::TYPE_UNKNOWN
+                    } else { type_metatype::TYPE_UINT },
+                ).unwrap()
+            } else {
+                types.get_type_pointer(
+                    if case == "narrow_pointer" { 4 } else { 8 },
+                    source_base,
+                    if case == "word_addressed" { 2 } else { 1 },
+                ).unwrap()
+            };
+            let source_address = Address::new(ram(&fd), 0x400);
+            let source = if case == "scalar_constant" {
+                let value = fd.new_constant(8, 0x200000);
+                fd.vn_update_type(value, source_type.clone());
+                value
+            } else if case == "scalar_callother" {
+                let producer = mk_op(&mut fd, 2, 0x0ffc, OpCode::CPUI_CALLOTHER);
+                let userop = fd.new_constant(4, 0);
+                let number = fd.new_constant(4, 0x29);
+                fd.op_set_input(producer, userop, 0).unwrap();
+                fd.op_set_input(producer, number, 1).unwrap();
+                let value = fd.new_unique(8, Some(source_type.clone()));
+                fd.op_set_output(producer, value).unwrap();
+                fd.vbank_mut().get_mut(value).unwrap().set_implied();
+                value
+            } else {
+                let value = fd.new_varnode(
+                    source_type.get_size(), &source_address, Some(source_type.clone()),
+                );
+                fd.set_input_varnode(value).unwrap()
+            };
+            fd.get_func_proto_mut().set_internal(Rc::clone(&model), void.clone());
+            fd.get_func_proto_mut().set_param(0, "callback", &ParameterPieces {
+                addr: source_address,
+                type_: Some(if case == "declared_void" {
+                    types.get_type_pointer(8, void, 1).unwrap()
+                } else { source_type.clone() }),
+                flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+            });
+            let cast = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_CAST);
+            fd.op_set_input(cast, source, 0).unwrap();
+            let output = fd.new_unique(8, Some(destination));
+            fd.op_set_output(cast, output).unwrap();
+            let call = mk_op(&mut fd, signature.num_params() + 1, 0x1000, OpCode::CPUI_CALLIND);
+            fd.op_set_input(call, output, 0).unwrap();
+            for slot in 0..signature.num_params() {
+                let argument = fd.new_constant(4, slot as u64 + 7);
+                fd.op_set_input(call, argument, slot + 1).unwrap();
+            }
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().copy(&signature);
+            fd.push_call_specs(specs);
+            if case == "second_use" {
+                let another = mk_op(&mut fd, 1, 0x1004, OpCode::CPUI_COPY);
+                fd.op_set_input(another, output, 0).unwrap();
+            }
+            fd.set_high_level();
+            let mut arch = bare_arch();
+            arch.types_impl().setup_sizes(Some(4), 8, 8);
+            arch.types_impl().set_core_type("code", 1, type_metatype::TYPE_CODE, false).unwrap();
+            arch.types_impl().cache_core_types().unwrap();
+            for native in [false, true, false] {
+                arch.ctypes = native;
+                let mut print = PrintC::new();
+                print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
+                print.set_markup(true);
+                print.emit_mut().set_capture_tokens(true);
+                print.op_type_cast_ir(&fd, &arch, cast);
+                let tokens = print.emit_mut().take_markup_tokens();
+                let casts = tokens.iter().filter(|token| token.kind == TokenKind::Type).count();
+                assert_eq!(casts, 1, "{case}, ctypes={native}");
+                let conversion = tokens.iter().find(|token| token.kind == TokenKind::Type).unwrap();
+                assert!(conversion.text.contains('(') && conversion.text.contains(if native { "int" } else { "int4" }),
+                    "explicit logical inputs must survive rendering: {case}: {conversion:?}");
+                assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(output));
+                assert_eq!(fd.obank().get(cast).unwrap().get_in(0), Some(source));
+                assert_eq!(fd.obank().get(cast).unwrap().code(), OpCode::CPUI_CAST);
+                if case == "declared_void" {
+                    assert_eq!(fd.vbank().get(source).unwrap().get_type()
+                        .get_ptr_to().unwrap().get_metatype(), type_metatype::TYPE_CODE);
+                    assert_eq!(fd.get_func_proto().get_param(0).unwrap().get_type().unwrap()
+                        .get_ptr_to().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn loaded_callable_views_preserve_explicit_signature_despite_member_guesses() {
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::prettyprint::TokenKind;
+
+        for case in [
+            "declared_code", "visible_cast", "declared_void", "named_cast",
+            "wrong_load_width", "wrong_stride", "unresolved_unknown_load",
+            "copy_loaded", "abi_boundary",
+        ] {
+            let mut fd = build_fd();
+            let types = TypeFactoryImpl::new();
+            types.setup_sizes(Some(4), 8, 8);
+            for (name, size, meta) in [
+                ("void", 1, type_metatype::TYPE_VOID),
+                ("code", 1, type_metatype::TYPE_CODE),
+                ("int4", 4, type_metatype::TYPE_INT),
+            ] {
+                types.set_core_type(name, size, meta, false).unwrap();
+            }
+            types.cache_core_types().unwrap();
+            let void = types.get_type_void().unwrap();
+            let code_ptr = types.get_type_pointer(8, types.get_type_code().unwrap(), 1).unwrap();
+            let code_table = types.get_type_pointer(8, code_ptr.clone(), 1).unwrap();
+            let void_ptr = types.get_type_pointer(8, void.clone(), 1).unwrap();
+            let void_table = types.get_type_pointer(8, void_ptr.clone(), 1).unwrap();
+            let declaration = if case == "visible_cast" {
+                void_ptr
+            } else if matches!(case, "declared_void" | "named_cast") {
+                void_table
+            } else {
+                code_table.clone()
+            };
+            let address = Address::new(ram(&fd), 0x400);
+            let table = fd.new_varnode(8, &address, Some(if case == "declared_void" {
+                code_table.clone()
+            } else { declaration.clone() }));
+            let table = fd.set_input_varnode(table).unwrap();
+            let mut model = ProtoModel::new(fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let model = Rc::new(model);
+            types.set_proto_context(Some(model.clone()), fd.get_arch().manage.clone()).unwrap();
+            fd.get_func_proto_mut().set_internal(Rc::clone(&model), void.clone());
+            fd.get_func_proto_mut().set_param(0, "table", &ParameterPieces {
+                addr: address, type_: Some(declaration.clone()),
+                flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+            });
+            let pointer = if matches!(case, "visible_cast" | "named_cast") {
+                let cast = mk_op(&mut fd, 1, 0x0ff0, OpCode::CPUI_CAST);
+                fd.op_set_input(cast, table, 0).unwrap();
+                let out = fd.new_unique(8, Some(code_table.clone()));
+                fd.op_set_output(cast, out).unwrap();
+                if case == "visible_cast" {
+                    fd.vbank_mut().get_mut(out).unwrap().set_implied();
+                }
+                out
+            } else if matches!(case, "wrong_stride" | "unresolved_unknown_load") {
+                let add = mk_op(&mut fd, 3, 0x0ff0, OpCode::CPUI_PTRADD);
+                let index = fd.new_constant(4, 1);
+                let stride = fd.new_constant(4, 4); // elements actually occupy 8 bytes
+                fd.op_set_input(add, table, 0).unwrap();
+                fd.op_set_input(add, index, 1).unwrap();
+                fd.op_set_input(add, stride, 2).unwrap();
+                let out = fd.new_unique(8, Some(code_table.clone()));
+                fd.op_set_output(add, out).unwrap();
+                fd.vbank_mut().get_mut(out).unwrap().set_implied();
+                out
+            } else { table };
+            let load = mk_op(&mut fd, 2, 0x0ff4, OpCode::CPUI_LOAD);
+            let space = fd.new_constant(4, ram(&fd).get_index() as u64);
+            fd.op_set_input(load, space, 0).unwrap();
+            fd.op_set_input(load, pointer, 1).unwrap();
+            // Deliberately stale member typing must not turn a short LOAD into
+            // a proven full-width callable read from an eight-byte table.
+            let loaded = fd.new_unique(
+                if case == "wrong_load_width" { 4 } else { 8 },
+                Some(if case == "unresolved_unknown_load" {
+                    types.intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap()
+                } else { code_ptr.clone() }),
+            );
+            fd.op_set_output(load, loaded).unwrap();
+            fd.vbank_mut().get_mut(loaded).unwrap().set_implied();
+            let source = if case == "copy_loaded" {
+                let copy = mk_op(&mut fd, 1, 0x0ff8, OpCode::CPUI_COPY);
+                fd.op_set_input(copy, loaded, 0).unwrap();
+                let out = fd.new_unique(8, Some(code_ptr));
+                fd.op_set_output(copy, out).unwrap();
+                fd.vbank_mut().get_mut(out).unwrap().set_implied();
+                out
+            } else { loaded };
+            let mut signature = FuncProto::new();
+            signature.set_internal(model, void.clone());
+            signature.set_param(0, "argument", &ParameterPieces {
+                addr: Address::new(ram(&fd), 0x80),
+                type_: Some(types.get_base(4, type_metatype::TYPE_INT).unwrap()),
+                flags: 0,
+            });
+            if case == "abi_boundary" { signature.set_abi_first_vararg(Some(1)); }
+            let declaration = crate::fspec::LogicalCallable {
+                binding: types.model_binding(None).unwrap(),
+                output: void.id(),
+                inputs: vec![types.get_base(4, type_metatype::TYPE_INT).unwrap().id()],
+                variadic: false,
+                input_closed: true,
+                logical_first: (case == "abi_boundary").then_some(1),
+                flags: 0,
+            };
+            let destination = types.get_type_pointer(
+                8, types.get_type_code_proto(&declaration).unwrap(), 1).unwrap();
+            let cast = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_CAST);
+            fd.op_set_input(cast, source, 0).unwrap();
+            let output = fd.new_unique(8, Some(destination));
+            fd.op_set_output(cast, output).unwrap();
+            let call = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_CALLIND);
+            let argument = fd.new_constant(4, 7);
+            fd.op_set_input(call, output, 0).unwrap();
+            fd.op_set_input(call, argument, 1).unwrap();
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().copy(&signature);
+            fd.push_call_specs(specs);
+            fd.set_high_level();
+            if case == "named_cast" {
+                // The CAST result is a member of the named input High. Reading
+                // it prints the void** declaration, not its hidden code** CAST.
+                let high = fd.vbank().get(table).unwrap().get_high().unwrap();
+                let other = fd.vbank().get(pointer).unwrap().get_high().unwrap();
+                let mut writes = Vec::new();
+                fd.with_high_split(|bank, ctx| {
+                    bank.merge_internal(high, other, false, ctx, &mut |vn, high, group| {
+                        writes.push((vn, high, group));
+                    })
+                }).unwrap();
+                for (vn, high, group) in writes {
+                    fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
+                }
+            }
+            let mut arch = bare_arch();
+            arch.types_impl().setup_sizes(Some(4), 8, 8);
+            arch.types_impl().set_core_type("code", 1, type_metatype::TYPE_CODE, false).unwrap();
+            arch.types_impl().cache_core_types().unwrap();
+            for native in [false, true, false] {
+                arch.ctypes = native;
+                let mut print = PrintC::new();
+                print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
+                print.set_markup(true);
+                print.emit_mut().set_capture_tokens(true);
+                print.op_type_cast_ir(&fd, &arch, cast);
+                let tokens = print.emit_mut().take_markup_tokens();
+                let conversions = tokens.iter().filter(|token| token.kind == TokenKind::Type).count();
+                let inner = usize::from(case == "visible_cast");
+                assert_eq!(conversions, inner + 1,
+                    "{case}, ctypes={native}: {tokens:?}");
+                let outer = tokens.iter().find(|token| token.kind == TokenKind::Type).unwrap();
+                assert!(outer.text.contains('('),
+                    "explicit signatures must survive loaded callable rendering: {case}: {tokens:?}");
+                assert_eq!(fd.obank().get(cast).unwrap().code(), OpCode::CPUI_CAST);
+                assert_eq!(fd.obank().get(cast).unwrap().get_in(0), Some(source));
+                assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(output));
+            }
+        }
     }
 
     /// FAITHFULNESS (1a): a `CPUI_CAST` whose output is `int8` renders
@@ -2316,5 +3196,1595 @@ mod w10_printc_cast_render {
         assert_eq!(render_cast(&fd, op, true), "0x2a", "nocasts: only the operand prints");
         // And with casts ON the SAME op DOES wear the cast (control).
         assert_eq!(render_cast(&fd, op, false), "(int8)0x2a");
+    }
+
+
+    #[derive(Clone, Copy)]
+    enum LogicalInputs { Tag, MethodByValue, Variadic }
+
+    #[derive(Clone, Copy)]
+    enum LogicalResultUse { Discarded, ExplicitPointer, ImpliedPointer, NestedPointer }
+
+    fn named_call_input(
+        fd: &mut Funcdata, name: &str, ty: crate::dtype::TypeRoot,
+    ) -> crate::context::VarnodeId {
+        let slot = fd.get_func_proto().num_params();
+        let addr = Address::new(ram(fd), 0x800 + slot as u64 * 0x20);
+        fd.get_func_proto_mut().set_param(slot, name, &crate::fspec::ParameterPieces {
+            addr: addr.clone(), type_: Some(ty.clone()),
+            flags: crate::fspec::parameter_pieces_flags::TYPELOCK
+                | crate::fspec::parameter_pieces_flags::NAMELOCK,
+        });
+        fd.link_proto_params();
+        let vn = fd.new_varnode(ty.get_size(), &addr, Some(ty));
+        let vn = fd.set_input_varnode(vn).unwrap();
+        fd.vbank_mut().get_mut(vn).unwrap().set_explicit();
+        let high = fd.vbank().get(vn).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name(name);
+        vn
+    }
+
+    fn name_call_local(fd: &mut Funcdata, vn: crate::context::VarnodeId, name: &str) {
+        fd.vbank_mut().get_mut(vn).unwrap().set_explicit();
+        let high = fd.vbank().get(vn).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name(name);
+    }
+
+    // Execution tests live alongside the private IR fixtures: no textual repair
+    // of a printed expression is permitted before it reaches the compiler.
+    fn execute_language_source(language: &str, source: &str, label: &str) {
+        use std::process::Command;
+        let compiler = if language == "rust" { "rustc" } else { "cc" };
+        match Command::new(compiler).arg("--version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("language execution {label}: skipping (missing `{compiler}`)");
+                return;
+            }
+            Err(e) => panic!("starting {compiler}: {e}"),
+            Ok(out) => assert!(out.status.success(), "{compiler} --version failed: {out:?}"),
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("kuna-language-{}-{label}-{language}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join(if language == "rust" { "consumer.rs" } else { "consumer.c" });
+        std::fs::write(&input, source).unwrap();
+        for optimization in ["0", "2"] {
+            let exe = dir.join(format!("consumer-{optimization}"));
+            let mut cmd = Command::new(compiler);
+            if language == "rust" {
+                cmd.args(["--edition=2021", "-A", "warnings", "-C"])
+                    .arg(format!("opt-level={optimization}"));
+                // Debug deliberately retains overflow checks; optimized matches
+                // the compiler default, not an overflow-suppressing test flag.
+            } else {
+                cmd.args(["-std=c11", "-Wall", "-Wextra"]).arg(format!("-O{optimization}"));
+            }
+            let out = cmd.arg(&input).arg("-o").arg(&exe).output().unwrap();
+            assert!(out.status.success(), "{label}/{language}/O{optimization}:\n{}\n{source}",
+                String::from_utf8_lossy(&out.stderr));
+            let out = Command::new(&exe).output().unwrap();
+            assert!(out.status.success(), "{label}/{language}/O{optimization}:\n{}\n{source}",
+                String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_enum_complements_preserve_width_sign_and_partial_parent() {
+        use crate::dtype::{flags, DatatypeKind, TypeFactory, TypeFactoryImpl};
+        use std::collections::BTreeMap;
+        let arch = bare_arch();
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_core_type("uint4", 4, type_metatype::TYPE_UINT, false).unwrap();
+        types.set_core_type("uint8", 8, type_metatype::TYPE_UINT, false).unwrap();
+        types.cache_core_types().unwrap();
+        let mut c = String::from("#include <assert.h>\n#include <stdint.h>\n");
+        let mut rust = String::new();
+        let mut c_checks = String::new();
+        let mut rust_checks = String::new();
+        for size in [1, 2, 4, 8] {
+            for signed in [false, true] {
+                let bits = size * 8;
+                let suffix = if signed { "s" } else { "u" };
+                let name = format!("Flags{bits}{suffix}");
+                let one = format!("{name}_ONE");
+                let two = format!("{name}_TWO");
+                let wide = format!("{name}_WIDE");
+                let minimum = if signed { -(1i128 << (bits - 1)) } else { 0 };
+                let maximum = if signed { (1u64 << (bits - 1)) - 1 }
+                    else { kuna_base::address::calc_mask(size) };
+                let min_c = if size == 8 && signed {
+                    "(-9223372036854775807LL-1)".to_string()
+                } else { minimum.to_string() };
+                c.push_str(&format!(
+                    "typedef enum __attribute__((packed)) {name} {{ {one}=1, {two}=2, {wide}={}, {name}_MIN={min_c}, {name}_MAX={maximum}ULL }} {name};\n_Static_assert(sizeof({name})=={size}, \"width\");\n_Static_assert((({name})-1<0)=={}, \"sign\");\n",
+                    if size == 8 { "2147483648ULL" } else { "4" }, u8::from(signed),
+                ));
+                let scalar = format!("{}{bits}", if signed { 'i' } else { 'u' });
+                rust.push_str(&format!(
+                    "const {one}: {scalar}=1; const {two}: {scalar}=2; const {wide}: {scalar}={};\n",
+                    if size == 8 { "2147483648" } else { "4" },
+                ));
+                let mut data = Datatype::new_with_align(size, size, if signed {
+                    type_metatype::TYPE_INT
+                } else { type_metatype::TYPE_UINT });
+                data.name = name.clone();
+                data.id = Datatype::hash_name(&name);
+                data.display_name = name;
+                data.flags |= flags::enumtype;
+                data.kind = DatatypeKind::Enum { namemap: BTreeMap::from([
+                    (1, one), (2, two), (if size == 8 { 0x8000_0000 } else { 4 }, wide),
+                ]) };
+                let ty = types.intern(data).unwrap();
+                for flag in [1, 3, if size == 8 { 0x8000_0000 } else { 4 }] {
+                    let value = kuna_base::address::calc_mask(size) ^ flag;
+                    let expected = if signed {
+                        (value as i128 - (1i128 << bits)).to_string()
+                    } else { value.to_string() };
+                    for is_rust in [false, true] {
+                        let mut print = execution_printer(&arch, is_rust);
+                        print.push_enum_constant_ir(&types, &ty, value, OpId::default(), VarnodeId::default(), false);
+                        let expression = print.emit_mut().output_str().to_string();
+                        if is_rust {
+                            rust_checks.push_str(&format!("assert_eq!({expression}, {expected}{scalar});\n"));
+                        } else {
+                            c_checks.push_str(&format!("assert(({expression}) == ({expected}{}));\n",
+                                if signed { "LL" } else { "ULL" }));
+                        }
+                    }
+                }
+            }
+        }
+        // Upper bytes cover complements, positive and negative named parents,
+        // and a zero enumerator that still needs a width-valid shift.
+        let mut data = Datatype::new_with_align(8, 8, type_metatype::TYPE_INT);
+        data.name = "Parent".into();
+        data.display_name = "Parent".into();
+        data.id = Datatype::hash_name("Parent");
+        data.flags |= flags::enumtype;
+        data.kind = DatatypeKind::Enum { namemap: BTreeMap::from([
+            (0, "PARENT_ZERO".into()),
+            (0x1_ffff_ffff, "PARENT_LOW".into()),
+            (0x300_0000_0000, "PARENT_HIGH".into()),
+            (0x8000_0000_0000_0000, "PARENT_SIGN".into()),
+        ]) };
+        let parent = types.intern(data).unwrap();
+        let partial = types.get_type_partial_enum(parent, 4, 4).unwrap();
+        c.push_str("typedef unsigned int uint4;\ntypedef unsigned long long uint8;\nenum Parent { PARENT_ZERO=0, PARENT_LOW=8589934591LL, PARENT_HIGH=0x30000000000LL, PARENT_SIGN=(-9223372036854775807LL-1) };\n");
+        rust.push_str("const PARENT_ZERO:i64=0; const PARENT_LOW:i64=8589934591; const PARENT_HIGH:i64=0x30000000000; const PARENT_SIGN:i64=i64::MIN;\n");
+        for value in [0xffff_fffe, 0, 0x300, 0x8000_0000] {
+            for is_rust in [false, true] {
+                let mut print = execution_printer(&arch, is_rust);
+                print.push_enum_constant_ir(&types, &partial, value, OpId::default(), VarnodeId::default(), false);
+                let expression = print.emit_mut().output_str().to_string();
+                if is_rust {
+                    rust_checks.push_str(&format!("assert_eq!({expression}, {value}u32);\n"));
+                } else {
+                    c_checks.push_str(&format!(
+                        "assert(({expression}) == {value}ULL);\nassert(!(({expression}) < (int64_t)-1));\n",
+                    ));
+                }
+            }
+        }
+        c.push_str(&format!("int main(void){{ {c_checks} return 0; }}\n"));
+        rust.push_str(&format!("fn main(){{ {rust_checks} }}\n"));
+        execute_language_source("c", &c, "enum-complement-width");
+        execute_language_source("rust", &rust, "enum-complement-width");
+    }
+
+    #[test]
+    fn emitted_default_high_characters_match_declared_byte_values() {
+        let fd = build_fd();
+        let arch = bare_arch();
+        let mut c = String::from("#include <assert.h>\nint main(void){\n");
+        let mut rust = String::from("fn main(){\n");
+        for signed in [false, true] {
+            let mut data = Datatype::new_with_align(1, 1, if signed {
+                type_metatype::TYPE_INT
+            } else { type_metatype::TYPE_UINT });
+            data.flags |= crate::dtype::flags::chartype;
+            let ty = crate::dtype::TypeFactoryImpl::new().intern(data).unwrap();
+            for value in [0, 0x41, 0x7f, 0x80, 0xfe, 0xff] {
+                for is_rust in [false, true] {
+                    let mut print = execution_printer(&arch, is_rust);
+                    print.push_char_constant_ir(&fd, &ty, value, OpId::default(), VarnodeId::default());
+                    let expression = print.emit_mut().output_str().to_string();
+                    if is_rust {
+                        rust.push_str(&format!("assert_eq!({expression}, {value}u8);\n"));
+                    } else {
+                        let expected = if signed { value as u8 as i8 as i32 } else { value as i32 };
+                        c.push_str(&format!("assert(({expression}) == {expected});\n"));
+                    }
+                }
+            }
+        }
+        c.push_str("return 0;}\n");
+        rust.push_str("}\n");
+        execute_language_source("c", &c, "default-high-character");
+        execute_language_source("rust", &rust, "default-high-character");
+    }
+
+    fn execution_input(fd: &mut Funcdata, name: &str, ty: crate::dtype::TypeRoot)
+        -> crate::context::VarnodeId
+    {
+        let vn = fd.new_unique(ty.get_size(), Some(ty));
+        name_call_local(fd, vn, name);
+        vn
+    }
+
+    fn execution_printer(arch: &crate::architecture::Architecture, rust: bool) -> PrintC {
+        let lang = if rust { crate::kuna_lang::OutLang::Rust } else { crate::kuna_lang::OutLang::C };
+        let mut print = PrintC::new();
+        print.set_name(lang.print_name());
+        print.rt_ctx = RealTypeCtx::from_arch(arch, lang, print.options.convention);
+        print.set_output_stream();
+        print
+    }
+
+    fn execution_call(
+        fd: &mut Funcdata, name: &str, ty: crate::dtype::TypeRoot, offset: u64,
+    ) -> crate::context::VarnodeId {
+        let op = mk_op(fd, 1, offset, OpCode::CPUI_CALL);
+        fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_CALL, crate::op::pcodeop_flags::call, "CALL"));
+        let target = Address::new(ram(fd), offset + 0x1000);
+        let target_vn = fd.new_constant(8, target.get_offset());
+        fd.op_set_input(op, target_vn, 0).unwrap();
+        let out = fd.new_unique(ty.get_size(), Some(ty));
+        fd.op_set_output(op, out).unwrap();
+        fd.vbank_mut().get_mut(out).unwrap().set_implied();
+        let mut specs = crate::fspec::FuncCallSpecs::new(op, target.clone());
+        specs.set_funcdata(target, name).unwrap();
+        fd.push_call_specs(specs);
+        out
+    }
+
+    #[test]
+    fn emitted_rust_nested_arithmetic_evaluates_calls_once() {
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let ty = named("u32", 4, type_metatype::TYPE_UINT);
+        let first = execution_call(&mut fd, "next_value", ty.clone(), 0x1000);
+        let second = execution_call(&mut fd, "next_value", ty.clone(), 0x1004);
+        let mul = mk_op(&mut fd, 2, 0x1008, OpCode::CPUI_INT_MULT);
+        fd.op_set_input(mul, first, 0).unwrap();
+        fd.op_set_input(mul, second, 1).unwrap();
+        let product = fd.new_unique(4, Some(ty.clone()));
+        fd.op_set_output(mul, product).unwrap();
+        fd.vbank_mut().get_mut(product).unwrap().set_implied();
+        let add = mk_op(&mut fd, 2, 0x100c, OpCode::CPUI_INT_ADD);
+        let literal = fd.new_constant(4, 0xffffffff);
+        fd.op_set_input(add, product, 0).unwrap();
+        fd.op_set_input(add, literal, 1).unwrap();
+        let result = fd.new_unique(4, Some(ty));
+        fd.op_set_output(add, result).unwrap();
+        let arch = bare_arch();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, add, None);
+        let emitted = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+use std::sync::atomic::{{AtomicU32, Ordering}};
+static CALLS: AtomicU32 = AtomicU32::new(0);
+fn next_value() -> u32 {{ CALLS.fetch_add(1, Ordering::SeqCst) + 1 }}
+fn consumer() -> u32 {{ {emitted} }}
+fn main() {{
+    assert_eq!(consumer(), 1);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+}}
+"#);
+        execute_language_source("rust", &source, "single-evaluation");
+    }
+
+    #[test]
+    fn emitted_rust_u128_variable_addition_wraps() {
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let ty = named("u128", 16, type_metatype::TYPE_UINT);
+        let a = execution_input(&mut fd, "a", ty.clone());
+        let b = execution_input(&mut fd, "b", ty.clone());
+        let add = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_INT_ADD);
+        fd.op_set_input(add, a, 0).unwrap();
+        fd.op_set_input(add, b, 1).unwrap();
+        let result = fd.new_unique(16, Some(ty));
+        fd.op_set_output(add, result).unwrap();
+        let arch = bare_arch();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, add, None);
+        let emitted = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+fn consumer(a: u128, b: u128) -> u128 {{ {emitted} }}
+fn main() {{
+    assert_eq!(consumer(u128::MAX, 2), 1);
+    assert_eq!(consumer(1u128 << 127, 1u128 << 127), 0);
+}}
+"#);
+        execute_language_source("rust", &source, "u128-variable");
+    }
+
+    #[test]
+    fn emitted_rust_narrow_addition_wraps_before_widening() {
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let narrow = named("u8", 1, type_metatype::TYPE_UINT);
+        let wide = named("u32", 4, type_metatype::TYPE_UINT);
+        let a = execution_input(&mut fd, "a", narrow.clone());
+        let b = execution_input(&mut fd, "b", narrow.clone());
+        let add = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_INT_ADD);
+        fd.op_set_input(add, a, 0).unwrap();
+        fd.op_set_input(add, b, 1).unwrap();
+        let sum = fd.new_unique(1, Some(narrow));
+        fd.op_set_output(add, sum).unwrap();
+        fd.vbank_mut().get_mut(sum).unwrap().set_implied();
+        // Genuine p-code width transition, not an invalid merge of differently
+        // sized High members manufactured to exercise declaration recovery.
+        let extend = mk_op(&mut fd, 1, 0x1004, OpCode::CPUI_INT_ZEXT);
+        fd.op_set_input(extend, sum, 0).unwrap();
+        let result = fd.new_unique(4, Some(wide));
+        fd.op_set_output(extend, result).unwrap();
+        let arch = bare_arch();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, extend, None);
+        let emitted = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+fn consumer(a: u8, b: u8) -> u32 {{ {emitted} }}
+fn main() {{
+    assert_eq!(consumer(255, 2), 1);
+    assert_eq!(consumer(128, 128), 0);
+    assert_eq!(consumer(200, 7), 207);
+}}
+"#);
+        execute_language_source("rust", &source, "narrow-before-widening");
+    }
+
+    #[test]
+    fn emitted_rust_pointer_stride_and_index_evaluation_are_preserved() {
+        use crate::dtype::TypeFactory;
+        if !cfg!(target_pointer_width = "64") {
+            eprintln!("language stride execution: skipping (fixture requires a 64-bit host)");
+            return;
+        }
+        let arch = bare_arch();
+        let types = arch.types_rc();
+        let cell = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+        let pointer = types.get_type_pointer(8, cell, 1).unwrap();
+        let index = types.intern(Datatype::new(8, type_metatype::TYPE_INT)).unwrap();
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let p = execution_input(&mut fd, "p", pointer.clone());
+        let i = execution_call(&mut fd, "next_index", index, 0x1000);
+        let add = mk_op(&mut fd, 3, 0x1004, OpCode::CPUI_PTRADD);
+        let stride = fd.new_constant(8, 8); // deliberately not sizeof(u32)
+        fd.op_set_input(add, p, 0).unwrap();
+        fd.op_set_input(add, i, 1).unwrap();
+        fd.op_set_input(add, stride, 2).unwrap();
+        let result = fd.new_unique(8, Some(pointer));
+        fd.op_set_output(add, result).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, add, None);
+        let emitted = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+use std::sync::atomic::{{AtomicU32, Ordering}};
+static CALLS: AtomicU32 = AtomicU32::new(0);
+fn next_index() -> i64 {{ CALLS.fetch_add(1, Ordering::SeqCst); -1 }}
+unsafe fn consumer(p: *mut u32) -> *mut u32 {{ {emitted} }}
+fn main() {{ unsafe {{
+    let mut cells = [0x11223344u32, 11, 22, 33, 0xaabbccdd];
+    let result = consumer(cells.as_mut_ptr().add(3));
+    assert_eq!(result, cells.as_mut_ptr().add(1));
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    *result = 77;
+    assert_eq!(cells, [0x11223344, 77, 22, 33, 0xaabbccdd]);
+}} }}
+"#);
+        execute_language_source("rust", &source, "stride-single-evaluation");
+    }
+
+    #[test]
+    fn emitted_rust_pointer_rejects_a_different_host_address_width() {
+        use crate::dtype::TypeFactory;
+        use std::process::Command;
+        match Command::new("rustc").arg("--version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("language width rejection: skipping (missing `rustc`)");
+                return;
+            }
+            Err(e) => panic!("starting rustc: {e}"),
+            Ok(out) => assert!(out.status.success(), "rustc --version failed: {out:?}"),
+        }
+        let target_size = if cfg!(target_pointer_width = "64") { 4 } else { 8 };
+        let arch = bare_arch();
+        let types = arch.types_rc();
+        let cell = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+        let pointer = types.get_type_pointer(target_size, cell, 1).unwrap();
+        let index = types.intern(Datatype::new(target_size, type_metatype::TYPE_INT)).unwrap();
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let p = execution_input(&mut fd, "p", pointer.clone());
+        let i = execution_input(&mut fd, "i", index);
+        let add = mk_op(&mut fd, 3, 0x1000, OpCode::CPUI_PTRADD);
+        let stride = fd.new_constant(target_size, 4);
+        fd.op_set_input(add, p, 0).unwrap();
+        fd.op_set_input(add, i, 1).unwrap();
+        fd.op_set_input(add, stride, 2).unwrap();
+        let result = fd.new_unique(target_size, Some(pointer));
+        fd.op_set_output(add, result).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, add, None);
+        let emitted = print.emit_mut().output_str().to_string();
+        let bits = target_size * 8;
+        let source = format!(
+            "unsafe fn consumer(p: *mut u32, i: i{bits}) -> *mut u32 {{ {emitted} }}\n\
+             fn main() {{ unsafe {{ let mut v = 7u32; let _ = consumer(&mut v, 0); }} }}\n"
+        );
+        let dir = std::env::temp_dir()
+            .join(format!("kuna-language-width-rejection-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("consumer.rs");
+        std::fs::write(&input, &source).unwrap();
+        let out = Command::new("rustc").args(["--edition=2021", "-A", "warnings"])
+            .arg(&input).arg("-o").arg(dir.join("consumer")).output().unwrap();
+        let diagnostic = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && diagnostic.contains("E0080"),
+            "a cross-width pointer must fail constant evaluation, not silently use host width:\n\
+             {diagnostic}\n{source}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_rust_actual_array_load_store_and_one_past_address_execute() {
+        use crate::dtype::TypeFactory;
+        if !cfg!(target_pointer_width = "64") {
+            eprintln!("language array execution: skipping (fixture requires a 64-bit host)");
+            return;
+        }
+        let arch = bare_arch();
+        let types = arch.types_rc();
+        let cell = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+        let array = types.get_type_array(5, cell.clone()).unwrap();
+        let array_pointer = types.get_type_pointer(8, array, 1).unwrap();
+        let pointer = types.get_type_pointer(8, cell.clone(), 1).unwrap();
+        let index = types.intern(Datatype::new(8, type_metatype::TYPE_INT)).unwrap();
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let p = execution_input(&mut fd, "p", array_pointer);
+        let i = execution_input(&mut fd, "i", index);
+        // Array decay retains pointer-sized p-code storage. PTRSUB exposes
+        // the pointed-to array expression; PTRADD indexes that expression.
+        let decay = mk_op(&mut fd, 2, 0x0ffc, OpCode::CPUI_PTRSUB);
+        let zero = fd.new_constant(8, 0);
+        fd.op_set_input(decay, p, 0).unwrap();
+        fd.op_set_input(decay, zero, 1).unwrap();
+        let cells = fd.new_unique(8, Some(pointer.clone()));
+        fd.op_set_output(decay, cells).unwrap();
+        fd.vbank_mut().get_mut(cells).unwrap().set_implied();
+        let add = mk_op(&mut fd, 3, 0x1000, OpCode::CPUI_PTRADD);
+        let stride = fd.new_constant(8, 4);
+        fd.op_set_input(add, cells, 0).unwrap();
+        fd.op_set_input(add, i, 1).unwrap();
+        fd.op_set_input(add, stride, 2).unwrap();
+        let address = fd.new_unique(8, Some(pointer));
+        fd.op_set_output(add, address).unwrap();
+        fd.vbank_mut().get_mut(address).unwrap().set_implied();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, add, None);
+        let address_text = print.emit_mut().output_str().to_string();
+        let load = mk_op(&mut fd, 2, 0x1004, OpCode::CPUI_LOAD);
+        let space = fd.new_constant(4, ram(&fd).get_index() as u64);
+        fd.op_set_input(load, space, 0).unwrap();
+        fd.op_set_input(load, address, 1).unwrap();
+        let loaded = fd.new_unique(4, Some(cell.clone()));
+        fd.op_set_output(load, loaded).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, load, None);
+        let load_text = print.emit_mut().output_str().to_string();
+        let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
+        let value = execution_input(&mut fd, "value", cell);
+        fd.op_set_input(store, space, 0).unwrap();
+        fd.op_set_input(store, address, 1).unwrap();
+        fd.op_set_input(store, value, 2).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.emit_statement(&fd, &arch, store);
+        let store_text = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+fn main() {{ unsafe {{
+    let mut cells = [0x11223344u32, 11, 22, 33, 0xaabbccdd];
+    let p = &mut cells as *mut [u32; 5];
+    for (i, expected) in [(1i64, 11u32), (2, 22), (3, 33)] {{
+        let loaded = {load_text};
+        assert_eq!(loaded, expected);
+        let address = {address_text};
+        assert_eq!(address, cells.as_mut_ptr().add(i as usize));
+    }}
+    let i = 5i64;
+    let one_past = {address_text};
+    assert_eq!(one_past, cells.as_mut_ptr().add(5));
+    for (i, value) in [(1i64, 101u32), (3, 303)] {{
+        {store_text}
+    }}
+    assert_eq!(cells, [0x11223344, 101, 22, 303, 0xaabbccdd]);
+    // P-code computes a target-width byte offset, not an unbounded array
+    // element index: ((2^62 + 1) * 4) mod 2^64 is four.
+    let i = (1i64 << 62) + 1;
+    let loaded = {load_text};
+    assert_eq!(loaded, 101);
+    let wrapped_address = {address_text};
+    assert_eq!(wrapped_address, cells.as_mut_ptr().add(1));
+    let value = 77u32;
+    {store_text}
+    assert_eq!(cells, [0x11223344, 77, 22, 303, 0xaabbccdd]);
+}} }}
+"#);
+        execute_language_source("rust", &source, "actual-array");
+    }
+
+    #[test]
+    fn emitted_integer_arithmetic_executes_at_its_pcode_width() {
+        for rust in [true, false] {
+            let mut source = if rust { String::new() } else {
+                "#include <stdint.h>\n#include <assert.h>\n".to_string()
+            };
+            let mut checks = String::new();
+            for size in [1, 2, 4, 8] {
+                for signed in [false, true] {
+                    let bits = size * 8;
+                    let mask = (1u128 << bits) - 1;
+                    let tyname = if rust {
+                        format!("{}{bits}", if signed { "i" } else { "u" })
+                    } else {
+                        format!("{}int{bits}_t", if signed { "" } else { "u" })
+                    };
+                    for (opname, opcode) in [
+                        ("add", OpCode::CPUI_INT_ADD),
+                        ("sub", OpCode::CPUI_INT_SUB),
+                        ("mul", OpCode::CPUI_INT_MULT),
+                    ] {
+                        for compound in [false, true] {
+                            let name = format!("f_{bits}_{signed}_{opname}_{compound}");
+                            let mut fd = build_fd();
+                            fd.set_high_level();
+                            let meta = if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
+                            let ty = named(&tyname, size, meta);
+                            let a = execution_input(&mut fd, "a", ty.clone());
+                            let b = execution_input(&mut fd, "b", ty.clone());
+                            let op = mk_op(&mut fd, 2, 0x1000, opcode);
+                            fd.op_set_input(op, a, 0).unwrap();
+                            fd.op_set_input(op, b, 1).unwrap();
+                            let out = fd.new_unique(size, Some(ty));
+                            fd.op_set_output(op, out).unwrap();
+                            name_call_local(&mut fd, out, "result");
+                            if compound {
+                                let high = fd.vbank().get(a).unwrap().get_high().unwrap();
+                                let other = fd.vbank().get(out).unwrap().get_high().unwrap();
+                                let mut writes = Vec::new();
+                                fd.with_high_split(|bank, ctx| {
+                                    bank.merge_internal(high, other, false, ctx, &mut |vn, high, group| {
+                                        writes.push((vn, high, group));
+                                    })
+                                }).unwrap();
+                                for (vn, high, group) in writes {
+                                    fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
+                                }
+                                fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("a");
+                            }
+                            let mut arch = bare_arch();
+                            arch.ctypes = false;
+                            arch.realtypes = false;
+                            let mut print = execution_printer(&arch, rust);
+                            if compound { print.emit_statement(&fd, &arch, op); }
+                            else { print.op_push_ir(&fd, &arch, op, None); }
+                            let emitted = print.emit_mut().output_str().to_string();
+                            let body = if compound { format!("{emitted}\nreturn a;") }
+                                else { format!("return {emitted};") };
+                            if rust {
+                                source.push_str(&format!("fn {name}(mut a: {tyname}, b: {tyname}) -> {tyname} {{ {body} }}\n"));
+                            } else {
+                                source.push_str(&format!("{tyname} {name}({tyname} a, {tyname} b) {{ {body} }}\n"));
+                            }
+                            // C signed overflow is not defined under ordinary
+                            // flags. Its control arm uses only defined inputs;
+                            // Rust must preserve p-code bits across overflow.
+                            let cases: Vec<(u128, u128)> = if !rust && signed {
+                                vec![(7, 3), (12, 2)]
+                            } else if !rust && size < 4 && opname == "mul" {
+                                // u16 promotes to int, but 65535*2 still fits
+                                // int: the return must truncate to 65534.
+                                if size == 2 { vec![(65535, 2)] }
+                                else { vec![(127, 3), (17, 9)] }
+                            } else {
+                                vec![(mask, 2), (0, 1), (mask >> 1, 3), ((mask >> 1) + 1, mask)]
+                            };
+                            for (a, b) in cases {
+                                let expected = match opname {
+                                    "add" => (a + b) & mask,
+                                    "sub" => (a + mask + 1 - b) & mask,
+                                    _ => (a * b) & mask,
+                                };
+                                if rust {
+                                    checks.push_str(&format!("assert_eq!(({name}({a}u64 as {tyname}, {b}u64 as {tyname}) as u64) & {mask}u64, {expected}u64);\n"));
+                                } else {
+                                    checks.push_str(&format!("assert((((uint64_t){name}(({tyname})UINT64_C({a}), ({tyname})UINT64_C({b}))) & UINT64_C({mask})) == UINT64_C({expected}));\n"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            source.push_str(&if rust { format!("fn main() {{ {checks} }}") }
+                else { format!("int main(void) {{ {checks} return 0; }}") });
+            execute_language_source(if rust { "rust" } else { "c" }, &source, "integers");
+        }
+    }
+
+    #[test]
+    fn emitted_pointer_offsets_preserve_cells_and_guards() {
+        use crate::dtype::TypeFactory;
+        if !cfg!(target_pointer_width = "64") {
+            eprintln!("language pointer execution: skipping (fixture requires a 64-bit host)");
+            return;
+        }
+        for rust in [true, false] {
+            let mut arch = bare_arch();
+            arch.ctypes = false;
+            arch.realtypes = false;
+            let types = arch.types_rc();
+            let cell = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+            let pointer = types.get_type_pointer(8, cell.clone(), 1).unwrap();
+            let index = types.intern(Datatype::new(8, type_metatype::TYPE_INT)).unwrap();
+            let mut fd = build_fd();
+            fd.set_high_level();
+            let p = execution_input(&mut fd, "p", pointer.clone());
+            let i = execution_input(&mut fd, "i", index);
+            let add = mk_op(&mut fd, 3, 0x1000, OpCode::CPUI_PTRADD);
+            let stride = fd.new_constant(8, 4);
+            fd.op_set_input(add, p, 0).unwrap();
+            fd.op_set_input(add, i, 1).unwrap();
+            fd.op_set_input(add, stride, 2).unwrap();
+            let address = fd.new_unique(8, Some(pointer));
+            fd.op_set_output(add, address).unwrap();
+            fd.vbank_mut().get_mut(address).unwrap().set_implied();
+            let mut print = execution_printer(&arch, rust);
+            print.op_push_ir(&fd, &arch, add, None);
+            let address_text = print.emit_mut().output_str().to_string();
+            let load = mk_op(&mut fd, 2, 0x1004, OpCode::CPUI_LOAD);
+            let space = fd.new_constant(4, ram(&fd).get_index() as u64);
+            fd.op_set_input(load, space, 0).unwrap();
+            fd.op_set_input(load, address, 1).unwrap();
+            let loaded = fd.new_unique(4, Some(cell.clone()));
+            fd.op_set_output(load, loaded).unwrap();
+            let mut print = execution_printer(&arch, rust);
+            print.op_push_ir(&fd, &arch, load, None);
+            let load_text = print.emit_mut().output_str().to_string();
+            let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
+            let value = execution_input(&mut fd, "value", cell);
+            fd.op_set_input(store, space, 0).unwrap();
+            fd.op_set_input(store, address, 1).unwrap();
+            fd.op_set_input(store, value, 2).unwrap();
+            let mut print = execution_printer(&arch, rust);
+            print.emit_statement(&fd, &arch, store);
+            let store_text = print.emit_mut().output_str().to_string();
+            let source = if rust {
+                format!(r#"
+unsafe fn address(p: *mut u32, i: i64) -> *mut u32 {{ {address_text} }}
+unsafe fn load(p: *mut u32, i: i64) -> u32 {{ {load_text} }}
+unsafe fn store(p: *mut u32, i: i64, value: u32) {{ {store_text} }}
+fn main() {{ unsafe {{
+    let mut cells = [0x11223344u32, 11, 22, 33, 0xaabbccdd];
+    let p = cells.as_mut_ptr().add(2);
+    for (i, want) in [(-1, 11), (0, 22), (1, 33)] {{
+        assert_eq!(load(p, i), want);
+        assert_eq!(address(p, i), p.offset(i as isize));
+    }}
+    assert_eq!(address(p, 3), cells.as_mut_ptr().add(5));
+    store(p, -1, 101); store(p, 1, 303);
+    assert_eq!(cells, [0x11223344, 101, 22, 303, 0xaabbccdd]);
+}} }}
+"#)
+            } else {
+                format!(r#"
+#include <stdint.h>
+#include <assert.h>
+uint32_t *address(uint32_t *p, int64_t i) {{ return {address_text}; }}
+uint32_t load(uint32_t *p, int64_t i) {{ return {load_text}; }}
+void store(uint32_t *p, int64_t i, uint32_t value) {{ {store_text} }}
+int main(void) {{
+    uint32_t cells[] = {{0x11223344, 11, 22, 33, 0xaabbccdd}};
+    uint32_t *p = cells + 2;
+    for (int64_t i = -1; i <= 1; ++i) {{
+        assert(load(p, i) == (uint32_t)(22 + i * 11));
+        assert(address(p, i) == p + i);
+    }}
+    assert(address(p, 3) == cells + 5);
+    store(p, -1, 101); store(p, 1, 303);
+    assert(cells[0] == 0x11223344 && cells[1] == 101 && cells[2] == 22 &&
+           cells[3] == 303 && cells[4] == 0xaabbccdd);
+    return 0;
+}}
+"#)
+            };
+            execute_language_source(if rust { "rust" } else { "c" }, &source, "pointers");
+        }
+    }
+
+    #[test]
+    fn emitted_rust_fallback_pointer_load_and_store_keep_the_memory_access() {
+        use crate::dtype::TypeFactory;
+        use std::process::Command;
+        let arch = bare_arch();
+        let types = arch.types_rc();
+        let cell = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+        let pointer = types.get_type_pointer(8, cell.clone(), 1).unwrap();
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let p = execution_input(&mut fd, "p", pointer.clone());
+        // construct_typed_pointer in constseq builds four-byte index/stride
+        // constants independently of the target pointer's storage width.
+        let i = fd.new_constant(4, 1);
+        let add = mk_op(&mut fd, 3, 0x1000, OpCode::CPUI_PTRADD);
+        let stride = fd.new_constant(4, 4);
+        fd.op_set_input(add, p, 0).unwrap();
+        fd.op_set_input(add, i, 1).unwrap();
+        fd.op_set_input(add, stride, 2).unwrap();
+        let address = fd.new_unique(8, Some(pointer));
+        fd.op_set_output(add, address).unwrap();
+        fd.vbank_mut().get_mut(address).unwrap().set_implied();
+        let load = mk_op(&mut fd, 2, 0x1004, OpCode::CPUI_LOAD);
+        let space = fd.new_constant(4, ram(&fd).get_index() as u64);
+        fd.op_set_input(load, space, 0).unwrap();
+        fd.op_set_input(load, address, 1).unwrap();
+        let loaded = fd.new_unique(4, Some(cell.clone()));
+        fd.op_set_output(load, loaded).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.op_push_ir(&fd, &arch, load, None);
+        let load_text = print.emit_mut().output_str().to_string();
+        let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
+        let value = execution_input(&mut fd, "value", cell);
+        fd.op_set_input(store, space, 0).unwrap();
+        fd.op_set_input(store, address, 1).unwrap();
+        fd.op_set_input(store, value, 2).unwrap();
+        let mut print = execution_printer(&arch, true);
+        print.emit_statement(&fd, &arch, store);
+        let store_text = print.emit_mut().output_str().to_string();
+        let source = format!(r#"
+extern "C" {{ fn PTRADD(p: *mut u32, index: i32, stride: i32) -> *mut u32; }}
+pub unsafe fn load(p: *mut u32) -> u32 {{ {load_text} }}
+pub unsafe fn store(p: *mut u32, value: u32) {{ {store_text} }}
+"#);
+        // Type/lvalue contract only: no invented PTRADD implementation, linking
+        // or execution claim for this unsupported native lowering.
+        let dir = std::env::temp_dir()
+            .join(format!("kuna-language-fallback-metadata-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("consumer.rs");
+        std::fs::write(&input, &source).unwrap();
+        let output = Command::new("rustc")
+            .args(["--edition=2021", "--crate-type=lib", "--emit=metadata", "-A", "warnings"])
+            .arg(&input).arg("-o").arg(dir.join("consumer.rmeta")).output();
+        let out = match output {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("language fallback metadata: skipping (missing `rustc`)");
+                std::fs::remove_dir_all(dir).unwrap();
+                return;
+            }
+            Err(e) => panic!("starting rustc: {e}"),
+            Ok(out) => out,
+        };
+        assert!(out.status.success(), "fallback LOAD/STORE lost its value/lvalue contract:\n{}\n{source}",
+            String::from_utf8_lossy(&out.stderr));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A real standard ABI: eight-byte resources force Big24 results through a
+    /// hidden pointer, while pointermax lowers Big24 inputs to indirect storage.
+    /// Every role below comes from materialize_callable, never fixture flags.
+    fn render_logical_call(
+        indirect: bool, inputs: LogicalInputs, result_use: LogicalResultUse, occupied_name: Option<&str>,
+    ) -> String {
+        use crate::dtype::{type_class, DatatypeKind, TypeFactory, TypeField};
+        use crate::fspec::{AbiInputOrigin, FuncCallSpecs, LogicalCallable, ParamEntry, ProtoModel};
+
+        let mut arch = bare_arch();
+        arch.realtypes = false;
+        arch.ctypes = false;
+        arch.cast_implied = false;
+        arch.cast_sign = false;
+        arch.cast_ternary = false;
+        let types = arch.types_rc();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_core_type("int4", 4, type_metatype::TYPE_INT, false).unwrap();
+        types.set_core_type("int8", 8, type_metatype::TYPE_INT, false).unwrap();
+        types.cache_core_types().unwrap();
+        let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let int8 = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let void = types.get_type_void().unwrap();
+        let void_ptr = types.get_type_pointer(8, void.clone(), 1).unwrap();
+        let mut draft = Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT);
+        draft.name = "Big24".to_owned();
+        draft.display_name = draft.name.clone();
+        draft.id = Datatype::hash_name(&draft.name);
+        draft.kind = DatatypeKind::Struct {
+            field: (0..3).map(|i| TypeField::new(i, i * 8, format!("v{i}"), int8.id())).collect(),
+            bitfield: vec![],
+        };
+        let big = types.intern(draft).unwrap();
+        let big_ptr = types.get_type_pointer(8, big.clone(), 1).unwrap();
+
+        let mut manager = build_manager();
+        manager.set_default_code_space(2).unwrap();
+        manager.set_default_data_space(2).unwrap();
+        let memory = manager.get_space_by_name("ram").unwrap().clone();
+        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+            "stack", 3, 8, &memory, 1, true, false,
+        ))).unwrap();
+        let manager = Rc::new(manager);
+        let space = manager.get_space_by_name("ram").unwrap().clone();
+        let mut model = ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        model.set_name("logical_call_test");
+        model.set_has_this(matches!(inputs, LogicalInputs::MethodByValue));
+        for group in 0..6 {
+            let input = model.input_mut();
+            let entry = ParamEntry::seed(group, type_class::TYPECLASS_GENERAL,
+                space.clone(), 0x100 + group as u64 * 8, 8, 1, 0, 0, true,
+                false, input.get_entry(), &manager).unwrap();
+            input.push_entry(entry);
+        }
+        model.input_mut().push_pointermax_rule(8);
+        model.input_mut().finish_decode();
+        model.output_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
+            space.clone(), 0x200, 8, 1, 0, 0, true, false, &[], &manager).unwrap());
+        model.output_mut().finish_decode();
+        let model = Rc::new(model);
+        types.set_proto_context(Some(model.clone()), manager.clone()).unwrap();
+        let declaration = LogicalCallable {
+            binding: types.model_binding(None).unwrap(), output: big.id(),
+            inputs: match inputs {
+                LogicalInputs::MethodByValue => vec![void_ptr.id(), big.id(), int4.id()],
+                _ => vec![int4.id()],
+            },
+            variadic: matches!(inputs, LogicalInputs::Variadic),
+            input_closed: !matches!(inputs, LogicalInputs::Variadic),
+            logical_first: matches!(inputs, LogicalInputs::Variadic).then_some(1),
+            flags: if matches!(inputs, LogicalInputs::MethodByValue) {
+                crate::fspec::func_proto_flags::HAS_THISPTR
+            } else { 0 },
+        };
+        let code = types.get_type_code_proto(&declaration).unwrap();
+        let abi = crate::fspec::materialize_callable(types.as_ref(), &code).unwrap().unwrap();
+        assert!(abi.prototype().get_output().is_indirect_storage());
+        assert_eq!(abi.prototype().logical_callable().unwrap().id(), code.id());
+
+        let mut context = ContextArch::new_shared(manager);
+        context.types = Some(types.clone());
+        let mut fd = Funcdata::new("driver", "driver", Rc::new(context),
+            Address::new(space.clone(), 0x1000), 0x1000_0000, 0x40).unwrap();
+        fd.get_func_proto_mut().set_internal(model.clone(), void.clone());
+        fd.set_high_level();
+        if let Some(name) = occupied_name {
+            named_call_input(&mut fd, name, int4.clone());
+        }
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+
+        let destination = if matches!(result_use, LogicalResultUse::ImpliedPointer | LogicalResultUse::NestedPointer) {
+            let next_code = types.get_type_code_proto(&LogicalCallable {
+                binding: declaration.binding.clone(), output: big_ptr.id(), inputs: vec![],
+                variadic: false, input_closed: true, logical_first: None, flags: 0,
+            }).unwrap();
+            let next_abi = crate::fspec::materialize_callable(types.as_ref(), &next_code)
+                .unwrap().unwrap();
+            let next = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_CALL);
+            fd.op_set_opcode(next, TypeOp::new(OpCode::CPUI_CALL,
+                crate::op::pcodeop_flags::call, "CALL"));
+            let target = fd.new_constant(8, 0x3000);
+            fd.op_set_input(next, target, 0).unwrap();
+            let out = fd.new_unique_out(8, next).unwrap();
+            fd.vn_update_type(out, big_ptr.clone());
+            fd.vbank_mut().get_mut(out).unwrap().set_implied();
+            fd.op_insert_end(next, block);
+            let mut specs = FuncCallSpecs::new(next, Address::new(space.clone(), 0x3000));
+            specs.set_funcdata(Address::new(space.clone(), 0x3000), "next_destination").unwrap();
+            specs.proto_mut().copy(next_abi.prototype());
+            fd.push_call_specs(specs);
+            out
+        } else {
+            named_call_input(&mut fd, "destination", big_ptr.clone())
+        };
+        let logical_args = match inputs {
+            LogicalInputs::MethodByValue => vec![
+                named_call_input(&mut fd, "object", void_ptr.clone()),
+                named_call_input(&mut fd, "source_ptr", big_ptr.clone()),
+                named_call_input(&mut fd, "tag", int4.clone()),
+            ],
+            _ => vec![named_call_input(&mut fd, "tag", int4.clone())],
+        };
+        let mut physical_args = Vec::new();
+        for (slot, origin) in abi.prototype().callable_input_origins().iter().enumerate() {
+            physical_args.push(match *origin {
+                AbiInputOrigin::HiddenResult => destination,
+                AbiInputOrigin::Declared(index) => {
+                    if matches!(inputs, LogicalInputs::MethodByValue) && index == 1 {
+                        assert!(abi.prototype().get_param(slot as int4).unwrap().is_indirect_storage());
+                    }
+                    logical_args[index]
+                }
+            });
+        }
+        assert_eq!(abi.prototype().callable_input_origins()[0], AbiInputOrigin::HiddenResult);
+        if matches!(inputs, LogicalInputs::MethodByValue) {
+            assert!(abi.prototype().get_param(1).unwrap().is_this_pointer());
+        }
+        if matches!(inputs, LogicalInputs::Variadic) {
+            physical_args.push(named_call_input(&mut fd, "extra", int4.clone()));
+        }
+        let target = if indirect {
+            named_call_input(&mut fd, "callback", void_ptr)
+        } else { fd.new_constant(8, 0x4000) };
+        let opcode = if indirect { OpCode::CPUI_CALLIND } else { OpCode::CPUI_CALL };
+        let call = mk_op(&mut fd, physical_args.len() as int4 + 1, 0x1010, opcode);
+        fd.op_set_opcode(call, TypeOp::new(opcode, crate::op::pcodeop_flags::call, "CALL"));
+        fd.op_set_input(call, target, 0).unwrap();
+        for (slot, vn) in physical_args.into_iter().enumerate() {
+            fd.op_set_input(call, vn, slot as int4 + 1).unwrap();
+        }
+        let physical_output = if matches!(result_use, LogicalResultUse::Discarded) { None } else {
+            let out = fd.new_unique_out(8, call).unwrap();
+            fd.vn_update_type(out, big_ptr.clone());
+            if matches!(result_use, LogicalResultUse::ImpliedPointer | LogicalResultUse::NestedPointer) {
+                fd.vbank_mut().get_mut(out).unwrap().set_implied();
+            } else { name_call_local(&mut fd, out, "returned"); }
+            Some(out)
+        };
+        fd.op_insert_end(call, block);
+        let mut specs = FuncCallSpecs::new(call, Address::new(space.clone(), 0x4000));
+        if !indirect {
+            specs.set_funcdata(Address::new(space, 0x4000), "make_big").unwrap();
+        }
+        specs.proto_mut().copy(abi.prototype());
+        specs.proto_mut().set_override(true); // source survives site pinning
+        fd.push_call_specs(specs);
+        if indirect {
+            fd.action_set_casts();
+            let cast_target = fd.obank().get(call).unwrap().get_in(0).unwrap();
+            assert_eq!(fd.vbank().get(cast_target).unwrap().get_type().get_ptr_to().unwrap().id(), code.id());
+        }
+        if let Some(out) = physical_output {
+            if matches!(result_use, LogicalResultUse::NestedPointer) {
+                let consumer_code = types.get_type_code_proto(&LogicalCallable {
+                    binding: declaration.binding.clone(), output: void.id(),
+                    inputs: vec![big_ptr.id(), int4.id()], variadic: false,
+                    input_closed: true, logical_first: None, flags: 0,
+                }).unwrap();
+                let consumer_abi = crate::fspec::materialize_callable(types.as_ref(), &consumer_code)
+                    .unwrap().unwrap();
+                let consumer = mk_op(&mut fd, 3, 0x1020, OpCode::CPUI_CALL);
+                fd.op_set_opcode(consumer, TypeOp::new(OpCode::CPUI_CALL,
+                    crate::op::pcodeop_flags::call, "CALL"));
+                let target = fd.new_constant(8, 0x5000);
+                fd.op_set_input(consumer, target, 0).unwrap();
+                fd.op_set_input(consumer, out, 1).unwrap();
+                fd.op_set_input(consumer, *logical_args.last().unwrap(), 2).unwrap();
+                fd.op_insert_end(consumer, block);
+                let entry = Address::new(ram(&fd), 0x5000);
+                let mut specs = FuncCallSpecs::new(consumer, entry.clone());
+                specs.set_funcdata(entry, "consume_pointer").unwrap();
+                specs.proto_mut().copy(consumer_abi.prototype());
+                fd.push_call_specs(specs);
+            } else {
+                let copy = mk_op(&mut fd, 1, 0x1020, OpCode::CPUI_COPY);
+                fd.op_set_input(copy, out, 0).unwrap();
+                let observed = fd.new_unique_out(8, copy).unwrap();
+                fd.vn_update_type(observed, big_ptr);
+                name_call_local(&mut fd, observed, "observed");
+                fd.op_insert_end(copy, block);
+            }
+        }
+        fd.get_func_proto_mut().set_input_lock(true);
+        fd.seed_sblocks_copy();
+        PrintC::new().doc_function_full(&fd, &arch)
+    }
+
+    fn compact_c(text: &str) -> String {
+        text.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// Find the address captured immediately before the aggregate store. Other
+    /// Big24 pointer locals and parameters are unrelated to this sequence.
+    fn result_capture(text: &str) -> String {
+        let c = compact_c(text);
+        for (store, _) in c.match_indices(",*") {
+            let Some((capture, _)) = c[..store].rsplit_once('=') else { continue };
+            let start = capture.rfind(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .map_or(0, |index| index + 1);
+            let name = &capture[start..];
+            if !name.is_empty() && c[store + 2..].starts_with(&format!("{name}=")) {
+                return name.to_owned();
+            }
+        }
+        panic!("missing captured-address aggregate store:\n{text}");
+    }
+
+    #[test]
+    fn logical_hidden_result_omits_abi_argument_and_preserves_used_pointer() {
+        for indirect in [false, true] {
+            for result_use in [LogicalResultUse::Discarded, LogicalResultUse::ExplicitPointer] {
+                let text = render_logical_call(indirect, LogicalInputs::Tag, result_use, None);
+                let temp = result_capture(&text);
+                let c = compact_c(&text);
+                let callee = if indirect { "(*(Big24(*)(int4))callback)(tag)" } else { "make_big(tag)" };
+                assert!(c.contains(&format!("{temp}=destination,*{temp}={callee}")), "{text}");
+                if matches!(result_use, LogicalResultUse::ExplicitPointer) {
+                    assert!(c.contains(&format!("returned=({temp}=destination,*{temp}={callee},{temp});")), "{text}");
+                    assert!(c.contains("observed=returned;"), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn implied_hidden_result_captures_side_effectful_destination_once() {
+        for indirect in [false, true] {
+            let text = render_logical_call(indirect, LogicalInputs::Tag, LogicalResultUse::ImpliedPointer, None);
+            let temp = result_capture(&text);
+            let c = compact_c(&text);
+            let callee = if indirect { "(*(Big24(*)(int4))callback)(tag)" } else { "make_big(tag)" };
+            assert!(c.contains(&format!("observed=({temp}=")), "{text}");
+            assert!(c.contains(&format!(",*{temp}={callee},{temp});")), "{text}");
+            assert_eq!(c.matches("next_destination()").count(), 1, "destination side effect runs once:\n{text}");
+        }
+    }
+
+    #[test]
+    fn logical_method_arguments_dereference_indirect_byvalue_storage() {
+        let text = render_logical_call(false, LogicalInputs::MethodByValue, LogicalResultUse::Discarded, None);
+        let temp = result_capture(&text);
+        assert!(compact_c(&text).contains(&format!("*{temp}=make_big(object,*source_ptr,tag)")), "{text}");
+    }
+
+    #[test]
+    fn logical_variadic_call_preserves_operands_beyond_source_role_prefix() {
+        let text = render_logical_call(false, LogicalInputs::Variadic, LogicalResultUse::Discarded, None);
+        let temp = result_capture(&text);
+        assert!(compact_c(&text).contains(&format!("*{temp}=make_big(tag,extra)")), "{text}");
+    }
+
+    #[test]
+    fn hidden_result_sequence_remains_one_nested_call_argument() {
+        for indirect in [false, true] {
+            let text = render_logical_call(indirect, LogicalInputs::Tag,
+                LogicalResultUse::NestedPointer, None);
+            let temp = result_capture(&text);
+            let c = compact_c(&text);
+            let callee = if indirect { "(*(Big24(*)(int4))callback)(tag)" } else { "make_big(tag)" };
+            assert!(c.contains(&format!("consume_pointer(({temp}=")), "{text}");
+            assert!(c.contains(&format!(",*{temp}={callee},{temp}),tag);")), "{text}");
+            assert_eq!(c.matches("next_destination()").count(), 1, "{text}");
+        }
+    }
+
+    #[test]
+    fn hidden_result_capture_does_not_shadow_existing_parameter() {
+        let original = render_logical_call(false, LogicalInputs::Tag,
+            LogicalResultUse::ExplicitPointer, None);
+        let occupied = result_capture(&original);
+        let text = render_logical_call(false, LogicalInputs::Tag,
+            LogicalResultUse::ExplicitPointer, Some(&occupied));
+        let temp = result_capture(&text);
+        let c = compact_c(&text);
+        assert_ne!(temp, occupied, "the result capture must not shadow a parameter:\n{text}");
+        assert!(c.contains(&format!("returned=({temp}=destination,*{temp}=make_big(tag),{temp});")), "{text}");
+    }
+
+    mod host_layout {
+        use super::*;
+        use crate::dtype::TypeFactory;
+        use crate::fspec::{ParameterPieces, ProtoModel};
+        use crate::prettyprint::ids;
+        use kuna_base::marshal::{Decoder, PackedDecode};
+
+        fn fixture() -> (Funcdata, Architecture) {
+            let mut arch = bare_arch();
+            arch.realtypes = false;
+            arch.ctypes = false;
+            let types = arch.types_rc();
+            types.setup_sizes(Some(4), 8, 8);
+            types.set_core_type("int4", 4, type_metatype::TYPE_INT, false).unwrap();
+            types.cache_core_types().unwrap();
+            let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let void = types.get_type_void().unwrap();
+            // A real local scope requires a stack space. Without it,
+            // link_proto_params is a no-op and named input highs are also
+            // emitted as locals instead of FUNCTION_PARAMETER symbols.
+            let mut manager = build_manager();
+            let register = Rc::new(AddrSpace::new(
+                spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3,
+                addrspace_flags::hasphysical, 1, 1,
+            ));
+            manager.insert_space(register.clone()).unwrap();
+            manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+                "stack", 4, 8, &register, 1, true, false,
+            ))).unwrap();
+            let manager = Rc::new(manager);
+            let model = Rc::new(ProtoModel::new(&manager));
+            let memory = manager.get_space_by_name("ram").unwrap().clone();
+            let mut context = ContextArch::new_shared(manager);
+            context.types = Some(types);
+            let mut fd = Funcdata::new("compute", "compute", Rc::new(context),
+                Address::new(memory.clone(), 0x1000), 0x1000_0000, 0x40).unwrap();
+            assert!(fd.get_scope_local().is_some(), "host fixture needs parameter symbols");
+            fd.get_func_proto_mut().set_internal(model, void);
+            fd.get_func_proto_mut().set_output(&ParameterPieces {
+                addr: Address::new(memory.clone(), 0x200),
+                type_: Some(integer.clone()), flags: 0,
+            });
+            for (index, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                fd.get_func_proto_mut().set_param(index as int4, name, &ParameterPieces {
+                    addr: Address::new(memory.clone(), 0x100 + index as u64 * 8),
+                    type_: Some(integer.clone()), flags: 0,
+                });
+            }
+            let root = fd.bblocks_root_pub();
+            let block = fd.bblocks_mut().new_block_basic(root);
+            let ret = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_RETURN);
+            let address = fd.new_constant(8, 0);
+            let value = fd.new_constant(4, 7);
+            fd.op_set_input(ret, address, 0).unwrap();
+            fd.op_set_input(ret, value, 1).unwrap();
+            fd.op_insert_end(ret, block);
+            fd.seed_sblocks_copy();
+            (fd, arch)
+        }
+
+        type FieldMarkup = (Vec<u8>, u64, i64, u64);
+
+        fn host_document(fd: &Funcdata, bytes: &[u8]) -> (String, Vec<FieldMarkup>) {
+            fn element(decoder: &mut PackedDecode<'_>, text: &mut String, fields: &mut Vec<FieldMarkup>) {
+                let id = decoder.open_element().unwrap();
+                let mut content = None;
+                let mut indent = 0;
+                loop {
+                    let attr = decoder.get_next_attribute_id().unwrap();
+                    if attr == 0 { break; }
+                    if attr == ids::ATTRIB_CONTENT.get_id() {
+                        content = Some(decoder.read_string().unwrap());
+                    } else if attr == ids::ATTRIB_INDENT.get_id() {
+                        indent = decoder.read_signed_integer().unwrap();
+                    }
+                }
+                if id == ids::ELEM_BREAK.get_id() {
+                    text.push('\n');
+                    text.extend(std::iter::repeat_n(' ', indent as usize));
+                }
+                if let Some(content) = content {
+                    text.push_str(std::str::from_utf8(&content).unwrap());
+                }
+                if id == ids::ELEM_FIELD.get_id() {
+                    fields.push((
+                        decoder.read_string_id(&ids::ATTRIB_NAME).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_ID).unwrap(),
+                        decoder.read_signed_integer_id(&ids::ATTRIB_OFF).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_OPREF).unwrap(),
+                    ));
+                }
+                while decoder.peek_element().unwrap() != 0 { element(decoder, text, fields); }
+                decoder.close_element(id).unwrap();
+            }
+            let mut decoder = PackedDecode::new(fd.get_arch().manage());
+            decoder.ingest_stream(bytes).unwrap();
+            let mut text = String::new();
+            let mut fields = Vec::new();
+            element(&mut decoder, &mut text, &mut fields);
+            (text, fields)
+        }
+
+        fn host_text(fd: &Funcdata, bytes: &[u8]) -> String {
+            host_document(fd, bytes).0
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum TypePosition { Other, Prototype, Return, Local, Statement }
+
+        fn host_type_tokens(fd: &Funcdata, bytes: &[u8]) -> Vec<(TypePosition, String, Option<u64>)> {
+            fn visit(
+                decoder: &mut PackedDecode<'_>, position: TypePosition,
+                tokens: &mut Vec<(TypePosition, String, Option<u64>)>,
+            ) {
+                let element = decoder.open_element().unwrap();
+                let position = if element == ids::ELEM_FUNCPROTO.get_id() {
+                    TypePosition::Prototype
+                } else if element == ids::ELEM_RETURN_TYPE.get_id() {
+                    TypePosition::Return
+                } else if element == ids::ELEM_VARDECL.get_id() && position != TypePosition::Prototype {
+                    TypePosition::Local
+                } else if element == ids::ELEM_STATEMENT.get_id() {
+                    TypePosition::Statement
+                } else { position };
+                let mut name = None;
+                let mut type_id = None;
+                loop {
+                    let attr = decoder.get_next_attribute_id().unwrap();
+                    if attr == 0 { break; }
+                    if attr == ids::ATTRIB_CONTENT.get_id() {
+                        name = Some(String::from_utf8(decoder.read_string().unwrap()).unwrap());
+                    } else if attr == ids::ATTRIB_ID.get_id() {
+                        type_id = Some(decoder.read_unsigned_integer().unwrap());
+                    }
+                }
+                if element == ids::ELEM_TYPE.get_id() {
+                    tokens.push((position, name.expect("type token content"), type_id));
+                }
+                while decoder.peek_element().unwrap() != 0 { visit(decoder, position, tokens); }
+                decoder.close_element(element).unwrap();
+            }
+            let mut decoder = PackedDecode::new(fd.get_arch().manage());
+            decoder.ingest_stream(bytes).unwrap();
+            let mut tokens = Vec::new();
+            visit(&mut decoder, TypePosition::Other, &mut tokens);
+            tokens
+        }
+
+        fn nominal_node(types: &crate::dtype::TypeFactoryImpl) -> crate::dtype::TypeRoot {
+            use crate::dtype::DatatypeKind;
+            let mut node = Datatype::new_with_align(8, 8, type_metatype::TYPE_STRUCT);
+            node.name = "Node".into();
+            node.display_name = node.name.clone();
+            node.id = 72_057_594_037_927_936;
+            node.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+            types.intern(node).unwrap()
+        }
+
+        #[test]
+        fn host_pointer_prototype_and_cast_keep_pointee_type_identity() {
+            for rust in [false, true] {
+                let (mut fd, mut arch) = fixture();
+                arch.cast_implied = false;
+                let types = arch.types_rc();
+                let node = nominal_node(&types);
+                let pointer = types.get_type_pointer(8, node, 1).unwrap();
+                fd.set_high_level();
+                named_call_input(&mut fd, "typed_input", pointer.clone());
+                let return_address = Address::new(ram(&fd), 0x200);
+                fd.get_func_proto_mut().set_output(&ParameterPieces {
+                    addr: return_address,
+                    type_: Some(pointer.clone()), flags: 0,
+                });
+                let ret = fd.obank().iter_alive().next().unwrap();
+                let cast = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_CAST);
+                let input = fd.new_constant(8, 0x1234);
+                fd.op_set_input(cast, input, 0).unwrap();
+                let output = fd.new_unique(8, Some(pointer));
+                fd.op_set_output(cast, output).unwrap();
+                fd.vbank_mut().get_mut(output).unwrap().set_implied();
+                fd.op_insert_before(cast, ret);
+                fd.op_set_input(ret, output, 1).unwrap();
+                let mut print = PrintC::new();
+                if rust { print.set_name("rust-language"); }
+                let bytes = print.doc_function_markup(&fd, &arch).unwrap();
+                let tokens = host_type_tokens(&fd, &bytes);
+                // Check the consumer-visible binding at each semantic position,
+                // independently of C/Rust's differing prototype token order.
+                for position in [TypePosition::Return, TypePosition::Prototype, TypePosition::Statement] {
+                    let ids: Vec<_> = tokens.iter()
+                        .filter(|(at, name, _)| *at == position && name == "Node")
+                        .map(|(_, _, id)| *id).collect();
+                    assert_eq!(ids, vec![Some(72_057_594_037_927_936)],
+                        "{position:?}: {}", host_text(&fd, &bytes));
+                }
+                assert!(!tokens.iter().any(|(at, name, _)|
+                    *at == TypePosition::Local && name == "Node"),
+                    "parameter must not also be declared as a local: {}", host_text(&fd, &bytes));
+            }
+        }
+
+        #[test]
+        fn host_callback_suffix_and_named_typedef_keep_independent_type_identities() {
+            use crate::fspec::LogicalCallable;
+            let (mut fd, arch) = fixture();
+            let types = arch.types_rc();
+            let node = nominal_node(&types);
+            let input = types.get_typedef(&node, "Input alias (v2)", 72_057_594_037_927_937, 0).unwrap();
+            let manager = Rc::new(build_manager());
+            let mut model = ProtoModel::new(&manager);
+            model.build_param_list("standard").unwrap();
+            types.set_proto_context(Some(Rc::new(model)), manager).unwrap();
+            let binding = types.model_binding(None).unwrap();
+            let callable = |output: &crate::dtype::TypeRoot, inputs: Vec<crate::dtype::TypeRoot>| {
+                let code = types.get_type_code_proto(&LogicalCallable {
+                    binding: binding.clone(), output: output.id(),
+                    inputs: inputs.iter().map(crate::dtype::TypeRoot::id).collect(),
+                    variadic: false, input_closed: true, logical_first: None, flags: 0,
+                }).unwrap();
+                types.get_type_pointer(8, code, 1).unwrap()
+            };
+            let nested = callable(&input, vec![node.clone()]);
+            let callback = callable(&node, vec![input, nested]);
+            let alias = types.get_typedef(&callback, "Transform (next)", 72_057_594_037_927_938, 0).unwrap();
+            fd.set_high_level();
+            named_call_input(&mut fd, "callback", callback);
+            named_call_input(&mut fd, "named_callback", alias);
+            let bytes = PrintC::new().doc_function_markup(&fd, &arch).unwrap();
+            let tokens = host_type_tokens(&fd, &bytes);
+            let nominal: Vec<_> = tokens.iter()
+                .filter(|(at, name, _)| *at == TypePosition::Prototype
+                    && matches!(name.as_str(), "Node" | "Input alias (v2)" | "Transform (next)"))
+                .map(|(_, name, id)| (name.clone(), *id))
+                .collect();
+            assert_eq!(nominal, vec![
+                ("Node".into(), Some(72_057_594_037_927_936)),
+                ("Input alias (v2)".into(), Some(72_057_594_037_927_937)),
+                ("Input alias (v2)".into(), Some(72_057_594_037_927_937)),
+                ("Node".into(), Some(72_057_594_037_927_936)),
+                ("Transform (next)".into(), Some(72_057_594_037_927_938)),
+            ], "{}", host_text(&fd, &bytes));
+            assert!(!tokens.iter().any(|(at, name, _)| *at == TypePosition::Local
+                && matches!(name.as_str(), "Node" | "Input alias (v2)" | "Transform (next)")),
+                "callback parameters must not also be declared as locals: {}", host_text(&fd, &bytes));
+        }
+
+        #[test]
+        fn host_local_symbol_override_annotates_selected_composite_or_array_element() {
+            for rust in [false, true] {
+                for array in [false, true] {
+                    let (mut fd, arch) = fixture();
+                    let types = arch.types_rc();
+                    let node = nominal_node(&types);
+                    let symbol_type = if array {
+                        types.get_type_array(2, node).unwrap()
+                    } else { node };
+                    let byte = types.get_base(1, type_metatype::TYPE_UINT).unwrap();
+                    fd.set_high_level();
+                    let ret = fd.obank().iter_alive().next().unwrap();
+                    let copy = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
+                    let value = fd.new_constant(1, 0);
+                    fd.op_set_input(copy, value, 0).unwrap();
+                    let output = fd.new_unique(1, Some(byte.clone()));
+                    fd.op_set_output(copy, output).unwrap();
+                    name_call_local(&mut fd, output, "local");
+                    let high = fd.vbank().get(output).unwrap().get_high().unwrap();
+                    let high = fd.high_bank_mut().get_mut(high).unwrap();
+                    high.set_symbol_type(symbol_type);
+                    high.set_symbol_offset(0);
+                    fd.op_insert_before(copy, ret);
+                    // This is genuinely an override, not two names for the
+                    // same datatype selected by the ordinary representative.
+                    assert_eq!(fd.vbank().get(output).unwrap().get_type(), &byte);
+                    let mut print = PrintC::new();
+                    if rust { print.set_name("rust-language"); }
+                    let bytes = print.doc_function_markup(&fd, &arch).unwrap();
+                    let nodes: Vec<_> = host_type_tokens(&fd, &bytes).into_iter()
+                        .filter(|(at, name, _)| *at == TypePosition::Local && name == "Node")
+                        .map(|(_, name, id)| (name, id)).collect();
+                    assert_eq!(nodes, vec![("Node".into(), Some(72_057_594_037_927_936))],
+                        "{}", host_text(&fd, &bytes));
+                }
+            }
+        }
+
+        #[test]
+        fn rust_host_markup_uses_rust_grammar_and_exact_field_references() {
+            use crate::dtype::{DatatypeKind, TypeField};
+            let (mut fd, arch) = fixture();
+            let types = arch.types_rc();
+            let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let first = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+            let mut node = Datatype::new_with_align(16, 8, type_metatype::TYPE_STRUCT);
+            node.name = "Node".into();
+            node.display_name = node.name.clone();
+            node.id = 72_057_594_037_927_936;
+            node.kind = DatatypeKind::Struct {
+                field: vec![
+                    TypeField::new(0, 0, "first", first.id()),
+                    TypeField::new(1, 8, "next", integer.id()),
+                ], bitfield: vec![],
+            };
+            let node = types.intern(node).unwrap();
+            let pointer = types.get_type_pointer(8, node, 1).unwrap();
+            let field_pointer = types.get_type_pointer(8, integer.clone(), 1).unwrap();
+            fd.set_high_level();
+            let base = named_call_input(&mut fd, "node", pointer);
+            let ret = fd.obank().iter_alive().next().unwrap();
+            let member = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_PTRSUB);
+            let offset = fd.new_constant(8, 8);
+            fd.op_set_input(member, base, 0).unwrap();
+            fd.op_set_input(member, offset, 1).unwrap();
+            let address = fd.new_unique(8, Some(field_pointer));
+            fd.op_set_output(member, address).unwrap();
+            fd.vbank_mut().get_mut(address).unwrap().set_implied();
+            fd.op_insert_before(member, ret);
+            let load = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_LOAD);
+            let space = fd.new_constant(8, ram(&fd).get_index() as u64);
+            fd.op_set_input(load, space, 0).unwrap();
+            fd.op_set_input(load, address, 1).unwrap();
+            let value = fd.new_unique(4, Some(integer));
+            fd.op_set_output(load, value).unwrap();
+            fd.vbank_mut().get_mut(value).unwrap().set_implied();
+            fd.op_insert_before(load, ret);
+            fd.op_set_input(ret, value, 1).unwrap();
+            // The fixture already seeded this basic block's BlockCopy. Added
+            // operations are visible through it; seeding again duplicates the
+            // same block in the structured graph.
+            let mut print = PrintC::new();
+            print.set_name("rust-language");
+            let bytes = print.doc_function_markup(&fd, &arch).unwrap();
+            let (text, fields) = host_document(&fd, &bytes);
+            let compact = compact_c(&text);
+            assert!(compact.contains("fncompute(") && compact.contains("node:*mutNode"), "{text}");
+            assert!(compact.contains(")->i32") && compact.contains(".next"), "{text}");
+            assert_eq!(fields, vec![(b"Node".to_vec(), 72_057_594_037_927_936, 8,
+                fd.obank().get(member).unwrap().get_time() as u64)]);
+            assert_eq!(print.get_name(), "rust-language");
+        }
+
+        #[test]
+        fn queued_c_comments_and_inline_warnings_keep_their_own_continuations() {
+            use crate::comment::comment_type as ct;
+            let (fd, mut arch) = fixture();
+            arch.commentdb.add_comment(ct::USER2, fd.get_address(), fd.get_address(),
+                "ordinary first\nordinary second");
+            arch.commentdb.add_comment(ct::WARNING, fd.get_address(), fd.get_address(),
+                "warning alpha beta gamma delta epsilon");
+            let mut print = PrintC::new();
+            print.set_max_line_size(20).unwrap();
+            print.set_line_comment_indent(2).unwrap();
+            print.set_comment_style("c").unwrap();
+            print.set_header_comment_flags(0);
+            print.set_instruction_comment_flags(ct::USER2 | ct::WARNING);
+            print.options.set_warn_inline(true);
+            let text = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
+            let block_start = text.find("/*").unwrap();
+            let block_end = block_start + text[block_start..].find("*/").unwrap();
+            let block = &text[block_start..block_end];
+            assert!(block.contains("ordinary") && !block.contains("//"), "{text}");
+            let warning = &text[text.find("//").unwrap()..];
+            let warning_lines: Vec<_> = warning.lines()
+                .filter(|line| line.contains("alpha") || line.contains("beta")
+                    || line.contains("gamma") || line.contains("delta") || line.contains("epsilon"))
+                .collect();
+            assert!(warning_lines.len() > 1, "{text}");
+            assert!(warning_lines.iter().all(|line| line.trim_start().starts_with("//")), "{text}");
+        }
+
+        #[test]
+        fn host_width_and_indent_survive_sinks_without_moving_raw_source_maps() {
+            let (fd, arch) = fixture();
+            let mut print = PrintC::new();
+            let raw = print.doc_function_full(&fd, &arch);
+            let tokens = print.doc_function_tokens(&fd, &arch);
+            let wide = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
+            assert_eq!(wide.split('{').next().unwrap().lines()
+                .filter(|line| !line.is_empty()).count(), 1, "{wide}");
+
+            print.set_max_line_size(20).unwrap();
+            print.set_indent_increment(4);
+            print.set_markup(true);
+            print.set_markup(false);
+            let narrow = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
+            assert_eq!(compact_c(&narrow), compact_c(&wide));
+            let signature = narrow.split('{').next().unwrap();
+            assert!(signature.lines().filter(|line| !line.is_empty()).count() > 1, "{narrow}");
+            assert!(narrow.contains("\n    return 7;"), "{narrow}");
+            assert_eq!(print.doc_function_full(&fd, &arch).split('{').next(),
+                raw.split('{').next(), "host wrapping must not reach raw C");
+            print.set_indent_increment(2);
+            assert_eq!(print.doc_function_tokens(&fd, &arch), tokens);
+            assert_eq!(print.doc_function_full(&fd, &arch), raw);
+
+            print.reset_wire_option_defaults();
+            let reset = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
+            assert_eq!(reset, wide);
+            assert!(print.set_max_line_size(19).is_err());
+            assert!(print.set_max_line_size(10001).is_err());
+            assert_eq!(host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap()), wide);
+            print.set_max_line_size(20).unwrap();
+            assert!(print.set_line_comment_indent(20).is_err());
+            assert!(print.set_line_comment_indent(-1).is_err());
+            print.set_line_comment_indent(19).unwrap();
+        }
+
+        #[test]
+        fn host_sink_restores_after_queue_error_and_render_unwind() {
+            let (fd, arch) = fixture();
+            let mut print = PrintC::new();
+            print.set_max_line_size(20).unwrap();
+            print.set_indent_increment(4);
+            print.emit.print("saved sink", SyntaxHighlight::NoColor);
+            let failed: KunaResult<()> = print.with_document_sink(
+                PrintEmit::Pretty(EmitPrettyPrint::new()), true, |print| {
+                    print.emit.begin_function();
+                    print.emit.flush()
+                });
+            assert!(failed.is_err());
+            assert_eq!(print.emit.output_str(), "saved sink");
+            assert!(!print.is_host_surface());
+            let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _: KunaResult<()> = print.with_document_sink(
+                    PrintEmit::Pretty(EmitPrettyPrint::new()), true, |print| {
+                        print.context.push_mod();
+                        print.context.set_mod(modifiers::PRINT_LOAD_VALUE);
+                        panic!("render interrupted");
+                    });
+            }));
+            assert!(unwind.is_err());
+            assert_eq!(print.emit.output_str(), "saved sink");
+            assert_eq!(print.context.mods(), 0);
+            assert!(print.emit_fd.is_none());
+            let recovered = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
+            assert!(recovered.contains("\n    return 7;"), "{recovered}");
+            assert!(!recovered.contains("saved sink"));
+            assert_eq!(print.emit.output_str(), "saved sink");
+        }
+    }
+
+    mod host_field_metadata {
+        use super::*;
+        use crate::dtype::{DatatypeKind, TypeFactoryImpl, TypeField};
+        use crate::prettyprint::ids;
+        use kuna_base::marshal::{Decoder, PackedDecode};
+
+        #[test]
+        fn recovered_member_keeps_nominal_host_parent_and_byte_offset() {
+            let types = TypeFactoryImpl::new();
+            let scalar = types.intern(Datatype::new(8, type_metatype::TYPE_INT)).unwrap();
+            let mut draft = Datatype::new_with_align(16, 8, type_metatype::TYPE_STRUCT);
+            draft.name = "Node".into();
+            draft.display_name = draft.name.clone();
+            draft.id = 72_057_594_037_927_936;
+            draft.kind = DatatypeKind::Struct {
+                field: vec![
+                    TypeField::new(0, 0, "first", scalar.id()),
+                    TypeField::new(1, 8, "next", scalar.id()),
+                ],
+                bitfield: vec![],
+            };
+            let node = types.intern(draft).unwrap();
+            let mut alias = Datatype::new_with_align(16, 8, type_metatype::TYPE_STRUCT);
+            alias.name = "NodeAlias".into();
+            alias.display_name = alias.name.clone();
+            alias.id = 72_057_594_037_927_937;
+            alias.kind = DatatypeKind::Alias;
+            alias.typedef_imm = Some(node.id());
+            let alias = types.intern(alias).unwrap();
+            for (parent, expected_name, expected_id) in [
+                (node, "Node", 72_057_594_037_927_936),
+                (alias, "NodeAlias", 72_057_594_037_927_937),
+            ] {
+                let mut fd = build_fd();
+                let op = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
+                let vn = fd.new_varnode(16, &Address::new(ram(&fd), 0x200), Some(parent.clone()));
+                fd.op_set_input(op, vn, 0).unwrap();
+                let arch = bare_arch();
+                let mut print = PrintC::new();
+                print.set_markup(true);
+                print.emit_fd = Some(&fd as *const Funcdata);
+                let document = print.emit_mut().begin_function();
+                assert!(print.push_partial_symbol_ir(
+                    &fd, &arch, "node", parent, 8, 8, vn, op, 0, false,
+                ));
+                print.recurse();
+                print.emit_mut().end_function(document);
+                let bytes = print.emit_mut().take_markup_bytes();
+                let mut decoder = PackedDecode::new(fd.get_arch().manage());
+                decoder.ingest_stream(&bytes).unwrap();
+                let root = decoder.open_element_id(&ids::ELEM_FUNCTION).unwrap();
+                let mut members = Vec::new();
+                while decoder.peek_element().unwrap() != 0 {
+                    let element = decoder.open_element().unwrap();
+                    if element == ids::ELEM_FIELD.get_id() {
+                        members.push((
+                            decoder.read_string_id(&ids::ATTRIB_CONTENT).unwrap(),
+                            decoder.read_string_id(&ids::ATTRIB_NAME).unwrap(),
+                            decoder.read_unsigned_integer_id(&ids::ATTRIB_ID).unwrap(),
+                            decoder.read_signed_integer_id(&ids::ATTRIB_OFF).unwrap(),
+                            decoder.read_unsigned_integer_id(&ids::ATTRIB_OPREF).unwrap(),
+                        ));
+                    }
+                    decoder.close_element_skipping(element).unwrap();
+                }
+                decoder.close_element(root).unwrap();
+                assert_eq!(members, vec![(
+                    b"next".to_vec(), expected_name.as_bytes().to_vec(), expected_id,
+                    8, fd.obank().get(op).unwrap().get_time() as u64,
+                )]);
+            }
+        }
     }
 }

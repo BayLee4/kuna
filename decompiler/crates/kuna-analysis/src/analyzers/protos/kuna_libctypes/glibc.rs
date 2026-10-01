@@ -45,12 +45,10 @@
 //!   v10 * 4`). The hole wins on every count that carries information.
 //!
 //! * **No self-reference.** `_IO_FILE::_chain` and `_IO_FILE::_freeres_list` are
-//!   `struct _IO_FILE *` in the header and `void *` here. Completing a struct
-//!   re-keys it into a NEW `Rc` (`TypeFactory::set_fields_struct`), so a
-//!   `FILE *` built against the shell WHILE the shell is being filled would be
-//!   stranded on the incomplete one and the program would carry two stream
-//!   types. Nothing reads `_chain`; the cost is a name, the alternative is a
-//!   split type.
+//!   `struct _IO_FILE *` in the header and `void *` here. This table retains
+//!   its existing limited field vocabulary; the shared datatype graph supports
+//!   stable recursive references, but this ownership migration does not expand
+//!   the table's type claims.
 //! * **At most one level of by-value nesting.** `stat` holds three `timespec`s
 //!   by value; `timespec` holds no aggregate. [`tests`](super::tests) asserts
 //!   that, so the recursive mint in [`super::named_aggregate`] terminates by
@@ -58,8 +56,7 @@
 
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory, TypeField};
-use std::rc::Rc;
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeField, TypeRoot};
 
 use super::{named_aggregate, Layout};
 
@@ -247,7 +244,7 @@ pub(super) fn layout_for(name: &str) -> Option<&'static [GlibcField]> {
 }
 
 /// Intern the type of one field.
-fn field_type(ty: &FTy, types: &dyn TypeFactory, word_size: uint4) -> KunaResult<Rc<Datatype>> {
+fn field_type(ty: &FTy, types: &dyn TypeFactory, word_size: uint4) -> KunaResult<TypeRoot> {
     let ptr = types.get_size_of_pointer();
     match ty {
         FTy::Int => types.get_base(4, type_metatype::TYPE_INT),
@@ -295,7 +292,7 @@ pub(super) fn build_fields(
     let mut out = Vec::with_capacity(fields.len());
     for field in fields {
         let ty = field_type(&field.ty, types, word_size)?;
-        out.push(TypeField::new(field.off, field.off, field.name, ty));
+        out.push(TypeField::new(field.off, field.off, field.name, ty.id()));
     }
     Ok(out)
 }

@@ -64,3 +64,110 @@ repositories {
 dependencies {
 	// No external dependencies.
 }
+
+
+// Compile the maintained producer and consumer deltas against this exact distribution.
+// Never place these classes in the extension's ordinary lib/ classpath: the supported
+// Ghidra/patch bootstrap path is installed into a separate distribution by the installer.
+def producerSourceArchive = file("${ghidraInstallDir}/Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling-src.zip")
+def producerModelJar = file("${ghidraInstallDir}/Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling.jar")
+def producerApplication = file("${ghidraInstallDir}/Ghidra/application.properties")
+def producerPatch = file('producer/call-return-origin.patch')
+def consumerPatch = file('producer/callable-support.patch')
+def consumerSourceArchive = file("${ghidraInstallDir}/Ghidra/Features/Decompiler/lib/Decompiler-src.zip")
+def consumerJar = file("${ghidraInstallDir}/Ghidra/Features/Decompiler/lib/Decompiler.jar")
+def consumerNames = [
+	'ghidra/app/decompiler/DecompileResults.java',
+	'ghidra/app/decompiler/DecompiledFunction.java',
+	'ghidra/app/util/exporter/CppExporter.java'
+]
+def producerSources = layout.buildDirectory.dir('producer/sources')
+def producerNames = [
+	'ghidra/app/plugin/processors/sleigh/PcodeEmit.java',
+	'ghidra/app/plugin/processors/sleigh/PcodeEmitPacked.java',
+	'ghidra/program/model/pcode/PcodeDataTypeManager.java',
+	'ghidra/program/model/data/DataTypeWriter.java'
+]
+
+def prepareProducerSources = tasks.register('prepareProducerSources') {
+	inputs.files(producerSourceArchive, producerPatch, consumerSourceArchive, consumerPatch)
+	outputs.dir(producerSources)
+	doLast {
+		delete producerSources
+		copy {
+			from zipTree(producerSourceArchive)
+			include producerNames
+			into producerSources
+		}
+		copy {
+			from zipTree(consumerSourceArchive)
+			include consumerNames
+			into producerSources
+		}
+		(producerNames + consumerNames).each { name ->
+			if (!producerSources.get().file(name).asFile.isFile()) {
+				throw new GradleException("Ghidra producer source is missing: ${name}")
+			}
+		}
+		// Exact context application fails closed if an upstream seam changes.
+		[producerPatch, consumerPatch].each { delta ->
+			providers.exec {
+				workingDir producerSources.get().asFile.toPath().root.toFile()
+				commandLine 'git', 'apply', '--check', '--unsafe-paths',
+					"--directory=${producerSources.get().asFile.absolutePath}", delta.absolutePath
+			}.result.get().assertNormalExitValue()
+			providers.exec {
+				workingDir producerSources.get().asFile.toPath().root.toFile()
+				commandLine 'git', 'apply', '--unsafe-paths',
+					"--directory=${producerSources.get().asFile.absolutePath}", delta.absolutePath
+			}.result.get().assertNormalExitValue()
+		}
+	}
+}
+
+def compileProducerJava = tasks.register('compileProducerJava', JavaCompile) {
+	dependsOn prepareProducerSources
+	source producerSources
+	classpath = sourceSets.main.compileClasspath
+	destinationDirectory = layout.buildDirectory.dir('classes/producer')
+	sourceCompatibility = tasks.named('compileJava').get().sourceCompatibility
+	targetCompatibility = tasks.named('compileJava').get().targetCompatibility
+	options.sourcepath = files()
+}
+
+def producerJar = tasks.register('producerJar', Jar) {
+	dependsOn compileProducerJava
+	archiveFileName = 'kuna-ghidra-producer.jar'
+	destinationDirectory = layout.buildDirectory.dir('producer')
+	from compileProducerJava.flatMap { it.destinationDirectory }
+	inputs.files(producerApplication, producerModelJar, producerSourceArchive,
+		consumerJar, consumerSourceArchive)
+	doFirst {
+		def sha256 = { File input ->
+			def digest = java.security.MessageDigest.getInstance('SHA-256')
+			input.withInputStream { stream ->
+				byte[] buffer = new byte[65536]
+				int length
+				while ((length = stream.read(buffer)) != -1) {
+					digest.update(buffer, 0, length)
+				}
+			}
+			digest.digest().encodeHex().toString()
+		}
+		manifest.attributes(
+			'Kuna-Producer-Protocol': 'callreturn-v1',
+			'Ghidra-Application-SHA256': sha256(producerApplication),
+			'Ghidra-SoftwareModeling-SHA256': sha256(producerModelJar),
+			'Ghidra-Source-SHA256': sha256(producerSourceArchive),
+			'Kuna-Callable-Support-Protocol': '2-e4030-4039-a4030-4048',
+			'Ghidra-Decompiler-SHA256': sha256(consumerJar),
+			'Ghidra-Decompiler-Source-SHA256': sha256(consumerSourceArchive))
+	}
+}
+
+tasks.named('buildExtension') {
+	dependsOn producerJar
+	from(producerJar) {
+		into "${project.name}/producer"
+	}
+}

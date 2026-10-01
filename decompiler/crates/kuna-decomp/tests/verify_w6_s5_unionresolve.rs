@@ -24,7 +24,7 @@ use kuna_base::space::{AddrSpace, spacetype};
 use kuna_base::types::int4;
 
 use kuna_decomp::dtype::{
-    Datatype, DatatypeKind, TypeFactoryImpl, TypeField, sub_metatype, type_metatype,
+    Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField, TypeRoot, sub_metatype, type_metatype,
 };
 use kuna_decomp::unionresolve::{
     ConstantFitFacts, FloatConstFact, ResolveEdge, ResolvedUnion, compute_best_index,
@@ -33,33 +33,31 @@ use kuna_decomp::unionresolve::{
 
 // ---- builders ---------------------------------------------------------------
 
-fn base_type(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base_type(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new(size, m)).unwrap()
 }
 
-fn with_id(size: int4, m: type_metatype, id: u64) -> Rc<Datatype> {
+fn with_id(types: &TypeFactoryImpl, size: int4, m: type_metatype, id: u64) -> TypeRoot {
     let mut dt = Datatype::new(size, m);
+    dt.name = format!("type{id}");
     dt.id = id;
-    Rc::new(dt)
+    types.intern(dt).unwrap()
 }
 
-fn pointer_to(ptrto: Rc<Datatype>, size: int4, wordsize: u32) -> Rc<Datatype> {
-    let mut p = Datatype::new(size, type_metatype::TYPE_PTR);
-    p.submeta = sub_metatype::SUB_PTR;
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize };
-    Rc::new(p)
+fn pointer_to(types: &TypeFactoryImpl, ptrto: TypeRoot, size: int4, wordsize: u32) -> TypeRoot {
+    types.get_type_pointer(size, ptrto, wordsize).unwrap()
 }
 
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(types: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
     u.submeta = sub_metatype::SUB_UNION;
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    types.intern(u).unwrap()
 }
 
 // =============================================================================
@@ -73,7 +71,14 @@ fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
 /// compared `encoding` as unsigned (u32) would put −1 == 0xFFFFFFFF *last*.
 #[test]
 fn resolve_edge_signed_encoding_orders_output_before_inputs() {
-    let int_t = with_id(4, type_metatype::TYPE_INT, 77);
+    let types = TypeFactoryImpl::new();
+    let first = with_id(&types, 4, type_metatype::TYPE_INT, 77);
+    let second = with_id(&types, 4, type_metatype::TYPE_INT, 76);
+    let (other_type, int_t) = if first.id() < second.id() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     // Output edge: slot = -1  => encoding = -1.
     let out_edge = ResolveEdge::new_op(&int_t, 1000, -1);
     // Input edges: slot 0 and slot 1 => encoding 0 and 1.
@@ -87,8 +92,7 @@ fn resolve_edge_signed_encoding_orders_output_before_inputs() {
 
     // And typeId still dominates encoding: a smaller typeId with a *larger*
     // encoding still sorts first.
-    let other_type = with_id(4, type_metatype::TYPE_INT, 76);
-    let big_enc = ResolveEdge::new_op(&other_type, 1000, 5); // typeId 76, enc 5
+    let big_enc = ResolveEdge::new_op(&other_type, 1000, 5);
     assert!(big_enc < out_edge, "typeId dominates encoding");
 }
 
@@ -101,7 +105,8 @@ fn resolve_edge_signed_encoding_orders_output_before_inputs() {
 /// public `Eq`/`Ord` instead of reading `opTime`.)
 #[test]
 fn resolve_edge_addr_optime_truncates_u64_to_u32() {
-    let int_t = with_id(4, type_metatype::TYPE_INT, 5);
+    let types = TypeFactoryImpl::new();
+    let int_t = with_id(&types, 4, type_metatype::TYPE_INT, 5);
     let space = Rc::new(AddrSpace::new(
         spacetype::IPTR_PROCESSOR,
         "ram",
@@ -143,7 +148,8 @@ fn resolve_edge_addr_optime_truncates_u64_to_u32() {
 #[test]
 fn score_truncation_int_branch_signed_offset_window() {
     use type_metatype::*;
-    let int8_t = base_type(8, TYPE_INT);
+    let types = TypeFactoryImpl::new();
+    let int8_t = base_type(&types, 8, TYPE_INT);
 
     // vn_size 4, offset 0 already taken by the loop's first check? No: curOff==0
     // but size(8) != vn(4), so we enter the body. int branch: 8 >= 4 + 0 -> score 1.
@@ -177,9 +183,10 @@ fn score_truncation_int_branch_signed_offset_window() {
 ///   Total: 5 - 5 - 2 = -2.
 #[test]
 fn score_locked_type_asymmetric_pointer_chain() {
-    let int4_t = base_type(4, type_metatype::TYPE_INT);
-    let ct = pointer_to(pointer_to(Rc::clone(&int4_t), 8, 1), 8, 1); // ptr->ptr->int (size 8)
-    let lock = pointer_to(Rc::clone(&int4_t), 8, 1); // ptr->int (size 8)
+    let types = TypeFactoryImpl::new();
+    let int4_t = base_type(&types, 4, type_metatype::TYPE_INT);
+    let ct = pointer_to(&types, pointer_to(&types, int4_t.clone(), 8, 1), 8, 1); // ptr->ptr->int (size 8)
+    let lock = pointer_to(&types, int4_t.clone(), 8, 1); // ptr->int (size 8)
     // iter1 +5; break; remaining ct=ptr(size8) vs lock=int(size4): -5 mismatch,
     // -2 size. Total -2.
     assert_eq!(score_locked_type(&ct, &lock), 5 - 5 - 2);
@@ -193,8 +200,8 @@ fn score_locked_type_asymmetric_pointer_chain() {
 
     // A bare ptr vs a non-pointer composite: no loop iteration (lockType not PTR
     // on entry), PTR vs STRUCT mismatch -5, sizes 8 vs 4 -> -2 => -7.
-    let struct4 = base_type(4, type_metatype::TYPE_STRUCT);
-    let p_int = pointer_to(Rc::clone(&int4_t), 8, 1);
+    let struct4 = base_type(&types, 4, type_metatype::TYPE_STRUCT);
+    let p_int = pointer_to(&types, int4_t.clone(), 8, 1);
     assert_eq!(score_locked_type(&p_int, &struct4), -5 - 2);
 }
 
@@ -259,38 +266,35 @@ fn compute_best_index_strict_gt_and_edges() {
 /// `unionresolve.cc:88-98`:
 /// - locked AND fieldNum differs  -> no change (lock protects the field, not
 ///   the resolved data-type)
-/// - same fieldNum AND same resolve (pointer identity) -> no change
+/// - same fieldNum AND same resolve (graph identity) -> no change
 /// - otherwise adopt op's fieldNum+resolve and report a change
 ///
-/// The "same resolve" test is **pointer identity** (`resolve == op.resolve`), so
-/// two distinct-but-equal Datatypes with the same fieldNum *do* count as a change.
+/// The "same resolve" test uses graph identity (`resolve == op.resolve`).
 #[test]
-fn resolved_union_update_pointer_identity_semantics() {
-    let union_t = make_union(4, &[(0, base_type(4, type_metatype::TYPE_INT))]);
-    let int_a = base_type(4, type_metatype::TYPE_INT);
-    let int_b = base_type(4, type_metatype::TYPE_INT); // distinct Rc, equal shape
+fn resolved_union_update_graph_identity_semantics() {
+    let types = TypeFactoryImpl::new();
+    let union_t = make_union(&types, 4, &[(0, base_type(&types, 4, type_metatype::TYPE_INT))]);
+    let int_a = base_type(&types, 4, type_metatype::TYPE_INT);
 
     // Unlocked: same fieldNum (-1), but a *different* resolve object -> change.
-    let mut res = ResolvedUnion::new(Rc::clone(&union_t));
-    let mut op = ResolvedUnion::new(Rc::clone(&union_t));
-    op.set_resolve(Rc::clone(&int_a));
+    let mut res = ResolvedUnion::new(union_t.clone());
+    let mut op = ResolvedUnion::new(union_t.clone());
+    op.set_resolve(int_a.clone());
     assert!(res.update(&op), "distinct resolve object with same fieldNum is a change");
-    assert!(Rc::ptr_eq(res.get_datatype(), &int_a));
+    assert_eq!(res.get_datatype(), &int_a);
 
-    // Now updating to a *pointer-identical* resolve with the same fieldNum -> no change.
-    let mut op_same = ResolvedUnion::new(Rc::clone(&union_t));
-    op_same.set_resolve(Rc::clone(&int_a));
-    assert!(!res.update(&op_same), "pointer-identical resolve + same fieldNum -> no change");
+    // Now updating to the same graph identity and fieldNum -> no change.
+    let mut op_same = ResolvedUnion::new(union_t.clone());
+    op_same.set_resolve(int_a.clone());
+    assert!(!res.update(&op_same), "same resolve identity + same fieldNum -> no change");
 
     // Locked, differing fieldNum -> rejected outright even with a new resolve.
     // Build an op with fieldNum 0 via the public field constructor (a plain
     // TYPE_UNION field 0 resolves through getDepend(0), which is the union's
     // field type — the factory is not consulted on this path).
     res.set_lock(true);
-    let factory = TypeFactoryImpl::new();
-    let op_field0 = ResolvedUnion::new_field(Rc::clone(&union_t), 0, &factory).unwrap();
+    let op_field0 = ResolvedUnion::new_field(union_t.clone(), 0, &types).unwrap();
     assert_eq!(op_field0.get_field_num(), 0, "constructed op has fieldNum 0");
     // res still has fieldNum -1; locked + differing fieldNum -> no change.
     assert!(!res.update(&op_field0), "locked + differing fieldNum -> rejected");
-    let _ = int_b;
 }

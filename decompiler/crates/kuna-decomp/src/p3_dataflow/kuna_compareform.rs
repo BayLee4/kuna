@@ -198,7 +198,7 @@ fn restore_lessequal(op: OpId, data: &mut Funcdata) -> bool {
     // returns char) and mis-render `'a'` instead of `0x61`.  The mapentry/Symbol
     // copy stays a W4 STUB (no mapentry link in the merged tree).
     let src_info =
-        data.vbank().get(vn).map(|s| (std::rc::Rc::clone(s.get_type()), s.get_flags()));
+        data.vbank().get(vn).map(|s| (s.get_type().clone(), s.get_flags()));
     if let Some((src_type, src_flags)) = src_info {
         if let Some(dst) = data.vbank_mut().get_mut(newvn) {
             dst.copy_symbol_fields(src_type, src_flags);

@@ -17,6 +17,8 @@
 //! Lints are inherited from the workspace (`[lints] workspace = true`).
 
 pub mod interface;
+#[cfg(test)]
+mod readonly_replay_tests;
 pub mod ifaceterm;
 pub mod ifacedecomp;
 mod entry_selector;

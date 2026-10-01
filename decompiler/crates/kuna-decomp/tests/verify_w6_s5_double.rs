@@ -33,7 +33,7 @@ use kuna_num::opcodes::OpCode;
 
 use kuna_decomp::action::Rule;
 use kuna_decomp::double::{RuleDoubleIn, SplitVarnode};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::type_metatype;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
 
@@ -58,7 +58,11 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let arch = ArchContext::new(manage);
+    let types = arch.types_impl().unwrap();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -66,10 +70,6 @@ fn build_fd() -> Funcdata {
 
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
-}
-
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
 }
 
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
@@ -82,7 +82,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.vbank_mut().create(size, Address::new(r, off), unk(size))
+    let ct = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
+    fd.vbank_mut().create(size, Address::new(r, off), ct)
 }
 
 fn mk_const(fd: &mut Funcdata, size: int4, val: u64) -> VarnodeId {

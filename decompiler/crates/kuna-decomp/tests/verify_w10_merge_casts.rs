@@ -30,61 +30,77 @@ use kuna_base::types::int4;
 use kuna_decomp::coreaction_casts::{is_op_identical, test_struct_offset0};
 use kuna_decomp::cast::{CastStrategy, CastStrategyC};
 use kuna_decomp::dtype::{
-    type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField,
+    type_metatype, Datatype, DatatypeKind, TypeRoot, TypeFactory, TypeFactoryImpl, TypeField,
 };
 
 // ---- type builders ---------------------------------------------------------
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(f: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, m)).unwrap()
 }
 
-fn void() -> Rc<Datatype> {
+fn void(f: &TypeFactoryImpl) -> TypeRoot {
     let mut d = Datatype::new(1, type_metatype::TYPE_VOID);
     d.kind = DatatypeKind::Void;
-    Rc::new(d)
+    f.intern(d).unwrap()
 }
 
 /// A plain `TypePointer` to `ptrto`, word-size 1, no bound space (so
 /// `castStandard`'s space check stays "one pointer has no address" -> no cast).
-fn ptr(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr(f: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
     let mut d = Datatype::new(8, type_metatype::TYPE_PTR);
-    d.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(d)
+    d.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    f.intern(d).unwrap()
 }
 
 /// An array of `n` elements of `elem`; align_size set to the array byte size so
 /// `getAlignSize()` differs from the element's (the C++ TypeArray align).
-fn array(elem: Rc<Datatype>, n: int4) -> Rc<Datatype> {
+fn array(f: &TypeFactoryImpl, elem: TypeRoot, n: int4) -> TypeRoot {
     let esz = elem.get_size();
     let mut d = Datatype::new(esz * n, type_metatype::TYPE_ARRAY);
     d.align_size = esz * n;
-    d.kind = DatatypeKind::Array { arrayof: elem, arraysize: n };
-    Rc::new(d)
+    d.kind = DatatypeKind::Array { arrayof: elem.id(), arraysize: n };
+    f.intern(d).unwrap()
 }
 
 /// A struct from `(offset, type)` fields.
-fn structof(fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn structof(f: &TypeFactoryImpl, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let total: int4 = fields.iter().map(|(o, t)| o + t.get_size()).max().unwrap_or(0);
     let mut d = Datatype::new(total, type_metatype::TYPE_STRUCT);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     d.kind = DatatypeKind::Struct { field, bitfield: Vec::new() };
-    Rc::new(d)
+    f.intern(d).unwrap()
 }
 
 /// A typedef wrapper: a fresh `Datatype` whose `typedef_imm` points to `inner`.
-fn typedefof(inner: Rc<Datatype>) -> Rc<Datatype> {
+fn typedefof(f: &TypeFactoryImpl, inner: TypeRoot) -> TypeRoot {
+    let name = "myint";
+    let id = Datatype::hash_name(name);
+    let alias = f.reserve_alias(name, id).unwrap();
     let mut d = Datatype::new(inner.get_size(), inner.get_metatype());
-    d.typedef_imm = Some(inner);
-    Rc::new(d)
+    d.name = name.to_owned();
+    d.display_name = name.to_owned();
+    d.id = id;
+    d.kind = DatatypeKind::Alias;
+    d.typedef_imm = Some(inner.id());
+    f.complete(&alias, d).unwrap();
+    alias
 }
 
-fn strat() -> CastStrategyC {
-    CastStrategyC::new(Rc::new(TypeFactoryImpl::new()) as Rc<dyn TypeFactory>)
+fn factory() -> Rc<TypeFactoryImpl> {
+    let f = TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    f.set_max_basetype_size(8);
+    f.setup_sizes(Some(4), 8, 8);
+    Rc::new(f)
+}
+
+fn strat(f: &Rc<TypeFactoryImpl>) -> CastStrategyC {
+    CastStrategyC::new(f.clone())
 }
 
 // ===========================================================================
@@ -97,18 +113,19 @@ fn strat() -> CastStrategyC {
 /// is induced (returns true).  coreaction.cc:2460-2464.
 #[test]
 fn w10_test_struct_offset0_array_first_element_induces_ptrsub() {
-    let s = strat();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let arr = array(Rc::clone(&int4t), 5);
-    let curtype = ptr(arr); // int4 (*)[5]
-    let reqtype = ptr(Rc::clone(&int4t)); // int4 *
+    let f = &factory();
+    let s = strat(f);
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let arr = array(f, Clone::clone(&int4t), 5);
+    let curtype = ptr(f, arr); // int4 (*)[5]
+    let reqtype = ptr(f, Clone::clone(&int4t)); // int4 *
     assert!(
         test_struct_offset0(&reqtype, &curtype, &s),
         "pointer-to-array-of-int4 vs pointer-to-int4: first element matches -> PTRSUB (cpp:2460)"
     );
     // ADVERSARIAL: the SAME current type, but a `void *` required type must NOT
     // induce a PTRSUB (cpp:2468-2470 "Don't induce PTRSUB for void *").
-    let reqvoid = ptr(void());
+    let reqvoid = ptr(f, void(f));
     assert!(
         !test_struct_offset0(&reqvoid, &curtype, &s),
         "void* required type must NOT induce a PTRSUB (cpp:2468)"
@@ -120,20 +137,21 @@ fn w10_test_struct_offset0_array_first_element_induces_ptrsub() {
 /// rejected (cpp:2452 `if ((*iter).offset != 0) return false`).
 #[test]
 fn w10_test_struct_offset0_struct_first_field_offset_gate() {
-    let s = strat();
-    let int4t = base(4, type_metatype::TYPE_INT);
+    let f = &factory();
+    let s = strat(f);
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
     // first field at offset 0, type int4 -> matches reqtype int4* -> PTRSUB.
-    let st0 = structof(&[(0, Rc::clone(&int4t)), (4, Rc::clone(&int4t))]);
-    let cur0 = ptr(st0);
-    let req = ptr(Rc::clone(&int4t));
+    let st0 = structof(f, &[(0, Clone::clone(&int4t)), (4, Clone::clone(&int4t))]);
+    let cur0 = ptr(f, st0);
+    let req = ptr(f, Clone::clone(&int4t));
     assert!(
         test_struct_offset0(&req, &cur0, &s),
         "struct first field @0 matching int4 -> PTRSUB (cpp:2448-2454)"
     );
     // ADVERSARIAL: a struct whose first field is at a NON-zero offset (e.g. 4) is
     // rejected outright (cpp:2452).  Build the struct's `field[0].offset = 4`.
-    let st_nonzero = structof(&[(4, Rc::clone(&int4t))]);
-    let cur_nonzero = ptr(st_nonzero);
+    let st_nonzero = structof(f, &[(4, Clone::clone(&int4t))]);
+    let cur_nonzero = ptr(f, st_nonzero);
     assert!(
         !test_struct_offset0(&req, &cur_nonzero, &s),
         "struct whose first field is at non-zero offset is rejected (cpp:2452)"
@@ -144,10 +162,11 @@ fn w10_test_struct_offset0_struct_first_field_offset_gate() {
 /// final `else { return false; }` (cpp:2465-2467) regardless of the required type.
 #[test]
 fn w10_test_struct_offset0_scalar_pointee_rejected() {
-    let s = strat();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let cur_scalar = ptr(Rc::clone(&int4t)); // int4 * (pointee is scalar)
-    let req = ptr(Rc::clone(&int4t));
+    let f = &factory();
+    let s = strat(f);
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let cur_scalar = ptr(f, Clone::clone(&int4t)); // int4 * (pointee is scalar)
+    let req = ptr(f, Clone::clone(&int4t));
     assert!(
         !test_struct_offset0(&req, &cur_scalar, &s),
         "pointer-to-scalar pointee cannot be a struct/array first-field access (cpp:2465)"
@@ -164,22 +183,16 @@ fn w10_test_struct_offset0_scalar_pointee_rejected() {
 //     coreaction.cc:2559-2571.
 // ===========================================================================
 
-/// Pointer-chain descent: `int4 **` is op-identical to `int4 **` (same leaf),
-/// but `int4 **` is NOT op-identical to `float4 **` (different leaf after the
-/// matched pointer descent).  cpp:2562-2565.
+/// Pointer-chain descent must distinguish incompatible pointee types:
+/// `int4 **` is NOT op-identical to `float4 **`.  cpp:2562-2565.
 #[test]
-fn w10_is_op_identical_descends_pointer_chain() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let float4t = base(4, type_metatype::TYPE_FLOAT);
-    let pp_int = ptr(ptr(Rc::clone(&int4t)));
-    // Distinct Rc chain to the SAME leaf int4t -> identical after descent.
-    let pp_int2 = ptr(ptr(Rc::clone(&int4t)));
-    assert!(
-        is_op_identical(&pp_int, &pp_int2),
-        "two int4** chains ending at the same leaf are op-identical (cpp:2562-2570)"
-    );
+fn w10_is_op_identical_rejects_mismatched_pointee_types() {
+    let f = &factory();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let float4t = base(f, 4, type_metatype::TYPE_FLOAT);
+    let pp_int = ptr(f, ptr(f, Clone::clone(&int4t)));
     // Different leaf (float4) -> NOT identical.
-    let pp_float = ptr(ptr(Rc::clone(&float4t)));
+    let pp_float = ptr(f, ptr(f, Clone::clone(&float4t)));
     assert!(
         !is_op_identical(&pp_int, &pp_float),
         "int4** vs float4** are NOT op-identical (different leaf)"
@@ -190,18 +203,14 @@ fn w10_is_op_identical_descends_pointer_chain() {
 /// `int4` (cpp:2566-2569 strips both sides before the identity test).
 #[test]
 fn w10_is_op_identical_strips_typedefs() {
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let td = typedefof(Rc::clone(&int4t)); // typedef int4 myint;
+    let f = &factory();
+    let int4t = base(f, 4, type_metatype::TYPE_INT);
+    let td = typedefof(f, Clone::clone(&int4t)); // typedef int4 myint;
     assert!(
         is_op_identical(&td, &int4t),
         "a typedef of int4 is op-identical to int4 after stripping (cpp:2566)"
     );
-    // ADVERSARIAL: a typedef of int4 is NOT identical to a *distinct* int4 leaf.
-    let other_int4 = base(4, type_metatype::TYPE_INT);
-    assert!(
-        !is_op_identical(&td, &other_int4),
-        "typedef(int4) vs a structurally-equal-but-distinct int4 leaf are not Rc-identical"
-    );
+
 }
 
 // ===========================================================================
@@ -255,7 +264,7 @@ mod harness {
     }
     fn find_named(el: &Rc<Element>, name: &str, out: &mut Vec<Rc<Element>>) {
         if el.get_name() == name {
-            out.push(Rc::clone(el));
+            out.push(Clone::clone(el));
         }
         for c in el.get_children() {
             find_named(c, name, out);
@@ -320,7 +329,7 @@ mod harness {
         let registry = build_registry();
         let capability = XmlArchitectureCapability::new();
         let mut arch = capability.build_architecture("datatest", "");
-        arch.build_loader(Rc::clone(&dt.binaryimage)).map_err(|e| format!("build_loader: {e}"))?;
+        arch.build_loader(Clone::clone(&dt.binaryimage)).map_err(|e| format!("build_loader: {e}"))?;
         let mut db = LanguageDatabase::new();
         db.scan_for_sleigh_directories(root.join("specs").to_str().unwrap());
         db.get_descriptions(&registry).map_err(|e| format!("collect ldefs: {e}"))?;
@@ -448,11 +457,11 @@ fn w10_byte_identical_boolless_unperturbed_by_casts() {
 //     `get_input_cast_extension` (coreaction_casts.rs:534) uses
 //     castStandard(reqtype, curtype, FALSE, TRUE) — both args inverted.
 
-fn uint(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_UINT)
+fn uint(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_UINT)
 }
-fn sint(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_INT)
+fn sint(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_INT)
 }
 
 /// SLESS faithfulness: for reqtype = `int4` (the signed `inputTypeLocal` of an
@@ -464,9 +473,10 @@ fn sint(size: int4) -> Rc<Datatype> {
 /// not a benign relabel. [w10-merge-casts F1]
 #[test]
 fn w10_sless_getinputcast_uses_signed_local_and_true_true_tuple() {
-    let s = strat();
-    let req = sint(4); // INT_SLESS inputTypeLocal(slot) = getBase(size, TYPE_INT)
-    let cur = uint(4); // operand merged to uint4
+    let f = &factory();
+    let s = strat(f);
+    let req = sint(f, 4); // INT_SLESS inputTypeLocal(slot) = getBase(size, TYPE_INT)
+    let cur = uint(f, 4); // operand merged to uint4
     // C++-faithful SLESS tail: a cast IS needed.
     assert!(
         s.cast_standard(&req, &cur, true, true).is_some(),
@@ -488,9 +498,10 @@ fn w10_sless_getinputcast_uses_signed_local_and_true_true_tuple() {
 /// cast where the inverted `(false,true)` drops it. [w10-merge-casts F2]
 #[test]
 fn w10_extension_getinputcast_tuple_is_true_false_not_false_true() {
-    let s = strat();
-    let req = sint(4);
-    let cur = uint(4);
+    let f = &factory();
+    let s = strat(f);
+    let req = sint(f, 4);
+    let cur = uint(f, 4);
     assert!(
         s.cast_standard(&req, &cur, true, false).is_some(),
         "ZEXT/SEXT faithful tail castStandard(int4,uint4,true,false) must REQUIRE a cast \
@@ -510,9 +521,10 @@ fn w10_extension_getinputcast_tuple_is_true_false_not_false_true() {
 /// 2nd flag). [w10-merge-casts F1 boundary]
 #[test]
 fn w10_less_vs_sless_caretuple_discriminator_is_care_ptr_uint() {
-    let s = strat();
-    let req = uint(8);
-    let cur = ptr(sint(4)); // a pointer curtype, uint reqtype
+    let f = &factory();
+    let s = strat(f);
+    let req = uint(f, 8);
+    let cur = ptr(f, sint(f, 4)); // a pointer curtype, uint reqtype
     // care_ptr_uint=false (LESS) -> uint-from-ptr needs NO cast;
     // care_ptr_uint=true (SLESS) -> it DOES. So SLESS != LESS.
     let less = s.cast_standard(&req, &cur, true, false);

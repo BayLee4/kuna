@@ -93,7 +93,7 @@ fn body_at_entry(prog: &mut ConsoleProgram, name: &str) -> String {
         entry,
         declared,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the function decompiles");
     kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)
@@ -165,7 +165,7 @@ fn a_declared_end_a_branch_targets_clips_instead_of_aborting() {
         addr,
         (BRANCH_END - BRANCH_ENTRY) as i32,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the clipped function decompiles");
     let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);
@@ -194,7 +194,7 @@ fn declaring_the_derived_extent_reproduces_the_undeclared_body() {
     let Some(mut prog) = load() else { return };
     let addr = code_addr(&prog, LEAF_ENTRY);
     let seed = DecompileSeed::plain(&[], &[]);
-    let natural = decompile_one(prog.arch_mut(), "sub_1129", addr.clone(), 0, &seed, &[])
+    let natural = decompile_one(prog.arch_mut(), "sub_1129", addr.clone(), 0, &seed, &kuna_decomp::overrides::Override::new())
         .result
         .expect("the undeclared function decompiles");
     let undeclared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &natural);
@@ -205,7 +205,7 @@ fn declaring_the_derived_extent_reproduces_the_undeclared_body() {
 
     let size = (LEAF_END - LEAF_ENTRY) as i32;
     prog.declare_function(addr.clone(), None, size).expect("the declaration is accepted");
-    let bounded = decompile_one(prog.arch_mut(), "sub_1129", addr, size, &seed, &[])
+    let bounded = decompile_one(prog.arch_mut(), "sub_1129", addr, size, &seed, &kuna_decomp::overrides::Override::new())
         .result
         .expect("the declared function decompiles");
     let declared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &bounded);
@@ -368,7 +368,7 @@ fn a_pcode_free_branch_resolves_at_a_discovered_funcbound_cutoff() {
         addr,
         0,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the funcboundflow-clipped callback decompiles");
     let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);

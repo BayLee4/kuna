@@ -73,10 +73,9 @@
 //! without touching anything here.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::types::uint4;
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeRoot, TypeFactory};
 use kuna_decomp::fspec::PrototypePieces;
 
 use super::kuna_typedepth::TypeWalk;
@@ -224,11 +223,12 @@ const MAX_SCOPE_DEPTH: u32 = 32;
 
 /// Build [`PrototypePieces`] for a resolved subprogram.
 ///
-/// Unlike the name-only builder this NEVER drops the whole prototype for one
-/// unmappable parameter: a type the DIE switch cannot build degrades to an
+/// A type the DIE switch cannot build degrades to an
 /// `undefined<n>` of the DIE's own byte size ([`degrade_datatype`]), so a single
 /// exotic member type costs that one parameter's type rather than the function's
-/// entire signature — names and every other type survive.
+/// entire signature. A mapped declaration without a required by-value layout,
+/// however, cannot be assigned ABI storage: omit that imported prototype and
+/// leave native recovery in place, just as the name-only builder does.
 pub(super) fn build_pieces(
     res: &ResolvedSub,
     dies: &BTreeMap<usize, DieSnap>,
@@ -236,7 +236,10 @@ pub(super) fn build_pieces(
     word_size: uint4,
 ) -> Option<PrototypePieces> {
     let mut walk = TypeWalk::new();
-    let outtype = build_datatype(res.type_ref, dies, types, word_size, &mut walk, true);
+    let outtype = build_datatype(res.type_ref, dies, types, word_size, &mut walk, true)?;
+    if !outtype.read().layout_ready(outtype.id()).ok()? {
+        return None;
+    }
 
     let mut intypes = Vec::with_capacity(res.params.len());
     let mut innames = Vec::with_capacity(res.params.len());
@@ -245,6 +248,9 @@ pub(super) fn build_pieces(
         let origin = p.origin_ref.and_then(|o| dies.get(&o));
         let type_ref = p.type_ref.or_else(|| origin.and_then(|o| o.type_ref));
         let ty = build_param_type(type_ref, dies, types, word_size, &mut walk)?;
+        if !ty.read().layout_ready(ty.id()).ok()? {
+            return None;
+        }
         let name = if p.name.is_empty() {
             origin.map(|o| o.name.clone()).unwrap_or_default()
         } else {
@@ -256,7 +262,7 @@ pub(super) fn build_pieces(
 
     Some(PrototypePieces {
         name: res.name.clone(),
-        outtype,
+        outtype: Some(outtype),
         intypes,
         innames,
         first_var_arg_slot: res.first_var_arg_slot,
@@ -265,26 +271,19 @@ pub(super) fn build_pieces(
     })
 }
 
-/// Map one parameter's type, degrading rather than failing.
-///
-/// Two things force the degrade. A tag the switch cannot map at all is the
-/// obvious one. The subtler one is an **aggregate passed by VALUE**: a
-/// `DW_TAG_class_type`/`structure_type` maps to a NAMED OPAQUE type of size 0
-/// (fields are the sibling increment), and handing storage assignment a
-/// zero-width by-value parameter is not merely imprecise — it walked off the end
-/// of the parameter storage model and failed `std::vector<int>
-/// ::_M_realloc_insert` outright. Any built type of non-positive size is
-/// therefore replaced by an `undefined<n>` at the DIE's own `DW_AT_byte_size`.
+/// Map one parameter's type, retaining the existing scalar degradation only for
+/// tags the mapper cannot build. A mapped opaque aggregate remains opaque so
+/// the prototype builder can reject its unavailable by-value layout.
 fn build_param_type(
     off: Option<usize>,
     dies: &BTreeMap<usize, DieSnap>,
     types: &dyn TypeFactory,
     word_size: uint4,
     walk: &mut TypeWalk,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     match build_datatype(off, dies, types, word_size, walk, true) {
-        Some(t) if t.get_size() > 0 => Some(t),
-        _ => degrade_datatype(off, dies, types),
+        Some(t) => Some(t),
+        None => degrade_datatype(off, dies, types),
     }
 }
 
@@ -301,10 +300,10 @@ fn degrade_datatype(
     off: Option<usize>,
     dies: &BTreeMap<usize, DieSnap>,
     types: &dyn TypeFactory,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let size = off
         .and_then(|o| dies.get(&o))
-        .map(|d| super::strip_qualifiers(d, dies).0)
+        .map(|d| super::strip_qualifiers(d, dies))
         .and_then(|d| d.byte_size)
         .filter(|&b| matches!(b, 1 | 2 | 4 | 8))
         .map(|b| b as i32)

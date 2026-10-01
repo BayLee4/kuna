@@ -15,14 +15,16 @@
 //! [`DynamicHash::unique_hash`] cycles methods until the hash is unique among
 //! same-address Varnodes.
 //!
-//! ## The hash computation is output-determining — transcribed exactly
+//! ## The hash computation is output-determining
 //!
 //! These 64-bit hashes are *persisted* in the symbol table for dynamic
 //! symbols, so every bit — the [`TRANSTABLE`] op-code lumping, the CRC fold
 //! order, the [`ToOpEdge`] sort (PcodeOp address, then order, then slot), the
 //! field packing in [`DynamicHash::piece_together_hash`], and the
-//! collision-resolution iteration in `unique_hash` — must match upstream
-//! byte-for-byte.  `uintb`→`u64`, `uint4`→`u32`, `int4`→`i32`; all arithmetic
+//! collision descriptor — must remain compatible with the host's finder.
+//! Collision selection retains the descriptor of the winning neighborhood,
+//! rather than mixing it with a later method's hash. `uintb`→`u64`,
+//! `uint4`→`u32`, `int4`→`i32`; all arithmetic
 //! that the C++ leaves to natural wrap is `wrapping_*`; the slot/method/opcode
 //! bit fields use exactly the C++ masks.
 //!
@@ -677,8 +679,8 @@ impl DynamicHash {
     /// (8 off / 16 on) at the call site.
     pub fn unique_hash(&mut self, root: VarnodeId, maxduplicates: uint4, data: &mut Funcdata) {
         let mut champion: Vec<VarnodeId> = Vec::new();
-        let mut tmphash: uint8 = 0;
-        let mut tmpaddr: Address = Address::default();
+        let mut champion_hash: uint8 = 0;
+        let mut champion_addr: Address = Address::default();
 
         let mut method: uint4 = 0;
         while method < 4 {
@@ -687,8 +689,8 @@ impl DynamicHash {
             if self.hash == 0 {
                 return; // Can't get a good hash
             }
-            tmphash = self.hash;
-            tmpaddr = self.addrresult.clone();
+            let tmphash = self.hash;
+            let tmpaddr = self.addrresult.clone();
             let mut vnlist: Vec<VarnodeId> = Vec::new();
             let mut vnlist2: Vec<VarnodeId> = Vec::new();
             Self::gather_first_level_vars(&mut vnlist, data, &tmpaddr, tmphash);
@@ -707,6 +709,11 @@ impl DynamicHash {
                 && (champion.is_empty() || vnlist2.len() < champion.len())
             {
                 champion = vnlist2;
+                // The neighborhoods are not nested: a later method can have
+                // more collisions. Keep the descriptor and anchor belonging to
+                // this winning list, not those of the last method attempted.
+                champion_hash = tmphash;
+                champion_addr = tmpaddr;
                 if champion.len() == 1 {
                     break; // Current hash is unique
                 }
@@ -731,17 +738,17 @@ impl DynamicHash {
             self.addrresult = Address::default();
             return;
         }
-        self.hash = tmphash | ((pos as uint8) << 49); // three bits for position
+        self.hash = champion_hash | ((pos as uint8) << 49); // three bits for position
         self.hash |= (total as uint8) << 52; // three bits for total
-        self.addrresult = tmpaddr;
+        self.addrresult = champion_addr;
     }
 
     /// Select unique hash for given PcodeOp and slot (C++ `uniqueHash(const
     /// PcodeOp *,int4,Funcdata *)`, `dynamic.cc:491`).
     pub fn unique_hash_op(&mut self, op: OpId, slot: int4, maxduplicates: uint4, data: &mut Funcdata) {
         let mut champion: Vec<OpId> = Vec::new();
-        let mut tmphash: uint8 = 0;
-        let mut tmpaddr: Address = Address::default();
+        let mut champion_hash: uint8 = 0;
+        let mut champion_addr: Address = Address::default();
         // (kuna) GH-8467: see unique_hash above -- same wider budget, passed in.
 
         let (op_opt, slot) = Self::move_off_skip(op, slot, data);
@@ -763,17 +770,10 @@ impl DynamicHash {
             if self.hash == 0 {
                 return; // Can't get a good hash
             }
-            tmphash = self.hash;
-            tmpaddr = self.addrresult.clone();
-            // Upstream quirk, transcribed as-is (`dynamic.cc:519`):
-            // `oplist` was filled by gatherOpsAtAddress BEFORE the method loop,
-            // but the loop body re-runs `oplist.clear()` every iteration, so the
-            // inner `for(i<oplist.size())` always iterates over the *cleared*
-            // container -- the collision scan never executes.  Transcribed as-is
-            // (C++ is spec); the net effect is `champion` stays empty and the op
-            // form of uniqueHash returns hash==0.  (`oplist2` is fresh per
-            // iteration here, matching the C++ `.clear()` at loop top.)
-            oplist.clear();
+            let tmphash = self.hash;
+            let tmpaddr = self.addrresult.clone();
+            // Every method examines the same live operations at this address.
+            // Only its matching-candidate list is rebuilt for the new method.
             let mut oplist2: Vec<OpId> = Vec::new();
             for tmpop in oplist.iter().copied() {
                 if slot >= data.obank().get(tmpop).expect("uniqueHashOp: tmpop").num_input() {
@@ -792,6 +792,8 @@ impl DynamicHash {
                 && (champion.is_empty() || oplist2.len() < champion.len())
             {
                 champion = oplist2;
+                champion_hash = tmphash;
+                champion_addr = tmpaddr;
                 if champion.len() == 1 {
                     break; // Current hash is unique
                 }
@@ -816,9 +818,9 @@ impl DynamicHash {
             self.addrresult = Address::default();
             return;
         }
-        self.hash = tmphash | ((pos as uint8) << 49);
+        self.hash = champion_hash | ((pos as uint8) << 49);
         self.hash |= (total as uint8) << 52;
-        self.addrresult = tmpaddr;
+        self.addrresult = champion_addr;
     }
 
     /// Get the (current) hash (C++ `getHash`).

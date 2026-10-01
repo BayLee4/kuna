@@ -53,6 +53,10 @@
 
 use kuna_base::types::int4;
 
+pub(crate) fn is_builtin_type_name(name: &str) -> bool {
+    matches!(name, "char" | "bool" | "short" | "int" | "long" | "float" | "double" | "wchar_t")
+}
+
 /// The target's C scalar widths, snapshotted from the type factory's decoded
 /// `<data_organization>`. Copied rather than borrowed so the rendering context
 /// stays `Copy` and threads cheaply through the declarator chokepoints.

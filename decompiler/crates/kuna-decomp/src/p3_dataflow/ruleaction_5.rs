@@ -13,9 +13,8 @@
 //!
 //! Each rule keeps its exact upstream `name()` string (`Rule(g,0,"<name>")`),
 //! the exact `getOpList` contents, and an `applyOp` body transcribed
-//! statement-for-statement.  Each rule carries its *group* string (the C++
-//! `getGroup()`), so `clone_rule` filters with `grouplist.contains(group)`
-//! exactly as the C++ `clone` does — the first six register in `"analysis"`,
+//! statement-for-statement. Registration owns group filtering: the first six
+//! register in `"analysis"`,
 //! the last three in `"typerecovery"` (see `coreaction.cc::universalAction`).
 //! [`specs`] lists the rules in C++ definition order with their groups for the
 //! W8 `universalAction` assembly.
@@ -54,7 +53,7 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8};
 use kuna_num::opcodes::{get_booleanflip, OpCode};
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -101,11 +100,8 @@ impl Rule for RuleBoolNegate {
         vec![OpCode::CPUI_BOOL_NEGATE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleBoolNegate { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBoolNegate { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -172,11 +168,8 @@ impl Rule for RuleLess2Zero {
         vec![OpCode::CPUI_INT_LESS]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleLess2Zero { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLess2Zero { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -247,11 +240,8 @@ impl Rule for RuleLessEqual2Zero {
         vec![OpCode::CPUI_INT_LESSEQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleLessEqual2Zero { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLessEqual2Zero { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -354,11 +344,8 @@ impl Rule for RuleSLess2Zero {
         vec![OpCode::CPUI_INT_SLESS]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSLess2Zero { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSLess2Zero { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -590,11 +577,8 @@ impl Rule for RuleEqual2Zero {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleEqual2Zero { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleEqual2Zero { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -693,8 +677,10 @@ impl Rule for RuleEqual2Zero {
         if !data.vbank().get(unnegvn).unwrap().is_heritage_known() {
             return 0;
         }
+        let receipt = crate::p4_calls::kuna_branchreachability::begin_equal_zero(data, op, posvn, unnegvn);
         data.op_set_input(op, posvn, 0).expect("RuleEqual2Zero: opSetInput");
         data.op_set_input(op, unnegvn, 1).expect("RuleEqual2Zero: opSetInput");
+        crate::p4_calls::kuna_branchreachability::finish(data, receipt);
         1
     }
 }
@@ -726,11 +712,8 @@ impl Rule for RuleEqual2Constant {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleEqual2Constant { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleEqual2Constant { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -838,11 +821,8 @@ impl Rule for RulePtrArith {
         vec![OpCode::CPUI_INT_ADD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RulePtrArith { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePtrArith { group: self.group })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1045,11 +1025,8 @@ impl Rule for RuleStructOffset0 {
         vec![OpCode::CPUI_LOAD, OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RuleStructOffset0 { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleStructOffset0 { group: self.group })
     }
 
     // The nested `if size==movesize { if numElements!=1 {...} }` mirrors the C++
@@ -1122,7 +1099,7 @@ impl Rule for RuleStructOffset0 {
             let sub_offset = newoff_addr.wrapping_neg() & calc_mask(ptr_size);
             let off_const = data.new_constant(ptr_size, sub_offset);
             let newop = data.new_op_before(op, OpCode::CPUI_PTRSUB, ptr_vn, off_const, None);
-            let ptr_ty = Rc::clone(data.vbank().get(ptr_vn).expect("RuleStructOffset0: stale ptrVn").get_type());
+            let ptr_ty = data.vbank().get(ptr_vn).expect("RuleStructOffset0: stale ptrVn").get_type().clone();
             if ptr_ty.needs_resolution() {
                 data.inherit_union_field(&ptr_ty, newop, 0, op, 1);
             }
@@ -1173,7 +1150,7 @@ impl Rule for RuleStructOffset0 {
         }
         let zero = data.new_constant(ptr_size, 0);
         let newop = data.new_op_before(op, OpCode::CPUI_PTRSUB, ptr_vn, zero, None);
-        let ptr_ty = Rc::clone(data.vbank().get(ptr_vn).expect("RuleStructOffset0: stale ptrVn").get_type());
+        let ptr_ty = data.vbank().get(ptr_vn).expect("RuleStructOffset0: stale ptrVn").get_type().clone();
         if ptr_ty.needs_resolution() {
             data.inherit_union_field(&ptr_ty, newop, 0, op, 1);
         }
@@ -1218,11 +1195,8 @@ impl Rule for RulePushPtr {
         vec![OpCode::CPUI_INT_ADD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(self.group) {
-            return None;
-        }
-        Some(Box::new(RulePushPtr { group: self.group }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePushPtr { group: self.group })
     }
 
     // The pointer-push loops re-read the front of a descend list the body rewires
@@ -1414,8 +1388,8 @@ fn duplicate_need(data: &mut Funcdata, op: OpId) {
 /// The `group` strings are the ones the rules are constructed with in
 /// `coreaction.cc::universalAction`: the first six are `"analysis"`, the last
 /// three (the pointer-arithmetic rules) are `"typerecovery"`.  Each spec's
-/// `ctor` builds the rule with that same group so its `clone_rule` filters
-/// correctly.
+/// `ctor` preserves the rule's construction state; registration metadata owns
+/// filtering when the pool is cloned.
 ///
 /// NOTE: definition order (this file's order) is preserved here; the *exact*
 /// registration order within `universalAction` (where `RuleBoolNegate`
@@ -1424,18 +1398,19 @@ fn duplicate_need(data: &mut Funcdata, op: OpId) {
 /// these named, grouped specs.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleBoolNegate::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleLess2Zero::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleLessEqual2Zero::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSLess2Zero::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleEqual2Zero::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleEqual2Constant::new("analysis")) },
-        RuleSpec { group: "typerecovery", ctor: || Box::new(RulePtrArith::new("typerecovery")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleBoolNegate::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleLess2Zero::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleLessEqual2Zero::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSLess2Zero::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleEqual2Zero::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleEqual2Constant::new("analysis")) },
+        RuleSpec { group: "typerecovery", aliases: &[], ctor: || Box::new(RulePtrArith::new("typerecovery")) },
         RuleSpec {
             group: "typerecovery",
+            aliases: &[],
             ctor: || Box::new(RuleStructOffset0::new("typerecovery")),
         },
-        RuleSpec { group: "typerecovery", ctor: || Box::new(RulePushPtr::new("typerecovery")) },
+        RuleSpec { group: "typerecovery", aliases: &[], ctor: || Box::new(RulePushPtr::new("typerecovery")) },
     ]
 }
 

@@ -166,8 +166,7 @@ fn assert_all_decompiled(r: &Run, targets: &[&str], what: &str) {
         .collect();
     assert!(
         failed.is_empty(),
-        "{what}: {} of {} functions came back with an EMPTY decompileAt payload, \
-         which Ghidra reports as `Expecting <doc> but did not scan an element`: {failed:?}",
+        "{what}: {} of {} functions returned no decompile document: {failed:?}",
         failed.len(),
         targets.len()
     );
@@ -273,8 +272,7 @@ fn aarch64_issues_no_inject_query() {
 }
 
 /// The host throwing (an unregistered payload name) must NOT come back as a
-/// Java exception: that would abort the whole decompileAt command as a
-/// `DecompileException` instead of the clean incomplete-function shape.
+/// Java exception: it must use the native low-level diagnostic path instead.
 /// Upstream catches it for exactly this reason (inject_ghidra.cc:58-59).
 #[test]
 fn a_thrown_inject_stays_a_low_level_error() {
@@ -291,10 +289,11 @@ fn a_thrown_inject_stays_a_low_level_error() {
         return;
     };
     assert_eq!(r.results[0].0, 0, "main should not have decompiled");
+    assert!(r.trace.responses[2].payload.is_none());
     assert!(
         r.trace.responses[2]
             .warnings
-            .contains("Injection error: No p-code injection with name: setISAMode"),
+            .contains("Low-level Error: Injection error: No p-code injection with name: setISAMode"),
         "main's warning did not carry the host's exception message: {}",
         r.trace.responses[2].warnings
     );
@@ -323,10 +322,11 @@ fn an_empty_inject_response_fails_only_that_function() {
         return;
     };
     assert_eq!(r.results[0].0, 0, "main should not have decompiled");
+    assert!(r.trace.responses[2].payload.is_none());
     assert!(
         r.trace.responses[2]
             .warnings
-            .contains("Could not retrieve injection: setISAMode"),
+            .contains("Low-level Error: Could not retrieve injection: setISAMode"),
         "main's warning did not name the unanswered injection: {}",
         r.trace.responses[2].warnings
     );

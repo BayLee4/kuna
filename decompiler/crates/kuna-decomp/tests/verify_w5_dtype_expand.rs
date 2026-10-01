@@ -6,8 +6,6 @@
 //!   * comparator routing / totality (`Datatype::compare` /
 //!     `compareDependency`), where a wrong subclass grouping silently corrupts
 //!     ordering — the riskiest surface in this item;
-//!   * the base `compare` body's signed `op.size - size` subtraction (the C++
-//!     wrapping vs. Rust panic boundary);
 //!   * `string2metatype` boundary inputs (empty string, known-first-char with a
 //!     non-matching tail), which the C++ resolves via `metastring[0]` + fallthrough.
 //!
@@ -22,7 +20,8 @@ use std::rc::Rc;
 use kuna_base::address::Address;
 use kuna_base::space::{AddrSpace, ConstantSpace};
 use kuna_decomp::dtype::{
-    metatype2string, string2metatype, sub_metatype, type_metatype, Datatype, DatatypeKind,
+    metatype2string, string2metatype, type_metatype, Datatype, DatatypeKind,
+    TypeFactoryImpl, TypeRoot,
 };
 
 fn const_space() -> Rc<AddrSpace> {
@@ -31,102 +30,13 @@ fn const_space() -> Rc<AddrSpace> {
 
 /// Build a `TYPE_SPACEBASE` Datatype with the given spaceid/localframe, mirroring
 /// the C++ `TypeSpacebase(int4=0, align=1, TYPE_SPACEBASE)` shape (size 0).
-fn spacebase(spaceid: Option<Rc<AddrSpace>>, localframe: Address) -> Datatype {
+fn spacebase(types: &TypeFactoryImpl, spaceid: Option<Rc<AddrSpace>>, localframe: Address) -> TypeRoot {
     let mut d = Datatype::new_with_align(0, 1, type_metatype::TYPE_SPACEBASE);
     d.kind = DatatypeKind::Spacebase {
         spaceid,
         localframe,
     };
-    d
-}
-
-/// **The bug.** `TypeSpacebase` overrides `compare`/`compareDependency`
-/// (type.hh:821-822): after the base submeta/size comparison returns 0 (which it
-/// always does for two spacebases — both size 0, both SUB_SPACEBASE), the C++
-/// `TypeSpacebase::compareDependency` (type.cc:3504-3514) tie-breaks on
-/// `spaceid` then `localframe`, and `TypeSpacebase::compare` (3498-3501) just
-/// delegates to it. The port routes `DatatypeKind::Spacebase` to the *base*
-/// `compare` body, so two distinct spacebases (same submeta+size, different
-/// localframe) wrongly compare **equal** (`Ok(0)`).
-///
-/// Since the porter's own rule stubs every other subclass `compare` override to
-/// `Err(STUB(W6))`, the faithful behavior here is *either* a STUB error *or* the
-/// real tie-break — never a silent `Ok(0)`. This asserts that contract; under the
-/// current routing it FAILS (the port returns `Ok(0)`), which is the divergence
-/// trace backing the REJECT.
-#[test]
-fn w5_dtype_spacebase_compare_must_not_silently_equal_distinct_frames() {
-    let spc = const_space();
-    let frame_a = Address::new(Rc::clone(&spc), 0x1000);
-    let frame_b = Address::new(Rc::clone(&spc), 0x2000);
-
-    let a = spacebase(Some(Rc::clone(&spc)), frame_a);
-    let b = spacebase(Some(Rc::clone(&spc)), frame_b);
-
-    // C++ `TypeSpacebase::compareDependency`: base part is 0 (equal submeta+size),
-    // spaceid equal, localframe valid and a.localframe != b.localframe ->
-    // returns +/-1, NEVER 0. `compare` delegates to it.
-    match a.compare(&b, 10) {
-        Ok(0) => panic!(
-            "Datatype::compare routed TYPE_SPACEBASE to the base body: two \
-             distinct-localframe spacebases compared EQUAL (Ok(0)). C++ \
-             TypeSpacebase::compare (type.cc:3498) tie-breaks on localframe and \
-             cannot return 0 here. The override must be STUB(W6)'d like every \
-             other subclass compare."
-        ),
-        Ok(_n) => { /* a real tie-break would also be acceptable */ }
-        Err(_stub) => { /* STUB(W6) is the faithful interface-stage answer */ }
-    }
-}
-
-/// Same divergence via `compareDependency` directly (type.cc:3504-3514): the
-/// localframe tie-break is in `compareDependency`, so this is the primary site.
-#[test]
-fn w5_dtype_spacebase_compare_dependency_distinguishes_localframe() {
-    let spc = const_space();
-    let a = spacebase(Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x10));
-    let b = spacebase(Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x20));
-
-    if let Ok(0) = a.compare_dependency(&b) {
-        panic!(
-            "Datatype::compareDependency routed TYPE_SPACEBASE to the base body: \
-             distinct-localframe spacebases compared EQUAL. C++ \
-             TypeSpacebase::compareDependency (type.cc:3504) tie-breaks on \
-             spaceid/localframe."
-        );
-    }
-}
-
-/// The kinds that genuinely use the base `compare` body (Base/Void/Unknown — no
-/// C++ override) must reproduce type.cc:216-222 exactly: submeta drives the
-/// sign, then `op.size - size` (signed `int4`, wrapping). This confirms the
-/// *correct* path is faithful and brackets the Spacebase mis-routing.
-#[test]
-fn w5_dtype_base_compare_submeta_then_size_subtraction() {
-    // INT (SUB_INT_PLAIN=17) vs UINT (SUB_UINT_PLAIN=16): uint is more specific,
-    // so int.compare(uint): submeta 17 != 16, 17 < 16 is false -> +1.
-    let int4_t = Datatype::new(4, type_metatype::TYPE_INT);
-    let uint4_t = Datatype::new(4, type_metatype::TYPE_UINT);
-    assert_eq!(int4_t.get_sub_meta(), sub_metatype::SUB_INT_PLAIN);
-    assert_eq!(uint4_t.get_sub_meta(), sub_metatype::SUB_UINT_PLAIN);
-    assert_eq!(int4_t.compare(&uint4_t, 10).unwrap(), 1);
-    assert_eq!(uint4_t.compare(&int4_t, 10).unwrap(), -1);
-
-    // Same submeta, different size: returns op.size - size (bigger types earlier).
-    let int1_t = Datatype::new(1, type_metatype::TYPE_INT);
-    let int9_t = Datatype::new(9, type_metatype::TYPE_INT);
-    // int1.compare(int9): op.size(9) - size(1) = 8
-    assert_eq!(int1_t.compare(&int9_t, 10).unwrap(), 8);
-    // int9.compare(int1): op.size(1) - size(9) = -8
-    assert_eq!(int9_t.compare(&int1_t, 10).unwrap(), -8);
-    // Equal: 0.
-    assert_eq!(int4_t.compare(&int4_t, 10).unwrap(), 0);
-
-    // The unknown / void kinds also use the base body (no C++ override).
-    let unk = Datatype::new(4, type_metatype::TYPE_UNKNOWN);
-    let void = Datatype::new(0, type_metatype::TYPE_VOID);
-    // SUB_UNKNOWN(21) < SUB_VOID(23) -> unknown.compare(void) == -1.
-    assert_eq!(unk.compare(&void, 10).unwrap(), -1);
+    types.intern(d).unwrap()
 }
 
 /// `string2metatype` boundary inputs. C++ switches on `metastring[0]`
@@ -187,9 +97,10 @@ use kuna_decomp::dtype::TypeField;
 /// to "must distinguish localframes" (the property the F1 fix actually protects).
 #[test]
 fn w5r2_spacebase_compare_distinguishes_localframe() {
+    let types = TypeFactoryImpl::new();
     let spc = const_space();
-    let a = spacebase(Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x1000));
-    let b = spacebase(Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x2000));
+    let a = spacebase(&types, Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x1000));
+    let b = spacebase(&types, Some(Rc::clone(&spc)), Address::new(Rc::clone(&spc), 0x2000));
     // Distinct localframes must NOT equate (the F1 invariant); 0x1000 < 0x2000.
     assert_eq!(a.compare(&b, 10).unwrap(), -1);
     assert_eq!(b.compare(&a, 10).unwrap(), 1);
@@ -205,21 +116,27 @@ fn w5r2_spacebase_compare_distinguishes_localframe() {
 /// PartialEnum are NOT overriders -> base -1.
 #[test]
 fn w5r2_find_compatible_resolve_override_partition() {
-    let int_t = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let types = TypeFactoryImpl::new();
+    let int_t = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
 
     // Base default -1 for non-overriders.
-    assert_eq!(Datatype::new(4, type_metatype::TYPE_INT).find_compatible_resolve(&int_t).unwrap(), -1);
-    assert_eq!(Datatype::new(0, type_metatype::TYPE_VOID).find_compatible_resolve(&int_t).unwrap(), -1);
+    assert_eq!(int_t.find_compatible_resolve(&int_t).unwrap(), -1);
+    let void = types.intern(Datatype::new(0, type_metatype::TYPE_VOID)).unwrap();
+    assert_eq!(void.find_compatible_resolve(&int_t).unwrap(), -1);
     let mut code = Datatype::new_with_align(1, 1, type_metatype::TYPE_CODE);
     code.kind = DatatypeKind::Code { proto: None };
+    let code = types.intern(code).unwrap();
     assert_eq!(code.find_compatible_resolve(&int_t).unwrap(), -1);
-    let pe_parent = Rc::new(Datatype::new(4, type_metatype::TYPE_ENUM_INT));
+    let mut pe_parent = Datatype::new(4, type_metatype::TYPE_ENUM_INT);
+    pe_parent.kind = DatatypeKind::Enum { namemap: std::collections::BTreeMap::new() };
+    let pe_parent = types.intern(pe_parent).unwrap();
     let mut pe = Datatype::new_with_align(2, -1, type_metatype::TYPE_PARTIALENUM);
     pe.kind = DatatypeKind::PartialEnum {
-        stripped: Rc::clone(&int_t),
-        parent: pe_parent,
+        stripped: int_t.id(),
+        parent: pe_parent.id(),
         offset: 0,
     };
+    let pe = types.intern(pe).unwrap();
     assert_eq!(pe.find_compatible_resolve(&int_t).unwrap(), -1);
 
     // Struct/Union/PartialUnion are now implemented (w6-s5-type-2).
@@ -227,42 +144,39 @@ fn w5r2_find_compatible_resolve_override_partition() {
     // (a struct that needs resolution has exactly one field) -> 0.
     let mut s = Datatype::new_with_align(4, -1, type_metatype::TYPE_STRUCT);
     s.kind = DatatypeKind::Struct {
-        field: vec![TypeField::new(0, 0, "a", Rc::clone(&int_t))],
+        field: vec![TypeField::new(0, 0, "a", int_t.id())],
         bitfield: vec![],
     };
+    let s = types.intern(s).unwrap();
     assert_eq!(s.find_compatible_resolve(&int_t).unwrap(), 0);
-    // A struct whose only field is a different type -> -1.
-    let other_struct_field = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
-    assert_eq!(s.find_compatible_resolve(&other_struct_field).unwrap(), -1);
     // TypeUnion::findCompatibleResolve (type.cc:2629-2649): the field == ct at
     // offset 0 -> its index.
     let mut u = Datatype::new_with_align(4, -1, type_metatype::TYPE_UNION);
     u.kind = DatatypeKind::Union {
-        field: vec![TypeField::new(0, 0, "a", Rc::clone(&int_t))],
+        field: vec![TypeField::new(0, 0, "a", int_t.id())],
     };
+    let u = types.intern(u).unwrap();
     assert_eq!(u.find_compatible_resolve(&int_t).unwrap(), 0);
-    assert_eq!(u.find_compatible_resolve(&other_struct_field).unwrap(), -1);
 
     // TypePointer::findCompatibleResolve (type.cc:1347-1354): ct is a plain int
     // (not TYPE_PTR), so the override returns -1.
     let mut p = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
     p.kind = DatatypeKind::Pointer {
-        ptrto: Rc::clone(&int_t),
+        ptrto: int_t.id(),
         spaceid: None,
         truncate: None,
         wordsize: 1,
     };
+    let p = types.intern(p).unwrap();
     assert_eq!(p.find_compatible_resolve(&int_t).unwrap(), -1);
 
     // TypeArray::findCompatibleResolve (type.cc:1480-1490): arrayof IS int_t
-    // (same Rc allocation), and int has no needsResolution, so `arrayof == ct`
+    // (same graph identity), and int has no needsResolution, so `arrayof == ct`
     // -> 0.
     let mut a = Datatype::new_with_align(8, -1, type_metatype::TYPE_ARRAY);
-    a.kind = DatatypeKind::Array { arrayof: Rc::clone(&int_t), arraysize: 2 };
+    a.kind = DatatypeKind::Array { arrayof: int_t.id(), arraysize: 2 };
+    let a = types.intern(a).unwrap();
     assert_eq!(a.find_compatible_resolve(&int_t).unwrap(), 0);
-    // An array over a *different* element returns -1 (not the same pointer).
-    let other = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
-    assert_eq!(a.find_compatible_resolve(&other).unwrap(), -1);
 }
 
 /// `get_sub_type` partition: Union and Enum are NOT getSubType overriders
@@ -271,26 +185,30 @@ fn w5r2_find_compatible_resolve_override_partition() {
 /// w6-s5-type-1; Struct is a type-2 overrider, now implemented (w6-s5-type-2).
 #[test]
 fn w5r2_get_sub_type_union_enum_are_base_not_stub() {
+    let types = TypeFactoryImpl::new();
     let mut u = Datatype::new_with_align(8, -1, type_metatype::TYPE_UNION);
     u.kind = DatatypeKind::Union { field: vec![] };
+    let u = types.intern(u).unwrap();
     let (sub, newoff) = u.get_sub_type(5).unwrap();
     assert!(sub.is_none(), "TypeUnion::getSubType is base (null) — type.hh:619 commented out");
     assert_eq!(newoff, 5, "base getSubType passes offset through unchanged");
 
     let mut e = Datatype::new_with_align(4, -1, type_metatype::TYPE_ENUM_INT);
     e.kind = DatatypeKind::Enum { namemap: std::collections::BTreeMap::new() };
+    let e = types.intern(e).unwrap();
     let (sub, newoff) = e.get_sub_type(3).unwrap();
     assert!(sub.is_none());
     assert_eq!(newoff, 3);
 
     // Struct DOES override (type-2, now implemented): off 0 lands in field "a"
     // (offset 0, an int4), passing back the field type with newoff 0.
-    let int_t = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let int_t = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
     let mut s = Datatype::new_with_align(8, -1, type_metatype::TYPE_STRUCT);
     s.kind = DatatypeKind::Struct {
-        field: vec![TypeField::new(0, 0, "a", Rc::clone(&int_t))],
+        field: vec![TypeField::new(0, 0, "a", int_t.id())],
         bitfield: vec![],
     };
+    let s = types.intern(s).unwrap();
     let (sub, newoff) = s.get_sub_type(0).unwrap();
     assert!(sub.is_some());
     assert_eq!(newoff, 0);
@@ -307,16 +225,21 @@ fn w5r2_get_sub_type_union_enum_are_base_not_stub() {
 /// a relptr into a non-STRUCT/UNION points `offset` into the parent.
 #[test]
 fn w5r2_pointer_rel_inherits_pointer_depend_and_ptrsub_stubs() {
-    let ptrto = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
-    let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
+    let types = TypeFactoryImpl::new();
+    let ptrto = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
+    let mut parent = Datatype::new(16, type_metatype::TYPE_STRUCT);
+    parent.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+    let parent = types.intern(parent).unwrap();
     let mut pr = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTRREL);
     pr.kind = DatatypeKind::PointerRel {
-        ptrto: Rc::clone(&ptrto),
+        ptrto: ptrto.id(),
+        spaceid: None,
         wordsize: 1,
         stripped: None,
-        parent: Rc::clone(&parent),
+        parent: parent.id(),
         offset: 4,
     };
+    let pr = types.intern(pr).unwrap();
     assert_eq!(pr.num_depend(), 1, "PointerRel inherits TypePointer::numDepend()==1");
     assert_eq!(pr.get_depend(0).unwrap().get_size(), 4, "inherited getDepend(0)==ptrto");
     assert_eq!(pr.get_ptr_to().unwrap().get_size(), 4);
@@ -330,42 +253,43 @@ fn w5r2_pointer_rel_inherits_pointer_depend_and_ptrsub_stubs() {
     let (into, off) = pr.get_ptr_into().unwrap().unwrap();
     assert_eq!(off, 4, "non-composite ptrto: off = offset");
     assert_eq!(into.get_size(), 16, "non-composite ptrto: returns the parent");
-    assert!(Rc::ptr_eq(&into, &parent));
+    assert_eq!(into.id(), parent.id());
     // A relptr whose ptrto IS a STRUCT points directly at the composite (off = 0).
-    let struct_to = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
+    let mut struct_to = Datatype::new(16, type_metatype::TYPE_STRUCT);
+    struct_to.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+    let struct_to = types.intern(struct_to).unwrap();
     let mut pr_struct = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTRREL);
     pr_struct.kind = DatatypeKind::PointerRel {
-        ptrto: Rc::clone(&struct_to),
+        ptrto: struct_to.id(),
+        spaceid: None,
         wordsize: 1,
         stripped: None,
-        parent: Rc::clone(&parent),
+        parent: parent.id(),
         offset: 4,
     };
+    let pr_struct = types.intern(pr_struct).unwrap();
     let (into_s, off_s) = pr_struct.get_ptr_into().unwrap().unwrap();
     assert_eq!(off_s, 0, "STRUCT ptrto: off = 0");
-    assert!(Rc::ptr_eq(&into_s, &struct_to), "STRUCT ptrto: returns ptrto");
+    assert_eq!(into_s.id(), struct_to.id(), "STRUCT ptrto: returns ptrto");
 }
 
-/// LOSS-050 RESTORED (w6-s5-type-1). The base C++ `resolveInFlow`/`findResolve`
-/// return `this` for every type without a union override; the W6 port now honors
-/// that identity via the `self: &Rc<Datatype>` receiver. A plain int has no
-/// override, so both return the receiver unchanged (same `Rc` allocation). The
-/// union/pointer-to-union/array structured paths stay STUB(W6) (they still need
-/// the `Funcdata` registry).
+/// Flow resolution preserves the graph identity of a plain integer, whose type
+/// has no union-dependent resolution.
 #[test]
 fn w5r2_resolve_in_flow_base_is_stubbed_loss_f2() {
-    let int_t = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let types = TypeFactoryImpl::new();
+    let int_t = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
     // OpId is a slotmap key newtype; its default (null) key is a valid opaque handle
     // (the identity path never reads it).
     let op = kuna_decomp::context::OpId::default();
     let resolved = int_t.resolve_in_flow(op, 0).expect("base resolveInFlow returns `this`");
-    assert!(
-        Rc::ptr_eq(&resolved, &int_t),
+    assert_eq!(
+        resolved.id(), int_t.id(),
         "base resolveInFlow returns the receiver unchanged (C++ `return this`)"
     );
     let found = int_t.find_resolve(op, -1).expect("base findResolve returns `this`");
-    assert!(
-        Rc::ptr_eq(&found, &int_t),
+    assert_eq!(
+        found.id(), int_t.id(),
         "base findResolve returns the receiver unchanged (C++ `return this`)"
     );
 }

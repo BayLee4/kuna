@@ -204,6 +204,7 @@ use std::time::{Duration, Instant};
 use kuna_console::engine::{EntryProvenance, ObjectLocation};
 use kuna_console::project::FuncResult;
 use kuna_decomp::decompile_drive::{GlobalInfo, LineMapping, TypeInfo, VarInfo};
+use kuna_decomp::kuna_callabletransport::CallableDefinition;
 use kuna_decomp::kuna_structsynth::shard::{self, FunctionRecord, Replay, SynthRequest};
 
 /// Ceiling on an automatically planned chunk, when `--jobs-chunk` is omitted.
@@ -252,7 +253,7 @@ const ACK_PREFIX: &str = "done ";
 const SYNTH_LINE: &str = "synth";
 
 const SPEC_MAGIC: &[u8; 12] = b"KUNAJOBSPEC3";
-const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES04";
+const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES10";
 
 /// Result-stream frame kind.  One kind today; the envelope is what lets a
 /// truncated tail be dropped rather than guessed.
@@ -505,6 +506,10 @@ impl<'a> Reader<'a> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 
+    fn i32(&mut self) -> Option<i32> {
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
     fn i64(&mut self) -> Option<i64> {
         Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
@@ -713,15 +718,40 @@ impl ResultWriter {
             put_str(&mut body, &t.definition);
             body.extend_from_slice(&t.size.to_le_bytes());
         }
-        // (kuna `globalref`) The globals the body names by address, for the
+        // The authenticated named and unnamed globals referenced by the body, for the
         // project header the parent writes.
         put_u32(&mut body, r.globals.len() as u32);
         for g in &r.globals {
+            body.extend_from_slice(&g.space_index.to_le_bytes());
             put_u64(&mut body, g.address);
             put_str(&mut body, &g.name);
             put_str(&mut body, &g.declaration);
             body.extend_from_slice(&g.size.to_le_bytes());
             body.push(u8::from(g.unknown) | u8::from(g.direct) << 1 | u8::from(g.aggregate) << 2);
+        }
+        put_opt_str(&mut body, r.callable_export_error.as_deref());
+        put_u32(&mut body, r.callable_artifacts.len() as u32);
+        for artifact in &r.callable_artifacts {
+            put_str(&mut body, &artifact.key);
+            put_str(&mut body, &artifact.declaration);
+            match &artifact.definition {
+                None => body.push(0),
+                Some(CallableDefinition::Wrapper(code)) => {
+                    body.push(1);
+                    put_str(&mut body, code);
+                }
+                Some(CallableDefinition::ExistingTarget { space, byte_address }) => {
+                    body.push(2);
+                    body.extend_from_slice(&space.to_le_bytes());
+                    put_u64(&mut body, *byte_address);
+                }
+                Some(CallableDefinition::BodyProof { provider }) => {
+                    body.push(3);
+                    put_str(&mut body, provider);
+                }
+            }
+            body.push(u8::from(artifact.required));
+            body.push(u8::from(artifact.deferred));
         }
         put_u64s(&mut body, &r.callee_hints);
         match &r.synth {
@@ -834,12 +864,14 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
     let ng = r.u32()? as usize;
     let mut globals = r.sized(ng);
     for _ in 0..ng {
+        let space_index = r.i32()?;
         let address = r.u64()?;
         let gname = r.string()?;
         let declaration = r.string()?;
         let gsize = r.i64()?;
         let bits = r.u8()?;
         globals.push(GlobalInfo {
+            space_index,
             address,
             name: gname,
             declaration,
@@ -849,6 +881,28 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
             aggregate: bits & 4 != 0,
         });
     }
+    let callable_export_error = r.opt_string()?;
+    let count = r.u32()? as usize;
+    let mut callable_artifacts = r.sized(count);
+    for _ in 0..count {
+        callable_artifacts.push(kuna_decomp::kuna_callabletransport::CallableArtifact {
+            key: r.string()?,
+            declaration: r.string()?,
+            definition: match r.u8()? {
+                0 => None,
+                1 => Some(CallableDefinition::Wrapper(r.string()?)),
+                2 => Some(CallableDefinition::ExistingTarget {
+                    space: r.i32()?,
+                    byte_address: r.u64()?,
+                }),
+                3 => Some(CallableDefinition::BodyProof { provider: r.string()? }),
+                _ => return None,
+            },
+            required: match r.u8()? { 0 => false, 1 => true, _ => return None },
+            deferred: match r.u8()? { 0 => false, 1 => true, _ => return None },
+        });
+    }
+    if callable_artifacts.iter().any(|artifact| artifact.deferred && !artifact.required) { return None; }
     let callee_hints = r.u64s()?;
     let synth = match r.u8()? {
         0 => None,
@@ -875,6 +929,8 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
         object_location,
         callee_hints,
         synth,
+        callable_artifacts,
+        callable_export_error,
         detail: None,
     })
 }
@@ -1264,6 +1320,12 @@ fn rename_result(
     for t in &mut out.types {
         t.name = text(&t.name)?;
         t.definition = text(&t.definition)?;
+    }
+    for artifact in &mut out.callable_artifacts {
+        artifact.declaration = text(&artifact.declaration)?;
+        if let Some(CallableDefinition::Wrapper(code)) = &mut artifact.definition {
+            *code = text(code)?;
+        }
     }
     Some(out)
 }
@@ -2794,6 +2856,8 @@ fn lost_result(t: &TargetSpec, reason: &str) -> FuncResult {
         object_location: t.object_location.clone(),
         callee_hints: Vec::new(),
         synth: None,
+        callable_artifacts: Vec::new(),
+        callable_export_error: None,
         detail: None,
     }
 }
@@ -3297,6 +3361,7 @@ mod tests {
             }],
             // (kuna `globalref`) One global, so the codec's flag byte is exercised.
             globals: vec![GlobalInfo {
+                space_index: 3,
                 address: 0x404010,
                 name: "dat_404010".into(),
                 declaration: "struct_0 dat_404010".into(),
@@ -3314,6 +3379,8 @@ mod tests {
             }),
             callee_hints: vec![0x401200, 0x401340, 0xffff_ffff_ffff_fff0],
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         }
     }
@@ -3386,6 +3453,8 @@ mod tests {
             object_location: None,
             callee_hints: Vec::new(),
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         };
         {
@@ -3815,6 +3884,8 @@ mod tests {
             object_location: None,
             callee_hints: Vec::new(),
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         };
         let results = vec![

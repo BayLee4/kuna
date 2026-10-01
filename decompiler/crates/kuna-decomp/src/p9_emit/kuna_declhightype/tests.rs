@@ -4,25 +4,25 @@
 //! return, an `unsigned long long *` from a pointer computation, and an integer.
 
 use super::*;
-use crate::dtype::{type_metatype, DatatypeKind};
+use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl};
 use slotmap::KeyData;
 
 fn vid(n: u64) -> VarnodeId {
     VarnodeId::from(KeyData::from_ffi(n))
 }
 
-fn ty(size: i32, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn ty(f: &TypeFactoryImpl, size: i32, m: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// `types->getTypePointer(8, elem, 1)` — an 8-byte pointer.
-fn ptr_to(elem: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr_to(f: &TypeFactoryImpl, elem: TypeRoot) -> TypeRoot {
     let mut t = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-    t.kind = DatatypeKind::Pointer { ptrto: elem, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(t)
+    t.kind = DatatypeKind::Pointer { ptrto: elem.id(), spaceid: None, truncate: None, wordsize: 1 };
+    f.intern(t).unwrap()
 }
 
-fn member(n: u64, type_lock: bool, ty: Rc<Datatype>) -> Option<Member> {
+fn member(n: u64, type_lock: bool, ty: TypeRoot) -> Option<Member> {
     Some(Member { vn: vid(n), type_lock, ty })
 }
 
@@ -35,7 +35,9 @@ fn empty_instance_list_has_no_representative() {
 /// A lone member is the representative whatever its type.
 #[test]
 fn lone_member_is_the_representative() {
-    let m = vec![member(3, false, ty(8, type_metatype::TYPE_UINT))];
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let m = vec![member(3, false, ty(f, 8, type_metatype::TYPE_UINT))];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(3)));
 }
 
@@ -44,15 +46,17 @@ fn lone_member_is_the_representative() {
 /// state-machine write-back) declares as the pointer.
 #[test]
 fn a_pointer_beats_an_integer_of_the_same_width() {
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
     let m = vec![
-        member(1, false, ty(8, type_metatype::TYPE_UINT)),
-        member(2, false, ptr_to(ty(1, type_metatype::TYPE_INT))),
+        member(1, false, ty(f, 8, type_metatype::TYPE_UINT)),
+        member(2, false, ptr_to(f, ty(f, 1, type_metatype::TYPE_INT))),
     ];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(2)));
     // and the order of the members does not decide it
     let m = vec![
-        member(2, false, ptr_to(ty(1, type_metatype::TYPE_INT))),
-        member(1, false, ty(8, type_metatype::TYPE_UINT)),
+        member(2, false, ptr_to(f, ty(f, 1, type_metatype::TYPE_INT))),
+        member(1, false, ty(f, 8, type_metatype::TYPE_UINT)),
     ];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(2)));
 }
@@ -61,9 +65,11 @@ fn a_pointer_beats_an_integer_of_the_same_width() {
 /// specialization (C++ `getTypeRepresentative`'s first arm).
 #[test]
 fn a_type_locked_member_outranks_a_more_specialized_unlocked_one() {
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
     let m = vec![
-        member(1, true, ty(8, type_metatype::TYPE_UINT)),
-        member(2, false, ptr_to(ty(1, type_metatype::TYPE_INT))),
+        member(1, true, ty(f, 8, type_metatype::TYPE_UINT)),
+        member(2, false, ptr_to(f, ty(f, 1, type_metatype::TYPE_INT))),
     ];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(1)));
 }
@@ -72,15 +78,19 @@ fn a_type_locked_member_outranks_a_more_specialized_unlocked_one() {
 /// ordering never reshuffles a high whose members agree.
 #[test]
 fn a_tie_keeps_the_earlier_member() {
-    let t = ty(4, type_metatype::TYPE_INT);
-    let m = vec![member(7, false, Rc::clone(&t)), member(9, false, t)];
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let t = ty(f, 4, type_metatype::TYPE_INT);
+    let m = vec![member(7, false, Clone::clone(&t)), member(9, false, t)];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(7)));
 }
 
 /// An unresolvable member is skipped, not treated as a candidate.
 #[test]
 fn an_unresolvable_member_is_skipped() {
-    let m = vec![None, member(5, false, ty(4, type_metatype::TYPE_INT)), None];
+    let f = &TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    let m = vec![None, member(5, false, ty(f, 4, type_metatype::TYPE_INT)), None];
     assert_eq!(pick_representative(m.into_iter()), Some(vid(5)));
 }
 

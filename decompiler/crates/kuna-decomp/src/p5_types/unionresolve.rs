@@ -11,7 +11,7 @@
 //!
 //!   * [`ResolvedUnion`] — the resolved-data-type record (all three C++
 //!     constructors, [`ResolvedUnion::update`], the accessors).  This is a pure
-//!     value type over `Rc<Datatype>` plus the [`TypeFactory`] handle, and is
+//!     value type over `TypeRoot` plus the [`TypeFactory`] handle, and is
 //!     ported faithfully.
 //!   * [`ResolveEdge`] — the data-flow-edge key, **including its load-bearing
 //!     total order** (`operator<`, `unionresolve.hh:212-220`): order by
@@ -57,14 +57,12 @@
 //! and exercised by the synthetic-union scoring-matrix tests; W4/W6/W7 fill the
 //! graph-walk driver in place against the frozen scoring functions here.
 
-use std::rc::Rc;
-
 use kuna_base::address::{Address, bit_transitions};
 use kuna_base::error::{KunaError, KunaResult};
-use kuna_base::types::{int4, int8, uint8, uintb, uintm};
+use kuna_base::types::{int4, int8, uintb, uintm};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{Datatype, TypeFactory, type_metatype};
+use crate::dtype::{TypeRoot, TypeId, TypeFactory, type_metatype};
 
 // =============================================================================
 // ResolvedUnion (unionresolve.hh:39-56, unionresolve.cc:25-98)
@@ -81,10 +79,10 @@ use crate::dtype::{Datatype, TypeFactory, type_metatype};
 #[derive(Debug, Clone)]
 pub struct ResolvedUnion {
     /// The resolved data-type (C++ `resolve`).
-    resolve: Rc<Datatype>,
+    resolve: TypeRoot,
     /// Union or Structure being resolved (pointers and partials stripped)
     /// (C++ `baseType`).
-    base_type: Rc<Datatype>,
+    base_type: TypeRoot,
     /// Index of field referenced by `resolve` (C++ `fieldNum`).
     field_num: int4,
     /// If `true`, resolution cannot be overridden (C++ `lock`).
@@ -98,17 +96,17 @@ impl ResolvedUnion {
     /// The original data-type must be a union, a partial union, a structure with
     /// a single field, an array with a single element, or a pointer to one of
     /// these.  The object is set up to resolve to the parent.
-    pub fn new(unres_type: Rc<Datatype>) -> ResolvedUnion {
+    pub fn new(unres_type: TypeRoot) -> ResolvedUnion {
         let base_type = match unres_type.get_metatype() {
             type_metatype::TYPE_PTR => unres_type
                 .get_ptr_to()
-                .unwrap_or_else(|| Rc::clone(&unres_type)),
+                .unwrap_or_else(|| unres_type.clone()),
             type_metatype::TYPE_PARTIALUNION => unres_type
                 .get_partial_base()
-                .unwrap_or_else(|| Rc::clone(&unres_type)),
-            _ => Rc::clone(&unres_type),
+                .unwrap_or_else(|| unres_type.clone()),
+            _ => unres_type.clone(),
         };
-        ResolvedUnion { resolve: Rc::clone(&unres_type), base_type, field_num: -1, lock: false }
+        ResolvedUnion { resolve: unres_type, base_type, field_num: -1, lock: false }
     }
 
     /// Construct a resolution with a specific field number (C++
@@ -120,14 +118,14 @@ impl ResolvedUnion {
     /// to `unres_type`)
     /// \param typegrp constructs the resolved data-type of the field
     pub fn new_field(
-        unres_type: Rc<Datatype>,
+        unres_type: TypeRoot,
         fld_num: int4,
         typegrp: &dyn TypeFactory,
     ) -> KunaResult<ResolvedUnion> {
-        let mut base_type = Rc::clone(&unres_type);
+        let mut base_type = unres_type.clone();
         let field_num = fld_num;
         let lock = false;
-        let resolve: Rc<Datatype>;
+        let resolve: TypeRoot;
         match unres_type.get_metatype() {
             type_metatype::TYPE_PARTIALUNION => {
                 base_type = unres_type.get_partial_base().ok_or_else(|| {
@@ -138,10 +136,14 @@ impl ResolvedUnion {
                         KunaError::lowlevel("ResolvedUnion: partial union missing stripped")
                     })?;
                 } else {
-                    let field = base_type.get_field(fld_num).ok_or_else(|| {
-                        KunaError::lowlevel("ResolvedUnion: parent union field out of range")
-                    })?;
-                    let field_type = Rc::clone(&field.field_type);
+                    let field_type = {
+                        let view = base_type.read();
+                        let id = view.resolve_alias(base_type.id())?;
+                        let field = view.get_field(id, fld_num)?.ok_or_else(|| {
+                            KunaError::lowlevel("ResolvedUnion: parent union field out of range")
+                        })?;
+                        base_type.related(field.field_type)?
+                    };
                     let offset = unres_type.get_partial_offset().ok_or_else(|| {
                         KunaError::lowlevel("ResolvedUnion: partial union missing offset")
                     })?;
@@ -163,7 +165,7 @@ impl ResolvedUnion {
                     KunaError::lowlevel("ResolvedUnion: pointer missing ptrto")
                 })?;
                 if fld_num < 0 {
-                    resolve = Rc::clone(&unres_type);
+                    resolve = unres_type.clone();
                 } else {
                     let field = base_type.get_depend(fld_num).ok_or_else(|| {
                         KunaError::lowlevel("ResolvedUnion: pointer ptrto field out of range")
@@ -177,7 +179,7 @@ impl ResolvedUnion {
             }
             _ => {
                 if fld_num < 0 {
-                    resolve = Rc::clone(&unres_type);
+                    resolve = unres_type.clone();
                 } else {
                     resolve = unres_type.get_depend(fld_num).ok_or_else(|| {
                         KunaError::lowlevel("ResolvedUnion: field out of range")
@@ -191,9 +193,9 @@ impl ResolvedUnion {
     /// Copy constructor with updated resolve data-type (C++
     /// `ResolvedUnion::ResolvedUnion(const ResolvedUnion&,Datatype*)`,
     /// `unionresolve.cc:77-84`).
-    pub fn new_with_resolve(op: &ResolvedUnion, res: Rc<Datatype>) -> ResolvedUnion {
+    pub fn new_with_resolve(op: &ResolvedUnion, res: TypeRoot) -> ResolvedUnion {
         ResolvedUnion {
-            base_type: Rc::clone(&op.base_type),
+            base_type: op.base_type.clone(),
             field_num: op.field_num,
             lock: op.lock,
             resolve: res,
@@ -202,13 +204,13 @@ impl ResolvedUnion {
 
     /// Get the resolved data-type (C++ `getDatatype`).
     #[inline]
-    pub fn get_datatype(&self) -> &Rc<Datatype> {
+    pub fn get_datatype(&self) -> &TypeRoot {
         &self.resolve
     }
 
     /// Get the union or structure being referenced (C++ `getBase`).
     #[inline]
-    pub fn get_base(&self) -> &Rc<Datatype> {
+    pub fn get_base(&self) -> &TypeRoot {
         &self.base_type
     }
 
@@ -232,18 +234,18 @@ impl ResolvedUnion {
         if self.lock && self.field_num != op.field_num {
             return false; // Lock protects the fieldNum resolution not the resolved data-type
         }
-        if self.field_num == op.field_num && Rc::ptr_eq(&self.resolve, &op.resolve) {
+        if self.field_num == op.field_num && self.resolve == op.resolve {
             return false;
         }
         self.field_num = op.field_num;
-        self.resolve = Rc::clone(&op.resolve);
+        self.resolve = op.resolve.clone();
         true
     }
 
     /// Update the resolution data-type without changing field resolution (C++
     /// `setResolve`).
     #[inline]
-    pub fn set_resolve(&mut self, res: Rc<Datatype>) {
+    pub fn set_resolve(&mut self, res: TypeRoot) {
         self.resolve = res;
     }
 
@@ -276,8 +278,10 @@ impl ResolvedUnion {
 /// ordering ([`Ord`]) keys the C++ `unionMap`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolveEdge {
-    /// Id of base data-type being resolved (C++ `typeId`).
-    type_id: uint8,
+    /// Graph identity of the base data-type being resolved (C++ `typeId`).
+    /// Host tokens can repeat across inferred revisions or retired generations;
+    /// they must not merge distinct resolution-cache entries.
+    type_id: TypeId,
     /// Id of PcodeOp edge (C++ `opTime`).
     op_time: uintm,
     /// Encoding of the slot and pointer-ness (C++ `encoding`).
@@ -292,7 +296,7 @@ impl ResolveEdge {
     /// \param unres_type is the data-type that needs resolution
     /// \param op_time is `op->getTime()` (the PcodeOp's unique id)
     /// \param slot is the slot (>=0 for input, -1 for output)
-    pub fn new_op(unres_type: &Datatype, op_time: uintm, slot: int4) -> ResolveEdge {
+    pub fn new_op(unres_type: &TypeRoot, op_time: uintm, slot: int4) -> ResolveEdge {
         let mut encoding = slot;
         let type_id = match unres_type.get_metatype() {
             type_metatype::TYPE_PTR => {
@@ -301,14 +305,14 @@ impl ResolveEdge {
                 encoding += 0x1000;
                 unres_type
                     .get_ptr_to()
-                    .map(|p| p.get_id())
-                    .unwrap_or_else(|| unres_type.get_id())
+                    .map(|p| p.id())
+                    .unwrap_or_else(|| unres_type.id())
             }
             type_metatype::TYPE_PARTIALUNION => unres_type
                 .get_partial_base()
-                .map(|p| p.get_id())
-                .unwrap_or_else(|| unres_type.get_id()),
-            _ => unres_type.get_id(),
+                .map(|p| p.id())
+                .unwrap_or_else(|| unres_type.id()),
+            _ => unres_type.id(),
         };
         ResolveEdge { type_id, op_time, encoding }
     }
@@ -319,7 +323,7 @@ impl ResolveEdge {
     ///
     /// The C++ ignores the `slot` parameter for the address form and always
     /// encodes `0x2000`.
-    pub fn new_addr(unres_type: &Datatype, addr: &Address, _slot: int4) -> ResolveEdge {
+    pub fn new_addr(unres_type: &TypeRoot, addr: &Address, _slot: int4) -> ResolveEdge {
         // (uintm) cast: the C++ stores addr.getOffset() (uintb/u64) into the
         // uintm (u32) `opTime` member, truncating to 32 bits.
         let op_time = addr.get_offset() as uintm;
@@ -327,13 +331,13 @@ impl ResolveEdge {
         let type_id = match unres_type.get_metatype() {
             type_metatype::TYPE_PTR => unres_type
                 .get_ptr_to()
-                .map(|p| p.get_id())
-                .unwrap_or_else(|| unres_type.get_id()),
+                .map(|p| p.id())
+                .unwrap_or_else(|| unres_type.id()),
             type_metatype::TYPE_PARTIALUNION => unres_type
                 .get_partial_base()
-                .map(|p| p.get_id())
-                .unwrap_or_else(|| unres_type.get_id()),
-            _ => unres_type.get_id(),
+                .map(|p| p.id())
+                .unwrap_or_else(|| unres_type.id()),
+            _ => unres_type.id(),
         };
         ResolveEdge { type_id, op_time, encoding }
     }
@@ -382,16 +386,16 @@ pub const MAX_TRIALS: int4 = 1024;
 /// A trial that encounters a locked data-type does not propagate through it but
 /// scores the trial data-type against the locked data-type.  Pure over the two
 /// data-types.
-pub fn score_locked_type(ct: &Rc<Datatype>, lock_type: &Rc<Datatype>) -> int4 {
+pub fn score_locked_type(ct: &TypeRoot, lock_type: &TypeRoot) -> int4 {
     use type_metatype::*;
     let mut score: int4 = 0;
 
-    if Rc::ptr_eq(lock_type, ct) {
+    if lock_type == ct {
         score += 5;
     }
 
-    let mut ct: Rc<Datatype> = Rc::clone(ct);
-    let mut lock_type: Rc<Datatype> = Rc::clone(lock_type);
+    let mut ct = ct.clone();
+    let mut lock_type = lock_type.clone();
     while ct.get_metatype() == TYPE_PTR {
         if lock_type.get_metatype() != TYPE_PTR {
             break;
@@ -453,9 +457,9 @@ pub struct LockedProtoFacts {
     /// `proto->numParams()`. // STUB(W4)
     pub num_params: int4,
     /// `proto->getParam(i)->getType()` for `i` in `0..num_params`. // STUB(W4)
-    pub param_types: Vec<Rc<Datatype>>,
+    pub param_types: Vec<TypeRoot>,
     /// `proto->getOutputType()`. // STUB(W4)
-    pub output_type: Option<Rc<Datatype>>,
+    pub output_type: Option<TypeRoot>,
 }
 
 /// Score a trial data-type against a parameter (C++
@@ -464,7 +468,7 @@ pub struct LockedProtoFacts {
 /// STUB(W4): the C++ queries `Funcdata::getCallSpecs(op)`; here the proto facts
 /// arrive as [`LockedProtoFacts`] (`None` transcribes a null proto).
 pub fn score_parameter(
-    ct: &Rc<Datatype>,
+    ct: &TypeRoot,
     proto: Option<&LockedProtoFacts>,
     param_slot: int4,
 ) -> int4 {
@@ -486,7 +490,7 @@ pub fn score_parameter(
 /// `ScoreUnionFields::scoreReturnType`, `unionresolve.cc:246-256`).
 ///
 /// STUB(W4): proto facts arrive as [`LockedProtoFacts`].
-pub fn score_return_type(ct: &Rc<Datatype>, proto: Option<&LockedProtoFacts>) -> int4 {
+pub fn score_return_type(ct: &TypeRoot, proto: Option<&LockedProtoFacts>) -> int4 {
     use type_metatype::*;
     if let Some(p) = proto {
         if p.output_locked {
@@ -509,7 +513,7 @@ pub struct DerefResult {
     /// The score passed back (C++ `score` out-param).
     pub score: int4,
     /// The data-type of the value being loaded/stored, or `None` (C++ return).
-    pub res_type: Option<Rc<Datatype>>,
+    pub res_type: Option<TypeRoot>,
 }
 
 /// Test if `fit_type` is a pointer whose pointed-to data-type is compatible with
@@ -521,7 +525,7 @@ pub struct DerefResult {
 /// \param vn_size is `vn->getSize()` of the value Varnode
 /// \param typegrp builds the array fallback data-type
 pub fn deref_pointer(
-    fit_type: &Rc<Datatype>,
+    fit_type: &TypeRoot,
     max_length: int4,
     vn_size: int4,
     typegrp: &dyn TypeFactory,
@@ -531,7 +535,7 @@ pub fn deref_pointer(
         let ptrto = fit_type
             .get_ptr_to()
             .ok_or_else(|| KunaError::lowlevel("derefPointer: pointer missing ptrto"))?;
-        let mut sub_type: Option<Rc<Datatype>> = Some(Rc::clone(&ptrto));
+        let mut sub_type = Some(ptrto.clone());
         while let Some(st) = &sub_type {
             if st.get_size() <= vn_size {
                 break;
@@ -541,7 +545,7 @@ pub fn deref_pointer(
         }
         if let Some(st) = &sub_type {
             if st.get_size() == vn_size {
-                return Ok(DerefResult { score: 10, res_type: Some(Rc::clone(st)) });
+                return Ok(DerefResult { score: 10, res_type: Some(st.clone()) });
             }
         }
         if max_length != 0 && ptrto.get_size() != 0 && (vn_size % ptrto.get_size()) == 0 {
@@ -568,28 +572,29 @@ pub fn deref_pointer(
 /// \param result_base is `result.getBase()` (for the union self-match bonus), or
 /// `None`
 pub fn score_truncation(
-    ct: &Rc<Datatype>,
+    ct: &TypeRoot,
     vn_size: int4,
     offset: int4,
-    result_base: Option<&Rc<Datatype>>,
-) -> KunaResult<(int4, Option<Rc<Datatype>>)> {
+    result_base: Option<&TypeRoot>,
+) -> KunaResult<(int4, Option<TypeRoot>)> {
     use type_metatype::*;
     let score: int4;
-    let mut ct_out: Option<Rc<Datatype>> = Some(Rc::clone(ct));
+    let mut ct_out = Some(ct.clone());
     if ct.get_metatype() == TYPE_UNION {
         // ct = 0;  // Don't recurse a data-type from truncation of a union
         ct_out = None;
         // score = -10;  // Negative score if the union has no field matching the size
         let mut score_local = -10;
         let num = ct.num_depend();
+        let view = ct.read();
+        let id = view.resolve_alias(ct.id())?;
         for i in 0..num {
-            let field = ct
-                .get_field(i)
+            let field = view.get_field(id, i)?
                 .ok_or_else(|| KunaError::lowlevel("scoreTruncation: union field out of range"))?;
-            if field.offset == offset && field.field_type.get_size() == vn_size {
+            if field.offset == offset && view.get(field.field_type)?.get_size() == vn_size {
                 score_local = 10;
                 if let Some(base) = result_base {
-                    if Rc::ptr_eq(base, ct) {
+                    if base == ct {
                         score_local += 5;
                     }
                 }
@@ -605,7 +610,7 @@ pub fn score_truncation(
         // mismatch)` half is the loop-continuation check, inverted to a `break`.
         // (Cannot use `while let Some(c) = &ct_out` — the body reassigns `ct_out`.)
         while ct_out.is_some() {
-            let cur = Rc::clone(ct_out.as_ref().unwrap());
+            let cur = ct_out.as_ref().unwrap().clone();
             if cur_off == 0 && cur.get_size() == vn_size {
                 break;
             }
@@ -772,7 +777,7 @@ pub struct TrialScore {
     /// The score to add to `scores[trial.scoreIndex]`.
     pub score: int4,
     /// The data-type to recurse into, or `None` (C++ `resType`).
-    pub res_type: Option<Rc<Datatype>>,
+    pub res_type: Option<TypeRoot>,
     /// The max-length to carry into the recursion (C++ `maxLength`).
     pub max_length: int4,
 }
@@ -1330,7 +1335,7 @@ pub struct ResolveCache {
 struct ResolveRecord {
     /// The union or structure needing resolution (pointers/partials stripped)
     /// (C++ `baseType`).
-    base_type: Rc<Datatype>,
+    base_type: TypeRoot,
     /// Index of the specific resolution (C++ `fieldNum`).
     field_num: int4,
     /// Context key (C++ `key`).
@@ -1339,8 +1344,8 @@ struct ResolveRecord {
 
 impl ResolveRecord {
     /// Does the given key/data-type match this record (C++ `Record::match`).
-    fn matches(&self, k: int4, dt: &Rc<Datatype>) -> bool {
-        self.key == k && Rc::ptr_eq(&self.base_type, dt)
+    fn matches(&self, k: int4, dt: &TypeRoot) -> bool {
+        self.key == k && self.base_type == *dt
     }
 }
 
@@ -1357,77 +1362,75 @@ impl ResolveCache {
     /// `fieldNum`-th component; otherwise return the original data-type.  (The
     /// `add_resolution` population path is STUB(W6), so in practice the list is
     /// empty and this returns `dt`.)
-    pub fn resolve(&self, key: int4, dt: &Rc<Datatype>) -> Rc<Datatype> {
+    pub fn resolve(&self, key: int4, dt: &TypeRoot) -> TypeRoot {
         for rec in &self.records {
             if rec.matches(key, dt) {
                 if rec.field_num < 0 {
-                    return Rc::clone(dt);
+                    return dt.clone();
                 }
                 if let Some(dep) = dt.get_depend(rec.field_num) {
                     return dep;
                 }
-                return Rc::clone(dt);
+                return dt.clone();
             }
         }
-        Rc::clone(dt)
+        dt.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dtype::{DatatypeKind, TypeField, sub_metatype};
-    use kuna_base::address::sign_extend;
+    use crate::dtype::{Datatype, DatatypeKind, TypeFactoryImpl, TypeField, sub_metatype};
 
     // ---- synthetic-type builders --------------------------------------------
 
-    fn base_type(size: int4, m: type_metatype) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, m))
+    fn base_type(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+        types.intern(Datatype::new(size, m)).unwrap()
     }
 
-    fn with_id(mut dt: Datatype, id: uint8) -> Rc<Datatype> {
-        dt.id = id;
-        Rc::new(dt)
-    }
-
-    fn pointer_to(ptrto: Rc<Datatype>, size: int4, wordsize: u32) -> Rc<Datatype> {
-        let mut p = Datatype::new(size, type_metatype::TYPE_PTR);
-        p.submeta = sub_metatype::SUB_PTR;
-        p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize };
-        Rc::new(p)
+    fn pointer_to(types: &TypeFactoryImpl, ptrto: TypeRoot, size: int4, wordsize: u32) -> TypeRoot {
+        types.get_type_pointer(size, ptrto, wordsize).unwrap()
     }
 
     /// Build a union with the given (offset, type) fields.
-    fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+    fn make_union(types: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
         let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
         u.submeta = sub_metatype::SUB_UNION;
         let field: Vec<TypeField> = fields
             .iter()
             .enumerate()
             .map(|(i, (off, ct))| {
-                TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct))
+                TypeField::new(i as int4, *off, format!("f{i}"), ct.id())
             })
             .collect();
         u.kind = DatatypeKind::Union { field };
-        Rc::new(u)
+        types.intern(u).unwrap()
     }
 
     // ---- ResolveEdge total order (the unionMap key) -------------------------
 
     #[test]
     fn resolve_edge_order_typeid_then_encoding_then_optime() {
+        let types = TypeFactoryImpl::new();
         // typeId dominates; then encoding; then opTime.
-        let int_t = base_type(4, type_metatype::TYPE_INT);
+        let int_t = base_type(&types, 4, type_metatype::TYPE_INT);
+        let uint_t = base_type(&types, 4, type_metatype::TYPE_UINT);
+        let (first, second) = if int_t.id() < uint_t.id() {
+            (int_t.id(), uint_t.id())
+        } else {
+            (uint_t.id(), int_t.id())
+        };
         let mut a = ResolveEdge::new_op(&int_t, 100, 0);
         // Make three edges sharing typeId but differing in encoding/opTime.
-        a.type_id = 5;
+        a.type_id = first;
         a.encoding = 2;
         a.op_time = 100;
         let mut b = a;
         b.encoding = 3; // bigger encoding -> bigger
         assert!(a < b);
         let mut c = a;
-        c.type_id = 6; // typeId dominates everything
+        c.type_id = second; // typeId dominates everything
         c.encoding = 0;
         c.op_time = 0;
         assert!(a < c);
@@ -1441,34 +1444,29 @@ mod tests {
 
     #[test]
     fn resolve_edge_op_pointer_strips_and_flags() {
-        // For a pointer, typeId = ptrTo->getId() and encoding = slot + 0x1000.
-        let union_t = with_id(
-            (*make_union(4, &[(0, base_type(4, type_metatype::TYPE_INT))])).clone(),
-            42,
-        );
-        let ptr = pointer_to(Rc::clone(&union_t), 8, 1);
+        let types = TypeFactoryImpl::new();
+        let union_t = make_union(&types, 4, &[(0, base_type(&types, 4, type_metatype::TYPE_INT))]);
+        let ptr = pointer_to(&types, union_t.clone(), 8, 1);
         let edge = ResolveEdge::new_op(&ptr, 7, 3);
-        assert_eq!(edge.type_id, 42); // stripped to the union's id
+        assert_eq!(edge.type_id, union_t.id());
         assert_eq!(edge.encoding, 3 + 0x1000); // pointer flag
         assert_eq!(edge.op_time, 7);
 
-        // Non-pointer: typeId = unresType->getId(), no flag.
+        // Non-pointer: graph identity of the unresolved type, no flag.
         let edge2 = ResolveEdge::new_op(&union_t, 9, 1);
-        assert_eq!(edge2.type_id, 42);
+        assert_eq!(edge2.type_id, union_t.id());
         assert_eq!(edge2.encoding, 1);
     }
 
     #[test]
     fn resolve_edge_addr_form_encodes_0x2000() {
-        let union_t = with_id(
-            (*make_union(4, &[(0, base_type(4, type_metatype::TYPE_INT))])).clone(),
-            17,
-        );
+        let types = TypeFactoryImpl::new();
+        let union_t = make_union(&types, 4, &[(0, base_type(&types, 4, type_metatype::TYPE_INT))]);
         let addr = Address::new_invalid();
         // invalid address offset is 0; use a real space-less test of the encoding.
         let edge = ResolveEdge::new_addr(&union_t, &addr, 99);
         assert_eq!(edge.encoding, 0x2000); // slot ignored
-        assert_eq!(edge.type_id, 17);
+        assert_eq!(edge.type_id, union_t.id());
         assert_eq!(edge.op_time, addr.get_offset() as uintm);
     }
 
@@ -1476,72 +1474,76 @@ mod tests {
 
     #[test]
     fn resolved_union_self_resolution_strips_base() {
+        let types = TypeFactoryImpl::new();
         // Pointer parent: baseType strips to ptrTo.
-        let union_t = make_union(4, &[(0, base_type(4, type_metatype::TYPE_INT))]);
-        let ptr = pointer_to(Rc::clone(&union_t), 8, 1);
-        let res = ResolvedUnion::new(Rc::clone(&ptr));
-        assert!(Rc::ptr_eq(res.get_datatype(), &ptr)); // resolves to the parent
-        assert!(Rc::ptr_eq(res.get_base(), &union_t)); // base is the stripped union
+        let union_t = make_union(&types, 4, &[(0, base_type(&types, 4, type_metatype::TYPE_INT))]);
+        let ptr = pointer_to(&types, union_t.clone(), 8, 1);
+        let res = ResolvedUnion::new(ptr.clone());
+        assert_eq!(res.get_datatype(), &ptr);
+        assert_eq!(res.get_base(), &union_t);
         assert_eq!(res.get_field_num(), -1);
         assert!(!res.is_locked());
 
         // Non-pointer parent: baseType is the parent.
-        let res2 = ResolvedUnion::new(Rc::clone(&union_t));
-        assert!(Rc::ptr_eq(res2.get_base(), &union_t));
+        let res2 = ResolvedUnion::new(union_t.clone());
+        assert_eq!(res2.get_base(), &union_t);
         assert_eq!(res2.get_field_num(), -1);
     }
 
     #[test]
     fn resolved_union_update_lock_protects_fieldnum() {
-        let union_t = make_union(4, &[(0, base_type(4, type_metatype::TYPE_INT))]);
-        let int_t = base_type(4, type_metatype::TYPE_INT);
-        let mut res = ResolvedUnion::new(Rc::clone(&union_t));
+        let types = TypeFactoryImpl::new();
+        let union_t = make_union(&types, 4, &[(0, base_type(&types, 4, type_metatype::TYPE_INT))]);
+        let int_t = base_type(&types, 4, type_metatype::TYPE_INT);
+        let mut res = ResolvedUnion::new(union_t.clone());
         res.set_lock(true);
         // Same fieldNum, same resolve -> no change.
-        let same = ResolvedUnion::new(Rc::clone(&union_t));
+        let same = ResolvedUnion::new(union_t.clone());
         assert!(!res.clone().update(&same));
         // Locked, but a different fieldNum -> rejected.
-        let mut other = ResolvedUnion::new(Rc::clone(&union_t));
+        let mut other = ResolvedUnion::new(union_t.clone());
         other.field_num = 0;
-        other.resolve = Rc::clone(&int_t);
+        other.resolve = int_t.clone();
         assert!(!res.update(&other));
         // Same fieldNum but new resolve -> change accepted even when locked.
-        let mut newres = ResolvedUnion::new(Rc::clone(&union_t));
+        let mut newres = ResolvedUnion::new(union_t.clone());
         newres.field_num = -1;
-        newres.resolve = Rc::clone(&int_t);
+        newres.resolve = int_t.clone();
         assert!(res.update(&newres));
-        assert!(Rc::ptr_eq(res.get_datatype(), &int_t));
+        assert_eq!(res.get_datatype(), &int_t);
     }
 
     // ---- score_locked_type matrix -------------------------------------------
 
     #[test]
     fn score_locked_type_matrix() {
-        let int4_t = base_type(4, type_metatype::TYPE_INT);
-        let uint4_t = base_type(4, type_metatype::TYPE_UINT);
-        let int8_t = base_type(8, type_metatype::TYPE_INT);
-        let struct_t = base_type(4, type_metatype::TYPE_STRUCT);
+        let types = TypeFactoryImpl::new();
+        let int4_t = base_type(&types, 4, type_metatype::TYPE_INT);
+        let uint4_t = base_type(&types, 4, type_metatype::TYPE_UINT);
+        let int8_t = base_type(&types, 8, type_metatype::TYPE_INT);
+        let struct_t = base_type(&types, 4, type_metatype::TYPE_STRUCT);
 
         // Perfect pointer identity + same metatype (plain int, not composite): 5 + 3.
         assert_eq!(score_locked_type(&int4_t, &int4_t), 5 + 3);
-        // Different objects, same metatype int (size match): +3.
-        let int4_b = base_type(4, type_metatype::TYPE_INT);
+        // Distinct graph identities, same metatype int (size match): +3.
+        let other_types = TypeFactoryImpl::new();
+        let int4_b = base_type(&other_types, 4, type_metatype::TYPE_INT);
         assert_eq!(score_locked_type(&int4_t, &int4_b), 3);
         // int vs uint, same size: -1 mismatch, no size penalty.
         assert_eq!(score_locked_type(&int4_t, &uint4_t), -1);
         // int vs int, different size: same metatype +3 (size only penalizes on mismatch metatype).
         assert_eq!(score_locked_type(&int4_t, &int8_t), 3);
         // int vs uint, different size: -1 (sign mismatch) + (-2 size): -3.
-        let uint8_t = base_type(8, type_metatype::TYPE_UINT);
+        let uint8_t = base_type(&types, 8, type_metatype::TYPE_UINT);
         assert_eq!(score_locked_type(&int4_t, &uint8_t), -1 - 2);
         // struct vs struct, same metatype composite: +3? No — composite gets +10.
-        let struct_b = base_type(4, type_metatype::TYPE_STRUCT);
+        let struct_b = base_type(&other_types, 4, type_metatype::TYPE_STRUCT);
         assert_eq!(score_locked_type(&struct_t, &struct_b), 10);
         // int vs struct (general mismatch), same size: -5.
         assert_eq!(score_locked_type(&int4_t, &struct_t), -5);
 
         // Pointer chain: ptr->ptr->int vs ptr->ptr->int, identity at top: 5 + 5 + 5 + 3.
-        let pp_a = pointer_to(pointer_to(Rc::clone(&int4_t), 8, 1), 8, 1);
+        let pp_a = pointer_to(&types, pointer_to(&types, int4_t.clone(), 8, 1), 8, 1);
         assert_eq!(score_locked_type(&pp_a, &pp_a), 5 + 5 + 5 + 3);
     }
 
@@ -1549,8 +1551,9 @@ mod tests {
 
     #[test]
     fn score_parameter_unlocked_defaults() {
-        let int_t = base_type(4, type_metatype::TYPE_INT);
-        let struct_t = base_type(4, type_metatype::TYPE_STRUCT);
+        let types = TypeFactoryImpl::new();
+        let int_t = base_type(&types, 4, type_metatype::TYPE_INT);
+        let struct_t = base_type(&types, 4, type_metatype::TYPE_STRUCT);
         // No proto: composite -> -1, scalar -> 0.
         assert_eq!(score_parameter(&struct_t, None, 0), -1);
         assert_eq!(score_parameter(&int_t, None, 0), 0);
@@ -1560,13 +1563,14 @@ mod tests {
 
     #[test]
     fn score_parameter_locked_uses_score_locked_type() {
-        let int_t = base_type(4, type_metatype::TYPE_INT);
+        let types = TypeFactoryImpl::new();
+        let int_t = base_type(&types, 4, type_metatype::TYPE_INT);
         let facts = LockedProtoFacts {
             input_locked: true,
             output_locked: true,
             num_params: 1,
-            param_types: vec![Rc::clone(&int_t)],
-            output_type: Some(Rc::clone(&int_t)),
+            param_types: vec![int_t.clone()],
+            output_type: Some(int_t.clone()),
         };
         // Locked, slot 0 in range -> scoreLockedType(int,int identity) = 5+3.
         assert_eq!(score_parameter(&int_t, Some(&facts), 0), 8);
@@ -1651,10 +1655,11 @@ mod tests {
     #[test]
     fn score_truncation_union_field_match() {
         use type_metatype::*;
+        let types = TypeFactoryImpl::new();
         // Union with an int4 field at offset 0 and a uint2 field at offset 0.
-        let int4_t = base_type(4, TYPE_INT);
-        let uint2_t = base_type(2, TYPE_UINT);
-        let union_t = make_union(4, &[(0, Rc::clone(&int4_t)), (0, Rc::clone(&uint2_t))]);
+        let int4_t = base_type(&types, 4, TYPE_INT);
+        let uint2_t = base_type(&types, 2, TYPE_UINT);
+        let union_t = make_union(&types, 4, &[(0, int4_t.clone()), (0, uint2_t.clone())]);
         // Truncation of size 2 at offset 0 matches the uint2 field -> 10, no recurse.
         let (score, recurse) = score_truncation(&union_t, 2, 0, None).unwrap();
         assert_eq!(score, 10);
@@ -1671,14 +1676,15 @@ mod tests {
     #[test]
     fn score_truncation_scalar_exact_match() {
         use type_metatype::*;
+        let types = TypeFactoryImpl::new();
         // Exact size match at offset 0: score 10, recurse the type itself.
-        let int4_t = base_type(4, TYPE_INT);
+        let int4_t = base_type(&types, 4, TYPE_INT);
         let (score, recurse) = score_truncation(&int4_t, 4, 0, None).unwrap();
         assert_eq!(score, 10);
         assert!(recurse.is_some());
-        assert!(Rc::ptr_eq(&recurse.unwrap(), &int4_t));
+        assert_eq!(recurse.unwrap(), int4_t);
         // int wider than the varnode, offset 0: int can hold it -> score 1.
-        let int8_t = base_type(8, TYPE_INT);
+        let int8_t = base_type(&types, 8, TYPE_INT);
         let (score2, _) = score_truncation(&int8_t, 4, 0, None).unwrap();
         assert_eq!(score2, 1);
     }
@@ -1752,33 +1758,10 @@ mod tests {
 
     #[test]
     fn resolve_cache_empty_returns_unresolved() {
+        let types = TypeFactoryImpl::new();
         let cache = ResolveCache::new();
-        let int_t = base_type(4, type_metatype::TYPE_INT);
+        let int_t = base_type(&types, 4, type_metatype::TYPE_INT);
         // No records (population is STUB(W6)) -> returns the original data-type.
-        assert!(Rc::ptr_eq(&cache.resolve(0, &int_t), &int_t));
-    }
-
-    // Touch the otherwise-driver-only imports so a future driver wiring change
-    // surfaces here rather than as dead-code warnings.
-    #[test]
-    fn constants_and_helpers_present() {
-        assert_eq!(THRESHOLD, 256);
-        assert_eq!(MAX_PASSES, 6);
-        assert_eq!(MAX_TRIALS, 1024);
-        // sign_extend/int8/uint8/uintb are used by the seamed driver helpers;
-        // exercise sign_extend here to keep the import live and pin its behavior
-        // for the INT_ADD constant-offset arm (C++ `sign_extend(off,size*8-1)`).
-        let off: int8 = sign_extend(0xff, 8 * 1 - 1);
-        assert_eq!(off, -1);
-        let _ = (0u64 as uint8, 0u64 as uintb);
-    }
-
-    fn _use_deref(typegrp: &dyn TypeFactory) {
-        // Reference deref_pointer / direction so a driver rewiring keeps them
-        // discoverable (not invoked: needs a live TypeFactory).
-        let int_t = base_type(4, type_metatype::TYPE_INT);
-        let _ = deref_pointer(&int_t, 0, 4, typegrp);
-        let _ = score_tables::Direction::Down;
-        let _ = score_tables::Direction::Up;
+        assert_eq!(cache.resolve(0, &int_t), int_t);
     }
 }

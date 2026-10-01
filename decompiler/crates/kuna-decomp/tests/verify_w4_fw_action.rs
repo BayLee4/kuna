@@ -115,8 +115,8 @@ impl Rule for LogRule {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
     }
-    fn clone_rule(&self, _g: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(LogRule { tag: self.tag.clone(), log: self.log.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(LogRule { tag: self.tag.clone(), log: self.log.clone() })
     }
 }
 
@@ -140,8 +140,8 @@ impl Rule for MorphRule {
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
     }
-    fn clone_rule(&self, _g: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(MorphRule { log: self.log.clone(), fired: self.fired.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(MorphRule { log: self.log.clone(), fired: self.fired.clone() })
     }
 }
 
@@ -335,7 +335,7 @@ fn w4_fw_action_empty_grouplist_derives_a_noop_root_not_a_crash() {
     // an empty ActionGroup so the map stays total and the root is a safe no-op.
     let log: Log = Rc::new(RefCell::new(Vec::new()));
     let mut pool = ActionPool::new(0, "pool");
-    // A rule whose clone only survives group "x".
+    // Registration in group "x" controls whether the rule survives.
     struct XRule {
         log: Log,
     }
@@ -347,12 +347,8 @@ fn w4_fw_action_empty_grouplist_derives_a_noop_root_not_a_crash() {
         fn get_op_list(&self) -> Vec<OpCode> {
             vec![OpCode::CPUI_INT_ADD]
         }
-        fn clone_rule(&self, g: &ActionGroupList) -> Option<Box<dyn Rule>> {
-            if g.contains("x") {
-                Some(Box::new(XRule { log: self.log.clone() }))
-            } else {
-                None
-            }
+        fn clone_rule(&self) -> Box<dyn Rule> {
+            Box::new(XRule { log: self.log.clone() })
         }
     }
     pool.add_rule(RuleState::new("x", 0, "xrule"), Box::new(XRule { log: log.clone() }));
@@ -430,8 +426,8 @@ fn w4_fw_action_cursor_jumps_to_op_inserted_below_after_break_documents_divergen
         fn get_op_list(&self) -> Vec<OpCode> {
             vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
         }
-        fn clone_rule(&self, _g: &ActionGroupList) -> Option<Box<dyn Rule>> {
-            Some(Box::new(InsertBelowRule { log: self.log.clone(), done: self.done.clone() }))
+        fn clone_rule(&self) -> Box<dyn Rule> {
+            Box::new(InsertBelowRule { log: self.log.clone(), done: self.done.clone() })
         }
     }
 

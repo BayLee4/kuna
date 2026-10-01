@@ -35,7 +35,7 @@
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -74,12 +74,9 @@ impl Rule for RuleBoolSignShift {
     }
 
     /// C++ `RuleBoolSignShift::clone(grouplist)`:
-    /// `if (!grouplist.contains(getGroup())) return 0; return new ...(getGroup());`
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleBoolSignShift { enabled: self.enabled, group: self.group.clone() }))
+    /// Group membership is handled by the registered rule entry.
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBoolSignShift { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleBoolSignShift::applyOp` (`kuna_booleanmask.cc:19`) — transcribed.
@@ -168,6 +165,7 @@ pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         // C++ `new RuleBoolSignShift("analysis")` in oppool1 (coreaction.cc:5811).
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option booleanmask on` (architecture.cc resets
         // fold_boolean_mask = true; kuna DIV-2 default-on, GH-1282).
         ctor: || Box::new(RuleBoolSignShift::with_group(true, "analysis")),

@@ -8,13 +8,15 @@ use super::*;
 
 use std::rc::Rc;
 
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool};
+
 use kuna_base::address::Address;
 use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, BlockId};
 use crate::varnode::DefOpInfo;
 
@@ -43,7 +45,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -53,8 +60,9 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {
@@ -107,7 +115,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// `isFree()`/`isHeritageKnown()` guards the rules apply to leaf operands.
 fn mk_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(size, Address::new(ram, off), dt(size));
+    let datatype = dt(fd, size);
+    let vn = fd.vbank_mut().create(size, Address::new(ram, off), datatype);
     let mut no_replace =
         |_b: &mut crate::varnode::VarnodeBank, _a: VarnodeId, _c: VarnodeId| Ok(());
     fd.vbank_mut().set_input(vn, &mut no_replace).expect("mk_reg set_input")
@@ -134,7 +143,7 @@ fn mk_written(
         fd.op_set_input(defop, vn, i as int4).expect("mk_written set input");
     }
     let ram = ram_space(fd);
-    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(out_size)));
+    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(fd, out_size)));
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let mut no_replace =
@@ -158,6 +167,28 @@ fn is_const(fd: &Funcdata, vn: VarnodeId) -> bool {
     fd.vbank().get(vn).unwrap().is_constant()
 }
 
+/// Run a registered alias-only pool alongside a self-XOR that only the
+/// unrelated primary-group TrivialArith rule would fold.
+fn apply_alias(alias: &str, fd: &mut Funcdata) -> int4 {
+    let registered = specs();
+    let spec = registered.iter().find(|spec| spec.aliases.contains(&alias)).unwrap();
+    let mut pool = ActionPool::new(0, "aliases");
+    pool.add_spec(spec, alias);
+    pool.add_spec(&registered[13], "trivialarith");
+
+    let bl = mk_block(fd);
+    let v = mk_reg(fd, 0xff00, 4);
+    let (_, excluded) = mk_written(fd, bl, 0xff10, 4, OpCode::CPUI_INT_XOR, &[v, v]);
+    let mut filtered = pool
+        .clone_filtered(&ActionGroupList::from_names([alias]))
+        .expect("registered alias must survive filtering");
+    assert_eq!(filtered.apply(fd, &mut ActionContext::new()), 0);
+    assert_eq!(code_of(fd, excluded), OpCode::CPUI_INT_XOR);
+    assert_eq!(in_of(fd, excluded, 0), Some(v));
+    assert_eq!(in_of(fd, excluded, 1), Some(v));
+    filtered.base().count
+}
+
 // =============================================================================
 // RuleFloatRange  (intricate: slot normalization + dual comparison match)
 // =============================================================================
@@ -178,7 +209,7 @@ fn floatrange_less_or_equal_collapses_to_lessequal() {
     fd.op_set_input(or, eq_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    let r = RuleFloatRange.apply_op(or, &mut fd);
+    let r = apply_alias("floatrange", &mut fd);
     assert_eq!(r, 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_FLOAT_LESSEQUAL);
     // Inputs collapse to (V, C): slot1 stays 0 (nvn1 = V at slot 0 of cmp1).
@@ -259,7 +290,7 @@ fn doublesub_combines_offsets() {
     fd.op_set_input(outer, c1, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleSub.apply_op(outer, &mut fd), 1);
+    assert_eq!(apply_alias("doublesub", &mut fd), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_SUBPIECE);
     assert_eq!(in_of(&fd, outer, 0), Some(v)); // middleman skipped
     let off = in_of(&fd, outer, 1).unwrap();
@@ -299,7 +330,7 @@ fn doubleshift_same_direction_adds() {
     fd.op_set_input(outer, three, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(apply_alias("doubleshift", &mut fd), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_INT_LEFT);
     assert_eq!(in_of(&fd, outer, 0), Some(v)); // skip middle shift
     let sa = in_of(&fd, outer, 1).unwrap();
@@ -447,7 +478,7 @@ fn trivialbool_and_true_is_copy_of_v() {
     fd.op_set_input(op, t, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd), 1);
+    assert_eq!(apply_alias("trivialbool", &mut fd), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(in_of(&fd, op, 0), Some(v));
 }
@@ -517,7 +548,7 @@ fn slesstoless_nonnegative_constants_convert() {
     fd.op_set_input(op, b, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd), 1);
+    assert_eq!(apply_alias("slesstoless", &mut fd), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
 }
 
@@ -565,7 +596,7 @@ fn andzext_sext_with_full_low_mask_becomes_zext() {
     let mask = mk_const(&mut fd, 4, 0xffff); // calc_mask(2)
     let (_anded, andop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[sext_out, mask]);
 
-    assert_eq!(RuleAndZext.apply_op(andop, &mut fd), 1);
+    assert_eq!(apply_alias("andzext", &mut fd), 1);
     assert_eq!(code_of(&fd, andop), OpCode::CPUI_INT_ZEXT);
     assert_eq!(fd.obank().get(andop).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, andop, 0), Some(x)); // rootvn becomes the sole input
@@ -601,7 +632,7 @@ fn lessequal_less_or_equal_to_lessequal() {
     fd.op_set_input(or, eq_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleLessEqual.apply_op(or, &mut fd), 1);
+    assert_eq!(apply_alias("lessequal", &mut fd), 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_INT_LESSEQUAL);
     assert_eq!(in_of(&fd, or, 0), Some(v));
     assert_eq!(in_of(&fd, or, 1), Some(w));
@@ -659,7 +690,7 @@ fn lessnotequal_combines_to_less() {
     fd.op_set_input(and, ne_out, 1).unwrap();
     fd.op_insert(and, bl, None);
 
-    assert_eq!(RuleLessNotEqual.apply_op(and, &mut fd), 1);
+    assert_eq!(apply_alias("lessnotequal", &mut fd), 1);
     assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_LESS);
     assert_eq!(in_of(&fd, and, 0), Some(v));
     assert_eq!(in_of(&fd, and, 1), Some(w));
@@ -699,7 +730,7 @@ fn zexteliminate_drops_extension_in_equal() {
     fd.op_set_input(eq, c, 1).unwrap();
     fd.op_insert(eq, bl, None);
 
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 1);
+    assert_eq!(apply_alias("zexteliminate", &mut fd), 1);
     assert_eq!(code_of(&fd, eq), OpCode::CPUI_INT_EQUAL); // opcode unchanged
     assert_eq!(in_of(&fd, eq, 0), Some(x)); // zext input promoted
     let nc = in_of(&fd, eq, 1).unwrap();
@@ -738,7 +769,7 @@ fn concatshift_exact_cancellation_to_zext() {
     let sa = mk_const(&mut fd, 4, 16);
     let (_shifted, shop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_RIGHT, &[cat_out, sa]);
 
-    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd), 1);
+    assert_eq!(apply_alias("concatshift", &mut fd), 1);
     assert_eq!(code_of(&fd, shop), OpCode::CPUI_INT_ZEXT);
     assert_eq!(fd.obank().get(shop).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, shop, 0), Some(hi)); // most significant part extended
@@ -798,7 +829,7 @@ fn zextsless_drops_extension() {
     fd.op_set_input(op, c, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleZextSless.apply_op(op, &mut fd), 1);
+    assert_eq!(apply_alias("zextsless", &mut fd), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
     assert_eq!(in_of(&fd, op, 0), Some(x));
     let nc = in_of(&fd, op, 1).unwrap();
@@ -835,7 +866,7 @@ fn doublearithshift_adds_amounts() {
     let d = mk_const(&mut fd, 4, 3);
     let (_o, outer) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[inner_out, d]);
 
-    assert_eq!(RuleDoubleArithShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(apply_alias("doublearithshift", &mut fd), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_INT_SRIGHT);
     assert_eq!(in_of(&fd, outer, 0), Some(x));
     let sa = in_of(&fd, outer, 1).unwrap();
@@ -877,7 +908,7 @@ fn booleanundistribute_matches_shared_clause() {
     fd.op_set_input(ne, and1_out, 1).unwrap();
     fd.op_insert(ne, bl, None);
 
-    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 1);
+    assert_eq!(apply_alias("booleanundistribute", &mut fd), 1);
     // central_equal starts false (NOTEQUAL) and neither clause is BOOL_OR, so
     // combine = BOOL_AND, inner = NOTEQUAL(B, C).  Slot 0 = A, slot 1 = inner.
     assert_eq!(code_of(&fd, ne), OpCode::CPUI_BOOL_AND);
@@ -909,87 +940,164 @@ fn booleanundistribute_declines_without_shared_clause() {
     assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 0);
 }
 
-// =============================================================================
-// specs() registration
-// =============================================================================
-
 #[test]
-fn specs_are_in_cpp_definition_order() {
-    let specs = specs();
-    let groups: Vec<&str> = specs.iter().map(|s| s.group).collect();
-    assert_eq!(
-        groups,
-        vec![
-            "floatrange",
-            "andcommute",
-            "andpiece",
-            "andzext",
-            "andcompare",
-            "doublesub",
-            "doubleshift",
-            "doublearithshift",
-            "concatshift",
-            "leftright",
-            "shiftcompare",
-            "lessequal",
-            "lessnotequal",
-            // RuleTrivialArith's C++ constructor group is "analysis"
-            // (coreaction.cc:5786), not the rule name -- corrected so the rule
-            // survives the real "decompile"/"jumptable" grouplists.
-            "analysis",
-            "trivialbool",
-            "zexteliminate",
-            "slesstoless",
-            "zextsless",
-            "bitundistribute",
-            "booleanundistribute",
-        ]
-    );
-}
+fn andcommute_alias_moves_mask_before_left_shift() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 4);
+    let sa = mk_const(&mut fd, 4, 8);
+    let (shifted, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let mask = mk_const(&mut fd, 4, 0xff00);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[shifted, mask]);
 
-#[test]
-fn clone_rule_filters_by_group() {
-    // Each spec's ctor produces a rule that clones iff its group is present.
-    for spec in specs() {
-        let rule = (spec.ctor)();
-        let yes = ActionGroupList::from_names([spec.group]);
-        let no = ActionGroupList::from_names(["some_other_group"]);
-        assert!(rule.clone_rule(&yes).is_some(), "{} should clone in its group", spec.group);
-        assert!(rule.clone_rule(&no).is_none(), "{} should not clone out of group", spec.group);
+    assert_eq!(apply_alias("andcommute", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LEFT);
+    let and = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    let unshift = fd.vbank().get(in_of(&fd, and, 1).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, unshift), OpCode::CPUI_INT_RIGHT);
+    // Constants are copied when rewired to a second use. Their values, not
+    // incidental arena identity, define the recovered masked shift.
+    for (operation, slot, value) in [(op, 1, 8), (unshift, 0, 0xff00), (unshift, 1, 8)] {
+        let constant = fd.vbank().get(in_of(&fd, operation, slot).unwrap()).unwrap();
+        assert!(constant.is_constant());
+        assert_eq!(constant.get_offset(), value);
     }
 }
 
 #[test]
+fn andpiece_alias_discards_masked_high_piece() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let hi = mk_reg(&mut fd, 0x100, 2);
+    let lo = mk_reg(&mut fd, 0x104, 2);
+    let (piece, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_PIECE, &[hi, lo]);
+    let mask = mk_const(&mut fd, 4, 0xffff);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[piece, mask]);
+
+    assert_eq!(apply_alias("andpiece", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, op, 1), Some(mask));
+    let ext = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, ext), OpCode::CPUI_INT_ZEXT);
+    assert_eq!(in_of(&fd, ext, 0), Some(lo));
+}
+
+#[test]
+fn andcompare_alias_moves_mask_to_unextended_input() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 2);
+    let (extended, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_ZEXT, &[v]);
+    let mask = mk_const(&mut fd, 4, 0xff);
+    let (masked, _) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[extended, mask]);
+    let zero = mk_const(&mut fd, 4, 0);
+    let (_, op) = mk_written(&mut fd, bl, 0x30, 1, OpCode::CPUI_INT_EQUAL, &[masked, zero]);
+
+    assert_eq!(apply_alias("andcompare", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
+    let narrowed = in_of(&fd, op, 0).unwrap();
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_size(), 2);
+    let and = fd.vbank().get(narrowed).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, and, 1).unwrap()), 0xff);
+    let zero = in_of(&fd, op, 1).unwrap();
+    assert_eq!(const_val(&fd, zero), 0);
+    assert_eq!(fd.vbank().get(zero).unwrap().get_size(), 2);
+}
+
+#[test]
+fn leftright_alias_replaces_paired_shifts_with_sign_extension() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 4);
+    let sa = mk_const(&mut fd, 4, 16);
+    let (shifted, left) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[shifted, sa]);
+
+    assert_eq!(apply_alias("leftright", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SEXT);
+    assert_eq!(code_of(&fd, left), OpCode::CPUI_SUBPIECE);
+    assert_eq!(in_of(&fd, left, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, left, 1).unwrap()), 0);
+    let narrowed = in_of(&fd, op, 0).unwrap();
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_size(), 2);
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_def(), Some(left));
+}
+
+#[test]
+fn shiftcompare_alias_preserves_information_loss_mask() {
+    // Reuse the verifier's (V:1 << 4) == 0x30 => (V & 0x0f) == 3 fixture.
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 1);
+    let sa = mk_const(&mut fd, 1, 4);
+    let (shifted, _) = mk_written(&mut fd, bl, 0x10, 1, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let constant = mk_const(&mut fd, 1, 0x30);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 1, OpCode::CPUI_INT_EQUAL, &[shifted, constant]);
+
+    assert_eq!(apply_alias("shiftcompare", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
+    assert_eq!(const_val(&fd, in_of(&fd, op, 1).unwrap()), 3);
+    let and = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, and, 1).unwrap()), 0x0f);
+}
+
+#[test]
+fn bitundistribute_alias_factors_shared_arithmetic_shift() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let a = mk_reg(&mut fd, 0x100, 4);
+    let b = mk_reg(&mut fd, 0x104, 4);
+    let sa = mk_const(&mut fd, 4, 3);
+    let (left, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_SRIGHT, &[a, sa]);
+    let (right, _) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[b, sa]);
+    let (_, op) = mk_written(&mut fd, bl, 0x30, 4, OpCode::CPUI_INT_OR, &[left, right]);
+
+    assert_eq!(apply_alias("bitundistribute", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SRIGHT);
+    assert_eq!(const_val(&fd, in_of(&fd, op, 1).unwrap()), 3);
+    let or = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, or), OpCode::CPUI_INT_OR);
+    assert_eq!(in_of(&fd, or, 0), Some(a));
+    assert_eq!(in_of(&fd, or, 1), Some(b));
+}
+
+#[test]
 fn trivialarith_survives_the_real_grouplists_via_its_analysis_group() {
-    // Regression pin for the `clone_rule` group-gating fix.  C++
-    // `RuleTrivialArith::clone` gates on `getGroup()` == "analysis"
-    // (coreaction.cc:5786 / ruleaction.hh:493).  The previous Rust port gated on
-    // the literal rule NAME "trivialarith", which is NEVER in any root
-    // grouplist, so the rule was silently dropped from the active pipeline (the
-    // self-`INT_AND`/`INT_XOR` folds never ran -- the loaded byte in a `*ptr`
-    // signed-compare cluster could not type `char`, and `Promotion on compare
-    // #2` regressed).  The fix gates on the group, so the rule must:
-    //   (a) survive the "decompile" grouplist (lists "analysis"),
-    //   (b) survive the "jumptable" grouplist (lists "analysis"),
-    //   (c) NOT be clonable by the bare rule name (the old, wrong gate).
-    let rule = RuleTrivialArith;
-    let decompile = ActionGroupList::from_names([
-        "base", "analysis", "canonicalcompare", "typerecovery", "deadcode",
-    ]);
-    let jumptable = ActionGroupList::from_names(["base", "analysis", "deadcode"]);
-    let by_name = ActionGroupList::from_names(["trivialarith"]);
-    assert!(
-        rule.clone_rule(&decompile).is_some(),
-        "trivialarith must survive the decompile grouplist (it lists \"analysis\")"
-    );
-    assert!(
-        rule.clone_rule(&jumptable).is_some(),
-        "trivialarith must survive the jumptable grouplist (it lists \"analysis\")"
-    );
-    assert!(
-        rule.clone_rule(&by_name).is_none(),
-        "the bare rule NAME is not a group -- it must NOT clone the rule (the old bug)"
-    );
+    let mut pool = ActionPool::new(0, "arith");
+    pool.add_spec(&specs()[13], "trivialarith");
+    for (groups, enabled) in [
+        (ActionGroupList::from_names([
+            "base", "analysis", "canonicalcompare", "typerecovery", "deadcode",
+        ]), true),
+        (ActionGroupList::from_names(["base", "analysis", "deadcode"]), true),
+        (ActionGroupList::from_names(["trivialarith"]), false),
+        (ActionGroupList::new(), false),
+    ] {
+        let mut fd = build_fd();
+        let bl = mk_block(&mut fd);
+        let v = mk_reg(&mut fd, 0x100, 4);
+        let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_XOR, &[v, v]);
+        if let Some(mut filtered) = pool.clone_filtered(&groups) {
+            assert_eq!(filtered.apply(&mut fd, &mut ActionContext::new()), 0);
+        }
+        if enabled {
+            assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
+            let zero = in_of(&fd, op, 0).unwrap();
+            assert!(is_const(&fd, zero));
+            assert_eq!(const_val(&fd, zero), 0);
+            assert_eq!(fd.vbank().get(zero).unwrap().get_size(), 4);
+        } else {
+            assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_XOR);
+            assert_eq!(in_of(&fd, op, 0), Some(v));
+            assert_eq!(in_of(&fd, op, 1), Some(v));
+        }
+    }
 }
 
 /// Durability: `op_typeop` is the seam `RuleBitUndistribute` & co. retype ops

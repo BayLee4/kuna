@@ -71,7 +71,7 @@ use kuna_num::opcodes::OpCode;
 
 use kuna_base::marshal::ElementId;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -111,11 +111,8 @@ impl Rule for RuleStackProbeLoop {
     }
 
     /// C++ `RuleStackProbeLoop::clone`.
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleStackProbeLoop { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleStackProbeLoop { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleStackProbeLoop::applyOp` (`kuna_stackprobeloop.cc:63`).
@@ -289,6 +286,7 @@ pub fn parse_stack_probe_loop_form(p1: &str) -> KunaResult<(StackProbeLoopForm, 
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         ctor: || Box::new(RuleStackProbeLoop::new(true, "analysis")),
     }]
 }

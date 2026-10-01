@@ -13,7 +13,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use super::*;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
@@ -40,7 +40,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -50,8 +55,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> kuna_base::error::KunaResult<()>
@@ -93,7 +99,7 @@ fn wire_const(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_written(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     set_def(fd, vn, defop)
 }
 
@@ -104,7 +110,7 @@ fn build_add(fd: &mut Funcdata, off: u64, vbase: VarnodeId, kval: u64, sz: int4)
     let kconst = fd.new_constant(sz, kval);
     wire(fd, vbase, addop, 0);
     wire(fd, kconst, addop, 1);
-    let sum = fd.new_unique(sz, Some(unk(sz)));
+    let sum = fd.new_unique(sz, Some(unk(fd, sz)));
     set_def(fd, sum, addop)
 }
 
@@ -113,7 +119,7 @@ fn build_bool(fd: &mut Funcdata, off: u64, opc: OpCode, in0: VarnodeId, in1: Var
     let b = mk_op(fd, off, 2, opc);
     wire(fd, in0, b, 0);
     wire(fd, in1, b, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     set_def(fd, out, b)
 }
 
@@ -143,7 +149,7 @@ fn build_idiom(fd: &mut Funcdata, sz: int4, kval: u64) -> (OpId, VarnodeId) {
     let op = mk_op(fd, 0x130, 2, OpCode::CPUI_INT_NOTEQUAL);
     wire(fd, in0, op, 0);
     wire(fd, in1, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     let _ = set_def(fd, out, op);
 
     (op, vbase)
@@ -190,7 +196,7 @@ fn non_matching_in1_declines() {
     let op = mk_op(&mut fd, 0x130, 2, OpCode::CPUI_INT_NOTEQUAL);
     wire(&mut fd, in0, op, 0);
     wire(&mut fd, in1, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleOvLessSimplify::new(true);
@@ -215,7 +221,7 @@ fn mismatched_constants_decline() {
     let op = mk_op(&mut fd, 0x130, 2, OpCode::CPUI_INT_NOTEQUAL);
     wire(&mut fd, in0, op, 0);
     wire(&mut fd, in1, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleOvLessSimplify::new(true);

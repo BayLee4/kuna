@@ -47,7 +47,12 @@ fn build_fd() -> Funcdata {
     let stackspc = Rc::clone(manage.get_stack_space().unwrap());
     let sp_data = VarnodeStorage { space: Some(regspc), offset: SP_OFF, size: SP_SIZE as u32 };
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
-    let glb = Rc::new(ArchContext::new(manage));
+    let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let mut arch = ArchContext::new(manage);
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let code = Rc::clone(glb.manage().get_space_by_name("register").unwrap());
     let entry = Address::new(code, 0x1000);
     Funcdata::new("func", "func", glb, entry, 0x1000_0000, 0x40).unwrap()
@@ -185,13 +190,8 @@ fn apply_type_recommendations_locks_input_varnode_type() {
     let in_vn = fd.set_input_varnode(in_vn).unwrap();
     assert!(!fd.vbank().get(in_vn).unwrap().is_type_lock());
 
-    // Build an explicit 8-byte INT recommendation at the input's storage (a
-    // standalone factory suffices; the recommendation only carries an `Rc<Datatype>`).
-    use crate::dtype::TypeFactory as _;
-    let factory = crate::dtype::TypeFactoryImpl::new();
-    factory.set_default_alignment_map();
-    factory.set_max_basetype_size(8);
-    let dt = factory.get_base(8, type_metatype::TYPE_INT).unwrap();
+    // The recommendation belongs to the same graph as the input's initial type.
+    let dt = fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_INT).unwrap();
 
     assert!(!fd.get_scope_local().unwrap().has_type_recommendations());
     fd.get_scope_local_mut().unwrap().add_type_recommendation(in_addr, dt);
@@ -274,11 +274,7 @@ fn w10_stacklocal_typing_apply_type_recommendations_size_mismatch_no_lock() {
 
     // A *4-byte* INT recommendation at the same address — size mismatch vs the
     // 8-byte input, so findVarnodeInput(4, addr) finds nothing.
-    use crate::dtype::TypeFactory as _;
-    let factory = crate::dtype::TypeFactoryImpl::new();
-    factory.set_default_alignment_map();
-    factory.set_max_basetype_size(8);
-    let dt4 = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let dt4 = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_INT).unwrap();
     fd.get_scope_local_mut().unwrap().add_type_recommendation(in_addr, dt4);
 
     fd.apply_type_recommendations();
@@ -304,11 +300,7 @@ fn w10_stacklocal_typing_apply_type_recommendations_unknown_stays_unlocked() {
     let in_vn = fd.new_varnode(4, &in_addr, None);
     let in_vn = fd.set_input_varnode(in_vn).unwrap();
 
-    use crate::dtype::TypeFactory as _;
-    let factory = crate::dtype::TypeFactoryImpl::new();
-    factory.set_default_alignment_map();
-    factory.set_max_basetype_size(8);
-    let unk = factory.get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
+    let unk = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     fd.get_scope_local_mut().unwrap().add_type_recommendation(in_addr, unk);
 
     fd.apply_type_recommendations();

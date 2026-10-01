@@ -30,7 +30,7 @@ use std::rc::Rc;
 use kuna_base::address::{Address, RangeList};
 use kuna_base::partmap::PartMap;
 use kuna_base::space::{spacetype, AddrSpace, ConstantSpace};
-use kuna_decomp::dtype::Datatype;
+use kuna_decomp::dtype::{TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::context::{GlobalEntry, GlobalQuery};
 use kuna_decomp::varnode::varnode_flags;
 
@@ -63,7 +63,7 @@ fn entry(
     first: u64,
     last: u64,
     all_flags: u32,
-    ty: Option<Rc<Datatype>>,
+    ty: Option<TypeRoot>,
 ) -> GlobalEntry {
     GlobalEntry {
         space_index: space.get_index(),
@@ -225,10 +225,11 @@ fn v4_smallest_containing_flags_win() {
 #[test]
 fn v5_sized_type_only_when_typelocked_and_boundary_inclusive() {
     let ram = ram_space(3);
-    let ty: Rc<Datatype> = Rc::new(Datatype::new(
+    let factory = TypeFactoryImpl::new();
+    let ty = factory.get_base(
         4,
         kuna_decomp::dtype::type_metatype::TYPE_INT,
-    ));
+    ).unwrap();
     let usepoint = Address::new_invalid();
 
     // (a) NON-typelocked covering Symbol → None (inference stays free).

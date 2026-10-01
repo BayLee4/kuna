@@ -245,8 +245,8 @@ fn main_prototype(ctx: &AnalysisCtx) -> Option<PrototypePieces> {
     let charpp = types.get_type_pointer(ptr, charp, word_size).ok()?;
     Some(PrototypePieces {
         name: MAIN.to_string(),
-        outtype: Some(std::rc::Rc::clone(&int4)),
-        intypes: vec![int4, std::rc::Rc::clone(&charpp), charpp],
+        outtype: Some(int4.clone()),
+        intypes: vec![int4, charpp.clone(), charpp],
         innames: vec!["argc".to_string(), "argv".to_string(), "envp".to_string()],
         first_var_arg_slot: -1,
         output_storage: None,

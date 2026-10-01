@@ -55,6 +55,11 @@ phalanx; overlapping storage pieces of one symbol are tied together by the
 `variable.rs (VariableGroup)`/`(VariablePiece)` model so a 4-byte read of an
 8-byte slot stays a *piece* of the same group rather than a rival variable.
 
+Global name binding retains the raw chosen name and its optional owning scope
+path on the HighVariable. Qualification is deferred to emission, so changing
+namespace policy does not require rebinding names or change symbol/alias identity.
+Local names retain their existing binding rules.
+
 **Cover.** A variable can only absorb another if their live ranges do not
 collide, and the live range is the
 `decompiler/crates/kuna-decomp/src/p6_variables/cover.rs (Cover)`: per basic
@@ -845,6 +850,24 @@ optimizer, not of the aliasing — and its cost is a deliberately masked pointer
 (`p ^ mask`, dereferenced after a second `^ mask`), whose base stops counting
 as escaped; `option cookiescramble off` restores upstream's answer.
 
+**Parameter symbol lifetimes.** `ScopeLocal::add_param_symbol` mirrors committed
+parameter flags without erasing independent name/type locks on an exact
+existing symbol. New parameter mappings whose complete storage is not owned by
+the local scope are restricted to entry minus one, not the entire physical
+storage lifetime. This includes synthetic JOIN storage, whether its pieces are
+all registers or a register/stack mixture: a later write to one register must
+not become a write to the original aggregate field. Owned contiguous stack
+storage retains whole-function mapping, including genuine address-taken alias
+effects. Existing explicit mappings keep their use ranges and overlap behavior;
+stack pieces still inherit the stack scope's address-tied properties. Property lookup for a free,
+unattached Varnode uses an invalid usepoint
+(`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs
+(Funcdata::set_varnode_properties)`); only after it becomes an input or a
+written value is its actual usepoint known. This prevents transform-created
+register temporaries from inheriting a parameter's name lock and displacing
+the real input as a high-variable name representative. Whole-scope,
+address-tied symbols remain eligible before that lifetime is known.
+
 **Name recommendations.** A namelocked-but-NOT-typelocked local never
 survives restructure — `clearUnlockedCategory(-1)` removes every non-typelocked
 category-less symbol at the pass head — so its *name* survives separately: C++
@@ -939,7 +962,11 @@ same-address Varnodes with an equal comparable hash, and keeps the *smallest*
 collision list not exceeding the budget; a singleton wins immediately. If no
 method reaches uniqueness, the champion list's *position* and *total* are
 packed into dedicated bit fields of the hash (bits 49–51 and 52–54), making
-"the 3rd of 5 identical values at this address" a stable identity. When even
+"the 3rd of 5 identical values at this address" a stable identity. The chosen
+list, method/hash, and anchor address are retained together: a later method
+can have more collisions, and its hash must not be combined with an earlier
+method's count and position. Java's replay consumer checks that exact
+cardinality before resolving the recorded position. When even
 that fails — every method's list overflows the budget — the hash is 0 and the
 consumer errors: `decompiler/crates/kuna-decomp/src/substrate/funcdata.rs
 (Funcdata::build_dynamic_symbol)` aborts the request with "Unable to find

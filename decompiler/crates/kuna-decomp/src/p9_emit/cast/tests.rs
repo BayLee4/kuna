@@ -16,93 +16,106 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::*;
-use crate::dtype::{flags, type_metatype, DatatypeKind, TypeFactoryImpl};
+use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeFactoryImpl};
+
+fn fixture_factory() -> TypeFactoryImpl {
+    let f = TypeFactoryImpl::new();
+    f.set_default_alignment_map();
+    f.set_max_basetype_size(8);
+    f.setup_sizes(Some(4), 8, 8);
+    f
+}
 
 // -- Data-type builders -----------------------------------------------------
 //
 // These mirror `parse("int4")` etc. from testtypes.cc.  `parse` returns the
-// canonical factory type; here we build standalone `Rc<Datatype>`s with the
+// canonical factory type; here each test publishes factory-owned drafts with the
 // fields `castStandard`/`is*Cast` read (metatype, size, flags, typedefImm,
 // pointer ptrto/space/wordsize, code proto).
 
-fn base(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, meta))
+fn base(f: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, meta)).unwrap()
 }
 
-fn int_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_INT)
+fn int_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_INT)
 }
 
-fn uint_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_UINT)
+fn uint_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_UINT)
 }
 
-fn bool_t() -> Rc<Datatype> {
-    base(1, type_metatype::TYPE_BOOL)
+fn bool_t(f: &TypeFactoryImpl) -> TypeRoot {
+    base(f, 1, type_metatype::TYPE_BOOL)
 }
 
-fn float_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_FLOAT)
+fn float_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_FLOAT)
 }
 
-fn unknown_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_UNKNOWN)
+fn unknown_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_UNKNOWN)
 }
 
-fn void_t() -> Rc<Datatype> {
+fn void_t(f: &TypeFactoryImpl) -> TypeRoot {
     let mut t = Datatype::new(0, type_metatype::TYPE_VOID);
     t.kind = DatatypeKind::Void;
-    Rc::new(t)
+    f.intern(t).unwrap()
 }
 
 /// `parse("char")` — a 1-byte signed char (TYPE_INT metatype + chartype flag).
-fn char_t() -> Rc<Datatype> {
+fn char_t(f: &TypeFactoryImpl) -> TypeRoot {
     let mut t = Datatype::new(1, type_metatype::TYPE_INT);
     t.flags |= flags::chartype;
-    Rc::new(t)
+    f.intern(t).unwrap()
 }
 
 /// `types->getBase(s, meta, "name")` — a typedef whose `typedefImm` is `imm`.
-fn typedef_of(imm: Rc<Datatype>) -> Rc<Datatype> {
+fn typedef_of(f: &TypeFactoryImpl, imm: TypeRoot) -> TypeRoot {
     let mut t = Datatype::new(imm.get_size(), imm.get_metatype());
-    t.typedef_imm = Some(imm);
-    Rc::new(t)
+    t.kind = DatatypeKind::Alias;
+    t.typedef_imm = Some(imm.id());
+    f.intern(t).unwrap()
 }
 
 /// An enum data-type (`enum {…}`) — TYPE_INT/UINT metatype + enumtype flag.
-fn enum_t(size: int4, meta: type_metatype) -> Rc<Datatype> {
+fn enum_t(f: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
     let mut t = Datatype::new(size, meta);
     t.flags |= flags::enumtype;
-    Rc::new(t)
+    f.intern(t).unwrap()
 }
 
 /// A struct data-type (`struct {…}`) — TYPE_STRUCT, size from its fields.
-fn struct_t(size: int4) -> Rc<Datatype> {
-    let mut t = Datatype::new(size, type_metatype::TYPE_STRUCT);
+fn struct_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    // This layout-only record has no members imposing a stronger alignment.
+    // Unlike intern(), completion publishes a fully specified layout draft.
+    let mut t = Datatype::new_with_align(size, 1, type_metatype::TYPE_STRUCT);
     t.kind = DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
-    Rc::new(t)
+    let root = f.reserve_inferred("", 0, type_metatype::TYPE_STRUCT).unwrap();
+    f.complete(&root, t).unwrap();
+    root
 }
 
 /// `types->getTypePointer(8, ptrto, wordsize)` — an 8-byte pointer.
-fn ptr_to(ptrto: Rc<Datatype>, wordsize: uint4) -> Rc<Datatype> {
+fn ptr_to(f: &TypeFactoryImpl, ptrto: TypeRoot, wordsize: uint4) -> TypeRoot {
     let mut t = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-    t.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize };
-    Rc::new(t)
+    t.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize };
+    f.intern(t).unwrap()
 }
 
 /// An array data-type (`T var[n]`).
-fn array_of(arrayof: Rc<Datatype>, arraysize: int4) -> Rc<Datatype> {
+fn array_of(f: &TypeFactoryImpl, arrayof: TypeRoot, arraysize: int4) -> TypeRoot {
     let size = arrayof.get_size() * arraysize;
     let mut t = Datatype::new_with_align(size, -1, type_metatype::TYPE_ARRAY);
-    t.kind = DatatypeKind::Array { arrayof, arraysize };
-    Rc::new(t)
+    t.kind = DatatypeKind::Array { arrayof: arrayof.id(), arraysize };
+    f.intern(t).unwrap()
 }
 
 /// A code data-type with no prototype (a generic code pointer target).
-fn code_noproto() -> Rc<Datatype> {
+fn code_noproto(f: &TypeFactoryImpl) -> TypeRoot {
     let mut t = Datatype::new(1, type_metatype::TYPE_CODE);
     t.kind = DatatypeKind::Code { proto: None };
-    Rc::new(t)
+    f.intern(t).unwrap()
 }
 
 /// A `CastStrategyC` with `promoteSize == 4` (the x86:LE:64 `int` size the
@@ -126,7 +139,7 @@ fn strategy_java() -> CastStrategyJava {
 /// `castPrinted(opc, t1, t2)` for the non-comparison ops drives
 /// `TypeOpCopy::getInputCast` (typeop.cc:398-404):
 /// `castStandard(reqtype=t1, curtype=t2, care_uint_int=false, care_ptr_uint=true)`.
-fn copy_cast_printed(s: &CastStrategyC, t1: &Rc<Datatype>, t2: &Rc<Datatype>) -> bool {
+fn copy_cast_printed(s: &CastStrategyC, t1: &TypeRoot, t2: &TypeRoot) -> bool {
     s.cast_standard(t1, t2, false, true).is_some()
 }
 
@@ -134,83 +147,85 @@ fn copy_cast_printed(s: &CastStrategyC, t1: &Rc<Datatype>, t2: &Rc<Datatype>) ->
 
 #[test]
 fn cast_basic() {
+    let f = &fixture_factory();
     let s = strategy_c();
     assert_eq!(s.promote_size(), 4);
 
     // pre-validates TypeOpCopy::getInputCast over castStandard(t1,t2,false,true)
-    assert!(copy_cast_printed(&s, &int_t(4), &int_t(2))); // size differs -> cast
-    assert!(!copy_cast_printed(&s, &int_t(4), &uint_t(4))); // !care_uint_int -> no cast
-    assert!(copy_cast_printed(&s, &ptr_to(int_t(4), 1), &uint_t(8))); // ptr vs uint
-    assert!(!copy_cast_printed(&s, &int_t(1), &bool_t())); // INT<-BOOL same size -> no cast
-    assert!(!copy_cast_printed(&s, &unknown_t(4), &uint_t(4))); // reqbase UNKNOWN -> no cast
-    assert!(!copy_cast_printed(&s, &int_t(4), &unknown_t(4))); // curbase UNKNOWN, INT, !care -> no cast
-    assert!(copy_cast_printed(&s, &int_t(4), &float_t(4))); // INT<-FLOAT -> cast
-    assert!(copy_cast_printed(&s, &array_of(int_t(1), 4), &uint_t(4))); // ARRAY size4 vs UINT4 -> cast
+    assert!(copy_cast_printed(&s, &int_t(f, 4), &int_t(f, 2))); // size differs -> cast
+    assert!(!copy_cast_printed(&s, &int_t(f, 4), &uint_t(f, 4))); // !care_uint_int -> no cast
+    assert!(copy_cast_printed(&s, &ptr_to(f, int_t(f, 4), 1), &uint_t(f, 8))); // ptr vs uint
+    assert!(!copy_cast_printed(&s, &int_t(f, 1), &bool_t(f))); // INT<-BOOL same size -> no cast
+    assert!(!copy_cast_printed(&s, &unknown_t(f, 4), &uint_t(f, 4))); // reqbase UNKNOWN -> no cast
+    assert!(!copy_cast_printed(&s, &int_t(f, 4), &unknown_t(f, 4))); // curbase UNKNOWN, INT, !care -> no cast
+    assert!(copy_cast_printed(&s, &int_t(f, 4), &float_t(f, 4))); // INT<-FLOAT -> cast
+    assert!(copy_cast_printed(&s, &array_of(f, int_t(f, 1), 4), &uint_t(f, 4))); // ARRAY size4 vs UINT4 -> cast
 
     // typedef int4 vs int4: stripping the typedef yields the shared canonical
     // int4 -> ptr-eq -> no cast.
-    let canonical_int4 = int_t(4);
-    let typedef_int = typedef_of(Rc::clone(&canonical_int4));
+    let canonical_int4 = int_t(f, 4);
+    let typedef_int = typedef_of(f, Clone::clone(&canonical_int4));
     assert!(!copy_cast_printed(&s, &typedef_int, &canonical_int4));
 
     // char vs int1: both TYPE_INT size 1 -> no cast.
-    assert!(!copy_cast_printed(&s, &char_t(), &int_t(1)));
+    assert!(!copy_cast_printed(&s, &char_t(f), &int_t(f, 1)));
     // uint1 vs char: req UINT1, cur INT(char) size1, !care_uint_int -> meta INT
     // in the no-cast set -> no cast.
-    assert!(!copy_cast_printed(&s, &uint_t(1), &char_t()));
+    assert!(!copy_cast_printed(&s, &uint_t(f, 1), &char_t(f)));
 }
 
 // -- cast_pointer (testtypes.cc:137-155) ------------------------------------
 
 #[test]
 fn cast_pointer() {
+    let f = &fixture_factory();
     let s = strategy_c();
 
     // uint4* vs int4*: descend into ptrto (care_uint_int becomes true);
     // UINT vs INT with care -> cast.
-    assert!(copy_cast_printed(&s, &ptr_to(uint_t(4), 1), &ptr_to(int_t(4), 1)));
+    assert!(copy_cast_printed(&s, &ptr_to(f, uint_t(f, 4), 1), &ptr_to(f, int_t(f, 4), 1)));
     // void* vs float4*: descend; reqbase VOID -> no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(void_t(), 1), &ptr_to(float_t(4), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, void_t(f), 1), &ptr_to(f, float_t(f, 4), 1)));
     // int2* vs void*: descend; curbase VOID -> no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(int_t(2), 1), &ptr_to(void_t(), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, int_t(f, 2), 1), &ptr_to(f, void_t(f), 1)));
 
     // pointer-to-typedef (myint4) vs int4*: descend into the pointers, then strip
     // the typedef on the req side -> shared int4 -> ptr-eq -> no cast.
     // (testtypes: `typedefPtr = getTypePointer(8, typedefInt, 1)`.)
-    let canonical_int4 = int_t(4);
-    let typedef_int = typedef_of(Rc::clone(&canonical_int4));
-    let ptr_to_typedef = ptr_to(typedef_int, 1);
-    let plain_int_ptr = ptr_to(Rc::clone(&canonical_int4), 1);
+    let canonical_int4 = int_t(f, 4);
+    let typedef_int = typedef_of(f, Clone::clone(&canonical_int4));
+    let ptr_to_typedef = ptr_to(f, typedef_int, 1);
+    let plain_int_ptr = ptr_to(f, Clone::clone(&canonical_int4), 1);
     assert!(!copy_cast_printed(&s, &ptr_to_typedef, &plain_int_ptr));
 
     // bool** vs int1**: descend twice; BOOL vs INT same size with care -> cast.
     assert!(copy_cast_printed(
         &s,
-        &ptr_to(ptr_to(bool_t(), 1), 1),
-        &ptr_to(ptr_to(int_t(1), 1), 1)
+        &ptr_to(f, ptr_to(f, bool_t(f), 1), 1),
+        &ptr_to(f, ptr_to(f, int_t(f, 1), 1), 1)
     ));
 
     // structone* vs structtwo*: descend; two distinct structs same size ->
     // default arm -> cast.
-    assert!(copy_cast_printed(&s, &ptr_to(struct_t(8), 1), &ptr_to(struct_t(8), 1)));
+    assert!(copy_cast_printed(&s, &ptr_to(f, struct_t(f, 8), 1), &ptr_to(f, struct_t(f, 8), 1)));
 
     // xunknown4* vs int4*: descend; reqbase UNKNOWN -> no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(unknown_t(4), 1), &ptr_to(int_t(4), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, unknown_t(f, 4), 1), &ptr_to(f, int_t(f, 4), 1)));
     // uint4* vs xunknown4*: descend; UINT with care, curbase UNKNOWN + isptr ->
     // no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(uint_t(4), 1), &ptr_to(unknown_t(4), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, uint_t(f, 4), 1), &ptr_to(f, unknown_t(f, 4), 1)));
     // char* vs int1*: descend; both TYPE_INT (char is INT) size1 -> no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(char_t(), 1), &ptr_to(int_t(1), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, char_t(f), 1), &ptr_to(f, int_t(f, 1), 1)));
     // uint1* vs char*: descend; req UINT1, cur INT(char), care -> default -> cast.
-    assert!(copy_cast_printed(&s, &ptr_to(uint_t(1), 1), &ptr_to(char_t(), 1)));
+    assert!(copy_cast_printed(&s, &ptr_to(f, uint_t(f, 1), 1), &ptr_to(f, char_t(f), 1)));
 
     // int4* vs named-pointer(myptrint4 -> int4): a named pointer is still a real
     // TypePointer to the same int4 (`getTypePointer(8, int4, 1, "myptrint4")`),
     // so descending yields shared int4 -> ptr-eq -> no cast.  The name only
     // affects printing, not the cast lattice.
-    let inner2 = int_t(4);
-    let req_ptr = ptr_to(Rc::clone(&inner2), 1);
-    let named = ptr_to(Rc::clone(&inner2), 1);
+    let inner2 = int_t(f, 4);
+    let req_ptr = ptr_to(f, Clone::clone(&inner2), 1);
+    let named = ptr_to(f, Clone::clone(&inner2), 1);
     assert!(!copy_cast_printed(&s, &req_ptr, &named));
 }
 
@@ -218,20 +233,21 @@ fn cast_pointer() {
 
 #[test]
 fn cast_enum() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // `enum enumone { ONE=1, TWO=2 }` is an *unsigned* enum in Ghidra
     // (TYPE_ENUM_UINT -> base metatype TYPE_UINT), size 8.
-    let enum1 = enum_t(8, type_metatype::TYPE_UINT);
+    let enum1 = enum_t(f, 8, type_metatype::TYPE_UINT);
 
     // int8 vs enumone: req INT8, cur UINT(enum) size8, !care_uint_int -> meta
     // UINT in INT's no-cast set -> no cast.
-    assert!(!copy_cast_printed(&s, &int_t(8), &enum1));
+    assert!(!copy_cast_printed(&s, &int_t(f, 8), &enum1));
     // uint8* vs enumone*: descend (care becomes true); req UINT8, cur UINT(enum)
     // -> UINT no-cast arm -> no cast.
-    assert!(!copy_cast_printed(&s, &ptr_to(uint_t(8), 1), &ptr_to(Rc::clone(&enum1), 1)));
+    assert!(!copy_cast_printed(&s, &ptr_to(f, uint_t(f, 8), 1), &ptr_to(f, Clone::clone(&enum1), 1)));
     // enumone vs uint8: req UINT(enum), cur UINT8, !care -> UINT in UINT's
     // no-cast set -> no cast.
-    assert!(!copy_cast_printed(&s, &enum1, &uint_t(8)));
+    assert!(!copy_cast_printed(&s, &enum1, &uint_t(f, 8)));
 }
 
 // -- cast_compare (testtypes.cc:165-177) ------------------------------------
@@ -248,6 +264,7 @@ fn cast_enum() {
 
 #[test]
 fn cast_compare_signedness() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // INT_LESS wants unsigned operands: comparing two int4 needs a cast, two
     // uint4 does not.  This is castStandard(uint-required, curtype, false, false)
@@ -258,11 +275,11 @@ fn cast_compare_signedness() {
     // unsigned requirement.  We assert the castStandard building block: a UINT
     // requirement against an INT current with !care_uint_int does NOT cast,
     // confirming the cast must originate in getInputCast's promotion forcing.
-    assert!(s.cast_standard(&uint_t(4), &int_t(4), false, false).is_none());
+    assert!(s.cast_standard(&uint_t(f, 4), &int_t(f, 4), false, false).is_none());
 
     // INT_SLESS wants signed operands.  castStandard(INT, UINT, false, false):
     // !care_uint_int -> UINT in INT no-cast set -> no cast at the lattice level.
-    assert!(s.cast_standard(&int_t(4), &uint_t(4), false, false).is_none());
+    assert!(s.cast_standard(&int_t(f, 4), &uint_t(f, 4), false, false).is_none());
 
     // INT_EQUAL uint8 vs int4*: same size 8?  int4* is size 8, uint8 size 8.
     // reqtype = lower typeOrder; castStandard(uint8, int4*, false, false): req
@@ -271,15 +288,15 @@ fn cast_compare_signedness() {
     // which slot getInputCast queries.  At the lattice level:
     //   castStandard(int4*, uint8, false, false): req PTR, cur UINT8 same size,
     //   PTR default arm -> cast.
-    assert!(s.cast_standard(&ptr_to(int_t(4), 1), &uint_t(8), false, false).is_some());
+    assert!(s.cast_standard(&ptr_to(f, int_t(f, 4), 1), &uint_t(f, 8), false, false).is_some());
     //   castStandard(uint8, int4*, false, false): req UINT, !care_ptr_uint & PTR
     //   -> no cast.
-    assert!(s.cast_standard(&uint_t(8), &ptr_to(int_t(4), 1), false, false).is_none());
+    assert!(s.cast_standard(&uint_t(f, 8), &ptr_to(f, int_t(f, 4), 1), false, false).is_none());
 
     // INT_EQUAL int4 vs float4: different metatype same size -> reqtype lower
     // typeOrder is float; castStandard(int4, float4, false, false): req INT, cur
     // FLOAT not in no-cast set -> default -> cast.
-    assert!(s.cast_standard(&int_t(4), &float_t(4), false, false).is_some());
+    assert!(s.cast_standard(&int_t(f, 4), &float_t(f, 4), false, false).is_some());
 }
 
 // -- cast_integertoken (testtypes.cc:204-213) -------------------------------
@@ -345,11 +362,12 @@ fn cast_integertoken() {
 
 #[test]
 fn cast_code_generic_no_cast() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // Two generic code pointers (no prototype) of the same size -> the TYPE_CODE
     // arm returns no cast (don't cast between function/generic code pointers).
-    let a = code_noproto();
-    let b = code_noproto();
+    let a = code_noproto(f);
+    let b = code_noproto(f);
     assert!(s.cast_standard(&a, &b, false, false).is_none());
 }
 
@@ -357,21 +375,22 @@ fn cast_code_generic_no_cast() {
 
 #[test]
 fn mark_explicit_unsigned_basic() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // INT_OR(const uint4, var int4): INT_OR inherits sign, not first-param-only,
     // const slot 0 is UINT (markable), other side INT (won't force) -> marked.
     let mut ctx = MockCtx::new();
-    let cst = ctx.add_const(4, 5, uint_t(4));
-    let other = ctx.add_var(4, int_t(4));
-    let out = ctx.add_var(4, int_t(4));
+    let cst = ctx.add_const(4, 5, uint_t(f, 4));
+    let other = ctx.add_var(4, int_t(f, 4));
+    let out = ctx.add_var(4, int_t(f, 4));
     let op = ctx.add_op(OpCode::CPUI_INT_OR, vec![cst, other], Some(out));
     assert!(s.mark_explicit_unsigned(&mut ctx, op, 0));
     assert!(ctx.unsigned_marked(cst));
 
     // If the other side is UINT, the operation forces unsigned anyway -> not marked.
     let mut ctx2 = MockCtx::new();
-    let cst2 = ctx2.add_const(4, 5, uint_t(4));
-    let other2 = ctx2.add_var(4, uint_t(4));
+    let cst2 = ctx2.add_const(4, 5, uint_t(f, 4));
+    let other2 = ctx2.add_var(4, uint_t(f, 4));
     let op2 = ctx2.add_op(OpCode::CPUI_INT_OR, vec![cst2, other2], None);
     assert!(!s.mark_explicit_unsigned(&mut ctx2, op2, 0));
 }
@@ -380,18 +399,20 @@ fn mark_explicit_unsigned_basic() {
 
 #[test]
 fn int_promotion_no_promotion_for_full_size() {
+    let f = &fixture_factory();
     let s = strategy_c();
     let mut ctx = MockCtx::new();
     // size >= promoteSize(4) -> NO_PROMOTION regardless of contents.
-    let v = ctx.add_var(4, int_t(4));
+    let v = ctx.add_var(4, int_t(f, 4));
     assert_eq!(s.int_promotion_type(&ctx, v), IntPromotionCode::NO_PROMOTION);
 }
 
 #[test]
 fn int_promotion_explicit_small_is_no_promotion() {
+    let f = &fixture_factory();
     let s = strategy_c();
     let mut ctx = MockCtx::new();
-    let v = ctx.add_var(2, int_t(2));
+    let v = ctx.add_var(2, int_t(f, 2));
     ctx.set_explicit(v, true);
     // explicit small non-constant -> NO_PROMOTION
     assert_eq!(s.int_promotion_type(&ctx, v), IntPromotionCode::NO_PROMOTION);
@@ -399,16 +420,17 @@ fn int_promotion_explicit_small_is_no_promotion() {
 
 #[test]
 fn local_extension_constant_high_bit_zero_is_either() {
+    let f = &fixture_factory();
     let s = strategy_c();
     let mut ctx = MockCtx::new();
     // small UINT constant, high bit clear -> EITHER_EXTENSION
-    let c = ctx.add_const(2, 5, uint_t(2));
+    let c = ctx.add_const(2, 5, uint_t(f, 2));
     assert_eq!(
         s.local_extension_type(&ctx, c, None),
         IntPromotionCode::EITHER_EXTENSION
     );
     // small INT constant, high bit set -> natural (SIGNED)
-    let c2 = ctx.add_const(2, 0x8000, int_t(2));
+    let c2 = ctx.add_const(2, 0x8000, int_t(f, 2));
     assert_eq!(
         s.local_extension_type(&ctx, c2, None),
         IntPromotionCode::SIGNED_EXTENSION
@@ -419,68 +441,72 @@ fn local_extension_constant_high_bit_zero_is_either() {
 
 #[test]
 fn java_cast_standard_pointers_never_cast() {
+    let f = &fixture_factory();
     let s = strategy_java();
     // Any pointer involved -> no cast (object refs use explicit cast ops).
     assert!(s
-        .cast_standard(&ptr_to(int_t(4), 1), &ptr_to(uint_t(4), 1), true, true)
+        .cast_standard(&ptr_to(f, int_t(f, 4), 1), &ptr_to(f, uint_t(f, 4), 1), true, true)
         .is_none());
-    assert!(s.cast_standard(&int_t(4), &ptr_to(int_t(4), 1), true, true).is_none());
+    assert!(s.cast_standard(&int_t(f, 4), &ptr_to(f, int_t(f, 4), 1), true, true).is_none());
     // Size change -> always cast.
-    assert!(s.cast_standard(&int_t(4), &int_t(2), false, true).is_some());
+    assert!(s.cast_standard(&int_t(f, 4), &int_t(f, 2), false, true).is_some());
 }
 
 #[test]
 fn java_is_zext_cast() {
+    let f = &fixture_factory();
     let s = strategy_java();
     // int1 -> int4 (byte->int): INT size1 -> not zext (byte) -> false
-    assert!(!s.is_zext_cast(&int_t(4), &int_t(1)));
+    assert!(!s.is_zext_cast(&int_t(f, 4), &int_t(f, 1)));
     // uint1 -> uint4: UINT size1 (<4, not the short/byte exclusions) -> zext
-    assert!(s.is_zext_cast(&uint_t(4), &uint_t(1)));
+    assert!(s.is_zext_cast(&uint_t(f, 4), &uint_t(f, 1)));
     // size 2 non-char -> not zext (short) -> false
-    assert!(!s.is_zext_cast(&int_t(4), &uint_t(2)));
+    assert!(!s.is_zext_cast(&int_t(f, 4), &uint_t(f, 2)));
     // size >=4 -> not zext -> false
-    assert!(!s.is_zext_cast(&int_t(8), &uint_t(4)));
+    assert!(!s.is_zext_cast(&int_t(f, 8), &uint_t(f, 4)));
     // non-integer input -> false
-    assert!(!s.is_zext_cast(&int_t(4), &float_t(2)));
+    assert!(!s.is_zext_cast(&int_t(f, 4), &float_t(f, 2)));
 }
 
 #[test]
 fn c_is_sext_zext_cast() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // SEXT cast: input must be signed (INT or BOOL), output INT/UINT.
-    assert!(s.is_sext_cast(&int_t(4), &int_t(2)));
-    assert!(s.is_sext_cast(&uint_t(4), &bool_t()));
-    assert!(!s.is_sext_cast(&int_t(4), &uint_t(2))); // input UINT -> not sext
-    assert!(!s.is_sext_cast(&float_t(4), &int_t(2))); // output FLOAT -> not cast
+    assert!(s.is_sext_cast(&int_t(f, 4), &int_t(f, 2)));
+    assert!(s.is_sext_cast(&uint_t(f, 4), &bool_t(f)));
+    assert!(!s.is_sext_cast(&int_t(f, 4), &uint_t(f, 2))); // input UINT -> not sext
+    assert!(!s.is_sext_cast(&float_t(f, 4), &int_t(f, 2))); // output FLOAT -> not cast
     // ZEXT cast: input must be unsigned (UINT or BOOL).
-    assert!(s.is_zext_cast(&int_t(4), &uint_t(2)));
-    assert!(s.is_zext_cast(&uint_t(4), &bool_t()));
-    assert!(!s.is_zext_cast(&int_t(4), &int_t(2))); // input INT -> not zext
+    assert!(s.is_zext_cast(&int_t(f, 4), &uint_t(f, 2)));
+    assert!(s.is_zext_cast(&uint_t(f, 4), &bool_t(f)));
+    assert!(!s.is_zext_cast(&int_t(f, 4), &int_t(f, 2))); // input INT -> not zext
 }
 
 #[test]
 fn c_is_subpiece_cast() {
+    let f = &fixture_factory();
     let s = strategy_c();
     // offset != 0 -> never a cast.
-    assert!(!s.is_subpiece_cast(&int_t(2), &int_t(4), 1));
+    assert!(!s.is_subpiece_cast(&int_t(f, 2), &int_t(f, 4), 1));
     // INT<-INT, offset 0 -> cast (truncation shows up).
-    assert!(s.is_subpiece_cast(&int_t(2), &int_t(4), 0));
+    assert!(s.is_subpiece_cast(&int_t(f, 2), &int_t(f, 4), 0));
     // float output from int input -> cast.
-    assert!(s.is_subpiece_cast(&float_t(2), &int_t(4), 0));
+    assert!(s.is_subpiece_cast(&float_t(f, 2), &int_t(f, 4), 0));
     // far pointer (size 8) -> near pointer (size 4): out smaller -> cast.
     let near = {
         let mut t = Datatype::new_with_align(4, -1, type_metatype::TYPE_PTR);
         t.kind = DatatypeKind::Pointer {
-            ptrto: int_t(4),
+            ptrto: int_t(f, 4).id(),
             spaceid: None,
             truncate: None,
             wordsize: 1,
         };
-        Rc::new(t)
+        f.intern(t).unwrap()
     };
-    assert!(s.is_subpiece_cast(&near, &ptr_to(int_t(4), 1), 0));
+    assert!(s.is_subpiece_cast(&near, &ptr_to(f, int_t(f, 4), 1), 0));
     // ptr input, non-int/uint output -> not a cast.
-    assert!(!s.is_subpiece_cast(&float_t(8), &ptr_to(int_t(4), 1), 0));
+    assert!(!s.is_subpiece_cast(&float_t(f, 8), &ptr_to(f, int_t(f, 4), 1), 0));
 }
 
 // -- Mock CastContext -------------------------------------------------------
@@ -488,7 +514,7 @@ fn c_is_subpiece_cast() {
 struct MockVn {
     size: int4,
     offset: uintb,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
     constant: bool,
     explicit: bool,
     written: bool,
@@ -520,7 +546,7 @@ impl MockCtx {
         }
     }
 
-    fn add_var(&mut self, size: int4, ty: Rc<Datatype>) -> VnRef {
+    fn add_var(&mut self, size: int4, ty: TypeRoot) -> VnRef {
         let id = self.vns.len();
         self.vns.push(MockVn {
             size,
@@ -538,7 +564,7 @@ impl MockCtx {
         VnRef(id)
     }
 
-    fn add_const(&mut self, size: int4, offset: uintb, ty: Rc<Datatype>) -> VnRef {
+    fn add_const(&mut self, size: int4, offset: uintb, ty: TypeRoot) -> VnRef {
         let v = self.add_var(size, ty);
         self.vns[v.0].constant = true;
         self.vns[v.0].offset = offset;
@@ -602,11 +628,11 @@ impl CastContext for MockCtx {
     fn vn_lone_descend(&self, vn: VnRef) -> Option<OpRef> {
         self.vns[vn.0].lone
     }
-    fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type(&self, vn: VnRef) -> TypeRoot {
+        Clone::clone(&self.vns[vn.0].ty)
     }
-    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> TypeRoot {
+        Clone::clone(&self.vns[vn.0].ty)
     }
     fn op_inherits_sign(&self, op: OpRef) -> bool {
         crate::typeop::type_op_info(self.ops[op.0].code).inherits_sign()
@@ -653,11 +679,12 @@ fn long_printed(
     size: int4,
     val: uintb,
 ) -> bool {
+    let f = &fixture_factory();
     let mut ctx = MockCtx::new();
-    let ct = base(size, meta);
+    let ct = base(f, size, meta);
     let cst = ctx.add_const(size, val, ct);
-    let sa = ctx.add_var(4, int_t(4));
-    let out = ctx.add_var(size, int_t(size));
+    let sa = ctx.add_var(4, int_t(f, 4));
+    let out = ctx.add_var(size, int_t(f, size));
     let op = ctx.add_op(opc, vec![cst, sa], Some(out));
     s.mark_explicit_long_size(&mut ctx, op, 0)
 }

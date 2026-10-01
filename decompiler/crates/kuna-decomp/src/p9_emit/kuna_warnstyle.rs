@@ -15,8 +15,9 @@
 //! `emit_comment_func_header` collect [`crate::printc::warning_slug`] slugs
 //! under [`crate::printc::PrintCOptions::warn_inline`], and
 //! `flush_eol_warnings` appends them at the owning line's last token.  Only
-//! comments of type WARNING/WARNINGHEADER restyle; user and `dwarf_lines`
-//! comments keep their banner-line form.
+//! warning-only WARNING/WARNINGHEADER comments restyle; user and `dwarf_lines`
+//! comments keep their banner-line form. A console comment tagged with its
+//! selected visibility mask remains ordinary even if that mask includes WARNING.
 //!
 //! Following the kuna-option idiom ([`crate::kuna_arraynotation::OptionArrayNotation`]),
 //! this module owns only the option struct; the caller

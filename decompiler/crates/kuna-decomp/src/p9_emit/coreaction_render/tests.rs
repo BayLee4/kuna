@@ -24,6 +24,7 @@ use kuna_base::space::{
 use super::*;
 use crate::action::ActionGroupList;
 use crate::context::ArchContext;
+use crate::dtype::TypeFactory;
 
 // -----------------------------------------------------------------------------
 // Harness (mirrors coreaction_cleanup.rs / coreaction_protos.rs fixtures)
@@ -326,5 +327,276 @@ fn all_applies_report_no_change_on_empty_fd() {
         let r = a.apply(&mut fd, &mut ctx);
         assert_eq!(r, 0, "{} apply must return 0", a.get_name());
         assert_eq!(a.base().count, 0, "{} apply must report no change", a.get_name());
+    }
+}
+
+fn typed_call_fixture() -> (Funcdata, crate::dtype::TypeRoot, Rc<crate::fspec::ProtoModel>) {
+    typed_call_fixture_with_globals(|_, _| {})
+}
+
+fn typed_call_fixture_with_globals(
+    configure: impl FnOnce(&mut ArchContext, &crate::dtype::TypeRoot),
+) -> (Funcdata, crate::dtype::TypeRoot, Rc<crate::fspec::ProtoModel>) {
+    use crate::dtype::{type_class, TypeFactoryImpl};
+    use crate::fspec::{LogicalCallable, ModelContext, ParamEntry, ProtoModel};
+
+    let mut manager = build_manager();
+    let register = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3,
+        addrspace_flags::hasphysical, 1, 1,
+    ));
+    manager.insert_space(register.clone()).unwrap();
+    manager.insert_space(Rc::new(kuna_base::space::FspecSpace::new(4))).unwrap();
+    let manager = Rc::new(manager);
+    let mut model = ProtoModel::new(&manager);
+    model.build_param_list("standard").unwrap();
+    model.set_name("callback");
+    for (input, offset) in [(true, 0x10), (false, 0x20)] {
+        let entry = ParamEntry::seed(
+            0, type_class::TYPECLASS_GENERAL, register.clone(), offset, 4, 1, 0,
+            0, true, false, &[], &manager,
+        ).unwrap();
+        let list = if input { model.input_mut() } else { model.output_mut() };
+        list.push_entry(entry);
+        list.finish_decode();
+    }
+    let model = Rc::new(model);
+    let context = ModelContext::new(manager.clone());
+    context.set_default(Some(model.clone()));
+    let factory = Rc::new(TypeFactoryImpl::new());
+    factory.set_default_alignment_map();
+    factory.set_max_basetype_size(8);
+    factory.set_core_type("void", 0, type_metatype::TYPE_VOID, false).unwrap();
+    factory.set_core_type("int4", 4, type_metatype::TYPE_INT, false).unwrap();
+    factory.cache_core_types().unwrap();
+    factory.set_model_context(context).unwrap();
+    let int_type = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let code = factory.get_type_code_proto(&LogicalCallable {
+        binding: factory.model_binding(None).unwrap(),
+        output: int_type.id(),
+        inputs: vec![int_type.id()],
+        variadic: false,
+        input_closed: true,
+        logical_first: None,
+        flags: 0,
+    }).unwrap();
+    let mut arch = ArchContext::new_shared(manager);
+    let address = Address::new(arch.manage().get_space_by_name("ram").unwrap().clone(), 0x1000);
+    arch.types = Some(factory);
+    arch.defaultfp = Some(model.clone());
+    configure(&mut arch, &code);
+    let mut fd = Funcdata::new("typed", "typed", Rc::new(arch), address, 0x10000000, 0x40).unwrap();
+    fd.start_type_recovery();
+    (fd, code, model)
+}
+
+fn add_typed_indirect_call(
+    fd: &mut Funcdata,
+    code: &crate::dtype::TypeRoot,
+    model: Rc<crate::fspec::ProtoModel>,
+    offset: u64,
+) -> (crate::context::OpId, crate::context::VarnodeId, crate::context::VarnodeId) {
+    use crate::context::TypeOp;
+    use crate::fspec::FuncCallSpecs;
+    use crate::op::pcodeop_flags;
+
+    let register = fd.get_arch().manage().get_space_by_name("register").unwrap().clone();
+    let factory = fd.get_arch().types_rc().unwrap();
+    let pointer = factory.get_type_pointer(8, code.clone(), 1).unwrap();
+    let int_type = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let call = fd.new_op(3, Address::new(ram_space(fd), offset));
+    fd.obank_mut().change_opcode(call, TypeOp::new(
+        OpCode::CPUI_CALLIND, pcodeop_flags::call, "CALLIND",
+    ));
+    let target = fd.new_varnode(8, &Address::new(register.clone(), 0x80), Some(pointer));
+    let discarded = fd.new_varnode(4, &Address::new(register.clone(), 0x30), Some(int_type.clone()));
+    let argument = fd.new_varnode(4, &Address::new(register.clone(), 0x10), Some(int_type));
+    fd.op_set_input(call, target, 0).unwrap();
+    fd.op_set_input(call, discarded, 1).unwrap();
+    fd.op_set_input(call, argument, 2).unwrap();
+    let output = fd.new_varnode_out(4, &Address::new(register.clone(), 0x20), call).unwrap();
+    let mut spec = FuncCallSpecs::new(call, Address::new_invalid());
+    spec.proto_mut().set_internal(model, factory.get_type_void().unwrap());
+    spec.get_active_input().register_trial(&Address::new(register.clone(), 0x30), 4);
+    spec.get_active_input().register_trial(&Address::new(register, 0x10), 4);
+    fd.push_call_specs(spec);
+    (call, argument, output)
+}
+
+#[test]
+fn typed_callind_commits_real_operands_and_preserves_shared_signature() {
+    let (mut fd, code, model) = typed_call_fixture();
+    let (call, argument, output) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+    let factory = fd.get_arch().types_rc().unwrap();
+    let shared = crate::fspec::materialize_callable(&*factory, &code).unwrap().unwrap();
+    let mut ctx = ActionContext::new();
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ctx);
+    assert!(!ctx.has_error());
+    assert!(!fd.has_restart_pending());
+    let op = fd.obank().get(call).unwrap();
+    assert_eq!(op.code(), OpCode::CPUI_CALLIND);
+    assert_eq!(op.num_input(), 2);
+    assert_eq!(op.get_in(1), Some(argument));
+    assert_eq!(op.get_out(), Some(output));
+    assert_eq!(fd.get_call_specs(0).proto().get_output().get_type().unwrap().id(), shared.logical.output);
+    assert!(fd.get_call_specs(0).proto().is_override());
+    assert!(!shared.prototype().is_override());
+    assert!(Rc::ptr_eq(&shared, &crate::fspec::materialize_callable(&*factory, &code).unwrap().unwrap()));
+}
+
+#[test]
+fn typed_callind_preserves_unlocked_site_pin_while_restricting_other_site() {
+    use crate::fspec::{parameter_pieces_flags, ParameterPieces};
+
+    let (mut fd, code, model) = typed_call_fixture();
+    let (first, _, _) = add_typed_indirect_call(&mut fd, &code, model.clone(), 0x1010);
+    let (second, argument, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1020);
+    let register = fd.get_arch().manage().get_space_by_name("register").unwrap().clone();
+    let custom = fd.get_arch().types().unwrap().get_base(2, type_metatype::TYPE_UINT).unwrap();
+    let proto = fd.get_call_specs_mut(0).proto_mut();
+    proto.set_param(0, "pinned_name", &ParameterPieces {
+        addr: Address::new(register, 0x30),
+        type_: Some(custom),
+        flags: parameter_pieces_flags::NAMELOCK,
+    });
+    proto.set_custom_storage(true);
+    proto.set_override(true);
+    assert!(!proto.is_input_locked());
+    let mut ctx = ActionContext::new();
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ctx);
+    assert!(!ctx.has_error());
+    assert_eq!(fd.obank().get(first).unwrap().num_input(), 3);
+    let pinned = fd.get_call_specs(0).proto();
+    assert!(pinned.has_custom_storage());
+    assert!(!pinned.is_input_locked());
+    assert_eq!(pinned.get_param(0).unwrap().get_name(), "pinned_name");
+    assert_eq!(pinned.get_param(0).unwrap().get_address().get_offset(), 0x30);
+    assert_eq!(fd.obank().get(second).unwrap().num_input(), 2);
+    assert_eq!(fd.obank().get(second).unwrap().get_in(1), Some(argument));
+}
+
+#[test]
+fn typed_callind_failed_late_restriction_persists_only_in_same_analysis() {
+    let (mut fd, code, model) = typed_call_fixture();
+    let (call, _, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+    // No surviving trial can provide the required register argument.
+    fd.get_call_specs_mut(0).get_active_input().clear();
+    let site = fd.obank().get(call).unwrap().get_addr().clone();
+    let mut ctx = ActionContext::new();
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ctx);
+    assert!(!ctx.has_error());
+    assert!(fd.has_restart_pending());
+    assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
+    let stored = fd.get_override().find_proto_override(&site).unwrap();
+    assert_eq!(stored.num_params(), 1);
+    assert_eq!(stored.get_param(0).unwrap().get_address().get_offset(), 0x10);
+    assert_eq!(stored.get_output().get_address().get_offset(), 0x20);
+    fd.clear();
+    assert!(fd.get_override().find_proto_override(&site).unwrap().is_override());
+    let arch = fd.get_arch().clone();
+    let fresh = Funcdata::new("fresh", "fresh", arch, fd.get_address().clone(), 0x10000000, 0x40).unwrap();
+    assert!(fresh.get_override().find_proto_override(&site).is_none());
+}
+
+#[test]
+fn generic_code_pointer_does_not_invent_a_callable_declaration() {
+    let (mut fd, _, model) = typed_call_fixture();
+    let generic_code = fd.get_arch().types().unwrap().get_type_code().unwrap();
+    let (call, _, output) = add_typed_indirect_call(&mut fd, &generic_code, model, 0x1010);
+    let mut ctx = ActionContext::new();
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ctx);
+    assert!(!ctx.has_error());
+    assert!(!fd.has_restart_pending());
+    assert!(!fd.get_call_specs(0).proto().is_override());
+    assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
+    assert_eq!(fd.obank().get(call).unwrap().get_out(), Some(output));
+}
+
+#[test]
+fn late_external_deindirection_keeps_exact_data_signature_precedence() {
+    use kuna_base::address::RangeList;
+    use kuna_base::partmap::PartMap;
+    use crate::context::{GlobalEntry, GlobalQuery};
+    use crate::fspec::LogicalCallable;
+    use crate::varnode::varnode_flags;
+
+    for callable_data in [false, true] {
+        let (mut fd, code, model) = typed_call_fixture_with_globals(|arch, code| {
+            let factory = arch.types_rc().unwrap();
+            let loader_code = if callable_data {
+                // Conflict: the slot declares one input; the loader declares none.
+                factory.get_type_code_proto(&LogicalCallable {
+                    binding: factory.model_binding(None).unwrap(),
+                    output: factory.get_base(4, type_metatype::TYPE_INT).unwrap().id(),
+                    inputs: Vec::new(),
+                    variadic: false,
+                    input_closed: true,
+                    logical_first: None,
+                    flags: 0,
+                }).unwrap()
+            } else {
+                // Conflict: a data-only slot cannot inherit this one-input type.
+                code.clone()
+            };
+            let data_type = if callable_data {
+                factory.get_type_pointer(8, code.clone(), 1).unwrap()
+            } else {
+                factory.get_base(8, type_metatype::TYPE_INT).unwrap()
+            };
+            let entry = |name: &str, ty, is_function| GlobalEntry {
+                space_index: arch.manage().get_space_by_name("ram").unwrap().get_index(),
+                first: 0x3000,
+                last: 0x3007,
+                size: 8,
+                all_flags: 0,
+                addrtied: true,
+                uselimit: RangeList::new(),
+                symbol_name: name.to_owned(),
+                symbol_offset: 0,
+                symbol_type: Some(ty),
+                scope_path: Vec::new(),
+                is_function,
+                func_inject_id: -1,
+                func_no_return: false,
+                symbol_id: 0,
+            };
+            arch.global_query = Some(Rc::new(GlobalQuery::new(
+                vec![entry("import_name", loader_code, true), entry("slot", data_type, false)],
+                RangeList::new(), PartMap::new(0),
+            )));
+        });
+        let (call, argument, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+        if !callable_data {
+            fd.op_remove_input(call, 2);
+            fd.op_remove_input(call, 1);
+            fd.get_call_specs_mut(0).get_active_input().clear();
+        }
+        let slot = Address::new(ram_space(&fd), 0x3000);
+        let target_type = if callable_data {
+            fd.get_arch().types().unwrap().get_type_pointer(8, code.clone(), 1).unwrap()
+        } else {
+            fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_INT).unwrap()
+        };
+        let target = fd.new_varnode(8, &slot, Some(target_type));
+        fd.vbank_mut().get_mut(target).unwrap()
+            .set_flags_pub(varnode_flags::persist | varnode_flags::externref);
+        fd.op_set_input(call, target, 0).unwrap();
+        let mut ctx = ActionContext::new();
+        ActionDeindirect::boxed("g").apply(&mut fd, &mut ctx);
+        assert!(!ctx.has_error());
+        assert!(!fd.has_restart_pending());
+        assert_eq!(fd.get_call_specs(0).get_name(), "import_name");
+        assert_eq!(fd.obank().get(call).unwrap().code(), OpCode::CPUI_CALL);
+        assert_eq!(fd.obank().get(call).unwrap().num_input(), if callable_data { 2 } else { 1 });
+        if callable_data {
+            assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(argument));
+            assert_eq!(fd.get_call_specs(0).proto().logical_callable(), Some(&code));
+        } else {
+            assert_eq!(fd.get_call_specs(0).proto().num_params(), 0);
+            assert!(fd.get_call_specs(0).proto().logical_callable().is_none());
+        }
+        // Resolving an actual direct call still uses the loader declaration.
+        let (_, _, direct) = fd.get_arch().query_function(&slot).unwrap().unwrap();
+        assert_eq!(direct.num_params(), if callable_data { 0 } else { 1 });
     }
 }

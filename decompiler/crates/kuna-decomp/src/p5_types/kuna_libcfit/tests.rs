@@ -19,7 +19,7 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn sized_ptr(f: &TypeFactoryImpl, name: &str, size: i32) -> Rc<Datatype> {
+fn sized_ptr(f: &TypeFactoryImpl, name: &str, size: i32) -> TypeRoot {
     let shell = f.get_type_struct(name).unwrap();
     let shell = if size > 0 {
         f.set_fields_struct_raw(&shell, Vec::new(), Vec::new(), size, 8, flags::type_incomplete).unwrap()

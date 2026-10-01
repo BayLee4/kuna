@@ -146,7 +146,7 @@ pub trait MergeContext: HighContext {
     /// `high->isTypeLock()`.
     fn high_is_type_lock(&mut self, high: HighVariableId) -> bool;
     /// `high->getType()`.
-    fn high_get_type(&mut self, high: HighVariableId) -> std::rc::Rc<crate::dtype::Datatype>;
+    fn high_get_type(&mut self, high: HighVariableId) -> crate::dtype::TypeRoot;
     /// `high->isAddrTied()`.
     fn high_is_addr_tied(&mut self, high: HighVariableId) -> bool;
     /// `high->isInput()`.
@@ -340,9 +340,9 @@ pub trait MergeContext: HighContext {
     /// `op->previousOp()`.
     fn op_previous(&self, op: OpId) -> Option<OpId>;
     /// `op->outputTypeLocal()`.
-    fn op_output_type_local(&self, op: OpId) -> std::rc::Rc<crate::dtype::Datatype>;
+    fn op_output_type_local(&self, op: OpId) -> crate::dtype::TypeRoot;
     /// `op->inputTypeLocal(slot)`.
-    fn op_input_type_local(&self, op: OpId, slot: int4) -> std::rc::Rc<crate::dtype::Datatype>;
+    fn op_input_type_local(&self, op: OpId, slot: int4) -> crate::dtype::TypeRoot;
     /// The `(block_index, CoverPoint)` of `op` (for `range.contain(op,1)`).
     fn op_cover_point(&self, op: OpId) -> (int4, crate::cover::CoverPoint);
     /// `getOpFromConst(indop->getIn(1)->getAddr())` — the op an INDIRECT marks.
@@ -504,7 +504,7 @@ impl Merge {
         if ctx.high_is_type_lock(high_in) && ctx.high_is_type_lock(high_out) {
             let t_in = ctx.high_get_type(high_in);
             let t_out = ctx.high_get_type(high_out);
-            if !std::rc::Rc::ptr_eq(&t_in, &t_out) {
+            if t_in != t_out {
                 return false;
             }
         }
@@ -614,7 +614,7 @@ impl Merge {
         // Make sure variables have the same type.
         let t_out = ctx.high_get_type(high_out);
         let t_in = ctx.high_get_type(high_in);
-        if !std::rc::Rc::ptr_eq(&t_out, &t_in) {
+        if t_out != t_in {
             return false;
         }
 
@@ -1291,7 +1291,7 @@ impl Merge {
             let mut rest: std::collections::VecDeque<HighVariableId> = std::collections::VecDeque::new();
             while let Some(h) = remaining.pop_front() {
                 let t = ctx.high_get_type(h);
-                if std::rc::Rc::ptr_eq(&ct, &t) {
+                if ct == t {
                     highvec.push(h);
                 } else {
                     rest.push_back(h);
@@ -1320,7 +1320,7 @@ impl Merge {
             let ct = ctx.op_output_type_local(op);
             let ni = ctx.op_num_input(op);
             for i in 0..ni {
-                if !std::rc::Rc::ptr_eq(&ct, &ctx.op_input_type_local(op, i)) {
+                if ct != ctx.op_input_type_local(op, i) {
                     continue; // Only merge if types should be the same
                 }
                 let vn2 = ctx.op_in(op, i);
@@ -2335,12 +2335,11 @@ fn single_contain_varnode_def(cover: &Cover, ctx: &dyn MergeContext, vn: Varnode
 mod tests {
     use super::*;
     use crate::cover::{CoverBlock, CoverPoint, PcodeOpSet};
-    use crate::dtype::{type_metatype, Datatype};
+    use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
     use crate::variable::{CompareNameView, VarnodeView, VarnodeViewLoc};
     use kuna_base::address::Address;
     use slotmap::{Key, KeyData};
     use std::collections::BTreeMap;
-    use std::rc::Rc;
 
     fn vid(n: u64) -> VarnodeId {
         VarnodeId::from(KeyData::from_ffi(n))
@@ -2357,8 +2356,8 @@ mod tests {
     fn okey(op: OpId) -> u64 {
         op.data().as_ffi()
     }
-    fn dt(size: int4, meta: type_metatype) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, meta))
+    fn dt(types: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+        types.intern(Datatype::new(size, meta)).unwrap()
     }
 
     fn op_point(uindex: uintm) -> CoverPoint {
@@ -2399,7 +2398,7 @@ mod tests {
     /// Per-high test state.
     #[derive(Clone, Default)]
     struct HighState {
-        type_: Option<Rc<Datatype>>,
+        type_: Option<TypeRoot>,
         type_lock: bool,
         addr_tied: bool,
         input: bool,
@@ -2423,6 +2422,7 @@ mod tests {
     /// A minimal in-memory `MergeContext` for the pure-logic unit tests.  Only the
     /// methods the tests reach are meaningful; IR-mutation seams panic if reached.
     struct Mock {
+        types: TypeFactoryImpl,
         highs: BTreeMap<u32, HighState>,
         vn_high: BTreeMap<u64, HighVariableId>,
         vn_def: BTreeMap<u64, OpId>,
@@ -2439,6 +2439,7 @@ mod tests {
     impl Mock {
         fn new() -> Mock {
             Mock {
+                types: TypeFactoryImpl::new(),
                 highs: BTreeMap::new(),
                 vn_high: BTreeMap::new(),
                 vn_def: BTreeMap::new(),
@@ -2468,7 +2469,7 @@ mod tests {
             VarnodeView {
                 flags: 0,
                 size: 0,
-                type_: dt(1, type_metatype::TYPE_UNKNOWN),
+                type_: dt(&self.types, 1, type_metatype::TYPE_UNKNOWN),
                 type_lock: false,
                 merge_group: 0,
                 written: false,
@@ -2510,8 +2511,8 @@ mod tests {
         fn high_is_type_lock(&mut self, h: HighVariableId) -> bool {
             self.hs(h).type_lock
         }
-        fn high_get_type(&mut self, h: HighVariableId) -> Rc<Datatype> {
-            self.hs(h).type_.clone().unwrap_or_else(|| dt(1, type_metatype::TYPE_UNKNOWN))
+        fn high_get_type(&mut self, h: HighVariableId) -> TypeRoot {
+            self.hs(h).type_.clone().unwrap_or_else(|| dt(&self.types, 1, type_metatype::TYPE_UNKNOWN))
         }
         fn high_is_addr_tied(&mut self, h: HighVariableId) -> bool {
             self.hs(h).addr_tied
@@ -2779,11 +2780,11 @@ mod tests {
         fn op_previous(&self, _op: OpId) -> Option<OpId> {
             None
         }
-        fn op_output_type_local(&self, _op: OpId) -> Rc<Datatype> {
-            dt(1, type_metatype::TYPE_UNKNOWN)
+        fn op_output_type_local(&self, _op: OpId) -> TypeRoot {
+            dt(&self.types, 1, type_metatype::TYPE_UNKNOWN)
         }
-        fn op_input_type_local(&self, _op: OpId, _slot: int4) -> Rc<Datatype> {
-            dt(1, type_metatype::TYPE_UNKNOWN)
+        fn op_input_type_local(&self, _op: OpId, _slot: int4) -> TypeRoot {
+            dt(&self.types, 1, type_metatype::TYPE_UNKNOWN)
         }
         fn op_cover_point(&self, _op: OpId) -> (int4, CoverPoint) {
             (0, CoverPoint::Begin)
@@ -2866,7 +2867,7 @@ mod tests {
     fn add_high(m: &mut Mock, n: u32, mut s: HighState) {
         // Default a type so getType() comparisons are well-defined.
         if s.type_.is_none() {
-            s.type_ = Some(dt(4, type_metatype::TYPE_INT));
+            s.type_ = Some(dt(&m.types, 4, type_metatype::TYPE_INT));
         }
         if s.tied_addr == Address::default() {
             s.tied_addr = Address::new_invalid();
@@ -3014,10 +3015,10 @@ mod tests {
         let mut m = Mock::new();
         let mut a = HighState::default();
         a.type_lock = true;
-        a.type_ = Some(dt(4, type_metatype::TYPE_INT));
+        a.type_ = Some(dt(&m.types, 4, type_metatype::TYPE_INT));
         let mut b = HighState::default();
         b.type_lock = true;
-        b.type_ = Some(dt(4, type_metatype::TYPE_UINT)); // different Rc
+        b.type_ = Some(dt(&m.types, 4, type_metatype::TYPE_UINT)); // different graph identity
         add_high(&mut m, 1, a);
         add_high(&mut m, 2, b);
         assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
@@ -3209,9 +3210,9 @@ mod tests {
     #[test]
     fn merge_linear_merges_compatible_disjoint_highs() {
         let mut m = Mock::new();
-        // Three highs, same type (shared Rc so the adjacency type test passes),
+        // Three highs, same graph identity so the adjacency type test passes,
         // disjoint instance covers -> all merge into the earliest-block high.
-        let shared = dt(4, type_metatype::TYPE_INT);
+        let shared = dt(&m.types, 4, type_metatype::TYPE_INT);
         for n in 1..=3u32 {
             let mut s = HighState::default();
             s.has_cover = true;

@@ -63,7 +63,7 @@
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::kuna_castimplied::{int_range, preserves, CType, ImpliedCasts, PrintedForms};
 
@@ -157,7 +157,7 @@ fn usual(a: u8, b: u8) -> u8 {
 }
 
 /// The promoted type of `t`, for an integer (or `bool`) of 1, 2, 4 or 8 bytes.
-fn promote(t: &Datatype) -> Option<u8> {
+fn promote(t: &TypeRoot) -> Option<u8> {
     let (lo, _) = int_range(t)?;
     match (t.get_size(), lo < 0) {
         (1 | 2, _) => Some(INT),
@@ -170,7 +170,7 @@ fn promote(t: &Datatype) -> Option<u8> {
 }
 
 /// The promoted types an operand of known or unknown C type may have.
-fn value_set(c: &CType, ir: &Datatype) -> Option<u8> {
+fn value_set(c: &CType, ir: &TypeRoot) -> Option<u8> {
     match c {
         CType::Known(t) => promote(t),
         CType::Unknown => {
@@ -335,7 +335,7 @@ fn conversion_arm(
 }
 
 /// An integer that is neither `bool` nor an enum.
-fn is_int(t: &Datatype) -> bool {
+fn is_int(t: &TypeRoot) -> bool {
     matches!(t.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT)
         && !t.is_enum_type()
         && int_range(t).is_some()

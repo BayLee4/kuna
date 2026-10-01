@@ -155,7 +155,11 @@ impl Funcdata {
         // store-less proto (a partial/jump-table-recovery clone) has nothing
         // encodable; `<prototype>` is optional to HighFunction.decode.
         if self.get_func_proto().has_store() {
-            self.get_func_proto().encode(enc)?;
+            if self.get_func_proto().has_execution_signature() {
+                self.get_func_proto().source_prototype().encode(enc)?;
+            } else {
+                self.get_func_proto().encode(enc)?;
+            }
         }
         // v1.1: localoverride.encode(encoder,name)  (<override>) — Java skips it.
         enc.close_element(&ELEM_FUNCTION);
@@ -220,6 +224,8 @@ impl Funcdata {
         }
         enc.open_element(&ELEM_HIGHLIST);
         for high in order {
+            let execution_input = self.execution_input_slot_for_high(high).is_some();
+            let source_projection = self.source_projection_slot_for_high(high).is_some();
             // Phase 1: the &mut HighVariable reads (predicates / type / name
             // representative / instances) under the field-split borrow.
             let (rep, spacebase, implied, persist, addrtied, constant, typelock, dtype, insts) =
@@ -251,14 +257,15 @@ impl Funcdata {
                 h.kuna_link_symbol()
                     .or_else(|| h.kuna_dynamic_symbol())
                     .or_else(|| h.kuna_equate_symbol())
-            });
+            }).filter(|_| !execution_input);
             // A wire-only symbol (the analysis left the high symbol-less) is
             // referenced by its reserved id and is never a parameter.
             let wire = self
                 .kuna_wire_symbol_for_high
                 .get(&high)
                 .and_then(|i| self.kuna_wire_symbols.get(*i))
-                .map(|w| w.id);
+                .map(|w| w.id)
+                .filter(|_| !execution_input);
             let (local_symref, category) = match (attached, wire, self.get_scope_local()) {
                 // The wire arm takes the SAME encodable gate as the attached
                 // one: an id that was filtered out of `<localdb>` (or a whole
@@ -282,9 +289,13 @@ impl Funcdata {
                 }
                 _ => (None, crate::database::symbol_category::NO_CATEGORY),
             };
-            let is_global_class = persist && addrtied;
+            let is_global_class = !execution_input && persist && addrtied;
             // class per variable.cc:839-855 (order load-bearing).
-            let class: &str = if spacebase || implied {
+            let class: &str = if source_projection && local_symref.is_some() && !execution_input
+                && category == crate::database::symbol_category::FUNCTION_PARAMETER
+            {
+                "param"
+            } else if execution_input || spacebase || implied {
                 "other"
             } else if is_global_class {
                 "global"
@@ -407,6 +418,9 @@ impl Funcdata {
             if !seen.insert(high) {
                 continue;
             }
+            if self.execution_input_slot_for_high(high).is_some() {
+                continue;
+            }
             // Symbol already attached — during analysis (equate / dynamic) or
             // by the naming pass's recorded bind decision
             // (`kuna_link_symbol`), which INCLUDES a previous run of this
@@ -442,8 +456,12 @@ impl Funcdata {
                 });
             // Only local (non-persist) nameable storage acquires a Symbol —
             // the C++ `if (!vn->isPersist())` create guard; constants take the
-            // equate path, spacebase/implied never carry symbols.
-            if persist || constant || spacebase || implied {
+            // equate path and implied expressions never carry symbols. The
+            // aggregate spacebase flag alone does not identify the architectural
+            // stack-pointer input: a named computed pointer can inherit it from
+            // a member. Use the naming pass's predicate to exclude only the
+            // non-nameable base, retaining identity for declared pointer locals.
+            if persist || constant || implied || (spacebase && !self.high_has_name(high)) {
                 continue;
             }
             let rep_vn = match self.vbank().get(rep) {
@@ -496,7 +514,7 @@ impl Funcdata {
             // while `DynamicEntry.decode` has no size check at all.  (The
             // `is_encodable` filter on the encode is the backstop if the hash
             // also fails.)
-            let hash = if covered || dtype.get_size() < 1 {
+            let (hash, symbol_usepoint) = if covered || dtype.get_size() < 1 {
                 // The collision budget is pinned at the UPSTREAM 8 on the wire
                 // path: Java computes its own hash for the same variable with a
                 // hardcoded `maxduplicates = 8` (`DynamicHash.java:440`), and a
@@ -505,11 +523,11 @@ impl Funcdata {
                 // value must match what Java recomputes, not what kuna's own
                 // analysis is configured for.
                 match crate::dynamic::dynamic_unique_hash(rep, 8, self) {
-                    Ok((h, _)) if h != 0 => h,
+                    Ok((h, anchor)) if h != 0 => (h, anchor),
                     _ => continue, // no unique hash: stay symbol-less
                 }
             } else {
-                0
+                (0, if rep_addrtied { Address::new_invalid() } else { usepoint })
             };
             let Some(id) = self
                 .get_scope_local_mut()
@@ -524,14 +542,10 @@ impl Funcdata {
                 dtype,
                 addr: if hash != 0 { Address::new_invalid() } else { rep_addr },
                 hash,
-                // A mapped addr-tied storage is valid function-wide (empty
-                // uselimit); everything else is scoped to its use point, which
-                // is also the address a DYNAMIC entry hashes at.
-                usepoint: if hash == 0 && rep_addrtied {
-                    Address::new_invalid()
-                } else {
-                    usepoint
-                },
+                // Dynamic identity is the hash AND its selected anchor, which
+                // may bypass a CAST rather than use the representative's def PC.
+                // Mapped storage retains its ordinary usepoint/addr-tied rules.
+                usepoint: symbol_usepoint,
             });
             self.kuna_wire_symbol_for_high.insert(high, idx);
         }
@@ -768,6 +782,110 @@ mod tests {
 
     fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
+    }
+
+    #[test]
+    fn hashed_wire_local_resolves_at_hash_anchor_across_cast() {
+        use crate::dtype::type_metatype;
+        use crate::dynamic::DynamicHash;
+        use crate::remote_provider::{ELEM_HASH, ELEM_MAPSYM};
+        use kuna_base::address::RangeList;
+        use kuna_base::marshal::{ATTRIB_TYPE, ATTRIB_VAL};
+
+        let mut manager = build_manager();
+        let register = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 5,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+            "stack", 6, 8, &register, 1, true, false,
+        ))).unwrap();
+        let glb = Rc::new(ArchContext::new(manager));
+        let memory = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+        let mut fd = Funcdata::new(
+            "hash_anchor", "hash_anchor", glb,
+            Address::new(Rc::clone(&memory), 0x1000), 0x10000000, 0x40,
+        ).unwrap();
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+        fd.bblocks_mut().set_start_block(root, block);
+        let dtype = fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_UINT).unwrap();
+        let emit = |fd: &mut Funcdata, opcode, pc, offset, inputs: &[VarnodeId]| {
+            let op = new_op(fd, inputs.len() as int4, opcode, pc);
+            for (slot, input) in inputs.iter().enumerate() {
+                fd.op_set_input(op, *input, slot as int4).unwrap();
+            }
+            let output = fd.new_varnode(
+                8, &Address::new(Rc::clone(&memory), offset), Some(dtype.clone()),
+            );
+            fd.op_set_output(op, output).unwrap();
+            fd.op_insert_end(op, block);
+            output
+        };
+        let ca = fd.new_constant(8, 0x11);
+        let a = emit(&mut fd, OpCode::CPUI_COPY, 0x1010, 0x100, &[ca]);
+        let cb = fd.new_constant(8, 0x22);
+        let b = emit(&mut fd, OpCode::CPUI_COPY, 0x1014, 0x108, &[cb]);
+        let sum = emit(&mut fd, OpCode::CPUI_INT_ADD, 0x1018, 0x110, &[a, b]);
+        let cast = emit(&mut fd, OpCode::CPUI_CAST, 0x101c, 0x130, &[sum]);
+        emit(&mut fd, OpCode::CPUI_COPY, 0x1020, 0x118, &[cast]);
+        fd.structure_reset();
+        fd.set_high_level();
+        let high = fd.vbank().get(cast).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("cast_local");
+        // The occupied storage cannot safely identify this distinct local;
+        // export must use a data-flow hash rather than the covering symbol.
+        let covering_type = fd.type_base_unknown(16);
+        fd.get_scope_local_mut().unwrap().add_symbol(
+            "covering_local", covering_type,
+            &Address::new(Rc::clone(&memory), 0x130), &Address::new_invalid(),
+        ).unwrap();
+        let def_address = Address::new(Rc::clone(&memory), 0x101c);
+        let (expected_hash, anchor) = crate::dynamic::dynamic_unique_hash(cast, 8, &mut fd).unwrap();
+        assert_ne!(anchor, def_address, "CAST fixture must distinguish hash anchor from definition");
+        assert_eq!(
+            DynamicHash::new().find_varnode(&mut fd, &anchor, expected_hash), Some(cast),
+            "the hash consumer must identify the intended variable",
+        );
+
+        fd.kuna_link_high_symbols();
+        let mut bytes = Vec::new();
+        fd.get_scope_local().unwrap().encode_with_wire_symbols(
+            &fd.kuna_wire_symbols, &mut PackedEncode::new(&mut bytes),
+        ).unwrap();
+        fn collect_dynamic(dec: &mut PackedDecode, found: &mut Vec<(u64, Address)>) {
+            while dec.peek_element().unwrap() != 0 {
+                let eid = dec.open_element().unwrap();
+                if eid == ELEM_MAPSYM.get_id() {
+                    if dec.read_string_id(&ATTRIB_TYPE).ok().as_deref() == Some(b"dynamic") {
+                        dec.skip_element().unwrap(); // <symbol> and its datatype
+                        let hid = dec.open_element_id(&ELEM_HASH).unwrap();
+                        let hash = dec.read_unsigned_integer_id(&ATTRIB_VAL).unwrap();
+                        dec.close_element(hid).unwrap();
+                        let mut ranges = RangeList::default();
+                        ranges.decode(dec).unwrap();
+                        let range = ranges.get_first_range().expect("dynamic symbol hash address");
+                        found.push((hash, range.get_first_addr()));
+                    }
+                    dec.close_element_skipping(eid).unwrap();
+                } else {
+                    while dec.get_next_attribute_id().unwrap() != 0 {}
+                    collect_dynamic(dec, found);
+                    dec.close_element(eid).unwrap();
+                }
+            }
+        }
+        let mut decoder = PackedDecode::new(fd.get_arch().manage());
+        decoder.ingest_stream(&bytes).unwrap();
+        let mut entries = Vec::new();
+        collect_dynamic(&mut decoder, &mut entries);
+        assert_eq!(entries.len(), 1, "only cast_local requires dynamic storage");
+        let (hash, address) = &entries[0];
+        assert_eq!(
+            DynamicHash::new().find_varnode(&mut fd, address, *hash), Some(cast),
+            "emitted hash/range replay must resolve cast_local, not use the CAST definition PC",
+        );
     }
 
     fn new_op(fd: &mut Funcdata, inputs: int4, opc: OpCode, off: u64) -> OpId {

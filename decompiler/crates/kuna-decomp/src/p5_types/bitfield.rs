@@ -70,14 +70,13 @@
 //! into one `INSERT`/`PULL` per field so each renders as a separate
 //! `ptr->field = ...` statement (e.g. `ip->field5 = ip->field5 + 1;`).
 
-use std::rc::Rc;
 
 use kuna_base::address::{leastsigbit_set, mostsigbit_set};
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, BitFieldTriple, Datatype};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::{type_metatype, BitFieldTriple, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::VarnodeId;
 
@@ -432,15 +431,14 @@ impl BitRange {
 /// data-type (`field->type`, used as the `InsertRecord`/`PullRecord` `dt` and to
 /// test `getMetatype() == TYPE_INT`) and its formal bit width
 /// (`field->bits.numBits`).  The [`FieldRef::Field`] variant carries an owned
-/// [`TypeBitField`] clone (cheap — its body is an `Rc<Datatype>`), exactly the
-/// projection the transforms consume, so the C++ `const TypeBitField *` pointer
-/// is replaced without holding an aliased reference.
+/// bitfield descriptor plus an external root retaining its type context.
+/// The descriptor's graph edges remain non-owning.
 #[derive(Debug, Clone)]
 pub enum FieldRef {
     /// A hole record (C++ `field == (const TypeBitField *)0`).
     Hole,
     /// A real bit-field — the owned `TypeBitField` the C++ `field` pointed at.
-    Field(crate::dtype::TypeBitField),
+    Field { field: crate::dtype::TypeBitField, field_type: TypeRoot },
 }
 
 impl FieldRef {
@@ -486,10 +484,11 @@ impl BitFieldNodeState {
         used: &BitRange,
         vn: VarnodeId,
         fld: &crate::dtype::TypeBitField,
+        owner: &TypeRoot,
     ) -> BitFieldNodeState {
         let field_bits = fld.bits();
-        let field_is_int =
-            fld.field_type.get_metatype() == type_metatype::TYPE_INT;
+        let field_type = owner.related(fld.field_type).expect("bitfield type belongs to owner");
+        let field_is_int = field_type.get_metatype() == type_metatype::TYPE_INT;
         let bits_field = BitRange::in_container(&field_bits, used.byte_offset, used.byte_size);
         let orig_least_sig_bit = bits_field.least_sig_bit;
         let is_sign_extended = field_is_int && bits_field.is_most_significant();
@@ -497,7 +496,7 @@ impl BitFieldNodeState {
             bits_used: *used,
             bits_field,
             node: vn,
-            field: FieldRef::Field(fld.clone()),
+            field: FieldRef::Field { field: fld.clone(), field_type },
             orig_least_sig_bit,
             is_sign_extended,
         }
@@ -552,7 +551,15 @@ impl BitFieldNodeState {
     /// for a hole).
     pub fn field(&self) -> Option<&crate::dtype::TypeBitField> {
         match &self.field {
-            FieldRef::Field(f) => Some(f),
+            FieldRef::Field { field, .. } => Some(field),
+            FieldRef::Hole => None,
+        }
+    }
+
+    /// Retained external type of the followed field, absent for a hole.
+    pub fn field_type(&self) -> Option<&TypeRoot> {
+        match &self.field {
+            FieldRef::Field { field_type, .. } => Some(field_type),
             FieldRef::Hole => None,
         }
     }
@@ -566,14 +573,14 @@ impl BitFieldNodeState {
     /// Return `true` if the signedness of the field matches the extension used to
     /// extract it (C++ `doesSignExtensionMatch`, bitfield.hh:41).  In C++ this is
     /// `isSignExtended == (field->type->getMetatype() == TYPE_INT)`; the
-    /// metatype-`TYPE_INT` datum is carried in [`FieldRef::Field::is_int`].  A
+    /// metatype is read through the retained field type root. A
     /// hole record has no field; the C++ never calls this on a hole, so it
     /// returns `false` defensively.
     pub fn does_sign_extension_match(&self) -> bool {
         match &self.field {
-            FieldRef::Field(f) => {
+            FieldRef::Field { field_type, .. } => {
                 self.is_sign_extended
-                    == (f.field_type.get_metatype() == type_metatype::TYPE_INT)
+                    == (field_type.get_metatype() == type_metatype::TYPE_INT)
             }
             FieldRef::Hole => false,
         }
@@ -606,7 +613,7 @@ pub struct BitFieldTransform {
     /// root data-type is neither a struct nor a partial-struct wrapping one — the
     /// C++ leaves `parentStruct` null in that case and `establishFields` is never
     /// reached.
-    pub parent_struct: Option<Rc<Datatype>>,
+    pub parent_struct: Option<TypeRoot>,
     /// Byte offset into parent structure (C++ `initialOffset`).
     pub initial_offset: int4,
     /// Size of Varnode containing bitfields (C++ `containerSize`).
@@ -627,12 +634,12 @@ impl BitFieldTransform {
     /// architecture by the caller).  When `dt` is a `TYPE_PARTIALSTRUCT`, the
     /// parent struct is unwrapped and the partial's offset folds into
     /// `initialOffset`.
-    pub fn new(dt: &Rc<Datatype>, off: int4, big_endian: bool) -> BitFieldTransform {
-        let mut parent_struct: Option<Rc<Datatype>> = None;
+    pub fn new(dt: &TypeRoot, off: int4, big_endian: bool) -> BitFieldTransform {
+        let mut parent_struct: Option<TypeRoot> = None;
         let mut initial_offset: int4 = -1;
         let meta = dt.get_metatype();
         if meta == type_metatype::TYPE_STRUCT {
-            parent_struct = Some(Rc::clone(dt));
+            parent_struct = Some(dt.clone());
             initial_offset = off;
         } else if meta == type_metatype::TYPE_PARTIALSTRUCT {
             // (`getParent` returns the `container`, which is `get_partial_base` for a
@@ -715,6 +722,7 @@ impl BitFieldTransform {
                     &bitrange,
                     vn,
                     &triple.bitfield,
+                    self.parent_struct.as_ref().expect("bitfields have parent structure"),
                 ));
             } else if follow_holes {
                 self.work_list
@@ -785,10 +793,8 @@ impl Rule for RuleBitFieldStore {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // Group membership lives in the engine-owned RuleState; see ruleaction_3
-        // module docs.  The clone is unconditional here.
-        Some(Box::new(RuleBitFieldStore))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBitFieldStore)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -841,8 +847,8 @@ impl Rule for RuleBitFieldOut {
         oplist
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldOut))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBitFieldOut)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -878,8 +884,8 @@ impl Rule for RuleBitFieldLoad {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldLoad))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBitFieldLoad)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -945,8 +951,8 @@ impl Rule for RuleBitFieldIn {
         ]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldIn))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleBitFieldIn)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -982,8 +988,8 @@ impl Rule for RulePullAbsorb {
         vec![OpCode::CPUI_ZPULL, OpCode::CPUI_SPULL]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RulePullAbsorb))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePullAbsorb)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -1004,8 +1010,8 @@ impl Rule for RuleInsertAbsorb {
         vec![OpCode::CPUI_INSERT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleInsertAbsorb))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleInsertAbsorb)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
@@ -1023,12 +1029,12 @@ impl Rule for RuleInsertAbsorb {
 /// real stage group when it places them.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "", ctor: || Box::new(RuleBitFieldStore) },
-        RuleSpec { group: "", ctor: || Box::new(RuleBitFieldOut) },
-        RuleSpec { group: "", ctor: || Box::new(RuleBitFieldLoad) },
-        RuleSpec { group: "", ctor: || Box::new(RuleBitFieldIn) },
-        RuleSpec { group: "", ctor: || Box::new(RulePullAbsorb) },
-        RuleSpec { group: "", ctor: || Box::new(RuleInsertAbsorb) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RuleBitFieldStore) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RuleBitFieldOut) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RuleBitFieldLoad) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RuleBitFieldIn) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RulePullAbsorb) },
+        RuleSpec { group: "", aliases: &[], ctor: || Box::new(RuleInsertAbsorb) },
     ]
 }
 

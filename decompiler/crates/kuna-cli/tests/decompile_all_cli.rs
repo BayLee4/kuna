@@ -39,6 +39,17 @@ fn specs() -> String {
     repo_root().join("specs").to_str().unwrap().to_string()
 }
 
+fn have_c_compiler() -> bool {
+    match Command::new("cc").arg("--version").output() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => panic!("starting C compiler: {error}"),
+        Ok(output) => {
+            assert!(output.status.success(), "C compiler probe failed: {output:?}");
+            true
+        }
+    }
+}
+
 /// A small **ARM 32-bit** (Thumb) ELF fixture — the non-x86-64 discovery surface
 /// where `decompile-all` defaults `funcstart_patterns` ON (DIV-20).
 fn arm_thumb() -> String {
@@ -2570,9 +2581,10 @@ fn printed_functions(stdout: &str, names: &[&str]) -> String {
 /// storing that word as an integer.  A float vote there printed `(int)v1 + 3`,
 /// `(short)((unsigned int)v1 >> 0x10)` and `a2[1] = (int)v1` -- value conversions
 /// where the machine moves bits -- so it is refused.  The round trip compiles the
-/// seven printed callers (`-no-pie`, so the array's address survives the printed
-/// 32-bit `(int)a1 + 0xc`) against a bit-preserving `h` and compares them with the
-/// source.
+/// seven printed callers against a bit-preserving `h` and compares them with the
+/// source helpers. Generated storage follows the emitted interface, which may
+/// represent the two output words as either a record or an integer array; this
+/// checks these callers' values and bytes, not the whole original MIPS ABI.
 #[test]
 fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
     let bin = repo_root()
@@ -2588,37 +2600,76 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         return;
     }
     assert!(ok, "kuna decompile-all failed: {stderr}");
-    for want in [
-        "return (int)(float)h(a0,v1) + v1 + 3;",
-        "(unsigned int)(v1 < 0x3fc00000)",
-        "if (v1 == 0x3fc00001)",
-        "(unsigned int)(0x3fc00000 < v1)",
-        "*a2 = (short)((unsigned int)v1 >> 0x10);",
-        "a2[1] = (char)((unsigned int)v1 >> 0x10);",
-    ] {
-        assert!(stdout.contains(want), "missing `{want}`:\n{stdout}");
-    }
-    assert!(
-        stdout.contains("a2[1] = v1;") || stdout.contains("a2->field_0x4 = v1;"),
-        "missing the bitwise store of v1:\n{stdout}"
-    );
-    for bad in ["float v1;", "1.5000001"] {
-        assert!(!stdout.contains(bad), "`{bad}` printed:\n{stdout}");
-    }
-    let converts_v1 = |cast: &str, shift_ok: bool| {
-        stdout.match_indices(cast).any(|(i, m)| {
-            let rest = &stdout[i + m.len()..];
-            !rest.starts_with(|c: char| c.is_ascii_digit()) && !(shift_ok && rest.starts_with(" >>"))
-        })
-    };
-    assert!(!converts_v1("(int)v1", false), "`(int)v1` printed:\n{stdout}");
-    assert!(!converts_v1("(unsigned int)v1", true), "`(unsigned int)v1` printed:\n{stdout}");
-
-    if Command::new("cc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("protoorder float-in-GPR round trip: no `cc`, spelling checked only");
-        return;
-    }
     let printed = printed_functions(&stdout, &["g3 ", "g5 ", "g6 ", "g9 ", "g20 ", "g22 ", "g24 "]);
+    let signature = printed
+        .lines()
+        .find_map(|line| line.split_once(" g24(").map(|(_, args)| args))
+        .expect("g24 has an emitted declaration");
+    let params: Vec<_> =
+        signature.strip_suffix(')').expect("g24 declaration ends with ')'").split(',').collect();
+    assert_eq!(params.len(), 3, "unsupported g24 interface: {signature}");
+    let (pointee, parameter) = params[2].split_once('*').expect("g24 output is a pointer");
+    let pointee = pointee.trim();
+    let identifier = |name: &str| {
+        let mut chars = name.chars();
+        chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+            && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+    };
+    assert!(identifier(parameter.trim()), "unsupported g24 output parameter: {}", params[2]);
+    let (storage, argument, layout) = if pointee == "int" {
+        (
+            "int printed_q[2] = {0};".to_string(),
+            "printed_q",
+            "_Static_assert(sizeof(int) == 4 && sizeof(int[2]) == 8, \
+             \"integer array has two four-byte slots at offsets 0 and 4\");"
+                .to_string(),
+        )
+    } else {
+        let tag = if let Some(tag) = pointee.strip_prefix("struct ") {
+            assert!(identifier(tag), "unsupported g24 pointee: {pointee}");
+            tag
+        } else {
+            assert!(identifier(pointee), "unsupported g24 pointee: {pointee}");
+            printed
+                .lines()
+                .find_map(|line| {
+                    let declaration = line.strip_prefix("typedef struct ")?.strip_suffix(';')?;
+                    let mut words = declaration.split_whitespace();
+                    let tag = words.next()?;
+                    (words.next() == Some(pointee) && words.next().is_none()).then_some(tag)
+                })
+                .expect("g24 pointee has an emitted struct typedef")
+        };
+        assert!(identifier(tag), "unsupported g24 record tag: {tag}");
+        let header = format!("struct {tag} {{");
+        let mut definition = printed.lines().skip_while(|line| line.trim() != header);
+        assert!(definition.next().is_some(), "missing emitted definition for {pointee}");
+        let mut members = Vec::new();
+        let mut closed = false;
+        for line in definition {
+            let line = line.trim();
+            if line == "};" {
+                closed = true;
+                break;
+            }
+            let mut words =
+                line.strip_suffix(';').expect("g24 member is a declaration").split_whitespace();
+            assert_eq!(words.next(), Some("int"), "unsupported g24 member: {line}");
+            let member = words.next().expect("g24 member has a name");
+            assert!(identifier(member) && words.next().is_none(), "unsupported g24 member: {line}");
+            members.push(member);
+        }
+        assert!(closed && members.len() == 2, "g24 must define exactly two integer slots");
+        let layout = format!(
+            "_Static_assert(offsetof({pointee}, {}) == 0, \"first store offset\");\n\
+             _Static_assert(offsetof({pointee}, {}) == 4, \"raw word store offset\");\n\
+             _Static_assert(sizeof((({pointee} *)0)->{}) == 4 && \
+             sizeof((({pointee} *)0)->{}) == 4, \"four-byte members\");\n\
+             _Static_assert(sizeof({pointee}) == 8, \"no padding in compared record\");",
+            members[0], members[1], members[0], members[1]
+        );
+        (format!("{pointee} printed_q = {{0}};"), "&printed_q", layout)
+    };
     let dir = std::env::temp_dir().join(format!("kuna-protoorder-floatgpr-rt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("rt.c");
@@ -2626,10 +2677,17 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
     std::fs::write(
         &src,
         format!(
-            "#include <stdio.h>\n#include <string.h>\n\
+            "#include <assert.h>\n#include <stddef.h>\n#include <limits.h>\n#include <float.h>\n\
+             #include <stdio.h>\n#include <string.h>\n\
+             _Static_assert(CHAR_BIT == 8, \"byte width\");\n\
+             _Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(short) == 2, \
+             \"fixture scalar widths\");\n\
+             _Static_assert(FLT_RADIX == 2 && FLT_MANT_DIG == 24 && FLT_MIN_EXP == -125 && \
+             FLT_MAX_EXP == 128 && FLT_HAS_SUBNORM == 1, \"binary32 floats\");\n\
              static float hs(int k, float x) {{ return x * 2.5f + (float)k; }}\n\
              static float h(int k, int bits) {{ float x; memcpy(&x, &bits, 4); return hs(k, x); }}\n\
              {printed}\n\
+             {layout}\n\
              static float fb(int b) {{ float f; memcpy(&f, &b, 4); return f; }}\n\
              static int s3(int k, int *p) {{ int b = p[3]; return (int)hs(k, fb(b)) + b + 3; }}\n\
              static int s5(int k, int *p) {{ int b = p[3]; return (int)hs(k, fb(b)) + (b < 0x3fc00000); }}\n\
@@ -2644,34 +2702,59 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
              q[1] = b; q[0] = (int)r; return 0; }}\n\
              static int arr[4] = {{1, 2, 3, 0x3fc00001}};\n\
              static int bits[4] = {{1, 2, 3, 0x3fc01234}};\n\
+             static unsigned char saved_bytes[2][8];\n\
              static void run(int use_printed) {{\n  \
              void *a = arr, *b = bits;\n  \
              unsigned short s = 0; char c[2] = {{0, 0}}; int q[2] = {{0, 0}}; int r20, r22, r24;\n  \
              if (use_printed) {{\n    \
+             {storage}\n    \
              printf(\"%d %d %d %u \", g3(7, a), g5(7, a), g6(7, a), (unsigned)g9(7, a));\n    \
-             r20 = g20(7, b, &s); r22 = g22(7, b, c); r24 = (int)g24(7, b, q);\n  \
+             r20 = g20(7, b, &s); r22 = g22(7, b, c); r24 = (int)g24(7, b, {argument});\n    \
+             memcpy(q, &printed_q, sizeof q);\n  \
              }} else {{\n    \
              printf(\"%d %d %d %u \", s3(7, arr), s5(7, arr), s6(7, arr), s9(7, (unsigned *)arr));\n    \
              r20 = s20(7, bits, &s); r22 = s22(7, bits, c); r24 = (int)s24(7, bits, q);\n  \
              }}\n  \
-             printf(\"%d %04x %d %02x %02x %d %d %x\\n\", r20, s, r22, (unsigned char)c[0], (unsigned char)c[1], \
-             r24, q[0], q[1]);\n\
+             assert(q[0] == 10 && q[1] == 0x3fc01234);\n  \
+             memcpy(saved_bytes[use_printed], q, sizeof q);\n  \
+             printf(\"%d %04x %d %02x %02x %d %d %x\\n\", r20, (unsigned)s, r22, \
+             (unsigned)(unsigned char)c[0], (unsigned)(unsigned char)c[1], r24, q[0], (unsigned)q[1]);\n\
              }}\n\
-             int main(void) {{\n  run(1);\n  run(0);\n  return 0;\n}}\n"
+             int main(void) {{\n  \
+             const int inputs[] = {{0x3fc00001, 0x3fbfffff, 0x3fc00000}};\n  \
+             for (unsigned i = 0; i < sizeof inputs / sizeof inputs[0]; ++i) {{\n    \
+             arr[3] = inputs[i];\n    run(1);\n    run(0);\n    \
+             assert(memcmp(saved_bytes[1], saved_bytes[0], sizeof saved_bytes[0]) == 0);\n  \
+             }}\n  return 0;\n}}\n"
         ),
     )
     .unwrap();
     let cc = Command::new("cc")
-        .args(["-std=gnu11", "-w", "-fno-pie", "-no-pie", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+        .args([
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pedantic-errors",
+            "-O2",
+            "-fstrict-aliasing",
+            "-o",
+            exe.to_str().unwrap(),
+            src.to_str().unwrap(),
+        ])
         .output()
         .expect("spawn cc");
     assert!(cc.status.success(), "the printed callers did not compile:\n{}", String::from_utf8_lossy(&cc.stderr));
     let run = Command::new(&exe).output().expect("run the round trip");
     let got = String::from_utf8_lossy(&run.stdout).to_string();
+    assert!(run.status.success(), "the round trip failed:\n{got}\n{}", String::from_utf8_lossy(&run.stderr));
     let _ = std::fs::remove_dir_all(&dir);
     let lines: Vec<&str> = got.lines().collect();
-    assert_eq!(lines.len(), 2, "{got}");
-    assert_eq!(lines[0], lines[1], "the printed callers compute different values:\n{printed}");
+    assert_eq!(lines.len(), 6, "{got}");
+    assert_eq!(lines[0], "1069547534 10 110 11 10 3fc0 10 12 c0 0 10 3fc01234");
+    for pair in lines.chunks_exact(2) {
+        assert_eq!(pair[0], pair[1], "the printed callers compute different values:\n{printed}");
+    }
 }
 
 /// `dsum`, `norm` and `use` read their argument as `double *`, `struct P *` and
@@ -2689,7 +2772,7 @@ fn a_float_pointee_keeps_the_callers_integer_stores_round_trip() {
         .unwrap()
         .to_string();
     let sp = specs();
-    let have_cc = Command::new("cc").arg("--version").output().map(|o| o.status.success()).unwrap_or(false);
+    let have_cc = have_c_compiler();
     for off in [false, true] {
         let mut args = vec!["decompile-all", bin.as_str(), "--option", "structdefs", "on", "--sleighpath", &sp];
         if off {
@@ -2702,14 +2785,8 @@ fn a_float_pointee_keeps_the_callers_integer_stores_round_trip() {
         }
         assert!(ok, "kuna decompile-all failed: {stderr}");
         let names = ["u1 ", "u2 ", "s3 ", "cp1 ", "cp3 ", "cp5 "];
-        let chunks: Vec<&str> =
-            stdout.split("// Function: ").filter(|c| names.iter().any(|n| c.starts_with(n))).collect();
-        assert_eq!(chunks.len(), names.len(), "{stdout}");
-        for bad in ["= (double)(", "= (float)", "NAN", "double a1", "double a2"] {
-            assert!(!chunks.iter().any(|c| c.contains(bad)), "`{bad}` printed (off={off}):\n{stdout}");
-        }
         if !have_cc {
-            eprintln!("protoorder float pointee round trip: no `cc`, spelling checked only");
+            eprintln!("protoorder float pointee round trip: skipping (missing `cc`)");
             continue;
         }
         let printed = printed_functions(&stdout, &names);
@@ -2746,26 +2823,26 @@ fn a_float_pointee_keeps_the_callers_integer_stores_round_trip() {
                  static void run(int p) {{\n  \
                  long b[4], s[4] = {{0x40000000L << 32 | 1, 0x4008000000000000L, 0, 0}};\n  \
                  memcpy(b, (long[4]){{1, 2, 3, 4}}, 32);\n  \
-                 if (p) ((void (*)(void *, long))u1)(b, 7); else s_u1((void *)b, 7);\n  show(\"u1\", b);\n  \
+                 if (p) u1((void *)b, 7); else s_u1((void *)b, 7);\n  show(\"u1\", b);\n  \
                  memcpy(b, (long[4]){{1, 2, 3, 4}}, 32);\n  \
-                 if (p) ((void (*)(void *))u2)(b); else s_u2((void *)b);\n  show(\"u2\", b);\n  \
+                 if (p) u2((void *)b); else s_u2((void *)b);\n  show(\"u2\", b);\n  \
                  memset(b, 0, 32);\n  \
-                 if (p) ((void (*)(void *, long, long))s3)(b, 0x4008000000000001L, 0x4010000000000000L);\n  \
+                 if (p) s3((void *)b, 0x4008000000000001L, 0x4010000000000000L);\n  \
                  else s_s3((void *)b, 0x4008000000000001L, 0x4010000000000000L);\n  show(\"s3\", b);\n  \
                  memset(b, 0, 32);\n  \
-                 if (p) ((void (*)(void *, void *))cp1)(b, s); else s_cp1((void *)b, (void *)s);\n  \
+                 if (p) cp1((void *)b, (void *)s); else s_cp1((void *)b, (void *)s);\n  \
                  show(\"cp1\", b);\n  memset(b, 0, 32);\n  \
-                 if (p) ((void (*)(void *, long, long))cp3)(b, 0x4000000000000001L, 0x3ff0000000000000L);\n  \
+                 if (p) cp3((void *)b, 0x4000000000000001L, 0x3ff0000000000000L);\n  \
                  else s_cp3((void *)b, 0x4000000000000001L, 0x3ff0000000000000L);\n  show(\"cp3\", b);\n  \
                  memset(b, 0, 32);\n  \
-                 if (p) ((void (*)(void *, unsigned))cp5)(b, 0x1fc00007u); else s_cp5((void *)b, 0x1fc00007u);\n  \
+                 if (p) cp5((void *)b, 0x1fc00007u); else s_cp5((void *)b, 0x1fc00007u);\n  \
                  show(\"cp5\", b);\n}}\n\
                  int main(void) {{\n  run(1);\n  printf(\"--\\n\");\n  run(0);\n  return 0;\n}}\n"
             ),
         )
         .unwrap();
         let cc = Command::new("cc")
-            .args(["-std=gnu11", "-w", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+            .args(["-std=gnu11", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
             .output()
             .expect("spawn cc");
         assert!(
@@ -2775,6 +2852,7 @@ fn a_float_pointee_keeps_the_callers_integer_stores_round_trip() {
         );
         let run = Command::new(&exe).output().expect("run the round trip");
         let got = String::from_utf8_lossy(&run.stdout).to_string();
+        assert!(run.status.success(), "the round trip failed (off={off}):\n{got}\n{}", String::from_utf8_lossy(&run.stderr));
         let _ = std::fs::remove_dir_all(&dir);
         let (printed_run, source_run) = got.split_once("--\n").expect("both runs printed");
         assert_eq!(printed_run, source_run, "the printed callers store different bytes (off={off}):\n{printed}");
@@ -4008,11 +4086,9 @@ fn a_sign_contested_synthesized_field_round_trips_through_the_printed_c() {
         return;
     }
     assert!(ok, "kuna decompile-all failed: {stderr}");
-    assert!(stdout.contains("unsigned short field_0xc;"), "{stdout}");
-    assert!(stdout.contains("sink(a0->field_0xc);"), "{stdout}");
 
-    if Command::new("cc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("signfield round trip: no `cc`, spelling checked only");
+    if !have_c_compiler() {
+        eprintln!("signfield round trip: skipping (missing `cc`)");
         return;
     }
     let dir = std::env::temp_dir().join(format!("kuna-signfield-rt-{}", std::process::id()));
@@ -4025,20 +4101,21 @@ fn a_sign_contested_synthesized_field_round_trips_through_the_printed_c() {
             "#include <stdio.h>\nstatic unsigned int got;\nvoid touch(void *s) {{ (void)s; }}\n\
              void sink(unsigned int x) {{ got = x; }}\n{stdout}\n\
              int main(void) {{\n  static unsigned long s[2];\n  s[0] = 1;\n  \
-             ((unsigned short *)s)[6] = 0x9abc;\n  int (*fp)() = (int (*)())f;\n  fp((void *)s);\n  \
-             printf(\"%u\\n\", got);\n  return 0;\n}}\n"
+             ((unsigned short *)s)[6] = 0x9abc;\n  int result = f((void *)s);\n  \
+             printf(\"%d %u\\n\", result, got);\n  return 0;\n}}\n"
         ),
     )
     .unwrap();
     let cc = Command::new("cc")
-        .args(["-std=gnu11", "-w", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+        .args(["-std=gnu11", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
         .output()
         .expect("spawn cc");
     assert!(cc.status.success(), "the printed f did not compile:\n{}", String::from_utf8_lossy(&cc.stderr));
     let run = Command::new(&exe).output().expect("run the round trip");
     let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
+    assert!(run.status.success(), "the round trip failed:\n{got}\n{}", String::from_utf8_lossy(&run.stderr));
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(got, (0x9abcu32).to_string(), "the printed f hands sink a different value:\n{stdout}");
+    assert_eq!(got, format!("2 {}", 0x9abcu32), "the printed f changes the return or sink value:\n{stdout}");
 }
 
 /// An 8-byte union member read both as a `double` and as a `long` is raw bytes,
@@ -4063,11 +4140,9 @@ fn a_float_and_integer_union_field_round_trips_through_the_printed_c() {
         return;
     }
     assert!(ok, "kuna decompile-all failed: {stderr}");
-    assert!(stdout.contains("char field_0x8[8];"), "{stdout}");
-    assert!(stdout.contains("return *(double *)a0->field_0x8;"), "{stdout}");
 
-    if Command::new("cc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
-        eprintln!("unionfield round trip: no `cc`, spelling checked only");
+    if !have_c_compiler() {
+        eprintln!("unionfield round trip: skipping (missing `cc`)");
         return;
     }
     let dir = std::env::temp_dir().join(format!("kuna-unionfield-rt-{}", std::process::id()));
@@ -4086,19 +4161,22 @@ fn a_float_and_integer_union_field_round_trips_through_the_printed_c() {
              int bad = 0;\n  for (int k = 0; k < 2; k++)\n    for (int tag = 0; tag < 5; tag++) {{\n      \
              double d = 2.5;\n      if (k) for (int i = 8; i < 16; i++) b[i] = (unsigned char)(i * 37 + 0x81);\n      \
              else memcpy(b + 8, &d, 8);\n      memcpy(b, &tag, 4);\n      \
-             double (*fp)() = (double (*)())vread;\n      double got = fp((void *)s), want = truth(b);\n      \
+             unsigned char before[16]; memcpy(before, b, 16);\n      \
+             double want = truth(before), got = vread((void *)s);\n      \
+             if (memcmp(before, b, 16)) {{ printf(\"payload %d tag %d: storage changed\\n\", k, tag); bad++; }}\n      \
              if (memcmp(&got, &want, 8)) {{ printf(\"payload %d tag %d: %a != %a\\n\", k, tag, got, want); bad++; }}\n    }}\n  \
              printf(\"%d\\n\", bad);\n  return 0;\n}}\n"
         ),
     )
     .unwrap();
     let cc = Command::new("cc")
-        .args(["-std=gnu11", "-w", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+        .args(["-std=gnu11", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
         .output()
         .expect("spawn cc");
     assert!(cc.status.success(), "the printed vread did not compile:\n{}", String::from_utf8_lossy(&cc.stderr));
     let run = Command::new(&exe).output().expect("run the round trip");
     let got = String::from_utf8_lossy(&run.stdout).to_string();
+    assert!(run.status.success(), "the round trip failed:\n{got}\n{}", String::from_utf8_lossy(&run.stderr));
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(got.lines().last(), Some("0"), "the printed vread reads the union differently:\n{got}\n{stdout}");
 }
@@ -4118,11 +4196,11 @@ fn a_zero_extended_narrow_load_round_trips_through_the_printed_c() {
         .unwrap()
         .to_string();
     let sp = specs();
-    let arms: [(&[&str], &str); 2] = [
-        (&["--option", "structsynth", "off"], "sink(*(unsigned short *)&a0[0x1a]);"),
-        (&["--option", "structdefs", "on"], "sink(a0->field_0x68);"),
+    let arms: [&[&str]; 2] = [
+        &["--option", "structsynth", "off"],
+        &["--option", "structdefs", "on"],
     ];
-    for (extra, call) in arms {
+    for extra in arms {
         let mut args = vec!["decompile-all", bin.as_str(), "--functions", "f", "--sleighpath", sp.as_str()];
         args.extend_from_slice(extra);
         let (stdout, stderr, ok) = run_kuna(&args);
@@ -4131,10 +4209,9 @@ fn a_zero_extended_narrow_load_round_trips_through_the_printed_c() {
             return;
         }
         assert!(ok, "kuna decompile-all failed: {stderr}");
-        assert!(stdout.contains(call), "{stdout}");
 
-        if Command::new("cc").arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
-            eprintln!("expandload round trip: no `cc`, spelling checked only");
+        if !have_c_compiler() {
+            eprintln!("expandload round trip: skipping (missing `cc`)");
             continue;
         }
         let dir = std::env::temp_dir()
@@ -4147,18 +4224,19 @@ fn a_zero_extended_narrow_load_round_trips_through_the_printed_c() {
             format!(
                 "#include <stdio.h>\nstatic unsigned int got;\nvoid sink(unsigned int x) {{ got = x; }}\n{stdout}\n\
                  int main(void) {{\n  static unsigned int s[27];\n  s[0] = 1; s[1] = 2;\n  \
-                 ((unsigned short *)s)[0x34] = 0x9abc;\n  void (*fp)() = (void (*)())f;\n  fp((void *)s);\n  \
+                 ((unsigned short *)s)[0x34] = 0x9abc;\n  ((unsigned short *)s)[0x35] = 0xdead;\n  f((void *)s);\n  \
                  printf(\"%u\\n\", got);\n  return 0;\n}}\n"
             ),
         )
         .unwrap();
         let cc = Command::new("cc")
-            .args(["-std=gnu11", "-w", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
+            .args(["-std=gnu11", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", "-o", exe.to_str().unwrap(), src.to_str().unwrap()])
             .output()
             .expect("spawn cc");
         assert!(cc.status.success(), "the printed f did not compile:\n{}", String::from_utf8_lossy(&cc.stderr));
         let run = Command::new(&exe).output().expect("run the round trip");
         let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        assert!(run.status.success(), "the round trip failed:\n{got}\n{}", String::from_utf8_lossy(&run.stderr));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, (0x9abcu32).to_string(), "the printed f hands sink a different value:\n{stdout}");
     }
@@ -5239,12 +5317,15 @@ fn a_constant_address_named_as_a_global_round_trips_through_the_printed_c() {
             &[],
         ),
     ];
-    let expected = Command::new(&bin).output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    let Ok(expected) = expected else {
-        eprintln!("globalref round trip: the x86-64 fixture does not run here, spelling checked only");
-        return;
+    let expected = if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        let run = Command::new(&bin).output().expect("run the Linux x86-64 fixture");
+        assert!(run.status.success(), "fixture failed: {run:?}");
+        let expected = String::from_utf8_lossy(&run.stdout).trim().to_string();
+        assert_eq!(expected, "210 21 27 121 1 0 4 229 1 -8608764254683430263 2", "the fixture itself");
+        Some(expected)
+    } else {
+        None
     };
-    assert_eq!(expected, "210 21 27 121 1 0 4 229 1 -8608764254683430263 2", "the fixture itself");
     let dir = std::env::temp_dir().join(format!("kuna-globalref-rt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -5279,6 +5360,10 @@ fn a_constant_address_named_as_a_global_round_trips_through_the_printed_c() {
         if arm == "off" {
             assert!(!header.contains("globals the code names by address"), "{header}");
         }
+        let Some(expected) = expected.as_deref() else {
+            eprintln!("globalref {arm}: export checked; execution requires Linux x86-64 (ELF mmap harness)");
+            continue;
+        };
         let mut printed = String::from("#include \"globalref_x86_64.h\"\n");
         for w in witnesses {
             let head = format!("// Function: {w} @ ");
@@ -5304,6 +5389,7 @@ fn a_constant_address_named_as_a_global_round_trips_through_the_printed_c() {
             .collect();
         printed.insert_str(printed.find('\n').unwrap() + 1, &undeclared);
         std::fs::write(out.join("printed.c"), &printed).unwrap();
+        let mut executed_compilers = 0;
         for cc in ["gcc", "clang"] {
             if Command::new(cc).arg("--version").output().map(|o| !o.status.success()).unwrap_or(true) {
                 eprintln!("globalref round trip: no `{cc}`");
@@ -5336,9 +5422,12 @@ fn a_constant_address_named_as_a_global_round_trips_through_the_printed_c() {
                 String::from_utf8_lossy(&built.stderr)
             );
             let run = Command::new(&exe).output().expect("run the round trip");
+            assert!(run.status.success(), "{arm}/{cc}: printed callers failed: {run:?}");
             let got = String::from_utf8_lossy(&run.stdout).trim().to_string();
             assert_eq!(got, expected, "{arm}/{cc}: the printed callers compute something else:\n{printed}");
+            executed_compilers += 1;
         }
+        assert!(executed_compilers > 0, "{arm}: the execution witness requires GCC or Clang");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -5761,4 +5850,553 @@ fn a_calls_own_return_address_push_is_part_of_the_call() {
             "{build}: a store other than a push changed in `stacked`\n{off}\n{on}"
         );
     }
+}
+
+#[test]
+fn joined_return_project_compiles_with_scalar_piece_helpers() {
+    if !have_c_compiler() {
+        eprintln!("joined return project: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-joined-return-project-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("join_return");
+    // x86 cdecl: EAX = low stack argument; EDX = high stack argument; RET.
+    std::fs::write(&image, [0x8b, 0x44, 0x24, 0x04, 0x8b, 0x54, 0x24, 0x08, 0xc3]).unwrap();
+    let project = dir.join("project");
+    let sp = specs();
+    let (_, stderr, ok) = run_kuna(&[
+        "decompile-project", image.to_str().unwrap(), "-o", project.to_str().unwrap(),
+        "--raw-image", "--target", "x86:LE:32:default:gcc", "--base", "0x1000",
+        "--sleighpath", &sp, "--addr", "0x1000", "--define-function", "0x1000-0x1009=subject",
+        "--assert-strict", "--assert",
+        "prototype subject unsigned long long __cdecl subject(unsigned int low,unsigned int high)",
+    ]);
+    if !ok && is_specs_skip(&stderr) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!("joined return project: skipping (no `.sla`; run `make specs`)");
+        return;
+    }
+    assert!(ok, "joined return export failed: {stderr}");
+    let consumer = dir.join("consumer.c");
+    std::fs::write(&consumer, r#"#include "join_return.h"
+int main(void) {
+    /* Exact EDX:EAX instruction results, including the signed high-bit boundary. */
+    if (subject(0, 7) != 0x0000000700000000ULL) return 1;
+    if (subject(7, 0) != 7ULL) return 2;
+    if (subject(0x12345678U, 0x76543210U) != 0x7654321012345678ULL) return 3;
+    if (subject(0xffffffffU, 0x80000000U) != 0x80000000ffffffffULL) return 4;
+    return 0;
+}
+"#).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let executable = dir.join(format!("consumer{opt}"));
+        let built = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
+                "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(&project).arg(project.join("join_return.c"))
+            .arg(&consumer).arg("-o").arg(&executable).output().expect("spawn cc");
+        assert!(built.status.success(), "unchanged JOIN export failed to compile {opt}:\n{}",
+            String::from_utf8_lossy(&built.stderr));
+        let ran = Command::new(&executable).output().expect("run joined return consumer");
+        assert!(ran.status.success(), "JOIN return differs from EDX:EAX {opt}:\n{}",
+            String::from_utf8_lossy(&ran.stderr));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn narrow_declared_inputs_preserve_live_physical_bits() {
+    if !have_c_compiler() {
+        eprintln!("physical input round trip: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-physical-input-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sp = specs();
+    // Each oracle describes the instructions, not the declared source width.
+    // No entry-extension assertion or rewritten emitted body is permitted.
+    let cases: &[(&str, &[u8], &str, &[&str], &str, &str, u32)] = &[
+        ("byte", &[0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned char value)", &[],
+         "subject(raw)", "(uint32_t)raw == 85", 255),
+        ("bool_byte", &[0x31,0xc0,0x40,0x80,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(bool value)", &[],
+         "subject(raw)", "(uint8_t)raw == 85", 255),
+        ("short", &[0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned short value)", &[],
+         "subject(raw)", "(uint32_t)raw == 85", 65535),
+        ("movzx_byte", &[0x40,0x0f,0xb6,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned char value)", &[],
+         "subject(raw)", "(uint8_t)raw == 85", 255),
+        ("movzx_short", &[0x0f,0xb7,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned short value)", &[],
+         "subject(raw)", "(uint16_t)raw == 85", 65535),
+        ("movsx_edi_clears_upper", &[0x40,0x0f,0xbe,0xff,0x48,0x89,0xf8,0x48,0xc1,0xe8,0x20,0xc3],
+         "unsigned long long subject(signed char value)", &[],
+         "subject(raw)", "0", 255),
+        ("independent_upper", &[0x48,0x89,0xf8,0x48,0xc1,0xe8,0x20,0xc3],
+         "unsigned long long subject(unsigned char value)", &[],
+         "subject(raw)", "raw >> 32", 255),
+        ("custom_si", &[0x89,0xf0,0xc3],
+         "unsigned int subject(unsigned short value)",
+         &["--assert", "param subject::0 SI unsigned short value"],
+         "subject(raw)", "(uint32_t)raw", 65535),
+        ("custom_ah", &[0x0f,0xb7,0xc0,0xc3],
+         "unsigned int subject(unsigned char value)",
+         &["--assert", "param subject::0 AH unsigned char value"],
+         "subject(raw)", "(uint16_t)raw", 65535),
+        ("independent_locked_high", &[0x48,0x89,0xf8,0xc3],
+         "unsigned long long subject(unsigned char value,unsigned int high)",
+         &["--assert", "param subject::0 DIL unsigned char value", "--assert", "param subject::1 [register,0x3c,4] unsigned int high"],
+         "subject(raw, high)", "((uint64_t)high << 32) | (uint32_t)raw", 255),
+        ("after_call", &[0xe8,0x09,0,0,0,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3,0xc3],
+         "unsigned int subject(unsigned char value)",
+         &["--define-function", "0x100e-0x100f=noop", "--addr", "0x100e", "--assert", "prototype noop void noop(void)"],
+         "subject(raw)", "(uint32_t)raw == 85", 255),
+    ];
+    for &(name, code, declaration, extra, call, expected, limit) in cases {
+        let image = dir.join(format!("{name}.bin"));
+        std::fs::write(&image, code).unwrap();
+        let end = if name == "after_call" { 0x100e } else { 0x1000 + code.len() };
+        let definition = format!("0x1000-0x{end:x}=subject");
+        let prototype = format!("prototype subject {declaration}");
+        let mut args = vec![
+            "decompile-all", image.to_str().unwrap(), "--raw-image", "--target", "x86:LE:64:default:gcc",
+            "--base", "0x1000", "--addr", "0x1000", "--define-function", &definition,
+            "--sleighpath", &sp, "--assert-strict", "--assert", &prototype,
+        ];
+        args.extend_from_slice(extra);
+        let (printed, stderr, ok) = run_kuna(&args);
+        if !ok && is_specs_skip(&stderr) {
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("physical input round trip: skipping (no `.sla`; run `make specs`)");
+            return;
+        }
+        assert!(ok, "{name}: decompilation failed: {stderr}");
+        let source = dir.join(format!("{name}.c"));
+        let high_count = if name == "independent_locked_high" { 4 } else { 1 };
+        std::fs::write(&source, format!(
+            "#include <stdint.h>\n#include <stdio.h>\n#include <stdbool.h>\n\
+             typedef unsigned char byte, uchar; typedef signed char sbyte, schar;\n\
+             typedef unsigned short ushort; typedef unsigned int uint;\n\
+             typedef unsigned long long ulonglong; typedef long long longlong;\n\
+             typedef int8_t int1; typedef uint8_t uint1; typedef int16_t int2; typedef uint16_t uint2;\n\
+             typedef int32_t int4; typedef uint32_t uint4; typedef int64_t int8; typedef uint64_t uint8;\n\
+             #define CONCAT44(a,b) (((uint64_t)(a)<<32)|(uint32_t)(b))\n\
+             void noop(void);\n{printed}\n\
+             static uint64_t reference(uint64_t raw, uint32_t high) {{\n\
+               (void)raw; (void)high; return {expected};\n}}\n\
+             int main(void) {{\n\
+               const uint64_t upper[] = {{0, UINT64_C(0x10000), UINT64_C(0x1234567800000000), UINT64_C(0xffffffff00000000)}};\n\
+               const uint32_t highs[] = {{0, 1, UINT32_C(0x80000000), UINT32_MAX}};\n\
+               for (unsigned h=0; h<{high_count}; ++h) for (unsigned p=0; p<4; ++p)\n\
+                 for (uint32_t bits=0; bits<={limit}U; ++bits) {{\n\
+                   uint64_t raw=upper[p]|bits; uint32_t high=highs[h];\n\
+                   uint64_t want=reference(raw,high); uint64_t got={call};\n\
+                   if (got!=want) {{ fprintf(stderr,\"raw=%llx high=%x got=%llx want=%llx\\n\",\n\
+                     (unsigned long long)raw,high,(unsigned long long)got,(unsigned long long)want); return 1; }}\n\
+                 }}\n\
+               return 0;\n}}\n"
+        )).unwrap();
+        for opt in ["-O0", "-O2"] {
+            let exe = dir.join(format!("{name}{opt}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+                .arg(&source).arg("-o").arg(&exe).output().expect("spawn cc");
+            assert!(build.status.success(), "{name} {opt}: unchanged emitted C did not compile:\n{}\n{printed}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run emitted consumer");
+            assert!(run.status.success(), "{name} {opt}: emitted behavior differs from instruction oracle:\n{}\n{printed}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn selected_typed_callbacks_and_direct_callers_transport_the_same_physical_value() {
+    if !have_c_compiler() {
+        eprintln!("physical callback round trip: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-physical-callback-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let relative = |opcode: u8, pc: u64, target: u64| {
+        let mut bytes = vec![opcode];
+        let delta = i32::try_from(target as i64 - pc as i64 - 5).unwrap();
+        bytes.extend_from_slice(&delta.to_le_bytes());
+        bytes
+    };
+    // choose returns a real code pointer. Both source declarations are Flags8,
+    // but the second target consumes EDI rather than DIL.
+    let choose = vec![0x85,0xff,0x48,0x8d,0x05,0x37,0,0,0,0x48,0x8d,0x0d,0x50,0,0,0,0x48,0x0f,0x45,0xc1,0xc3];
+    let mut dispatch = vec![0x53,0x48,0x89,0xfb,0x89,0xf7];
+    dispatch.extend(relative(0xe8, 0x10a0 + dispatch.len() as u64, 0x1000));
+    dispatch.extend_from_slice(&[0x48,0x89,0xc6,0x48,0x89,0xdf,0x5b]);
+    dispatch.extend(relative(0xe9, 0x10a0 + dispatch.len() as u64, 0x1080));
+    let mut functions = vec![
+        ("choose", 0x1000u64, choose, "Callback choose(unsigned int which)".to_string()),
+        ("byte_target", 0x1040, vec![0x31,0xc0,0x40,0x80,0xff,0x55,0x0f,0x94,0xc0,0xc3], "int byte_target(Flags value)".to_string()),
+        ("word_target", 0x1060, vec![0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3], "int word_target(Flags value)".to_string()),
+        ("invoke", 0x1080, vec![0xff,0xd6,0xc3], "int invoke(Flags value,Callback callback)".to_string()),
+        ("dispatch", 0x10a0, dispatch, "int dispatch(Flags value,unsigned int which)".to_string()),
+    ];
+    for (name, pc, raw) in [("direct_dirty", 0x1100u64, 0x10055u32), ("direct_clean", 0x1120, 85)] {
+        let mut code = vec![0xbf];
+        code.extend_from_slice(&raw.to_le_bytes());
+        code.extend(relative(0xe8, pc + code.len() as u64, 0x1060));
+        code.push(0xc3);
+        functions.push((name, pc, code, format!("int {name}(void)")));
+    }
+    let mut ambient = relative(0xe8, 0x1140, 0x1060);
+    ambient.push(0xc3);
+    functions.push(("ambient", 0x1140, ambient, "int ambient(void)".to_string()));
+    for (name, pc, raw) in [("ambient_dirty", 0x1160u64, 0x10055u32), ("ambient_clean", 0x1180, 85)] {
+        let mut code = vec![0xbf];
+        code.extend_from_slice(&raw.to_le_bytes());
+        code.extend(relative(0xe8, pc + code.len() as u64, 0x1140));
+        code.push(0xc3);
+        functions.push((name, pc, code, format!("int {name}(void)")));
+    }
+    let mut wide_ambient = relative(0xe8, 0x11a0, 0x1140);
+    wide_ambient.push(0xc3);
+    functions.push(("wide_ambient", 0x11a0, wide_ambient, "int wide_ambient(unsigned long long bits)".to_string()));
+    let mut image = vec![0u8; 0x1c0];
+    let binary = dir.join("whole_calls");
+    let project = dir.join("project");
+    let mut args = vec![
+        "decompile-project".to_string(), binary.display().to_string(), "-o".into(), project.display().to_string(),
+        "--raw-image".into(), "--target".into(), "x86:LE:64:default:gcc".into(), "--base".into(), "0x1000".into(),
+        "--sleighpath".into(), specs(), "--assert-strict".into(),
+        "--assert".into(), "typedef typedef unsigned char Flags;".into(),
+        "--assert".into(), "typedef typedef int (*Callback)(Flags);".into(),
+    ];
+    for (name, pc, code, prototype) in functions {
+        let offset = (pc - 0x1000) as usize;
+        image[offset..offset + code.len()].copy_from_slice(&code);
+        args.extend([
+            "--addr".into(), format!("{pc:#x}"),
+            "--define-function".into(), format!("{pc:#x}-{:#x}={name}", pc + code.len() as u64),
+            "--assert".into(), format!("prototype {name} {prototype}"),
+        ]);
+    }
+    std::fs::write(&binary, image).unwrap();
+    let refs: Vec<_> = args.iter().map(String::as_str).collect();
+    let (_, stderr, ok) = run_kuna(&refs);
+    if !ok && is_specs_skip(&stderr) {
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("physical callback round trip: skipping (no `.sla`; run `make specs`)");
+        return;
+    }
+    assert!(ok, "whole callback export failed: {stderr}");
+    let driver = dir.join("consumer.c");
+    std::fs::write(&driver, r#"#include <stdint.h>
+#include <stdio.h>
+#include "whole_calls.h"
+int main(void) {
+    if (choose(0) != choose(0) || choose(1) != choose(1) || choose(0) == choose(1)) return 11;
+    if (direct_dirty() != 0 || direct_clean() != 1) return 12;
+    if (ambient_dirty() != 0 || ambient_clean() != 1) return 15;
+    const uint64_t upper[] = {0, UINT64_C(0x10000), UINT64_C(0x1234567800000000)};
+    for (unsigned p=0; p<3; ++p) for (unsigned low=0; low<256; ++low) {
+        uint64_t raw=upper[p]|low;
+        int got=ambient(raw), wide=wide_ambient(raw), want=(uint32_t)raw==85;
+        if (got != want || wide != want) {
+            fprintf(stderr,"ambient raw=%llx got=%d wide=%d want=%d\n",(unsigned long long)raw,got,wide,want);
+            return 14;
+        }
+    }
+    for (unsigned p=0; p<3; ++p) for (unsigned low=0; low<256; ++low) for (unsigned which=0; which<2; ++which) {
+        uint64_t raw=upper[p]|low;
+        int want=which ? (uint32_t)raw==85 : (uint8_t)raw==85;
+        int got=dispatch(raw,which);
+        int indirect=invoke(raw,choose(which));
+        if (got != want || indirect != want) {
+            fprintf(stderr,"raw=%llx target=%u dispatch=%d indirect=%d want=%d\n", (unsigned long long)raw,which,got,indirect,want);
+            return 13;
+        }
+    }
+    return 0;
+}
+"#).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let exe = dir.join(format!("consumer{opt}"));
+        let build = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(&project).arg(project.join("whole_calls.c"))
+            .arg(&driver).arg("-o").arg(&exe).output().expect("spawn cc");
+        assert!(build.status.success(), "{opt}: untouched exported caller/targets/header are incompatible:\n{}", String::from_utf8_lossy(&build.stderr));
+        let run = Command::new(&exe).output().expect("run whole callback consumer");
+        assert!(run.status.success(), "{opt}: whole callback behavior or identity changed:\n{}", String::from_utf8_lossy(&run.stderr));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn signed_byte_table_loads_ignore_the_consumers_plain_char_mode() {
+    if !have_c_compiler() {
+        eprintln!("signed table round trip: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-signed-table-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("signed_table");
+    let mut bytes = vec![0u8; 0x108];
+    // AND EDI,7; LEA RAX,[RIP+0xf6]; MOVSBL [RDI+RAX],EAX; RET.
+    let code = [0x83,0xe7,0x07,0x48,0x8d,0x05,0xf6,0,0,0,0x0f,0xbe,0x04,0x07,0xc3];
+    bytes[..code.len()].copy_from_slice(&code);
+    bytes[0x100..].copy_from_slice(&[129,4,225,99,0,127,255,42]);
+    std::fs::write(&image, bytes).unwrap();
+    let sp = specs();
+    let (printed, stderr, ok) = run_kuna(&[
+        "decompile-all", image.to_str().unwrap(), "--raw-image", "--target", "x86:LE:64:default:gcc",
+        "--base", "0x1000", "--addr", "0x1000", "--define-function", "0x1000-0x100f=table_value",
+        "--sleighpath", &sp, "--assert-strict",
+        "--assert", "prototype table_value int table_value(unsigned int index)",
+        "--assert", "data 0x1100 char identity_table[8]",
+    ]);
+    if !ok && is_specs_skip(&stderr) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!("signed table round trip: skipping (no `.sla`; run `make specs`)");
+        return;
+    }
+    assert!(ok, "signed table decompilation failed: {stderr}");
+    assert!(printed.contains("identity_table"), "the machine load lost its named global dependency:\n{printed}");
+    let source = dir.join("consumer.c");
+    std::fs::write(&source, format!(r#"#include <stdint.h>
+#include <stdio.h>
+const signed char identity_table[8] = {{-127,4,-31,99,0,127,-1,42}};
+{printed}
+int main(void) {{
+    const int expected[8] = {{-127,4,-31,99,0,127,-1,42}};
+    for (unsigned index=0; index<8; ++index) {{
+        int actual=table_value(index);
+        if (actual!=expected[index]) {{
+            fprintf(stderr,"table_value(%u)=%d expected=%d\n",index,actual,expected[index]);
+            return 1;
+        }}
+    }}
+    return 0;
+}}
+"#)).unwrap();
+    for opt in ["-O0", "-O2"] {
+        for char_mode in ["-fsigned-char", "-funsigned-char"] {
+            let exe = dir.join(format!("consumer{opt}{char_mode}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=implicit-function-declaration", opt, char_mode])
+                .arg(&source).arg("-o").arg(&exe).output().expect("spawn cc");
+            assert!(build.status.success(), "{opt} {char_mode}: unchanged signed table C did not compile:\n{}\n{printed}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run signed table consumer");
+            assert!(run.status.success(), "{opt} {char_mode}: MOVSBL changed meaning:\n{}\n{printed}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn callback_callee_saved_effects_cannot_be_folded_into_the_wrong_result() {
+    if !have_c_compiler() {
+        eprintln!("callback register effects: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-callback-preserved-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sp = specs();
+    for restore in [false, true] {
+        let name = if restore { "restored" } else { "clobbered" };
+        let binary = dir.join(name);
+        let project = dir.join(format!("{name}-project"));
+        // The outer producer passes this actual target, not an arbitrary native callback.
+        let dispatch = [0x48,0x8d,0x35,0xf9,1,0,0,0xbf,85,0,0,0,0xe8,0xef,0,0,0,0xc3];
+        let caller = [0x53,0xbb,42,0,0,0,0xff,0xd6,0x89,0xd8,0x5b,0xc3];
+        let target: &[u8] = if restore {
+            &[0x53,0xbb,7,0,0,0,0xb8,3,0,0,0,0x5b,0xc3]
+        } else {
+            &[0xbb,7,0,0,0,0xb8,3,0,0,0,0xc3]
+        };
+        let mut image = vec![0u8; 0x220];
+        image[..dispatch.len()].copy_from_slice(&dispatch);
+        image[0x100..0x100+caller.len()].copy_from_slice(&caller);
+        image[0x200..0x200+target.len()].copy_from_slice(target);
+        std::fs::write(&binary, image).unwrap();
+        let target_definition = format!("0x1200-0x{:x}=target", 0x1200 + target.len());
+        let common = [
+            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
+            "--addr", "0x1000", "--addr", "0x1100", "--addr", "0x1200",
+            "--define-function", "0x1000-0x1012=dispatch", "--define-function", "0x1100-0x110c=caller",
+            "--define-function", &target_definition, "--assert-strict",
+            "--assert", "typedef typedef int (*Callback)(unsigned char);",
+            "--assert", "prototype dispatch int dispatch(void)",
+            "--assert", "prototype caller int caller(unsigned char value,Callback callback)",
+            "--assert", "prototype target int target(unsigned char value)",
+        ];
+        let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
+            .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap()])
+            .args(common).output().expect("export callback effects");
+        let stderr = String::from_utf8_lossy(&export.stderr);
+        if !export.status.success() && is_specs_skip(&stderr) {
+            std::fs::remove_dir_all(&dir).unwrap();
+            eprintln!("callback register effects: skipping (no `.sla`; run `make specs`)");
+            return;
+        }
+        if !export.status.success() {
+            assert!(!restore, "a real save/restore must remain representable: {stderr}");
+            assert_eq!(export.status.code(), Some(1), "not an executable-boundary rejection: {stderr}");
+            let mut args = vec!["decompile-all", binary.to_str().unwrap(), "--json"];
+            args.extend(common);
+            let (metadata, error, ok) = run_kuna(&args);
+            assert!(ok, "diagnostic decompilation must remain available: {error}");
+            assert!(metadata.contains("\"callable_export_error\": \""), "{metadata}");
+            continue;
+        }
+        let expected = if restore { 42 } else { 7 };
+        let driver = dir.join(format!("{name}-consumer.c"));
+        std::fs::write(&driver, format!(
+            "#include \"{name}.h\"\n#include <stdio.h>\nint main(void) {{ int got=dispatch(); if(got!={expected}) {{ fprintf(stderr,\"got=%d expected={expected}\\n\",got); return 1; }} return 0; }}\n"
+        )).unwrap();
+        for opt in ["-O0", "-O2"] {
+            let exe = dir.join(format!("{name}{opt}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+                .arg("-I").arg(&project).arg(project.join(format!("{name}.c")))
+                .arg(&driver).arg("-o").arg(&exe).output().expect("compile callback effects");
+            assert!(build.status.success(), "{name} {opt}: {}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run callback effects");
+            assert!(run.status.success(), "{name} {opt}: unchanged C differs from the machine: {}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn restored_register_saved_slot_remains_observable_to_a_read_only_child() {
+    if !have_c_compiler() {
+        eprintln!("saved-slot child effects: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-saved-slot-child-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("saved_slot");
+    let project = dir.join("project");
+    // x86-32 cdecl: PUSH EBX; MOV EBX,7; CALL child; POP EBX; RET.
+    // Child reads [ESP+4], which is the caller's saved incoming EBX, not 7.
+    // Restoring EBX therefore does not make its incoming value bookkeeping.
+    let caller = [0x53,0xbb,7,0,0,0,0xe8,0xf5,0,0,0,0x5b,0xc3];
+    let child = [0x8b,0x44,0x24,4,0xc3];
+    let mut image = vec![0u8; 0x105];
+    image[..caller.len()].copy_from_slice(&caller);
+    image[0x100..].copy_from_slice(&child);
+    std::fs::write(&binary, image).unwrap();
+    let sp = specs();
+    let common = [
+        "--raw-image", "--target", "x86:LE:32:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
+        "--addr", "0x1000", "--addr", "0x1100",
+        "--define-function", "0x1000-0x100d=saved_argument", "--define-function", "0x1100-0x1105=child",
+        "--assert-strict", "--assert", "prototype saved_argument int __cdecl saved_argument(void)",
+        "--assert", "prototype child int __cdecl child(int value)",
+    ];
+    let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
+        .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap()])
+        .args(common).output().expect("export saved-slot child effects");
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    if !export.status.success() && is_specs_skip(&stderr) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!("saved-slot child effects: skipping (no `.sla`; run `make specs`)");
+        return;
+    }
+    if !export.status.success() {
+        assert_eq!(export.status.code(), Some(1), "not an executable-boundary rejection: {stderr}");
+        let mut args = vec!["decompile-all", binary.to_str().unwrap(), "--json"];
+        args.extend(common);
+        let (metadata, error, ok) = run_kuna(&args);
+        assert!(ok, "diagnostic decompilation must remain available: {error}");
+        assert!(metadata.contains("\"callable_export_error\": \""), "{metadata}");
+    } else {
+        let driver = dir.join("consumer.c");
+        std::fs::write(&driver, r#"#include "saved_slot.h"
+#include <stdint.h>
+#include <stdio.h>
+int main(void) {
+    const uint32_t incoming[] = {0, 7, 0x1234, 0x5678, UINT32_C(0x80000000), UINT32_MAX};
+    for (unsigned i = 0; i < sizeof incoming / sizeof incoming[0]; ++i) {
+        uint32_t got = (uint32_t)saved_argument(incoming[i]);
+        if (got != incoming[i]) {
+            fprintf(stderr, "incoming EBX=%u, result=%u\n", incoming[i], got);
+            return 1;
+        }
+    }
+    return 0;
+}
+"#).unwrap();
+        for opt in ["-O0", "-O2"] {
+            let exe = dir.join(format!("consumer{opt}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+                .arg("-I").arg(&project).arg(project.join("saved_slot.c"))
+                .arg(&driver).arg("-o").arg(&exe).output().expect("compile saved-slot child effects");
+            assert!(build.status.success(), "{opt}: {}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run saved-slot child effects");
+            assert!(run.status.success(), "{opt}: unchanged C lost an observable saved value: {}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn branch_selected_entry_values_survive_the_cli_raw_image_pipeline() {
+    if !have_c_compiler() {
+        eprintln!("branch entry-value effects: skipping (missing `cc`)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kuna-branch-entry-rt-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("branch_copy");
+    let project = dir.join("project");
+    // TEST EDX; JZ first; MOV RAX,RSI; JMP done; first: MOV RAX,RDI; done: RET.
+    // Neither branch defines the incoming source value that it returns.
+    std::fs::write(&binary, [0x85,0xd2,0x74,5,0x48,0x89,0xf0,0xeb,3,0x48,0x89,0xf8,0xc3]).unwrap();
+    let sp = specs();
+    let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
+        .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap(),
+            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
+            "--addr", "0x1000", "--define-function", "0x1000-0x100d=subject", "--assert-strict", "--assert",
+            "prototype subject unsigned long long subject(unsigned long long first,unsigned long long second,unsigned int which)"])
+        .output().expect("export branch entry-value effects");
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    if !export.status.success() && is_specs_skip(&stderr) {
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!("branch entry-value effects: skipping (no `.sla`; run `make specs`)");
+        return;
+    }
+    assert!(export.status.success(), "a branch selecting declared inputs must be representable: {stderr}");
+    let driver = dir.join("consumer.c");
+    std::fs::write(&driver, r#"#include "branch_copy.h"
+#include <stdint.h>
+#include <stdio.h>
+int main(void) {
+    const uint64_t pairs[][2] = {{0,7}, {7,0},
+        {UINT64_C(0x123456789abcdef0),UINT64_C(0x76543210fedcba98)}};
+    const unsigned flags[] = {0,1,UINT32_MAX};
+    for (unsigned i=0; i<3; ++i) for (unsigned j=0; j<3; ++j) {
+        uint64_t want = pairs[i][flags[j] != 0];
+        uint64_t got = subject(pairs[i][0],pairs[i][1],flags[j]);
+        if (got != want) {
+            fprintf(stderr,"pair=%u flag=%u got=%llx want=%llx\n",i,flags[j],
+                (unsigned long long)got,(unsigned long long)want);
+            return 1;
+        }
+    }
+    return 0;
+}
+"#).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let exe = dir.join(format!("consumer{opt}"));
+        let build = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(&project).arg(project.join("branch_copy.c"))
+            .arg(&driver).arg("-o").arg(&exe).output().expect("compile branch entry-value effects");
+        assert!(build.status.success(), "{opt}: {}", String::from_utf8_lossy(&build.stderr));
+        let run = Command::new(&exe).output().expect("run branch entry-value effects");
+        assert!(run.status.success(), "{opt}: unchanged C discarded a branch's incoming value: {}", String::from_utf8_lossy(&run.stderr));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

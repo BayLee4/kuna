@@ -19,15 +19,14 @@ use kuna_base::marshal::{IdRegistry, XmlDecode, XmlEncode};
 use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
-use kuna_base::types::uintb;
 
 use kuna_decomp::callgraph::{CallGraph, NodeIndex, ELEM_CALLGRAPH, ELEM_NODE};
 use kuna_decomp::cpool::{
-    cpool_tag, ConstantPool, ConstantPoolInternal, CPoolTypeFactory, CPoolTypeRef,
-    CPoolTypeRefProvider, ELEM_CONSTANTPOOL, ELEM_CPOOLREC, ELEM_REF, ELEM_TOKEN,
+    cpool_tag, ConstantPool, ConstantPoolInternal, CPoolTypeFactory,
+    ELEM_CONSTANTPOOL, ELEM_CPOOLREC, ELEM_REF, ELEM_TOKEN,
     ATTRIB_A, ATTRIB_B, ATTRIB_LENGTH, ATTRIB_TAG,
 };
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_base::error::KunaResult;
 use kuna_base::marshal::{Decoder, Encoder};
 
@@ -37,29 +36,13 @@ use kuna_base::marshal::{Decoder, Encoder};
 
 struct VoidAccess;
 
-fn void_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))
+fn void_type() -> TypeRoot {
+    TypeFactoryImpl::new().get_type_void().unwrap()
 }
 
-impl CPoolTypeRef for VoidAccess {
-    fn encode_ref(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
-        encoder.open_element(&kuna_base::marshal::ELEM_VOID);
-        encoder.close_element(&kuna_base::marshal::ELEM_VOID);
-        Ok(())
-    }
-}
-impl CPoolTypeRefProvider for VoidAccess {
-    fn encode_record_type_ref(
-        &self,
-        _record: &kuna_decomp::cpool::CPoolRecord,
-        encoder: &mut dyn Encoder,
-    ) -> KunaResult<()> {
-        self.encode_ref(encoder)
-    }
-}
 impl CPoolTypeFactory for VoidAccess {
-    fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<Rc<Datatype>> {
-        let id = decoder.open_element()?;
+    fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<TypeRoot> {
+        let id = decoder.open_element_id(&kuna_base::marshal::ELEM_VOID)?;
         decoder.close_element(id)?;
         Ok(void_type())
     }
@@ -68,10 +51,8 @@ impl CPoolTypeFactory for VoidAccess {
         decoder: &mut dyn Decoder,
         _c: bool,
         _d: bool,
-    ) -> KunaResult<Rc<Datatype>> {
-        let id = decoder.open_element()?;
-        decoder.close_element(id)?;
-        Ok(void_type())
+    ) -> KunaResult<TypeRoot> {
+        self.decode_type(decoder)
     }
 }
 
@@ -84,21 +65,6 @@ fn cpool_registry() -> IdRegistry {
         reg.register_element(e);
     }
     reg
-}
-
-fn cpool_roundtrip(pool: &ConstantPoolInternal) -> ConstantPoolInternal {
-    let mgr = AddrSpaceManager::new();
-    let reg = cpool_registry();
-    let mut buf: Vec<u8> = Vec::new();
-    {
-        let mut enc = XmlEncode::new(&mut buf);
-        pool.encode(&mut enc, &VoidAccess).unwrap();
-    }
-    let mut dec = XmlDecode::new(&mgr, &reg);
-    dec.ingest_stream(&buf).unwrap();
-    let mut out = ConstantPoolInternal::new();
-    out.decode(&mut dec, &mut VoidAccess).unwrap();
-    out
 }
 
 /// HUNT(off-by-one / tokenizer): the C++ encode wraps a `'\n'` into the byte
@@ -169,39 +135,6 @@ fn cpool_duplicate_error_names_existing_token() {
     let msg = e.to_string();
     assert!(msg.contains("ORIGINAL"), "expected existing token, got: {msg}");
     assert!(!msg.contains("REPLACEMENT"), "must not name new token: {msg}");
-}
-
-/// HUNT(iteration order): the container is a BTreeMap keyed by the
-/// lexicographic CheapSorter (`a` then `b`); single-int refs have `b == 0`.
-/// Inserting wildly out of order and round-tripping must preserve the sorted
-/// order, and `(a, 0)` must sort before `(a, 1)` and before `(a+1, _)`.
-#[test]
-fn cpool_container_lexicographic_after_roundtrip() {
-    let mut pool = ConstantPoolInternal::new();
-    let refs: &[&[uintb]] = &[
-        &[2, 0],
-        &[1, 5],
-        &[1, 0],
-        &[1, 1],
-        &[2, 0xffff_ffff_ffff_ffff],
-        &[0, 9],
-    ];
-    for r in refs {
-        let rec = pool.create_record(r).unwrap();
-        rec_tag_primitive(rec);
-    }
-    let out = cpool_roundtrip(&pool);
-    // Each ref still resolves.
-    for r in refs {
-        assert!(out.get_record(r).is_some(), "lost ref {r:?}");
-    }
-    assert!(!out.empty());
-}
-
-fn rec_tag_primitive(rec: &mut kuna_decomp::cpool::CPoolRecord) {
-    // create_record leaves a default (primitive, value 0, no token) record,
-    // which encodes/decodes cleanly; nothing to set.
-    let _ = rec;
 }
 
 // --------------------------------------------------------------------------

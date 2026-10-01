@@ -2,9 +2,7 @@
 //! byte, and the two neighbours it must never swallow (a wider unknown, an
 //! array of unknown).
 
-use std::rc::Rc;
-
-use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory, TypeFactoryImpl};
 
 use super::is_uncommitted_byte;
 
@@ -25,7 +23,7 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn unknown(f: &TypeFactoryImpl, size: i32) -> Rc<Datatype> {
+fn unknown(f: &TypeFactoryImpl, size: i32) -> TypeRoot {
     f.get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 

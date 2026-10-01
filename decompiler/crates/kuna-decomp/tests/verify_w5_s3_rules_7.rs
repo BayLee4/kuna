@@ -31,7 +31,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 
 use kuna_decomp::action::Rule;
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_7::{
     RuleDivChain, RuleSignForm2, RuleSignMod2Opt, RuleSignMod2nOpt,
@@ -65,7 +65,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -75,8 +82,8 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -104,7 +111,7 @@ fn make_op(
     let pc = Address::new(Rc::clone(&r), off);
     let op = fd.obank_mut().create_at(num_in, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, 0, format!("{opc:?}")));
-    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize)));
+    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(fd, outsize)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();

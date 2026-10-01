@@ -296,7 +296,7 @@ fn dwarfstructs_off_suppresses_the_variant_arm_too() {
         return;
     };
     assert!(
-        prog.arch().types().kuna_variant_layouts().is_empty(),
+        prog.arch().types().kuna_variant_types().is_empty(),
         "the variant arm must not run with `dwarfstructs off`"
     );
 }
@@ -326,13 +326,17 @@ fn the_layout_side_table_is_recorded() {
             return;
         };
         let types = prog.arch().types();
-        let l = types.kuna_variant_layout("core::result::Result<u32, u32>");
+        let result = types.find_by_name("core::result::Result<u32, u32>").expect("Result lookup");
         if !on {
-            assert!(l.is_none(), "gate off records nothing");
-            assert!(types.kuna_variant_layouts().is_empty());
+            assert!(result.as_ref().is_none_or(|root| root.read().variant_layout(root.id()).is_none()),
+                "gate off records nothing");
+            assert!(types.kuna_variant_types().is_empty());
             continue;
         }
-        let l = l.expect("Result layout recorded");
+        let result = result.expect("Result type recorded");
+        let result_view = result.read();
+        let l = result_view.variant_layout(result.id()).expect("Result layout recorded");
+        assert_eq!(l.type_id, result.id());
         assert_eq!(l.size, 8);
         assert_eq!((l.tag_offset, l.tag_size), (0, 4));
         assert_eq!(l.payload_offset, 4);
@@ -347,22 +351,25 @@ fn the_layout_side_table_is_recorded() {
 
         // The niche shape's DEFAULT variant is recorded as one: every value the
         // other variants did not claim selects it.
-        let n = types
-            .kuna_variant_layout("core::option::Option<&u32>")
-            .expect("niche Option layout recorded");
+        let option = types.find_by_name("core::option::Option<&u32>")
+            .expect("niche Option lookup").expect("niche Option type recorded");
+        let option_view = option.read();
+        let n = option_view.variant_layout(option.id()).expect("niche Option layout recorded");
         assert!(n.niche);
-        assert_eq!(n.union_type, n.type_name, "the union is the whole type");
+        assert_eq!(n.union_type, option.id(), "the union is the whole type");
         assert_eq!(n.payload_offset, 0);
         assert_eq!(n.facet_named("Some").unwrap().discr, None);
-        assert!(n.facet_named("None").unwrap().payload_type.is_empty());
+        assert!(n.facet_named("None").unwrap().payload_type.is_none());
         assert_eq!(n.facet_for_discr(0).unwrap().name, "None");
         assert_eq!(n.facet_for_discr(0x2010c8).unwrap().name, "Some");
 
         // Three variants, and the fieldless one is on the table with no payload
         // type -- it has no bytes to overlay.
-        let t = types.kuna_variant_layout("fx::Three").expect("Three layout recorded");
+        let three = types.find_by_name("fx::Three").expect("Three lookup").expect("Three type recorded");
+        let three_view = three.read();
+        let t = three_view.variant_layout(three.id()).expect("Three layout recorded");
         assert_eq!(t.variants.len(), 3);
-        assert!(t.facet_named("C").unwrap().payload_type.is_empty());
+        assert!(t.facet_named("C").unwrap().payload_type.is_none());
         assert_eq!(t.facet_named("B").unwrap().fields, vec![("__0".to_string(), 8)]);
     }
 }
@@ -470,18 +477,20 @@ fn the_side_table_keeps_the_names_the_type_does_not() {
     };
     let types = prog.arch().types();
 
-    let r = types
-        .kuna_variant_layout("core::result::Result<u64, u64>")
-        .expect("Result<u64,u64> layout recorded");
+    let result = types.find_by_name("core::result::Result<u64, u64>")
+        .expect("Result<u64,u64> lookup").expect("Result<u64,u64> type recorded");
+    let result_view = result.read();
+    let r = result_view.variant_layout(result.id()).expect("Result<u64,u64> layout recorded");
     assert_eq!(r.facet_for_discr(0).unwrap().name, "Ok");
     assert_eq!(r.facet_for_discr(1).unwrap().name, "Err");
     assert_eq!(r.facet_named("Ok").unwrap().label, "field_0x8");
     assert_eq!(r.facet_named("Err").unwrap().label, "field_0x8");
     assert!(!r.names_any_variant(), "nothing in the emitted type names a variant");
 
-    let o = types
-        .kuna_variant_layout("core::option::Option<u64>")
-        .expect("Option<u64> layout recorded");
+    let option = types.find_by_name("core::option::Option<u64>")
+        .expect("Option<u64> lookup").expect("Option<u64> type recorded");
+    let option_view = option.read();
+    let o = option_view.variant_layout(option.id()).expect("Option<u64> layout recorded");
     assert_eq!(o.facet_named("Some").unwrap().label, "Some");
     assert!(o.names_any_variant());
 }

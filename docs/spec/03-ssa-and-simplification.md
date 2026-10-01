@@ -604,6 +604,22 @@ group):
 | `decompiler/crates/kuna-decomp/src/p3_dataflow/ruleaction_7.rs` | signed div/mod idioms, segments, pointer flow, predication, float compares | `RuleSignDiv2`, `RuleSignMod2nOpt`, `RuleModOpt`, `RuleSegment`, `RulePtrFlow`, `RuleConditionalMove` (group `conditionalexe`), `RuleFloatCast`, `RuleIgnoreNan` |
 | `decompiler/crates/kuna-decomp/src/p3_dataflow/ruleaction_8.rs` | int↔float conversion recovery, bit-counting booleans, float sign ops, compare splitting | `RuleUnsigned2Float`, `RuleThreeWayCompare`, `RulePopcountBoolXor`, `RuleLzcountShiftBool`, `RuleFloatSign`, `RuleOrCompare`, `RuleFuncPtrEncoding`, cleanup-pool `RuleExpandLoad` |
 
+**Floating-point constant evaluation.** `RuleCollapseConstants` evaluates
+floating operations through `decompiler/crates/kuna-num/src/float.rs
+(FloatFormat)`, also used by emulation. Its NaN results follow an unconditional
+pinned-oracle compatibility policy rather than the build host's arithmetic
+NaN sign: addition, subtraction, multiplication and division select the first
+encoded NaN operand's sign, otherwise the second's, and return a canonical
+quiet NaN before host arithmetic. Subtraction does not negate a selected
+second NaN. Square root, ceiling, floor and rounding preserve a NaN input's
+sign; negation flips it and absolute value clears it. Invalid operations with
+no NaN input retain the negative canonical NaN. Payloads and signaling
+distinctions are discarded as before; finite evaluation, signed zero,
+infinities, comparisons and conversions are unchanged. This is compatibility
+with the pinned C++ vectors, not a universal target-ISA NaN rule. "First" means
+the operand received by the evaluator: term ordering may already have swapped
+commutative inputs. Both golden replays remain byte-exact.
+
 For the 64-bit unsigned divide-by-three reciprocal, GCC can share one wide
 multiply between the quotient and remainder. After `RuleDivOpt` recovers
 `x / 3`, the sibling `(high64(x * 0xaaaaaaaaaaaaaaab) & ~1)` is exactly twice
@@ -860,6 +876,18 @@ container, converting constant encodings between formats along the way.
 per-field transfers using recovered types — described with the type system in
 chapter 05, as is lane division (`ActionLaneDivide` in stackstall, over
 `subflow.rs (LaneDivide)` (built over `transform.rs (TransformManager)`)).
+
+**Splitting constant payloads** (`subflow.rs (SplitDatatype::build_in_constants)`).
+A constant Varnode's logical width can exceed its unsigned 64-bit payload.
+Each component extracts bytes using the same zero-filling semantics as
+`CPUI_SUBPIECE`: offsets at or beyond byte eight yield zero, while lower offsets
+shift the payload and mask it to the component width. The byte boundary is
+checked before converting the offset to bits; neither a wrapped shift nor sign
+extension describes those upper bytes. Little-endian destinations use the
+component offset directly; big-endian destinations measure it from the opposite
+end of the logical value. This permits splitting the 16-byte SIMD zero stores in
+`tests/stages/gh1537-simd-memset.xml` with checked arithmetic, preserving both
+the individual stores and their optional recovery into a `memset`.
 
 **Which copies the split declines** (`subflow.rs
 (SplitDatatype::test_copy_constraints)`). Upstream refuses a COPY whose input is
@@ -1218,7 +1246,9 @@ register* the context database pins to a constant at this function's address
 type-recovery flag — the gate the oppool2 pointer rules and
 `ActionInferTypes` key on (chapter 05) — and `ActionStartCleanUp` marks the
 transition into the cleanup phase. `ActionNormalizeSetup` (normalize variant
-only) strips prototype locks for the normalization style.
+only) clears the analysis-owned prototype's inputs and unlocks its output and
+model once per function. Immutable host prototype facts are unchanged; resetting
+the action for a new function resets this once-per-function state.
 
 **Per-iteration maintenance** (mainloop): `ActionSpacebase` marks
 stack-pointer varnodes and their types ahead of heritage; `ActionHeritage`
@@ -1256,3 +1286,50 @@ branch, severing the dead edge
 constant-propagation result (P5 facts) edits the P2 control-flow artifact
 without any restart (§0.7): the next mainloop iteration simply re-heritages
 the smaller graph.
+
+Executable-C flow analysis can retain an opaque receipt for a bounded entry
+branch whose decision was made by these actual optimizer actions. The receipt
+records original operation/site identities, the genuine readonly load or raw
+memory COPY, tracked inputs, and the removed successor edge; it is not a second
+P-code evaluator. Heritage binding and supported rewrites (including
+`RuleSub2Add` and `RuleEqual2Zero`) advance the receipt only around their real
+successful mutations. Unsupported changes invalidate it. The selected analysis
+model is installed before the raw-flow snapshot, and source/model identity is
+still checked rather than waived when no source declaration exists.
+
+On re-following the same function, an old receipt can justify a conditional edge
+cut only if the original raw prefix, source context, tracked values, selected
+loader bytes, readonly policy, and nonvolatile/nonexternal memory properties
+still match. Final publication also requires the real optimizer to complete the
+same decision in the new flow. This conditional reachability proof never
+changes the original machine register-preservation summary or the all-original-
+CFG internal-role analysis. A same-owner real MIPS-image probe exercised both
+raw admission and final replay: changing the captured loader byte, readonly
+policy, volatile property, or relevant tracked value rejected the retained
+receipt; restoring each premise restored admission. This is receipt validation,
+not evidence that every caller can marshal a conditional callee as C.
+
+The maintained same-owner regression is
+`kuna-console/src/readonly_replay_tests.rs`; its private mutation implementation
+is `kuna-decomp/src/p4_calls/kuna_branchreachability/replay_tests.rs`. With the
+MIPS SLEIGH specification built, run from `decompiler/`:
+
+```sh
+cargo test --release -p kuna-console --lib actual_mips_readonly_receipt_replays_reject_changed_premises
+```
+
+It loads the checked-in `protoorder_floatgpr_mipsel` image, runs the actual
+optimizer, and retains the original receipt and owning function for all eight
+negative mutations and restored controls. The console dev-dependency enables
+the decompiler's `test-support` feature; these mutation helpers and their entry
+point are absent from normal library and CLI builds.
+
+The full caller-preservation gate is
+`python3 tests/ghidra/callable/readonly_preservation.py` from the repository root,
+using the prerequisites in `tests/ghidra/README.md`. It builds the genuine x86
+assembly fixture, checks its original machine register behavior, and requires
+unchanged exported C/H at `-O0` and `-O2` plus refusal when the concrete child
+provider is omitted. Nonzero readonly bytes, mutable storage, and disabled
+readonly propagation are independent refusal controls. Its positive caller
+assertion requires actual publication: an unresolved boundary is a failure, not
+an expected failure or a substitute receipt-only result.

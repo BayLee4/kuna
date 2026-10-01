@@ -614,7 +614,7 @@ pub fn returns_tail_result(data: &Funcdata, vn: VarnodeId, addr: &Address, size:
 
 /// The type a tail call this pass claimed hands back: the callee's own
 /// recovered return type, offered as the CALL output's local type.
-pub fn tail_return_type(data: &Funcdata, op: OpId, size: int4) -> Option<std::rc::Rc<crate::dtype::Datatype>> {
+pub fn tail_return_type(data: &Funcdata, op: OpId, size: int4) -> Option<crate::dtype::TypeRoot> {
     if !data.get_arch().pass_through {
         return None;
     }
@@ -624,7 +624,7 @@ pub fn tail_return_type(data: &Funcdata, op: OpId, size: int4) -> Option<std::rc
     }
     let fc = (0..data.num_calls()).map(|i| data.get_call_specs(i)).find(|fc| fc.get_op() == op)?;
     let (_, osize, ct) = data.kuna_protoorder_types(fc.get_entry_address())?.output.as_ref()?;
-    (*osize == size && ct.get_size() == size).then(|| std::rc::Rc::clone(ct))
+    (*osize == size && ct.get_size() == size).then(|| ct.clone())
 }
 
 /// Must heritage leave `[addr, addr+size)` out of the function's own RETURN

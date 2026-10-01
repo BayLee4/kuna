@@ -104,7 +104,7 @@ fn descend_of(data: &Funcdata, vn: VarnodeId) -> Vec<OpId> {
 /// Copy the data-type of `src_vn` onto the (newly created) `dst_vn` — the C++
 /// `newVn->updateType(srcVn->getType())` idiom.
 fn copy_type(data: &mut Funcdata, dst_vn: VarnodeId, src_vn: VarnodeId) {
-    let ty = data.vbank().get(src_vn).map(|v| Rc::clone(v.get_type()));
+    let ty = data.vbank().get(src_vn).map(|v| v.get_type().clone());
     if let Some(ty) = ty {
         if let Some(v) = data.vbank_mut().get_mut(dst_vn) {
             v.update_type(ty);
@@ -420,7 +420,7 @@ fn pull_absorb_and(data: &mut Funcdata, and_op: OpId, pull_op: OpId) -> int4 {
             }
             let new_zero = data.new_constant(vn_sz, 0);
             // dt = types->resizeInteger(vn->getType(), vn->getSize());
-            let vn_ty = data.vbank().get(vn).map(|v| Rc::clone(v.get_type()));
+            let vn_ty = data.vbank().get(vn).map(|v| v.get_type().clone());
             let arch = Rc::clone(data.get_arch());
             if let (Some(types), Some(vn_ty)) = (arch.types(), vn_ty) {
                 if let Ok(dt) = types.resize_integer(vn_ty, vn_sz) {
@@ -680,7 +680,7 @@ fn pull_absorb_comp_zero(data: &mut Funcdata, comp_op: OpId, pull_op: OpId) -> i
     // const TypeBitField *field = BitFieldExpression::getPullField(pullOp);
     // if (field == 0 || field->type->getMetatype() != TYPE_BOOL) return 0;
     match get_pull_field(data, pull_op) {
-        Some(field) if field.field_type.get_metatype() == type_metatype::TYPE_BOOL => {}
+        Some((_, field_type)) if field_type.get_metatype() == type_metatype::TYPE_BOOL => {}
         _ => return 0,
     }
     let comp_code = op_code(data, comp_op).unwrap();

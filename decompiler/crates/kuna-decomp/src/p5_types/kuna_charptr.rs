@@ -49,7 +49,7 @@
 //!   a character array in the image.
 //!
 //! The candidate is one more vote in the same `getLocalType` fold, folded by
-//! [`Datatype::type_order`], and it may also *refine* a pointer vote that points
+//! [`TypeRoot::type_order`], and it may also *refine* a pointer vote that points
 //! at nothing: `void *` and `undefined1 *` become `char *`, while a pointer vote
 //! at a named or sized thing — `FILE *`, `stat *`, `long *`, a synthesized
 //! `struct_3 *` — is left as it was.  The guard reads the vote in flight, so a
@@ -90,7 +90,7 @@ use kuna_base::address::Address;
 use kuna_base::types::{int4, uintb};
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use kuna_num::opcodes::OpCode;
 
@@ -173,13 +173,13 @@ enum Use {
 }
 
 /// Is `t` the one-byte ASCII `char` core type?
-fn is_char(t: &Datatype) -> bool {
+fn is_char(t: &TypeRoot) -> bool {
     t.get_size() == 1 && t.get_metatype() == type_metatype::TYPE_INT && t.is_ascii()
 }
 
 /// Is `t` a pointer at a single character?
-fn is_char_pointer(t: &Datatype) -> bool {
-    t.get_metatype() == type_metatype::TYPE_PTR && t.get_ptr_to().as_deref().is_some_and(is_char)
+fn is_char_pointer(t: &TypeRoot) -> bool {
+    t.get_metatype() == type_metatype::TYPE_PTR && t.get_ptr_to().as_ref().is_some_and(is_char)
 }
 
 /// Does `cur` point at nothing this rule would be overriding?
@@ -189,7 +189,7 @@ fn is_char_pointer(t: &Datatype) -> bool {
 /// this rule can supply.  A pointer at anything else — a named aggregate, a
 /// sized primitive, a synthesized struct — is a claim, and a claim outranks
 /// use evidence.
-fn points_at_nothing(cur: &Datatype) -> bool {
+fn points_at_nothing(cur: &TypeRoot) -> bool {
     match cur.get_ptr_to() {
         Some(p) => {
             p.get_metatype() == type_metatype::TYPE_VOID
@@ -230,9 +230,9 @@ fn is_declared_storage(data: &Funcdata, vn: VarnodeId) -> bool {
 pub fn char_pointer_from_evidence(
     data: &Funcdata,
     vn: VarnodeId,
-    cur: &Rc<Datatype>,
+    cur: &TypeRoot,
     enabled: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if !enabled {
         return None;
     }
@@ -253,6 +253,8 @@ pub fn char_pointer_from_evidence(
     let ev = walk_is_char(data, vn);
     if census_on() {
         let v = data.vbank().get(vn)?;
+        let view = cur.read();
+        let current = view.get(cur.id()).ok()?;
         eprintln!(
             "CHARPTR fn={:#x} {} size={} cur={} ev={}",
             data.get_address().get_offset(),
@@ -262,7 +264,7 @@ pub fn char_pointer_from_evidence(
                 format!("stack@{}", v.get_addr().get_offset() as i64)
             },
             ptrsize,
-            cur.get_name(),
+            current.get_name(),
             ev.label()
         );
     }
@@ -651,14 +653,16 @@ fn constant_is_string(data: &Funcdata, op: OpId, cvn: VarnodeId) -> bool {
     match glb.query_container_global(&rampoint, 1, &invalid) {
         Some(entry) => {
             if census_on() {
+                let view = entry.symbol_type.as_ref().map(TypeRoot::read);
+                let definition = entry.symbol_type.as_ref().zip(view.as_ref())
+                    .and_then(|(t, view)| view.get(t.id()).ok());
                 eprintln!(
                     "CHARPTR-STR ram={:#x} entry={:#x} ty={} sz={}",
                     rampoint.get_offset(),
                     entry.entry_addr.get_offset(),
-                    entry
-                        .symbol_type
+                    definition
                         .as_ref()
-                        .map(|t| t.get_name().to_string())
+                        .map(|ty| ty.get_name())
                         .unwrap_or_default(),
                     entry
                         .symbol_type
@@ -679,7 +683,7 @@ fn constant_is_string(data: &Funcdata, op: OpId, cvn: VarnodeId) -> bool {
 }
 
 /// Is `cand` more specific than `cur` in the `getLocalType` fold?
-pub fn folds_over(cand: &Rc<Datatype>, cur: &Rc<Datatype>) -> bool {
+pub fn folds_over(cand: &TypeRoot, cur: &TypeRoot) -> bool {
     0 > cand.type_order(cur).unwrap_or(0)
 }
 

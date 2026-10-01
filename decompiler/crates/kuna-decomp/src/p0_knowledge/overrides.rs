@@ -41,11 +41,8 @@
 //!
 //! ### Boundaries
 //!
-//! - The prototype override (`protoover : map<Address,FuncProto*>`) holds the W4
-//!   `FuncProto` (`fspec.cc`, not yet ported).  Its insert/query/encode/printRaw
-//!   surface is captured by the [`FuncProtoOverride`] trait so the store, the
-//!   merge-on-insert rule, and the encode walk are faithful; the W4 wiring point
-//!   implements [`FuncProtoOverride`] for the real `FuncProto`.  // STUB(W4)
+//! - Prototype overrides own immutable completed `FuncProto` facts keyed by
+//!   the caller's call instruction address, independently of callee prototypes.
 //! - `applyPrototype`/`applyIndirect` copy into a `FuncCallSpecs` (W4) and
 //!   `applyDeadCodeDelay`/`applyForceGoto` drive `Funcdata`/`Heritage`.  Those
 //!   are exposed as query/iterator accessors here ([`Override::find_proto_override`],
@@ -120,78 +117,9 @@ pub mod flow_type {
 // FuncProto boundary (override.hh: map<Address,FuncProto *> protoover)
 // ---------------------------------------------------------------------------
 
-/// \brief The slice of the W4 `FuncProto` that [`Override`] drives.
-///
-/// STUB(W4): the prototype override stores a `FuncProto*` (fspec.cc, not yet
-/// ported).  [`Override`] only ever (a) marks it as an override
-/// (`p->setOverride(true)`), (b) encodes it (`(*fiter).second->encode(encoder)`),
-/// and (c) prints it (`(*fiter).second->printRaw("func", s)`); the copy into a
-/// `FuncCallSpecs` happens at the W4 call site, not here.  This trait captures
-/// exactly that surface so the store + merge-on-insert rule are faithful.
-pub trait FuncProtoOverride {
-    /// Mark this prototype as an override (C++ `FuncProto::setOverride(true)`).
-    fn set_override(&mut self, val: bool);
-
-    /// Encode the prototype to a stream (C++ `FuncProto::encode`).
-    fn encode(&self, encoder: &mut dyn Encoder) -> KunaResult<()>;
-
-    /// Append a debug description of the prototype (C++ `FuncProto::printRaw`,
-    /// here always with the C++ literal name `"func"`).
-    fn print_raw(&self, s: &mut String);
-
-    /// The parsed [`PrototypePieces`](crate::fspec::PrototypePieces) this override
-    /// forces, when it is a parsed-declaration override (`override prototype <addr>
-    /// <decl>`).  `None` for an XML-decoded / non-pieces override.  Drives
-    /// `FlowInfo`'s flow-time `applyPrototype` (C++ `Override::applyPrototype` →
-    /// `fspecs.copy(*proto)`): the pieces are built into a locked `FuncProto`
-    /// copied onto the matching call spec.
-    fn pieces(&self) -> Option<&crate::fspec::PrototypePieces> {
-        None
-    }
-}
-
-/// A [`FuncProtoOverride`] backed by parsed [`PrototypePieces`](crate::fspec::PrototypePieces),
-/// the value an `override prototype <addr> <decl>` installs (C++ `IfcProtooverride`
-/// builds a `FuncProto` from the pieces; the kuna store keeps the pieces and
-/// reconstructs the `FuncProto` at flow-time `applyPrototype`).  Mirrors the
-/// console's wrapper; lives here so the re-seed path
-/// ([`crate::decompile_drive`]) can construct it without depending on the console
-/// crate.
-pub struct PiecesProtoOverride {
-    /// The parsed prototype declaration.
-    pub pieces: crate::fspec::PrototypePieces,
-}
-
-impl FuncProtoOverride for PiecesProtoOverride {
-    fn set_override(&mut self, _val: bool) {
-        // The override flag rides on the rebuilt `FuncProto` (set in
-        // `ArchFlowEnv::build_override_proto`), not on the pieces.
-    }
-    fn encode(&self, _encoder: &mut dyn Encoder) -> KunaResult<()> {
-        Err(KunaError::lowlevel(
-            "kuna rust port: prototype-override encode needs the W4 FuncProto::encode",
-        ))
-    }
-    fn print_raw(&self, s: &mut String) {
-        s.push_str("func(");
-        s.push_str(&self.pieces.intypes.len().to_string());
-        s.push(')');
-    }
-    fn pieces(&self) -> Option<&crate::fspec::PrototypePieces> {
-        Some(&self.pieces)
-    }
-}
-
-/// The W4 construct-and-decode callback used by [`Override::decode`] for the
-/// `<protooverride>` branch.
-///
-/// STUB(W4): the C++ builds a `FuncProto` from `glb->defaultfp` /
-/// `glb->types->getTypeVoid()` and calls `fp->decode(decoder, glb)`.  Both the
-/// default prototype model and the type factory are W4, so the construction is
-/// supplied by the caller as this callback (which decodes the child element and
-/// returns the boxed override).
+/// Model-aware construction callback for the `<protooverride>` branch.
 pub type ProtoDecoder<'a> =
-    dyn FnMut(&mut dyn Decoder) -> KunaResult<Box<dyn FuncProtoOverride>> + 'a;
+    dyn FnMut(&mut dyn Decoder) -> KunaResult<crate::fspec::FuncProto> + 'a;
 
 // ---------------------------------------------------------------------------
 // Override (override.hh:50-92, override.cc:29-433)
@@ -201,12 +129,11 @@ pub type ProtoDecoder<'a> =
 /// behavior for a single function (C++ `Override`, the P0 store).
 ///
 /// The C++ maps key on `Address` (`std::map`, ordered) — ported to `BTreeMap`
-/// with the same [`Address`] ordering.  `deadcodedelay` and `multistagejump` are
-/// the C++ `vector`s, ported to `Vec`.  The prototype-override values are boxed
-/// [`FuncProtoOverride`] trait objects (STUB(W4)).
+/// with the same [`Address`] ordering. Completed prototypes are immutable,
+/// shared caller facts; call specs copy them into their own mutable state.
 ///
 /// `Default` constructs the empty store (the C++ default-constructed `Override`).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Override {
     /// Force goto on jump at \b targetpc to \b destpc.
     forcegoto: BTreeMap<Address, Address>,
@@ -215,8 +142,8 @@ pub struct Override {
     deadcodedelay: Vec<int4>,
     /// Override indirect at \b call-point into direct to \b addr.
     indirectover: BTreeMap<Address, Address>,
-    /// Override prototype at \b call-point (STUB(W4): boxed `FuncProto`).
-    protoover: BTreeMap<Address, Box<dyn FuncProtoOverride>>,
+    /// Override prototype at \b call-point.
+    protoover: BTreeMap<Address, std::rc::Rc<crate::fspec::FuncProto>>,
     /// Addresses of indirect jumps that need multistage recovery.
     multistagejump: Vec<Address>,
     /// Override the CALL <-> BRANCH interpretation of a branch instruction.
@@ -236,7 +163,7 @@ impl Override {
 
     /// Clear the entire set of overrides (C++ `Override::clear`).
     ///
-    /// The C++ `delete`s each `protoover` value; the Rust `Box`es drop on clear.
+    /// Releases this store's references to the immutable prototypes.
     pub fn clear(&mut self) {
         self.forcegoto.clear();
         self.deadcodedelay.clear();
@@ -309,13 +236,37 @@ impl Override {
     /// Override the assumed function prototype at a specific call site
     /// (C++ `Override::insertProtoOverride`).
     ///
-    /// The C++ deletes any pre-existing override at the same call point, marks
-    /// the new prototype as an override (`setOverride(true)`), and takes
-    /// ownership.  The `BTreeMap::insert` drops the old `Box` (the `delete`),
-    /// preserving the merge rule "newest override at a call point wins".
-    pub fn insert_proto_override(&mut self, callpoint: Address, mut p: Box<dyn FuncProtoOverride>) {
-        p.set_override(true); // Mark this as an override
-        self.protoover.insert(callpoint, p); // Takes ownership; drops any prior value
+    /// The newest override at a call point wins, without mutating any other
+    /// caller's seed or a callee-global prototype.
+    pub fn insert_proto_override(&mut self, callpoint: Address, mut p: crate::fspec::FuncProto) {
+        p.set_override(true);
+        self.format_calls.remove(&callpoint);
+        self.protoover.insert(callpoint, std::rc::Rc::new(p));
+    }
+
+    pub fn has_proto_overrides(&self) -> bool {
+        !self.protoover.is_empty()
+    }
+
+    pub fn proto_overrides(&self) -> impl Iterator<Item = (&Address, &crate::fspec::FuncProto)> {
+        self.protoover.iter().map(|(addr, proto)| (addr, proto.as_ref()))
+    }
+
+    /// Merge completed caller seeds, retaining each source's format marker.
+    pub fn merge_proto_overrides(&mut self, source: &Override) {
+        for (addr, proto) in &source.protoover {
+            self.protoover.insert(addr.clone(), std::rc::Rc::clone(proto));
+            if source.format_calls.contains(addr) {
+                self.format_calls.insert(addr.clone());
+            } else {
+                self.format_calls.remove(addr);
+            }
+        }
+    }
+
+    pub fn remove_proto_override(&mut self, addr: &Address) {
+        self.protoover.remove(addr);
+        self.format_calls.remove(addr);
     }
 
     /// Flag an indirect jump for multistage analysis
@@ -355,14 +306,8 @@ impl Override {
     /// Look up a function-prototype override at a call point (C++
     /// `Override::applyPrototype`'s map find).
     ///
-    /// STUB(W4): the C++ then does `fspecs.copy(*proto)`; the copy into the W4
-    /// `FuncCallSpecs` happens at the call site, so the port returns the matched
-    /// override (or `None`) for the caller to copy in.  Returns `None`
-    /// immediately when the store is empty (the C++ `if (!protoover.empty())`).
-    pub fn find_proto_override(&self, callpoint: &Address) -> Option<&dyn FuncProtoOverride> {
-        if self.protoover.is_empty() {
-            return None;
-        }
+    /// The call site copies this prototype before recovering mutable call state.
+    pub fn find_proto_override(&self, callpoint: &Address) -> Option<&crate::fspec::FuncProto> {
         self.protoover.get(callpoint).map(|b| b.as_ref())
     }
 
@@ -469,7 +414,7 @@ impl Override {
             let mut a = String::new();
             callpoint.print_raw(&mut a).expect("printRaw: proto callpoint");
             s.push_str(&format!("override prototype at {a} to "));
-            proto.print_raw(s);
+            proto.print_raw("func", s);
             s.push('\n');
         }
     }
@@ -536,7 +481,7 @@ impl Override {
         for (callpoint, proto) in &self.protoover {
             encoder.open_element(&ELEM_PROTOOVERRIDE);
             callpoint.encode(encoder)?;
-            proto.encode(encoder)?;
+            proto.encode_internal(encoder)?;
             encoder.close_element(&ELEM_PROTOOVERRIDE);
         }
 
@@ -559,11 +504,8 @@ impl Override {
     /// Parse an `<override>` element containing override commands
     /// (C++ `Override::decode`).
     ///
-    /// STUB(W4): the `<protooverride>` branch constructs a `FuncProto` from
-    /// `glb->defaultfp` / `glb->types->getTypeVoid()` and decodes it — both W4.
-    /// The port takes a `proto_decoder` callback that performs that W4
-    /// construction+decode (and returns the boxed [`FuncProtoOverride`]); the
-    /// rest of the element walk is faithful.
+    /// The callback resolves the model and materializes complete storage before
+    /// insertion; no declaration pieces or flow-time ABI reassignment remain.
     pub fn decode(
         &mut self,
         decoder: &mut dyn Decoder,

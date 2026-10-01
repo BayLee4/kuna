@@ -15,9 +15,8 @@
 //!     `size -= offset` truncation, reached for an odd-sized data-type in
 //!     `MultiSlotAssign::assignAddress`.  Wrap-prone (`uint4 -= int4`).
 //!   - **`HomogeneousAggregate::filter`** (modelrules.cc:412-430): the
-//!     `primitives.get(i).dt != base` pointer-identity comparison, ported as
-//!     `Rc::ptr_eq` — must accept an array of identical primitives and reject a
-//!     struct of distinct primitives.  TypeFactory cache determinism.
+//!     primitive type identity comparison — must accept arrays and structs of
+//!     the same primitive and reject aggregates of different primitives.
 //!   - **`VarargsFilter`** (modelrules.cc:502-508, .hh:224): the
 //!     `firstPos = 0x80000000` (INT_MIN) decode default, the
 //!     `firstVarArgSlot < 0` short-circuit, and inclusive `[firstPos,lastPos]`.
@@ -30,7 +29,9 @@ use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_class, type_metatype, Datatype, DatatypeKind, TypeField, TypeFactory};
+use kuna_decomp::dtype::{
+    type_class, type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField, TypeRoot,
+};
 use kuna_decomp::fspec::{
     AssignActionResponse, ParamEntry, ParamListKind, ParamListStandard, ParameterPieces,
     PrototypePieces,
@@ -99,30 +100,39 @@ fn stack_entry(
     .expect("seed stack entry")
 }
 
-fn dt_int(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, type_metatype::TYPE_INT))
+fn dt_int(factory: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    factory
+        .intern(Datatype::new_with_align(size, size, type_metatype::TYPE_INT))
+        .expect("intern integer")
 }
-fn dt_float(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, type_metatype::TYPE_FLOAT))
+fn dt_float(factory: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    factory
+        .intern(Datatype::new_with_align(size, size, type_metatype::TYPE_FLOAT))
+        .expect("intern float")
 }
 
-fn dt_struct(size: int4, align: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn dt_struct(
+    factory: &TypeFactoryImpl,
+    size: int4,
+    align: int4,
+    fields: &[(int4, TypeRoot)],
+) -> TypeRoot {
     let mut d = Datatype::new_with_align(size, align, type_metatype::TYPE_STRUCT);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ft))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ft)))
+        .map(|(i, (off, ft))| TypeField::new(i as int4, *off, format!("f{i}"), ft.id()))
         .collect();
     d.kind = DatatypeKind::Struct { field, bitfield: Vec::new() };
-    Rc::new(d)
+    factory.intern(d).expect("intern struct")
 }
 
-fn dt_array(elem: Rc<Datatype>, nels: int4) -> Rc<Datatype> {
+fn dt_array(factory: &TypeFactoryImpl, elem: &TypeRoot, nels: int4) -> TypeRoot {
     let elsize = elem.get_align_size();
     let mut d =
         Datatype::new_with_align(elsize * nels, elem.get_alignment(), type_metatype::TYPE_ARRAY);
-    d.kind = DatatypeKind::Array { arrayof: elem, arraysize: nels };
-    Rc::new(d)
+    d.kind = DatatypeKind::Array { arrayof: elem.id(), arraysize: nels };
+    factory.intern(d).expect("intern array")
 }
 
 fn modelrules_registry() -> IdRegistry {
@@ -188,68 +198,30 @@ fn decode_filter(xml: &str, mgr: &AddrSpaceManager) -> kuna_base::error::KunaRes
     DatatypeFilter::decode_filter(&mut decoder)
 }
 
-// A minimal TypeFactory that only services get_type_pointer (for ConvertToPointer),
-// panicking on everything else.  Not used by these tests, but assign_address needs
-// the trait object — so build a never-reached panic factory.
-struct PanicFactory;
-#[allow(unused_variables)]
-impl TypeFactory for PanicFactory {
-    fn get_size_of_int(&self) -> int4 { panic!() }
-    fn get_size_of_long(&self) -> int4 { panic!() }
-    fn get_size_of_char(&self) -> int4 { panic!() }
-    fn get_size_of_wchar(&self) -> int4 { panic!() }
-    fn get_size_of_pointer(&self) -> int4 { panic!() }
-    fn get_size_of_alt_pointer(&self) -> int4 { panic!() }
-    fn get_alignment(&self, size: u32) -> kuna_base::error::KunaResult<int4> { panic!() }
-    fn get_primitive_align_size(&self, size: u32) -> kuna_base::error::KunaResult<int4> { panic!() }
-    fn get_type_void(&self) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_base_no_char(&self, s: int4, m: type_metatype) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_base(&self, s: int4, m: type_metatype) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_base_named(&self, s: int4, m: type_metatype, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_char(&self, s: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_code(&self) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer_strip_array(&self, s: int4, pt: Rc<Datatype>, ws: u32) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer(&self, s: int4, pt: Rc<Datatype>, ws: u32) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer_named(&self, s: int4, pt: Rc<Datatype>, ws: u32, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn resize_pointer(&self, ptr: Rc<Datatype>, new_size: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer_rel(&self, parent_ptr: Rc<Datatype>, ptr_to: Rc<Datatype>, off: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer_rel_full(&self, sz: int4, parent: Rc<Datatype>, ptr_to: Rc<Datatype>, ws: int4, off: int4, nm: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_pointer_with_space(&self, ptr_to: Rc<Datatype>, spc: Rc<AddrSpace>, nm: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_array(&self, as_: int4, ao: Rc<Datatype>) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_struct(&self, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_partial_struct(&self, contain: Rc<Datatype>, off: int4, sz: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_union(&self, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_partial_union(&self, contain: Rc<Datatype>, off: int4, sz: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_partial_enum(&self, contain: Rc<Datatype>, off: int4, sz: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_enum(&self, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_type_spacebase(&self, id: Rc<AddrSpace>, addr: &kuna_base::address::Address) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn resize_integer(&self, ct: Rc<Datatype>, new_size: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-    fn get_exact_piece(&self, ct: Rc<Datatype>, offset: int4, size: int4) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> { panic!() }
-    fn find_by_name(&self, n: &str) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> { panic!() }
-    fn concretize(&self, ct: Rc<Datatype>) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
-}
-
 // ===========================================================================
 // 1. SizeRestrictedFilter::initFromSizeList (parse_size_list) parity
 // ===========================================================================
 
 #[test]
 fn v_w6_s4_modelrules_size_list_parse_parity() {
+    let factory = TypeFactoryImpl::new();
     let mgr = AddrSpaceManager::new();
 
     // "8, 2, 4" -> sizes {2,4,8} (set order), minSize=2, maxSize=8.
     // The filter then accepts exactly 2/4/8-byte types and nothing else.
     let f = decode_filter(r#"<datatype name="any" sizes="8, 2, 4"/>"#, &mgr).expect("sizes decode");
-    assert!(f.filter(&dt_int(2)), "2 in {{2,4,8}}");
-    assert!(f.filter(&dt_int(4)), "4 in {{2,4,8}}");
-    assert!(f.filter(&dt_int(8)), "8 in {{2,4,8}}");
-    assert!(!f.filter(&dt_int(1)), "1 below min");
-    assert!(!f.filter(&dt_int(3)), "3 not enumerated even though min<=3<=max");
-    assert!(!f.filter(&dt_int(16)), "16 above max");
+    assert!(f.filter(&dt_int(&factory, 2)), "2 in {{2,4,8}}");
+    assert!(f.filter(&dt_int(&factory, 4)), "4 in {{2,4,8}}");
+    assert!(f.filter(&dt_int(&factory, 8)), "8 in {{2,4,8}}");
+    assert!(!f.filter(&dt_int(&factory, 1)), "1 below min");
+    assert!(!f.filter(&dt_int(&factory, 3)), "3 not enumerated even though min<=3<=max");
+    assert!(!f.filter(&dt_int(&factory, 16)), "16 above max");
 
     // Space-separated (no commas) parses identically (C++ `s>>ws` between ints).
     let f2 = decode_filter(r#"<datatype name="any" sizes="4 8"/>"#, &mgr).expect("space decode");
-    assert!(f2.filter(&dt_int(4)) && f2.filter(&dt_int(8)) && !f2.filter(&dt_int(6)));
+    assert!(f2.filter(&dt_int(&factory, 4))
+        && f2.filter(&dt_int(&factory, 8))
+        && !f2.filter(&dt_int(&factory, 6)));
 
     // A non-positive value throws "Bad filter size" (val <= 0 in the C++ loop).
     assert!(decode_filter(r#"<datatype name="any" sizes="4 0 8"/>"#, &mgr).is_err());
@@ -286,6 +258,7 @@ fn two_reg_stack_model(
 
 #[test]
 fn v_w6_s4_modelrules_justify_pieces_little_endian() {
+    let factory = TypeFactoryImpl::new();
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let stk = stack_space();
@@ -296,7 +269,7 @@ fn v_w6_s4_modelrules_justify_pieces_little_endian() {
     let mut status = vec![0i32; 3];
     let mut res = ParameterPieces::default();
     let r = rule
-        .assign_address(&dt_int(3), &PrototypePieces::default().with_dummy(), 0, &PanicFactory, &mut status, &mut res, &model, &mgr)
+        .assign_address(&dt_int(&factory, 3), &PrototypePieces::default().with_dummy(), 0, &factory, &mut status, &mut res, &model, &mgr)
         .expect("assign");
     assert_eq!(r, AssignActionResponse::success);
     // One 4-byte register consumed; the single piece truncated to 3 bytes.
@@ -307,6 +280,7 @@ fn v_w6_s4_modelrules_justify_pieces_little_endian() {
 
 #[test]
 fn v_w6_s4_modelrules_justify_pieces_big_endian() {
+    let factory = TypeFactoryImpl::new();
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_be();
     let stk = stack_space();
@@ -317,7 +291,7 @@ fn v_w6_s4_modelrules_justify_pieces_big_endian() {
     let mut status = vec![0i32; 3];
     let mut res = ParameterPieces::default();
     let r = rule
-        .assign_address(&dt_int(3), &PrototypePieces::default().with_dummy(), 0, &PanicFactory, &mut status, &mut res, &model, &mgr)
+        .assign_address(&dt_int(&factory, 3), &PrototypePieces::default().with_dummy(), 0, &factory, &mut status, &mut res, &model, &mgr)
         .expect("assign");
     assert_eq!(r, AssignActionResponse::success);
     // addOffset = BE(true) ^ mostSig(true) ^ justRight(true) = true -> offset += 1.
@@ -327,49 +301,42 @@ fn v_w6_s4_modelrules_justify_pieces_big_endian() {
 }
 
 // ===========================================================================
-// 3. HomogeneousAggregate::filter pointer-identity (Rc::ptr_eq)
+// 3. HomogeneousAggregate::filter primitive type identity
 // ===========================================================================
 
 #[test]
-fn v_w6_s4_modelrules_homogeneous_aggregate_ptr_identity() {
+fn v_w6_s4_modelrules_homogeneous_aggregate_primitive_identity() {
+    let factory = TypeFactoryImpl::new();
     let mgr = AddrSpaceManager::new();
     // <datatype name="homogeneous-float-aggregate"/> -> meta=FLOAT, maxPrim=4.
     let f = decode_filter(r#"<datatype name="homogeneous-float-aggregate"/>"#, &mgr)
         .expect("homo decode");
 
-    // Array of 4 identical floats: every primitive shares the same Rc (array base)
-    // -> Rc::ptr_eq true for all, base meta == FLOAT -> ACCEPT.
-    let f4 = dt_float(4);
-    let arr = dt_array(Rc::clone(&f4), 4);
+    // Array of 4 identical floats: every primitive has the same graph identity.
+    let f4 = dt_float(&factory, 4);
+    let arr = dt_array(&factory, &f4, 4);
     assert!(f.filter(&arr), "array of 4 identical floats is a homogeneous float aggregate");
 
     // Array of 5 identical floats exceeds maxPrimitives=4 -> extractor invalid -> REJECT.
-    let arr5 = dt_array(Rc::clone(&f4), 5);
+    let arr5 = dt_array(&factory, &f4, 5);
     assert!(!f.filter(&arr5), "5 primitives exceeds the maxprimitives=4 default");
 
     // Struct {float, int}: primitives differ (and one is non-float) -> REJECT.
-    let mixed = dt_struct(8, 4, &[(0, dt_float(4)), (4, dt_int(4))]);
+    let mixed = dt_struct(&factory, 8, 4, &[(0, dt_float(&factory, 4)), (4, dt_int(&factory, 4))]);
     assert!(!f.filter(&mixed), "mixed float/int struct is not a homogeneous float aggregate");
 
-    // Struct {float@0, float@4} built from DISTINCT Rc allocations of the same
-    // logical float: C++ would dedup these to one Datatype* (ptr-eq true); the
-    // kuna harness does NOT dedup, so Rc::ptr_eq is false on field 1 -> REJECT.
-    // This documents the TypeFactory-cache dependency of the ptr-identity port.
-    let s_distinct = dt_struct(8, 4, &[(0, dt_float(4)), (4, dt_float(4))]);
-    assert!(
-        !f.filter(&s_distinct),
-        "distinct-Rc fields are NOT ptr-eq in the no-dedup harness (cache-determinism dependency)"
+    // Repeated requests for the same primitive produce homogeneous struct fields.
+    let s_shared = dt_struct(
+        &factory,
+        8,
+        4,
+        &[(0, dt_float(&factory, 4)), (4, dt_float(&factory, 4))],
     );
-
-    // Struct {float@0, float@4} built from a SHARED Rc: ptr-eq true -> ACCEPT,
-    // matching C++ when the TypeFactory has deduplicated the field type.
-    let shared = dt_float(4);
-    let s_shared = dt_struct(8, 4, &[(0, Rc::clone(&shared)), (4, Rc::clone(&shared))]);
-    assert!(f.filter(&s_shared), "shared-Rc identical float fields ARE a homogeneous float aggregate");
+    assert!(f.filter(&s_shared), "identical float fields are a homogeneous float aggregate");
 
     // An int aggregate is rejected because the base meta (INT) != FLOAT.
-    let i4 = dt_int(4);
-    let iarr = dt_array(Rc::clone(&i4), 2);
+    let i4 = dt_int(&factory, 4);
+    let iarr = dt_array(&factory, &i4, 2);
     assert!(!f.filter(&iarr), "homogeneous INT aggregate fails a FLOAT filter");
 }
 

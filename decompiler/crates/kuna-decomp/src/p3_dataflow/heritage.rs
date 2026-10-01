@@ -90,6 +90,7 @@ use crate::kuna_restartlog::{KunaRestartReason, RestartLog};
 use crate::overrides::Override;
 use crate::context::BlockId;
 use crate::varnode::varnode_flags;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 // =============================================================================
 // VariableStack (heritage.hh:29)
@@ -1577,6 +1578,32 @@ impl Heritage {
             // heritage.cc:1468) because the output-active branch can promote it to
             // `killedbycall`.
             let mut effecttype = fc.proto().has_effect(&trans_addr, size);
+            // A decoded body can violate the model's preserved-register
+            // promise. Retain its real call-linked state before SSA removes
+            // it; explicit effect overrides remain authoritative.
+            if effecttype == effect_type::UNAFFECTED && !fc.proto().has_effect_override()
+                && spc.get_name() == "register"
+                // This is a generated-body obligation, not a change to raw
+                // machine effects. Its exact target definition must be closed
+                // successfully before executable publication can succeed.
+                && !crate::p4_calls::kuna_callabletransport::provisional_execution_preserves(
+                    fd, fc, &trans_addr, size)
+                && fc.physical_requirements().is_some_and(|requirements|
+                    requirements.is_complete() && !requirements.preserves(&trans_addr, size)
+                        // ActionExtraPopSetup already represents this exact
+                        // proven adjustment; do not add a second unknown SP.
+                        && !requirements.stack_adjustments.iter().any(|(at, bytes, delta)|
+                            *at == trans_addr && *bytes == size
+                                && fc.get_effective_extra_pop() != crate::fspec::EXTRAPOP_UNKNOWN
+                                && *delta == i64::from(fc.get_effective_extra_pop())
+                                && fd.get_arch().manage().get_stack_space().is_some_and(|stack|
+                                    stack.get_spacebase(0).is_ok_and(|point|
+                                        point.offset == at.get_offset() && point.size as int4 == size
+                                            && point.space.as_ref().zip(at.get_space())
+                                                .is_some_and(|(a, b)| Rc::ptr_eq(a, b))))))
+            {
+                effecttype = effect_type::UNKNOWN_EFFECT;
+            }
             // (kuna) `calleeprotostack` — a callee with a locked, non-variadic
             // prototype owns the return-address slot and its own parameter area
             // and nothing above them.  A caller slot above that floor is reachable
@@ -1658,7 +1685,23 @@ impl Heritage {
                     fc,
                     &trans_addr,
                     size,
-                ) || msvc_cookie_return);
+                ) || msvc_cookie_return
+                    || (!fc.proto().has_effect_override()
+                        && fd.get_func_proto().is_input_locked() && fd.get_func_proto().has_model()
+                        && (crate::p4_calls::kuna_physicalinputs::has_narrow_source(fd.get_func_proto())
+                            || fd.get_func_proto().has_execution_inputs()
+                            || (0..fd.get_func_proto().num_params()).any(|slot| {
+                                fd.get_func_proto().source_param(slot).is_some_and(|source| {
+                                    let at = source.get_address();
+                                    at.get_space().zip(trans_addr.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+                                        && at.get_offset() <= trans_addr.get_offset()
+                                        && at.get_offset() + source.get_size() as u64 >= trans_addr.get_offset() + size as u64
+                                })
+                            })
+                            || (fd.get_func_proto().num_params() == 0
+                                && fd.get_func_proto().model().possible_input_param(&trans_addr, size)))
+                        && trans_addr.get_space().is_some_and(|space| space.get_name() == "register")
+                        && fc.physical_requirements().is_some_and(|requirements| requirements.preserves(&trans_addr, size))));
             // A locked-void prototype has no concrete output, so its model may
             // identify an 8-byte logical return inside a 16-byte heritaged XMM
             // range. Preserve only that exact slice. The flanking bytes remain
@@ -1784,6 +1827,21 @@ impl Heritage {
                 {
                     Self::guard_call_overlapping_input(fd, fc, addr, &trans_addr, size);
                 }
+            }
+
+            // A private, padding-free logical result produces these exact
+            // caller bytes. Keep call argument/trial processing above intact;
+            // only replace this range's old-value alias guard with a creation.
+            if crate::p4_calls::kuna_physicalinputs::execution_memory_definition_covers(fd, fc, addr, size) {
+                let indop = fd.new_indirect_creation(op, addr, size, false);
+                if let Some(out) = fd.obank().get(indop).and_then(|operation| operation.get_out()) {
+                    if let Some(value) = fd.vbank_mut().get_mut(out) {
+                        value.set_active_heritage();
+                        if holdind { value.set_addr_force(); }
+                    }
+                    write.push(out);
+                }
+                continue;
             }
 
             // The `unknown_effect`/`return_address` INDIRECT-*op* (heritage.cc:1512-
@@ -3445,7 +3503,9 @@ impl Heritage {
                             }
                         }
                     }
+                    let receipt = branch_receipt::begin_heritage(fd, op, vnin, vnnew, slot);
                     fd.op_set_input(op, vnnew, slot).expect("rename_recurse: op_set_input read");
+                    branch_receipt::finish(fd, receipt);
                     if fd.vbank().get(vnin).expect("rename_recurse: in").has_no_descend() {
                         fd.delete_varnode(vnin).expect("rename_recurse: delete free read");
                     }
@@ -5058,7 +5118,14 @@ mod tests {
 
     fn build_fd() -> Funcdata {
         let manage = build_manager();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -5651,7 +5718,14 @@ mod tests {
             0,
         )))
         .unwrap();
-        let glb = Rc::new(ArchContext::new(m));
+        let mut arch = ArchContext::new(m);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let entry = Address::new(Rc::clone(&ram), 0x2000);
         let mut fd = Funcdata::new("func", "func", glb, entry, 0x10000000, 0x40).unwrap();
@@ -5759,7 +5833,14 @@ mod tests {
 
     fn build_fd_with_join() -> Funcdata {
         let manage = build_manager_with_join();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -5800,7 +5881,14 @@ mod tests {
 
     fn build_fd_iop() -> Funcdata {
         let manage = build_manager_iop();
-        let glb = Rc::new(ArchContext::new(manage));
+        let mut arch = ArchContext::new(manage);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, crate::dtype::type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()

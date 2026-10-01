@@ -456,7 +456,7 @@ pub struct ConsoleProgram {
     /// so the rebuilt `Funcdata`'s `ScopeLocal` is re-seeded with each as a
     /// typelock|namelock stack symbol — the same path the console `map addr` directive
     /// uses. Real-ELF DWARF path only (empty on the XML datatest path).
-    dwarf_locals: Vec<(u64, String, Rc<kuna_decomp::dtype::Datatype>, i64)>,
+    dwarf_locals: Vec<(u64, String, kuna_decomp::dtype::TypeRoot, i64)>,
     /// (kuna `libctypes glibc`) Did the load-time `libctypes` pass install the
     /// published glibc x86-64 field layouts on THIS image?
     ///
@@ -1714,7 +1714,7 @@ impl ConsoleProgram {
     /// TYPE_CODE base, and every `metatype == TYPE_CODE` spec is dropped.
     /// This also drops the deliberately code-typed untyped Data placeholders
     /// some gated analysis passes install (size-1, no real extent — useless as
-    /// data labels); typed data (DWARF `undefined<N>` globals, `char[N]`
+    /// data labels); typed data (DWARF source globals, `char[N]`
     /// string symbols) is kept. `type_size` is the mapped datatype's byte size.
     /// Sorted by VMA.
     pub fn global_data_symbols(&self) -> Vec<(String, u64, i64)> {
@@ -2136,7 +2136,7 @@ impl ConsoleProgram {
     pub fn dwarf_locals_for(
         &self,
         func_addr: u64,
-    ) -> Vec<(String, Rc<kuna_decomp::dtype::Datatype>, Address, kuna_base::types::uint4)> {
+    ) -> Vec<(String, kuna_decomp::dtype::TypeRoot, Address, kuna_base::types::uint4)> {
         use kuna_decomp::varnode::varnode_flags;
         let Some(stack) = self.arch().manage().get_stack_space() else {
             return Vec::new();
@@ -2152,7 +2152,7 @@ impl ConsoleProgram {
                 let waddr = stack.wrap_offset(*off as u64);
                 (
                     name.clone(),
-                    Rc::clone(ty),
+                    ty.clone(),
                     Address::new(Rc::clone(stack), waddr),
                     flags,
                 )
@@ -4101,26 +4101,10 @@ fn commit_analysis_output(
         }
     }
 
-    // 1a. Named data globals with a known byte size (`out.data_objects`, the DWARF
-    //     top-level variables). Mapped into the global scope with an
-    //     `undefined<size>` type so a memory access of the object's storage
-    //     (`mov [max_width], eax`) queries `queryContainer(addr, size)` and finds a
-    //     covering SymbolEntry — the ActionNameVars global-scope query then binds the
-    //     name, rendering `max_width` instead of `dat_<addr>`. A plain `SymFact{Data}`
-    //     is installed with a size-1 code type, which only covers a 1-byte access, so
-    //     multi-byte globals (`int`/`char*`) were left unnamed. Matches IDA Pro /
-    //     Ghidra, which name data globals from the symbol table. `namelock` keeps the
-    //     name; the `undefined<size>` type is NOT typelocked, so type propagation still
-    //     infers the object's real type from its uses. A synthetic-`namelock` symbol
-    //     is skipped where the address already carries a function or a covering data
-    //     Symbol (a string `s_<addr>` or a hand-`map addr`ed global must not be
-    //     shadowed) — the same guard the string-literal placement uses.
-    //     The extent is clamped into the type factory's `int4` domain exactly as
-    //     arm 4a does. This arm cannot actually overflow — `d.size` is produced
-    //     from a `Datatype::get_size()`, itself an `int4`, and filtered to `>= 1`
-    //     (`analyzers/dwarf/mod.rs`), so it already lives in `1..=int4::MAX` —
-    //     but the two arms must not differ in shape, or the safe one reads as an
-    //     endorsement of the unsafe one.
+    // 1a. DWARF globals retain their source graph root, typelock, and storage
+    //     volatility. Do not replace declared callback/record types with an
+    //     inferred integer of the same width. Unresolved types retain the old
+    //     size-only unknown mapping. Existing explicit/function mappings win.
     for d in &out.data_objects {
         let addr = Address::new(Rc::clone(code_space), d.addr);
         let occupied = {
@@ -4139,19 +4123,22 @@ fn commit_analysis_output(
         if occupied {
             continue;
         }
-        let ct = prog
-            .arch()
-            .types()
-            .get_base(
+        let ct = match &d.type_ {
+            Some(type_) => type_.clone(),
+            None => prog.arch().types().get_base(
                 d.size.clamp(1, int4::MAX as u32) as int4,
                 kuna_decomp::dtype::type_metatype::TYPE_UNKNOWN,
-            )?;
+            )?,
+        };
         let arch = prog.arch_mut();
         let (scope, base) =
             arch.symboltab.find_create_scope_from_symbol_name(&d.name, "::", None, num_spaces)?;
         let (sid, _) =
             arch.symboltab.add_symbol_mapped(scope, &base, ct, &addr, &Address::new_invalid())?;
-        arch.symboltab.set_attribute(sid, kuna_decomp::varnode::varnode_flags::namelock);
+        let mut flags = kuna_decomp::varnode::varnode_flags::namelock;
+        if d.type_.is_some() { flags |= kuna_decomp::varnode::varnode_flags::typelock; }
+        if d.volatile { flags |= kuna_decomp::varnode::varnode_flags::volatil; }
+        arch.symboltab.set_attribute(sid, flags);
     }
 
     // 1b. Extra read-only address ranges a pass discovered (`out.readonly`) — e.g.
@@ -4477,7 +4464,7 @@ fn commit_analysis_output(
         let (sid, _) = arch.symboltab.add_symbol_mapped(
             scope,
             &base,
-            Rc::clone(&fact.type_),
+            fact.type_.clone(),
             &addr,
             &Address::new_invalid(),
         )?;
@@ -4489,12 +4476,12 @@ fn commit_analysis_output(
     }
 
     // 4a. Loader data symbols: the defined `STT_OBJECT` entries of `.symtab` /
-    //     `.dynsym` (`ConsoleProgram::loader_data_objects`). Installed exactly like
-    //     the DWARF data globals of arm 1a — an `undefined<size>` global with
+    //     `.dynsym` (`ConsoleProgram::loader_data_objects`). Installed as an
+    //     `undefined<size>` global with
     //     `namelock` only, so the container query matches at the real access width
     //     and type propagation still infers the object's real type — but committed
-    //     HERE, last, so the two richer sources win every address they claim: a
-    //     DWARF-described global keeps its DWARF extent (arm 1a) and a detected
+    //     HERE, last, so richer sources win every address they claim: a
+    //     DWARF-described global keeps its source type and extent (arm 1a) and a detected
     //     string literal keeps its `char[N]` typelock (arm 4). What is left is the
     //     set neither reaches, and that is precisely the interesting one: a
     //     copy-relocated libc extern (`optind`, `stdin`, `stdout`, `optarg`) has a

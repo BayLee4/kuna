@@ -83,7 +83,7 @@ use std::rc::Rc;
 
 use kuna_base::address::Address;
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::Datatype;
+use kuna_decomp::dtype::TypeRoot;
 use kuna_decomp::fspec::{ParameterPieces, ProtoModel, PrototypePieces};
 use kuna_decomp::funcdata::Funcdata;
 
@@ -655,17 +655,29 @@ pub(crate) fn park_proto_pieces(
 }
 
 /// The three things a full `prototype` directive does: park the pieces for the
-/// callers, record the calling convention it named, and lock the signature onto
-/// the symbol itself.
+/// callers, capture its named or default calling convention, and lock the
+/// logical signature onto the symbol itself.
 pub(crate) fn park_prototype(
     prog: &mut ConsoleProgram,
     target: &ProtoTarget,
     pieces: &mut PrototypePieces,
     model: Option<&Rc<ProtoModel>>,
-) {
+) -> Result<(), String> {
+    let binding = match model {
+        Some(m) => prog.arch().types().model_binding_for(Rc::clone(m)),
+        None => prog.arch().types().model_binding(None),
+    }
+    .map_err(|e| e.explain().to_string())?;
+    let captured_model = binding.model().clone();
+    let variadic = pieces.first_var_arg_slot >= 0;
+    let logical = kuna_decomp::fspec::LogicalCallable::from_declaration(
+        binding, pieces, variadic, !variadic, 0,
+    )
+    .map_err(|e| e.explain().to_string())?;
+    lock_prototype_on_symbol(prog, target, &logical)?;
     park_proto_pieces(prog, target, pieces);
-    park_proto_model(prog, target, model);
-    lock_prototype_on_symbol(prog, target, pieces, model);
+    park_proto_model(prog, target, Some(&captured_model));
+    Ok(())
 }
 
 /// `prototype <func> <C declaration>` — the in-process twin of `parse line
@@ -698,7 +710,7 @@ fn apply_prototype(prog: &mut ConsoleProgram, func: &str, decl: &str) -> Result<
         .ok_or_else(|| "not a function declaration".to_string())?;
     let target = resolve_proto_target(prog, func)?;
     let model = declared_model(prog, &model);
-    park_prototype(prog, &target, &mut pieces, model.as_ref());
+    park_prototype(prog, &target, &mut pieces, model.as_ref())?;
     prog.set_pending_prototype(target.name(), pieces);
     Ok(())
 }
@@ -720,9 +732,8 @@ pub(crate) fn declared_model(prog: &ConsoleProgram, model: &str) -> Option<Rc<Pr
     prog.arch().get_model(model).cloned()
 }
 
-/// Record the calling convention a `prototype` directive named, so the
-/// function's own decompile is seeded under it rather than under the
-/// architecture default.
+/// Record the captured calling convention so a later decompile does not
+/// reinterpret the declaration under a changed architecture default.
 ///
 /// Keyed by the target's NAME, which is the key the arch handle joins against
 /// the parked pieces — those carry `pieces.name == target.name()`
@@ -744,36 +755,29 @@ pub(crate) fn park_proto_model(
 pub(crate) fn lock_prototype_on_symbol(
     prog: &mut ConsoleProgram,
     target: &ProtoTarget,
-    pieces: &PrototypePieces,
-    model: Option<&Rc<ProtoModel>>,
-) {
+    logical: &kuna_decomp::fspec::LogicalCallable,
+) -> Result<(), String> {
     let arch = prog.arch_mut();
     let sid = match target {
         ProtoTarget::Named(name) => {
             let Some(scope) = arch.symboltab.get_global_scope() else {
-                return;
+                return Ok(());
             };
             match arch.symboltab.query_function_by_name(scope, name) {
                 Some(sid) => sid,
-                None => return,
+                None => return Ok(()),
             }
         }
         ProtoTarget::At(addr, _) => match arch.symboltab.find_function_across_scopes(addr) {
             Some((sid, _)) => sid,
-            None => return,
+            None => return Ok(()),
         },
     };
-    // The prototype-bearing `TypeCode` is what a CALLER reads a declared callee's
-    // signature back from (`ArchContext::query_callee_proto`), so the declared
-    // convention has to be baked in here: the storage the caller sees for each
-    // argument is assigned when this `FuncProto` is built.
-    let tc = match model {
-        Some(m) => arch.types_impl().get_type_code_proto_model(pieces, Rc::clone(m)),
-        None => arch.types().get_type_code_proto(pieces),
-    };
-    if let Ok(tc) = tc {
-        let _ = arch.symboltab.retype_symbol(sid, tc);
-    }
+    // ABI assignment waits for ready by-value layouts. Exact function storage
+    // remains in the independently parked pieces, never in this datatype.
+    let tc = arch.types().get_type_code_proto(logical)
+        .map_err(|e| e.explain().to_string())?;
+    arch.symboltab.retype_symbol(sid, tc).map_err(|e| e.explain().to_string())
 }
 
 /// Apply a `param <func>::<i> <storage> <decl>` / `return <func>::<storage>
@@ -820,7 +824,7 @@ fn apply_cross_function(
                 .map_err(|e| e.explain().to_string())?;
             let slot = *index as usize;
             while pieces.intypes.len() <= slot {
-                pieces.intypes.push(Rc::clone(&filler));
+                pieces.intypes.push(filler.clone());
             }
             while pieces.innames.len() <= slot {
                 pieces.innames.push(String::new());
@@ -848,13 +852,8 @@ fn apply_cross_function(
         _ => return Err("internal: not a cross-function prototype directive".into()),
     }
     park_proto_pieces(prog, &target, &mut pieces);
-    // The symbol retype (what lets a by-value struct argument be split) needs a
-    // return type; `param` alone never declares one, and the storage assignment
-    // behind `getTypeCode` dereferences `outtype` unconditionally.
-    if pieces.outtype.is_some() {
-        let model = prog.arch().function_prototype_model(target.name()).cloned();
-        lock_prototype_on_symbol(prog, &target, &pieces, model.as_ref());
-    }
+    // A slot edit is an authoritative function fact, not a closed callable
+    // declaration. Preserve its independent input/output locks and storage.
     prog.set_pending_prototype(target.name(), pieces);
     Ok(())
 }
@@ -1088,21 +1087,30 @@ pub fn apply_symbol_scoped(
     fd: &mut Funcdata,
     name: &str,
     single: bool,
+    mapped_params: &mut Vec<(int4, String, ParameterPieces)>,
 ) -> bool {
     let directives = prog.assertions().to_vec();
+    let mut edited_formals = Vec::new();
     let mut applied_any = false;
     for (i, directive) in directives.iter().enumerate() {
         if !directive.body.is_symbol_scoped() || !binds_to(&directive.body, name, single) {
             continue;
         }
         let outcome = match apply_one_symbol_scoped(prog, fd, &directive.body) {
-            Ok(()) => {
+            Ok(formal) => {
+                if let Some(symbol) = formal { edited_formals.push(symbol); }
                 applied_any = true;
                 directive.applied()
             }
             Err(detail) => directive.rejected(detail),
         };
         prog.set_assertion_outcome(i, outcome);
+    }
+    if !edited_formals.is_empty() {
+        // Snapshot only after the batch: raw carrier Highs remain distinguishable
+        // while later directives resolve their targets against this same IR.
+        *mapped_params = fd.source_parameter_replay(&edited_formals)
+            .expect("edited source formals retain their category and data-type");
     }
     applied_any
 }
@@ -1111,7 +1119,7 @@ fn apply_one_symbol_scoped(
     prog: &ConsoleProgram,
     fd: &mut Funcdata,
     body: &Body,
-) -> Result<(), String> {
+) -> Result<Option<kuna_decomp::database::SymbolId>, String> {
     use kuna_decomp::database::symbol_category;
     use kuna_decomp::varnode::varnode_flags;
     let (symbol, retype) = match body {
@@ -1139,7 +1147,7 @@ fn apply_one_symbol_scoped(
                 (Body::Type { .. }, Some((ct, newname))) => (newname.clone(), ct),
                 _ => unreachable!("symbol-scoped directive kinds are exhausted above"),
             };
-            return crate::kuna_hightarget::bind_printed_local(fd, &target, &bind, ct);
+            return crate::kuna_hightarget::bind_printed_local(fd, &target, &bind, ct).map(|()| None);
         }
         1 => {}
         n => return Err(format!("More than one symbol named: {symbol} ({n})")),
@@ -1172,7 +1180,7 @@ fn apply_one_symbol_scoped(
         }
         _ => unreachable!("symbol-scoped directive kinds are exhausted above"),
     }
-    Ok(())
+    Ok(is_param.then_some(sym))
 }
 
 /// Does any directive assert a read-only range?
@@ -1199,7 +1207,7 @@ pub fn unclaimed(directive: &Directive) -> Outcome {
 /// The mutated local scope of the first pass, in the shape the second decompile
 /// re-seeds it from (`IfcDecompile` carries the same specs across its own IR
 /// rebuild).
-pub fn carried_symbols(fd: &Funcdata) -> Vec<(String, Rc<Datatype>, Address, uint4)> {
+pub fn carried_symbols(fd: &Funcdata) -> Vec<(String, TypeRoot, Address, uint4)> {
     fd.mapped_symbol_specs()
 }
 
@@ -1211,6 +1219,6 @@ pub fn carried_symbols(fd: &Funcdata) -> Vec<(String, Rc<Datatype>, Address, uin
 /// `applied` over unchanged output.
 pub fn carried_usepoint_symbols(
     fd: &Funcdata,
-) -> Vec<(String, Rc<Datatype>, Address, uint4, Address, bool)> {
+) -> Vec<(String, TypeRoot, Address, uint4, Address, bool)> {
     fd.usepoint_symbol_specs()
 }

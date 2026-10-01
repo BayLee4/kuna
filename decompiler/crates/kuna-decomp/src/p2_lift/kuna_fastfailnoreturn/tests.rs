@@ -11,7 +11,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{ArchContext, OpId, TypeOp};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 
@@ -38,14 +38,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn space(fd: &Funcdata, name: &str) -> Rc<AddrSpace> {
@@ -64,7 +70,8 @@ fn make_op(fd: &mut Funcdata, opc: OpCode, pc_off: u64, ninputs: int4, start: bo
 
 fn set_const_input(fd: &mut Funcdata, op: OpId, slot: int4, value: uintb, size: int4) {
     let cspace = space(fd, "const");
-    let vn = fd.vbank_mut().create(size, Address::new(cspace, value), unk_type(size));
+    let datatype = unk_type(fd, size);
+    let vn = fd.vbank_mut().create(size, Address::new(cspace, value), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), slot);
 }
 
@@ -73,7 +80,8 @@ fn set_const_input(fd: &mut Funcdata, op: OpId, slot: int4, value: uintb, size: 
 /// is the pre-SSA shape).
 fn unique_vn(fd: &mut Funcdata, off: u64) -> crate::context::VarnodeId {
     let uspace = space(fd, "unique");
-    fd.vbank_mut().create(8, Address::new(uspace, off), unk_type(8))
+    let datatype = unk_type(fd, 8);
+    fd.vbank_mut().create(8, Address::new(uspace, off), datatype)
 }
 
 /// The canonical `INT imm8` idiom in one instruction:
@@ -226,11 +234,13 @@ fn a_non_temporary_call_target_is_declined() {
     let callother = make_op(&mut fd, OpCode::CPUI_CALLOTHER, 0x1000, 2, true);
     set_const_input(&mut fd, callother, 0, 3, 4);
     set_const_input(&mut fd, callother, 1, FASTFAIL_VECTOR, 1);
-    let out = fd.vbank_mut().create(8, Address::new(Rc::clone(&ram), 0x2000), unk_type(8));
+    let datatype = unk_type(&fd, 8);
+    let out = fd.vbank_mut().create(8, Address::new(Rc::clone(&ram), 0x2000), datatype);
     fd.obank_mut().get_mut(callother).unwrap().set_output(Some(out));
 
     let callind = make_op(&mut fd, OpCode::CPUI_CALLIND, 0x1000, 1, false);
-    let target = fd.vbank_mut().create(8, Address::new(ram, 0x2000), unk_type(8));
+    let datatype = unk_type(&fd, 8);
+    let target = fd.vbank_mut().create(8, Address::new(ram, 0x2000), datatype);
     fd.obank_mut().get_mut(callind).unwrap().set_input(Some(target), 0);
     assert!(!is_fastfail_callind(&fd, callind, resolver));
     assert_eq!(swi_vector_of_callind(&fd, callind, resolver), None);

@@ -10,14 +10,14 @@ ROOT   := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 SPECS  := $(ROOT)/specs
 ENGINE := $(ROOT)/decompiler
 PROFILE ?= release
+PYTHON ?= python3
 BINDIR  := $(ENGINE)/target/$(PROFILE)
 SLACOMP := $(BINDIR)/slacomp
-PYTHON  ?= python3
 # Where `test-ghidra` tees its output for the two false-green canaries below
 # (inside target/, which is gitignored, so a failed run leaves no repo litter).
 GHIDRA_SIM_LOG := $(ENGINE)/target/ghidra-sim.log
 
-.PHONY: all binaries specs test test-stages test-cli test-ghidra rust rust-test clean check-spec version
+.PHONY: all binaries specs test test-stages test-cli test-ghidra test-ghidra-live rust rust-test clean check-spec version
 
 all: binaries specs
 
@@ -32,7 +32,7 @@ rust: binaries
 
 # Compile every vendored .slaspec -> .sla (next to the spec, gitignored) with the
 # SLEIGH compiler. End-to-end correctness is `make test` (the built specs decode
-# the corpus to 675/675).
+# the corpus to 674/674).
 specs: $(SLACOMP)
 	$(SLACOMP) -a $(SPECS)
 
@@ -90,6 +90,10 @@ test-ghidra:
 	  echo "ERROR: the sort/grep breadth test did not RUN (needs --include-ignored) -- false green"; \
 	  exit 1; \
 	}
+
+# Real Java/CLI consumers; requires the tests/ghidra Python/Ghidra environment.
+test-ghidra-live:
+	$(PYTHON) tests/ghidra/run.py $(LIVE_ARGS)
 
 # Spec honesty gate: docs/spec/ anchors resolve, every phase folder is owned by
 # exactly one chapter, and (strict) every settable option is mentioned.

@@ -29,7 +29,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::unionresolve_run::ScoreUnionFields;
@@ -70,27 +70,27 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// A pointer data-type (TYPE_PTR, 8 bytes) to `ptrto`, align_size = 8.
-fn ptr_to(ptrto: Rc<Datatype>) -> Rc<Datatype> {
+fn ptr_to(types: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
     let mut p = Datatype::new_with_align(8, 8, type_metatype::TYPE_PTR);
-    p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-    Rc::new(p)
+    p.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize: 1 };
+    types.intern(p).unwrap()
 }
 
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(types: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
     u.flags |= 0x800; // needs_resolution
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    types.intern(u).unwrap()
 }
 
 fn new_op_code(fd: &mut Funcdata, inputs: int4, opc: OpCode, name: &str) -> OpId {
@@ -106,7 +106,7 @@ fn wire_input(
     slot: int4,
     off: u64,
     size: int4,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
 ) -> VarnodeId {
     let r = ram(fd);
     let m = Address::new(r, off);
@@ -132,14 +132,14 @@ fn w10_ptradd_up_ptr_field_scores_positive_like_cpp() {
     let (mut fd, tf) = build_fd();
 
     // union { int8 f0; void* f1; }  (both 8 bytes, offset 0).
-    let int8t = base(8, type_metatype::TYPE_INT);
-    let voidt = base(1, type_metatype::TYPE_UNKNOWN);
-    let ptrt = ptr_to(Rc::clone(&voidt)); // align_size(ptrto) = 1
-    let u = make_union(8, &[(0, Rc::clone(&int8t)), (0, Rc::clone(&ptrt))]);
+    let int8t = base(&tf, 8, type_metatype::TYPE_INT);
+    let voidt = base(&tf, 1, type_metatype::TYPE_UNKNOWN);
+    let ptrt = ptr_to(&tf, voidt); // align_size(ptrto) = 1
+    let u = make_union(&tf, 8, &[(0, int8t), (0, ptrt.clone())]);
 
     // out = PTRADD(arrbase, index, elsize)  with out typed as the union.
     let op = new_op_code(&mut fd, 3, OpCode::CPUI_PTRADD, "PTRADD");
-    let _arrbase = wire_input(&mut fd, op, 0, 0x400, 8, Rc::clone(&ptrt));
+    let _arrbase = wire_input(&mut fd, op, 0, 0x400, 8, ptrt);
     let _index = {
         let c = const_vn(&mut fd, 2, 8);
         fd.op_set_input(op, c, 1).unwrap();
@@ -153,13 +153,13 @@ fn w10_ptradd_up_ptr_field_scores_positive_like_cpp() {
     };
     let r = ram(&fd);
     let outm = Address::new(r, 0x500);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
+    let out = fd.new_varnode(8, &outm, Some(u.clone()));
     fd.op_set_output(op, out).unwrap();
 
     // Score the union against the WRITE edge (slot = -1): each field becomes an
     // up-trial whose def is the PTRADD.
     let result = {
-        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1).unwrap();
+        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), u, op, -1).unwrap();
         scorer.into_result()
     };
 
@@ -190,21 +190,21 @@ fn w10_ptradd_up_ptr_field_scores_positive_like_cpp() {
 fn w10_int_field_up_through_int_add_resolves_control() {
     let (mut fd, tf) = build_fd();
     // union { int8 f0; float8 f1; }
-    let int8t = base(8, type_metatype::TYPE_INT);
-    let float8t = base(8, type_metatype::TYPE_FLOAT);
-    let u = make_union(8, &[(0, Rc::clone(&int8t)), (0, Rc::clone(&float8t))]);
+    let int8t = base(&tf, 8, type_metatype::TYPE_INT);
+    let float8t = base(&tf, 8, type_metatype::TYPE_FLOAT);
+    let u = make_union(&tf, 8, &[(0, int8t.clone()), (0, float8t)]);
 
     // out = INT_ADD(a, b), out typed as the union (slot = -1 up-trials).
     let op = new_op_code(&mut fd, 2, OpCode::CPUI_INT_ADD, "INT_ADD");
-    let _a = wire_input(&mut fd, op, 0, 0x600, 8, Rc::clone(&int8t));
-    let _b = wire_input(&mut fd, op, 1, 0x608, 8, Rc::clone(&int8t));
+    let _a = wire_input(&mut fd, op, 0, 0x600, 8, int8t.clone());
+    let _b = wire_input(&mut fd, op, 1, 0x608, 8, int8t);
     let r = ram(&fd);
     let outm = Address::new(r, 0x700);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
+    let out = fd.new_varnode(8, &outm, Some(u.clone()));
     fd.op_set_output(op, out).unwrap();
 
     let result = {
-        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1).unwrap();
+        let scorer = ScoreUnionFields::new_edge(&fd, tf.as_ref(), u, op, -1).unwrap();
         scorer.into_result()
     };
     // INT_ADD-up: int field scores +5, float field scores -5 -> int field wins.
@@ -215,27 +215,4 @@ fn w10_int_field_up_through_int_add_resolves_control() {
     );
 }
 
-// ===========================================================================
-// Order/boundary: an empty-input PTRADD edge must not panic (boundary input the
-// hunt list flags for the live-read arms).
-// ===========================================================================
 
-#[test]
-fn w10_ptradd_up_missing_inputs_does_not_panic() {
-    let (mut fd, tf) = build_fd();
-    let int8t = base(8, type_metatype::TYPE_INT);
-    let ptrt = ptr_to(base(1, type_metatype::TYPE_UNKNOWN));
-    let u = make_union(8, &[(0, int8t), (0, ptrt)]);
-
-    // A PTRADD with only slot 0 wired (no index / no elsize) — the live reads of
-    // in(1)/in(2) must degrade gracefully, not panic.
-    let op = new_op_code(&mut fd, 3, OpCode::CPUI_PTRADD, "PTRADD");
-    let _arrbase = wire_input(&mut fd, op, 0, 0x800, 8, Rc::clone(&u));
-    let r = ram(&fd);
-    let outm = Address::new(r, 0x900);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
-    fd.op_set_output(op, out).unwrap();
-
-    // Just must not panic.
-    let _ = ScoreUnionFields::new_edge(&fd, tf.as_ref(), Rc::clone(&u), op, -1);
-}

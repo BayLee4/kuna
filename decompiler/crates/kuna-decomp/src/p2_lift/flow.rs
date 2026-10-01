@@ -171,10 +171,26 @@ pub struct VisitStat {
 /// lints on the public signatures using it are `#[allow]`ed.)
 pub type VisitedMap = BTreeMap<Address, VisitStat>;
 
+/// Separate an ordinary failed recovery attempt from an invalid declaration
+/// encountered by its action pipeline. Fatal errors escape the recovery chain
+/// as their original error rather than become a truncated indirect jump.
+#[derive(Debug)]
+pub enum JtPipelineError {
+    Recoverable(KunaError),
+    Fatal(KunaError),
+}
+
+impl From<KunaError> for JtPipelineError {
+    fn from(error: KunaError) -> Self {
+        Self::Recoverable(error)
+    }
+}
+
 /// The reduced "jumptable" action-pipeline runner the recovery chain calls per
 /// partial clone (it builds the partial's blocks + runs the action set).  Type
 /// alias to keep the recovery signatures from tripping `clippy::type_complexity`.
-pub type JtPipelineFn<'a> = dyn FnMut(&mut Funcdata, &VisitedMap) -> KunaResult<()> + 'a;
+pub type JtPipelineFn<'a> =
+    dyn FnMut(&mut Funcdata, &VisitedMap) -> Result<(), JtPipelineError> + 'a;
 
 /// The W4/W6 subsystem slice [`FlowInfo`] reaches through its owning
 /// `Architecture` (C++ `glb`) and per-function `Override`.
@@ -307,20 +323,6 @@ pub trait FlowEnvironment {
     /// empty name.
     fn call_fixup_name(&self, _inject_id: int4) -> String {
         String::new()
-    }
-
-    /// Build a locked override [`FuncProto`](crate::fspec::FuncProto) from the
-    /// parsed [`PrototypePieces`](crate::fspec::PrototypePieces) of an `override
-    /// prototype <addr> <decl>` (C++ `IfcProtooverride`'s `new FuncProto;
-    /// setInternal(pieces.model, void); setPieces(pieces)`).  Used by
-    /// `build_call_specs` to apply the override onto the matching call spec
-    /// (`Override::applyPrototype` → `fspecs.copy(*proto)`).  The W3 shell has no
-    /// type factory / model registry and reports `None`.
-    fn build_override_proto(
-        &self,
-        _pieces: &crate::fspec::PrototypePieces,
-    ) -> KunaResult<Option<crate::fspec::FuncProto>> {
-        Ok(None)
     }
 
     /// (kuna) GH-8817: is `op` a V850 `jmp [reg]` CALLIND to reclassify as
@@ -2027,7 +2029,7 @@ truncating the fall-through here"
             }
             let backaddr = self.addrlist.last().expect("fallthru: addrlist back").clone();
             if bound <= backaddr {
-                if bound == self.eaddr {
+                if bound == self.eaddr && (backaddr != bound || !self.visited.contains_key(&bound)) {
                     if backaddr <= self.eaddr {
                         // (kuna) `eaddr` is the last IN-BODY byte, so an
                         // instruction that STARTS on it is inside the range --
@@ -2543,7 +2545,7 @@ truncating the fall-through here"
                 self.data.get_call_specs_mut(idx).proto_mut().cancel_inject_id();
             }
         }
-        self.check_for_flow_modification(op, &entry)
+        self.check_for_flow_modification(op)
     }
 
     /// Examine and apply the call site's prototype/control-flow modifications
@@ -2557,10 +2559,9 @@ truncating the fall-through here"
     /// not inline) a `"Subroutine does not return"` warning is buffered.  Returns
     /// `true` when the call never returns (the caller backs up one op).
     ///
-    /// `op` is the CALL/CALLIND op and `entry` its resolved direct entry address
-    /// (invalid for an indirect call); the inline/noreturn flow effects were
-    /// already copied onto the fspec by [`build_call_specs`].
-    fn check_for_flow_modification(&mut self, op: OpId, entry: &Address) -> KunaResult<bool> {
+    /// The inline/noreturn effects have already been resolved with call-site
+    /// override precedence by [`build_call_specs`].
+    fn check_for_flow_modification(&mut self, op: OpId) -> KunaResult<bool> {
         // The flow effects live on the just-built fspec; recover its flags.
         let (is_inline, is_no_return) = match self.data.get_call_specs_index(op) {
             Some(idx) => {
@@ -2572,10 +2573,7 @@ truncating the fall-through here"
         if is_inline {
             self.injectlist.push(op);
         }
-        // The noreturn flag is also reported straight from the symbol table for
-        // envs that carry it only there (the W4-era `query_call_no_return` hook).
-        let no_return = is_no_return || (!entry.is_invalid() && self.env.query_call_no_return(entry));
-        if no_return {
+        if is_no_return {
             let addr = self
                 .data
                 .obank()
@@ -2630,7 +2628,7 @@ truncating the fall-through here"
             self.data.op_set_opcode_code(op, OpCode::CPUI_CALL);
             self.build_call_specs(op, entry.clone(), false)?;
             self.qlst_count += 1;
-            return self.check_for_flow_modification(op, &entry);
+            return self.check_for_flow_modification(op);
         }
 
         self.build_call_specs(op, Address::default(), true)?;
@@ -2679,10 +2677,9 @@ truncating the fall-through here"
                 return Ok(true);
             }
         }
-        // C++ `return checkForFlowModification(*res)` (flow.cc:740).  An indirect
-        // call has an invalid entry, so the inline/noreturn flow effects are only
-        // present if an override turned it direct (handled above).
-        self.check_for_flow_modification(op, &Address::default())
+        // An indirect call can carry an explicit site's flow effects even
+        // without a globally resolved target.
+        self.check_for_flow_modification(op)
     }
 
     /// Shared body of [`setup_call_specs`]/[`setup_callind_specs`]: create the
@@ -2702,18 +2699,14 @@ truncating the fall-through here"
         {
             let op_addr =
                 self.data.obank().get(op).map(|o| o.get_addr().clone()).unwrap_or_default();
-            let pieces = self
+            if let Some(proto) = self
                 .data
                 .get_override()
                 .find_proto_override(&op_addr)
-                .and_then(|ov| ov.pieces())
-                .cloned();
-            if let Some(pieces) = pieces {
-                if let Some(proto) = self.env.build_override_proto(&pieces)? {
-                    fc.proto_mut().copy(&proto);
-                    if self.data.get_override().is_format_call(&op_addr) {
-                        fc.set_format_arity(Some(pieces.intypes.len() as int4));
-                    }
+            {
+                fc.proto_mut().copy(proto);
+                if self.data.get_override().is_format_call(&op_addr) {
+                    fc.set_format_arity(Some(proto.num_params()));
                 }
             }
         }
@@ -2731,14 +2724,18 @@ truncating the fall-through here"
             // (no inject id) sets is_inline only; `IfcFixupApply` sets the inject
             // id (which also implies inline, fspec.cc `setInjectId`).
             let inject_id = self.env.query_call_inject_id(&entry);
-            let mut is_inline_call = false;
-            if inject_id >= 0 {
-                fc.proto_mut().set_inject_id(inject_id);
-                is_inline_call = true;
-            } else if self.env.query_call_inline(&entry) {
-                fc.proto_mut().set_inline(true);
-                is_inline_call = true;
+            let callee_inline = inject_id >= 0 || self.env.query_call_inline(&entry);
+            let callee_no_return = self.env.query_call_no_return(&entry);
+            // Stock queryCall preserves a completed site override's flow
+            // effects unless the callee is inline (including callfixups).
+            if !fc.proto().has_model() || callee_inline {
+                fc.proto_mut().set_inline(callee_inline);
+                fc.proto_mut().set_no_return(callee_no_return);
+                if inject_id >= 0 {
+                    fc.proto_mut().set_inject_id(inject_id);
+                }
             }
+            let is_inline_call = fc.proto().is_inline();
             // C++ `ActionDefaultParams::apply` (coreaction.cc:2379-2391) performs
             // the full callee-proto copy (only when `fc` has no model).
             // RELOCATION STUB(W4 callee-Funcdata copy): the C++ does this copy at
@@ -2771,10 +2768,15 @@ truncating the fall-through here"
                 let callee_proto = if entry.is_invalid() {
                     None
                 } else {
-                    self.data.get_arch().query_callee_proto(&entry)
+                    self.data.get_arch().query_callee_proto(&entry)?
                 };
                 if let Some(callee_proto) = callee_proto {
                     fc.proto_mut().copy(&callee_proto);
+                    // Standalone declaration types do not own the separate
+                    // FunctionSymbol no-return fact.
+                    if callee_no_return {
+                        fc.proto_mut().set_no_return(true);
+                    }
                     let evalfp = self
                         .data
                         .get_arch()
@@ -3398,7 +3400,7 @@ truncating the fall-through here"
                 &visited_snapshot,
                 run_pipeline,
                 &mut shared_partial,
-            );
+            )?;
             match mode {
                 Ok(Some(jt_idx)) => {
                     // jt->isPartial(): if incomplete and there is more flow, the
@@ -3607,6 +3609,27 @@ impl<'f, 'e, E: FlowEnvironment> FlowEmit<'f, 'e, E> {
 }
 
 impl<E: FlowEnvironment> PcodeEmit for FlowEmit<'_, '_, E> {
+    fn decode_op(&mut self, addr: &Address, decoder: &mut dyn kuna_num::opcodes::OpcodeDecoder,
+        context: kuna_sleigh::translate::PcodeDecodeContext) -> KunaResult<()> {
+        let before = self.emitted.len();
+        let origin = kuna_sleigh::translate::decode_pcode_op(self, addr, decoder, context)?;
+        if let Some(error) = self.error.take() { return Err(error); }
+        if let Some(ordinal) = origin {
+            if ordinal.checked_add(1) != Some(before) || self.emitted.len() != before + 1 {
+                return Err(KunaError::decoder("CALL_RETURN origin is not the preceding call"));
+            }
+            let call = self.emitted[ordinal];
+            let operation = self.fd.obank().get(call).expect("fresh instruction operation");
+            if !matches!(operation.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND)
+                || operation.get_addr() != addr || operation.get_out().is_some() {
+                return Err(KunaError::decoder("CALL_RETURN origin is not a same-instruction call"));
+            }
+            self.fd.record_flow_return_origin(self.emitted[before], call,
+                crate::p4_calls::kuna_physicalinputs::FlowReturnOrigin::HostInstruction);
+        }
+        Ok(())
+    }
+
     fn dump(
         &mut self,
         addr: &Address,

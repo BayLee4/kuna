@@ -8,7 +8,7 @@ use kuna_base::address::Address;
 use kuna_console::decompile_step::{decompile_one, DecompileSeed};
 use kuna_console::engine::{bootstrap_from_object, EntrySelector};
 use kuna_console::grammar::{parse_protopieces, DataOrg};
-use kuna_decomp::dtype::type_metatype;
+use kuna_decomp::dtype::{type_metatype, TypeFactory};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -48,7 +48,16 @@ fn callsite_prototype_override_wins_over_slot_prototype() {
     .expect("override declaration");
     let code = Rc::clone(prog.arch().manage().get_default_code_space().unwrap());
     let callpoint = Address::new(code, 0x1000005cc);
-    let overrides = vec![(callpoint, override_pieces)];
+    let mut proto = kuna_decomp::fspec::FuncProto::new();
+    proto.seed_locked_from_pieces(
+        &override_pieces,
+        Rc::clone(prog.arch().default_fp().unwrap()),
+        prog.arch().types().get_type_void().unwrap(),
+        prog.arch().types(),
+        prog.arch().manage(),
+    ).unwrap();
+    let mut overrides = kuna_decomp::overrides::Override::new();
+    overrides.insert_proto_override(callpoint, proto);
     let seed = DecompileSeed::plain(&[], &[]);
     let step = decompile_one(
         prog.arch_mut(),

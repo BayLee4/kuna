@@ -14,7 +14,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use super::*;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
@@ -41,7 +41,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -51,8 +56,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> kuna_base::error::KunaResult<()>
@@ -90,7 +96,7 @@ fn wire_const(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_written(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     set_def(fd, vn, defop)
 }
 
@@ -98,14 +104,14 @@ fn build_bool(fd: &mut Funcdata, off: u64, opc: OpCode, in0: VarnodeId, in1: Var
     let b = mk_op(fd, off, 2, opc);
     wire(fd, in0, b, 0);
     wire(fd, in1, b, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     set_def(fd, out, b)
 }
 
 fn bool_neg(fd: &mut Funcdata, off: u64, src: VarnodeId) -> VarnodeId {
     let n = mk_op(fd, off, 1, OpCode::CPUI_BOOL_NEGATE);
     wire(fd, src, n, 0);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     set_def(fd, out, n)
 }
 
@@ -120,7 +126,7 @@ fn boolsignless_folds_to_noteq() {
     let sa = fd.new_constant(1, 7);
     wire_const(&mut fd, boolvn, leftshift, 0); // shared const, no descend
     wire(&mut fd, sa, leftshift, 1);
-    let shiftout = fd.new_unique(1, Some(unk(1)));
+    let shiftout = fd.new_unique(1, Some(unk(&fd, 1)));
     let shiftout = set_def(&mut fd, shiftout, leftshift);
 
     // op = INT_SLESS(shiftout, 0)
@@ -128,7 +134,7 @@ fn boolsignless_folds_to_noteq() {
     let zero = fd.new_constant(1, 0);
     wire(&mut fd, shiftout, op, 0);
     wire(&mut fd, zero, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(true);
@@ -150,13 +156,13 @@ fn boolsignless_gate_off_is_noop() {
     let sa = fd.new_constant(1, 7);
     wire_const(&mut fd, boolvn, leftshift, 0);
     wire(&mut fd, sa, leftshift, 1);
-    let shiftout = fd.new_unique(1, Some(unk(1)));
+    let shiftout = fd.new_unique(1, Some(unk(&fd, 1)));
     let shiftout = set_def(&mut fd, shiftout, leftshift);
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_SLESS);
     let zero = fd.new_constant(1, 0);
     wire(&mut fd, shiftout, op, 0);
     wire(&mut fd, zero, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(false);
@@ -173,13 +179,13 @@ fn boolsignless_extra_nzmask_bit_declines() {
     let sa = fd.new_constant(1, 7);
     wire_const(&mut fd, boolvn, leftshift, 0);
     wire(&mut fd, sa, leftshift, 1);
-    let shiftout = fd.new_unique(1, Some(unk(1)));
+    let shiftout = fd.new_unique(1, Some(unk(&fd, 1)));
     let shiftout = set_def(&mut fd, shiftout, leftshift);
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_SLESS);
     let zero = fd.new_constant(1, 0);
     wire(&mut fd, shiftout, op, 0);
     wire(&mut fd, zero, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(true);
@@ -197,19 +203,19 @@ fn build_and_of_ors(fd: &mut Funcdata, n: VarnodeId, v: VarnodeId) -> OpId {
     let or_a = mk_op(fd, 0x208, 2, OpCode::CPUI_BOOL_OR);
     wire(fd, n, or_a, 0);
     wire(fd, not_v, or_a, 1);
-    let oa = fd.new_unique(1, Some(unk(1)));
+    let oa = fd.new_unique(1, Some(unk(fd, 1)));
     let oa = set_def(fd, oa, or_a);
     // OR(!N, V)
     let or_b = mk_op(fd, 0x20c, 2, OpCode::CPUI_BOOL_OR);
     wire(fd, not_n, or_b, 0);
     wire(fd, v, or_b, 1);
-    let ob = fd.new_unique(1, Some(unk(1)));
+    let ob = fd.new_unique(1, Some(unk(fd, 1)));
     let ob = set_def(fd, ob, or_b);
     // AND(oa, ob)
     let andop = mk_op(fd, 0x210, 2, OpCode::CPUI_BOOL_AND);
     wire(fd, oa, andop, 0);
     wire(fd, ob, andop, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     let _ = set_def(fd, out, andop);
     andop
 }
@@ -223,7 +229,7 @@ fn build_flag_pair(fd: &mut Funcdata, vbase: VarnodeId, kval: u64, sz: int4) -> 
     let negk_c = fd.new_constant(sz, negk);
     wire(fd, vbase, subop, 0);
     wire(fd, negk_c, subop, 1);
-    let sub = fd.new_unique(sz, Some(unk(sz)));
+    let sub = fd.new_unique(sz, Some(unk(fd, sz)));
     let sub = set_def(fd, sub, subop);
 
     // N = INT_SLESSEQUAL(0, V-K)
@@ -235,7 +241,7 @@ fn build_flag_pair(fd: &mut Funcdata, vbase: VarnodeId, kval: u64, sz: int4) -> 
     let kc = fd.new_constant(sz, kval);
     wire(fd, vbase, sbop, 0);
     wire(fd, kc, sbop, 1);
-    let v = fd.new_unique(1, Some(unk(1)));
+    let v = fd.new_unique(1, Some(unk(fd, 1)));
     let v = set_def(fd, v, sbop);
     (n, v)
 }
@@ -280,7 +286,7 @@ fn sborrowge_non_xnor_declines() {
     let andop = mk_op(&mut fd, 0x100, 2, OpCode::CPUI_BOOL_AND);
     wire(&mut fd, a, andop, 0);
     wire(&mut fd, b, andop, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, andop);
 
     let mut rule = RuleSborrowGe::new(true);

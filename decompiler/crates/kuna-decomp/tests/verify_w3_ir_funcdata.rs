@@ -27,7 +27,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintm};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::op::{pcodeop_flags, PcodeOpBank};
 use kuna_decomp::context::{ArchContext, BlockId, OpId, TypeOp};
@@ -64,8 +64,8 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new(4, type_metatype::TYPE_UNKNOWN))
+fn unk_type(types: &TypeFactoryImpl) -> TypeRoot {
+    types.intern(Datatype::new(4, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn copy_op(fd: &mut Funcdata, inputs: int4, off: u64) -> OpId {
@@ -102,13 +102,14 @@ fn order_of(fd: &Funcdata, op: OpId) -> uintm {
 fn thunk_repoints_self_def_input_cpp_skips_it() {
     let manage = build_manager();
     let ram = Rc::clone(manage.get_space_by_name("ram").unwrap());
-    let ct = unk_type();
+    let types = TypeFactoryImpl::new();
+    let ct = unk_type(&types);
     let mut bank = VarnodeBank::new(&manage, 0x10000000).unwrap();
     let mut obank = PcodeOpBank::new();
 
     // oldvn (to be replaced) and newvn (the survivor / op's own output).
-    let oldvn = bank.create(4, Address::new(Rc::clone(&ram), 0x100), Rc::clone(&ct));
-    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), Rc::clone(&ct));
+    let oldvn = bank.create(4, Address::new(Rc::clone(&ram), 0x100), ct.clone());
+    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), ct.clone());
 
     // op: output == newvn, input[0] == oldvn.
     let op = obank.create_at(1, Address::new(Rc::clone(&ram), 0x1000));
@@ -158,13 +159,14 @@ fn thunk_repoints_self_def_input_cpp_skips_it() {
 fn thunk_repoints_ordinary_reader_matches_cpp() {
     let manage = build_manager();
     let ram = Rc::clone(manage.get_space_by_name("ram").unwrap());
-    let ct = unk_type();
+    let types = TypeFactoryImpl::new();
+    let ct = unk_type(&types);
     let mut bank = VarnodeBank::new(&manage, 0x10000000).unwrap();
     let mut obank = PcodeOpBank::new();
 
-    let oldvn = bank.create(4, Address::new(Rc::clone(&ram), 0x100), Rc::clone(&ct));
-    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), Rc::clone(&ct));
-    let other = bank.create(4, Address::new(Rc::clone(&ram), 0x300), Rc::clone(&ct));
+    let oldvn = bank.create(4, Address::new(Rc::clone(&ram), 0x100), ct.clone());
+    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), ct.clone());
+    let other = bank.create(4, Address::new(Rc::clone(&ram), 0x300), ct.clone());
 
     // op reads oldvn in slot 0, slot 1 holds `other`; output is `other`
     // (!= newvn), so the self-def skip does NOT apply.
@@ -425,23 +427,24 @@ fn no_replace() -> impl FnMut(&mut VarnodeBank, kuna_decomp::context::VarnodeId,
 fn verify_r2_multi_slot_read_repoints_every_slot() {
     let manage = build_manager();
     let ram = Rc::clone(manage.get_space_by_name("ram").unwrap());
-    let ct = unk_type();
+    let types = TypeFactoryImpl::new();
+    let ct = unk_type(&types);
     let mut bank = VarnodeBank::new(&manage, 0x10000000).unwrap();
     let mut obank = PcodeOpBank::new();
 
     // oldvn must be non-free to hold two descend entries -> make it an input.
-    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), Rc::clone(&ct));
+    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), ct.clone());
     let oldvn = bank.set_input(oldfree, &mut no_replace()).unwrap();
     // newvn must also be non-free: C++ `addDescend` (and the port) reject a
     // FREE varnode gaining a 2nd descendant ("Free varnode has multiple
     // descendants", varnode.cc:336) — the survivor of a 2-read replace is a
     // real SSA varnode, never free.
-    let newfree = bank.create(4, Address::new(Rc::clone(&ram), 0x200), Rc::clone(&ct));
+    let newfree = bank.create(4, Address::new(Rc::clone(&ram), 0x200), ct.clone());
     let newvn = bank.set_input(newfree, &mut no_replace()).unwrap();
 
     // op = ADD oldvn, oldvn  (reads oldvn in slot 0 AND slot 1); output is some
     // unrelated varnode (NOT newvn) so the self-def skip does not apply.
-    let out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), Rc::clone(&ct));
+    let out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), ct.clone());
     let op = obank.create_at(2, Address::new(Rc::clone(&ram), 0x1000));
     obank.change_opcode(op, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "INT_ADD"));
     obank.get_mut(op).unwrap().set_output(Some(out));
@@ -480,14 +483,15 @@ fn verify_r2_multi_slot_read_repoints_every_slot() {
 fn verify_r2_self_def_skip_preserves_other_readers() {
     let manage = build_manager();
     let ram = Rc::clone(manage.get_space_by_name("ram").unwrap());
-    let ct = unk_type();
+    let types = TypeFactoryImpl::new();
+    let ct = unk_type(&types);
     let mut bank = VarnodeBank::new(&manage, 0x10000000).unwrap();
     let mut obank = PcodeOpBank::new();
 
-    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), Rc::clone(&ct));
+    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), ct.clone());
     let oldvn = bank.set_input(oldfree, &mut no_replace()).unwrap();
-    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), Rc::clone(&ct));
-    let other_out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), Rc::clone(&ct));
+    let newvn = bank.create(4, Address::new(Rc::clone(&ram), 0x200), ct.clone());
+    let other_out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), ct.clone());
 
     // op_self: output == newvn, reads oldvn in slot 0  (the SKIP case).
     let op_self = obank.create_at(1, Address::new(Rc::clone(&ram), 0x1000));
@@ -530,16 +534,17 @@ fn verify_r2_self_def_skip_preserves_other_readers() {
 fn verify_r2_interleaved_selfdef_and_double_reader() {
     let manage = build_manager();
     let ram = Rc::clone(manage.get_space_by_name("ram").unwrap());
-    let ct = unk_type();
+    let types = TypeFactoryImpl::new();
+    let ct = unk_type(&types);
     let mut bank = VarnodeBank::new(&manage, 0x10000000).unwrap();
     let mut obank = PcodeOpBank::new();
 
-    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), Rc::clone(&ct));
+    let oldfree = bank.create(4, Address::new(Rc::clone(&ram), 0x100), ct.clone());
     let oldvn = bank.set_input(oldfree, &mut no_replace()).unwrap();
     // newvn non-free (it gains two descendants from op_dbl).
-    let newfree = bank.create(4, Address::new(Rc::clone(&ram), 0x200), Rc::clone(&ct));
+    let newfree = bank.create(4, Address::new(Rc::clone(&ram), 0x200), ct.clone());
     let newvn = bank.set_input(newfree, &mut no_replace()).unwrap();
-    let other_out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), Rc::clone(&ct));
+    let other_out = bank.create(4, Address::new(Rc::clone(&ram), 0x300), ct.clone());
 
     let op_self = obank.create_at(1, Address::new(Rc::clone(&ram), 0x1000));
     obank.change_opcode(op_self, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));

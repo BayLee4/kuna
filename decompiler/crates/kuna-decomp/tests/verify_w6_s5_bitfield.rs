@@ -16,17 +16,16 @@
 //! the C++-UB-vs-Rust-shift seam in `getMask`.
 
 use kuna_decomp::bitfield::{BitFieldNodeState, BitRange};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeBitField};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeBitField, TypeFactoryImpl};
 use kuna_decomp::context::VarnodeId;
-use std::rc::Rc;
 
 /// Build a `TypeBitField` whose `bits()` matches `field_bits`, with the given
 /// underlying metatype (TYPE_INT for signed, else unsigned).  The transforms read
 /// only `field->type->getMetatype()` and the field's range.
-fn bf(field_bits: &BitRange, is_int: bool) -> TypeBitField {
+fn bf(types: &TypeFactoryImpl, field_bits: &BitRange, is_int: bool) -> TypeBitField {
     let meta = if is_int { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
     let mut f = TypeBitField::new(0, field_bits.num_bits, field_bits.is_big_endian, "f",
-        Rc::new(Datatype::new(field_bits.byte_size.max(1), meta)));
+        types.intern(Datatype::new(field_bits.byte_size.max(1), meta)).unwrap().id());
     f.byte_offset = field_bits.byte_offset;
     f.byte_size = field_bits.byte_size;
     f.least_sig_bit = field_bits.least_sig_bit;
@@ -194,25 +193,27 @@ fn compare_total_order_antisymmetry() {
 /// (sign-ext), plus that `does_sign_extension_match` reads the carried `is_int`.
 #[test]
 fn node_state_follow_field_signext_matrix() {
+    let types = TypeFactoryImpl::new();
+    let owner = types.intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap();
     let used = BitRange::byte_range(0, 8, false);
 
     // Field at byteOffset 2 (LE) -> translateLSB 16, not top of 64-bit container.
-    let mid = BitFieldNodeState::follow_field(&used, vn(), &bf(&BitRange::new(2, 2, 0, 16, false), true));
+    let mid = BitFieldNodeState::follow_field(&used, vn(), &bf(&types, &BitRange::new(2, 2, 0, 16, false), true), &owner);
     assert_eq!((mid.bits_field.least_sig_bit, mid.bits_field.num_bits), (16, 16));
     assert_eq!(mid.orig_least_sig_bit, 16);
     assert!(!mid.is_sign_extended, "not most-significant => no sign extension");
     assert!(!mid.does_sign_extension_match(), "false == true(is_int) => mismatch");
 
     // Field at byteOffset 6 (LE) -> translateLSB 48, top of the 64-bit container.
-    let top = BitFieldNodeState::follow_field(&used, vn(), &bf(&BitRange::new(6, 2, 0, 16, false), true));
+    let top = BitFieldNodeState::follow_field(&used, vn(), &bf(&types, &BitRange::new(6, 2, 0, 16, false), true), &owner);
     assert!(top.bits_field.is_most_significant());
     assert!(top.is_sign_extended, "int field at the top sign-extends");
     assert!(top.does_sign_extension_match());
 
     // Same top field but unsigned: never sign-extends; match is true (false==false).
-    let topu = BitFieldNodeState::follow_field(&used, vn(), &bf(&BitRange::new(6, 2, 0, 16, false), false));
+    let topu = BitFieldNodeState::follow_field(&used, vn(), &bf(&types, &BitRange::new(6, 2, 0, 16, false), false), &owner);
     assert!(!topu.is_sign_extended);
-    assert_eq!(topu.field().unwrap().field_type.get_metatype(), type_metatype::TYPE_UINT);
+    assert_eq!(topu.field_type().unwrap().get_metatype(), type_metatype::TYPE_UINT);
     assert!(topu.does_sign_extension_match());
 
     // A hole carries no field; does_sign_extension_match is defensively false.

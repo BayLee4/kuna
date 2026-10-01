@@ -16,7 +16,7 @@
 //! The C++ oracle values used below were produced with a standalone
 //! `istringstream >> int/unsigned int` harness (see the verdict file).
 
-use kuna_base::error::KunaError;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4};
 use kuna_decomp::options::{
     split_datatype, ArchOption, ArchOptionContext, NamespaceStrategy, OptionDatabase,
@@ -110,12 +110,13 @@ impl ArchOptionContext for Ctx {
     fn set_convention_printing(&mut self, _v: bool) {}
     fn set_no_cast_printing(&mut self, _v: bool) {}
     fn set_hide_implied_exts(&mut self, _v: bool) {}
-    fn set_max_line_size(&mut self, v: int4) {
+    fn set_max_line_size(&mut self, v: int4) -> KunaResult<()> {
         self.log.push(format!("max_line={v}"));
+        Ok(())
     }
     fn set_indent_increment(&mut self, _v: int4) {}
-    fn set_line_comment_indent(&mut self, _v: int4) {}
-    fn set_comment_style(&mut self, _s: &str) {}
+    fn set_line_comment_indent(&mut self, _v: int4) -> KunaResult<()> { Ok(()) }
+    fn set_comment_style(&mut self, _s: &str) -> KunaResult<()> { Ok(()) }
     fn header_comment_flags(&self) -> uint4 {
         self.header_comment
     }
@@ -128,21 +129,22 @@ impl ArchOptionContext for Ctx {
     fn set_instruction_comment_flags(&mut self, f: uint4) {
         self.instruction_comment = f;
     }
-    fn set_integer_format(&mut self, _f: &str) {}
+    fn set_integer_format(&mut self, _f: &str) -> KunaResult<()> { Ok(()) }
     fn set_namespace_strategy(&mut self, _s: NamespaceStrategy) {}
     fn set_brace_format(&mut self, _c: BraceCategory, _s: BraceStyle) {}
     fn set_print_language(&mut self, _l: &str) {}
     fn set_action_warning(&mut self, _v: bool, _n: &str) -> bool {
         true
     }
-    fn clone_action_group(&mut self, _f: &str, _t: &str) {}
-    fn set_current_action(&mut self, n: &str) {
+    fn clone_action_group(&mut self, _f: &str, _t: &str) -> KunaResult<()> { Ok(()) }
+    fn set_current_action(&mut self, n: &str) -> KunaResult<()> {
         self.current_action = n.to_string();
+        Ok(())
     }
     fn current_action_name(&self) -> String {
         self.current_action.clone()
     }
-    fn toggle_action(&mut self, _g: &str, _s: &str, _v: bool) {}
+    fn toggle_action(&mut self, _g: &str, _s: &str, _v: bool) -> KunaResult<()> { Ok(()) }
     fn enable_rule(&mut self, _p: &str) -> bool {
         true
     }

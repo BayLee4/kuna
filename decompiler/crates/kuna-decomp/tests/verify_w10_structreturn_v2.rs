@@ -27,12 +27,12 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::variable::HighVariableBank;
 use kuna_decomp::varnode::VarnodeBank;
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(tf: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    tf.intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).expect("unknown type")
 }
 
 fn manager() -> AddrSpaceManager {
@@ -67,15 +67,16 @@ fn build_struct_group(
     root_size: int4,
     pieces: &[(int4, int4)],
 ) -> (HighVariableBank, kuna_decomp::context::HighVariableId, Vec<kuna_decomp::context::HighVariableId>) {
+    let tf = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(m, 0).unwrap();
     let mut hb = HighVariableBank::new();
 
-    let root_vn = vbank.create(root_size, ram(m, 0x100), dt(root_size));
+    let root_vn = vbank.create(root_size, ram(m, 0x100), dt(&tf, root_size));
     let root_high = hb.new_high(root_vn);
 
     let mut piece_highs = Vec::new();
     for &(off, sz) in pieces {
-        let pvn = vbank.create(sz, ram(m, 0x200 + off as u64), dt(sz));
+        let pvn = vbank.create(sz, ram(m, 0x200 + off as u64), dt(&tf, sz));
         let ph = hb.new_high(pvn);
         // Merge::groupPartialRoot: nodeVn->getHigh()->groupWith(typeOffset, root).
         // (first_size / hi2_first_size are the C++ `getTypeSize` args; the offset
@@ -145,14 +146,15 @@ fn at2_nonzero_root_symbol_offset_shifts_all_field_keys() {
 #[test]
 fn at3_incompatible_root_symbol_offset_is_err_not_panic() {
     let m = manager();
+    let tf = TypeFactoryImpl::new();
     // Two pieces; make the *root* a grouped piece sitting at a non-zero group
     // offset by grouping it under a wider container, then give it a symbol offset
     // below its group offset.
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut hb = HighVariableBank::new();
-    let container_vn = vbank.create(8, ram(&m, 0x300), dt(8));
+    let container_vn = vbank.create(8, ram(&m, 0x300), dt(&tf, 8));
     let container = hb.new_high(container_vn);
-    let root_vn = vbank.create(4, ram(&m, 0x304), dt(4));
+    let root_vn = vbank.create(4, ram(&m, 0x304), dt(&tf, 4));
     let root = hb.new_high(root_vn);
     // root sits at group offset 4 within the container.
     hb.group_with(root, 4, container, 4, 8).unwrap();
@@ -178,9 +180,10 @@ fn at3_incompatible_root_symbol_offset_is_err_not_panic() {
 #[test]
 fn at4_groupless_high_is_noop() {
     let m = manager();
+    let tf = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut hb = HighVariableBank::new();
-    let vn = vbank.create(4, ram(&m, 0x400), dt(4));
+    let vn = vbank.create(4, ram(&m, 0x400), dt(&tf, 4));
     let lone = hb.new_high(vn);
 
     assert!(hb.high_piece_id(lone).is_none(), "ungrouped high has no piece");
@@ -188,7 +191,7 @@ fn at4_groupless_high_is_noop() {
     // No panic, returns Ok.
     assert!(hb.establish_group_symbol_offset(lone).is_ok());
     // Two unrelated lone highs are never the same group.
-    let vn2 = vbank.create(4, ram(&m, 0x404), dt(4));
+    let vn2 = vbank.create(4, ram(&m, 0x404), dt(&tf, 4));
     let lone2 = hb.new_high(vn2);
     assert!(!hb.is_same_group(lone, lone2));
 }

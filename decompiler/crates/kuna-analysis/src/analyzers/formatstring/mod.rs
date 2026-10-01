@@ -92,11 +92,9 @@ pub mod apply;
 /// anything is decompiled, so the typing costs no second decompile.
 pub mod kuna_fmtstatic;
 
-use std::rc::Rc;
-
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeRoot, TypeFactory};
 
 /// A single parsed format argument: the optional length modifier plus the
 /// conversion specifier. Faithful mirror of Ghidra's `FormatArgument` (the
@@ -1144,7 +1142,7 @@ pub fn parse_format_specifiers(fmt: &str) -> Vec<Spec> {
 // pick (kuna has no .gdt typedefs — a documented LOSS).
 // ---------------------------------------------------------------------------
 
-/// Build the kuna [`Datatype`] for a [`Spec`] using the architecture's type
+/// Build the kuna [`TypeRoot`] for a [`Spec`] using the architecture's type
 /// factory — the analog of `protos::build_ty`. `word_size` is the addressable
 /// word size (the `.2` of `Architecture::data_org`). The extended-precision
 /// typedefs are modeled as their integer fallback per
@@ -1153,7 +1151,7 @@ pub fn spec_to_datatype(
     spec: Spec,
     types: &dyn TypeFactory,
     word_size: uint4,
-) -> KunaResult<Rc<Datatype>> {
+) -> KunaResult<TypeRoot> {
     let ptr = types.get_size_of_pointer();
     let int_sz = types.get_size_of_int();
     let long_sz = types.get_size_of_long();
@@ -1180,7 +1178,7 @@ pub fn spec_to_datatype(
     // Build a base integer/float of (size, metatype).
     let base = |s: int4, m: type_metatype| types.get_base(s, m);
     // Build a pointer to a base integer/float of (size, metatype).
-    let ptr_to_base = |s: int4, m: type_metatype| -> KunaResult<Rc<Datatype>> {
+    let ptr_to_base = |s: int4, m: type_metatype| -> KunaResult<TypeRoot> {
         let pointee = types.get_base(s, m)?;
         types.get_type_pointer(ptr, pointee, word_size)
     };

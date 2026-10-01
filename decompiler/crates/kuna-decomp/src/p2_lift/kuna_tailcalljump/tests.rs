@@ -10,7 +10,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, OpId, TypeOp};
 
@@ -38,14 +38,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn proc_space(fd: &Funcdata) -> Rc<AddrSpace> {
@@ -59,9 +65,10 @@ fn build_branch_op(fd: &mut Funcdata, opc: OpCode, off: u64) -> OpId {
     let op = fd.obank_mut().create_at(1, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, 0, "op"));
     let ram = proc_space(fd);
+    let datatype = unk_type(fd, 8);
     let vn = fd
         .vbank_mut()
-        .create(8, Address::new(ram, off), unk_type(8));
+        .create(8, Address::new(ram, off), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);
     op
 }

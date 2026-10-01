@@ -145,6 +145,25 @@ pub fn arr<I: IntoIterator<Item = String>>(items: I) -> String {
     out
 }
 
+pub fn callable_artifacts_json<'a>(artifacts: impl Iterator<Item = &'a kuna_decomp::kuna_callabletransport::CallableArtifact>) -> String {
+    use kuna_decomp::kuna_callabletransport::CallableDefinition;
+    arr(artifacts.map(|artifact| {
+        let definition = match &artifact.definition {
+            None => "null".to_string(),
+            Some(CallableDefinition::Wrapper(code)) => Obj::new()
+                .str("kind", "wrapper").str("code", code).end(),
+            Some(CallableDefinition::ExistingTarget { space, byte_address }) => Obj::new()
+                .str("kind", "existing_target").num("space", space)
+                .raw("byte_address", &hex_str(*byte_address)).end(),
+            Some(CallableDefinition::BodyProof { provider }) => Obj::new()
+                .str("kind", "body_proof").str("provider", provider).end(),
+        };
+        Obj::new().str("key", &artifact.key).str("declaration", &artifact.declaration)
+            .raw("definition", &definition)
+            .bool("required", artifact.required).bool("deferred", artifact.deferred).end()
+    }))
+}
+
 /// The per-directive report, the fields `kuna decompile-all --json` gives it.
 pub fn assertions_json(outcomes: &[Outcome]) -> String {
     arr(outcomes.iter().map(|o| {

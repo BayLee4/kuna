@@ -9,9 +9,9 @@
 //! The `findResolve` overrides (`type.cc:590-2986`: `TypePointer`/`TypeArray`/
 //! `TypeStruct`/`TypeUnion`/`TypePartialUnion`) all reach the per-function union
 //! cache through `op->getParent()->getFuncdata()->getUnionField(this,op,slot)`.
-//! A `Datatype` in the Rust port carries no `Funcdata` back-pointer (ADR-0001:
-//! types are interned arena values, not graph-owned), so `findResolve` cannot be a
-//! method on `Datatype` the way the C++ has it.  Instead the *whole* facing
+//! Graph-owned datatype nodes carry no `Funcdata` back-pointer. External
+//! `TypeRoot`s retain their graph, while a borrowed read view follows internal
+//! edges and resolves aliases without copying definitions. The *whole* facing
 //! computation — including the `findResolve` dispatch — lives here on `Funcdata`,
 //! which already owns both the merged `high_bank` and the `union_map` cache
 //! (`crate::funcdata_union`).  This is the faithful equivalent: every C++ call site
@@ -30,9 +30,7 @@
 //! `findResolve` overrides do, so the typed-access cluster (`union_datatype.xml`)
 //! gets the resolved field type once the Casts stage drives the cache.
 
-use std::rc::Rc;
-
-use crate::dtype::{type_metatype, Datatype, DatatypeKind};
+use crate::dtype::{type_metatype, TypeRoot, DatatypeKind};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 
@@ -49,11 +47,14 @@ impl Funcdata {
     /// when a needs-resolution type misses the cache.
     pub fn find_resolve_facing(
         &self,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
         op: OpId,
         slot: i32,
-    ) -> Rc<Datatype> {
-        match &ct.kind {
+    ) -> TypeRoot {
+        let view = ct.read();
+        let ty = view.get(ct.id()).and_then(|ty| ty.effective())
+            .expect("facing type must be readable");
+        match &ty.kind {
             // TypePointer::findResolve (type.cc:1335-1345): only a pointer *to a
             // union* consults the cache; any other pointer returns itself.
             //
@@ -62,57 +63,58 @@ impl Funcdata {
             // inherited `TypePointer::findResolve` — the same cache consult, keyed on
             // the (stripped-pointer) ptrto id.  Match both kinds here.
             DatatypeKind::Pointer { ptrto, .. } | DatatypeKind::PointerRel { ptrto, .. } => {
-                if ptrto.get_metatype() == type_metatype::TYPE_UNION {
+                if view.get(*ptrto).and_then(|ty| ty.effective())
+                    .expect("pointer target must be readable").get_metatype() == type_metatype::TYPE_UNION {
                     if let Some(res) = self.get_union_field(ct, op, slot) {
-                        return Rc::clone(res.get_datatype());
+                        return res.get_datatype().clone();
                     }
                 }
-                Rc::clone(ct)
+                ct.clone()
             }
             // TypeArray::findResolve (type.cc:1470-1478): cache, else the element.
             DatatypeKind::Array { arrayof, .. } => {
                 if let Some(res) = self.get_union_field(ct, op, slot) {
-                    return Rc::clone(res.get_datatype());
+                    return res.get_datatype().clone();
                 }
-                Rc::clone(arrayof)
+                ct.related(*arrayof).expect("array element must be readable")
             }
             // TypeStruct::findResolve (type.cc:2290-2298): cache, else field[0].
             DatatypeKind::Struct { field, .. } => {
                 if let Some(res) = self.get_union_field(ct, op, slot) {
-                    return Rc::clone(res.get_datatype());
+                    return res.get_datatype().clone();
                 }
                 match field.first() {
-                    Some(f) => Rc::clone(&f.field_type),
+                    Some(f) => ct.related(f.field_type).expect("field type must be readable"),
                     // A field-less struct cannot occur for a needs-resolution
                     // struct, but keep the type rather than panic (fail-closed).
-                    None => Rc::clone(ct),
+                    None => ct.clone(),
                 }
             }
             // TypeUnion::findResolve (type.cc:2559-2567): cache, else self.
             DatatypeKind::Union { .. } => {
                 if let Some(res) = self.get_union_field(ct, op, slot) {
-                    return Rc::clone(res.get_datatype());
+                    return res.get_datatype().clone();
                 }
-                Rc::clone(ct)
+                ct.clone()
             }
             // TypePartialUnion::findResolve (type.cc:2978-2986): cache, else stripped.
             DatatypeKind::PartialUnion { stripped, .. } => {
                 if let Some(res) = self.get_union_field(ct, op, slot) {
-                    return Rc::clone(res.get_datatype());
+                    return res.get_datatype().clone();
                 }
-                Rc::clone(stripped)
+                ct.related(*stripped).expect("stripped type must be readable")
             }
             // Datatype::findResolve base (type.cc:590-594): return this.
-            _ => Rc::clone(ct),
+            _ => ct.clone(),
         }
     }
 
     /// C++ `Varnode::getTypeDefFacing()` (varnode.cc:645-651): the Varnode's own
     /// data-type, resolved against the *write* edge (`slot == -1`) when it needs
     /// union resolution.  `vn` **must** be written.
-    pub fn vn_type_def_facing(&self, vn: VarnodeId) -> Rc<Datatype> {
+    pub fn vn_type_def_facing(&self, vn: VarnodeId) -> TypeRoot {
         let v = self.vbank().get(vn).expect("vn_type_def_facing: stale vn");
-        let ty = Rc::clone(v.get_type());
+        let ty = v.get_type().clone();
         if !ty.needs_resolution() {
             return ty;
         }
@@ -123,8 +125,8 @@ impl Funcdata {
     /// C++ `Varnode::getTypeReadFacing(op)` (varnode.cc:658-664): the Varnode's own
     /// data-type, resolved against the *read* edge (`op->getSlot(this)`) when it
     /// needs union resolution.
-    pub fn vn_type_read_facing(&self, vn: VarnodeId, op: OpId) -> Rc<Datatype> {
-        let ty = Rc::clone(self.vbank().get(vn).expect("vn_type_read_facing: stale vn").get_type());
+    pub fn vn_type_read_facing(&self, vn: VarnodeId, op: OpId) -> TypeRoot {
+        let ty = self.vbank().get(vn).expect("vn_type_read_facing: stale vn").get_type().clone();
         if !ty.needs_resolution() {
             return ty;
         }
@@ -136,10 +138,10 @@ impl Funcdata {
     /// HighVariable's data-type, resolved against the write edge when it needs
     /// union resolution.  This is the def-facing node of the type graph the Casts
     /// stage walks.
-    pub fn vn_high_type_def_facing(&mut self, vn: VarnodeId) -> Rc<Datatype> {
+    pub fn vn_high_type_def_facing(&mut self, vn: VarnodeId) -> TypeRoot {
         let ct = self
             .high_get_type(vn)
-            .unwrap_or_else(|| Rc::clone(self.vbank().get(vn).expect("stale vn").get_type()));
+            .unwrap_or_else(|| self.vbank().get(vn).expect("stale vn").get_type().clone());
         if !ct.needs_resolution() {
             return ct;
         }
@@ -155,10 +157,10 @@ impl Funcdata {
     /// HighVariable's data-type, resolved against the read edge when it needs union
     /// resolution.  This is the read-facing node of the type graph
     /// `ActionSetCasts::castInput`/`castOutput` query.
-    pub fn vn_high_type_read_facing(&mut self, vn: VarnodeId, op: OpId) -> Rc<Datatype> {
+    pub fn vn_high_type_read_facing(&mut self, vn: VarnodeId, op: OpId) -> TypeRoot {
         let ct = self
             .high_get_type(vn)
-            .unwrap_or_else(|| Rc::clone(self.vbank().get(vn).expect("stale vn").get_type()));
+            .unwrap_or_else(|| self.vbank().get(vn).expect("stale vn").get_type().clone());
         if !ct.needs_resolution() {
             return ct;
         }

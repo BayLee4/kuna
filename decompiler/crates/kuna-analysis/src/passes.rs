@@ -280,16 +280,11 @@ pub fn passes_for(compiler: Compiler, format: object::BinaryFormat) -> Vec<Box<d
         // (`__uflow` and friends). Merged after those two, so its prototypes are
         // committed last and win for every name it restates.
         //
-        // Registered after `DwarfPass` ON PURPOSE, and this is load-bearing: the
-        // pass INTERNS a named shell per aggregate as it builds the signatures,
-        // and a `Rc<Datatype>` pointee is captured by value. `TypeFactory`
-        // completion re-keys a struct into a NEW `Rc` (`set_fields_struct`), so a
-        // pointer minted against an empty shell keeps pointing at the empty shell
-        // even after DWARF completes the same name. Running second, the pass sees
-        // the platform's real `struct stat` already interned and points at THAT
-        // (`kuna_libctypes::named_aggregate`); the names DWARF did not define it
-        // mints itself. The order also keeps the prototype precedence right — a
-        // DWARF-defined function outranks a table entry.
+        // Registered after `DwarfPass` so source definitions are available before
+        // the table fills missing aggregate layouts (`named_aggregate`).
+        // Shared graph identities preserve pointers through shell completion;
+        // this ordering selects authoritative source facts, not pointer freshness.
+        // A DWARF-defined function still outranks a table entry.
         //
         // The pass SELF-GATES on the `libctypes` env bridge rather than on the
         // commit boundary, because with the gate off not one of those shells may

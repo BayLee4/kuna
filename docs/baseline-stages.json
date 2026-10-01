@@ -1,7 +1,7 @@
 {
   "data_footer": [
-    1397,
-    1397
+    1391,
+    1391
   ],
   "passing": [
     "data:ALIASOVERLAP #1: the 4-byte read at a0+7 is a local ahead of a store into it",
@@ -499,7 +499,6 @@
     "data:LIBCTYPES #27: off, an obstack entry point the image DEFINES says nothing, so its caller has neither arity nor a pointee",
     "data:LIBCTYPES #28: on, that same definition -- gnulib's copy, linked in and exported -- names the pointer its caller holds",
     "data:LIBCTYPES #29: off, the imported `putspent` leaves both of its aggregate slots unsaid",
-    "data:LIBCTYPES #2: on, the same parameter is a minted FILE *",
     "data:LIBCTYPES #30: on, its declaration names the shadow record and the stream it is written to",
     "data:LIBCTYPES #31: off, the IMPORTED obstack entry point says nothing either",
     "data:LIBCTYPES #32: on, an import takes glibc's own spelling -- `int`, where the linked-in gnulib copy of #28 takes `size_t`",
@@ -514,8 +513,6 @@
     "data:LIBCTYPES #4: on, the fopen result is a minted FILE *",
     "data:LIBCTYPES #5: the DWARF layout of `stat` reads the same in both passes -- the named table adopted it instead of shadowing it",
     "data:LIBCTYPES #6: and neither aggregate a DWARF definition already described fell back to an offset-named field",
-    "data:LIBCTYPES #7: on a binary whose DWARF DOES define the stream type, that definition is what the table points at",
-    "data:LIBCTYPES #8: including the parameter the whole option exists for",
     "data:LIBCTYPES #9: with its real field layout, not a shell",
     "data:LINUXSYSCALL #1: both int 0x80 sites render as an indirect call through swi() only in the linuxsyscall-off pass",
     "data:LINUXSYSCALL #2: with the option on, the number in EAX names the call and the ABI registers become its arguments",
@@ -561,8 +558,6 @@
     "data:LOWEREDSWITCHHEADS #5: the last case value is assigned in both passes",
     "data:LOWEREDSWITCHHEADS #6: the default value is assigned in both passes",
     "data:LOWEREDSWITCHVALUE #1: pass 2 dispatches on the compared first parameter",
-    "data:LOWEREDSWITCHVALUE #2: pass 1 dispatches both functions on a local holding a clobbered register",
-    "data:LOWEREDSWITCHVALUE #3: pass 1's local is the second parameter",
     "data:LOWEREDSWITCHVALUE #4: pass 2 keeps the dispatched-on parameter in the prototype",
     "data:LOWEREDSWITCHVALUE #5: a case body is present in both passes",
     "data:LOWEREDSWITCHVALUE #6: big_consts switches only in pass 1, on the second parameter",
@@ -1057,7 +1052,6 @@
     "data:charbyte #5: uint1 bytes: all eight functions with the option off; the table, unsigned-compare, call-argument, sibling and counter controls with it on",
     "data:charbyte #6: char bytes: isdash, ishigh and dashlen with the option on",
     "data:charbyte #7: with the option off a byte compared with 0xe9 is uint1 against a number",
-    "data:charbyte #8: with the option on the constant takes char with the byte, so the comparison stays true for 0xe9",
     "data:charbyte #9: with the option off the byte pushes uint1 * over the pointer strlen made char *",
     "data:charptr #10: the same struct-embedded walk at -O2 keeps its placeholder in both passes",
     "data:charptr #11: a string whose first character is skipped before any read cannot be told from a field at offset one, so it is void * in both passes",

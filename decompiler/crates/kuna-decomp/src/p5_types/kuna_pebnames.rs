@@ -79,8 +79,6 @@
 //! * `auto` needs `image_windows_user`, which only the object loader writes, so it
 //!   never fires in the Ghidra front-end; `on` does.
 
-use std::rc::Rc;
-
 use kuna_base::address::Address;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::int4;
@@ -88,7 +86,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::action::{Action, ActionBase, ActionContext, ActionGroupList, ApplyResult};
-use crate::dtype::{flags, type_metatype, Datatype, TypeFactory, TypeField};
+use crate::dtype::{flags, type_metatype, TypeFactory, TypeField, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::varnode::varnode_flags;
 
@@ -307,7 +305,7 @@ pub fn resolve_register(data: &Funcdata) -> Option<(&'static Layout, Address)> {
 
 /// Is `ct` a completed variable-length structure of `size` bytes whose field
 /// `marker` sits at `marker_off`?
-fn matches_layout(ct: &Datatype, size: int4, marker: &str, marker_off: int4) -> bool {
+fn matches_layout(ct: &TypeRoot, size: int4, marker: &str, marker_off: int4) -> bool {
     if ct.get_metatype() != type_metatype::TYPE_STRUCT
         || ct.is_incomplete()
         || !ct.is_variable_length()
@@ -315,14 +313,17 @@ fn matches_layout(ct: &Datatype, size: int4, marker: &str, marker_off: int4) -> 
     {
         return false;
     }
-    (0..ct.num_depend()).filter_map(|i| ct.get_field(i)).any(|f| f.name == marker && f.offset == marker_off)
+    let view = ct.read();
+    (0..ct.num_depend())
+        .filter_map(|i| view.get_field(ct.id(), i).ok().flatten())
+        .any(|f| f.name == marker && f.offset == marker_off)
 }
 
 /// Is `ct` the `TEB *` this pass builds for `layout`?
-pub fn is_teb_pointer(ct: &Datatype, layout: &Layout) -> bool {
+pub fn is_teb_pointer(ct: &TypeRoot, layout: &Layout) -> bool {
     ct.get_metatype() == type_metatype::TYPE_PTR
         && ct.get_ptr_to().is_some_and(|t| {
-            t.get_name() == "TEB"
+            t.read().get(t.id()).is_ok_and(|ty| ty.get_name() == "TEB")
                 && matches_layout(
                     &t,
                     layout.teb_size,
@@ -334,7 +335,7 @@ pub fn is_teb_pointer(ct: &Datatype, layout: &Layout) -> bool {
 
 /// A completed structure already in the program under `name`: `Ok(Some)` when it
 /// is this layout, `Err` when the name belongs to something else.
-fn existing(types: &dyn TypeFactory, name: &str, size: int4, marker: &str, off: int4) -> Result<Option<Rc<Datatype>>, ()> {
+fn existing(types: &dyn TypeFactory, name: &str, size: int4, marker: &str, off: int4) -> Result<Option<TypeRoot>, ()> {
     match types.find_by_name(name) {
         Ok(None) => Ok(None),
         Ok(Some(t)) if matches_layout(&t, size, marker, off) => Ok(Some(t)),
@@ -346,26 +347,26 @@ fn fields_of(
     types: &dyn TypeFactory,
     layout: &Layout,
     spec: &[Field],
-    teb: Option<&Rc<Datatype>>,
-    peb: Option<&Rc<Datatype>>,
+    teb: Option<&TypeRoot>,
+    peb: Option<&TypeRoot>,
 ) -> Option<Vec<TypeField>> {
     let ps = layout.ptr_size;
     let opaque = types.get_base(ps, type_metatype::TYPE_UNKNOWN).ok()?;
     let mut out = Vec::with_capacity(spec.len());
     for (i, &(off, name, kind)) in spec.iter().enumerate() {
         let ct = match kind {
-            Kind::Opaque => Rc::clone(&opaque),
+            Kind::Opaque => opaque.clone(),
             Kind::TebPtr => match teb {
-                Some(t) => types.get_type_pointer(ps, Rc::clone(t), 1).ok()?,
-                None => Rc::clone(&opaque),
+                Some(t) => types.get_type_pointer(ps, t.clone(), 1).ok()?,
+                None => opaque.clone(),
             },
-            Kind::PebPtr => types.get_type_pointer(ps, Rc::clone(peb?), 1).ok()?,
+            Kind::PebPtr => types.get_type_pointer(ps, peb?.clone(), 1).ok()?,
             Kind::U1 => types.get_base(1, type_metatype::TYPE_UINT).ok()?,
             Kind::U2 => types.get_base(2, type_metatype::TYPE_UINT).ok()?,
             Kind::U4 => types.get_base(4, type_metatype::TYPE_UINT).ok()?,
-            Kind::OpaqueArray(n) => types.get_type_array(n, Rc::clone(&opaque)).ok()?,
+            Kind::OpaqueArray(n) => types.get_type_array(n, opaque.clone()).ok()?,
         };
-        out.push(TypeField::new(i as int4, off, name, ct));
+        out.push(TypeField::new(i as int4, off, name, ct.id()));
     }
     Some(out)
 }
@@ -378,9 +379,9 @@ fn build_struct(
     spec: &[Field],
     size: int4,
     marker: &str,
-    teb: Option<&Rc<Datatype>>,
-    peb: Option<&Rc<Datatype>>,
-) -> Option<Rc<Datatype>> {
+    teb: Option<&TypeRoot>,
+    peb: Option<&TypeRoot>,
+) -> Option<TypeRoot> {
     if let Some(t) = existing(types, name, size, marker, layout.offset_of(spec, marker)).ok()? {
         return Some(t);
     }
@@ -392,11 +393,11 @@ fn build_struct(
 /// The `TEB *` type for `layout`, building `PEB`, `_TEB` and `TEB` on first use.
 /// `None` when any of the names is already taken by a different type.
 ///
-/// Completing a structure mints a new `Rc`, so a field cannot point at the
-/// structure that holds it: `TEB.Self` points at the identical `_TEB` (the Windows
-/// structure tag), whose own `Self` is opaque. `teb->Self->ProcessEnvironmentBlock`
-/// therefore resolves; a second `->Self` stays an untyped value.
-pub fn teb_pointer_type(types: &dyn TypeFactory, layout: &Layout) -> Option<Rc<Datatype>> {
+/// Preserve the bounded Windows layout model: `TEB.Self` points at `_TEB` (the
+/// Windows structure tag), whose own `Self` is opaque.
+/// `teb->Self->ProcessEnvironmentBlock` therefore resolves; a second `->Self`
+/// stays an untyped value.
+pub fn teb_pointer_type(types: &dyn TypeFactory, layout: &Layout) -> Option<TypeRoot> {
     let marker = "ProcessEnvironmentBlock";
     let peb = build_struct(types, layout, "PEB", layout.peb, layout.peb_size, "BeingDebugged", None, None)?;
     let inner = build_struct(types, layout, "_TEB", layout.teb, layout.teb_size, marker, None, Some(&peb))?;

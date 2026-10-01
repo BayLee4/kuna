@@ -12,6 +12,8 @@
 
 use super::*;
 
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool};
+
 use std::rc::Rc;
 
 use kuna_base::address::{Address, SeqNum};
@@ -19,7 +21,7 @@ use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, BlockId};
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,10 @@ fn build_fd() -> Funcdata {
 fn build_fd_with_cancel_byte_arithmetic(gate: bool) -> Funcdata {
     let manage = build_manager();
     let mut ctx = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    ctx.types = Some(Rc::new(types));
     ctx.cancel_byte_arithmetic = gate;
     let glb = Rc::new(ctx);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
@@ -63,8 +69,9 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 /// A fresh basic block under the bblocks root.
@@ -86,7 +93,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// operands, exactly as heritaged registers are non-free in a real flow).
 fn mk_vn(fd: &mut Funcdata, s: int4, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(s, Address::new(ram, off), dt(s));
+    let datatype = dt(fd, s);
+    let vn = fd.vbank_mut().create(s, Address::new(ram, off), datatype);
     fd.vbank_mut().set_input(vn, &mut |_, _, _| Ok(())).expect("mk_vn: set_input")
 }
 
@@ -110,30 +118,6 @@ fn mk_def(
     (op, out)
 }
 
-// ---------------------------------------------------------------------------
-// registration
-// ---------------------------------------------------------------------------
-
-#[test]
-fn specs_in_definition_order() {
-    let names: Vec<&str> = specs()
-        .iter()
-        .map(|s| {
-            // The ctor's debug name comes from the rule's clone group; we instead
-            // assert order via the rule's own `get_op_list` first opcode, which is
-            // distinctive enough alongside the count.
-            s.group
-        })
-        .collect();
-    assert_eq!(names.len(), 19);
-    // RuleLoadVarnode/RuleStoreVarnode (the first two, in definition order)
-    // register under "stackvars" (coreaction.cc:5939-5940); the other 17 are
-    // "analysis".
-    assert_eq!(names[0], "stackvars");
-    assert_eq!(names[1], "stackvars");
-    assert!(names[2..].iter().all(|g| *g == "analysis"));
-}
-
 #[test]
 fn op_lists_match_cpp() {
     assert_eq!(RuleLoadVarnode::new().get_op_list(), vec![OpCode::CPUI_LOAD]);
@@ -149,14 +133,6 @@ fn op_lists_match_cpp() {
     assert_eq!(RuleHumptyOr::new().get_op_list(), vec![OpCode::CPUI_INT_OR]);
     assert_eq!(RuleSwitchSingle::new().get_op_list(), vec![OpCode::CPUI_BRANCHIND]);
     assert_eq!(RuleCondNegate::new().get_op_list(), vec![OpCode::CPUI_CBRANCH]);
-}
-
-#[test]
-fn clone_filters_on_group() {
-    let inside = ActionGroupList::from_names(["analysis"]);
-    let outside = ActionGroupList::from_names(["other"]);
-    assert!(RuleSubCancel::new().clone_rule(&inside).is_some());
-    assert!(RuleSubCancel::new().clone_rule(&outside).is_none());
 }
 
 // ---------------------------------------------------------------------------
@@ -615,8 +591,16 @@ fn subcancel_and_total_cancel() {
     fd.op_insert(subop, bl, None);
     let _subout = new_unique_out(&mut fd, 2, subop);
 
-    let res = RuleSubCancel::new().apply_op(subop, &mut fd);
-    assert_eq!(res, 1);
+    let mut pool = ActionPool::new(0, "subcancel");
+    pool.add_spec(&specs()[12], "subcancel");
+    if let Some(mut excluded) = pool.clone_filtered(&ActionGroupList::from_names(["other"])) {
+        assert_eq!(excluded.apply(&mut fd, &mut ActionContext::new()), 0);
+    }
+    assert_eq!(fd.obank().get(subop).unwrap().get_in(0), Some(andout));
+    let mut selected = pool
+        .clone_filtered(&ActionGroupList::from_names(["analysis"]))
+        .expect("registered group survives");
+    assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
     // slot 0 now reads V (the AND's thruvn); opcode unchanged (still SUBPIECE).
     assert_eq!(fd.obank().get(subop).unwrap().get_in(0), Some(v));
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_SUBPIECE);

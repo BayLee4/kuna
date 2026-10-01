@@ -178,7 +178,7 @@ use kuna_num::opcodes::OpCode;
 
 use crate::action::{Action, ActionBase, ActionContext, ActionGroupList, ApplyResult};
 use crate::context::VarnodeId;
-use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeField};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory, TypeField};
 use crate::funcdata::Funcdata;
 
 /// (kuna `structsynth`) The program-wide layout ledger: which minted `struct_N`
@@ -273,7 +273,7 @@ struct Slot {
     /// The widest access seen at this offset.
     width: int4,
     /// The type the widest access carried, when one was readable.
-    ctype: Option<Rc<Datatype>>,
+    ctype: Option<TypeRoot>,
     /// What every access of that width said the bytes are.
     seen: Kinds,
 }
@@ -290,7 +290,7 @@ struct Kinds {
 }
 
 impl Kinds {
-    fn note(&mut self, t: &Datatype) {
+    fn note(&mut self, t: &TypeRoot) {
         match t.get_metatype() {
             type_metatype::TYPE_INT => self.signed = true,
             type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN => self.unsigned = true,
@@ -308,7 +308,7 @@ impl Slot {
 
     /// The type the field commits to, or `None` when the accesses disagree. Sign
     /// is contested only for an integer field: a pointer has no sign to get wrong.
-    fn committed(&self) -> Option<&Rc<Datatype>> {
+    fn committed(&self) -> Option<&TypeRoot> {
         let ct = self.ctype.as_ref()?;
         let integer = matches!(
             ct.get_metatype(),
@@ -360,7 +360,7 @@ impl Evidence {
     /// field read as `double` prints `(double)p->field_0x8`, a value conversion of
     /// bits the binary reinterprets (`movsd 0x8(%rdi)`), where a byte array makes
     /// every access cast the address instead.
-    fn record(&mut self, off: intb, width: int4, ctype: Option<Rc<Datatype>>) {
+    fn record(&mut self, off: intb, width: int4, ctype: Option<TypeRoot>) {
         let slot = self.slots.entry(off).or_default();
         if width < slot.width {
             return;
@@ -370,7 +370,7 @@ impl Evidence {
             slot.seen = Kinds::default();
             slot.ctype = ctype.clone();
         }
-        if let Some(t) = ctype.as_deref() {
+        if let Some(t) = ctype.as_ref() {
             slot.seen.note(t);
         }
     }
@@ -550,11 +550,11 @@ fn sign_extend(val: uintb, size: int4) -> intb {
 /// `HighVariable`s do not exist yet in `mainloop` -- merging runs later -- so the
 /// Varnode's own type, which is what `ActionInferTypes::write_back` sets, is the
 /// reading here; a high, when one exists, wins.
-fn vn_type(data: &mut Funcdata, vn: VarnodeId) -> Option<Rc<Datatype>> {
+fn vn_type(data: &mut Funcdata, vn: VarnodeId) -> Option<TypeRoot> {
     if let Some(t) = data.high_get_type(vn) {
         return Some(t);
     }
-    data.vbank().get(vn).map(|v| Rc::clone(v.get_type()))
+    data.vbank().get(vn).map(|v| v.get_type().clone())
 }
 
 /// Walk the op bank once and accumulate the access evidence per base.
@@ -731,12 +731,13 @@ fn address_walks(data: &Funcdata, vn: VarnodeId, depth: u32) -> bool {
 
 /// Is `ct` a pointer whose pointee is a named aggregate a person or a named-type
 /// pass supplied?  Such a type always wins over a synthesized one.
-pub(crate) fn points_at_named_composite(ct: &Datatype) -> bool {
+pub(crate) fn points_at_named_composite(ct: &TypeRoot) -> bool {
     let Some(pt) = ct.get_ptr_to() else { return false };
+    let view = pt.read();
     matches!(
         pt.get_metatype(),
         type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION | type_metatype::TYPE_ARRAY
-    ) && !pt.get_name().is_empty()
+    ) && !view.get(pt.id()).expect("valid pointee").get_name().is_empty()
 }
 
 /// Does this offset set read as an ARRAY rather than a structure?
@@ -790,7 +791,7 @@ fn is_array_shaped(slots: &BTreeMap<intb, Slot>, ptr_size: int4) -> bool {
 /// alignment into the exported header, so an aggregate-typed value degrades to
 /// the honest `undefined<N>` of the access width rather than moving the fields
 /// after it.
-fn spells_its_own_width(ct: &Datatype) -> bool {
+fn spells_its_own_width(ct: &TypeRoot) -> bool {
     matches!(
         ct.get_metatype(),
         type_metatype::TYPE_INT
@@ -830,17 +831,17 @@ fn fields_for(
         let ct = if *filled {
             // Always an array, even for one byte: a member of array type is how
             // the instruments tell filler from a field the pass actually claims.
-            types.get_type_array(*width, Rc::clone(&byte)).ok()?
+            types.get_type_array(*width, byte.clone()).ok()?
         } else {
             match ev.slots.get(&(*off as intb)).and_then(Slot::committed) {
                 // A value type wider or narrower than the access is not this
                 // offset's field; fall back to the honest unknown of the access
                 // width, which prints `undefined<N>`.
-                Some(t) if t.get_size() == *width && spells_its_own_width(t) => Rc::clone(t),
+                Some(t) if t.get_size() == *width && spells_its_own_width(t) => t.clone(),
                 _ => types.get_base(*width, type_metatype::TYPE_UNKNOWN).ok()?,
             }
         };
-        fields.push(TypeField::new(i as int4, *off, format!("field_0x{off:x}"), ct));
+        fields.push(TypeField::new(i as int4, *off, format!("field_0x{off:x}"), ct.id()));
     }
     Some((fields, size))
 }
@@ -908,7 +909,7 @@ fn synthesize(data: &mut Funcdata) -> bool {
         asks.sort_by(|a, b| b.1.cmp(&a.1));
     }
 
-    let mut installs: Vec<(VarnodeId, Rc<Datatype>)> = Vec::new();
+    let mut installs: Vec<(VarnodeId, TypeRoot)> = Vec::new();
     for (base, _, fields, size, unclaimed, selfs) in asks {
         let Some(st) = answer(data, types.as_ref(), fields, size, &unclaimed, &selfs) else {
             continue;
@@ -963,7 +964,7 @@ fn answer(
     size: int4,
     unclaimed: &[(int4, int4)],
     selfs: &[int4],
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     match &data.get_arch().struct_synth_shard {
         Some(hook) => shard::lookup(hook, types, fields, size, unclaimed, selfs),
         None => ledger::lookup_or_mint(
@@ -1201,7 +1202,7 @@ const MAX_OVERLAP_BACK: uintb = 16;
 /// parameter read at one constant offset other than zero ([`is_lone_field`]),
 /// `headless` one read at two or more with none of them zero
 /// ([`crate::kuna_structheadless`]).
-fn accepts_record(data: &Funcdata, ct: &Datatype, e: &Evidence, lone: bool, headless: bool) -> bool {
+fn accepts_record(data: &Funcdata, ct: &TypeRoot, e: &Evidence, lone: bool, headless: bool) -> bool {
     // Pointer-ness is not invented here.
     if ct.get_metatype() != type_metatype::TYPE_PTR {
         return false;
@@ -1260,7 +1261,7 @@ fn is_lone_field(e: &Evidence) -> bool {
 /// `char **`, or a word read out of a `char *`, is the function's own evidence
 /// against its callers. A pointee the recovery guessed (a callee's `int *` for
 /// a record whose first member is an enum) gives way too.
-fn pointee_is_given(data: &Funcdata, base: VarnodeId, ct: &Datatype, e: &Evidence) -> bool {
+fn pointee_is_given(data: &Funcdata, base: VarnodeId, ct: &TypeRoot, e: &Evidence) -> bool {
     let Some(pointee) = ct.get_ptr_to() else { return false };
     if matches!(pointee.get_metatype(), type_metatype::TYPE_VOID | type_metatype::TYPE_UNKNOWN) {
         return false;
@@ -1280,55 +1281,22 @@ fn pointee_is_given(data: &Funcdata, base: VarnodeId, ct: &Datatype, e: &Evidenc
 /// (kuna `calleevote fields`) Is `ct` a pointer to a synthesized record that
 /// claims exactly one field -- what a lone field read mints? Such a record
 /// gives way to the one every caller of the function passes.
-pub fn points_at_lone_record(ct: &Datatype) -> bool {
+pub fn points_at_lone_record(ct: &TypeRoot) -> bool {
     let Some(pt) = ct.get_ptr_to() else { return false };
     ledger::minted_number(&pt).is_some() && ledger::layout_of(&pt).is_some_and(|l| l.fields.len() == 1)
 }
 
 /// (kuna `structheadless`) Is `ct` a pointer to a record this pass minted?
-pub fn points_at_synthesized_record(ct: &Datatype) -> bool {
+pub fn points_at_synthesized_record(ct: &TypeRoot) -> bool {
     ct.get_ptr_to().is_some_and(|pt| ledger::minted_number(&pt).is_some())
 }
 
 /// (kuna `structheadless`) Is `ct` a pointer to a record this pass minted with
 /// two or more claims and none at offset 0 -- what only a headless read mints?
-pub fn points_at_headless_record(ct: &Datatype) -> bool {
+pub fn points_at_headless_record(ct: &TypeRoot) -> bool {
     let Some(pt) = ct.get_ptr_to() else { return false };
     ledger::minted_number(&pt).is_some()
         && ledger::layout_of(&pt).is_some_and(|l| l.fields.len() >= 2 && l.fields.first().is_some_and(|f| f.offset > 0))
-}
-
-/// (kuna `structsynth nest`) The completed record a pointer to its own shell
-/// stands for, or `None` for any other type.
-///
-/// A record that points at itself is minted around its incomplete shell
-/// (`ledger::mint`), so the field's pointer names a type with no members, and a
-/// value loaded through it would print every access as raw offset arithmetic
-/// (`*(long **)((long)v1 + 8)`). A LOAD or STORE whose value type is such a
-/// pointer takes the pointer to the completed record instead. Only a shell the
-/// completed synthesized record itself points at is resolved; a DWARF forward
-/// declaration, or any other incomplete type, is left alone.
-pub fn resolve_self_pointer(types: &dyn TypeFactory, ct: &Datatype) -> Option<Rc<Datatype>> {
-    let DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize } = &ct.kind else {
-        return None;
-    };
-    if !ptrto.is_incomplete()
-        || ptrto.get_metatype() != type_metatype::TYPE_STRUCT
-        || !ptrto.get_name().starts_with("struct_")
-    {
-        return None;
-    }
-    let full = types.find_by_name(ptrto.get_name()).ok().flatten()?;
-    if full.is_incomplete() || ledger::minted_number(&full).is_none() {
-        return None;
-    }
-    let holds = (0..full.num_depend())
-        .filter_map(|i| full.get_field(i))
-        .any(|f| f.field_type.get_ptr_to().is_some_and(|p| Rc::ptr_eq(&p, ptrto)));
-    if !holds {
-        return None;
-    }
-    types.get_type_pointer(ct.get_size(), full, *wordsize).ok()
 }
 
 /// (kuna) `ActionStructSynth` -- synthesize `struct_N` over a dereferenced

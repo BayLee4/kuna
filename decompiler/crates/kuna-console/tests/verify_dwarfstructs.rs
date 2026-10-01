@@ -15,8 +15,10 @@
 //! * every field access came out as a cast-and-offset.
 //!
 //! The fixture `dwarfstructs_x86_64` (both sources vendored alongside) is a
-//! `-g -O1` C binary carrying one function per shape. Each test is TWO-PASS:
-//! `dwarfstructs off` reproduces the bug, the default reproduces the fix.
+//! `-g -O1` C binary carrying one function per shape. With `dwarfstructs off`,
+//! aggregates remain opaque: pointer signatures are usable, but unavailable
+//! by-value layouts must leave ABI recovery to the native instruction path.
+//! With layout import on, source aggregate signatures and fields must survive.
 //!
 //! ## The collision case
 //!
@@ -116,8 +118,8 @@ fn by_value_struct_parameter_keeps_its_type() {
         return;
     };
     assert!(
-        off.contains("take_struct(unsigned long p,int4 k)"),
-        "gate off should reproduce the bug, got:\n{off}"
+        off.contains(">> 0x20") && off.contains("return ") && !off.contains("Execution error"),
+        "without an imported value layout, native recovery must still read both halves:\n{off}"
     );
     assert!(
         on.contains("take_struct(P8 p,int4 k)") && on.contains("p.a") && on.contains("p.b"),
@@ -125,19 +127,19 @@ fn by_value_struct_parameter_keeps_its_type() {
     );
 }
 
-/// The headline correctness case: an 8-byte struct return is a REGISTER return,
-/// but a zero-size return type is classified as a hidden-return-buffer call — so
-/// a phantom `rethidden` parameter appeared and the body did arithmetic on it.
+/// An 8-byte struct is a register return. With no imported layout, its arithmetic
+/// still comes from the real input register, not a fabricated hidden pointer.
 #[test]
-fn small_struct_return_loses_its_phantom_sret() {
+fn small_struct_return_recovers_arithmetic_with_and_without_layout() {
     let (Some(off), Some(on)) =
         (decompile(&["ret_struct"], false), decompile(&["ret_struct"], true))
     else {
         return;
     };
     assert!(
-        off.contains("rethidden") && off.contains("(int4)rethidden"),
-        "gate off should reproduce the phantom sret used in arithmetic, got:\n{off}"
+        off.contains("* 7") && off.contains("+ 1") && off.contains("CONCAT44")
+            && !off.contains("Execution error"),
+        "native recovery must return both computed register halves:\n{off}"
     );
     assert!(
         on.contains("P8 ret_struct(uint4 x)") && !on.contains("rethidden"),
@@ -153,7 +155,11 @@ fn large_struct_return_keeps_its_real_sret() {
     else {
         return;
     };
-    assert!(off.contains("rethidden"), "the 24-byte sret is real off, got:\n{off}");
+    assert!(
+        off.contains("[1] =") && off.contains("* 2") && off.contains("[2] =")
+            && off.contains("* 3") && !off.contains("Execution error"),
+        "native recovery must preserve stores to the real return buffer:\n{off}"
+    );
     assert!(
         on.contains("rethidden") && on.contains("rethidden->x") && on.contains("rethidden->z"),
         "the sret must survive and be typed, got:\n{on}"
@@ -170,8 +176,8 @@ fn union_members_resolve() {
         return;
     };
     assert!(
-        off.contains("take_union(unsigned int u)"),
-        "gate off should reproduce the bug, got:\n{off}"
+        off.contains(">> 8") && off.contains("return ") && !off.contains("Execution error"),
+        "native recovery must preserve the union's byte extraction:\n{off}"
     );
     assert!(
         on.contains("take_union(U4 u)") && on.contains("u.i"),

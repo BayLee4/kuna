@@ -29,7 +29,7 @@
 //!
 //! Every method is transcribed statement-for-statement from the cited C++ body.
 //! `Varnode *` / `PcodeOp *` become [`VarnodeId`]/[`OpId`] read back through the
-//! banks; `Datatype *` become `Rc<Datatype>` (a null pointer becomes `None`).
+//! banks; `Datatype *` become `TypeRoot` (a null pointer becomes `None`).
 //!
 //! # Seams folded in (vs. the leaf-function placeholders)
 //!
@@ -42,14 +42,12 @@
 //! expose; absent it the `FLOAT` constant arm takes the C++ `format == 0` branch
 //! (`score = -1`), recorded as a loss.
 
-use std::rc::Rc;
-
 use kuna_base::address::sign_extend;
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::unionresolve::{
@@ -83,7 +81,7 @@ struct Trial {
     /// (C++ `maxLength`).
     max_length: int4,
     /// The putative data-type of the Varnode (C++ `fitType`).
-    fit_type: Rc<Datatype>,
+    fit_type: TypeRoot,
     /// The original field being scored by this trial (C++ `scoreIndex`).
     score_index: int4,
 }
@@ -95,7 +93,7 @@ impl Trial {
         data: &Funcdata,
         o: OpId,
         slot: int4,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         index: int4,
         max: int4,
     ) -> Trial {
@@ -117,7 +115,7 @@ impl Trial {
 
     /// Construct an upward trial for a Varnode (C++ `Trial(Varnode*,...)`,
     /// `unionresolve.hh:119-120`).
-    fn new_up(v: VarnodeId, ct: Rc<Datatype>, index: int4, max: int4) -> Trial {
+    fn new_up(v: VarnodeId, ct: TypeRoot, index: int4, max: int4) -> Trial {
         Trial {
             vn: v,
             op: None,
@@ -155,7 +153,7 @@ pub struct ScoreUnionFields<'a> {
     /// (C++ `scores`).
     scores: Vec<int4>,
     /// Field corresponding to each score (C++ `fields`).
-    fields: Vec<Rc<Datatype>>,
+    fields: Vec<TypeRoot>,
     /// Places that have already been visited (C++ `visited`).
     visited: std::collections::BTreeSet<VisitMark>,
     /// Current trials being pushed (C++ `trialCurrent`).
@@ -234,7 +232,7 @@ impl<'a> ScoreUnionFields<'a> {
     }
 
     /// C++ `ScoreUnionFields::testSimpleCases` (unionresolve.cc:171-183).
-    fn test_simple_cases(&self, op: OpId, inslot: int4, parent: &Rc<Datatype>) -> bool {
+    fn test_simple_cases(&self, op: OpId, inslot: int4, parent: &TypeRoot) -> bool {
         let is_marker = self.data.obank().get(op).map(|o| o.is_marker()).unwrap_or(false);
         if is_marker && inslot < 0 {
             return true; // Propagate raw union across MULTIEQUAL and INDIRECT
@@ -257,28 +255,29 @@ impl<'a> ScoreUnionFields<'a> {
     fn callspecs_facts(&self, op: OpId) -> Option<LockedProtoFacts> {
         let idx = self.data.get_call_specs_index(op)?;
         let fc = self.data.get_call_specs(idx);
-        Some(Self::proto_facts(fc.proto()))
+        Some(self.proto_facts(fc.proto()))
     }
 
     /// Build the locked-proto facts for the function's own prototype
     /// (C++ `&data.getFuncProto()`).
     fn funcproto_facts(&self) -> LockedProtoFacts {
-        Self::proto_facts(self.data.get_func_proto())
+        self.proto_facts(self.data.get_func_proto())
     }
 
     /// Resolve a [`crate::fspec::FuncProto`] into the seam-free [`LockedProtoFacts`]
     /// the leaf [`score_parameter`]/[`score_return_type`] consume.
-    fn proto_facts(proto: &crate::fspec::FuncProto) -> LockedProtoFacts {
+    fn proto_facts(&self, proto: &crate::fspec::FuncProto) -> LockedProtoFacts {
         let input_locked = proto.is_input_locked();
         let output_locked = proto.is_output_locked();
         let num_params = proto.num_params();
         // Snapshot every param type so the leaf indexes `param_types[paramSlot]`.
-        let mut param_types: Vec<Rc<Datatype>> = Vec::with_capacity(num_params.max(0) as usize);
+        let mut param_types: Vec<TypeRoot> = Vec::with_capacity(num_params.max(0) as usize);
         for i in 0..num_params {
             let ty = proto
                 .get_param(i)
                 .and_then(|p| p.get_type().cloned())
-                .unwrap_or_else(|| Rc::new(Datatype::new(1, type_metatype::TYPE_UNKNOWN)));
+                .unwrap_or_else(|| self.typegrp.get_base(1, type_metatype::TYPE_UNKNOWN)
+                    .expect("one-byte unknown type"));
             param_types.push(ty);
         }
         let output_type = proto.get_output_type().cloned();
@@ -342,7 +341,7 @@ impl<'a> ScoreUnionFields<'a> {
     // -- newTrialsDown / newTrials (unionresolve.cc:297-346) -------------------
 
     /// C++ `ScoreUnionFields::newTrialsDown` (unionresolve.cc:297-315).
-    fn new_trials_down(&mut self, vn: VarnodeId, ct: Rc<Datatype>, score_index: int4, max: int4) {
+    fn new_trials_down(&mut self, vn: VarnodeId, ct: TypeRoot, score_index: int4, max: int4) {
         if !self.visited.insert(VisitMark(vn, score_index)) {
             return; // Already visited this Varnode
         }
@@ -362,12 +361,12 @@ impl<'a> ScoreUnionFields<'a> {
             .unwrap_or_default();
         for op in descends {
             let slot = self.data.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
-            self.trial_next.push(Trial::new_down(self.data, op, slot, Rc::clone(&ct), score_index, max));
+            self.trial_next.push(Trial::new_down(self.data, op, slot, ct.clone(), score_index, max));
         }
     }
 
     /// C++ `ScoreUnionFields::newTrials` (unionresolve.cc:323-346).
-    fn new_trials(&mut self, op: OpId, slot: int4, ct: Rc<Datatype>, score_index: int4, max: int4) {
+    fn new_trials(&mut self, op: OpId, slot: int4, ct: TypeRoot, score_index: int4, max: int4) {
         let vn = match self.data.obank().get(op).and_then(|o| o.get_in(slot)) {
             Some(v) => v,
             None => return,
@@ -384,7 +383,7 @@ impl<'a> ScoreUnionFields<'a> {
             }
         }
         // trialNext.emplace_back(vn,ct,scoreIndex,max);  // Try to fit up
-        self.trial_next.push(Trial::new_up(vn, Rc::clone(&ct), score_index, max));
+        self.trial_next.push(Trial::new_up(vn, ct.clone(), score_index, max));
         let descends: Vec<OpId> = self
             .data
             .vbank()
@@ -400,7 +399,7 @@ impl<'a> ScoreUnionFields<'a> {
                 self.data,
                 read_op,
                 inslot,
-                Rc::clone(&ct),
+                ct.clone(),
                 score_index,
                 max,
             ));
@@ -414,7 +413,7 @@ impl<'a> ScoreUnionFields<'a> {
         if trial.direction == DirType::Up {
             return Ok(()); // Trial doesn't push in this direction
         }
-        let mut res_type: Option<Rc<Datatype>> = None;
+        let mut res_type: Option<TypeRoot> = None;
         let mut max_length: int4 = 0;
         let meta = trial.fit_type.get_metatype();
         let mut score: int4 = 0;
@@ -428,7 +427,7 @@ impl<'a> ScoreUnionFields<'a> {
             // Driver-handled arms (recursion / live varnode read).
             match opc {
                 OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INDIRECT => {
-                    res_type = Some(Rc::clone(&trial.fit_type)); // No score, but propagate
+                    res_type = Some(trial.fit_type.clone()); // No score, but propagate
                     max_length = trial.max_length;
                 }
                 OpCode::CPUI_LOAD => {
@@ -471,7 +470,7 @@ impl<'a> ScoreUnionFields<'a> {
                                     let ws = store_ptr.get_word_size().unwrap_or(1);
                                     let ptr = self.typegrp.get_type_pointer_strip_array(
                                         store_ptr.get_size(),
-                                        Rc::clone(&trial.fit_type),
+                                        trial.fit_type.clone(),
                                         ws,
                                     )?;
                                     self.new_trials(
@@ -567,10 +566,10 @@ impl<'a> ScoreUnionFields<'a> {
         trial: &Trial,
         op: OpId,
         meta: type_metatype,
-    ) -> KunaResult<(int4, Option<Rc<Datatype>>, int4)> {
+    ) -> KunaResult<(int4, Option<TypeRoot>, int4)> {
         use type_metatype::*;
         let mut score: int4 = 0;
-        let mut res_type: Option<Rc<Datatype>> = None;
+        let mut res_type: Option<TypeRoot> = None;
         let mut max_length: int4 = 0;
         if meta == TYPE_PTR {
             if trial.inslot >= 0 {
@@ -584,7 +583,7 @@ impl<'a> ScoreUnionFields<'a> {
                 if is_const {
                     let vsize = vref.map(|v| v.get_size()).unwrap_or(0);
                     let voff = vref.map(|v| v.get_offset()).unwrap_or(0);
-                    let mut base_type: Option<Rc<Datatype>> = Some(Rc::clone(&trial.fit_type));
+                    let mut base_type: Option<TypeRoot> = Some(trial.fit_type.clone());
                     // cast: the C++ `sign_extend(uintb,int4)` takes the raw bit
                     // pattern; `voff as i64` reinterprets the same bits (the value
                     // is a constant Varnode offset, sign-extended next).
@@ -599,7 +598,7 @@ impl<'a> ScoreUnionFields<'a> {
                     }
                     while off != 0 {
                         let bt = match &base_type {
-                            Some(b) => Rc::clone(b),
+                            Some(b) => b.clone(),
                             None => break,
                         };
                         // downChain(off,par,parOff,true,typegrp) — allow_array_wrap = true.
@@ -610,7 +609,7 @@ impl<'a> ScoreUnionFields<'a> {
                     }
                     if let Some(bt) = &base_type {
                         let ptr_sz = bt.get_ptr_to().map(|p| p.get_size()).unwrap_or(0);
-                        res_type = Some(Rc::clone(bt));
+                        res_type = Some(bt.clone());
                         max_length = ptr_sz;
                         score = 5;
                     }
@@ -644,7 +643,7 @@ impl<'a> ScoreUnionFields<'a> {
                             } else {
                                 score = 5;
                             }
-                            res_type = Some(Rc::clone(&trial.fit_type));
+                            res_type = Some(trial.fit_type.clone());
                             max_length = trial.max_length;
                         }
                     } else {
@@ -654,7 +653,7 @@ impl<'a> ScoreUnionFields<'a> {
             }
         } else if meta == TYPE_INT || meta == TYPE_UINT || meta == TYPE_UNKNOWN {
             score = 1;
-            res_type = Some(Rc::clone(&trial.fit_type));
+            res_type = Some(trial.fit_type.clone());
         } else if meta == TYPE_BOOL {
             score = -3;
         } else {
@@ -669,10 +668,10 @@ impl<'a> ScoreUnionFields<'a> {
         trial: &Trial,
         op: OpId,
         meta: type_metatype,
-    ) -> KunaResult<(int4, Option<Rc<Datatype>>)> {
+    ) -> KunaResult<(int4, Option<TypeRoot>)> {
         use type_metatype::*;
         let mut score: int4 = 0;
-        let mut res_type: Option<Rc<Datatype>> = None;
+        let mut res_type: Option<TypeRoot> = None;
         if meta == TYPE_PTR {
             if trial.inslot == 0 {
                 let align = trial.fit_type.get_ptr_to().map(|p| p.get_align_size()).unwrap_or(-1);
@@ -686,7 +685,7 @@ impl<'a> ScoreUnionFields<'a> {
                     .unwrap_or(0);
                 if align as int8 == in2off as int8 {
                     score = 10;
-                    res_type = Some(Rc::clone(&trial.fit_type));
+                    res_type = Some(trial.fit_type.clone());
                 }
             } else {
                 score = -10;
@@ -716,7 +715,7 @@ impl<'a> ScoreUnionFields<'a> {
             }
             return Ok(()); // Nothing to propagate up through
         }
-        let mut res_type: Option<Rc<Datatype>> = None;
+        let mut res_type: Option<TypeRoot> = None;
         let mut max_length: int4 = 0;
         let mut newslot: int4 = 0;
         let mut score: int4 = 0;
@@ -734,7 +733,7 @@ impl<'a> ScoreUnionFields<'a> {
         } else {
             match def_opc {
                 OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INDIRECT => {
-                    res_type = Some(Rc::clone(&trial.fit_type)); // propagate
+                    res_type = Some(trial.fit_type.clone()); // propagate
                     max_length = trial.max_length;
                     newslot = 0;
                 }
@@ -749,7 +748,7 @@ impl<'a> ScoreUnionFields<'a> {
                         .unwrap_or(0);
                     res_type = Some(self.typegrp.get_type_pointer_strip_array(
                         in1sz,
-                        Rc::clone(&trial.fit_type),
+                        trial.fit_type.clone(),
                         1,
                     )?);
                     max_length = trial.fit_type.get_size();
@@ -879,11 +878,11 @@ impl<'a> ScoreUnionFields<'a> {
     /// data-type to recurse (or `None`).  Used by constructors 2 and 3.
     fn score_truncation_driver(
         &mut self,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
         vn: VarnodeId,
         offset: int4,
         score_index: int4,
-    ) -> KunaResult<Option<Rc<Datatype>>> {
+    ) -> KunaResult<Option<TypeRoot>> {
         let vn_size = self.data.vbank().get(vn).map(|v| v.get_size()).unwrap_or(0);
         let (score, res) = score_truncation(ct, vn_size, offset, Some(self.result.get_base()))?;
         self.scores[score_index as usize] += score;
@@ -946,7 +945,7 @@ impl<'a> ScoreUnionFields<'a> {
     fn compute_best_index(&mut self) {
         let (field_num, best_index) = compute_best_index(&self.scores);
         self.result.set_field_num(field_num);
-        self.result.set_resolve(Rc::clone(&self.fields[best_index as usize]));
+        self.result.set_resolve(self.fields[best_index as usize].clone());
     }
 
     /// C++ `ScoreUnionFields::run` (unionresolve.cc:1068-1085).
@@ -978,11 +977,11 @@ impl<'a> ScoreUnionFields<'a> {
     pub fn new_edge(
         data: &'a Funcdata,
         typegrp: &'a crate::dtype::TypeFactoryImpl,
-        parent_type: Rc<Datatype>,
+        parent_type: TypeRoot,
         op: OpId,
         slot: int4,
     ) -> KunaResult<ScoreUnionFields<'a>> {
-        let result = ResolvedUnion::new(Rc::clone(&parent_type));
+        let result = ResolvedUnion::new(parent_type.clone());
         let mut s = ScoreUnionFields {
             data,
             typegrp,
@@ -1004,7 +1003,7 @@ impl<'a> ScoreUnionFields<'a> {
         };
         let num_fields = s.result.get_base().num_depend();
         s.scores = vec![0; (num_fields + 1) as usize];
-        s.fields = vec![Rc::clone(&parent_type); (num_fields + 1) as usize];
+        s.fields = vec![parent_type.clone(); (num_fields + 1) as usize];
         let parent_size = parent_type.get_size();
         let vn = if slot < 0 {
             s.data.obank().get(op).and_then(|o| o.get_out())
@@ -1020,14 +1019,14 @@ impl<'a> ScoreUnionFields<'a> {
             if vn_size != parent_size {
                 s.scores[0] -= 10;
             } else {
-                s.trial_current.push(Trial::new_up(vn, Rc::clone(&parent_type), 0, 0));
+                s.trial_current.push(Trial::new_up(vn, parent_type.clone(), 0, 0));
             }
         } else if vn_size != parent_size {
             s.scores[0] -= 10;
         } else {
-            s.trial_current.push(Trial::new_down(s.data, op, slot, Rc::clone(&parent_type), 0, 0));
+            s.trial_current.push(Trial::new_down(s.data, op, slot, parent_type.clone(), 0, 0));
         }
-        s.fields[0] = Rc::clone(&parent_type);
+        s.fields[0] = parent_type.clone();
         let opc = s.data.obank().get(op).map(|o| o.code()).unwrap_or(OpCode::CPUI_COPY);
         if word_size == 0
             || opc == OpCode::CPUI_INT_ADD
@@ -1061,13 +1060,13 @@ impl<'a> ScoreUnionFields<'a> {
             if vn_size != field_type.get_size() {
                 s.scores[(i + 1) as usize] -= 10; // size mismatch, don't create trial
             } else if slot < 0 {
-                s.trial_current.push(Trial::new_up(vn, Rc::clone(&field_type), i + 1, max_length));
+                s.trial_current.push(Trial::new_up(vn, field_type.clone(), i + 1, max_length));
             } else {
                 s.trial_current.push(Trial::new_down(
                     s.data,
                     op,
                     slot,
-                    Rc::clone(&field_type),
+                    field_type.clone(),
                     i + 1,
                     max_length,
                 ));
@@ -1085,11 +1084,11 @@ impl<'a> ScoreUnionFields<'a> {
     pub fn new_subpiece(
         data: &'a Funcdata,
         typegrp: &'a crate::dtype::TypeFactoryImpl,
-        union_type: Rc<Datatype>,
+        union_type: TypeRoot,
         offset: int4,
         op: OpId,
     ) -> KunaResult<ScoreUnionFields<'a>> {
-        let result = ResolvedUnion::new(Rc::clone(&union_type));
+        let result = ResolvedUnion::new(union_type.clone());
         let mut s = ScoreUnionFields {
             data,
             typegrp,
@@ -1108,17 +1107,17 @@ impl<'a> ScoreUnionFields<'a> {
         let vn_size = s.data.vbank().get(vn).map(|v| v.get_size()).unwrap_or(0);
         let num_fields = union_type.num_depend();
         s.scores = vec![0; (num_fields + 1) as usize];
-        s.fields = vec![Rc::clone(&union_type); (num_fields + 1) as usize];
-        s.fields[0] = Rc::clone(&union_type);
+        s.fields = vec![union_type.clone(); (num_fields + 1) as usize];
+        s.fields[0] = union_type.clone();
         s.scores[0] = -10;
         for i in 0..num_fields {
-            let union_field = match union_type.get_field(i) {
-                Some(f) => f,
-                None => continue,
+            let (field_type, field_offset) = {
+                let view = union_type.read();
+                let id = view.resolve_alias(union_type.id())?;
+                let Some(field) = view.get_field(id, i)? else { continue };
+                (union_type.related(field.field_type)?, field.offset)
             };
-            let field_type = Rc::clone(&union_field.field_type);
-            let field_offset = union_field.offset;
-            s.fields[(i + 1) as usize] = Rc::clone(&field_type);
+            s.fields[(i + 1) as usize] = field_type.clone();
             if field_type.get_size() != vn_size || field_offset != offset {
                 s.scores[(i + 1) as usize] = -10;
                 continue;
@@ -1141,12 +1140,12 @@ impl<'a> ScoreUnionFields<'a> {
     pub fn new_truncation(
         data: &'a Funcdata,
         typegrp: &'a crate::dtype::TypeFactoryImpl,
-        union_type: Rc<Datatype>,
+        union_type: TypeRoot,
         offset: int4,
         op: OpId,
         slot: int4,
     ) -> KunaResult<ScoreUnionFields<'a>> {
-        let result = ResolvedUnion::new(Rc::clone(&union_type));
+        let result = ResolvedUnion::new(union_type.clone());
         let mut s = ScoreUnionFields {
             data,
             typegrp,
@@ -1173,17 +1172,17 @@ impl<'a> ScoreUnionFields<'a> {
         let vn_size = s.data.vbank().get(vn).map(|v| v.get_size()).unwrap_or(0);
         let num_fields = union_type.num_depend();
         s.scores = vec![0; (num_fields + 1) as usize];
-        s.fields = vec![Rc::clone(&union_type); (num_fields + 1) as usize];
-        s.fields[0] = Rc::clone(&union_type);
+        s.fields = vec![union_type.clone(); (num_fields + 1) as usize];
+        s.fields[0] = union_type.clone();
         s.scores[0] = -10; // entire union is not a good fit
         for i in 0..num_fields {
-            let union_field = match union_type.get_field(i) {
-                Some(f) => f,
-                None => continue,
+            let (field_type, field_offset) = {
+                let view = union_type.read();
+                let id = view.resolve_alias(union_type.id())?;
+                let Some(field) = view.get_field(id, i)? else { continue };
+                (union_type.related(field.field_type)?, field.offset)
             };
-            let field_type = Rc::clone(&union_field.field_type);
-            let field_offset = union_field.offset;
-            s.fields[(i + 1) as usize] = Rc::clone(&field_type);
+            s.fields[(i + 1) as usize] = field_type.clone();
             let ct = s.score_truncation_driver(&field_type, vn, offset - field_offset, i + 1)?;
             if let Some(ct) = ct {
                 if slot < 0 {
@@ -1209,7 +1208,7 @@ impl<'a> ScoreUnionFields<'a> {
     /// *unconditionally*, so when `getExactPiece` returns null (type.cc:4579-4609,
     /// e.g. no sub-piece of the requested size) C++ leaves `result.resolve ==
     /// nullptr` and caches that.  The landed `ResolvedUnion.resolve` field is a
-    /// non-nullable `Rc<Datatype>` (unionresolve.rs:84) — making it `Option` would
+    /// non-nullable `TypeRoot` — making it `Option` would
     /// ripple through every `get_datatype()` consumer (funcdata_facing /
     /// coreaction_casts).  So on the `None` arm we keep the prior `resolve` rather
     /// than store null.  Unobservable on the live paths: constructor 2 (SUBPIECE)
@@ -1223,7 +1222,7 @@ impl<'a> ScoreUnionFields<'a> {
         offset: int4,
         vn_size: int4,
     ) -> KunaResult<()> {
-        let cur = Rc::clone(s.result.get_datatype());
+        let cur = s.result.get_datatype().clone();
         if let Some(piece) = s.typegrp.get_exact_piece(cur, offset, vn_size)? {
             s.result.set_resolve(piece);
         }

@@ -12,11 +12,7 @@
 //!     frame where `diff + b.size` legitimately grows `size`; assert the exact
 //!     grown size (a `wadd` that silently dropped a carry, or that was actually a
 //!     `checked_add`, would be caught here — not just "no panic").
-//!   * the `isConstAbsorbable` width divergence (varmap.cc:47): C++ computes
-//!     `highind * getAlignSize()` as `int4 * int4` (32-bit, truncating), then
-//!     widens to `intb`; the Rust widens both to `intb` FIRST then multiplies in
-//!     64-bit.  Characterize the (degenerate-only) divergence and pin that the
-//!     32-bit-safe regime agrees exactly.
+//!   * `isConstAbsorbable` boundaries for ordinary stack-frame sizes.
 //!   * `contain`'s `b->sstart + b->size - 1 <= sstart + size - 1` at the i64
 //!     boundary (varmap.cc:115): wrap-prone `intb` arithmetic.
 //!   * `absorb`'s COPY_CONSTANT `b->sstart - sstart + b->size` highind growth
@@ -27,7 +23,7 @@ use std::rc::Rc;
 
 use kuna_base::space::{addrspace_flags, spacetype, AddrSpace};
 
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::varmap::{RangeHint, RangeType, COPY_CONSTANT};
 
 fn space_ws(ws: u32) -> Rc<AddrSpace> {
@@ -46,8 +42,8 @@ fn space_ws(ws: u32) -> Rc<AddrSpace> {
 
 /// `new_with_align` pins `align_size = size`, so `get_align_size()` returns
 /// `size`.  Tests that need a specific align-size set it via the size argument.
-fn base(size: i32, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn base(types: &TypeFactoryImpl, size: i32, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new_with_align(size, size, meta)).unwrap()
 }
 
 fn factory() -> TypeFactoryImpl {
@@ -83,8 +79,8 @@ fn r3_merge_confuse_grows_size_then_opens() {
     let space = space_ws(1);
     let factory = factory();
 
-    let mut a = RangeHint::new(0, 4, 0, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
-    let b = RangeHint::new(4, 8, 4, base(8, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0, 4, 0, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b = RangeHint::new(4, 8, 4, base(&factory, 8, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
 
     // Confirm the geometry forces resType==2 (no containment, a unlocked).
     assert!(!a.contain(&b), "b_end 11 > a_end 3 and sstart differ: no containment");
@@ -110,8 +106,8 @@ fn r3_merge_confuse_grows_size_to_power_of_two() {
     let space = space_ws(1);
     let factory = factory();
 
-    let mut a = RangeHint::new(0, 2, 0, base(2, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
-    let b = RangeHint::new(2, 6, 2, base(6, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0, 2, 0, base(&factory, 2, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b = RangeHint::new(2, 6, 2, base(&factory, 6, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
 
     assert!(!a.contain(&b));
     let _ = a.merge(&b, &space, &factory).unwrap();
@@ -138,9 +134,10 @@ fn r3_merge_confuse_grows_size_to_power_of_two() {
 // ===========================================================================
 #[test]
 fn r3_const_absorbable_highind_mul_boundary_32bit_safe() {
+    let factory = factory();
     // self: open primitive int, sstart 0x100, align_size 4, highind 3.
     //   end = 0x100 + 3*4 = 0x100 + 12 = 0x10C.
-    let mut me = RangeHint::new(0x100, 4, 0x100, base(4, type_metatype::TYPE_INT), 0, RangeType::Open, 3);
+    let mut me = RangeHint::new(0x100, 4, 0x100, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Open, 3);
 
     // b must be a COPY_CONSTANT, unlocked, b.size >= self.size, meta unknown/int/uint.
     let mk_b = |sstart: i64| {
@@ -148,7 +145,7 @@ fn r3_const_absorbable_highind_mul_boundary_32bit_safe() {
             sstart as u64,
             4, // == self.size, satisfies b.size < size check (not <)
             sstart,
-            base(4, type_metatype::TYPE_UNKNOWN),
+            base(&factory, 4, type_metatype::TYPE_UNKNOWN),
             COPY_CONSTANT,
             RangeType::Fixed,
             -1,
@@ -169,51 +166,6 @@ fn r3_const_absorbable_highind_mul_boundary_32bit_safe() {
     assert!(!me.is_const_absorbable(&mk_b(0x105)), "one past size-derived end is rejected");
 }
 
-// ===========================================================================
-// isConstAbsorbable width DIVERGENCE characterization (degenerate-only).
-//
-// When highind*alignSize overflows i32, C++ truncates the product to 32 bits
-// (and on the int4*int4 == 0x1_0000_0000 case the low 32 bits are 0), while the
-// Rust widens to i64 first and keeps the full product.  This flips the
-// absorbability decision.  It requires highind*alignSize >= 2^31, which on a
-// real frame (alignSize <= 8) needs highind >= 2^28 -- an impossible stack array
-// index; both the C++ and Rust only reach it on a synthetic degenerate type.
-//
-// This test documents the KNOWN, UNREACHABLE divergence rather than asserting
-// C++ parity: it records that the Rust takes the WIDE branch.  If a future fix
-// narrows the multiply to int4, this test flips (and the verdict's observation
-// is resolved).  align_size is forced to 0x10000 via the size argument, and
-// highind 0x10000 makes int4*int4 == 0x1_0000_0000 -> low32 == 0.
-// ===========================================================================
-#[test]
-fn r3_const_absorbable_int4_mul_overflow_is_wide_in_rust() {
-    // self: "primitive int" of align_size 0x10000 (degenerate), highind 0x10000.
-    //   C++ 32-bit product: (int4)(0x10000 * 0x10000) = 0 -> end = sstart + 0.
-    //   Rust 64-bit product: 0x10000 * 0x10000 = 0x1_0000_0000 -> end = sstart + 0x1_0000_0000.
-    let me = RangeHint::new(0, 0x10000, 0, base(0x10000, type_metatype::TYPE_INT), 0, RangeType::Open, 0x10000);
-
-    // b at sstart 0x100: bigger than the C++ wrapped end (0), smaller than the
-    // Rust wide end (0x1_0000_0000).  b.size must be >= self.size (0x10000).
-    let b = RangeHint::new(
-        0x100,
-        0x10000,
-        0x100,
-        base(0x10000, type_metatype::TYPE_UNKNOWN),
-        COPY_CONSTANT,
-        RangeType::Fixed,
-        -1,
-    );
-
-    // Rust (wide): end = 0x1_0000_0000, 0x100 > end is FALSE -> absorbable (true).
-    // C++ (narrow): end = 0, 0x100 > 0 is TRUE -> NOT absorbable (false).
-    // This asserts the CURRENT Rust behavior and documents the divergence.
-    assert!(
-        me.is_const_absorbable(&b),
-        "Rust widens highind*alignSize to i64 (end = sstart + 0x1_0000_0000) so b is \
-         absorbable; C++ truncates the int4*int4 product to 0 and would REJECT. \
-         Divergence is unreachable on real frames (alignSize<=8 => highind>=2^28)."
-    );
-}
 
 // ===========================================================================
 // contain boundary arithmetic (varmap.cc:115).
@@ -224,20 +176,21 @@ fn r3_const_absorbable_int4_mul_overflow_is_wide_in_rust() {
 // ===========================================================================
 #[test]
 fn r3_contain_end_boundary_exact() {
+    let factory = factory();
     // a: sstart 0, size 8 -> a_end = 7.
-    let a = RangeHint::new(0, 8, 0, base(8, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let a = RangeHint::new(0, 8, 0, base(&factory, 8, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
 
     // b ends exactly at 7: sstart 4, size 4 -> b_end = 4+4-1 = 7 <= 7 -> contained.
-    let b_in = RangeHint::new(4, 4, 4, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b_in = RangeHint::new(4, 4, 4, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     assert!(a.contain(&b_in), "b_end 7 == a_end 7: contained");
 
     // b ends one past: sstart 4, size 5 -> b_end = 8 > 7 -> NOT contained (and
     // sstart 4 != 0, so no short-circuit).
-    let b_out = RangeHint::new(4, 5, 4, base(5, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b_out = RangeHint::new(4, 5, 4, base(&factory, 5, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     assert!(!a.contain(&b_out), "b_end 8 > a_end 7 and sstarts differ: not contained");
 
     // sstart==b.sstart short-circuits to true regardless of size.
-    let b_eq = RangeHint::new(0, 100, 0, base(8, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b_eq = RangeHint::new(0, 100, 0, base(&factory, 8, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     assert!(a.contain(&b_eq), "sstart == b.sstart short-circuits to true");
 }
 
@@ -259,9 +212,10 @@ fn r3_contain_end_boundary_exact() {
 // ===========================================================================
 #[test]
 fn r3_absorb_copy_constant_grows_highind() {
-    let mut me = RangeHint::new(0, 4, 0, base(4, type_metatype::TYPE_INT), 0, RangeType::Open, 1);
+    let factory = factory();
+    let mut me = RangeHint::new(0, 4, 0, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Open, 1);
     // b is Fixed (NOT open) with copy_constant set; takes the else-if branch.
-    let b = RangeHint::new(0x20, 4, 0x20, base(4, type_metatype::TYPE_INT), COPY_CONSTANT, RangeType::Fixed, -1);
+    let b = RangeHint::new(0x20, 4, 0x20, base(&factory, 4, type_metatype::TYPE_INT), COPY_CONSTANT, RangeType::Fixed, -1);
 
     me.absorb(&b);
     assert_eq!(me.highind, 9, "diffsz 0x24 / align_size 4 = 9 > old highind 1");
@@ -275,10 +229,11 @@ fn r3_absorb_copy_constant_grows_highind() {
 // self HAS copy_constant, b does NOT -> the bit is cleared.
 #[test]
 fn r3_absorb_clears_self_copy_constant_when_b_lacks_it() {
+    let factory = factory();
     // Make self Fixed so the open/copy-const branches are skipped; only the
     // trailing XOR-clear runs.
-    let mut me = RangeHint::new(0, 4, 0, base(4, type_metatype::TYPE_INT), COPY_CONSTANT, RangeType::Fixed, -1);
-    let b = RangeHint::new(0, 4, 0, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let mut me = RangeHint::new(0, 4, 0, base(&factory, 4, type_metatype::TYPE_INT), COPY_CONSTANT, RangeType::Fixed, -1);
+    let b = RangeHint::new(0, 4, 0, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     me.absorb(&b);
     assert_eq!(me.flags & COPY_CONSTANT, 0, "self had cc, b lacked it -> cleared by xor");
 }

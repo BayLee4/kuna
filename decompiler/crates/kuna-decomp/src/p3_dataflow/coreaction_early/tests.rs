@@ -52,7 +52,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -170,23 +175,50 @@ fn starttypes_reset_and_apply() {
 }
 
 // -----------------------------------------------------------------------------
-// ActionNormalizeSetup (realized reset): flips the normalization flag
+// Normalization changes the analysis copy, not the retained host prototype.
 // -----------------------------------------------------------------------------
 
 #[test]
-fn normalizesetup_reset_sets_normalization() {
-    let mut fd = build_fd();
+fn normalization_clears_locks_for_each_function_without_changing_the_seed() {
+    use crate::dtype::{type_metatype, TypeFactory};
+    use crate::fspec::{FuncProto, ParameterPieces, ProtoModel};
+
+    let fd = build_fd();
+    let glb = fd.get_arch().clone();
+    let types = glb.types.as_ref().unwrap();
+    let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let mut model = ProtoModel::new(glb.manage());
+    model.build_param_list("standard").unwrap();
+    let mut seed = FuncProto::new();
+    seed.set_internal(Rc::new(model), types.get_type_void().unwrap());
+    seed.set_param(0, "committed_argument", &ParameterPieces {
+        addr: ram_addr(&fd, 0x10), type_: Some(integer.clone()), flags: 0,
+    });
+    seed.set_output(&ParameterPieces {
+        addr: ram_addr(&fd, 0x20), type_: Some(integer), flags: 0,
+    });
+    seed.set_input_lock(true);
+    seed.set_output_lock(true);
+
     let mut ctx = ActionContext::new();
     let mut act = ActionNormalizeSetup::boxed("base");
-
-    assert!(!fd.is_normalization_on());
-    act.reset(&mut fd);
-    assert!(fd.is_normalization_on(), "reset must setNormalization(true)");
-
-    // apply body is the W4-stubbed lock-stripping => no change count.
-    let res = act.apply(&mut fd, &mut ctx);
-    assert_eq!(res, 0);
-    assert_eq!(act.base().count, 0);
+    for name in ["first", "second"] {
+        let mut analysis = Funcdata::new(
+            name, name, glb.clone(), ram_addr(&fd, 0x1000), 0x10000000, 0x40,
+        ).unwrap();
+        analysis.get_func_proto_mut().copy(&seed);
+        act.reset(&mut analysis);
+        act.perform(&mut analysis, &mut ctx);
+        let normalized = analysis.get_func_proto();
+        assert_eq!(normalized.num_params(), 0);
+        assert!(!normalized.is_model_locked());
+        assert!(!normalized.is_output_locked());
+        assert!(analysis.is_normalization_on());
+        assert_eq!(normalized.get_output().get_address(), seed.get_output().get_address());
+        assert_eq!(seed.num_params(), 1);
+        assert!(seed.is_model_locked() && seed.is_output_locked());
+        assert!(seed.get_param(0).unwrap().is_type_locked());
+    }
 }
 
 // -----------------------------------------------------------------------------

@@ -21,14 +21,13 @@ fn factory() -> TypeFactoryImpl {
 
 /// Minting the same aggregate twice must hand back the SAME interned type, not a
 /// second definition: `fopen`'s result and `fclose`'s parameter have to be one
-/// `FILE`, and `get_type_struct` alone would fail the second call (its size-0
-/// probe no longer compares equal to the sized shell).
+/// `FILE`, including pointers published before the aggregate is completed.
 #[test]
 fn a_named_aggregate_is_minted_once() {
     let types = factory();
     let first = named_aggregate("FILE", &types, 1, Layout::Opaque).expect("mint FILE");
     let second = named_aggregate("FILE", &types, 1, Layout::Opaque).expect("re-find FILE");
-    assert!(Rc::ptr_eq(&first, &second), "FILE must intern once");
+    assert_eq!(first, second, "FILE must intern once");
     assert_eq!(first.get_size(), 216, "the glibc x86-64 width, not 0");
 }
 
@@ -59,12 +58,12 @@ fn a_completed_name_is_left_alone() {
     let types = factory();
     let shell = types.get_type_struct("stat").expect("shell");
     let int4t = types.get_base(4, type_metatype::TYPE_INT).expect("int");
-    let field = kuna_decomp::dtype::TypeField::new(0, 0, "st_dev", int4t);
+    let field = kuna_decomp::dtype::TypeField::new(0, 0, "st_dev", int4t.id());
     let complete = types
         .set_fields_struct_raw(&shell, vec![field], Vec::new(), 144, 8, 0)
         .expect("complete stat");
     let got = named_aggregate("stat", &types, 1, Layout::Opaque).expect("find the held stat");
-    assert!(Rc::ptr_eq(&complete, &got), "the held definition is the answer");
+    assert_eq!(complete, got, "the held definition is the answer");
     assert!(!got.is_incomplete(), "and it stays complete");
 }
 
@@ -76,7 +75,7 @@ fn a_different_type_under_the_same_name_declines() {
     let types = factory();
     let shell = types.get_type_struct("option").expect("shell");
     let int4t = types.get_base(4, type_metatype::TYPE_INT).expect("int");
-    let field = kuna_decomp::dtype::TypeField::new(0, 0, "mine", int4t);
+    let field = kuna_decomp::dtype::TypeField::new(0, 0, "mine", int4t.id());
     types
         .set_fields_struct_raw(&shell, vec![field], Vec::new(), 24, 8, 0)
         .expect("a 24-byte `option` that is not the platform's");
@@ -91,20 +90,30 @@ fn the_platform_spelling_of_the_same_type_is_adopted() {
     let types = factory();
     let shell = types.get_type_struct("_IO_FILE").expect("shell");
     let int4t = types.get_base(4, type_metatype::TYPE_INT).expect("int");
-    let field = kuna_decomp::dtype::TypeField::new(0, 0, "_flags", int4t);
+    let field = kuna_decomp::dtype::TypeField::new(0, 0, "_flags", int4t.id());
     let complete = types
         .set_fields_struct_raw(&shell, vec![field], Vec::new(), 216, 8, 0)
         .expect("complete _IO_FILE");
     let got = named_aggregate("FILE", &types, 1, Layout::Opaque).expect("adopt the platform spelling");
-    assert!(Rc::ptr_eq(&complete, &got), "`FILE` resolves to the held `_IO_FILE`");
-    assert_eq!(got.get_name(), "_IO_FILE");
+    assert_eq!(complete, got, "`FILE` resolves to the held `_IO_FILE`");
+    assert_eq!(got.read().get(got.id()).unwrap().get_name(), "_IO_FILE");
+
+    let alias = types.get_typedef(&complete, "FILE", 0x1234, 0).unwrap();
+    let adopted = named_aggregate("FILE", &types, 1, Layout::Opaque).unwrap();
+    assert_eq!(adopted, alias, "a supplied nominal alias takes precedence over its tag");
+    assert_eq!(adopted.get_id(), 0x1234);
+    assert_eq!(adopted.get_typedef(), Some(complete));
+    let view = adopted.read();
+    let body = view.resolve_alias(adopted.id()).unwrap();
+    let field = view.get_field(body, 0).unwrap().unwrap();
+    assert_eq!((field.name.as_str(), field.offset, field.field_type), ("_flags", 0, int4t.id()));
 }
 
 /// A DWARF forward declaration (`DW_AT_declaration`, no `DW_AT_byte_size`) is
 /// interned at width 0. Pointing at it is the one thing a sized shell exists to
 /// prevent — `RulePtrsubUndo` keeps the `PTRSUB` alive on a zero-width pointee
-/// and the printer emits it in functional form — and completing it here would
-/// re-key somebody else's type. So the signature is declined instead.
+/// and the printer emits it in functional form. This table does not complete
+/// another source's declaration, so the signature is declined instead.
 #[test]
 fn a_zero_width_forward_declaration_declines() {
     let types = factory();
@@ -126,7 +135,7 @@ fn an_incomplete_struct_of_the_declared_width_is_adopted() {
         .expect("a 144-byte shell somebody else is populating");
     assert!(held.is_incomplete(), "the fixture is the incomplete case");
     let got = named_aggregate("stat", &types, 1, Layout::Opaque).expect("adopted");
-    assert!(Rc::ptr_eq(&held, &got), "the held shell is the answer, not a second definition");
+    assert_eq!(held, got, "the held shell is the answer, not a second definition");
 }
 
 /// Every `NamedPtr` in either table must name a row of `NAMED_AGGREGATES` —
@@ -380,7 +389,7 @@ fn the_declared_lookup_follows_the_gate() {
         .expect("fopen on");
     let on_base = on.outtype.as_ref().and_then(|t| t.get_ptr_to());
     assert_eq!(
-        on_base.as_ref().map(|p| p.get_name().to_string()),
+        on_base.as_ref().map(|p| p.read().get(p.id()).unwrap().get_name().to_string()),
         Some("FILE".to_string()),
         "on: the named signature"
     );
@@ -397,7 +406,7 @@ fn a_declined_aggregate_degrades_to_the_width_stable_signature() {
     kuna_decomp::kuna_libctypes::set_libctypes_env_layout(kuna_decomp::kuna_libctypes::LibcTypesLayout::Opaque);
     let shell = types.get_type_struct("stat").expect("shell");
     let int4t = types.get_base(4, type_metatype::TYPE_INT).expect("int");
-    let field = kuna_decomp::dtype::TypeField::new(0, 0, "mine", int4t);
+    let field = kuna_decomp::dtype::TypeField::new(0, 0, "mine", int4t.id());
     types
         .set_fields_struct_raw(&shell, vec![field], Vec::new(), 24, 8, 0)
         .expect("a 24-byte `stat` of the program's own");
@@ -424,7 +433,9 @@ fn glibc_layouts_fit_their_aggregate() {
             .iter()
             .find(|a| a.name == *name)
             .unwrap_or_else(|| panic!("`{name}` has a layout but no width"));
+        let root = types.get_type_struct(name).expect("aggregate context");
         let fields = glibc::build_fields(rows, &types, 1).expect("build the layout");
+        let view = root.read();
         let mut end = 0;
         for (row, field) in rows.iter().zip(&fields) {
             assert!(
@@ -433,7 +444,7 @@ fn glibc_layouts_fit_their_aggregate() {
                 row.name,
                 row.off
             );
-            end = row.off + field.field_type.get_size();
+            end = row.off + view.get(field.field_type).unwrap().get_size();
             assert!(
                 end <= agg.size,
                 "{name}::{} runs past the {}-byte aggregate",
@@ -485,13 +496,14 @@ fn glibc_mints_a_complete_file_with_its_published_fields() {
     let file = named_aggregate("FILE", &types, 1, Layout::Glibc).expect("mint FILE");
     assert_eq!(file.get_size(), 216, "the glibc x86-64 width");
     assert!(!file.is_incomplete(), "a struct with its members is not incomplete");
+    let view = file.read();
     for (off, want, size) in [(0, "_flags", 4), (8, "_IO_read_ptr", 8), (0x10, "_IO_read_end", 8), (0x70, "_fileno", 4)] {
         let field = (0..file.num_depend())
-            .filter_map(|i| file.get_field(i))
+            .filter_map(|i| view.get_field(file.id(), i).unwrap())
             .find(|f| f.offset == off)
             .unwrap_or_else(|| panic!("no field at {off:#x}"));
         assert_eq!(field.name, want, "the field at {off:#x}");
-        assert_eq!(field.field_type.get_size(), size, "{want} width");
+        assert_eq!(view.get(field.field_type).unwrap().get_size(), size, "{want} width");
     }
 }
 
@@ -504,37 +516,38 @@ fn glibc_stat_nests_one_interned_timespec() {
     let types = factory();
     let stat = named_aggregate("stat", &types, 1, Layout::Glibc).expect("mint stat");
     assert_eq!(stat.get_size(), 144);
+    let timespec = named_aggregate("timespec", &types, 1, Layout::Opaque).expect("find timespec");
+    let view = stat.read();
     let atim = (0..stat.num_depend())
-        .filter_map(|i| stat.get_field(i))
+        .filter_map(|i| view.get_field(stat.id(), i).unwrap())
         .find(|f| f.offset == 0x48)
         .expect("st_atim");
     assert_eq!(atim.name, "st_atim");
-    assert_eq!(atim.field_type.get_size(), 16, "a timespec by value");
-    let timespec = named_aggregate("timespec", &types, 1, Layout::Opaque).expect("find timespec");
-    assert!(
-        Rc::ptr_eq(&atim.field_type, &timespec),
+    assert_eq!(view.get(atim.field_type).unwrap().get_size(), 16, "a timespec by value");
+    assert_eq!(
+        atim.field_type, timespec.id(),
         "the nested timespec is the interned one"
     );
-    assert_eq!(timespec.get_field(0).expect("tv_sec").name, "tv_sec");
-    assert_eq!(timespec.get_field(1).expect("tv_nsec").name, "tv_nsec");
+    assert_eq!(view.get_field(timespec.id(), 0).unwrap().expect("tv_sec").name, "tv_sec");
+    assert_eq!(view.get_field(timespec.id(), 1).unwrap().expect("tv_nsec").name, "tv_nsec");
 }
 
 /// Under `glibc` too, a definition somebody else established is ADOPTED, never
-/// overwritten: the DWARF importer runs first, and completing a struct re-keys
-/// it into a new `Rc` that the pointers already handed out would not follow.
+/// overwritten: the DWARF importer runs first and its layout facts take
+/// precedence over this table's published platform layouts.
 #[test]
 fn glibc_adopts_a_held_definition_instead_of_installing_over_it() {
     let types = factory();
     let shell = types.get_type_struct("stat").expect("shell");
     let int4t = types.get_base(4, type_metatype::TYPE_INT).expect("int");
-    let field = kuna_decomp::dtype::TypeField::new(0, 0, "theirs", int4t);
+    let field = kuna_decomp::dtype::TypeField::new(0, 0, "theirs", int4t.id());
     let theirs = types
         .set_fields_struct_raw(&shell, vec![field], Vec::new(), 144, 8, 0)
         .expect("somebody else's 144-byte `stat`");
     let got = named_aggregate("stat", &types, 1, Layout::Glibc).expect("adopt");
-    assert!(Rc::ptr_eq(&got, &theirs), "the held definition is the answer");
+    assert_eq!(got, theirs, "the held definition is the answer");
     assert_eq!(
-        got.get_field(0).expect("their field").name,
+        got.read().get_field(got.id(), 0).unwrap().expect("their field").name,
         "theirs",
         "no published layout was installed over it"
     );
@@ -606,9 +619,10 @@ fn no_layout_names_a_reserved_member() {
     let types = factory();
     let stat = named_aggregate("stat", &types, 1, Layout::Glibc).expect("mint stat");
     assert_eq!(stat.get_size(), 144, "the holes do not shrink the aggregate");
+    let view = stat.read();
     for off in [0x24, 0x78, 0x80, 0x88] {
         assert!(
-            (0..stat.num_depend()).filter_map(|i| stat.get_field(i)).all(|f| f.offset != off),
+            (0..stat.num_depend()).filter_map(|i| view.get_field(stat.id(), i).unwrap()).all(|f| f.offset != off),
             "stat has no member at {off:#x}"
         );
     }
@@ -639,7 +653,7 @@ fn a_refused_target_cannot_reach_the_glibc_layouts() {
     let shelled = super::super::declared_libc_prototype("fopen", &refused, 1, Layout::Opaque)
         .expect("fopen");
     let shell = shelled.outtype.as_ref().and_then(|t| t.get_ptr_to()).expect("FILE *");
-    assert_eq!(shell.get_name(), "FILE", "the name is still the table's");
+    assert_eq!(shell.read().get(shell.id()).unwrap().get_name(), "FILE", "the name is still the table's");
     assert!(
         shell.is_incomplete(),
         "a refused target gets the fieldless shell, whatever the program holds"
@@ -651,7 +665,7 @@ fn a_refused_target_cannot_reach_the_glibc_layouts() {
     let pieces = super::super::declared_libc_prototype("fopen", &accepted, 1, Layout::Glibc)
         .expect("fopen");
     let file = pieces.outtype.as_ref().and_then(|t| t.get_ptr_to()).expect("FILE *");
-    assert_eq!(file.get_name(), "FILE");
+    assert_eq!(file.read().get(file.id()).unwrap().get_name(), "FILE");
     assert!(!file.is_incomplete(), "an accepted target gets the fields");
     assert_eq!(file.get_size(), 216, "the published x86-64 width");
 
@@ -691,7 +705,7 @@ fn a_copy_relocated_stream_slot_is_the_stream_pointer() {
     );
     for f in &facts {
         let pointee = f.type_.get_ptr_to().expect("FILE *");
-        assert_eq!(pointee.get_name(), "FILE", "{}: one indirection to the stream", f.name);
+        assert_eq!(pointee.read().get(pointee.id()).unwrap().get_name(), "FILE", "{}: one indirection to the stream", f.name);
     }
 }
 
@@ -716,7 +730,7 @@ fn a_shared_object_names_the_got_slot_as_a_pointer_to_the_stream() {
     for f in &facts {
         let once = f.type_.get_ptr_to().expect("FILE **");
         let twice = once.get_ptr_to().expect("the stream behind it");
-        assert_eq!(twice.get_name(), "FILE", "{}: two indirections", f.name);
+        assert_eq!(twice.read().get(twice.id()).unwrap().get_name(), "FILE", "{}: two indirections", f.name);
     }
 }
 
@@ -779,7 +793,7 @@ fn a_stream_slot_shares_the_tables_own_file_type() {
     assert!(!facts.is_empty());
     for f in &facts {
         let pointee = f.type_.get_ptr_to().expect("FILE *");
-        assert!(Rc::ptr_eq(&pointee, &table), "{}: one FILE, not two", f.name);
+        assert_eq!(pointee, table, "{}: one FILE, not two", f.name);
     }
 }
 

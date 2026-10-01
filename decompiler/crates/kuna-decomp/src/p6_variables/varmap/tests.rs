@@ -33,8 +33,8 @@ fn stack_space() -> Rc<AddrSpace> {
 }
 
 /// A base data-type of the given size and meta-type (align-size == size).
-fn base(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn base(types: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new_with_align(size, size, meta)).unwrap()
 }
 
 /// A usable type factory (default alignment map, base-type cap of 8), matching
@@ -47,7 +47,7 @@ fn factory() -> TypeFactoryImpl {
 }
 
 /// A fixed-size hint at the given signed/unsigned start with a given type.
-fn hint(start: uintb, size: int4, ct: Rc<Datatype>, rt: RangeType) -> RangeHint {
+fn hint(start: uintb, size: int4, ct: TypeRoot, rt: RangeType) -> RangeHint {
     // For these synthetic frames word-size is 1, so sstart == start treated as
     // signed; callers pass small positive offsets where sstart == start.
     RangeHint::new(start, size, start as intb, ct, 0, rt, -1)
@@ -57,34 +57,38 @@ fn hint(start: uintb, size: int4, ct: Rc<Datatype>, rt: RangeType) -> RangeHint 
 
 #[test]
 fn compare_orders_by_signed_start_first() {
-    let a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x20, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let f = factory();
+    let a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x20, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     assert_eq!(a.compare(&b), -1);
     assert_eq!(b.compare(&a), 1);
 }
 
 #[test]
 fn compare_small_sizes_come_first() {
+    let f = factory();
     // Same start: smaller size sorts first (varmap.cc:326-327).
-    let small = hint(0x10, 2, base(2, type_metatype::TYPE_INT), RangeType::Fixed);
-    let big = hint(0x10, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed);
+    let small = hint(0x10, 2, base(&f, 2, type_metatype::TYPE_INT), RangeType::Fixed);
+    let big = hint(0x10, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed);
     assert_eq!(small.compare(&big), -1);
     assert_eq!(big.compare(&small), 1);
 }
 
 #[test]
 fn compare_rangetype_breaks_size_ties() {
+    let f = factory();
     // Same start+size: fixed(0) < open(1) < endpoint(2).
-    let fixed = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let open = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Open);
+    let fixed = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let open = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Open);
     assert_eq!(fixed.compare(&open), -1);
     assert_eq!(open.compare(&fixed), 1);
 }
 
 #[test]
 fn compare_flags_then_highind_break_remaining_ties() {
-    let mut a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let mut b = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let f = factory();
+    let mut a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let mut b = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     a.flags = 0;
     b.flags = TYPELOCK;
     assert_eq!(a.compare(&b), -1); // lower flags first
@@ -99,19 +103,21 @@ fn compare_flags_then_highind_break_remaining_ties() {
 
 #[test]
 fn compare_ignores_datatype() {
+    let f = factory();
     // Identical key fields, different data-types: compare() returns 0.
-    let a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x10, 4, base(4, type_metatype::TYPE_UINT), RangeType::Fixed);
+    let a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_UINT), RangeType::Fixed);
     assert_eq!(a.compare(&b), 0);
 }
 
 #[test]
 fn compare_ranges_is_a_strict_weak_ordering_used_by_sort() {
+    let f = factory();
     let mut v = [
-        hint(0x30, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed),
-        hint(0x10, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed),
-        hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed),
-        hint(0x20, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed),
+        hint(0x30, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed),
+        hint(0x10, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed),
+        hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed),
+        hint(0x20, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed),
     ];
     v.sort_by(RangeHint::compare_ranges);
     let starts: Vec<(uintb, int4)> = v.iter().map(|h| (h.start, h.size)).collect();
@@ -123,10 +129,11 @@ fn compare_ranges_is_a_strict_weak_ordering_used_by_sort() {
 
 #[test]
 fn contain_same_start_or_enclosed() {
-    let a = hint(0x10, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed);
-    let same_start = hint(0x10, 2, base(2, type_metatype::TYPE_INT), RangeType::Fixed);
-    let enclosed = hint(0x12, 2, base(2, type_metatype::TYPE_INT), RangeType::Fixed);
-    let overhang = hint(0x14, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed);
+    let f = factory();
+    let a = hint(0x10, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed);
+    let same_start = hint(0x10, 2, base(&f, 2, type_metatype::TYPE_INT), RangeType::Fixed);
+    let enclosed = hint(0x12, 2, base(&f, 2, type_metatype::TYPE_INT), RangeType::Fixed);
+    let overhang = hint(0x14, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed);
     assert!(a.contain(&same_start)); // sstart == sstart
     assert!(a.contain(&enclosed)); // b end <= a end
     assert!(!a.contain(&overhang)); // b extends past a
@@ -134,10 +141,11 @@ fn contain_same_start_or_enclosed() {
 
 #[test]
 fn const_absorbable_requires_copy_constant_and_primitive() {
+    let f = factory();
     // `this` is an open INT; `b` is a copy-constant of >= size with unknown type.
-    let mut this = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Open);
+    let mut this = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Open);
     this.highind = -1;
-    let mut b = hint(0x10, 4, base(4, type_metatype::TYPE_UNKNOWN), RangeType::Fixed);
+    let mut b = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_UNKNOWN), RangeType::Fixed);
     b.flags = COPY_CONSTANT;
     assert!(this.is_const_absorbable(&b));
 
@@ -146,26 +154,28 @@ fn const_absorbable_requires_copy_constant_and_primitive() {
     assert!(!this.is_const_absorbable(&b));
 
     // A struct `this` is not a primitive, so never const-absorbs.
-    let s = hint(0x10, 4, base(4, type_metatype::TYPE_STRUCT), RangeType::Open);
-    let mut bc = hint(0x10, 4, base(4, type_metatype::TYPE_UNKNOWN), RangeType::Fixed);
+    let s = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_STRUCT), RangeType::Open);
+    let mut bc = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_UNKNOWN), RangeType::Fixed);
     bc.flags = COPY_CONSTANT;
     assert!(!s.is_const_absorbable(&bc));
 }
 
 #[test]
 fn reconcile_equal_sizes_line_up() {
+    let f = factory();
     // Two 4-byte ints at the same start reconcile (align-sizes equal → true).
-    let a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     assert!(a.reconcile(&b).unwrap());
 }
 
 #[test]
 fn reconcile_typelocked_mismatch_fails() {
+    let f = factory();
     // A 4-byte int containing a 2-byte type-locked int at an offset that does
     // not divide into a matching component → not reconcilable.
-    let a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let mut b = hint(0x11, 2, base(2, type_metatype::TYPE_INT), RangeType::Fixed);
+    let a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let mut b = hint(0x11, 2, base(&f, 2, type_metatype::TYPE_INT), RangeType::Fixed);
     b.sstart = 0x11;
     b.flags = TYPELOCK;
     assert!(!a.reconcile(&b).unwrap());
@@ -175,21 +185,23 @@ fn reconcile_typelocked_mismatch_fails() {
 
 #[test]
 fn preferred_different_start_always_true() {
-    let a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x14, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let f = factory();
+    let a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x14, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     assert!(a.preferred(&b, false).unwrap());
 }
 
 #[test]
 fn preferred_locked_beats_unlocked() {
-    let mut a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let f = factory();
+    let mut a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     a.flags = TYPELOCK;
     // a is locked, b is not → a is preferred.
     assert!(a.preferred(&b, true).unwrap());
     // Flip: now b is locked, a is not → a is NOT preferred.
-    let mut a2 = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let mut b2 = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let mut a2 = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let mut b2 = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     b2.flags = TYPELOCK;
     a2.flags = 0;
     assert!(!a2.preferred(&b2, true).unwrap());
@@ -197,18 +209,20 @@ fn preferred_locked_beats_unlocked() {
 
 #[test]
 fn preferred_fixed_bigger_size_wins_without_reconcile() {
+    let f = factory();
     // Two fixed ranges, same start, unreconciled, different size → bigger wins.
-    let big = hint(0x10, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed);
-    let small = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let big = hint(0x10, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed);
+    let small = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     assert!(big.preferred(&small, false).unwrap());
     assert!(!small.preferred(&big, false).unwrap());
 }
 
 #[test]
 fn preferred_open_thrown_out_when_not_reconciled() {
+    let f = factory();
     // a is open, b is fixed, not reconciled → open is thrown out (a not preferred).
-    let open = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Open);
-    let fixed = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let open = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Open);
+    let fixed = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
     assert!(!open.preferred(&fixed, false).unwrap());
     // Reverse roles: a fixed, b open, not reconciled → a is preferred.
     assert!(fixed.preferred(&open, false).unwrap());
@@ -218,10 +232,11 @@ fn preferred_open_thrown_out_when_not_reconciled() {
 
 #[test]
 fn absorb_extends_open_array_highind() {
+    let f = factory();
     // An open int array [0..0] absorbs a second open int one element later with
     // its own indexing, extending highind.
-    let mut a = RangeHint::new(0x10, 4, 0x10, base(4, type_metatype::TYPE_INT), 0, RangeType::Open, 0);
-    let b = RangeHint::new(0x14, 4, 0x14, base(4, type_metatype::TYPE_INT), 0, RangeType::Open, 2);
+    let mut a = RangeHint::new(0x10, 4, 0x10, base(&f, 4, type_metatype::TYPE_INT), 0, RangeType::Open, 0);
+    let b = RangeHint::new(0x14, 4, 0x14, base(&f, 4, type_metatype::TYPE_INT), 0, RangeType::Open, 2);
     a.absorb(&b);
     assert_eq!(a.range_type, RangeType::Open);
     // diffsz = (0x14-0x10)/4 = 1; trialhi = b.highind(2)+1 = 3 > a.highind(0)
@@ -230,27 +245,30 @@ fn absorb_extends_open_array_highind() {
 
 #[test]
 fn attempt_join_concatenates_matching_array_elements() {
+    let f = factory();
     // Open int array with room (highind=3) joins a later same-type open element.
     // The C++ `attemptJoin` tests data-type identity by pointer (`aTestType !=
     // bTestType`), and the TypeFactory interns identical types to one pointer;
-    // model that by sharing the same `Rc` for both hints.
-    let int4 = base(4, type_metatype::TYPE_INT);
-    let mut a = RangeHint::new(0x10, 4, 0x10, Rc::clone(&int4), 0, RangeType::Open, 3);
+    // model that by sharing the same graph identity for both hints.
+    let int4 = base(&f, 4, type_metatype::TYPE_INT);
+    let mut a = RangeHint::new(0x10, 4, 0x10, int4.clone(), 0, RangeType::Open, 3);
     let b = RangeHint::new(0x14, 4, 0x14, int4, 0, RangeType::Open, -1);
     assert!(a.attempt_join(&b));
 }
 
 #[test]
 fn attempt_join_refuses_endpoint() {
-    let mut a = RangeHint::new(0x10, 4, 0x10, base(4, type_metatype::TYPE_INT), 0, RangeType::Open, 3);
-    let term = RangeHint::new(0x14, 1, 0x14, base(1, type_metatype::TYPE_UNKNOWN), 0, RangeType::Endpoint, -2);
+    let f = factory();
+    let mut a = RangeHint::new(0x10, 4, 0x10, base(&f, 4, type_metatype::TYPE_INT), 0, RangeType::Open, 3);
+    let term = RangeHint::new(0x14, 1, 0x14, base(&f, 1, type_metatype::TYPE_UNKNOWN), 0, RangeType::Endpoint, -2);
     assert!(!a.attempt_join(&term)); // Don't merge with bounding range
 }
 
 #[test]
 fn attempt_join_refuses_non_open_this() {
-    let mut a = hint(0x10, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let b = hint(0x14, 4, base(4, type_metatype::TYPE_INT), RangeType::Open);
+    let f = factory();
+    let mut a = hint(0x10, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let b = hint(0x14, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Open);
     assert!(!a.attempt_join(&b));
 }
 
@@ -261,8 +279,8 @@ fn merge_two_typelocked_overlapping_is_an_error() {
     let space = stack_space();
     let factory = factory();
     // Non-contained (b overhangs a) and both locked → the LowlevelError path.
-    let mut a = RangeHint::new(0x10, 4, 0x10, base(4, type_metatype::TYPE_INT), TYPELOCK, RangeType::Fixed, -1);
-    let b = RangeHint::new(0x12, 8, 0x12, base(8, type_metatype::TYPE_UINT), TYPELOCK, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0x10, 4, 0x10, base(&factory, 4, type_metatype::TYPE_INT), TYPELOCK, RangeType::Fixed, -1);
+    let b = RangeHint::new(0x12, 8, 0x12, base(&factory, 8, type_metatype::TYPE_UINT), TYPELOCK, RangeType::Fixed, -1);
     let err = a.merge(&b, &space, &factory).unwrap_err();
     assert!(err.to_string().contains("Overlapping forced variable types"));
 }
@@ -272,8 +290,8 @@ fn merge_confused_types_yields_unknown() {
     let space = stack_space();
     let factory = factory();
     // Non-contained, neither locked → resType 2 (confuse): unknown type, size grows.
-    let mut a = RangeHint::new(0x10, 4, 0x10, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
-    let b = RangeHint::new(0x12, 4, 0x12, base(4, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0x10, 4, 0x10, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let b = RangeHint::new(0x12, 4, 0x12, base(&factory, 4, type_metatype::TYPE_UINT), 0, RangeType::Fixed, -1);
     let ret = a.merge(&b, &space, &factory).unwrap();
     assert!(!ret); // merge always returns false on this path
     assert_eq!(a.type_.get_metatype(), type_metatype::TYPE_UNKNOWN);
@@ -288,8 +306,8 @@ fn merge_contained_prefers_this_when_locked() {
     let space = stack_space();
     let factory = factory();
     // a (locked, 8-byte) contains b (4-byte) at the same start → a absorbs b.
-    let mut a = RangeHint::new(0x10, 8, 0x10, base(8, type_metatype::TYPE_INT), TYPELOCK, RangeType::Fixed, -1);
-    let b = RangeHint::new(0x10, 4, 0x10, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0x10, 8, 0x10, base(&factory, 8, type_metatype::TYPE_INT), TYPELOCK, RangeType::Fixed, -1);
+    let b = RangeHint::new(0x10, 4, 0x10, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     a.merge(&b, &space, &factory).unwrap();
     assert!(a.is_type_lock());
     assert_eq!(a.size, 8);
@@ -314,9 +332,9 @@ fn mapstate_initialize_sorts_and_terminates() {
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
     // Add out-of-order fixed hints.
-    state.add_range_pub(0x30, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
-    state.add_range_pub(0x10, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
-    state.add_range_pub(0x20, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
+    state.add_range_pub(0x30, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
+    state.add_range_pub(0x10, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
+    state.add_range_pub(0x20, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
 
     assert!(state.initialize().unwrap());
 
@@ -346,8 +364,8 @@ fn mapstate_reconcile_collapses_same_keyed_duplicates() {
     // Two identical-key 4-byte hints at 0x10 (same start/size/flags), one UINT
     // one INT: reconcileDatatypes keeps a single entry with the more-specific
     // type and drops the duplicate (compare()==0).
-    state.add_range_pub(0x10, Some(base(4, type_metatype::TYPE_UINT)), 0, RangeType::Fixed, -1);
-    state.add_range_pub(0x10, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
+    state.add_range_pub(0x10, Some(base(&factory, 4, type_metatype::TYPE_UINT)), 0, RangeType::Fixed, -1);
+    state.add_range_pub(0x10, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1);
 
     assert!(state.initialize().unwrap());
 
@@ -372,8 +390,8 @@ fn mapstate_addrange_drops_out_of_window_hints() {
     let pm = RangeList::new();
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
-    state.add_range_pub(0x10, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // in
-    state.add_range_pub(0x40, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // out
+    state.add_range_pub(0x10, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // in
+    state.add_range_pub(0x40, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // out
 
     assert!(state.initialize().unwrap());
     let mut starts = vec![state.next().start];
@@ -406,8 +424,8 @@ fn mapstate_constructor_removes_param_ranges_from_window() {
     let pm = window(&space, 0x80, 0xff);
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
-    state.add_range_pub(0x10, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // kept
-    state.add_range_pub(0x90, Some(base(4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // carved out
+    state.add_range_pub(0x10, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // kept
+    state.add_range_pub(0x90, Some(base(&factory, 4, type_metatype::TYPE_INT)), 0, RangeType::Fixed, -1); // carved out
 
     assert!(state.initialize().unwrap());
     let mut starts = vec![state.next().start];
@@ -429,7 +447,7 @@ fn add_fixed_type_plain_type_is_a_fixed_hint() {
     let pm = RangeList::new();
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
-    state.add_fixed_type_pub(0x10, base(4, type_metatype::TYPE_INT), 0, &factory);
+    state.add_fixed_type_pub(0x10, base(&factory, 4, type_metatype::TYPE_INT), 0, &factory);
     assert!(state.initialize().unwrap());
     assert_eq!(state.next().start, 0x10);
     assert_eq!(state.next().range_type, RangeType::Fixed);
@@ -581,26 +599,6 @@ fn derive_boundaries_uses_proto_param_last_for_negative_stack() {
     assert!(!checker.has_local_alias(Some((Rc::clone(&space), 0x140)), &mut mock));
 }
 
-// --- Recommendation record round-trips ------------------------------------
-
-#[test]
-fn recommendation_records_carry_their_fields() {
-    let space = stack_space();
-    let addr = Address::new(Rc::clone(&space), 0x10);
-    let use_addr = Address::new(Rc::clone(&space), 0x20);
-    let nr = NameRecommend::new(addr.clone(), use_addr.clone(), 4, "foo".into(), 7);
-    assert_eq!(nr.size, 4);
-    assert_eq!(nr.name, "foo");
-    assert_eq!(nr.symbol_id, 7);
-
-    let dr = DynamicRecommend::new(use_addr.clone(), 0xdead, "bar".into(), 9);
-    assert_eq!(dr.hash, 0xdead);
-    assert_eq!(dr.symbol_id, 9);
-
-    let tr = TypeRecommend::new(addr, base(4, type_metatype::TYPE_INT));
-    assert_eq!(tr.data_type.get_size(), 4);
-}
-
 // --- ScopeLocal -----------------------------------------------------------
 
 /// A `ScopeLocal` over the synthetic stack space, sized for that space's index.
@@ -610,14 +608,225 @@ fn scope_local() -> ScopeLocal {
 }
 
 #[test]
+fn locked_register_type_seed_respects_parameter_and_later_value_usepoints() {
+    use crate::fspec::parameter_pieces_flags;
+    use crate::varnode::varnode_flags;
+
+    let mut scope = scope_local();
+    let types = factory();
+    let register = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 2,
+        addrspace_flags::hasphysical, 1, 1,
+    ));
+    let code = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 3,
+        addrspace_flags::hasphysical, 1, 1,
+    ));
+    let storage = Address::new(register, 0x38);
+    let input_usepoint = Address::new(Rc::clone(&code), 0xfff);
+    let later_usepoint = Address::new(Rc::clone(&code), 0x1020);
+    let other_usepoint = Address::new(code, 0x1024);
+    let parameter_type = base(&types, 4, type_metatype::TYPE_INT);
+    scope.add_param_symbol(
+        0, "input", parameter_type.clone(), &storage, &input_usepoint,
+        parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+    ).unwrap();
+    assert_eq!(
+        &scope.build_localtype_seed(&storage, 4, &input_usepoint, &types).unwrap(),
+        &parameter_type,
+    );
+    assert!(
+        scope.build_localtype_seed(&storage, 4, &later_usepoint, &types).is_none(),
+        "the input's committed type must not seed a later SSA write to the same register",
+    );
+
+    let later_type = base(&types, 4, type_metatype::TYPE_FLOAT);
+    let later = scope.add_symbol(
+        "later", later_type.clone(), &storage, &later_usepoint,
+    ).unwrap();
+    scope.set_attribute(later, varnode_flags::typelock);
+    assert_eq!(
+        &scope.build_localtype_seed(&storage, 4, &later_usepoint, &types).unwrap(),
+        &later_type,
+    );
+    assert_eq!(
+        &scope.build_localtype_seed(&storage, 4, &input_usepoint, &types).unwrap(),
+        &parameter_type,
+    );
+    assert!(scope.build_localtype_seed(&storage, 4, &other_usepoint, &types).is_none());
+}
+
+#[test]
+fn joined_parameter_fields_are_scoped_to_input_not_register_reuse() {
+    use crate::dtype::{DatatypeKind, TypeField};
+    use crate::fspec::parameter_pieces_flags as pf;
+    use crate::varnode::varnode_flags as vf;
+    use kuna_base::space::{AddrSpaceManager, ConstantSpace, JoinSpace, VarnodeStorage};
+
+    for mixed_stack in [false, true] {
+        let mut scope = scope_local();
+        let types = factory();
+        let register = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 2,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        let code = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 3,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        let stack = Rc::clone(scope.get_space_id());
+        let mut window = RangeList::new();
+        window.insert_range(Rc::clone(&stack), 0, 0xff);
+        scope.reset_local_window(&RangeList::new(), &window, true);
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.insert_space(Rc::clone(&code)).unwrap();
+        manager.insert_space(Rc::clone(&stack)).unwrap();
+        manager.insert_space(Rc::new(JoinSpace::new(5, false))).unwrap();
+        let low = Address::new(Rc::clone(&register), 0x10);
+        let high = Address::new(if mixed_stack { stack } else { register }, 0x20);
+        let pieces = [high.clone(), low.clone()].map(|addr| VarnodeStorage {
+            space: addr.get_space().cloned(), offset: addr.get_offset(), size: 4,
+        });
+        let joined = manager.find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+        let input = Address::new(Rc::clone(&code), 0xfff);
+        let later = Address::new(code, 0x1020);
+        let integer = base(&types, 4, type_metatype::TYPE_INT);
+        let float = base(&types, 4, type_metatype::TYPE_FLOAT);
+        let mut draft = Datatype::new_with_align(8, 4, type_metatype::TYPE_STRUCT);
+        draft.kind = DatatypeKind::Struct {
+            field: vec![
+                TypeField::new(17, 0, "count", integer.id()),
+                TypeField::new(29, 4, "value", float.id()),
+            ],
+            bitfield: vec![],
+        };
+        let pair = types.intern(draft).unwrap();
+        let symbol = scope.add_param_symbol(
+            0, "incoming", pair.clone(), &joined, &input, pf::TYPELOCK | pf::NAMELOCK,
+        ).unwrap().unwrap();
+        assert_eq!(scope.build_localtype_seed(&joined, 8, &input, &types), Some(pair.clone()));
+        assert!(scope.build_localtype_seed(&joined, 8, &later, &types).is_none());
+        for (addr, offset, dtype, field_name) in [
+            (&low, 0, &integer, "count"), (&high, 4, &float, "value"),
+        ] {
+            let entry = scope.query_container_for_link(addr, &input).unwrap();
+            assert_eq!(entry.symbol, symbol);
+            assert_eq!(entry.display_name, "incoming");
+            assert_eq!(entry.sym_off, offset);
+            let view = pair.read();
+            assert_eq!(view.get_field(pair.id(), offset / 4).unwrap().unwrap().name, field_name);
+            assert_eq!(scope.build_localtype_seed(addr, 4, &input, &types).as_ref(), Some(dtype));
+            assert!(scope.query_container_for_link(addr, &later).is_none());
+            assert!(scope.build_localtype_seed(addr, 4, &later, &types).is_none());
+        }
+        assert_eq!(scope.query_properties(&low, 4, &later) & (vf::mapped | vf::addrtied), 0);
+        if mixed_stack {
+            assert_eq!(
+                scope.query_properties(&high, 4, &later) & (vf::mapped | vf::addrtied),
+                vf::mapped | vf::addrtied,
+                "real owned stack remains memory, without naming it as the incoming aggregate",
+            );
+        }
+        let replacement = scope.add_symbol("delta", float.clone(), &low, &later).unwrap();
+        scope.set_attribute(replacement, vf::typelock | vf::namelock);
+        let later_entry = scope.query_container_for_link(&low, &later).unwrap();
+        assert_eq!(later_entry.symbol, replacement);
+        assert_eq!(later_entry.display_name, "delta");
+        assert_eq!(scope.build_localtype_seed(&low, 4, &later, &types), Some(float));
+        assert_eq!(scope.build_localtype_seed(&low, 4, &input, &types), Some(integer));
+    }
+}
+
+#[test]
+fn owned_stack_parameter_keeps_whole_function_mapping() {
+    use crate::fspec::parameter_pieces_flags as pf;
+    use crate::varnode::varnode_flags as vf;
+
+    let mut scope = scope_local();
+    let types = factory();
+    let stack = Rc::clone(scope.get_space_id());
+    let mut window = RangeList::new();
+    window.insert_range(Rc::clone(&stack), 0x10, 0x3f);
+    scope.reset_local_window(&RangeList::new(), &window, true);
+    let storage = Address::new(Rc::clone(&stack), 0x20);
+    let input = Address::new(Rc::clone(&stack), 0xfff);
+    let later = Address::new(stack, 0x1020);
+    let dtype = base(&types, 4, type_metatype::TYPE_INT);
+    let symbol = scope.add_param_symbol(
+        0, "memory_input", dtype.clone(), &storage, &input, pf::TYPELOCK | pf::NAMELOCK,
+    ).unwrap().unwrap();
+    for usepoint in [&input, &later] {
+        assert_eq!(scope.query_container_for_link(&storage, usepoint).unwrap().symbol, symbol);
+        assert_eq!(scope.build_localtype_seed(&storage, 4, usepoint, &types), Some(dtype.clone()));
+        assert_eq!(scope.query_properties(&storage, 4, usepoint) & (vf::mapped | vf::addrtied), vf::mapped | vf::addrtied);
+    }
+}
+
+#[test]
+fn parameter_creation_preserves_explicit_mapping_lifetime_and_overlap() {
+    use crate::database::symbol_category;
+    use crate::varnode::varnode_flags as vf;
+
+    for (point_scoped, existing_size) in [(false, 4), (true, 4), (true, 8)] {
+        let mut scope = scope_local();
+        let types = factory();
+        let space = Rc::clone(scope.get_space_id());
+        let storage = Address::new(Rc::clone(&space), 0x10);
+        let input = Address::new(Rc::clone(&space), 0xfff);
+        let later = Address::new(space, 0x1020);
+        let explicit_usepoint = if point_scoped { later.clone() } else { Address::new_invalid() };
+        let explicit_type = base(&types, existing_size, type_metatype::TYPE_FLOAT);
+        let symbol = scope.add_symbol("committed", explicit_type.clone(), &storage, &explicit_usepoint).unwrap();
+        scope.set_attribute(symbol, vf::typelock | vf::namelock);
+        let formal_type = base(&types, 4, type_metatype::TYPE_INT);
+        assert!(scope.add_param_symbol(0, "formal", formal_type, &storage, &input, 0).unwrap().is_none());
+        let entry = scope.query_container_for_link(&storage, &later).unwrap();
+        assert_eq!(entry.symbol, symbol);
+        assert_eq!(entry.display_name, "committed");
+        assert_eq!(entry.entry_size, existing_size);
+        assert_eq!(entry.sym_type, Some(explicit_type.clone()));
+        let expected_category = if existing_size == 4 { symbol_category::FUNCTION_PARAMETER } else { symbol_category::NO_CATEGORY };
+        assert_eq!(entry.category, expected_category);
+        assert_eq!(scope.build_localtype_seed(&storage, existing_size, &later, &types), Some(explicit_type));
+        assert_eq!(scope.query_container_for_link(&storage, &input).is_some(), !point_scoped);
+        assert!(scope.database().symbol(symbol).is_name_locked());
+    }
+}
+
+#[test]
+fn address_tied_type_seed_remains_available_but_requires_containing_storage() {
+    let mut scope = scope_local();
+    let types = factory();
+    let space = Rc::clone(scope.get_space_id());
+    let storage = Address::new(Rc::clone(&space), 0x10);
+    let dtype = base(&types, 4, type_metatype::TYPE_INT);
+    let local = scope.add_symbol(
+        "local", dtype.clone(), &storage, &Address::new_invalid(),
+    ).unwrap();
+    scope.set_attribute(local, crate::varnode::varnode_flags::typelock);
+    for usepoint in [Address::new_invalid(), Address::new(Rc::clone(&space), 0x2000)] {
+        assert_eq!(
+            &scope.build_localtype_seed(&storage, 4, &usepoint, &types).unwrap(),
+            &dtype,
+        );
+        assert!(scope.build_localtype_seed(&storage, 8, &usepoint, &types).is_none());
+        let partial = Address::new(Rc::clone(&space), 0x12);
+        assert!(scope.build_localtype_seed(&partial, 4, &usepoint, &types).is_none());
+    }
+}
+
+#[test]
 fn scope_local_add_symbol_maps_a_named_local() {
+    let f = factory();
     // The `map address s0x... int4 i` console path: addSymbol(name,ct,addr,inv).
     let mut sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
     let addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffe4);
     let inv = Address::new_invalid();
     let sym = sl
-        .add_symbol("i", base(4, type_metatype::TYPE_INT), &addr, &inv)
+        .add_symbol("i", base(&f, 4, type_metatype::TYPE_INT), &addr, &inv)
         .expect("addSymbol");
     // The symbol is mapped at the stack offset under the named local scope.
     let scope = sl.scope_id();
@@ -628,6 +837,7 @@ fn scope_local_add_symbol_maps_a_named_local() {
 
 #[test]
 fn scope_local_query_properties_marks_mapped_range_addrtied() {
+    let f = factory();
     use crate::varnode::varnode_flags;
     // C++ `Scope::queryProperties` (database.cc:1268): a storage range covered by
     // a `map addr`-mapped stack Symbol comes back `mapped | addrtied` (plus the
@@ -638,7 +848,7 @@ fn scope_local_query_properties_marks_mapped_range_addrtied() {
     let spc = Rc::clone(sl.get_space_id());
     let inv = Address::new_invalid();
     let addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffe4);
-    sl.add_symbol("v", base(4, type_metatype::TYPE_INT), &addr, &inv).expect("addSymbol");
+    sl.add_symbol("v", base(&f, 4, type_metatype::TYPE_INT), &addr, &inv).expect("addSymbol");
 
     let fl = sl.query_properties(&addr, 4, &inv);
     assert_ne!(fl & varnode_flags::mapped, 0, "a mapped stack symbol is `mapped`");
@@ -661,11 +871,11 @@ fn spacebase_get_sub_type_resolves_mapped_local_and_falls_back_to_unknown() {
     let inv = Address::new_invalid();
     // Map an `int4 c[16]` at stack offset 0xff..a8 (byte == address, word size 1).
     let arr_addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffa8);
-    let arr_ty: Rc<Datatype> = {
-        let elem = base(4, type_metatype::TYPE_INT);
+    let arr_ty: TypeRoot = {
+        let elem = base(&f, 4, type_metatype::TYPE_INT);
         f.get_type_array(16, elem).expect("int4[16]")
     };
-    sl.add_symbol("c", Rc::clone(&arr_ty), &arr_addr, &inv).expect("addSymbol c");
+    sl.add_symbol("c", arr_ty.clone(), &arr_addr, &inv).expect("addSymbol c");
 
     // Inside the symbol: getSubType returns the symbol's type with newoff = byte
     // offset into the symbol (0 at its base).
@@ -705,11 +915,11 @@ fn w10_spacebase_typing_get_sub_type_midsymbol_newoff_is_byte_offset_into_symbol
     let inv = Address::new_invalid();
     let base_off: u64 = 0xffff_ffff_ffff_ffa8;
     let arr_addr = Address::new(Rc::clone(&spc), base_off);
-    let arr_ty: Rc<Datatype> = {
-        let elem = base(4, type_metatype::TYPE_INT);
+    let arr_ty: TypeRoot = {
+        let elem = base(&f, 4, type_metatype::TYPE_INT);
         f.get_type_array(16, elem).expect("int4[16]")
     };
-    sl.add_symbol("c", Rc::clone(&arr_ty), &arr_addr, &inv).expect("addSymbol c");
+    sl.add_symbol("c", arr_ty.clone(), &arr_addr, &inv).expect("addSymbol c");
 
     // addr = base + 0x10 (well within the 64-byte array)
     let (ty, newoff) = sl
@@ -753,11 +963,11 @@ fn w10_spacebase_typing_nearest_backward_resolves_array_distance() {
     let inv = Address::new_invalid();
     let base_off: u64 = 0xffff_ffff_ffff_ffa8;
     let arr_addr = Address::new(Rc::clone(&spc), base_off);
-    let arr_ty: Rc<Datatype> = {
-        let elem = base(4, type_metatype::TYPE_INT);
+    let arr_ty: TypeRoot = {
+        let elem = base(&f, 4, type_metatype::TYPE_INT);
         f.get_type_array(16, elem).expect("int4[16]")
     };
-    sl.add_symbol("c", Rc::clone(&arr_ty), &arr_addr, &inv).expect("addSymbol c");
+    sl.add_symbol("c", arr_ty.clone(), &arr_addr, &inv).expect("addSymbol c");
 
     let (distance, newoff, _el) =
         sl.spacebase_nearest_arrayed_backward(base_off as i64, 128, &f);
@@ -806,10 +1016,10 @@ fn scope_local_restructure_builds_a_disjoint_cover() {
         Rc::clone(&spc),
         &localr,
         &paramr,
-        base(1, type_metatype::TYPE_UNKNOWN),
+        base(&f, 1, type_metatype::TYPE_UNKNOWN),
     );
-    state.add_fixed_type_pub(0x10, base(4, type_metatype::TYPE_INT), 0, &f);
-    state.add_fixed_type_pub(0x20, base(4, type_metatype::TYPE_INT), 0, &f);
+    state.add_fixed_type_pub(0x10, base(&f, 4, type_metatype::TYPE_INT), 0, &f);
+    state.add_fixed_type_pub(0x20, base(&f, 4, type_metatype::TYPE_INT), 0, &f);
 
     let overlaps = sl.restructure(&mut state, &f).expect("restructure");
     assert!(!overlaps, "two disjoint hints reconcile without overlap problems");
@@ -843,11 +1053,11 @@ fn scope_local_clear_unlocked_category_resets_layout_each_pass() {
         Rc::clone(&spc),
         &localr,
         &paramr,
-        base(1, type_metatype::TYPE_UNKNOWN),
+        base(&f, 1, type_metatype::TYPE_UNKNOWN),
     );
     state.add_range_pub(0x10, None, 0, crate::varmap::RangeType::Open, 3);
     // A guard endpoint so `restructure` closes the open range into an entry.
-    state.add_fixed_type_pub(0x30, base(4, type_metatype::TYPE_INT), 0, &f);
+    state.add_fixed_type_pub(0x30, base(&f, 4, type_metatype::TYPE_INT), 0, &f);
     sl.restructure(&mut state, &f).expect("restructure pass 1");
     let scope = sl.scope_id();
     let a0 = Address::new(Rc::clone(&spc), 0x10);
@@ -873,6 +1083,7 @@ fn scope_local_clear_unlocked_category_resets_layout_each_pass() {
 // everything to vN" shortcut would fail.
 #[test]
 fn verify_w10_sized_stackvn_resolve_default_name_whole_symbol_gate() {
+    let f = factory();
     let mut sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
     let inv = Address::new_invalid();
@@ -882,7 +1093,7 @@ fn verify_w10_sized_stackvn_resolve_default_name_whole_symbol_gate() {
     //     resolve_default_name at (0x40, 4) must rename it to `v1` (base 1).
     let whole_addr = Address::new(Rc::clone(&spc), 0x40);
     let s_whole = sl
-        .add_symbol("$$undef00000000", base(4, type_metatype::TYPE_INT), &whole_addr, &inv)
+        .add_symbol("$$undef00000000", base(&f, 4, type_metatype::TYPE_INT), &whole_addr, &inv)
         .expect("add undefined whole symbol");
     assert!(sl.database().symbol(s_whole).is_name_undefined());
     let mut b: int4 = 1;
@@ -899,7 +1110,7 @@ fn verify_w10_sized_stackvn_resolve_default_name_whole_symbol_gate() {
     //     must NOT rename it — the name stays undefined, base does not advance.
     let big_addr = Address::new(Rc::clone(&spc), 0x80);
     let s_big = sl
-        .add_symbol("$$undef00000001", base(8, type_metatype::TYPE_INT), &big_addr, &inv)
+        .add_symbol("$$undef00000001", base(&f, 8, type_metatype::TYPE_INT), &big_addr, &inv)
         .expect("add undefined big symbol");
     let member_addr = Address::new(Rc::clone(&spc), 0x84);
     let mut b2: int4 = 5;
@@ -930,6 +1141,7 @@ fn verify_w10_sized_stackvn_resolve_default_name_whole_symbol_gate() {
 
 #[test]
 fn scope_local_build_variable_name_stack_convention() {
+    let f = factory();
     // buildVariableName: an addr-tied non-persistent stack local in the local
     // range gets the `<TypeBase>Stack[XY]_<hexoff>` name.  Under negative stack
     // growth a negative raw offset is a *local* (start negates to positive, no
@@ -937,7 +1149,7 @@ fn scope_local_build_variable_name_stack_convention() {
     use crate::varnode::varnode_flags;
     let sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
-    let int4t = base(4, type_metatype::TYPE_INT);
+    let int4t = base(&f, 4, type_metatype::TYPE_INT);
 
     // Negative offset -4: sign-extends to -4, negated to +4 -> plain "Stack_4".
     let local = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_fffc);
@@ -992,14 +1204,15 @@ fn scope_local_build_variable_name_stack_convention() {
 /// reverse of the C++ `intb` ordering — silently corrupting the layout cover.
 #[test]
 fn adv_w10_compare_signed_start_on_real_stack_offsets() {
+    let f = factory();
     // forloop_loaditer: count @ s0xfffffffffffffff4 (-12), loopvar @
     // s0xffffffffffffffe0 (-32).  Signed: -32 < -12, so loopvar precedes count.
     let count_off: uintb = 0xfffffffffffffff4; // -12
     let loop_off: uintb = 0xffffffffffffffe0; // -32
     assert!((count_off as intb) > (loop_off as intb), "fixture sanity: -12 > -32");
 
-    let count = hint(count_off, 4, base(4, type_metatype::TYPE_INT), RangeType::Fixed);
-    let loopvar = hint(loop_off, 8, base(8, type_metatype::TYPE_INT), RangeType::Fixed);
+    let count = hint(count_off, 4, base(&f, 4, type_metatype::TYPE_INT), RangeType::Fixed);
+    let loopvar = hint(loop_off, 8, base(&f, 8, type_metatype::TYPE_INT), RangeType::Fixed);
 
     // loopvar (-32) sorts strictly before count (-12).
     assert_eq!(loopvar.compare(&count), -1, "deeper (more negative) stack slot first");
@@ -1086,12 +1299,13 @@ fn adv_w10_gather_offset_int_sub_wraps_at_zero() {
 /// `ScopeLocal::markNotMapped` (varmap.cc:510-545).
 #[test]
 fn adv_l4_mark_not_mapped_removes_unlocked_local() {
+    let f = factory();
     let mut sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
     let addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffe4);
     let inv = Address::new_invalid();
     let _sym = sl
-        .add_symbol("vrsp", base(8, type_metatype::TYPE_UNKNOWN), &addr, &inv)
+        .add_symbol("vrsp", base(&f, 8, type_metatype::TYPE_UNKNOWN), &addr, &inv)
         .expect("addSymbol");
     let scope = sl.scope_id();
     assert!(
@@ -1111,13 +1325,14 @@ fn adv_l4_mark_not_mapped_removes_unlocked_local() {
 /// (varmap.cc:529-537).  Purely category/flag driven; no address special-casing.
 #[test]
 fn adv_l4_mark_not_mapped_preserves_typelocked_symbol() {
+    let f = factory();
     use crate::varnode::varnode_flags;
     let mut sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
     let addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffe0);
     let inv = Address::new_invalid();
     let sym = sl
-        .add_symbol("locked", base(4, type_metatype::TYPE_INT), &addr, &inv)
+        .add_symbol("locked", base(&f, 4, type_metatype::TYPE_INT), &addr, &inv)
         .expect("addSymbol");
     // Type-lock it (the bit markNotMapped checks before removing).
     sl.set_attribute(sym, varnode_flags::typelock);
@@ -1188,12 +1403,13 @@ fn adv_l4_mark_not_mapped_offset_wraps_without_panic() {
 /// that is NOT the one later queried.
 #[test]
 fn has_isolated_symbols_tracks_set_symbol_isolated() {
+    let f = factory();
     let mut sl = scope_local();
     let spc = Rc::clone(sl.get_space_id());
     let inv = Address::new_invalid();
     let addr = Address::new(Rc::clone(&spc), 0xffff_ffff_ffff_ffe4);
     let sym = sl
-        .add_symbol("i", base(4, type_metatype::TYPE_INT), &addr, &inv)
+        .add_symbol("i", base(&f, 4, type_metatype::TYPE_INT), &addr, &inv)
         .expect("addSymbol");
     assert!(
         !sl.has_isolated_symbols(),

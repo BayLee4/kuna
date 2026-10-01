@@ -51,7 +51,7 @@ use kuna_base::space::spacetype;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::constseq::{ArraySequence, StringSequence, WriteNode};
 use crate::context::{BlockId, OpId, VarnodeId};
 use crate::dtype::{type_metatype, TypeFactory};
@@ -96,14 +96,11 @@ impl Rule for RuleRodataStringCopy {
         vec![OpCode::CPUI_COPY]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleRodataStringCopy {
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleRodataStringCopy {
             enabled: self.enabled,
             group: self.group.clone(),
-        }))
+        })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -209,7 +206,7 @@ fn try_recover(root: OpId, data: &mut Funcdata) -> Option<StringSequence> {
     if char_type.get_size() != 1 {
         return None;
     }
-    let dest_type = types.get_type_array(str_len, Rc::clone(&char_type)).ok()?;
+    let dest_type = types.get_type_array(str_len, char_type.clone()).ok()?;
     let entry = crate::varmap::StringContainerEntry {
         first: dst_start.get_offset(),
         size: str_len,
@@ -375,6 +372,7 @@ pub fn parse_rodata_string_form(p1: &str) -> KunaResult<(RodataStringForm, Strin
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         ctor: || Box::new(RuleRodataStringCopy::with_group(true, "analysis")),
     }]
 }

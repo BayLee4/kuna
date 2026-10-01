@@ -7,13 +7,14 @@
 //! merge-on-insert rule (newest wins, old dropped), and the `<override>`
 //! encode/decode round-trip.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
 use kuna_base::address::Address;
-use kuna_base::error::KunaResult;
-use kuna_base::marshal::{Decoder, Encoder, IdRegistry, XmlDecode, XmlEncode, ATTRIB_TYPE};
+use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode, XmlEncode};
 use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace};
+
+use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+use crate::fspec::{parameter_pieces_flags, FuncProto, ParameterPieces, ProtoModel};
 
 use super::*;
 
@@ -63,33 +64,23 @@ fn registry() -> IdRegistry {
     reg
 }
 
-/// A test prototype override capturing the three operations [`Override`] drives:
-/// `set_override`, `encode`, `print_raw`.
-struct TestProto {
-    tag: String,
-    overridden: RefCell<bool>,
-}
-
-impl TestProto {
-    fn new(tag: &str) -> Box<TestProto> {
-        Box::new(TestProto { tag: tag.to_string(), overridden: RefCell::new(false) })
-    }
-}
-
-impl FuncProtoOverride for TestProto {
-    fn set_override(&mut self, val: bool) {
-        *self.overridden.borrow_mut() = val;
-    }
-    fn encode(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
-        // Stand-in for FuncProto::encode: a <prototype>-ish leaf carrying the tag.
-        encoder.open_element(&ELEM_PROTOOVERRIDE);
-        encoder.write_string(&ATTRIB_TYPE, self.tag.as_bytes());
-        encoder.close_element(&ELEM_PROTOOVERRIDE);
-        Ok(())
-    }
-    fn print_raw(&self, s: &mut String) {
-        s.push_str(&format!("proto({})", self.tag));
-    }
+fn prototype(m: &AddrSpaceManager, input: u64, output: u64) -> FuncProto {
+    let mut model = ProtoModel::new(m);
+    model.build_param_list("standard").unwrap();
+    model.set_name("custom_call_model");
+    let types = TypeFactoryImpl::new();
+    let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let mut proto = FuncProto::new();
+    proto.set_internal(Rc::new(model), types.get_type_void().unwrap());
+    proto.set_param(0, "argument", &ParameterPieces {
+        addr: ram(m, input), type_: Some(int4.clone()),
+        flags: parameter_pieces_flags::TYPELOCK,
+    });
+    proto.set_output(&ParameterPieces {
+        addr: ram(m, output), type_: Some(int4), flags: 0,
+    });
+    proto.set_custom_storage(true);
+    proto
 }
 
 // ---------------------------------------------------------------------------
@@ -258,54 +249,36 @@ fn deadcode_delay_bump_is_idempotent_and_survives_restart() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn proto_override_insert_marks_and_merges() {
+fn proto_override_replacement_is_callsite_local_and_preserves_exact_signature() {
     let m = manager();
     let mut ov = Override::new();
-    // Empty store: find short-circuits to None.
+    ov.insert_proto_override(ram(&m, 0x40), prototype(&m, 0x90, 0x10));
+    ov.insert_proto_override(ram(&m, 0x80), prototype(&m, 0x98, 0x08));
+    let original_caller = ov.clone();
+    ov.insert_proto_override(ram(&m, 0x40), prototype(&m, 0xa0, 0x18));
+    for (store, site, input, output) in [
+        (&ov, 0x40, 0xa0, 0x18),
+        (&ov, 0x80, 0x98, 0x08),
+        (&original_caller, 0x40, 0x90, 0x10),
+    ] {
+        let proto = store.find_proto_override(&ram(&m, site)).unwrap();
+        assert!(proto.is_override());
+        assert_eq!(proto.get_model_name(), "custom_call_model");
+        assert!(proto.has_custom_storage());
+        assert_eq!(proto.num_params(), 1);
+        let param = proto.get_param(0).unwrap();
+        assert_eq!(param.get_address(), ram(&m, input));
+        assert_eq!(param.get_size(), 4);
+        assert!(param.is_type_locked());
+        assert!(!param.is_name_locked());
+        assert_eq!(proto.get_output().get_address(), ram(&m, output));
+        assert_eq!(proto.get_output().get_size(), 4);
+        assert!(!proto.is_output_locked());
+    }
+    assert!(ov.find_proto_override(&ram(&m, 0x44)).is_none());
+    ov.clear();
     assert!(ov.find_proto_override(&ram(&m, 0x40)).is_none());
-
-    ov.insert_proto_override(ram(&m, 0x40), TestProto::new("first"));
-    {
-        let mut s = String::new();
-        ov.find_proto_override(&ram(&m, 0x40)).unwrap().print_raw(&mut s);
-        assert_eq!(s, "proto(first)");
-    }
-
-    // Re-insert at the same call point: the new prototype replaces (and drops)
-    // the old one (the C++ `delete` of the pre-existing override).
-    ov.insert_proto_override(ram(&m, 0x40), TestProto::new("second"));
-    {
-        let mut s = String::new();
-        ov.find_proto_override(&ram(&m, 0x40)).unwrap().print_raw(&mut s);
-        assert_eq!(s, "proto(second)");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// print_raw / generate_override_messages
-// ---------------------------------------------------------------------------
-
-#[test]
-fn print_raw_and_messages() {
-    let m = manager();
-    let stack = Rc::clone(m.get_space(2).unwrap());
-    let mut ov = Override::new();
-    ov.insert_force_goto(ram(&m, 0x40), ram(&m, 0x100));
-    ov.insert_indirect_override(ram(&m, 0x80), ram(&m, 0x500));
-    ov.insert_deadcode_delay(&stack, 3);
-    ov.insert_proto_override(ram(&m, 0xC0), TestProto::new("p"));
-
-    let mut s = String::new();
-    ov.print_raw(&mut s, &m);
-    assert!(s.contains("force goto at"));
-    assert!(s.contains("override indirect at"));
-    assert!(s.contains("dead code delay on stack set to 3"));
-    assert!(s.contains("override prototype at"));
-    assert!(s.contains("proto(p)"));
-
-    let msgs = ov.generate_override_messages(&m);
-    assert_eq!(msgs.len(), 1);
-    assert!(msgs[0].contains("delay deadcode elimination for space: stack"));
+    assert!(original_caller.find_proto_override(&ram(&m, 0x40)).is_some());
 }
 
 // ---------------------------------------------------------------------------

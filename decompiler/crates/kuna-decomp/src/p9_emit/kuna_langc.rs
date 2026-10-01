@@ -9,12 +9,11 @@
 //! and their tests are unchanged.
 
 use std::borrow::Cow;
-use std::rc::Rc;
 
 use kuna_base::types::int4;
 
-use crate::dtype::{type_metatype, Datatype};
-use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+use crate::dtype::type_metatype;
+use crate::kuna_langtypes::{SpellCtx, TypeSpeller, TypeText, TypeTokenPolicy};
 
 /// The c-language type speller.
 pub struct CSpeller;
@@ -32,8 +31,8 @@ pub static C_SPELLER: CSpeller = CSpeller;
 /// `a[4]` + `*` becomes `*a[4]`.
 #[derive(Default)]
 struct CDeclarator {
-    front: String,
-    back: String,
+    front: TypeText,
+    back: TypeText,
     /// A pointer prefix has been added since the last postfix grouped it.
     ungrouped_pointer: bool,
 }
@@ -43,24 +42,34 @@ impl CDeclarator {
         // We are walking from the outer type toward the base.  A newly reached
         // pointer belongs nearest the base type, so it prefixes the complete
         // declarator already accumulated around the identifier.
-        self.front.insert(0, '*');
+        self.front.prefix("*");
         self.ungrouped_pointer = true;
     }
 
-    fn postfix(&mut self, suffix: &str) {
+    fn postfix(&mut self, suffix: TypeText) {
         if self.ungrouped_pointer {
             // Group the complete current declarator, including any postfixes
             // already accumulated.  Closing before `self.back` would turn
             // `*a[2]` + `[3]` into `(*a)[2][3]` instead of `(*a[2])[3]`.
-            self.front.insert(0, '(');
-            self.back.push(')');
+            self.front.prefix("(");
+            self.back.push_str(")");
             self.ungrouped_pointer = false;
         }
-        self.back.push_str(suffix);
+        self.back.append(suffix);
     }
 }
 
 impl TypeSpeller for CSpeller {
+    fn is_generic_callable(&self, cx: &SpellCtx, dt: &crate::dtype::TypeRoot) -> bool {
+        let view = dt.read();
+        let node = view.get(dt.id()).expect("retained datatype");
+        dt.get_metatype() == type_metatype::TYPE_CODE
+            && view.get_code_prototype(dt.id()).expect("retained datatype").is_none()
+            && dt.is_core_type()
+            && !node.get_name().is_empty()
+            && self.relabel(cx, dt, true).is_none()
+    }
+
     /// Real C name for a residual `TYPE_UNKNOWN` base, or `None` when the gate is
     /// off / the type is not unknown. Conservative on sign (multi-byte unknowns
     /// are unsigned, since the real sign is genuinely unknown); a pointer-to-
@@ -69,7 +78,7 @@ impl TypeSpeller for CSpeller {
     fn relabel(
         &self,
         cx: &SpellCtx,
-        dt: &Rc<Datatype>,
+        dt: &crate::dtype::TypeRoot,
         under_pointer: bool,
     ) -> Option<Cow<'static, str>> {
         if dt.get_metatype() == type_metatype::TYPE_UNKNOWN {
@@ -94,7 +103,7 @@ impl TypeSpeller for CSpeller {
         .map(Cow::Borrowed)
     }
 
-    fn anonymous(&self, dt: &Rc<Datatype>) -> String {
+    fn anonymous(&self, dt: &crate::dtype::TypeRoot) -> String {
         match dt.get_metatype() {
             type_metatype::TYPE_VOID => "void".to_string(),
             _ => format!("undefined{}", dt.get_size()),
@@ -104,23 +113,29 @@ impl TypeSpeller for CSpeller {
     /// The stack is built base-up exactly as `buildTypeStack`; pointer modifiers
     /// go on the front (`*`), array modifiers on the tail (`[N]`), and a `*`
     /// front nested inside an array tail is parenthesised -- the precedence the
-    /// RPN `ptr_expr`/`array_expr` tokens encode. `CDeclarator::postfix` is generic
-    /// enough for function suffixes, but Datatype traversal currently supplies
-    /// pointer and array modifiers only.
-    fn declarator(&self, cx: &SpellCtx, ct: &Rc<Datatype>) -> (String, String) {
+    /// RPN `ptr_expr`/`array_expr` tokens encode. Completed callable types add a
+    /// function postfix and continue through their return datatype.
+    fn declarator_annotated(
+        &self, cx: &SpellCtx, ct: &crate::dtype::TypeRoot, annotate: bool,
+    ) -> (TypeText, TypeText) {
         // buildTypeStack: walk to the base (named) type, recording the modifiers.
-        let mut stack: Vec<Rc<Datatype>> = Vec::new();
-        let mut cur = Rc::clone(ct);
+        let mut stack: Vec<crate::dtype::TypeRoot> = Vec::new();
+        let mut cur = ct.clone();
         loop {
-            stack.push(Rc::clone(&cur));
-            if !cur.get_name().is_empty() {
+            stack.push(cur.clone());
+            let view = cur.read();
+            if !view.get(cur.id()).expect("retained datatype").get_name().is_empty() {
                 break; // base type
             }
             let next = match cur.get_metatype() {
                 type_metatype::TYPE_PTR => cur.get_ptr_to(),
                 type_metatype::TYPE_ARRAY => cur.get_array_base(),
+                type_metatype::TYPE_CODE => view.get_code_prototype(cur.id())
+                    .expect("retained datatype")
+                    .map(|proto| cur.related(proto.output).expect("callable output edge")),
                 _ => None, // other anonymous type: stop
             };
+            drop(view);
             match next {
                 Some(n) => cur = n,
                 None => break,
@@ -128,6 +143,8 @@ impl TypeSpeller for CSpeller {
         }
         // The base type's display name (anonymous -> `undefined<N>` / `void`).
         let base = stack.last().expect("declarator: non-empty stack");
+        let base_view = base.read();
+        let base_node = base_view.get(base.id()).expect("retained datatype");
         // (kuna) realtypes: relabel a residual TYPE_UNKNOWN base as a real C type
         // by size. Under a pointer modifier the same size table applies, so the
         // pointee width survives into the declaration; only a residual size with
@@ -136,12 +153,17 @@ impl TypeSpeller for CSpeller {
         let under_pointer = stack[..stack.len() - 1]
             .iter()
             .any(|m| matches!(m.get_metatype(), type_metatype::TYPE_PTR));
-        let base_name = if let Some(n) = self.relabel(cx, base, under_pointer) {
-            n.into_owned()
-        } else if base.get_name().is_empty() {
-            self.anonymous(base)
+        let (base_name, policy) = if let Some(n) = self.relabel(cx, base, under_pointer) {
+            (n.into_owned(), TypeTokenPolicy::SpelledWords)
+        } else if base_node.get_name().is_empty() {
+            (self.anonymous(base), TypeTokenPolicy::SpelledWords)
         } else {
-            base.get_display_name().to_string()
+            let policy = if annotate && !base_node.is_core_type() {
+                TypeTokenPolicy::NominalName
+            } else {
+                TypeTokenPolicy::SpelledWords
+            };
+            (base_node.get_display_name().to_string(), policy)
         };
 
         // Walk modifiers OUTERMOST-to-base (`stack[0]..stack[len-2]`).  This is
@@ -161,7 +183,18 @@ impl TypeSpeller for CSpeller {
                             .max(1);
                         ct_mod.get_size() / base
                     });
-                    decl.postfix(&format!("[{n}]"));
+                    decl.postfix(TypeText::plain(format!("[{n}]")));
+                }
+                type_metatype::TYPE_CODE => {
+                    let view = ct_mod.read();
+                    if let Some(proto) = view.get_code_prototype(ct_mod.id()).expect("retained datatype") {
+                        let convention = crate::printc::emitted_bound_model_name(proto.binding.model(), cx.conventions);
+                        if !convention.is_empty() {
+                            decl.front.prefix(" ");
+                            decl.front.prefix(convention);
+                        }
+                    }
+                    decl.postfix(self.callable_suffix(cx, ct_mod, annotate));
                 }
                 _ => {}
             }
@@ -169,31 +202,44 @@ impl TypeSpeller for CSpeller {
         // `<base> <front>` with a single separating space before any `*` modifiers
         // (the `type_expr_space` token); a bare base type has no trailing space
         // here (the caller adds the space before the identifier).
-        let front_full = if decl.front.is_empty() {
-            base_name
-        } else {
-            format!("{base_name} {}", decl.front)
-        };
+        let mut front_full = TypeText::leaf(base_name, base, annotate, policy);
+        if !decl.front.text.is_empty() {
+            front_full.text.reserve(1 + decl.front.text.len());
+            front_full.push_str(" ");
+            front_full.append(decl.front);
+        }
         (front_full, decl.back)
     }
 
-    fn type_name(&self, cx: &SpellCtx, t: &Rc<Datatype>) -> (String, String) {
+    fn type_name_annotated(
+        &self, cx: &SpellCtx, t: &crate::dtype::TypeRoot, annotate: bool,
+    ) -> (TypeText, TypeText) {
         // (kuna) realtypes: a scalar residual TYPE_UNKNOWN (the named `xunknownN`
         // core type or an anonymous `undefined<N>`) becomes its real C type by size.
         if let Some(n) = self.relabel(cx, t, false) {
-            return (n.into_owned(), String::new());
+            return (TypeText::leaf(n.into_owned(), t, annotate, TypeTokenPolicy::SpelledWords),
+                TypeText::default());
         }
-        let name = t.get_name();
+        let view = t.read();
+        let node = view.get(t.id()).expect("retained datatype");
+        let name = node.get_name();
         if !name.is_empty() {
-            return (name.to_string(), String::new());
+            let policy = if annotate && !node.is_core_type() {
+                TypeTokenPolicy::NominalName
+            } else {
+                TypeTokenPolicy::SpelledWords
+            };
+            return (TypeText::leaf(name.to_string(), t, annotate, policy), TypeText::default());
         }
         match t.get_metatype() {
             // An anonymous pointer renders as `<pointee> *` (recursively), exactly
             // as `push_cast_type` does for a `(char *)` cast. `declarator` walks
             // the modifier chain to the named base and lays out both halves; a
             // pointer to an array keeps its `)[N]` suffix for after the name.
-            type_metatype::TYPE_PTR => self.declarator(cx, t),
-            _ => (self.anonymous(t), String::new()),
+            type_metatype::TYPE_PTR | type_metatype::TYPE_CODE =>
+                self.declarator_annotated(cx, t, annotate),
+            _ => (TypeText::leaf(self.anonymous(t), t, annotate, TypeTokenPolicy::SpelledWords),
+                TypeText::default()),
         }
     }
 
@@ -232,6 +278,49 @@ impl TypeSpeller for CSpeller {
     }
 }
 
+impl CSpeller {
+    fn callable_suffix(&self, cx: &SpellCtx, code: &crate::dtype::TypeRoot, annotate: bool) -> TypeText {
+        let view = code.read();
+        let Some(proto) = view.get_code_prototype(code.id()).expect("retained datatype") else {
+            return TypeText::default();
+        };
+        let mut suffix = TypeText::plain("(");
+        let fixed = if proto.variadic {
+            proto.logical_first.map(|slot| slot as usize).unwrap_or(proto.inputs.len())
+        } else {
+            proto.inputs.len()
+        };
+        for (slot, &input) in proto.inputs[..fixed].iter().enumerate() {
+            if slot != 0 { suffix.push_str(", "); }
+            let dtype = code.related(input).expect("callable input edge");
+            let (front, back) = self.type_name_annotated(cx, &dtype, annotate);
+            suffix.append(front);
+            suffix.append(back);
+        }
+        if proto.variadic {
+            if fixed != 0 { suffix.push_str(", ..."); }
+        } else if fixed == 0 && proto.input_closed {
+            suffix.push_str("void");
+        }
+        suffix.push_str(")");
+        suffix
+    }
+
+    pub(crate) fn callable_typedef(&self, cx: &SpellCtx, code: &crate::dtype::TypeRoot, name: &str) -> String {
+        let view = code.read();
+        let Some(proto) = view.get_code_prototype(code.id()).expect("retained datatype") else {
+            return String::new();
+        };
+        let output = code.related(proto.output).expect("callable output edge");
+        let (front, back) = self.declarator(cx, &output);
+        let separator = if front.ends_with('*') { "" } else { " " };
+        let suffix = self.callable_suffix(cx, code, false);
+        let convention = crate::printc::emitted_bound_model_name(proto.binding.model(), cx.conventions);
+        let convention_separator = if convention.is_empty() { "" } else { " " };
+        format!("typedef {front}{separator}{convention}{convention_separator}{name}{}{back};\n", suffix.text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::CDeclarator;
@@ -248,17 +337,15 @@ mod tests {
         for modifier in modifiers_outer_to_inner {
             match modifier {
                 Modifier::Pointer => decl.pointer(),
-                Modifier::Array(n) => decl.postfix(&format!("[{n}]")),
-                Modifier::SyntheticPostfix(suffix) => decl.postfix(suffix),
+                Modifier::Array(n) => decl.postfix(super::TypeText::plain(format!("[{n}]"))),
+                Modifier::SyntheticPostfix(suffix) => decl.postfix(super::TypeText::plain(*suffix)),
             }
         }
-        format!("int {}x{}", decl.front, decl.back)
+        format!("int {}x{}", decl.front.text, decl.back.text)
     }
 
     /// The generic helper must distinguish every adjacent pointer/postfix
-    /// ordering. Datatype traversal currently supplies only array postfixes;
-    /// synthetic function suffixes here fence the helper's grouping rule. The
-    /// right-hand strings are declarations accepted by a C compiler.
+    /// ordering, including function suffixes and nested array returns.
     #[test]
     fn pointer_array_and_function_precedence_table() {
         use Modifier::{Array as A, Pointer as P, SyntheticPostfix as S};
@@ -281,5 +368,118 @@ mod tests {
         for (mods, expected) in cases {
             assert_eq!(spell(mods), *expected);
         }
+    }
+
+    #[test]
+    fn completed_callable_types_preserve_nested_parameter_and_return_declarators() {
+        use std::rc::Rc;
+        use kuna_base::space::AddrSpaceManager;
+        use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField, TypeRoot};
+        use crate::fspec::{LogicalCallable, ProtoModel};
+        use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(8), 8, 8);
+        types.set_core_type("int", 4, type_metatype::TYPE_INT, false).unwrap();
+        types.set_core_type("void", 1, type_metatype::TYPE_VOID, false).unwrap();
+        types.cache_core_types().unwrap();
+        let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let manager = Rc::new(AddrSpaceManager::new());
+        let mut model = ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        let model = Rc::new(model);
+        types.set_proto_context(Some(model), manager).unwrap();
+        let binding = types.model_binding(None).unwrap();
+        let callable = |output: TypeRoot, inputs: Vec<TypeRoot>, variadic: bool, input_closed: bool| {
+            let proto = LogicalCallable {
+                binding: binding.clone(),
+                output: output.id(),
+                logical_first: variadic.then_some(inputs.len() as i32),
+                inputs: inputs.iter().map(TypeRoot::id).collect(),
+                variadic,
+                input_closed,
+                flags: 0,
+            };
+            let code = types.get_type_code_proto(&proto).unwrap();
+            types.get_type_pointer(8, code, 1).unwrap()
+        };
+        let callback = callable(integer.clone(), vec![integer.clone()], false, true);
+        let callback_code = callback.get_ptr_to().unwrap();
+        assert_eq!(super::C_SPELLER.type_name(&SpellCtx::OFF, &callback_code),
+            ("int".to_string(), "(int)".to_string()));
+        let int_pointer = types.get_type_pointer(8, integer.clone(), 1).unwrap();
+        let nested = callable(int_pointer, vec![integer.clone(), callback], true, true);
+        let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, &nested);
+        // The semantic declaration never acquires an ABI hidden-result slot.
+        assert_eq!(format!("{front}x{back}"), "int *(*x)(int, int (*)(int), ...)");
+
+        let open = callable(integer.clone(), Vec::new(), false, false);
+        let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, &open);
+        assert_eq!(format!("{front}x{back}"), "int (*x)()");
+
+        let expanded = LogicalCallable {
+            binding: binding.clone(),
+            output: integer.id(),
+            inputs: vec![integer.id(), integer.id(), types.get_base(8, type_metatype::TYPE_FLOAT).unwrap().id()],
+            variadic: true,
+            input_closed: true,
+            logical_first: Some(1),
+            flags: 0,
+        };
+        let code = types.get_type_code_proto(&expanded).unwrap();
+        let pointer = types.get_type_pointer(8, code, 1).unwrap();
+        let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, &pointer);
+        assert_eq!(format!("{front}x{back}"), "int (*x)(int, ...)");
+
+        let array = types.get_type_array(3, integer).unwrap();
+        let array_pointer = types.get_type_pointer(8, array, 1).unwrap();
+        let nested_return = callable(array_pointer, Vec::new(), false, true);
+        let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, &nested_return);
+        assert_eq!(format!("{front}x{back}"), "int (*(*x)(void))[3]");
+
+        let node = types.reserve("Node", Datatype::hash_name("Node"), type_metatype::TYPE_STRUCT).unwrap();
+        let callback = callable(node.clone(), vec![node.clone()], false, true);
+        let mut body = Datatype::new_with_align(8, 8, type_metatype::TYPE_STRUCT);
+        body.name = "Node".into();
+        body.display_name = "Node".into();
+        body.id = Datatype::hash_name("Node");
+        body.kind = DatatypeKind::Struct {
+            field: vec![TypeField::new(0, 0, "next", callback.id())],
+            bitfield: vec![],
+        };
+        types.complete(&node, body).unwrap();
+        let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, &callback);
+        assert_eq!(format!("{front}x{back}"), "Node (*x)(Node)");
+        assert_eq!(crate::kuna_structdefs::definition_text(&node, SpellCtx::OFF),
+            "struct Node {\n    Node (*next)(Node);\n};\n");
+
+        // A callback suffix contains independent nominal leaves. Its identity
+        // cannot be copied from the enclosing pointer or outer return type.
+        let input = types.get_typedef(&node, "Input", 0x1234, 0).unwrap();
+        let nested = callable(input.clone(), vec![node.clone()], false, true);
+        let outer = callable(node.clone(), vec![input.clone(), nested], false, true);
+        let (front, back) = super::C_SPELLER.declarator_annotated(&SpellCtx::OFF, &outer, true);
+        assert_eq!(format!("{}x{}", front.text, back.text),
+            "Node (*x)(Input, Input (*)(Node))");
+        let leaves = |text: &super::TypeText| text.spans.iter().map(|span|
+            (text.text[span.start..span.end].to_string(), span.id)
+        ).collect::<Vec<_>>();
+        let node_id = node.get_unsized_id().unwrap();
+        assert_eq!(leaves(&front), vec![("Node".into(), node_id)]);
+        assert_eq!(leaves(&back), vec![
+            ("Input".into(), 0x1234), ("Input".into(), 0x1234), ("Node".into(), node_id),
+        ]);
+        let (plain_front, plain_back) =
+            super::C_SPELLER.declarator_annotated(&SpellCtx::OFF, &outer, false);
+        assert_eq!((&plain_front.text, &plain_back.text), (&front.text, &back.text));
+        assert!(plain_front.spans.is_empty() && plain_back.spans.is_empty());
+        front.into_parts();
+        back.into_parts();
+
+        // Naming the whole callable stops the traversal at the typedef itself.
+        let alias = types.get_typedef(&outer, "Transform", 0x5678, 0).unwrap();
+        let (front, back) = super::C_SPELLER.declarator_annotated(&SpellCtx::OFF, &alias, true);
+        assert_eq!(leaves(&front), vec![("Transform".into(), 0x5678)]);
+        assert!(back.text.is_empty() && back.spans.is_empty());
     }
 }

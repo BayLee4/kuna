@@ -29,7 +29,7 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn char_ptr(f: &TypeFactoryImpl) -> Rc<Datatype> {
+fn char_ptr(f: &TypeFactoryImpl) -> TypeRoot {
     let c = f.get_base(1, type_metatype::TYPE_INT).unwrap();
     f.get_type_pointer(8, c, 1).unwrap()
 }
@@ -86,30 +86,25 @@ fn char_pointer_recognition_is_exact() {
     ));
 }
 
-/// The census label names the evidence a candidate rests on, and a refusal
-/// outranks every piece of evidence collected before it.
+/// A refusal outranks every piece of evidence collected before it.
 #[test]
 fn evidence_commits_only_without_a_refusal() {
     let mut ev = Evidence::default();
     assert!(!ev.commits());
-    assert_eq!(ev.label(), "none");
     ev.byte = 2;
     assert!(ev.commits());
-    assert_eq!(ev.label(), "byte");
     ev.libc = 1;
     ev.fmt = 1;
-    assert_eq!(ev.label(), "fmt+byte");
     ev.refused = Some("elem-wider");
     assert!(!ev.commits());
-    assert_eq!(ev.label(), "refuse:elem-wider");
 }
 
-/// Two candidates of the same shape are the same `Rc`, so nothing downstream sees
+/// Two candidates of the same shape have the same graph identity, so nothing downstream sees
 /// a type change that is only identity churn.
 #[test]
 fn candidate_is_stable_across_calls() {
     let f = factory();
-    assert!(Rc::ptr_eq(&char_ptr(&f), &char_ptr(&f)));
+    assert_eq!(char_ptr(&f), char_ptr(&f));
 }
 
 /// A one-byte element step is character evidence only at a varying index from

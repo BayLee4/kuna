@@ -23,7 +23,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use super::{BitFieldNodeState, BitFieldTransform, BitRange};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use std::rc::Rc;
@@ -53,7 +53,7 @@ struct PullRecord {
     /// (C++ `readOp`).
     read_op: Option<OpId>,
     /// Data-type associated with the pulled value (C++ `dt`).
-    dt: Option<Rc<Datatype>>,
+    dt: Option<TypeRoot>,
     /// Type of pull (C++ `type`).
     kind: PullKind,
     /// Bit position of field being pulled (C++ `pos`).
@@ -78,7 +78,7 @@ impl PullRecord {
         PullRecord {
             read_vn: Some(state.node),
             read_op: op,
-            dt: Some(Rc::clone(&field.field_type)),
+            dt: state.field_type().cloned(),
             kind: PullKind::Normal,
             pos: state.orig_least_sig_bit,
             num_bits: field.num_bits,
@@ -95,7 +95,7 @@ impl PullRecord {
         PullRecord {
             read_vn: Some(state.node),
             read_op: Some(op),
-            dt: Some(Rc::clone(&field.field_type)),
+            dt: state.field_type().cloned(),
             kind: PullKind::Equal,
             pos: state.orig_least_sig_bit,
             num_bits: field.num_bits,
@@ -140,7 +140,7 @@ pub struct BitFieldPullTransform {
 /// `BitFieldPullTransform::TransformState`, bitfield.hh:125-131).
 struct TransformState {
     /// Partial data-type of the root container (C++ `partialType`).
-    partial_type: Rc<Datatype>,
+    partial_type: TypeRoot,
     /// Number of PullRecords processed (C++ `count`).
     count: int4,
     /// Scratch space for opDestroyRecursive (C++ `deadScratch`).
@@ -156,7 +156,7 @@ impl BitFieldPullTransform {
     pub fn new(
         data: &Funcdata,
         r: VarnodeId,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         off: int4,
         big_endian: bool,
     ) -> Option<BitFieldPullTransform> {
@@ -677,22 +677,22 @@ impl BitFieldPullTransform {
 
     /// Build the (partial) data-type associated with the root bitfield container
     /// (C++ `BitFieldTransform::buildPartialType`, bitfield.cc:556-562).
-    fn build_partial_type(&self, data: &Funcdata) -> Rc<Datatype> {
+    fn build_partial_type(&self, data: &Funcdata) -> TypeRoot {
         let parent = self.base.parent_struct.as_ref().expect("parentStruct set");
         if self.base.container_size == parent.get_size() {
-            return Rc::clone(parent);
+            return parent.clone();
         }
         let arch = Rc::clone(data.get_arch());
         if let Some(types) = arch.types() {
             if let Ok(t) = types.get_type_partial_struct(
-                Rc::clone(parent),
+                parent.clone(),
                 self.base.initial_offset,
                 self.base.container_size,
             ) {
                 return t;
             }
         }
-        Rc::clone(parent)
+        parent.clone()
     }
 
     /// Perform transform corresponding to the given PullRecord (C++
@@ -736,7 +736,7 @@ impl BitFieldPullTransform {
         data
             .vbank_mut()
             .get_mut(in_vn)
-            .map(|v| v.update_type(Rc::clone(&state.partial_type)));
+            .map(|v| v.update_type(state.partial_type.clone()));
         let mod_addr = data.obank().get(mod_op).unwrap().get_addr().clone();
         let pull_op = data.new_op(3, mod_addr.clone());
         let pull_code = if rec.dt.as_ref().unwrap().get_metatype() == type_metatype::TYPE_INT {
@@ -774,7 +774,7 @@ impl BitFieldPullTransform {
         if pull_out_meta == type_metatype::TYPE_UNKNOWN {
             let arch = Rc::clone(data.get_arch());
             if let Some(types) = arch.types() {
-                if let Ok(dt) = types.resize_integer(Rc::clone(rec.dt.as_ref().unwrap()), pull_out_size) {
+                if let Ok(dt) = types.resize_integer(rec.dt.as_ref().unwrap().clone(), pull_out_size) {
                     data.vbank_mut().get_mut(pull_out).map(|v| v.update_type(dt));
                 }
             }
@@ -782,7 +782,7 @@ impl BitFieldPullTransform {
             && pull_out_size == 1
             && rec.num_bits == 1
         {
-            let dt = Rc::clone(rec.dt.as_ref().unwrap());
+            let dt = rec.dt.as_ref().unwrap().clone();
             data.vbank_mut().get_mut(pull_out).map(|v| v.update_type(dt));
         }
         if Some(mod_op) != rec.read_op {
@@ -852,7 +852,7 @@ impl BitFieldPullTransform {
                 (
                     r.read_op.unwrap(),
                     r.read_vn.unwrap(),
-                    Rc::clone(r.dt.as_ref().unwrap()),
+                    r.dt.as_ref().unwrap().clone(),
                     r.mask,
                     r.left_shift,
                     r.num_bits,
@@ -867,7 +867,7 @@ impl BitFieldPullTransform {
             let cvn = data.new_constant(read_size, val);
             let arch = Rc::clone(data.get_arch());
             if let Some(types) = arch.types() {
-                if let Ok(ndt) = types.resize_integer(Rc::clone(&dt), read_size) {
+                if let Ok(ndt) = types.resize_integer(dt.clone(), read_size) {
                     data.vbank_mut().get_mut(cvn).map(|v| v.update_type(ndt));
                 }
             }

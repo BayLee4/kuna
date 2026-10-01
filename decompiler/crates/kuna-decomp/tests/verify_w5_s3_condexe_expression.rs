@@ -31,7 +31,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::expression::{
     boolean_match, functional_equality_level, BooleanMatch,
 };
@@ -65,7 +65,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -79,8 +86,8 @@ fn const_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space(0).unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn opcode_flags(opc: OpCode) -> kuna_base::types::uint4 {
@@ -114,12 +121,14 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(size, Address::new(ram, off), dt(size))
+    let ct = dt(fd, size);
+    fd.vbank_mut().create(size, Address::new(ram, off), ct)
 }
 
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(size, Address::new(ram, off), dt(size));
+    let ct = dt(fd, size);
+    let vn = fd.vbank_mut().create(size, Address::new(ram, off), ct);
     let mut noop_thunk = |_b: &mut kuna_decomp::varnode::VarnodeBank,
                           _o: VarnodeId,
                           _n: VarnodeId|
@@ -131,7 +140,8 @@ fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
 
 fn mk_const(fd: &mut Funcdata, val: u64, size: int4) -> VarnodeId {
     let c = const_space(fd);
-    fd.vbank_mut().create(size, Address::new(c, val), dt(size))
+    let ct = dt(fd, size);
+    fd.vbank_mut().create(size, Address::new(c, val), ct)
 }
 
 fn mk_out(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
@@ -145,8 +155,9 @@ fn mk_out(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
          -> kuna_base::error::KunaResult<()> {
             panic!("mk_out: distinct addresses must not collide (xref replace fired)")
         };
+        let ct = dt(fd, size);
         fd.vbank_mut()
-            .create_def(size, Address::new(ram, off), dt(size), def, &mut noop_thunk)
+            .create_def(size, Address::new(ram, off), ct, def, &mut noop_thunk)
             .unwrap()
     };
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));

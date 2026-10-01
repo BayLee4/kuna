@@ -39,11 +39,9 @@
 //! op) is genuinely `Funcdata`-dependent and lives in the console driver, not
 //! here, so this module stays a pure, portable, unit-tested library.
 
-use std::rc::Rc;
-
 use kuna_base::error::KunaResult;
 use kuna_base::types::uint4;
-use kuna_decomp::dtype::{Datatype, TypeFactory};
+use kuna_decomp::dtype::{TypeRoot, TypeFactory};
 use kuna_decomp::fspec::PrototypePieces;
 use kuna_decomp::kuna_formatstring::VarargAbi;
 
@@ -111,8 +109,8 @@ pub fn classify_variadic_call(name: &str) -> Option<bool> {
 /// as an `Err`.
 pub fn build_override_pieces(
     name: &str,
-    outtype: Option<Rc<Datatype>>,
-    fixed_param_types: &[Rc<Datatype>],
+    outtype: Option<TypeRoot>,
+    fixed_param_types: &[TypeRoot],
     format_specs: &[Spec],
     types: &dyn TypeFactory,
     word_size: uint4,
@@ -135,10 +133,10 @@ pub fn build_override_pieces(
     if format_specs.contains(&Spec::LongDouble) {
         return Ok(None);
     }
-    let mut intypes: Vec<Rc<Datatype>> = Vec::with_capacity(number_of_parameters);
+    let mut intypes: Vec<TypeRoot> = Vec::with_capacity(number_of_parameters);
     // i < initialFunctionParameters.size(): the callee's recovered fixed params.
     for ty in fixed_param_types {
-        intypes.push(Rc::clone(ty));
+        intypes.push(ty.clone());
     }
     // else: the format-string-derived var-arg types.
     for spec in format_specs {
@@ -212,7 +210,7 @@ mod tests {
             .set_core_type("char", 1, kuna_decomp::dtype::type_metatype::TYPE_INT, true)
             .expect("char core type");
         types.cache_core_types().expect("cache core types");
-        let fixed: Vec<Rc<Datatype>> = Vec::new();
+        let fixed: Vec<TypeRoot> = Vec::new();
         assert!(build_override_pieces(
             "printf",
             None,
@@ -248,7 +246,7 @@ mod tests {
             .set_core_type("char", 1, kuna_decomp::dtype::type_metatype::TYPE_INT, true)
             .expect("char core type");
         types.cache_core_types().expect("cache core types");
-        let fixed: Vec<Rc<Datatype>> = Vec::new();
+        let fixed: Vec<TypeRoot> = Vec::new();
         let build = |specs: &[Spec], abi| {
             build_override_pieces("printf", None, &fixed, specs, &types, 1, abi).unwrap()
         };

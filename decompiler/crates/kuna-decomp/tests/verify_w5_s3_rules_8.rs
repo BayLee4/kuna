@@ -35,7 +35,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use kuna_decomp::action::Rule;
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_8::{
     RuleLzcountShiftBool, RuleOrCompare, RuleThreeWayCompare,
@@ -68,7 +68,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -78,8 +85,8 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -109,7 +116,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, inputs: int4, off: u64, opc: OpCode) ->
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
 }
 
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
@@ -121,7 +128,7 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: u64) -> VarnodeId {
     fd.new_constant(size, val)
 }
 
-fn set_output(fd: &mut Funcdata, op: OpId, off: u64, ct: Rc<Datatype>) -> VarnodeId {
+fn set_output(fd: &mut Funcdata, op: OpId, off: u64, ct: TypeRoot) -> VarnodeId {
     let r = ram(fd);
     let size = ct.get_size();
     let vn = fd.new_varnode(size, &Address::new(r, off), Some(ct));
@@ -174,10 +181,12 @@ fn build_zext_cmp(
     let cmp = mk_op(fd, bl, 2, base_off, opc);
     wire(fd, a, cmp, 0);
     wire(fd, b, cmp, 1);
-    let cmp_out = set_output(fd, cmp, base_off + 0x40, unk(1));
+    let ct = unk(fd, 1);
+    let cmp_out = set_output(fd, cmp, base_off + 0x40, ct);
     let zext = mk_op(fd, bl, 1, base_off + 1, OpCode::CPUI_INT_ZEXT);
     wire(fd, cmp_out, zext, 0);
-    let zext_out = set_output(fd, zext, base_off + 0x80, unk(4));
+    let ct = unk(fd, 4);
+    let zext_out = set_output(fd, zext, base_off + 0x80, ct);
     (cmp, zext_out)
 }
 
@@ -196,14 +205,16 @@ fn w5s3r8_threeway_form1_eq_zero_collapses_to_int_equal() {
     let inner = mk_op(&mut fd, bl, 2, 0x300, OpCode::CPUI_INT_ADD);
     wire(&mut fd, z1, inner, 0);
     wire(&mut fd, z2, inner, 1);
-    let inner_out = set_output(&mut fd, inner, 0x340, unk(4));
+    let ct = unk(&fd, 4);
+    let inner_out = set_output(&mut fd, inner, 0x340, ct);
 
     // threeway = inner + (-1)  [Form 1: (z+z) - 1, the const is -1 = mask]
     let minus1 = mk_const(&mut fd, 4, 0xffff_ffff);
     let three = mk_op(&mut fd, bl, 2, 0x380, OpCode::CPUI_INT_ADD);
     wire(&mut fd, inner_out, three, 0);
     wire(&mut fd, minus1, three, 1);
-    let three_out = set_output(&mut fd, three, 0x3c0, unk(4));
+    let ct = unk(&fd, 4);
+    let three_out = set_output(&mut fd, three, 0x3c0, ct);
 
     // secondary: op = (threeway == 0), threeway on slot 0, 0 on slot 1.
     // -> in0 not const => constSlot becomes 1, val = 0 (the 0 constant).
@@ -211,7 +222,8 @@ fn w5s3r8_threeway_form1_eq_zero_collapses_to_int_equal() {
     let op = mk_op(&mut fd, bl, 2, 0x400, OpCode::CPUI_INT_EQUAL);
     wire(&mut fd, three_out, op, 0);
     wire(&mut fd, zero, op, 1);
-    let _ = set_output(&mut fd, op, 0x440, unk(1));
+    let ct = unk(&fd, 1);
+    let _ = set_output(&mut fd, op, 0x440, ct);
 
     let r = RuleThreeWayCompare.apply_op(op, &mut fd);
     assert_eq!(r, 1, "Form-1 threeway==0 must collapse");
@@ -239,17 +251,20 @@ fn w5s3r8_threeway_form1_sless_zero_collapses_to_a_lt_b() {
     let inner = mk_op(&mut fd, bl, 2, 0x300, OpCode::CPUI_INT_ADD);
     wire(&mut fd, z1, inner, 0);
     wire(&mut fd, z2, inner, 1);
-    let inner_out = set_output(&mut fd, inner, 0x340, unk(4));
+    let ct = unk(&fd, 4);
+    let inner_out = set_output(&mut fd, inner, 0x340, ct);
     let minus1 = mk_const(&mut fd, 4, 0xffff_ffff);
     let three = mk_op(&mut fd, bl, 2, 0x380, OpCode::CPUI_INT_ADD);
     wire(&mut fd, inner_out, three, 0);
     wire(&mut fd, minus1, three, 1);
-    let three_out = set_output(&mut fd, three, 0x3c0, unk(4));
+    let ct = unk(&fd, 4);
+    let three_out = set_output(&mut fd, three, 0x3c0, ct);
     let zero = mk_const(&mut fd, 4, 0);
     let op = mk_op(&mut fd, bl, 2, 0x400, OpCode::CPUI_INT_SLESS);
     wire(&mut fd, three_out, op, 0);
     wire(&mut fd, zero, op, 1);
-    let _ = set_output(&mut fd, op, 0x440, unk(1));
+    let ct = unk(&fd, 1);
+    let _ = set_output(&mut fd, op, 0x440, ct);
 
     let r = RuleThreeWayCompare.apply_op(op, &mut fd);
     assert_eq!(r, 1);
@@ -361,13 +376,15 @@ fn w5s3r8_lzcount_non_power_of_two_size_blocks_without_mutation() {
     let x = mk_input(&mut fd, 0x10, 3);
     let lz = mk_op(&mut fd, bl, 1, 0x100, OpCode::CPUI_LZCOUNT);
     wire(&mut fd, x, lz, 0);
-    let lz_out = set_output(&mut fd, lz, 0x40, unk(3));
+    let ct = unk(&fd, 3);
+    let lz_out = set_output(&mut fd, lz, 0x40, ct);
     // a matching shift reader (would otherwise fire): (lzout >> 4)
     let four = mk_const(&mut fd, 4, 4);
     let shr = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_RIGHT);
     wire(&mut fd, lz_out, shr, 0);
     wire(&mut fd, four, shr, 1);
-    let _ = set_output(&mut fd, shr, 0x80, unk(3));
+    let ct = unk(&fd, 3);
+    let _ = set_output(&mut fd, shr, 0x80, ct);
 
     assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd), 0, "size 3 -> popcount(24)!=1 blocks");
     // The shift reader is untouched.
@@ -387,12 +404,14 @@ fn w5s3r8_lzcount_power_of_two_completes_int_equal_rewrite() {
     let x = mk_input(&mut fd, 0x10, 4);
     let lz = mk_op(&mut fd, bl, 1, 0x100, OpCode::CPUI_LZCOUNT);
     wire(&mut fd, x, lz, 0);
-    let lz_out = set_output(&mut fd, lz, 0x40, unk(4));
+    let ct = unk(&fd, 4);
+    let lz_out = set_output(&mut fd, lz, 0x40, ct);
     let five = mk_const(&mut fd, 4, 5);
     let shr = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_RIGHT);
     wire(&mut fd, lz_out, shr, 0);
     wire(&mut fd, five, shr, 1);
-    let _ = set_output(&mut fd, shr, 0x80, unk(4));
+    let ct = unk(&fd, 4);
+    let _ = set_output(&mut fd, shr, 0x80, ct);
 
     assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd), 1, "transform completes since w4x");
     assert_eq!(code(&fd, shr), OpCode::CPUI_INT_ZEXT, "size-4 output -> INT_ZEXT (not COPY)");
@@ -426,12 +445,14 @@ fn w5s3r8_orcompare_completes_and_links_v_w_descendants() {
     let orop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_OR);
     wire(&mut fd, v, orop, 0);
     wire(&mut fd, w, orop, 1);
-    let orout = set_output(&mut fd, orop, 0x30, unk(4));
+    let ct = unk(&fd, 4);
+    let orout = set_output(&mut fd, orop, 0x30, ct);
     let zero = mk_const(&mut fd, 4, 0);
     let eq = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_EQUAL);
     wire(&mut fd, orout, eq, 0);
     wire(&mut fd, zero, eq, 1);
-    let _ = set_output(&mut fd, eq, 0x40, unk(1));
+    let ct = unk(&fd, 1);
+    let _ = set_output(&mut fd, eq, 0x40, ct);
 
     assert_eq!(fd.vbank().get(v).unwrap().num_descend(), 1);
     assert_eq!(fd.vbank().get(w).unwrap().num_descend(), 1);

@@ -1,0 +1,51 @@
+--- a/ghidra/app/plugin/processors/sleigh/PcodeEmit.java
++++ b/ghidra/app/plugin/processors/sleigh/PcodeEmit.java
+@@ -52,6 +52,8 @@
+ 	protected VarnodeData[] incache;
+ 	protected ArrayList<Integer> labeldef = null;
+ 	protected int numOps = 0;							// Number of PcodeOps generated so far
++	// Exact emitted CALL ordinal while generating a FlowOverride.CALL_RETURN return.
++	protected int callReturnOrigin = -1;
+ 	private int labelbase = 0;
+ 	private int labelcount = 0;
+ 	private boolean inDelaySlot = false;				// Are we currently emitting delayslot p-code
+@@ -227,7 +229,15 @@
+ 				new ConstTpl(ConstTpl.REAL, const_space.getPointerSize()));
+ 
+ 		OpTpl retOpt = new OpTpl(PcodeOp.RETURN, null, new VarnodeTpl[] { nullAddr });
+-		dump(retOpt);
++		// Each caller just emitted an output-less CALL/CALLIND. Any operand loads
++		// have already been counted, so this names the actual emitted call.
++		callReturnOrigin = numOps - 1;
++		try {
++			dump(retOpt);
++		}
++		finally {
++			callReturnOrigin = -1;
++		}
+ 	}
+ 
+ 	private boolean dumpCallOverride(OpTpl opt, boolean returnAfterCall) throws IOException {
+--- a/ghidra/app/plugin/processors/sleigh/PcodeEmitPacked.java
++++ b/ghidra/app/plugin/processors/sleigh/PcodeEmitPacked.java
+@@ -30,6 +30,10 @@
+  *
+  */
+ public class PcodeEmitPacked extends PcodeEmit {
++
++	// Kuna optional per-op provenance; stock decoders skip unknown attributes.
++	private static final AttributeId ATTRIB_KUNA_CALLRETURN =
++		new AttributeId("kuna_callreturn", 4002);
+ 
+ 	public class LabelRef {
+ 		public int opIndex;		// Index of operation referencing the label
+@@ -131,6 +135,9 @@
+ 		encoder.openElement(ELEM_OP);
+ 		encoder.writeSignedInteger(ATTRIB_CODE, updatedOpcode);
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, isize);
++		if (updatedOpcode == PcodeOp.RETURN && callReturnOrigin >= 0) {
++			encoder.writeUnsignedInteger(ATTRIB_KUNA_CALLRETURN, callReturnOrigin);
++		}
+ 		if (out == null) {
+ 			encoder.openElement(ELEM_VOID);
+ 			encoder.closeElement(ELEM_VOID);

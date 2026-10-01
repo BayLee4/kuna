@@ -26,9 +26,12 @@ use std::path::Path;
 use kuna_base::address::Address;
 use kuna_decomp::decompile_drive::{
     extract_type_definitions, extract_variables, print_c, print_c_prototype,
-    print_c_with_provenance, print_c_with_srcmap, GlobalInfo, LineMapping, TypeInfo, VarInfo,
+    print_c_with_provenance, print_c_with_srcmap, global_declarations, GlobalInfo, LineMapping, TypeInfo, VarInfo,
 };
 use kuna_decomp::funcdata::Funcdata;
+use kuna_decomp::kuna_callabletransport::{
+    collect_callable_publication, validate_callable_publication, CallableBody, CallableDefinition, CallablePublication,
+};
 use kuna_num::opcodes::OpCode;
 // `ConsoleProgram::sections` documents its `flags` word as exactly the
 // `kuna_sleigh::loadimage::section_flags` constant set (UNALLOC=1, NOLOAD=2,
@@ -80,11 +83,15 @@ pub struct FuncResult {
     /// `decompile-all` path, which does not serialize prototypes.
     pub proto: Option<String>,
     pub variables: Vec<VarInfo>,
+    /// Stable callable requests and final target-owned adapter definitions.
+    pub callable_artifacts: Vec<kuna_decomp::kuna_callabletransport::CallableArtifact>,
+    /// Diagnostic code remains available when an executable callable boundary is unproven.
+    pub callable_export_error: Option<String>,
     /// (kuna `structdefs`) The composite/enum/typedef definitions this
     /// function's C names, in definition-before-use order. Empty unless the
     /// option is on — the same decision that prints them above the body.
     pub types: Vec<TypeInfo>,
-    /// (kuna `globalref`) The globals the C names by address (`&dat_2b080`),
+    /// The authenticated named and unnamed globals referenced by the C,
     /// with the declaration the project header gives each. Never serialized
     /// into `decompile-all --json`; the `decompile-project` header declares them.
     pub globals: Vec<GlobalInfo>,
@@ -365,6 +372,9 @@ pub fn names_any_type(r: &FuncResult, names: &[String]) -> bool {
         || r.variables.iter().any(|v| hit(&v.type_name))
         || r.types.iter().any(|t| hit(&t.name))
         || r.globals.iter().any(|g| hit(&g.declaration))
+        || r.callable_artifacts.iter().any(|a| hit(&a.declaration)
+            || matches!(a.definition.as_ref(),
+                Some(CallableDefinition::Wrapper(text)) if hit(text)))
 }
 
 /// Is `needle` in `hay` as a whole C identifier?
@@ -475,6 +485,8 @@ pub fn decompile_pulled(
                 object_location,
                 callee_hints: Vec::new(),
                 synth: None,
+                callable_artifacts: Vec::new(),
+                callable_export_error: None,
                 detail: None,
             });
             continue;
@@ -508,6 +520,8 @@ pub fn decompile_pulled(
                 object_location,
                 callee_hints: Vec::new(),
                 synth: None,
+                callable_artifacts: Vec::new(),
+                callable_export_error: None,
                 detail: None,
             });
             continue;
@@ -529,6 +543,8 @@ pub fn decompile_pulled(
                 object_location,
                 callee_hints: Vec::new(),
                 synth: None,
+                callable_artifacts: Vec::new(),
+                callable_export_error: None,
                 detail: None,
             });
             continue;
@@ -577,7 +593,7 @@ pub fn decompile_pulled(
         // time, so it has to be seeded here rather than applied afterwards. Every
         // field is empty for a run that passed no directive, which is what makes
         // the plane free (`crate::assertions`).
-        let seed = crate::assertions::function_seed(prog, &name, &entry, single_target);
+        let mut seed = crate::assertions::function_seed(prog, &name, &entry, single_target);
         // (kuna `protoorder`) `entry` is consumed by the symbol-scoped second
         // decompile below; the park needs the address afterwards.
         let park_entry = entry.clone();
@@ -600,7 +616,7 @@ pub fn decompile_pulled(
                 flow_overrides: &flow_ovr,
                 mapped_params: &seed.mapped_params,
             },
-            &[],
+            &kuna_decomp::overrides::Override::new(),
         );
         // (kuna `--assert`) The symbol-scoped second pass. `name`/`type` name a
         // LOCAL, and a local does not exist until a decompile has produced it --
@@ -613,7 +629,7 @@ pub fn decompile_pulled(
             Ok(mut fd)
                 if crate::assertions::has_symbol_scoped(prog, &name, single_target) =>
             {
-                if crate::assertions::apply_symbol_scoped(prog, &mut fd, &name, single_target) {
+                if crate::assertions::apply_symbol_scoped(prog, &mut fd, &name, single_target, &mut seed.mapped_params) {
                     let carried = crate::assertions::carried_symbols(&fd);
                     let carried_usepoint = crate::assertions::carried_usepoint_symbols(&fd);
                     crate::decompile_step::decompile_one(
@@ -629,7 +645,7 @@ pub fn decompile_pulled(
                             flow_overrides: &flow_ovr,
                             mapped_params: &seed.mapped_params,
                         },
-                        &[],
+                        &kuna_decomp::overrides::Override::new(),
                     )
                     .result
                 } else {
@@ -732,10 +748,17 @@ pub fn decompile_pulled(
                         .as_ref()
                         .map(|ctx| ctx.scan(&fd, byte_address))
                         .unwrap_or_default();
-                    (code, variables, types, globals, proto, line_mappings, callee_hints, detail)
-                }));
+                    let (callable_artifacts, callable_export_error) =
+                        match kuna_decomp::kuna_callabletransport::export_artifacts(&fd, prog.arch(), prog.arch().print()) {
+                            Ok(artifacts) => (artifacts, None),
+                            Err(error) => (Vec::new(), Some(error.explain().to_string())),
+                        };
+                    Ok::<_, kuna_base::error::KunaError>((code, variables, types, globals, proto, line_mappings, callee_hints, detail, callable_artifacts, callable_export_error))
+                })).map_err(|_| kuna_base::error::KunaError::lowlevel(
+                    "panic while rendering C / extracting variables"
+                )).and_then(|result| result);
                 match rendered {
-                    Ok((code, variables, types, globals, proto, line_mappings, callee_hints, detail)) => sink(FuncResult {
+                    Ok((code, variables, types, globals, proto, line_mappings, callee_hints, detail, callable_artifacts, callable_export_error)) => sink(FuncResult {
                         name,
                         address,
                         byte_address,
@@ -744,6 +767,8 @@ pub fn decompile_pulled(
                         error: None,
                         proto,
                         variables,
+                        callable_artifacts,
+                        callable_export_error,
                         types,
                         globals,
                         line_mappings,
@@ -753,13 +778,13 @@ pub fn decompile_pulled(
                         synth: None,
                         detail,
                     }),
-                    Err(_) => sink(FuncResult {
+                    Err(error) => sink(FuncResult {
                         name,
                         address,
                         byte_address,
                         size: size as i64,
                         code: None,
-                        error: Some("panic while rendering C / extracting variables".into()),
+                        error: Some(error.explain().to_string()),
                         proto: None,
                         variables: Vec::new(),
                         types: Vec::new(),
@@ -769,6 +794,8 @@ pub fn decompile_pulled(
                         object_location,
                         callee_hints: Vec::new(),
                         synth: None,
+                        callable_artifacts: Vec::new(),
+                        callable_export_error: None,
                         detail: None,
                     }),
                 }
@@ -789,6 +816,8 @@ pub fn decompile_pulled(
                 object_location,
                 callee_hints: Vec::new(),
                 synth: None,
+                callable_artifacts: Vec::new(),
+                callable_export_error: None,
                 detail: None,
             }),
         }
@@ -912,8 +941,24 @@ fn code_ranges(spans: &[(u64, u64, u32)]) -> Vec<(u64, u64)> {
 
 /// Render the functions as concatenated C with `// Function:` headers (the human
 /// output, mirroring `DecompilationResult.to_c_file`).
-pub fn render_c(funcs: &[FuncResult]) -> String {
+pub fn render_c(funcs: &[FuncResult]) -> Result<String, String> {
+    let bodies = callable_bodies(funcs);
+    let artifacts = collect_callable_publication(&bodies)?;
+    validate_callable_publication(&bodies, &artifacts, |owner| funcs[owner].code.is_some())?;
     let mut out = String::new();
+    append_c_bodies(&mut out, funcs);
+    append_callable_definitions(&mut out, &artifacts);
+    Ok(out)
+}
+
+/// Function blocks only; streamed exports append adapters after requests arrive.
+pub fn render_c_bodies(funcs: &[FuncResult]) -> String {
+    let mut out = String::new();
+    append_c_bodies(&mut out, funcs);
+    out
+}
+
+fn append_c_bodies(out: &mut String, funcs: &[FuncResult]) {
     for f in funcs {
         match (&f.code, &f.error) {
             (Some(code), _) => {
@@ -930,7 +975,71 @@ pub fn render_c(funcs: &[FuncResult]) -> String {
             (None, None) => {}
         }
     }
-    out
+}
+
+/// Public support contains requested adapters and authenticated native declarations.
+pub fn required_callable_keys(funcs: &[FuncResult]) -> BTreeSet<&str> {
+    let mut required: BTreeSet<_> = funcs.iter().flat_map(|function| &function.callable_artifacts)
+        .filter(|artifact| artifact.required || artifact.definition.is_none()).map(|artifact| artifact.key.as_str()).collect();
+    for artifact in funcs.iter().flat_map(|function| &function.callable_artifacts) {
+        if required.contains(artifact.key.as_str()) {
+            if let Some(CallableDefinition::BodyProof { provider }) = &artifact.definition {
+                required.insert(provider.as_str());
+            }
+        }
+    }
+    required
+}
+
+fn callable_bodies(funcs: &[FuncResult]) -> Vec<CallableBody<'_>> {
+    funcs.iter().map(|function| CallableBody {
+        space: None,
+        byte_address: function.byte_address,
+        artifacts: &function.callable_artifacts,
+        failed: function.error.is_some(),
+        export_error: function.callable_export_error.as_deref(),
+    }).collect()
+}
+
+fn append_callable_declarations(out: &mut String, artifacts: &BTreeMap<&str, CallablePublication<'_>>,
+    prototype_emitted: impl Fn(usize) -> bool)
+{
+    for artifact in artifacts.values().filter(|artifact| artifact.required || artifact.definition.is_none()) {
+        if matches!(artifact.definition, Some((CallableDefinition::BodyProof { .. }, _))) { continue; }
+        // The explicit certificate, not a name or declaration-text guess, says
+        // the ordinary target prototype already declares this callable.
+        if let Some((CallableDefinition::ExistingTarget { .. }, owner)) = artifact.definition {
+            if prototype_emitted(owner) { continue; }
+        }
+        out.push_str(artifact.declaration);
+        if !artifact.declaration.ends_with('\n') { out.push('\n'); }
+    }
+}
+
+fn append_callable_definitions(out: &mut String, artifacts: &BTreeMap<&str, CallablePublication<'_>>) {
+    for artifact in artifacts.values().filter(|artifact| artifact.required) {
+        let (definition, _) = artifact.definition.expect("validated callable body publication");
+        if let CallableDefinition::Wrapper(text) = definition {
+            out.push('\n');
+            out.push_str(text);
+            if !text.ends_with('\n') { out.push('\n'); }
+        }
+    }
+}
+
+/// Resolve late producer requests against final target definitions for a stream.
+/// `bodies_written` records successful body writes in the same order as `funcs`;
+/// streamed results have already dropped their code and cannot attest that fact.
+pub fn render_callable_definitions(funcs: &[FuncResult], bodies_written: &[bool]) -> Result<String, String> {
+    if bodies_written.len() != funcs.len() {
+        return Err("callable body receipts do not match the exported function records".into());
+    }
+    let bodies = callable_bodies(funcs);
+    let artifacts = collect_callable_publication(&bodies)?;
+    validate_callable_publication(&bodies, &artifacts, |owner| bodies_written[owner])?;
+    let mut out = String::new();
+    append_callable_definitions(&mut out, &artifacts);
+    Ok(out)
 }
 
 // --- .h ------------------------------------------------------------------
@@ -1045,7 +1154,7 @@ fn matching_open(text: &str, open: char, close: char) -> Option<usize> {
 ///
 /// The type block is filtered by [`prune_unreferenced_synth_types`] first, so a
 /// synthesized structure the document no longer names is not declared.
-pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[FuncResult]) -> String {
+pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[FuncResult]) -> Result<String, String> {
     let guard = sanitize_guard(file_name);
     let types = &prune_unreferenced_synth_types(types, results);
     let shadowed = typedef_names(types);
@@ -1056,9 +1165,9 @@ pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[Func
         out.push_str("\n/* user-defined types */\n");
         out.push_str(types);
     }
-    let globals = global_declarations(results);
+    let globals = global_declarations(results.iter().flat_map(|result| result.globals.iter()));
     if !globals.is_empty() {
-        out.push_str("\n/* globals the code names by address */\n");
+        out.push_str("\n/* global symbols referenced by the code */\n");
         out.push_str(&globals);
     }
     out.push_str("\n/* function prototypes */\n");
@@ -1085,76 +1194,12 @@ pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[Func
             }
         }
     }
+    append_callable_declarations(&mut out, &collect_callable_publication(&callable_bodies(results))?, |owner| {
+        let target = &results[owner];
+        target.proto.is_some() && target.error.is_none() && !shadowed.contains(&target.name)
+    });
     out.push_str(&format!("\n#endif /* {guard} */\n"));
-    out
-}
-
-/// (kuna `globalref`) One `extern` line per global the functions name by address,
-/// in address order.
-///
-/// Each function declares the object at the type IT uses it at, so two
-/// functions can disagree, and a function that reads the same `dat_<addr>`
-/// directly reads it at the type IT printed. The declaration is what every
-/// direct read and write compiles against, so it must never be a scalar of
-/// another type than theirs: that would silently change what they compute (a
-/// signed compare turned unsigned, a store truncated), where a pointer of the
-/// wrong type in an address-taking body is a diagnosed mismatch. The choice:
-///
-/// * a record or union some function takes the address of, the larger one
-///   first: a scalar access of the name does not compile against it;
-/// * otherwise the one type the direct accesses agree on;
-/// * otherwise, with direct accesses at two types, nothing, and a comment says so;
-/// * with no direct access, a type over the unknown byte a `void *` use stands
-///   for, then the larger object, then the declaration more functions make,
-///   then the earlier function.
-///
-/// Every other type is listed in a comment on the line.
-fn global_declarations(results: &[FuncResult]) -> String {
-    let mut by_addr: BTreeMap<u64, (Vec<&GlobalInfo>, Vec<&GlobalInfo>)> = BTreeMap::new();
-    for g in results.iter().flat_map(|r| r.globals.iter()) {
-        let e = by_addr.entry(g.address).or_default();
-        if g.direct { e.1.push(g) } else { e.0.push(g) }
-    }
-    let quote = |d: &str| d.replace("/*", "/ *").replace("*/", "* /");
-    let mut out = String::new();
-    for (taken, direct) in by_addr.values() {
-        if taken.is_empty() {
-            continue;
-        }
-        let mut decls: Vec<(&GlobalInfo, usize)> = Vec::new();
-        for g in taken.iter().chain(direct.iter()) {
-            match decls.iter_mut().find(|(d, _)| d.declaration == g.declaration) {
-                Some((_, n)) => *n += 1,
-                None => decls.push((g, 1)),
-            }
-        }
-        let best = |pool: &mut dyn Iterator<Item = &(&GlobalInfo, usize)>| -> Option<String> {
-            pool.max_by(|(a, an), (b, bn)| (!a.unknown, a.size, *an).cmp(&(!b.unknown, b.size, *bn)).then(std::cmp::Ordering::Greater))
-                .map(|(g, _)| g.declaration.clone())
-        };
-        let mut direct_decls: Vec<&str> = direct.iter().map(|g| g.declaration.as_str()).collect();
-        direct_decls.sort_unstable();
-        direct_decls.dedup();
-        let record = best(&mut decls.iter().filter(|(g, _)| !g.direct && g.aggregate));
-        let chosen = match (record, direct_decls.as_slice()) {
-            (Some(r), _) => r,
-            (None, [one]) => one.to_string(),
-            (None, []) => best(&mut decls.iter()).unwrap_or_default(),
-            (None, _) => {
-                let all: Vec<String> = decls.iter().map(|(g, _)| quote(&g.declaration)).collect();
-                let _ = writeln!(out, "/* {} is read at two types, so it is not declared: {} */", taken[0].name, all.join(", "));
-                continue;
-            }
-        };
-        let others: Vec<String> =
-            decls.iter().filter(|(g, _)| g.declaration != chosen).map(|(g, _)| quote(&g.declaration)).collect();
-        if others.is_empty() {
-            let _ = writeln!(out, "extern {chosen};");
-        } else {
-            let _ = writeln!(out, "extern {chosen}; /* also used as: {} */", others.join(", "));
-        }
-    }
-    out
+    Ok(out)
 }
 
 /// (kuna `structsynth`) Drop the `struct_N` definitions this export does not use.
@@ -1265,8 +1310,8 @@ fn names_any_type_in(results: &[FuncResult], names: &[String]) -> bool {
 /// `<name>.c`: the header include + the exact `decompile-all` concatenated-C
 /// rendering (`render_c` — `// Function: <name> @ <addr>` blocks, failures as
 /// `(error: …)` comments).
-pub fn build_c(file_name: &str, results: &[FuncResult]) -> String {
-    format!("#include \"{file_name}.h\"\n\n{}", render_c(results))
+pub fn build_c(file_name: &str, results: &[FuncResult]) -> Result<String, String> {
+    Ok(format!("#include \"{file_name}.h\"\n\n{}", render_c(results)?))
 }
 
 // --- dat_ collection ------------------------------------------------------
@@ -1455,6 +1500,8 @@ mod tests {
             object_location: None,
             callee_hints: vec![],
             synth: None,
+            callable_artifacts: Vec::new(),
+            callable_export_error: None,
             detail: None,
         }
     }

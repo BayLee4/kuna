@@ -10,7 +10,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::op::pcodeop_flags;
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, OpId, TypeOp};
@@ -38,14 +38,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
@@ -71,9 +77,10 @@ fn make_op(fd: &mut Funcdata, opc: OpCode, pc_off: u64, ninputs: int4, start: bo
 /// Set op input-`slot` to a constant varnode of `value` (the user-op id).
 fn set_const_input(fd: &mut Funcdata, op: OpId, slot: int4, value: uintb) {
     let cspace = const_space(fd);
+    let datatype = unk_type(fd, 4);
     let vn = fd
         .vbank_mut()
-        .create(4, Address::new(cspace, value), unk_type(4));
+        .create(4, Address::new(cspace, value), datatype);
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), slot);
 }
 
@@ -144,9 +151,10 @@ fn non_constant_userop_input_returns_false() {
     let callother = make_op(&mut fd, OpCode::CPUI_CALLOTHER, 0x1000, 1, true);
     // input-0 is a register (non-constant), not a user-op id constant.
     let ram_space = ram(&fd);
+    let datatype = unk_type(&fd, 4);
     let reg = fd
         .vbank_mut()
-        .create(4, Address::new(ram_space, 0x40), unk_type(4));
+        .create(4, Address::new(ram_space, 0x40), datatype);
     fd.obank_mut().get_mut(callother).unwrap().set_input(Some(reg), 0);
     let branchind = make_op(&mut fd, OpCode::CPUI_BRANCHIND, 0x1000, 1, false);
     assert!(!kuna_is_sparc_struct_ret_trap(&fd, branchind, true, resolver));

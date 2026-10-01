@@ -29,6 +29,9 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+#[path = "common/call_facts.rs"]
+mod call_facts;
+
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram};
 use kuna_console::ifacedecomp::{
     execute, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE,
@@ -85,7 +88,7 @@ fn boot(gate: Option<bool>) -> Option<ConsoleProgram> {
     boot_fixture("pe_rexthunk_x86_64.exe", gate)
 }
 
-fn decompile_at(prog: ConsoleProgram, vma: u64) -> String {
+fn decompile_at(prog: ConsoleProgram, vma: u64) -> (String, kuna_decomp::funcdata::Funcdata) {
     let cmds: Vec<String> = [format!("load addr 0x{vma:x}"), "decompile".into(), "print C".into()]
         .into_iter()
         .collect();
@@ -100,7 +103,11 @@ fn decompile_at(prog: ConsoleProgram, vma: u64) -> String {
     for _ in 0..count {
         execute(&mut status);
     }
-    status.optr.clone()
+    let data = status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+        .downcast_mut::<IfaceDecompData>().unwrap();
+    let fd = data.fd.take().expect("decompiled function");
+    assert!(fd.kuna_pipeline_failure().is_none());
+    (status.optr.clone(), fd)
 }
 
 fn executable_entries(prog: &ConsoleProgram) -> Vec<u64> {
@@ -130,8 +137,12 @@ fn rex_tail_is_not_a_thunk_and_real_thunks_keep_their_names() {
 fn wrapper_tail_jump_still_names_the_import() {
     let _gate = lock();
     let Some(prog) = boot(None) else { return };
-    let out = decompile_at(prog, WRAPPER);
-    assert!(out.contains("InitializeSListHead(0x140002100);"), "got:\n{out}");
+    let (_, fd) = decompile_at(prog, WRAPPER);
+    assert_eq!(fd.num_calls(), 1);
+    let call = fd.get_call_specs(0);
+    assert_eq!(call.get_name(), "InitializeSListHead");
+    let op = fd.obank().get(call.get_op()).unwrap();
+    assert_eq!(call_facts::constant(&fd, op.get_in(1).unwrap()), Some(0x140002100));
 }
 
 /// The caller reaches the wrapper by its own entry, the import through the bare
@@ -141,7 +152,7 @@ fn wrapper_tail_jump_still_names_the_import() {
 fn caller_names_both_thunks_and_keeps_the_wrapper() {
     let _gate = lock();
     let Some(prog) = boot(None) else { return };
-    let out = decompile_at(prog, ENTRY);
+    let (out, _) = decompile_at(prog, ENTRY);
     assert!(out.contains("sub_140001030();"), "got:\n{out}");
     // `globalref` (default on) names the list head `&dat_140002100`; either
     // spelling types the argument.
@@ -213,7 +224,7 @@ fn noreturn_calls_through_pointers_keep_the_import() {
     let _gate = lock();
     for (vma, next_body) in [(0x140001170u64, "return 7;"), (0x140001150, "0x140002100")] {
         let Some(prog) = boot_fixture("pe_rexthunk_reach_x86_64.exe", None) else { return };
-        let out = decompile_at(prog, vma);
+        let (out, _) = decompile_at(prog, vma);
         assert!(out.contains("ExitProcess(0); // no-return"), "{vma:#x} got:\n{out}");
         assert!(!out.contains(next_body), "{vma:#x} absorbed the next function:\n{out}");
     }

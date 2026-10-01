@@ -284,8 +284,8 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
     let prelude = print_c_recompile_prelude(prog.arch());
     let types = pooled_types.unwrap_or_else(|| print_c_types(prog.arch_mut()));
 
-    let header = build_header(&file_name, &prelude, &types, &results);
-    let c_file = build_c(&file_name, &results);
+    let header = build_header(&file_name, &prelude, &types, &results)?;
+    let c_file = build_c(&file_name, &results)?;
     let dat_addrs = collect_dat_addrs(&results);
     let asm = build_asm(&prog, &results, &dat_addrs, &file_name);
     // The CLI's `| Path |` row prints the canonicalized on-disk path (the wasm

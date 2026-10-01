@@ -470,6 +470,15 @@ fn decode_varnode_attributes(
     decoder: &mut dyn Decoder,
 ) -> KunaResult<(Option<Rc<AddrSpace>>, u64, u32)> {
     let elem_id = decoder.open_element()?;
+    let attributes = decode_open_varnode_attributes(decoder)?;
+    decoder.close_element(elem_id)?;
+    Ok(attributes)
+}
+
+/// Read address attributes without opening or closing the current element.
+fn decode_open_varnode_attributes(
+    decoder: &mut dyn Decoder,
+) -> KunaResult<(Option<Rc<AddrSpace>>, u64, u32)> {
     let mut space: Option<Rc<AddrSpace>> = None;
     let mut size: u32 = 0;
     let mut offset: u64 = 0;
@@ -499,7 +508,6 @@ fn decode_varnode_attributes(
             break;
         }
     }
-    decoder.close_element(elem_id)?;
     Ok((space, offset, size))
 }
 
@@ -652,7 +660,9 @@ impl SeqNum {
     pub fn decode(decoder: &mut dyn Decoder) -> KunaResult<SeqNum> {
         let mut uniq: u32 = u32::MAX; // ~((uintm)0)
         let elem_id = decoder.open_element_id(&ELEM_SEQNUM)?;
-        let pc = Address::decode(decoder)?; // Recover address
+        let (space, offset, _) = decode_open_varnode_attributes(decoder)?;
+        let pc = Address::from_space_ptr(space.map_or(AddrSpacePtr::Null, AddrSpacePtr::Spc), offset);
+        decoder.rewind_attributes();
         loop {
             let attrib_id = decoder.get_next_attribute_id()?;
             if attrib_id == 0 {
@@ -2254,6 +2264,71 @@ mod tests {
         dec.ingest_stream(&buf).unwrap();
         let rt = Address::decode(&mut dec).unwrap();
         assert!(rt == addr);
+    }
+
+    #[test]
+    fn seqnum_decode_preserves_instruction_identity_and_siblings() {
+        use crate::marshal::{IdRegistry, PackedDecode, PackedEncode, XmlDecode, XmlEncode, ELEM_DATA};
+        use crate::space::AddrSpaceManager;
+        let mut manager = AddrSpaceManager::new();
+        let space = ram();
+        manager.insert_space(Rc::clone(&space)).unwrap();
+        let expected = [
+            SeqNum::new(Address::new(Rc::clone(&space), 0x401000), 7),
+            SeqNum::new(Address::new(Rc::clone(&space), 0x401000), 8),
+            SeqNum::new(Address::new(Rc::clone(&space), 0x1_0000_0000), u32::MAX),
+        ];
+        let registry = IdRegistry::with_base_ids();
+        for packed in [false, true] {
+            let mut bytes = Vec::new();
+            {
+                let mut encoder: Box<dyn Encoder + '_> = if packed {
+                    Box::new(PackedEncode::new(&mut bytes))
+                } else {
+                    Box::new(XmlEncode::new(&mut bytes))
+                };
+                encoder.open_element(&ELEM_DATA);
+                for seq in &expected {
+                    seq.encode(encoder.as_mut()).unwrap();
+                }
+                encoder.close_element(&ELEM_DATA);
+            }
+            let mut decoder: Box<dyn Decoder + '_> = if packed {
+                Box::new(PackedDecode::new(&manager))
+            } else {
+                Box::new(XmlDecode::new(&manager, &registry))
+            };
+            decoder.ingest_stream(&bytes).unwrap();
+            let root = decoder.open_element_id(&ELEM_DATA).unwrap();
+            for seq in &expected {
+                let actual = SeqNum::decode(decoder.as_mut()).unwrap();
+                assert_eq!(actual.get_addr(), seq.get_addr());
+                assert_eq!(actual.get_time(), seq.get_time());
+            }
+            decoder.close_element(root).unwrap();
+            assert_eq!(decoder.peek_element().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn seqnum_decode_accepts_attribute_order_and_missing_uniq() {
+        use crate::marshal::{IdRegistry, XmlDecode, ELEM_DATA};
+        use crate::space::AddrSpaceManager;
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(ram()).unwrap();
+        let registry = IdRegistry::with_base_ids();
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(br#"<data>
+            <seqnum uniq="9" offset="0x401000" space="ram"/>
+            <seqnum space="ram" offset="0x401004"/>
+        </data>"#).unwrap();
+        let root = decoder.open_element_id(&ELEM_DATA).unwrap();
+        for (offset, uniq) in [(0x401000, 9), (0x401004, u32::MAX)] {
+            let seq = SeqNum::decode(&mut decoder).unwrap();
+            assert_eq!(seq.get_addr(), &Address::new(Rc::clone(manager.get_space(3).unwrap()), offset));
+            assert_eq!(seq.get_time(), uniq);
+        }
+        decoder.close_element(root).unwrap();
     }
 
     #[test]

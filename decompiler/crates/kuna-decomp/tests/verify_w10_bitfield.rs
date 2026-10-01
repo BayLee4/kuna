@@ -16,30 +16,28 @@
 //! These are verifier-authored (independent of the porter) and land on the
 //! porter branch per docs/rust-port/verification.md.
 
-use std::rc::Rc;
-
 use kuna_decomp::bitfield::{BitFieldTransform, FieldRef};
 use kuna_decomp::dtype::{
-    flags, type_metatype, BitFieldTriple, Datatype, DatatypeKind, TypeBitField, TypeField,
+    flags, type_metatype, BitFieldTriple, Datatype, DatatypeKind, TypeBitField, TypeField, TypeFactoryImpl, TypeRoot,
 };
 use kuna_decomp::context::VarnodeId;
 
 /// Build one bitfield with an explicit container layout.
-fn bf(id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool, meta: type_metatype) -> TypeBitField {
-    let mut b = TypeBitField::new(id, nb, big, format!("f{id}"), Rc::new(Datatype::new(4, meta)));
+fn bf(types: &TypeFactoryImpl, id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool, meta: type_metatype) -> TypeBitField {
+    let mut b = TypeBitField::new(id, nb, big, format!("f{id}"), types.intern(Datatype::new(4, meta)).unwrap().id());
     b.byte_offset = byte_off;
     b.byte_size = byte_sz;
     b.least_sig_bit = lsb;
     b
 }
 
-fn struct_with(field: Vec<TypeField>, bitfield: Vec<TypeBitField>, size: i32) -> Datatype {
+fn struct_with(types: &TypeFactoryImpl, field: Vec<TypeField>, bitfield: Vec<TypeBitField>, size: i32) -> TypeRoot {
     let mut s = Datatype::new_with_align(size, 4, type_metatype::TYPE_STRUCT);
     if !bitfield.is_empty() {
         s.flags |= flags::has_bitfields;
     }
     s.kind = DatatypeKind::Struct { field, bitfield };
-    s
+    types.intern(s).unwrap()
 }
 
 fn vn() -> VarnodeId {
@@ -56,9 +54,10 @@ fn vn() -> VarnodeId {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bf_triple_compare_bigendian_reverses_byte_significance() {
+    let types = TypeFactoryImpl::new();
     // Two bitfields in different container bytes, big-endian.
-    let lo_byte = bf(0, 0, 1, 0, 3, true, type_metatype::TYPE_UINT); // byteOffset 0
-    let hi_byte = bf(1, 2, 1, 0, 3, true, type_metatype::TYPE_UINT); // byteOffset 2
+    let lo_byte = bf(&types, 0, 0, 1, 0, 3, true, type_metatype::TYPE_UINT); // byteOffset 0
+    let hi_byte = bf(&types, 1, 2, 1, 0, 3, true, type_metatype::TYPE_UINT); // byteOffset 2
 
     let t_lo = BitFieldTriple::new(lo_byte.clone(), 0);
     let t_hi = BitFieldTriple::new(hi_byte.clone(), 0);
@@ -77,8 +76,8 @@ fn w10bf_triple_compare_bigendian_reverses_byte_significance() {
     // The endianness key is op1's bitfield (C++ line 935): both records carry
     // big-endian here, and the order is the BE order, opposite of LE.
     // Sanity: the SAME two byte-offsets little-endian sort the other way.
-    let lo_le = bf(0, 0, 1, 0, 3, false, type_metatype::TYPE_UINT);
-    let hi_le = bf(1, 2, 1, 0, 3, false, type_metatype::TYPE_UINT);
+    let lo_le = bf(&types, 0, 0, 1, 0, 3, false, type_metatype::TYPE_UINT);
+    let hi_le = bf(&types, 1, 2, 1, 0, 3, false, type_metatype::TYPE_UINT);
     let t_lo_le = BitFieldTriple::new(lo_le, 0);
     let t_hi_le = BitFieldTriple::new(hi_le, 0);
     assert!(
@@ -94,7 +93,7 @@ fn w10bf_triple_compare_bigendian_reverses_byte_significance() {
     // op.offset + op.bitfield.byteOffset): a record at offset+2,byteOffset 0 must
     // compare equal-keyed to one at offset 0,byteOffset 2 under BE -> same total
     // significance, then leastSigBit tie-break (here both lsb 0 -> not-less).
-    let t_off = BitFieldTriple::new(bf(2, 0, 1, 0, 3, true, type_metatype::TYPE_UINT), 2);
+    let t_off = BitFieldTriple::new(bf(&types, 2, 0, 1, 0, 3, true, type_metatype::TYPE_UINT), 2);
     assert!(!BitFieldTriple::compare(&t_off, &t_hi), "equal folded byteOff + equal lsb -> not strictly less");
     assert!(!BitFieldTriple::compare(&t_hi, &t_off), "equal folded byteOff + equal lsb -> not strictly less");
 }
@@ -110,11 +109,12 @@ fn w10bf_triple_compare_bigendian_reverses_byte_significance() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bf_collect_upper_bound_skips_container_ending_at_offset() {
+    let types = TypeFactoryImpl::new();
     // Two single-byte containers: byte 0 (ends at byte 1) and byte 1 (ends at
     // byte 2).  Each holds one 8-bit field.
-    let b0 = bf(0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT);
-    let b1 = bf(1, 1, 1, 0, 8, false, type_metatype::TYPE_UINT);
-    let s = struct_with(vec![], vec![b0, b1], 2);
+    let b0 = bf(&types, 0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT);
+    let b1 = bf(&types, 1, 1, 1, 0, 8, false, type_metatype::TYPE_UINT);
+    let s = struct_with(&types, vec![], vec![b0, b1], 2);
 
     // Query byte range [1,2): compareMaxByte(1, b0) = 1 < (0+1) = false -> b0's
     // container ends AT 1, so upper_bound steps past it; b1 (ends at 2, 1<2) is
@@ -145,17 +145,20 @@ fn w10bf_collect_upper_bound_skips_container_ending_at_offset() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bf_collect_nested_offset_shift_and_halfopen_break() {
+    let types = TypeFactoryImpl::new();
     // inner struct (1 byte) with one 8-bit bitfield at container byte 0.
-    let inner = Rc::new(struct_with(
+    let inner = struct_with(
+        &types,
         vec![],
-        vec![bf(0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT)],
+        vec![bf(&types, 0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT)],
         1,
-    ));
+    );
     // outer: plain field `pad` at 0 (1 byte, not a struct -> skipped), nested
     // struct `inner` at offset 3.
-    let pad = TypeField::new(0, 0, "pad", Rc::new(Datatype::new(1, type_metatype::TYPE_UINT)));
-    let inner_f = TypeField::new(1, 3, "inner", Rc::clone(&inner));
-    let outer = struct_with(vec![pad, inner_f], vec![], 8);
+    let pad_type = types.intern(Datatype::new(1, type_metatype::TYPE_UINT)).unwrap();
+    let pad = TypeField::new(0, 0, "pad", pad_type.id());
+    let inner_f = TypeField::new(1, 3, "inner", inner.id());
+    let outer = struct_with(&types, vec![pad, inner_f], vec![], 8);
 
     // Query [3,4): only the nested struct at offset 3 is in range; recursion
     // reports container offset base(0)+3 = 3.
@@ -186,12 +189,13 @@ fn w10bf_collect_nested_offset_shift_and_halfopen_break() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bf_establish_fields_bigendian_three_fields_no_holes() {
+    let types = TypeFactoryImpl::new();
     let bitfield = vec![
-        bf(0, 0, 1, 0, 3, true, type_metatype::TYPE_UINT), // field3
-        bf(1, 0, 1, 3, 4, true, type_metatype::TYPE_INT),  // sfield4 (signed)
-        bf(2, 0, 1, 7, 1, true, type_metatype::TYPE_BOOL), // fieldb
+        bf(&types, 0, 0, 1, 0, 3, true, type_metatype::TYPE_UINT), // field3
+        bf(&types, 1, 0, 1, 3, 4, true, type_metatype::TYPE_INT),  // sfield4 (signed)
+        bf(&types, 2, 0, 1, 7, 1, true, type_metatype::TYPE_BOOL), // fieldb
     ];
-    let dt = Rc::new(struct_with(vec![], bitfield, 1));
+    let dt = struct_with(&types, vec![], bitfield, 1);
 
     let mut t = BitFieldTransform::new(&dt, 0, /*big_endian*/ true);
     assert!(t.parent_struct.is_some(), "TYPE_STRUCT root sets parentStruct");
@@ -201,7 +205,7 @@ fn w10bf_establish_fields_bigendian_three_fields_no_holes() {
     t.establish_fields(vn(), /*vn_size*/ 1, /*follow_holes*/ false);
     assert_eq!(t.work_list.len(), 3, "all three fields fully contained, no holes");
     assert!(
-        t.work_list.iter().all(|s| matches!(s.field, FieldRef::Field(_))),
+        t.work_list.iter().all(|s| matches!(s.field, FieldRef::Field { .. })),
         "no hole records with follow_holes=false"
     );
 
@@ -211,8 +215,8 @@ fn w10bf_establish_fields_bigendian_three_fields_no_holes() {
         .work_list
         .iter()
         .find(|s| {
-            s.field()
-                .is_some_and(|f| f.field_type.get_metatype() == type_metatype::TYPE_INT)
+            s.field_type()
+                .is_some_and(|f| f.get_metatype() == type_metatype::TYPE_INT)
         })
         .expect("sfield4 is the one TYPE_INT field");
     assert!(
@@ -236,13 +240,15 @@ fn w10bf_establish_fields_bigendian_three_fields_no_holes() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bf_establish_fields_leading_and_trailing_holes_gated() {
+    let types = TypeFactoryImpl::new();
     // One 2-bit field at lsb3..5 of a single byte; a 1-byte (8-bit) Varnode.
     // Holes: [0,3) before, [5,8) after.
-    let dt = Rc::new(struct_with(
+    let dt = struct_with(
+        &types,
         vec![],
-        vec![bf(0, 0, 1, 3, 2, false, type_metatype::TYPE_UINT)],
+        vec![bf(&types, 0, 0, 1, 3, 2, false, type_metatype::TYPE_UINT)],
         1,
-    ));
+    );
 
     let mut t = BitFieldTransform::new(&dt, 0, false);
     t.establish_fields(vn(), 1, /*follow_holes*/ true);
@@ -251,7 +257,7 @@ fn w10bf_establish_fields_leading_and_trailing_holes_gated() {
     assert!(matches!(t.work_list[0].field, FieldRef::Hole));
     assert_eq!(t.work_list[0].bits_field.least_sig_bit, 0);
     assert_eq!(t.work_list[0].bits_field.num_bits, 3);
-    assert!(matches!(t.work_list[1].field, FieldRef::Field(_)));
+    assert!(matches!(t.work_list[1].field, FieldRef::Field { .. }));
     assert!(matches!(t.work_list[2].field, FieldRef::Hole));
     assert_eq!(t.work_list[2].bits_field.least_sig_bit, 5);
     assert_eq!(t.work_list[2].bits_field.num_bits, 3);
@@ -260,7 +266,7 @@ fn w10bf_establish_fields_leading_and_trailing_holes_gated() {
     let mut t2 = BitFieldTransform::new(&dt, 0, false);
     t2.establish_fields(vn(), 1, false);
     assert_eq!(t2.work_list.len(), 1);
-    assert!(matches!(t2.work_list[0].field, FieldRef::Field(_)));
+    assert!(matches!(t2.work_list[0].field, FieldRef::Field { .. }));
 }
 
 // ===========================================================================
@@ -287,12 +293,14 @@ fn w10bf_establish_fields_leading_and_trailing_holes_gated() {
 // lsb 4..12 partially overlaps [0,8): overlapTest != 0/3 -> hole branch, gated.
 #[test]
 fn vrfy2_establish_fields_clamps_field_past_varnode_boundary() {
+    let types = TypeFactoryImpl::new();
     // 2-byte container, one field at byte 0, lsb 4, 8 bits wide -> bits [4,12).
-    let dt = Rc::new(struct_with(
+    let dt = struct_with(
+        &types,
         vec![],
-        vec![bf(0, 0, 2, 4, 8, false, type_metatype::TYPE_UINT)],
+        vec![bf(&types, 0, 0, 2, 4, 8, false, type_metatype::TYPE_UINT)],
         2,
-    ));
+    );
     // Root Varnode is only 1 byte (8 bits). initialOffset 0.
     let mut t = BitFieldTransform::new(&dt, 0, false);
     t.establish_fields(vn(), /*vn_size*/ 1, /*follow_holes*/ true);
@@ -331,10 +339,11 @@ fn vrfy2_establish_fields_clamps_field_past_varnode_boundary() {
 // collect byte-2 or miss the break).
 #[test]
 fn vrfy2_collect_overlap_codes_continue_then_break() {
-    let b0 = bf(0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 0
-    let b1 = bf(1, 1, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 1
-    let b2 = bf(2, 2, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 2
-    let s = struct_with(vec![], vec![b0, b1, b2], 3);
+    let types = TypeFactoryImpl::new();
+    let b0 = bf(&types, 0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 0
+    let b1 = bf(&types, 1, 1, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 1
+    let b2 = bf(&types, 2, 2, 1, 0, 8, false, type_metatype::TYPE_UINT); // byte 2
+    let s = struct_with(&types, vec![], vec![b0, b1, b2], 3);
 
     // upper_bound(compareMaxByte, offset=1): b0 ends at 1 (1<1 false) -> skipped
     // by upper_bound; iteration starts at b1. b1 overlaps [1,2) -> collected.
@@ -360,8 +369,9 @@ fn vrfy2_collect_overlap_codes_continue_then_break() {
 // panic suspect for an empty/at-end slice.
 #[test]
 fn vrfy2_collect_empty_and_past_end_are_safe_noops() {
+    let types = TypeFactoryImpl::new();
     // Empty struct: no fields, no bitfields.
-    let empty = struct_with(vec![], vec![], 4);
+    let empty = struct_with(&types, vec![], vec![], 4);
     let mut res = Vec::new();
     empty.collect_bit_fields(0, &mut res, 0, 4);
     assert!(res.is_empty(), "empty struct collects nothing");
@@ -369,8 +379,9 @@ fn vrfy2_collect_empty_and_past_end_are_safe_noops() {
 
     // One byte-0 field; query offset 5 (well past the single 1-byte container).
     let s = struct_with(
+        &types,
         vec![],
-        vec![bf(0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT)],
+        vec![bf(&types, 0, 0, 1, 0, 8, false, type_metatype::TYPE_UINT)],
         1,
     );
     let mut res2 = Vec::new();
@@ -380,7 +391,7 @@ fn vrfy2_collect_empty_and_past_end_are_safe_noops() {
 
     // establish_fields with an empty struct + follow_holes -> exactly one
     // whole-Varnode hole (the trailing-hole branch), no field records, no panic.
-    let dt = Rc::new(empty);
+    let dt = empty;
     let mut t = BitFieldTransform::new(&dt, 0, false);
     t.establish_fields(vn(), 4, true);
     assert_eq!(t.work_list.len(), 1);
@@ -394,9 +405,10 @@ fn vrfy2_collect_empty_and_past_end_are_safe_noops() {
 // sort must place lsb0 before lsb4 regardless of input order.
 #[test]
 fn vrfy2_triple_compare_same_byte_lsb_tiebreak_both_endians() {
+    let types = TypeFactoryImpl::new();
     for big in [false, true] {
-        let lo = BitFieldTriple::new(bf(0, 0, 1, 0, 3, big, type_metatype::TYPE_UINT), 0); // lsb0
-        let hi = BitFieldTriple::new(bf(1, 0, 1, 4, 3, big, type_metatype::TYPE_UINT), 0); // lsb4
+        let lo = BitFieldTriple::new(bf(&types, 0, 0, 1, 0, 3, big, type_metatype::TYPE_UINT), 0); // lsb0
+        let hi = BitFieldTriple::new(bf(&types, 1, 0, 1, 4, 3, big, type_metatype::TYPE_UINT), 0); // lsb4
         // Same container byte -> byte term ties -> lsb decides, lsb0 < lsb4 in
         // BOTH endians (type.cc:944-947 has no endian branch for the lsb term).
         assert!(

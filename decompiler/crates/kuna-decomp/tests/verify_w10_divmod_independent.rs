@@ -18,10 +18,8 @@
 //!      and rejects a magic whose maxx check fails (`0x24924925 n=34 x=32 -> 0`),
 //!      both oracle values from the standalone C++ algorithm; a hardcoded
 //!      {81,89,91,125} table could produce neither.
-//!   D. RuleDoubleShift::clone_rule fires when the live group "analysis" is in
-//!      the grouplist (the bug the porter fixed: the rule's runtime group is
-//!      "analysis", coreaction.cc:5807, not the placeholder name "doubleshift"),
-//!      and declines for an unrelated group.
+//!   D. Registered RuleDoubleShift transforms under its primary "analysis"
+//!      group or established "doubleshift" alias, but not an unrelated group.
 
 use std::rc::Rc;
 
@@ -33,10 +31,10 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::action::{ActionGroupList, Rule};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::action::{Action, ActionContext, ActionGroupList, ActionPool};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
-use kuna_decomp::ruleaction_2::RuleDoubleShift;
+use kuna_decomp::ruleaction_2;
 use kuna_decomp::ruleaction_6::RuleDivOpt;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::varnode::{DefOpInfo, VarnodeBank};
@@ -66,7 +64,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -76,8 +79,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -98,7 +102,7 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -186,37 +190,36 @@ fn w10_indep_calc_divisor_div9_recovers_and_maxx_fail_rejects() {
 }
 
 // =============================================================================
-// D — RuleDoubleShift::clone_rule fires for the live "analysis" group.
+// D — Registered RuleDoubleShift transforms for its primary group and alias.
 // =============================================================================
 //
-// C++ `RuleDoubleShift(g) : Rule(g,0,"doubleshift")` with `g == "analysis"`
-// (coreaction.cc:5807); its clone tests `grouplist.contains(getGroup())` =
-// contains("analysis").  The Rust unit struct previously tested only
-// "doubleshift" (the rule NAME), dropping the rule from every live pool.  The
-// fixed clone_rule must return Some when "analysis" is enabled, and None for an
-// unrelated group.
 #[test]
-fn w10_indep_doubleshift_clone_fires_for_analysis_group() {
-    let rule = RuleDoubleShift;
-    let analysis = ActionGroupList::from_names(["analysis"]);
-    assert!(
-        rule.clone_rule(&analysis).is_some(),
-        "RuleDoubleShift must clone into a pool whose enabled group is \"analysis\" \
-         (its real runtime group, coreaction.cc:5807)"
-    );
-
-    let unrelated = ActionGroupList::from_names(["stackvars"]);
-    assert!(
-        RuleDoubleShift.clone_rule(&unrelated).is_none(),
-        "RuleDoubleShift must decline when neither \"analysis\" nor the \
-         \"doubleshift\" placeholder is enabled"
-    );
-
-    // The placeholder-`specs()` contract still holds (so the per-op spec table,
-    // which keys on the name, also clones).
-    let placeholder = ActionGroupList::from_names(["doubleshift"]);
-    assert!(
-        RuleDoubleShift.clone_rule(&placeholder).is_some(),
-        "the placeholder \"doubleshift\" group must still clone (specs() contract)"
-    );
+fn w10_indep_doubleshift_registered_groups_transform() {
+    let spec = ruleaction_2::specs().into_iter()
+        .find(|spec| spec.aliases.contains(&"doubleshift")).unwrap();
+    let mut pool = ActionPool::new(0, "shifts");
+    pool.add_spec(&spec, "doubleshift");
+    for group in ["analysis", "doubleshift", "stackvars"] {
+        let mut fd = build_fd();
+        let input = fd.new_varnode(4, &Address::new(ram(&fd), 0x10), Some(unk(&fd, 4)));
+        let input = fd.vbank_mut().set_input(input, &mut no_replace()).unwrap();
+        let inner = mk_op(&mut fd, 2, 0x100, OpCode::CPUI_INT_LEFT);
+        let two = mk_const(&mut fd, 4, 2);
+        set_in(&mut fd, inner, input, 0);
+        set_in(&mut fd, inner, two, 1);
+        let shifted = give_output(&mut fd, inner, 0x20, 4);
+        let outer = mk_op(&mut fd, 2, 0x104, OpCode::CPUI_INT_LEFT);
+        let three = mk_const(&mut fd, 4, 3);
+        set_in(&mut fd, outer, shifted, 0);
+        set_in(&mut fd, outer, three, 1);
+        give_output(&mut fd, outer, 0x30, 4);
+        if let Some(mut selected) = pool.clone_filtered(&ActionGroupList::from_names([group])) {
+            assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
+        }
+        let transformed = group != "stackvars";
+        let result = fd.obank().get(outer).unwrap();
+        assert_eq!(result.get_in(0), Some(if transformed { input } else { shifted }), "{group}");
+        let amount = fd.vbank().get(result.get_in(1).unwrap()).unwrap().get_offset();
+        assert_eq!(amount, if transformed { 5 } else { 3 }, "{group}");
+    }
 }

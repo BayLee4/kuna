@@ -72,6 +72,8 @@ pub fn shed_format_tails(data: &mut Funcdata) -> int4 {
         let op = data.get_call_specs(idx).get_op();
         let ninput = data.obank().get(op).map_or(0, |o| o.num_input());
         for slot in (arity + 1..ninput).rev() {
+            let fc = data.get_call_specs(idx);
+            if fc.physical_inputs().iter().any(|input| input.operand_slot == slot) { continue; }
             data.op_remove_input(op, slot);
         }
         let fc = data.get_call_specs_mut(idx);

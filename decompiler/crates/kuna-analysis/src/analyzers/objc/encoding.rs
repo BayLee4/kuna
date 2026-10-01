@@ -17,7 +17,7 @@
 //! `ObjectiveC2_DecompilerMessageAnalyzer` encoding parser (the *naming-tier*
 //! subset). It is **not a demangler** — selectors are plain ASCII; this only maps
 //! the single-character primitive type codes (+ a pointer/struct fallback) to a
-//! kuna [`Datatype`] so an IMP gets a typed `PrototypePieces` (`id self, SEL
+//! kuna [`TypeRoot`] so an IMP gets a typed `PrototypePieces` (`id self, SEL
 //! _cmd, int n`) and an ivar gets its element type.
 //!
 //! ## Scope (design §3.2 LOSS)
@@ -30,9 +30,7 @@
 //! empty encoding yields `None` (the IMP is still *named* `-[Class sel]` — only
 //! the typed prototype is dropped), never a failure.
 
-use std::rc::Rc;
-
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeRoot};
 use kuna_decomp::fspec::PrototypePieces;
 
 /// Decode one ObjC method type encoding into a [`PrototypePieces`] named `name`
@@ -55,7 +53,7 @@ pub fn decode_method(
     // Return type first (a null/void return is still `Some(void)`).
     let outtype = Some(p.next_type(types, ptr_size, word_size)?);
 
-    let mut intypes: Vec<Rc<Datatype>> = Vec::new();
+    let mut intypes: Vec<TypeRoot> = Vec::new();
     let mut innames: Vec<String> = Vec::new();
     let mut idx = 0usize;
     while !p.at_end() {
@@ -83,14 +81,14 @@ pub fn decode_method(
 }
 
 /// Decode a single ivar type encoding (the element's `@encode` string) into its
-/// [`Datatype`]. Used for the `<Class>::ivar` typing (design §5 PR-O2). `None`
+/// [`TypeRoot`]. Used for the `<Class>::ivar` typing (design §5 PR-O2). `None`
 /// for an empty / unparseable encoding.
 pub fn decode_ivar_type(
     encoding: &str,
     types: &dyn TypeFactory,
     ptr_size: i32,
     word_size: u32,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     Parser::new(encoding).next_type(types, ptr_size, word_size)
 }
 
@@ -141,14 +139,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Consume one type code and map it to a [`Datatype`]. Returns `None` at the
+    /// Consume one type code and map it to a [`TypeRoot`]. Returns `None` at the
     /// end of the string or on an unparseable code.
     fn next_type(
         &mut self,
         types: &dyn TypeFactory,
         ptr_size: i32,
         word_size: u32,
-    ) -> Option<Rc<Datatype>> {
+    ) -> Option<TypeRoot> {
         self.skip_qualifiers();
         let c = self.peek()?;
         self.pos += 1;
@@ -252,7 +250,7 @@ fn named_opaque_ptr(
     struct_name: &str,
     ptr_size: i32,
     word_size: u32,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let pointee = types
         .get_type_struct(struct_name)
         .ok()

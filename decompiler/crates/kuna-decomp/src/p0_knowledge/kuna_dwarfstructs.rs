@@ -28,9 +28,10 @@
 //! `Architecture::analysis_dwarfstructs` bool keeps the option catalog-visible
 //! and makes `phase catalog`'s live `current` field reflect it.
 //!
-//! Default **on** (DIV): a zero-size type is not a conservative answer — it is a
-//! wrong one that the ABI classifier acts on. `--option dwarfstructs off`
-//! restores the byte-identical name-only mapping.
+//! Default **on** (DIV): by-value ABI classification requires a completed layout.
+//! `--option dwarfstructs off` retains named opaque declarations for pointers,
+//! but omits imported signatures requiring those layouts by value, leaving
+//! native instruction-based signature recovery in place.
 
 /// Environment variable that gates DWARF aggregate-layout import (read by
 /// `kuna-analysis::analyzers::dwarf::kuna_dwarfstructs`). Absent or any value

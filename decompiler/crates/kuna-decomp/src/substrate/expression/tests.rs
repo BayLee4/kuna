@@ -16,7 +16,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, OpId, TypeOp, VarnodeId};
@@ -67,8 +67,8 @@ fn const_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space(0).unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn opcode_flags(opc: OpCode) -> kuna_base::types::uint4 {
@@ -109,7 +109,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// only for single-reader / leaf terms; use [`mk_input`] for shared operands.
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(size, Address::new(ram, off), dt(size))
+    let ty = dt(fd, size);
+    fd.vbank_mut().create(size, Address::new(ram, off), ty)
 }
 
 /// A formal *input* varnode (allowed multiple descendants), for operands read by
@@ -117,7 +118,8 @@ fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
 /// `xref` collision callback never fires, so a no-op thunk suffices.
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(size, Address::new(ram, off), dt(size));
+    let ty = dt(fd, size);
+    let vn = fd.vbank_mut().create(size, Address::new(ram, off), ty);
     let mut noop_thunk = |_b: &mut crate::varnode::VarnodeBank,
                           _o: VarnodeId,
                           _n: VarnodeId|
@@ -130,7 +132,8 @@ fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
 /// A constant varnode.
 fn mk_const(fd: &mut Funcdata, val: u64, size: int4) -> VarnodeId {
     let c = const_space(fd);
-    fd.vbank_mut().create(size, Address::new(c, val), dt(size))
+    let ty = dt(fd, size);
+    fd.vbank_mut().create(size, Address::new(c, val), ty)
 }
 
 /// Mark `op` as the definition of a fresh written varnode at `off`/`size` and
@@ -146,6 +149,7 @@ fn mk_out(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum: seq };
+    let ty = dt(fd, size);
     let vn = {
         let mut noop_thunk = |_b: &mut crate::varnode::VarnodeBank,
                               _o: VarnodeId,
@@ -154,7 +158,7 @@ fn mk_out(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
             panic!("mk_out: distinct addresses must not collide (xref replace fired)")
         };
         fd.vbank_mut()
-            .create_def(size, Address::new(ram, off), dt(size), def, &mut noop_thunk)
+            .create_def(size, Address::new(ram, off), ty, def, &mut noop_thunk)
             .unwrap()
     };
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));

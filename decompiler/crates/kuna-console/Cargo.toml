@@ -7,6 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+test-support = ["kuna-decomp/test-support"]
+
 [dependencies]
 kuna-decomp.workspace = true
 kuna-base.workspace = true
@@ -22,6 +25,7 @@ kuna-analysis.workspace = true
 object.workspace = true
 
 [dev-dependencies]
+kuna-decomp = { workspace = true, features = ["test-support"] }
 # The register<->global over-merge render gate (`tests/verify_global_regmerge.rs`)
 # asserts, via a word-boundary regex, that no raw register / `Unique<hex>` leaks.
 regex.workspace = true

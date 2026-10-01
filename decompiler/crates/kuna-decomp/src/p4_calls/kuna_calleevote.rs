@@ -34,7 +34,7 @@ use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::context::VarnodeId;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::infra::architecture::Architecture;
 
@@ -100,7 +100,7 @@ impl OptionCalleeVote {
 pub struct Typed {
     pub addr: Address,
     pub size: int4,
-    pub ct: Rc<Datatype>,
+    pub ct: TypeRoot,
     /// A pointer to a pointer that is the address of one of the caller's own
     /// frame objects (`&v4`), or, for a statement, passed so by some caller.
     pub frame: bool,
@@ -210,7 +210,7 @@ impl Ledger {
 }
 
 /// Is `ct` a pointer to a pointer?
-fn points_at_a_pointer(ct: &Datatype) -> bool {
+fn points_at_a_pointer(ct: &TypeRoot) -> bool {
     ct.get_ptr_to().is_some_and(|p| p.get_metatype() == type_metatype::TYPE_PTR)
 }
 
@@ -222,14 +222,15 @@ fn key_of(a: &Address) -> Option<(int4, uintb)> {
 /// its layout, a character, or a pointer to a character pointer? An incomplete
 /// shell -- `FILE` as `libctypes` interns it without `glibc` layouts -- is a
 /// name and nothing else, so it is not a commitment.
-pub fn committed(ct: &Datatype) -> bool {
+pub fn committed(ct: &TypeRoot) -> bool {
     if ct.get_metatype() != type_metatype::TYPE_PTR {
         return false;
     }
     let Some(pt) = ct.get_ptr_to() else { return false };
     match pt.get_metatype() {
         type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION => {
-            !pt.get_name().is_empty() && !pt.is_incomplete()
+            let view = pt.read();
+            view.get(pt.id()).is_ok_and(|t| !t.get_name().is_empty()) && !pt.is_incomplete()
         }
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT => pt.get_size() == 1 && pt.is_char_print(),
         type_metatype::TYPE_PTR => pt.get_ptr_to().is_some_and(|c| c.get_size() == 1 && c.is_char_print()),
@@ -241,7 +242,7 @@ pub fn committed(ct: &Datatype) -> bool {
 /// pointer to nothing (`void *`, `undefined1 *`), a plain integer of that
 /// width, or a record synthesized from one field read, which the callers'
 /// record replaces?
-pub fn uncommitted(ct: &Datatype, ptr_size: int4) -> bool {
+pub fn uncommitted(ct: &TypeRoot, ptr_size: int4) -> bool {
     uncommitted_under(ct, ptr_size, false)
 }
 
@@ -250,7 +251,7 @@ pub fn uncommitted(ct: &Datatype, ptr_size: int4) -> bool {
 /// is a type the callers state from outside the recovery -- a `char **`, a
 /// `char *`, a named record -- and never another function's synthesized record,
 /// which is one more partial view ([`decide_ledger_under`]).
-pub fn uncommitted_under(ct: &Datatype, ptr_size: int4, headless: bool) -> bool {
+pub fn uncommitted_under(ct: &TypeRoot, ptr_size: int4, headless: bool) -> bool {
     match ct.get_metatype() {
         type_metatype::TYPE_PTR => {
             ct.get_ptr_to().is_some_and(|p| {
@@ -268,20 +269,27 @@ pub fn uncommitted_under(ct: &Datatype, ptr_size: int4, headless: bool) -> bool 
 /// The same type: one factory entry, or the same name and shape all the way
 /// down its pointer chain. A layout comparison alone would equate two records
 /// that merely have the same size.
-fn same_type(a: &Datatype, b: &Datatype) -> bool {
-    if std::ptr::eq(a, b) {
+fn same_type(a: &TypeRoot, b: &TypeRoot) -> bool {
+    if a == b {
         return true;
     }
     match (a.get_ptr_to(), b.get_ptr_to()) {
         (Some(pa), Some(pb)) => a.get_size() == b.get_size() && same_type(&pa, &pb),
-        (None, None) => a.get_name() == b.get_name() && a.compare(b, 10).is_ok_and(|c| c == 0),
+        (None, None) => {
+            let av = a.read();
+            let bv = b.read();
+            match (av.get(a.id()), bv.get(b.id())) {
+                (Ok(at), Ok(bt)) => at.get_name() == bt.get_name() && at.compare(&bt, 10).is_ok_and(|c| c == 0),
+                _ => false,
+            }
+        }
         _ => false,
     }
 }
 
 /// Is `ct`, the type the function input `vn` carries, the one its callers
 /// stated for it?
-pub fn took_stated_type(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
+pub fn took_stated_type(data: &Funcdata, vn: VarnodeId, ct: &TypeRoot) -> bool {
     let Some(stated) = data.kuna_calleevote_inputs() else { return false };
     let Some(v) = data.vbank().get(vn) else { return false };
     v.is_input() && stated.at(v.get_addr(), v.get_size()).is_some_and(|t| same_type(&t.ct, ct))
@@ -317,7 +325,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &mut Funcdata) {
                 args.push(None);
                 continue;
             };
-            let ct = fd.high_get_type(vn).or_else(|| fd.vbank().get(vn).map(|v| Rc::clone(v.get_type())));
+            let ct = fd.high_get_type(vn).or_else(|| fd.vbank().get(vn).map(|v| v.get_type().clone()));
             args.push(ct.map(|ct| {
                 let frame = points_at_a_pointer(&ct) && crate::kuna_protoorder::addresses_a_frame_object(fd, vn);
                 Typed { addr, size, ct, frame }
@@ -361,7 +369,7 @@ fn own_params(arch: &Architecture, entry: &Address, fd: &Funcdata) -> Option<Vec
         if addr.is_invalid() || p.get_size() <= 0 {
             return None;
         }
-        out.push(Typed { addr, size: p.get_size(), ct: Rc::clone(p.get_type()?), frame: false });
+        out.push(Typed { addr, size: p.get_size(), ct: p.get_type()?.clone(), frame: false });
     }
     Some(out)
 }
@@ -438,7 +446,7 @@ pub fn decide_ledger_under(
             if !uncommitted_under(&p.ct, ptr_size, headless) {
                 continue;
             }
-            let mut agreed: Option<Rc<Datatype>> = None;
+            let mut agreed: Option<TypeRoot> = None;
             let mut frame = false;
             let all = sites.iter().all(|s| {
                 let Some(Some(a)) = s.args.get(j) else { return false };
@@ -448,7 +456,7 @@ pub fn decide_ledger_under(
                 frame |= a.frame;
                 match &agreed {
                     None => {
-                        agreed = Some(Rc::clone(&a.ct));
+                        agreed = Some(a.ct.clone());
                         true
                     }
                     Some(t) => same_type(t, &a.ct),
@@ -502,10 +510,10 @@ pub fn forget_statements_naming(arch: &mut Architecture, names: &[String]) {
 }
 
 /// A type's name for the trace, pointers spelled through.
-fn spell(ct: &Datatype) -> String {
+fn spell(ct: &TypeRoot) -> String {
     match ct.get_ptr_to() {
         Some(p) => format!("{} *", spell(&p)),
-        None => ct.get_name().to_string(),
+        None => ct.read().get(ct.id()).expect("type vote retains valid datatype").get_name().to_string(),
     }
 }
 
@@ -542,7 +550,7 @@ pub fn seed(arch: &Architecture, data: &mut Funcdata) {
 /// pointer some caller passes as the address of its own frame object types
 /// that one object, so a callee that reaches past it (`cfg_free(&cfg)` reading
 /// the members after a `char *` first one) is not taking the object's type.
-pub fn input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> Option<Rc<Datatype>> {
+pub fn input_vote(data: &Funcdata, vn: VarnodeId, ct: &TypeRoot) -> Option<TypeRoot> {
     let stated = data.kuna_calleevote_inputs()?;
     let v = data.vbank().get(vn)?;
     if !v.is_input() || v.is_type_lock() {
@@ -559,7 +567,7 @@ pub fn input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> Option<R
     if want.frame && crate::kuna_protoorder::reaches_past_the_pointee(data, vn, &want.ct) {
         return None;
     }
-    Some(Rc::clone(&want.ct))
+    Some(want.ct.clone())
 }
 
 #[cfg(test)]

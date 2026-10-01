@@ -33,10 +33,9 @@
 
 use kuna_base::error::KunaResult;
 
-use std::rc::Rc;
 
 use crate::context::{HighVariableId, VarnodeId};
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 use crate::funcdata::Funcdata;
 use crate::options::on_or_off;
 
@@ -74,7 +73,7 @@ pub fn type_representative(fd: &Funcdata, high: HighVariableId) -> Option<Varnod
         fd.vbank().get(vn).map(|v| Member {
             vn,
             type_lock: v.is_type_lock(),
-            ty: Rc::clone(v.get_type()),
+            ty: Clone::clone(v.get_type()),
         })
     });
     pick_representative(members)
@@ -88,7 +87,7 @@ pub struct Member {
     /// `Varnode::isTypeLock()`.
     pub type_lock: bool,
     /// `Varnode::getType()`.
-    pub ty: Rc<Datatype>,
+    pub ty: TypeRoot,
 }
 
 /// The ordering `HighVariable::getTypeRepresentative` applies: a type-locked

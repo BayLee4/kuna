@@ -108,8 +108,8 @@ use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{OpId, VarnodeId};
@@ -149,7 +149,7 @@ impl WriteNode {
 /// widening).
 pub(crate) struct ArraySequence {
     /// Element data-type.
-    pub(crate) char_type: Rc<Datatype>,
+    pub(crate) char_type: TypeRoot,
     /// Number of elements in the final sequence.
     pub(crate) num_elements: int4,
     /// COPY/STORE into the array memory region (block-ordered after
@@ -170,7 +170,7 @@ impl ArraySequence {
     /// Initialize the (empty) sequence with the element data-type
     /// (C++ `ArraySequence::ArraySequence`).  `rootOp`/`block` are tracked by the
     /// concrete driver in the Rust port (the base only needs `char_type`).
-    pub(crate) fn new(char_type: Rc<Datatype>) -> Self {
+    pub(crate) fn new(char_type: TypeRoot) -> Self {
         ArraySequence { char_type, num_elements: 0, move_ops: Vec::new(), byte_array: Vec::new() }
     }
 
@@ -357,17 +357,17 @@ impl ArraySequence {
     pub(crate) fn select_string_copy_function(&self, data: &Funcdata) -> (uintb, int4) {
         // Faithful to constseq.cc:161-175: compare `charType` by pointer identity
         // against `types->getTypeChar(getSizeOfChar())` / `getTypeChar(getSizeOfWChar())`.
-        // The factory interns its core char types, so `Rc::ptr_eq` is the Rust
+        // The factory interns its core char types, so graph identity is the Rust
         // analogue of the C++ pointer-identity `==`.  Falls through to the C++
         // default `BUILTIN_MEMCPY` only when neither identity matches.
         if let Some(types) = data.get_arch().types_rc() {
             if let Ok(narrow) = types.get_type_char(types.get_size_of_char()) {
-                if Rc::ptr_eq(&self.char_type, &narrow) {
+                if self.char_type.id() == narrow.id() {
                     return (BUILTIN_STRNCPY as uintb, self.num_elements);
                 }
             }
             if let Ok(wide) = types.get_type_char(types.get_size_of_wchar()) {
-                if Rc::ptr_eq(&self.char_type, &wide) {
+                if self.char_type.id() == wide.id() {
                     return (BUILTIN_WCSNCPY as uintb, self.num_elements);
                 }
             }
@@ -425,7 +425,7 @@ struct HeapSequence {
 
 impl HeapSequence {
     /// C++ `HeapSequence::HeapSequence(Funcdata&,Datatype*,PcodeOp *root)`.
-    fn new(data: &Funcdata, ct: Rc<Datatype>, root: OpId) -> HeapSequence {
+    fn new(data: &Funcdata, ct: TypeRoot, root: OpId) -> HeapSequence {
         let block = data.obank().get(root).expect("HeapSequence: stale root").get_parent().expect(
             "HeapSequence: root has no parent block",
         );
@@ -463,7 +463,7 @@ impl HeapSequence {
     /// Construct, collect, and validate (the body of the C++ ctor after the
     /// field initialization).  Returns the built sequence; `is_valid()` is `false`
     /// when no viable sequence exists.
-    fn build(data: &Funcdata, ct: Rc<Datatype>, root: OpId) -> HeapSequence {
+    fn build(data: &Funcdata, ct: TypeRoot, root: OpId) -> HeapSequence {
         let mut seq = HeapSequence::new(data, ct, root);
         if !seq.collect_store_ops(data) {
             return seq;
@@ -752,14 +752,14 @@ impl HeapSequence {
     fn build_string_copy(&self, data: &mut Funcdata) -> Option<OpId> {
         let insert_point = self.base.move_ops[0].op;
         let root_in1 = op_get_in(data, self.root_op, 1);
-        let char_ptr_type = Rc::clone(
+        let char_ptr_type = TypeRoot::clone(
             data.vbank().get(root_in1).expect("buildStringCopy: stale ptr vn").get_type_read_facing(self.root_op),
         );
         let num_bytes = self.base.num_elements * self.base.char_type.get_size();
         let insert_addr = data.obank().get(insert_point).unwrap().get_addr().clone();
         let byte_array = self.base.byte_array.clone();
         let src_ptr =
-            data.get_internal_string(&byte_array, num_bytes, Rc::clone(&char_ptr_type), insert_point)?;
+            data.get_internal_string(&byte_array, num_bytes, char_ptr_type.clone(), insert_point)?;
 
         let mut dest_ptr = self.base_pointer;
         if self.base_offset != 0 || !self.non_const_adds.is_empty() {
@@ -780,7 +780,7 @@ impl HeapSequence {
                     data.op_set_input(add_op, self.non_const_adds[i], 1).ok();
                     let iv_size = data.vbank().get(iv).unwrap().get_size();
                     let new_iv = data.new_unique_out(iv_size, add_op).expect("newUniqueOut");
-                    data.vbank_mut().get_mut(new_iv).unwrap().update_type(Rc::clone(&int_type));
+                    data.vbank_mut().get_mut(new_iv).unwrap().update_type(int_type.clone());
                     data.op_insert_before(add_op, insert_point);
                     iv = new_iv;
                 }
@@ -789,7 +789,7 @@ impl HeapSequence {
             if self.base_offset != 0 {
                 let num_el = self.base_offset / (self.base.char_type.get_align_size() as u64);
                 let cvn = data.new_constant(bp_size, num_el);
-                data.vbank_mut().get_mut(cvn).unwrap().update_type(Rc::clone(&int_type));
+                data.vbank_mut().get_mut(cvn).unwrap().update_type(int_type.clone());
                 match index_vn {
                     None => index_vn = Some(cvn),
                     Some(iv) => {
@@ -799,7 +799,7 @@ impl HeapSequence {
                         data.op_set_input(add_op, cvn, 1).ok();
                         let iv_size = data.vbank().get(iv).unwrap().get_size();
                         let new_iv = data.new_unique_out(iv_size, add_op).expect("newUniqueOut");
-                        data.vbank_mut().get_mut(new_iv).unwrap().update_type(Rc::clone(&int_type));
+                        data.vbank_mut().get_mut(new_iv).unwrap().update_type(int_type.clone());
                         data.op_insert_before(add_op, insert_point);
                         index_vn = Some(new_iv);
                     }
@@ -814,7 +814,7 @@ impl HeapSequence {
             let align = self.base.char_type.get_align_size();
             let align_con = data.new_constant(bp_size, align as u64);
             data.op_set_input(ptr_add, align_con, 2).ok();
-            data.vbank_mut().get_mut(dp).unwrap().update_type(Rc::clone(&char_ptr_type));
+            data.vbank_mut().get_mut(dp).unwrap().update_type(char_ptr_type.clone());
             data.op_insert_before(ptr_add, insert_point);
             // (kuna) inheritUnionField on a union base pointer omitted — the heap
             // sequence's base pointer is a plain typed pointer in the ported tests;
@@ -1044,7 +1044,7 @@ impl StringSequence {
     /// COPY-into-array string exists for the given root.
     fn build(
         data: &Funcdata,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         entry: crate::varmap::StringContainerEntry,
         root: OpId,
         addr: Address,
@@ -1076,18 +1076,18 @@ impl StringSequence {
         }
         // Walk down the parent type to the array of `ct`.  `parent_type` is `None`
         // once the walk falls off the end (C++ parentType==0).
-        let mut parent_type: Option<Rc<Datatype>> = Some(Rc::clone(&seq.entry.sym_type));
-        let mut array_type: Option<Rc<Datatype>> = None;
+        let mut parent_type: Option<TypeRoot> = Some(seq.entry.sym_type.clone());
+        let mut array_type: Option<TypeRoot> = None;
         let mut last_off: int8 = 0;
         loop {
             let pt = match &parent_type {
-                Some(p) => Rc::clone(p),
+                Some(p) => p.clone(),
                 None => break, // parentType == 0
             };
-            if Rc::ptr_eq(&pt, &seq.base.char_type) {
+            if pt.id() == seq.base.char_type.id() {
                 break;
             }
-            array_type = Some(Rc::clone(&pt));
+            array_type = Some(pt.clone());
             last_off = off;
             if pt.needs_resolution() {
                 match Self::resolve_field(data, &pt, off, root, -1) {
@@ -1109,7 +1109,7 @@ impl StringSequence {
             }
         }
         let parent_matches_ct =
-            parent_type.as_ref().map(|p| Rc::ptr_eq(p, &seq.base.char_type)).unwrap_or(false);
+            parent_type.as_ref().map(|p| p.id() == seq.base.char_type.id()).unwrap_or(false);
         if !parent_matches_ct {
             return Some(seq);
         }
@@ -1146,11 +1146,11 @@ impl StringSequence {
     /// fall-through (the resolved-field branch is the deferred union follow-up).
     fn resolve_field(
         _data: &Funcdata,
-        _ct: &Rc<Datatype>,
+        _ct: &TypeRoot,
         _off: int8,
         _op: OpId,
         _slot: int4,
-    ) -> Option<(Rc<Datatype>, int8)> {
+    ) -> Option<(TypeRoot, int8)> {
         // Union resolution requires `&mut Funcdata` (scoring writes the slot-1
         // edge); the COPY-array driver runs on `&Funcdata`.  No stack-string
         // datatest reaches a union container, so decline (== C++ field==0).
@@ -1235,7 +1235,7 @@ impl StringSequence {
         } else {
             data.construct_const_spacebase(&spc).ok()?
         };
-        let mut base_type = Rc::clone(&self.entry.sym_type);
+        let mut base_type = self.entry.sym_type.clone();
         // PTRSUB from base register to the Symbol.
         let ptrsub = data.new_op(2, insert_addr.clone());
         data.op_set_opcode_code(ptrsub, OpCode::CPUI_PTRSUB);
@@ -1248,11 +1248,11 @@ impl StringSequence {
         space_ptr = data.new_unique_out(sp_size, ptrsub).ok()?;
         data.op_insert_before(ptrsub, insert_point);
         let mut cur_type = types
-            .get_type_pointer_strip_array(sp_size, Rc::clone(&base_type), spc.get_word_size())
+            .get_type_pointer_strip_array(sp_size, base_type.clone(), spc.get_word_size())
             .ok()?;
-        data.vbank_mut().get_mut(space_ptr)?.update_type(Rc::clone(&cur_type));
+        data.vbank_mut().get_mut(space_ptr)?.update_type(cur_type.clone());
         let mut cur_off: int8 = self.root_addr.get_offset().wrapping_sub(self.entry.first) as int8;
-        while !Rc::ptr_eq(&base_type, &self.base.char_type) {
+        while base_type.id() != self.base.char_type.id() {
             let el_size: int4 = if base_type.get_metatype() == type_metatype::TYPE_ARRAY {
                 base_type.get_array_base().map(|b| b.get_align_size()).unwrap_or(-1)
             } else {
@@ -1304,14 +1304,14 @@ impl StringSequence {
             }
             data.op_set_input(ptr_op, space_ptr, 0).ok();
             if cur_type.needs_resolution() {
-                data.inherit_union_field_ptr(Rc::clone(&cur_type), ptr_op, 0, insert_point, -1).ok();
+                data.inherit_union_field_ptr(cur_type.clone(), ptr_op, 0, insert_point, -1).ok();
             }
             space_ptr = data.new_unique_out(sp_size, ptr_op).ok()?;
             data.op_insert_before(ptr_op, insert_point);
             cur_type = types
-                .get_type_pointer_strip_array(sp_size, Rc::clone(&base_type), spc.get_word_size())
+                .get_type_pointer_strip_array(sp_size, base_type.clone(), spc.get_word_size())
                 .ok()?;
-            data.vbank_mut().get_mut(space_ptr)?.update_type(Rc::clone(&cur_type));
+            data.vbank_mut().get_mut(space_ptr)?.update_type(cur_type.clone());
             cur_off = new_off;
         }
         if cur_off != 0 {
@@ -1326,9 +1326,9 @@ impl StringSequence {
             space_ptr = data.new_unique_out(sp_size, add_op).ok()?;
             data.op_insert_before(add_op, insert_point);
             cur_type = types
-                .get_type_pointer(sp_size, Rc::clone(&self.base.char_type), spc.get_word_size())
+                .get_type_pointer(sp_size, self.base.char_type.clone(), spc.get_word_size())
                 .ok()?;
-            data.vbank_mut().get_mut(space_ptr)?.update_type(Rc::clone(&cur_type));
+            data.vbank_mut().get_mut(space_ptr)?.update_type(cur_type.clone());
         }
         Some(space_ptr)
     }
@@ -1353,7 +1353,7 @@ impl StringSequence {
         let char_ptr_type = types
             .get_type_pointer(
                 types.get_size_of_pointer(),
-                Rc::clone(&self.base.char_type),
+                self.base.char_type.clone(),
                 word_size,
             )
             .ok()?;
@@ -1369,7 +1369,7 @@ impl StringSequence {
         let dest_ptr = self.construct_typed_pointer(data, insert_point)?;
         data.op_set_input(copy_op, dest_ptr, 1).ok();
         data.op_set_input(copy_op, src_ptr, 2).ok();
-        let dest_ty = Rc::clone(data.vbank().get(dest_ptr)?.get_type_def_facing());
+        let dest_ty = data.vbank().get(dest_ptr)?.get_type_def_facing().clone();
         if dest_ty.needs_resolution() {
             data.inherit_union_field_ptr(dest_ty, copy_op, 1, insert_point, -1).ok();
         }
@@ -1491,7 +1491,7 @@ impl StringSequence {
     /// Returns `None` when no containing `ct`-array exists or no run was gathered.
     pub(crate) fn build_for_fill(
         data: &Funcdata,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         entry: crate::varmap::StringContainerEntry,
         root: OpId,
         addr: Address,
@@ -1518,18 +1518,18 @@ impl StringSequence {
         }
         // Walk the containing Symbol's type down to the `ct`-array (mirrors `build`).
         let mut off = off0;
-        let mut parent_type: Option<Rc<Datatype>> = Some(Rc::clone(&seq.entry.sym_type));
-        let mut array_type: Option<Rc<Datatype>> = None;
+        let mut parent_type: Option<TypeRoot> = Some(seq.entry.sym_type.clone());
+        let mut array_type: Option<TypeRoot> = None;
         let mut last_off: int8 = 0;
         loop {
             let pt = match &parent_type {
-                Some(p) => Rc::clone(p),
+                Some(p) => p.clone(),
                 None => break,
             };
-            if Rc::ptr_eq(&pt, &seq.base.char_type) {
+            if pt.id() == seq.base.char_type.id() {
                 break;
             }
-            array_type = Some(Rc::clone(&pt));
+            array_type = Some(pt.clone());
             last_off = off;
             if pt.needs_resolution() {
                 match Self::resolve_field(data, &pt, off, root, -1) {
@@ -1550,7 +1550,7 @@ impl StringSequence {
             }
         }
         let parent_matches_ct =
-            parent_type.as_ref().map(|p| Rc::ptr_eq(p, &seq.base.char_type)).unwrap_or(false);
+            parent_type.as_ref().map(|p| p.id() == seq.base.char_type.id()).unwrap_or(false);
         if !parent_matches_ct {
             return None;
         }
@@ -1658,7 +1658,7 @@ impl StringSequence {
         let dest_ptr = self.construct_typed_pointer(data, insert_point)?;
         data.op_set_input(memset_op, dest_ptr, 1).ok();
         if let Ok(dest_v) = data.vbank().get(dest_ptr).ok_or(()) {
-            let dest_ty = Rc::clone(dest_v.get_type_def_facing());
+            let dest_ty = dest_v.get_type_def_facing().clone();
             if dest_ty.needs_resolution() {
                 data.inherit_union_field_ptr(dest_ty, memset_op, 1, insert_point, -1).ok();
             }
@@ -1712,7 +1712,7 @@ impl StringSequence {
     /// insertion point) and `entry`/`root_addr` describe the destination the
     /// inherited `constructTypedPointer` walks.
     pub(crate) fn from_rodata_run(
-        char_type: Rc<Datatype>,
+        char_type: TypeRoot,
         entry: crate::varmap::StringContainerEntry,
         root: OpId,
         block: crate::context::BlockId,
@@ -1790,12 +1790,9 @@ impl Rule for RuleStringCopy {
     }
 
     /// C++ `RuleStringCopy::clone`:
-    /// `if (!grouplist.contains(getGroup())) return 0;`
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleStringCopy { group: self.group.clone() }))
+    /// Group membership is handled by the registered rule entry.
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleStringCopy { group: self.group.clone() })
     }
 
     /// C++ `RuleStringCopy::applyOp` (`constseq.cc:981`).
@@ -1811,7 +1808,7 @@ impl Rule for RuleStringCopy {
             Some(v) => v,
             None => return 0,
         };
-        let ct = Rc::clone(data.vbank().get(outvn).expect("RuleStringCopy: stale outvn").get_type_def_facing());
+        let ct = data.vbank().get(outvn).expect("RuleStringCopy: stale outvn").get_type_def_facing().clone();
         if !ct.is_char_print() {
             return 0;
         }
@@ -1892,12 +1889,9 @@ impl Rule for RuleStringStore {
     }
 
     /// C++ `RuleStringStore::clone`:
-    /// `if (!grouplist.contains(getGroup())) return 0;`
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleStringStore { group: self.group.clone() }))
+    /// Group membership is handled by the registered rule entry.
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleStringStore { group: self.group.clone() })
     }
 
     /// C++ `RuleStringStore::applyOp` (`constseq.cc:1013`).
@@ -1913,7 +1907,7 @@ impl Rule for RuleStringStore {
             Some(v) => v,
             None => return 0,
         };
-        let ct = Rc::clone(
+        let ct = TypeRoot::clone(
             data.vbank().get(ptrvn).expect("RuleStringStore: stale ptrvn").get_type_read_facing(op),
         );
         if ct.get_metatype() != type_metatype::TYPE_PTR {
@@ -1948,8 +1942,8 @@ impl Rule for RuleStringStore {
 /// that slot group.  The per-file placeholder is `"analysis"`.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleStringCopy::new("analysis")) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleStringStore::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleStringCopy::new("analysis")) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleStringStore::new("analysis")) },
     ]
 }
 

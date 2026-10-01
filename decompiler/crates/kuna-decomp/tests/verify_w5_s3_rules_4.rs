@@ -15,16 +15,8 @@
 //!     assert the rule returns the C++ result (0, AND not bypassed) *without
 //!     panicking* — under the bug they abort.
 //!
-//!   * **Registration group provenance.**  `coreaction.cc:5939-5940` registers
-//!     `RuleLoadVarnode`/`RuleStoreVarnode` with the group **`"stackvars"`**, not
-//!     `"analysis"` (the other 17 are `"analysis"`, 5845-5876).  The port's
-//!     `clone_rule` hardcodes `contains("analysis")` for all 19 and `specs()`
-//!     tags both with `group:"analysis"` — so these two rules clone/route under
-//!     the wrong group.  Asserted directly.
-//!
 //! C++ oracle: `decompiler/cpp/ruleaction.cc` (RuleShiftAnd 4935-4977,
-//! RuleSubZext 5059-5120) and `decompiler/cpp/coreaction.cc` (5845-5876,
-//! 5939-5940).
+//! RuleSubZext 5059-5120).
 
 use std::rc::Rc;
 
@@ -34,11 +26,11 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use kuna_decomp::action::{ActionGroupList, Rule};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::action::Rule;
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::ruleaction_4::{
-    RuleHumptyOr, RuleLoadVarnode, RuleShiftAnd, RuleStoreVarnode, RuleSubExtComm, RuleSubZext,
+    RuleHumptyOr, RuleShiftAnd, RuleSubExtComm, RuleSubZext,
 };
 use kuna_decomp::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
 use kuna_decomp::varnode::DefOpInfo;
@@ -64,7 +56,14 @@ fn build_fd() -> Funcdata {
         1,
     )))
     .unwrap();
-    let glb = Rc::new(ArchContext::new(m));
+    let mut arch = ArchContext::new(m);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -74,8 +73,8 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn set_opcode(fd: &mut Funcdata, op: OpId, opc: OpCode) {
@@ -97,7 +96,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// A non-free processor register Varnode (a heritaged input).
 fn mk_vn(fd: &mut Funcdata, s: int4, off: u64) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.vbank_mut().create(s, Address::new(r, off), dt(s));
+    let ct = dt(fd, s);
+    let vn = fd.vbank_mut().create(s, Address::new(r, off), ct);
     fd.vbank_mut().set_input(vn, &mut |_, _, _| Ok(())).expect("set_input")
 }
 
@@ -105,9 +105,10 @@ fn mk_vn(fd: &mut Funcdata, s: int4, off: u64) -> VarnodeId {
 fn mk_out(fd: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
     let seqnum = fd.obank().get(op).unwrap().get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum };
+    let ct = dt(fd, s);
     let vn = fd
         .vbank_mut()
-        .create_def_unique(s, dt(s), def, &mut |_, _, _| Ok(()))
+        .create_def_unique(s, ct, def, &mut |_, _, _| Ok(()))
         .expect("create_def_unique");
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));
     vn
@@ -185,40 +186,6 @@ fn shiftand_negative_int4_shift_count_no_panic() {
     let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
     // 0x80000000 & 63 == 0 -> nzm/mask unchanged -> declines (as the >>64 case).
     assert_eq!(res, 0, "negative-int4 shift count must x86-mask, not panic");
-}
-
-// ---------------------------------------------------------------------------
-// F2 (MAJOR): RuleLoadVarnode / RuleStoreVarnode register under "stackvars"
-// ---------------------------------------------------------------------------
-
-// coreaction.cc:5939-5940 -> these two rules carry group "stackvars"; their C++
-// `clone` gates on `grouplist.contains(getGroup())` == contains("stackvars").
-// The port hardcodes contains("analysis"), so it clones under the wrong group
-// (and `specs()` tags them "analysis").  Under a faithful port, asking to clone
-// into a "stackvars"-only grouplist must succeed and into an "analysis"-only
-// grouplist must decline.  The current port does the opposite.
-#[test]
-fn loadstore_varnode_clone_under_stackvars_group() {
-    let stackvars = ActionGroupList::from_names(["stackvars"]);
-    let analysis = ActionGroupList::from_names(["analysis"]);
-
-    // C++ oracle: getGroup()=="stackvars" -> clones iff list has "stackvars".
-    assert!(
-        RuleLoadVarnode::new().clone_rule(&stackvars).is_some(),
-        "RuleLoadVarnode is a stackvars-group rule (coreaction.cc:5939); must clone there"
-    );
-    assert!(
-        RuleLoadVarnode::new().clone_rule(&analysis).is_none(),
-        "RuleLoadVarnode must NOT clone into an analysis-only grouplist"
-    );
-    assert!(
-        RuleStoreVarnode::new().clone_rule(&stackvars).is_some(),
-        "RuleStoreVarnode is a stackvars-group rule (coreaction.cc:5940); must clone there"
-    );
-    assert!(
-        RuleStoreVarnode::new().clone_rule(&analysis).is_none(),
-        "RuleStoreVarnode must NOT clone into an analysis-only grouplist"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ use std::rc::Rc;
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace};
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_class, type_metatype, Datatype, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_class, type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::fspec::{
     parameter_pieces_flags, ParamEntry, ParamListKind, ParamListStandard, ParameterPieces,
     PrototypePieces,
@@ -100,7 +100,13 @@ fn type_factory(default_data_addr_size: int4) -> TypeFactoryImpl {
     tf
 }
 
-fn proto_returning(outtype: Rc<Datatype>) -> PrototypePieces {
+fn struct_type(tf: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    let mut draft = Datatype::new_with_align(size, 8, type_metatype::TYPE_STRUCT);
+    draft.set_struct_fields(Vec::new(), Vec::new(), size, 8);
+    tf.intern(draft).expect("struct type")
+}
+
+fn proto_returning(outtype: TypeRoot) -> PrototypePieces {
     PrototypePieces {
         name: "anon".to_string(),
         outtype: Some(outtype),
@@ -121,7 +127,7 @@ fn hidden_return_emits_indirect_output_and_trailing_pointer_param() {
     let (mgr, reg) = manager_with_data_space(8);
     let model = one_register_out_model(&reg, 8, &mgr);
     let tf = type_factory(8);
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 24);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -173,7 +179,9 @@ fn fitting_return_assigns_directly_with_no_hidden_param() {
     let model = one_register_out_model(&reg, 8, &mgr);
     let tf = type_factory(8);
     // A 4-byte int fits the 8-byte output register.
-    let outtype = Rc::new(Datatype::new_with_align(4, 4, type_metatype::TYPE_INT));
+    let outtype = tf
+        .intern(Datatype::new_with_align(4, 4, type_metatype::TYPE_INT))
+        .expect("integer type");
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -197,7 +205,7 @@ fn hidden_return_pointer_size_tracks_default_data_space() {
     // 24-byte struct cannot be assigned and the 4-byte pointer can.
     let model = one_register_out_model(&reg, 4, &mgr);
     let tf = type_factory(4);
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 24);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -233,7 +241,7 @@ fn hidden_return_without_data_space_errors_cleanly() {
     ));
     let model = one_register_out_model(&reg, 8, &mgr);
     let tf = type_factory(8);
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 24);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -246,7 +254,7 @@ fn hidden_return_without_data_space_errors_cleanly() {
 }
 
 /// `TypeFactory::get_type_void` is on the trait; reach it through the impl.
-fn tf_void(tf: &TypeFactoryImpl) -> Rc<Datatype> {
+fn tf_void(tf: &TypeFactoryImpl) -> TypeRoot {
     use kuna_decomp::dtype::TypeFactory;
     tf.get_type_void().expect("void type")
 }
@@ -289,7 +297,7 @@ fn pointer_unassignable_raises_param_unassigned_not_generic_lowlevel() {
     let (mgr, reg) = manager_with_data_space(8); // 8-byte pointer
     let model = one_register_out_model(&reg, 4, &mgr); // but only a 4-byte out reg
     let tf = type_factory(8);
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 24);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -335,7 +343,7 @@ fn no_data_space_guard_is_not_param_unassigned_so_catch_arm_cannot_swallow_it() 
     ));
     let model = one_register_out_model(&reg, 8, &mgr);
     let tf = type_factory(8);
-    let outtype = Rc::new(Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 24);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();
@@ -368,7 +376,7 @@ fn shared_status_lets_second_assign_reattempt_same_entry_and_fail() {
     let tf = type_factory(8);
     // 16-byte struct: too big for the 4-byte register, and the 8-byte pointer is
     // ALSO too big for it.
-    let outtype = Rc::new(Datatype::new_with_align(16, 8, type_metatype::TYPE_STRUCT));
+    let outtype = struct_type(&tf, 16);
     let proto = proto_returning(outtype);
 
     let mut res: Vec<ParameterPieces> = Vec::new();

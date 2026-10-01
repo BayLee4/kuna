@@ -462,3 +462,279 @@ fn raw_input_rejects_mapping_overflow() {
     }
     assert!(error.contains("overflows"), "unexpected error: {error}");
 }
+
+
+fn physical_source_program(fixture: &RawFixture) -> Option<kuna_console::engine::ConsoleProgram> {
+    match bootstrap_from_raw(fixture.0.to_str().unwrap(), "x86:LE:64:default:gcc",
+        0x1000, &[0x1000], None, &specs())
+    {
+        Ok(mut program) => {
+            program.commit_pending_analysis().unwrap();
+            Some(program)
+        }
+        Err(error) => {
+            skip_or_fail(&error.explain().to_string(), "x86");
+            None
+        }
+    }
+}
+
+#[test]
+fn physical_source_console_edits_replay_without_resurrecting_old_slots() {
+    use kuna_console::ifacedecomp::{execute, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
+    use kuna_console::ifaceterm::ConsoleCommands;
+    let fixture = RawFixture::new("physical-source-edits", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
+    let cases: &[(&[&str], [(&str, i32, u64); 2])] = &[
+        (&["rename value renamed", "decompile", "retype other uint2 changed", "decompile"],
+            [("renamed", 1, 0x38), ("changed", 2, 0x30)]),
+        (&["rename other sibling", "map param subject::0 [register,0x8,2] uint2 fresh",
+           "rename fresh newest", "decompile"],
+            [("newest", 2, 0x08), ("sibling", 1, 0x30)]),
+        (&["rename value old_rename", "parse line extern uint4 subject(uint2 fresh, uint1 other);",
+           "rename fresh newest", "decompile"],
+            [("newest", 2, 0x38), ("other", 1, 0x30)]),
+    ];
+    for &(commands, expected) in cases {
+        let Some(program) = physical_source_program(&fixture) else { return };
+        let mut script: Vec<String> = [
+            "map function [ram,0x1000] subject",
+            "load function subject",
+            "parse line extern uint4 subject(uint1 value,uint1 other);",
+            "decompile",
+        ].into_iter().map(str::to_string).collect();
+        script.extend(commands.iter().map(|command| command.to_string()));
+        let count = script.len();
+        let mut status = ConsoleCommands::into_status(script);
+        register_decomp_commands(&mut status);
+        let data = status.get_data_mut(DECOMPILE_MODULE).unwrap();
+        data.as_any_mut().downcast_mut::<IfaceDecompData>().unwrap().conf = Some(program);
+        for _ in 0..count { execute(&mut status); }
+        let transcript = status.optr.clone();
+        let data = status.get_data_mut(DECOMPILE_MODULE).unwrap();
+        let dcp = data.as_any_mut().downcast_mut::<IfaceDecompData>().unwrap();
+        let fd = dcp.fd.as_ref().expect("edited function remains selected");
+        let proto = fd.get_func_proto();
+        let actual: Vec<_> = (0..proto.num_params()).filter_map(|slot| proto.source_param(slot))
+            .map(|parameter| (parameter.get_name(), parameter.get_size(), parameter.get_address().get_offset()))
+            .collect();
+        assert_eq!(actual, expected, "source edits lost or stale carrier authority replayed: {transcript}");
+        assert!(proto.has_execution_inputs(), "wide machine reads must retain real carriers");
+        let scope = fd.get_scope_local().unwrap();
+        for (slot, &(name, size, offset)) in expected.iter().enumerate() {
+            let id = scope.parameter_symbol_for_slot(slot as i32).expect("source category0 symbol");
+            let symbol = scope.database().symbol(id);
+            assert_eq!(symbol.get_name(), name);
+            assert_eq!(symbol.dtype.as_ref().unwrap().get_size(), size);
+            assert!(symbol.mapentry.iter().any(|&entry| {
+                // Each source symbol's original storage survives independently.
+                let entry = scope.database().entry(symbol.scope, entry);
+                entry.get_addr().get_offset() == offset && entry.get_size() == size
+            }));
+        }
+        let args = (0..proto.num_params()).map(|slot| {
+            let param = proto.get_param(slot).unwrap();
+            match param.get_address().get_offset() {
+                0x38 => "left",
+                0x30 => "right",
+                0x08 => "0xaabbU",
+                other => panic!("unexpected execution parameter storage: {other:#x}"),
+            }
+        }).collect::<Vec<_>>().join(",");
+        let body = kuna_decomp::decompile_drive::print_c(dcp.conf.as_mut().unwrap().arch_mut(), fd);
+        let preamble = "#include <stdint.h>\n#include <stdbool.h>\n\
+            typedef uint8_t uint1; typedef uint16_t uint2; typedef uint32_t uint4; typedef uint64_t uint8;\n";
+        let driver = format!("int main(void) {{ for(unsigned v=0;v<256;v++) {{ \
+            uint32_t left=0x10000U|v,right=0x20000U|(v^0x5aU); \
+            if((uint32_t)subject({args})!=left+right)return 1; }} return 0; }}");
+        common::c_behavior::assert_c_behavior("source-formal-replay", preamble, &body, &driver);
+    }
+}
+
+#[test]
+fn physical_source_assertion_batch_keeps_carriers_read_only_until_replay() {
+    let fixture = RawFixture::new("physical-source-batch", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
+    let Some(mut program) = physical_source_program(&fixture) else { return };
+    let entry = program.find_entry_at(0x1000).expect("raw entry");
+    let function = entry.name.clone();
+    let prototype = Body::Prototype { func: function.clone(), decl: format!("uint4 {function}(uint1 value,uint1 other)") };
+    program.set_assertions(vec![Directive { raw: "physical source prototype".into(), body: prototype.clone() }]);
+    assertions::apply_program_scoped(&mut program);
+    let seed = assertions::function_seed(&mut program, &function, &entry.addr, false);
+    let fd = kuna_console::decompile_step::decompile_one(program.arch_mut(), &function,
+        entry.addr.clone(), 0, &kuna_console::decompile_step::DecompileSeed {
+            mapped_symbols: &[], usepoint_symbols: &[], dynamic_symbols: &[],
+            pending_proto: seed.pending_proto.as_ref(), flow_overrides: &[], mapped_params: &seed.mapped_params,
+        }, &kuna_decomp::overrides::Override::new()).result.expect("initial physical drive");
+    let carrier = fd.get_func_proto().get_param(0).unwrap();
+    assert!(fd.get_func_proto().is_execution_input(0));
+    let source = fd.get_func_proto().source_param(0).unwrap();
+    assert_eq!(source.get_size(), 1, "authentic source declaration stays a byte");
+    let edi = Address::new(source.get_address().get_space().unwrap().clone(), 0x38);
+    assert!(carrier.get_address().justified_contain(carrier.get_size(), &edi, 4, false) >= 0,
+        "carrier must preserve every bit read from EDI");
+    let input = fd.find_varnode_input(carrier.get_size(), &carrier.get_address()).expect("real carrier SSA input");
+    let high = fd.vbank().get(input).unwrap().get_high().unwrap();
+    assert_eq!(fd.execution_input_slot_for_high(high), Some(0));
+    let raw_name = fd.high_bank().get(high).unwrap().kuna_name().unwrap().to_string();
+    let specifications = [
+        prototype,
+        Body::Name { func: Some(function.clone()), symbol: "value".into(), newname: "renamed".into() },
+        Body::Name { func: Some(function), symbol: raw_name, newname: "forbidden".into() },
+    ];
+    program.set_assertions(specifications.into_iter().enumerate().map(|(index, body)| Directive {
+        raw: format!("source-batch-{index}"), body,
+    }).collect());
+    assertions::apply_program_scoped(&mut program);
+    let results = decompile_targets(&mut program, vec![entry], false, false, false);
+    let result = &results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let report = program.assertion_outcomes();
+    assert_eq!(report[1].status, "applied");
+    assert_eq!(report[2].status, "rejected");
+    let formals: Vec<_> = result.variables.iter().filter(|variable| variable.is_param)
+        .map(|variable| (variable.name.as_str(), variable.size)).collect();
+    assert_eq!(formals, [("renamed", 1), ("other", 1)]);
+}
+
+#[test]
+fn normalized_callback_input_requires_the_receivers_execution_body() {
+    let mut image = vec![0u8; 0x120];
+    image[..6].copy_from_slice(&[0xe8, 0xfb, 0, 0, 0, 0xc3]);
+    // The receiver calls its incoming code pointer with dirty EDI=0x10055.
+    image[0x100..0x10b].copy_from_slice(&[0x48, 0x89, 0xf8, 0xbf, 0x55, 0, 1, 0, 0xff, 0xd0, 0xc3]);
+    let fixture = RawFixture::new("native-callback-boundary", &image);
+    let mut program = match bootstrap_from_raw(fixture.0.to_str().unwrap(), "x86:LE:64:default:gcc",
+        0x1000, &[0x1000, 0x1100], None, &specs())
+    {
+        Ok(program) => program,
+        Err(error) => { skip_or_fail(&error.explain().to_string(), "x86"); return; }
+    };
+    program.commit_pending_analysis().unwrap();
+    let forward = program.find_entry_at(0x1000).expect("forward entry");
+    let receiver = program.find_entry_at(0x1100).expect("receiver entry");
+    let prototypes = [&forward, &receiver].into_iter().map(|entry| Directive {
+        raw: format!("prototype {}", entry.name),
+        body: Body::Prototype { func: entry.name.clone(),
+            decl: format!("int {}(int (*callback)(unsigned char))", entry.name) },
+    }).collect();
+    program.set_assertions(prototypes);
+    assertions::apply_program_scoped(&mut program);
+    assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
+    // Deliberately omit the receiver from the exported unit: a source callback
+    // declaration alone cannot authorize passing a normalized adapter to it.
+    let results = decompile_targets(&mut program, vec![forward], false, false, false);
+    let result = &results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(result.code.is_some(), "diagnostic body must remain available");
+    let formals: Vec<_> = result.variables.iter().filter(|variable| variable.is_param)
+        .map(|variable| (variable.name.as_str(), variable.size)).collect();
+    assert_eq!(formals, [("callback", 8)]);
+    assert!(result.callable_artifacts.iter().any(|artifact| artifact.required && artifact.definition.is_none()),
+        "callback normalization must require the omitted receiver, not just alter its formal datatype");
+    assert!(kuna_console::project::render_c(&results).is_err(),
+        "an unresolved native callback dependency cannot be published as executable C");
+}
+
+#[test]
+fn callback_nonresult_register_effects_are_not_published_as_ordinary_c() {
+    let mut image = vec![0u8; 0x120];
+    // CALL RDI; MOV EAX,ECX; RET observes a caller-saved register, not the C result.
+    image[..5].copy_from_slice(&[0xff, 0xd7, 0x89, 0xc8, 0xc3]);
+    // A valid machine callback returns EAX=3 while the caller observes ECX=7.
+    image[0x100..0x10b].copy_from_slice(&[0xb9, 7, 0, 0, 0, 0xb8, 3, 0, 0, 0, 0xc3]);
+    let fixture = RawFixture::new("callback-nonresult-effect", &image);
+    let mut program = match bootstrap_from_raw(fixture.0.to_str().unwrap(), "x86:LE:64:default:gcc",
+        0x1000, &[0x1000, 0x1100], None, &specs())
+    {
+        Ok(program) => program,
+        Err(error) => { skip_or_fail(&error.explain().to_string(), "x86"); return; }
+    };
+    program.commit_pending_analysis().unwrap();
+    let caller = program.find_entry_at(0x1000).expect("caller entry");
+    let target = program.find_entry_at(0x1100).expect("callback entry");
+    program.set_assertions(vec![
+        Directive { raw: format!("prototype {}", caller.name), body: Body::Prototype {
+            func: caller.name.clone(), decl: format!("int {}(int (*callback)(void))", caller.name),
+        } },
+        Directive { raw: format!("prototype {}", target.name), body: Body::Prototype {
+            func: target.name.clone(), decl: format!("int {}(void)", target.name),
+        } },
+    ]);
+    assertions::apply_program_scoped(&mut program);
+    assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
+    let results = decompile_targets(&mut program, vec![caller, target], false, false, false);
+    let result = &results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    assert!(result.code.is_some(), "the machine diagnostic body must remain available");
+    let formals: Vec<_> = result.variables.iter().filter(|variable| variable.is_param)
+        .map(|variable| (variable.name.as_str(), variable.size)).collect();
+    assert_eq!(formals, [("callback", 8)]);
+    assert!(result.callable_export_error.is_some());
+    assert!(kuna_console::project::render_c(&results).is_err(),
+        "a C callback result cannot substitute for its separately observed ECX effect");
+}
+
+#[test]
+fn an_unrepresented_return_register_remains_an_explicit_execution_boundary() {
+    let fixture = RawFixture::new("return-entry-state", &[0xc3]);
+    let mut program = match bootstrap_from_raw(fixture.0.to_str().unwrap(), "x86:LE:64:default:gcc",
+        0x1000, &[0x1000], None, &specs())
+    {
+        Ok(program) => program,
+        Err(error) => { skip_or_fail(&error.explain().to_string(), "x86"); return; }
+    };
+    program.commit_pending_analysis().unwrap();
+    let target = program.find_entry_at(0x1000).unwrap();
+    program.set_assertions(vec![Directive {
+        raw: format!("prototype {}", target.name),
+        body: Body::Prototype { func: target.name.clone(),
+            decl: format!("int {}(unsigned char value)", target.name) },
+    }]);
+    assertions::apply_program_scoped(&mut program);
+    assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
+    let results = decompile_targets(&mut program, vec![target], false, false, false);
+    let target = &results[0];
+    assert!(target.error.is_none(), "{:?}", target.error);
+    assert!(target.code.is_some());
+    let formals: Vec<_> = target.variables.iter().filter(|variable| variable.is_param)
+        .map(|variable| (variable.name.as_str(), variable.size)).collect();
+    assert_eq!(formals, [("value", 1)]);
+    assert!(target.callable_export_error.is_some());
+    assert!(kuna_console::project::render_c(&results).is_err(),
+        "RET observes incoming EAX; an uninitialized C local cannot represent it");
+}
+
+#[test]
+fn observable_link_register_state_is_not_return_target_bookkeeping() {
+    let mut image = vec![0u8; 0x24];
+    image[..8].copy_from_slice(&[0xe0, 0x03, 0x1e, 0xaa, 0xc0, 0x03, 0x5f, 0xd6]); // MOV X0,X30; RET
+    image[0x20..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]); // RET only
+    let fixture = RawFixture::new("link-register-entry-state", &image);
+    let mut program = match bootstrap_from_raw(fixture.0.to_str().unwrap(), "AARCH64:LE:64:v8A:default",
+        0x1000, &[0x1000, 0x1020], None, &specs())
+    {
+        Ok(program) => program,
+        Err(error) => { skip_or_fail(&error.explain().to_string(), "AARCH64"); return; }
+    };
+    program.commit_pending_analysis().unwrap();
+    let escape = program.find_entry_at(0x1000).unwrap();
+    let plain = program.find_entry_at(0x1020).unwrap();
+    program.set_assertions(vec![
+        Directive { raw: format!("prototype {}", escape.name), body: Body::Prototype {
+            func: escape.name.clone(), decl: format!("unsigned long long {}(void)", escape.name),
+        } },
+        Directive { raw: format!("prototype {}", plain.name), body: Body::Prototype {
+            func: plain.name.clone(), decl: format!("void {}(void)", plain.name),
+        } },
+    ]);
+    assertions::apply_program_scoped(&mut program);
+    assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
+    let results = decompile_targets(&mut program, vec![escape, plain], false, false, false);
+    assert!(results.iter().all(|result| result.error.is_none() && result.code.is_some()));
+    assert!(results.iter().all(|result| result.variables.iter().all(|variable| !variable.is_param)));
+    assert!(results[0].callable_export_error.is_some());
+    assert!(kuna_console::project::render_c(&results[..1]).is_err());
+    assert!(results[1].callable_export_error.is_none());
+    assert!(kuna_console::project::render_c(&results[1..]).is_ok(),
+        "a link register used only as the RETURN target is legitimate bookkeeping");
+}

@@ -23,11 +23,11 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 
 use kuna_decomp::database::{Database, ScopeId};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::varnode::varnode_flags;
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(size: int4) -> TypeRoot {
+    TypeFactoryImpl::new().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 /// const(0), unique(1), ram(2, 8-byte code space), register(3, 4-byte).

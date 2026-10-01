@@ -39,22 +39,20 @@
 //! Each test carries an inline `// DEFER(W8)`.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
-use kuna_decomp::dtype::{flags, type_metatype, Datatype, DatatypeKind};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 
 /// Build a `TypeEnum` from a (value -> name) map, mirroring the C++
 /// `parse("enum name { ... }")` result (an interned `TypeEnum` after decode).
 /// The x86-64 test environment's default enum size is 8.
-fn make_enum(size: i32, entries: &[(u64, &str)]) -> Rc<Datatype> {
-    let mut dt = Datatype::new_with_align(size, size, type_metatype::TYPE_INT);
-    dt.flags |= flags::enumtype;
+fn make_enum(types: &TypeFactoryImpl, size: i32, entries: &[(u64, &str)]) -> TypeRoot {
+    types.set_default_alignment_map();
+    let root = types.get_type_enum_sized("fixture_enum", size, type_metatype::TYPE_ENUM_INT).unwrap();
     let mut namemap: BTreeMap<u64, String> = BTreeMap::new();
     for (v, n) in entries {
         namemap.insert(*v, (*n).to_string());
     }
-    dt.kind = DatatypeKind::Enum { namemap };
-    Rc::new(dt)
+    types.set_enum_values(&root, namemap).unwrap()
 }
 
 // ===========================================================================
@@ -125,7 +123,9 @@ fn cast_integertoken() {}
 /// FOUR=4, EIGHT=8 } at the x86-64 default size of 8.
 #[test]
 fn enum_matching() {
+    let types = TypeFactoryImpl::new();
     let enum3 = make_enum(
+        &types,
         8,
         &[(0, "ZERO"), (1, "ONE"), (2, "TWO"), (4, "FOUR"), (8, "EIGHT")],
     );
@@ -159,7 +159,9 @@ fn enum_matching() {
 /// FOUR=4, SIX=6, EIGHT=8, ELEVEN=11 } at the x86-64 default size of 8.
 #[test]
 fn enum_matching2() {
+    let types = TypeFactoryImpl::new();
     let enum4 = make_enum(
+        &types,
         8,
         &[
             (0, "ZERO"),

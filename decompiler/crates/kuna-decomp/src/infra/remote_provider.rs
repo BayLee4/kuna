@@ -47,9 +47,10 @@ use kuna_base::space::AddrSpaceManager;
 use kuna_base::types::{int4, uint4};
 
 use crate::context::{GlobalEntry, GlobalQuery};
-use crate::dtype::{Datatype, TypeFactory, TypeFactoryImpl};
+use crate::dtype::{TypeFactory, TypeFactoryImpl, TypeRoot};
 use crate::funcdata_encode::ATTRIB_VOLATILE;
-use crate::fspec::{ProtoModel, PrototypePieces};
+use crate::fspec::{EffectRecord, FuncProto, ProtoModel, parameter_pieces_flags};
+use kuna_num::pcoderaw::VarnodeData;
 use crate::varnode::varnode_flags;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +82,8 @@ pub const ELEM_SCOPE: ElementId = ElementId::new("scope", 80);
 pub const ELEM_SYMBOLLIST: ElementId = ElementId::new("symbollist", 81);
 /// Marshaling element \<internallist> (C++ `ELEM_INTERNALLIST`, fspec.cc:39).
 pub const ELEM_INTERNALLIST: ElementId = ElementId::new("internallist", 161);
+pub const ELEM_PARAM: ElementId = ElementId::new("param", 166);
+pub const ELEM_RETPARAM: ElementId = ElementId::new("retparam", 171);
 /// Marshaling element \<prototype> (C++ `ELEM_PROTOTYPE`, fspec.cc:47).
 pub const ELEM_PROTOTYPE: ElementId = ElementId::new("prototype", 169);
 /// Marshaling element \<returnsym> (C++ `ELEM_RETURNSYM`, fspec.cc:50).
@@ -128,9 +131,17 @@ pub fn register_remote_provider_ids(reg: &mut IdRegistry) {
         &ELEM_SCOPE,
         &ELEM_SYMBOLLIST,
         &ELEM_INTERNALLIST,
+        &ELEM_PARAM,
+        &ELEM_RETPARAM,
+        &crate::overrides::ELEM_OVERRIDE,
+        &crate::overrides::ELEM_PROTOOVERRIDE,
         &ELEM_PROTOTYPE,
         &ELEM_RETURNSYM,
         &ELEM_LOCALDB,
+        &crate::fspec::ELEM_UNAFFECTED,
+        &crate::fspec::ELEM_KILLEDBYCALL,
+        &crate::fspec::ELEM_RETURNADDRESS,
+        &crate::fspec::ELEM_LIKELYTRASH,
     ] {
         reg.register_element(e);
     }
@@ -236,10 +247,10 @@ pub struct RemoteSymbolRecord {
     pub category: i64,
     /// Category index (parameter slot) when `category == 0`.
     pub cat_index: u64,
-    /// Whether this is the host's AUTO hidden-return storage parameter.
-    pub hidden_return: bool,
+    /// Parameter-only flags (hidden return, indirect storage, this pointer).
+    pub parameter_flags: uint4,
     /// The decoded data-type (data symbols; `None` for label/function shells).
-    pub dtype: Option<Rc<Datatype>>,
+    pub dtype: Option<TypeRoot>,
     /// The mapped storage entries.
     pub entries: Vec<RemoteEntry>,
     /// Present when the symbol is a function (`<function>`/`<functionshell>`).
@@ -268,6 +279,8 @@ pub struct RemoteFunction {
     pub inline: bool,
     /// The decoded `<prototype>` (+ `<localdb>` cat-0 params), when present.
     pub proto: Option<RemoteProto>,
+    /// Caller-owned call-site signatures, never facts about the global callee.
+    pub proto_overrides: Vec<(Address, RemoteProto)>,
     /// Non-parameter `<localdb>` symbols (host-committed locals; see
     /// [`RemoteLocalVar`]).
     pub locals: Vec<RemoteLocalVar>,
@@ -279,6 +292,8 @@ pub struct RemoteProto {
     pub model: String,
     /// `extrapop`; `None` = the wire string "unknown".
     pub extrapop: Option<i64>,
+    /// An omitted extrapop inherits the model; explicit "unknown" does not.
+    pub extrapop_seen: bool,
     /// Varargs marker.
     pub dotdotdot: bool,
     /// Void-input lock (a locked `void` parameter list).
@@ -288,15 +303,27 @@ pub struct RemoteProto {
     /// Return-type lock.
     pub out_lock: bool,
     /// The decoded return type.
-    pub out_type: Option<Rc<Datatype>>,
+    pub out_type: Option<TypeRoot>,
     /// Exact return storage from the host's `<returnsym><addr>`.
     pub out_storage: Address,
+    /// Return metadata carried by an internal signature.
+    pub out_flags: uint4,
     /// Whether Ghidra declared custom variable storage for this prototype.
     pub custom: bool,
     /// Parameters from the `<localdb>` cat-0 symbols, sorted by slot index.
     pub params: Vec<RemoteParam>,
-    /// Whether every parameter carried `typelock` (a locked signature).
-    pub params_locked: bool,
+    /// An internal list's ABI assignment boundary; presence selects internal
+    /// storage semantics. This is independent of open-ended `dotdotdot`.
+    pub internal_first: Option<int4>,
+    /// Whether the host explicitly locked the calling convention.
+    pub model_lock: bool,
+    /// Function-level semantic flags, independent of storage locks.
+    pub inline: bool,
+    pub constructor: bool,
+    pub destructor: bool,
+    /// Wire effects are deltas against the selected model.
+    pub effects: Vec<EffectRecord>,
+    pub likely_trash: Vec<VarnodeData>,
 }
 
 /// One category-0 (parameter) symbol.
@@ -306,9 +333,9 @@ pub struct RemoteParam {
     /// Parameter name.
     pub name: String,
     /// Parameter data-type.
-    pub dtype: Option<Rc<Datatype>>,
-    /// The symbol's typelock bit.
-    pub typelock: bool,
+    pub dtype: Option<TypeRoot>,
+    /// Exact parameter properties, using `parameter_pieces_flags`.
+    pub flags: uint4,
     /// The parameter's EXACT committed storage (the cat-0 mapsym's `<addr>`).
     /// Java's `checkFullCommit` compares kuna's echoed storage against the
     /// database's; re-deriving it from a default model instead (the Phase-4
@@ -316,8 +343,6 @@ pub struct RemoteParam {
     /// function force-commit a kuna-rederived signature over the user's.
     /// Invalid when the host sent a dynamic/hash entry.
     pub storage: Address,
-    /// The host's AUTO hidden-return parameter, re-derived by the prototype model.
-    pub hidden: bool,
 }
 
 /// One non-parameter local symbol delivered in the current function's
@@ -334,7 +359,7 @@ pub struct RemoteLocalVar {
     /// Symbol name.
     pub name: String,
     /// Symbol data-type.
-    pub dtype: Rc<Datatype>,
+    pub dtype: TypeRoot,
     /// Storage address of the first mapped entry — or, for a DYNAMIC
     /// (`<hash>`) entry, the hash's first-use address (`DynamicEntry`'s
     /// `getAddress()`), which is what `DynamicHash::findVarnode` keys on.
@@ -354,65 +379,11 @@ pub struct RemoteLocalVar {
 }
 
 impl RemoteProto {
-    /// Whether this prototype is locked enough to seed call-site/param
-    /// recovery (the `parse line extern` analogue): a locked-void input list,
-    /// or a non-empty all-typelocked parameter list.
+    /// Match FuncProto input locking without discarding individual locks.
     pub fn is_input_locked(&self) -> bool {
-        self.voidlock || (!self.params.is_empty() && self.params_locked)
-    }
-
-    /// Flatten to the [`PrototypePieces`] the kuna callee-prototype seams
-    /// consume (`ActionDefaultParams` / `query_callee_proto`'s `TypeCode`).
-    pub fn to_pieces(&self, name: &str) -> PrototypePieces {
-        let mut pieces = PrototypePieces {
-            name: name.to_string(),
-            outtype: self.out_type.clone(),
-            intypes: Vec::new(),
-            innames: Vec::new(),
-            first_var_arg_slot: if self.dotdotdot {
-                self.params
-                    .iter()
-                    .filter(|p| !p.hidden && p.dtype.is_some())
-                    .count() as int4
-            } else {
-                -1
-            },
-            output_storage: None,
-            input_storage: Vec::new(),
-        };
-        if self.custom {
-            pieces.output_storage = self.out_type.as_ref().map(|ct| {
-                crate::fspec::ParameterPieces {
-                    addr: self.out_storage.clone(),
-                    type_: Some(Rc::clone(ct)),
-                    flags: crate::fspec::parameter_pieces_flags::TYPELOCK
-                        | crate::fspec::parameter_pieces_flags::CUSTOM_STORAGE,
-                }
-            });
-        }
-        for p in &self.params {
-            if p.hidden {
-                continue;
-            }
-            if let Some(ct) = &p.dtype {
-                pieces.intypes.push(Rc::clone(ct));
-                pieces.innames.push(p.name.clone());
-                if self.custom && !p.storage.is_invalid() {
-                    let slot = (pieces.intypes.len() - 1) as int4;
-                    pieces.input_storage.push((
-                        slot,
-                        crate::fspec::ParameterPieces {
-                            addr: p.storage.clone(),
-                            type_: Some(Rc::clone(ct)),
-                            flags: crate::fspec::parameter_pieces_flags::TYPELOCK
-                                | crate::fspec::parameter_pieces_flags::NAMELOCK
-                                | crate::fspec::parameter_pieces_flags::CUSTOM_STORAGE,
-                        },
-                    ));
-                }
-            }
-        }
-        pieces
+        self.voidlock || self.params.first().is_some_and(|p| {
+            (p.flags & parameter_pieces_flags::TYPELOCK) != 0
+        })
     }
 }
 
@@ -477,7 +448,7 @@ pub fn decode_mapsym(
         // same shape plus a union-facet field attribute the scan skips.
         let sid = decoder.open_element()?;
         let mut rec = decode_symbol_header(decoder, scope_id)?;
-        rec.dtype = Some(types.decode_type(decoder)?);
+        rec.dtype = Some(types.decode_host_type(decoder)?);
         decoder.close_element_skipping(sid)?;
         rec
     } else if sub == ELEM_EQUATESYMBOL.get_id() {
@@ -517,7 +488,7 @@ pub fn decode_mapsym(
             flags: varnode_flags::typelock | varnode_flags::readonly,
             category: -1,
             cat_index: 0,
-            hidden_return: false,
+            parameter_flags: 0,
             // C++ ExternRefSymbol::buildNameType: the pointer's type is
             // pointer-to-code (glb->types->getTypePointer(...getTypeCode())).
             dtype: types
@@ -547,7 +518,7 @@ pub fn decode_mapsym(
             flags: varnode_flags::namelock | varnode_flags::typelock,
             category: -1,
             cat_index: 0,
-            hidden_return: false,
+            parameter_flags: 0,
             dtype: None,
             entries: Vec::new(),
             func: Some(func),
@@ -598,7 +569,7 @@ fn decode_symbol_header(
         flags: 0,
         category: -1,
         cat_index: 0,
-        hidden_return: false,
+        parameter_flags: 0,
         dtype: None,
         entries: Vec::new(),
         func: None,
@@ -638,11 +609,21 @@ fn decode_symbol_header(
             rec.category = decoder.read_signed_integer()?;
         } else if aid == ATTRIB_INDEX.get_id() {
             rec.cat_index = decoder.read_unsigned_integer()?;
-        } else if aid == kuna_base::marshal::ATTRIB_HIDDENRETPARM.get_id() {
-            rec.hidden_return = decoder.read_bool()?;
+        } else {
+            let flag = if aid == kuna_base::marshal::ATTRIB_HIDDENRETPARM.get_id() {
+                parameter_pieces_flags::HIDDENRETPARM
+            } else if aid == kuna_base::marshal::ATTRIB_INDIRECTSTORAGE.get_id() {
+                parameter_pieces_flags::INDIRECTSTORAGE
+            } else if aid == kuna_base::marshal::ATTRIB_THISPTR.get_id() {
+                parameter_pieces_flags::ISTHIS
+            } else {
+                0
+            };
+            if flag != 0 && decoder.read_bool()? {
+                rec.parameter_flags |= flag;
+            }
         }
-        // merge/thisptr/format/indirectstorage: skipped (the
-        // Phase-3 seams do not consume them).
+        // merge/format are not parameter properties.
     }
     if rec.display_name.is_empty() {
         rec.display_name = rec.name.clone();
@@ -669,6 +650,7 @@ fn decode_wire_function(
         no_return: false,
         inline: false,
         proto: None,
+        proto_overrides: Vec::new(),
         locals: Vec::new(),
     };
     loop {
@@ -698,7 +680,6 @@ fn decode_wire_function(
         func.entry = Address::decode(decoder)?;
     }
     let mut params: Vec<RemoteParam> = Vec::new();
-    let mut params_locked = true;
     let mut proto: Option<RemoteProto> = None;
     while decoder.peek_element()? != 0 {
         let sub = decoder.peek_element()?;
@@ -707,11 +688,24 @@ fn decode_wire_function(
                 decoder,
                 types,
                 &mut params,
-                &mut params_locked,
                 &mut func.locals,
             )?;
         } else if sub == ELEM_PROTOTYPE.get_id() {
             proto = Some(decode_prototype(decoder, types)?);
+        } else if sub == crate::overrides::ELEM_OVERRIDE.get_id() {
+            let oid = decoder.open_element()?;
+            while decoder.peek_element()? != 0 {
+                let sid = decoder.open_element()?;
+                if sid == crate::overrides::ELEM_PROTOOVERRIDE {
+                    let callpoint = Address::decode(decoder)?;
+                    let override_proto = decode_prototype(decoder, types)?;
+                    func.proto_overrides.push((callpoint, override_proto));
+                    decoder.close_element(sid)?;
+                } else {
+                    decoder.close_element_skipping(sid)?;
+                }
+            }
+            decoder.close_element(oid)?;
         } else {
             let sid = decoder.open_element()?;
             decoder.close_element_skipping(sid)?;
@@ -720,8 +714,9 @@ fn decode_wire_function(
     decoder.close_element(elem_id)?;
     if let Some(mut p) = proto {
         params.sort_by_key(|p| p.index);
-        p.params = params;
-        p.params_locked = params_locked;
+        if p.internal_first.is_none() {
+            p.params = params;
+        }
         func.proto = Some(p);
     }
     Ok(func)
@@ -735,7 +730,6 @@ fn decode_localdb_params(
     decoder: &mut dyn Decoder,
     types: &TypeFactoryImpl,
     params: &mut Vec<RemoteParam>,
-    params_locked: &mut bool,
     locals: &mut Vec<RemoteLocalVar>,
 ) -> KunaResult<()> {
     let localdb_id = decoder.open_element_id(&ELEM_LOCALDB)?;
@@ -760,8 +754,12 @@ fn decode_localdb_params(
                     }
                     let rec = decode_mapsym(decoder, types, 0)?;
                     if rec.category == 0 {
-                        if (rec.flags & varnode_flags::typelock) == 0 {
-                            *params_locked = false;
+                        let mut flags = rec.parameter_flags;
+                        if (rec.flags & varnode_flags::typelock) != 0 {
+                            flags |= parameter_pieces_flags::TYPELOCK;
+                        }
+                        if (rec.flags & varnode_flags::namelock) != 0 {
+                            flags |= parameter_pieces_flags::NAMELOCK;
                         }
                         let storage = rec
                             .entries
@@ -773,9 +771,8 @@ fn decode_localdb_params(
                             index: rec.cat_index,
                             name: rec.display_name,
                             dtype: rec.dtype,
-                            typelock: (rec.flags & varnode_flags::typelock) != 0,
+                            flags,
                             storage,
-                            hidden: rec.hidden_return,
                         });
                     } else if rec.category < 0 {
                         // A plain local committed to the host database: keep
@@ -837,7 +834,7 @@ fn decode_localdb_params(
 }
 
 /// Decode a `<prototype>` (C++ `FuncProto::decode`, fspec.cc:4675-4840,
-/// reduced to model/extrapop/flags + the `<returnsym>` type).
+/// retaining function/localdb and internal-signature storage semantics).
 fn decode_prototype(
     decoder: &mut dyn Decoder,
     types: &TypeFactoryImpl,
@@ -846,15 +843,23 @@ fn decode_prototype(
     let mut proto = RemoteProto {
         model: String::new(),
         extrapop: None,
+        extrapop_seen: false,
         dotdotdot: false,
         voidlock: false,
         no_return: false,
         out_lock: false,
         out_type: None,
         out_storage: Address::new_invalid(),
+        out_flags: 0,
         custom: false,
         params: Vec::new(),
-        params_locked: false,
+        internal_first: None,
+        model_lock: false,
+        inline: false,
+        constructor: false,
+        destructor: false,
+        effects: Vec::new(),
+        likely_trash: Vec::new(),
     };
     loop {
         let aid = decoder.get_next_attribute_id()?;
@@ -867,6 +872,7 @@ fn decode_prototype(
             // Either a signed integer or the string "unknown".
             let val = decoder.read_signed_integer_expect_string(b"unknown", i64::MIN)?;
             proto.extrapop = if val == i64::MIN { None } else { Some(val) };
+            proto.extrapop_seen = true;
         } else if aid == ATTRIB_DOTDOTDOT.get_id() {
             proto.dotdotdot = decoder.read_bool()?;
         } else if aid == ATTRIB_VOIDLOCK.get_id() {
@@ -875,8 +881,15 @@ fn decode_prototype(
             proto.no_return = decoder.read_bool()?;
         } else if aid == ATTRIB_CUSTOM.get_id() {
             proto.custom = decoder.read_bool()?;
+        } else if aid == ATTRIB_MODELLOCK.get_id() {
+            proto.model_lock = decoder.read_bool()?;
+        } else if aid == ATTRIB_INLINE.get_id() {
+            proto.inline = decoder.read_bool()?;
+        } else if aid == kuna_base::marshal::ATTRIB_CONSTRUCTOR.get_id() {
+            proto.constructor = decoder.read_bool()?;
+        } else if aid == kuna_base::marshal::ATTRIB_DESTRUCTOR.get_id() {
+            proto.destructor = decoder.read_bool()?;
         }
-        // modellock/inline/constructor/destructor: not consumed.
     }
     while decoder.peek_element()? != 0 {
         let sub = decoder.peek_element()?;
@@ -889,14 +902,103 @@ fn decode_prototype(
                 }
                 if aid == ATTRIB_TYPELOCK.get_id() {
                     proto.out_lock = decoder.read_bool()?;
+                } else if aid == kuna_base::marshal::ATTRIB_INDIRECTSTORAGE.get_id()
+                    && decoder.read_bool()?
+                {
+                    proto.out_flags |= parameter_pieces_flags::INDIRECTSTORAGE;
                 }
             }
             // <addr> (possibly attribute-less), then the return type.
             proto.out_storage = Address::decode(decoder)?;
-            proto.out_type = Some(types.decode_type(decoder)?);
+            proto.out_type = Some(types.decode_host_type(decoder)?);
             decoder.close_element_skipping(rid)?;
+        } else if sub == ELEM_INTERNALLIST.get_id() {
+            let iid = decoder.open_element()?;
+            let mut first = -1;
+            loop {
+                let aid = decoder.get_next_attribute_id()?;
+                if aid == 0 { break; }
+                if aid == kuna_base::address::ATTRIB_FIRST.get_id() {
+                    first = decoder.read_signed_integer()? as int4;
+                }
+            }
+            proto.internal_first = Some(first);
+            while decoder.peek_element()? != 0 {
+                let pid = decoder.open_element()?;
+                if pid != ELEM_PARAM && pid != ELEM_RETPARAM {
+                    decoder.close_element_skipping(pid)?;
+                    continue;
+                }
+                let mut name = String::new();
+                let mut flags = 0;
+                loop {
+                    let aid = decoder.get_next_attribute_id()?;
+                    if aid == 0 { break; }
+                    if aid == ATTRIB_NAME.get_id() {
+                        name = String::from_utf8_lossy(&decoder.read_string()?).into_owned();
+                        continue;
+                    }
+                    let flag = if aid == ATTRIB_TYPELOCK.get_id() {
+                        parameter_pieces_flags::TYPELOCK
+                    } else if aid == ATTRIB_NAMELOCK.get_id() {
+                        parameter_pieces_flags::NAMELOCK
+                    } else if aid == kuna_base::marshal::ATTRIB_THISPTR.get_id() {
+                        parameter_pieces_flags::ISTHIS
+                    } else if aid == kuna_base::marshal::ATTRIB_INDIRECTSTORAGE.get_id() {
+                        parameter_pieces_flags::INDIRECTSTORAGE
+                    } else if aid == kuna_base::marshal::ATTRIB_HIDDENRETPARM.get_id() {
+                        parameter_pieces_flags::HIDDENRETPARM
+                    } else {
+                        0
+                    };
+                    if flag != 0 && decoder.read_bool()? { flags |= flag; }
+                }
+                let storage = Address::decode(decoder)?;
+                let dtype = types.decode_host_type(decoder)?;
+                decoder.close_element(pid)?;
+                if pid == ELEM_RETPARAM {
+                    // Legacy internal output records refine the preceding
+                    // returnsym; they never consume an input slot.
+                    proto.out_storage = storage;
+                    proto.out_type = Some(dtype);
+                    proto.out_lock = flags & parameter_pieces_flags::TYPELOCK != 0;
+                    proto.out_flags = flags;
+                } else {
+                    proto.params.push(RemoteParam {
+                        index: proto.params.len() as u64, name, dtype: Some(dtype), flags, storage,
+                    });
+                }
+            }
+            decoder.close_element(iid)?;
+        } else if sub == crate::fspec::ELEM_UNAFFECTED.get_id()
+            || sub == crate::fspec::ELEM_KILLEDBYCALL.get_id()
+            || sub == crate::fspec::ELEM_RETURNADDRESS.get_id()
+            || sub == crate::fspec::ELEM_LIKELYTRASH.get_id()
+        {
+            let eid = decoder.open_element()?;
+            while decoder.peek_element()? != 0 {
+                let (addr, size) = Address::decode_sized(decoder)?;
+                let range = VarnodeData {
+                    space: addr.get_space().cloned(),
+                    offset: addr.get_offset(),
+                    size: size as uint4,
+                };
+                if sub == crate::fspec::ELEM_LIKELYTRASH.get_id() {
+                    proto.likely_trash.push(range);
+                } else {
+                    let effect = if sub == crate::fspec::ELEM_UNAFFECTED.get_id() {
+                        crate::fspec::effect_type::UNAFFECTED
+                    } else if sub == crate::fspec::ELEM_KILLEDBYCALL.get_id() {
+                        crate::fspec::effect_type::KILLEDBYCALL
+                    } else {
+                        crate::fspec::effect_type::RETURN_ADDRESS
+                    };
+                    proto.effects.push(EffectRecord::from_varnode(range, effect));
+                }
+            }
+            decoder.close_element(eid)?;
         } else {
-            // <inject>/<internallist>/effect lists: consumed whole.
+            // Callfixup activation is a separate consumer.
             let sid = decoder.open_element()?;
             decoder.close_element_skipping(sid)?;
         }
@@ -955,17 +1057,8 @@ struct RemoteScopeState {
     answered: RangeList,
     /// The materialized [`GlobalEntry`] records for every decoded symbol.
     entries: Vec<GlobalEntry>,
-    /// Callee prototype pieces for decoded LOCKED function signatures,
-    /// keyed like `ArchContext::callee_protos`.
-    callee_pieces: Vec<(int4, kuna_base::types::uintb, PrototypePieces)>,
     /// Function facts by (space_index, offset) for the flow-time seams.
     functions: std::collections::BTreeMap<(int4, u64), RemoteFunctionFacts>,
-    /// Host-declared prototype models for LOCKED callee signatures, keyed
-    /// like `callee_pieces`.  Recorded whenever the wire `<prototype model=…>`
-    /// resolved AT ALL — including the `defaultfp` fallback for an empty/
-    /// unregistered name — so the consumer's `unwrap_or(defaultfp)` is
-    /// equivalent either way.
-    callee_models: std::collections::BTreeMap<(int4, u64), Rc<ProtoModel>>,
     /// Per-entry getTrackedRegisters answers (cached until flush; an empty
     /// answer caches too so an address is asked once per flush epoch).
     tracked: std::collections::BTreeMap<(int4, u64), kuna_sleigh::globalcontext::TrackedSet>,
@@ -993,21 +1086,14 @@ pub struct RemoteFunctionFacts {
     pub display_name: String,
     /// `Function.hasNoReturn()` (or the prototype's noreturn).
     pub no_return: bool,
-    /// The locked prototype pieces, when the host signature was locked.
-    pub pieces: Option<PrototypePieces>,
+    /// Authoritative function-specific prototype, never structurally interned.
+    pub prototype: Option<Rc<FuncProto>>,
+    /// Immutable caller-owned call-site facts, cloned before following flow.
+    pub overrides: crate::overrides::Override,
     /// Host-committed non-parameter locals from the function's `<localdb>`
     /// (see [`RemoteLocalVar`]) — seeded into the fresh `Funcdata`'s local
     /// scope so GUI renames/retypes survive the event-driven re-decompile.
     pub locals: Vec<RemoteLocalVar>,
-    /// The host's declared prototype MODEL name (`<prototype model=…>`) when
-    /// the signature is locked — the convention its committed parameter
-    /// storage was assigned under.
-    pub model: Option<String>,
-    /// The host's EXACT committed parameter storage, slot-ordered:
-    /// `(slot, name, pieces)` ready for `Funcdata::apply_mapped_params`.
-    /// Empty when the signature is unlocked (kuna then recovers parameters
-    /// itself) or when the host sent no storage.
-    pub param_storage: Vec<(int4, String, crate::fspec::ParameterPieces)>,
 }
 
 /// The ghidra-mode lazy symbol provider (see the module docs).  Installed on
@@ -1019,13 +1105,8 @@ pub struct RemoteScope {
     fetch: Rc<dyn RemoteProviderFetch>,
     /// The engine's space manager (decoders resolve spaces against it).
     manager: Rc<AddrSpaceManager>,
-    /// The shared type factory (mapsym type decode + `get_type_code_proto`).
+    /// The shared type factory (mapsym type decode and generic function symbols).
     types: Rc<TypeFactoryImpl>,
-    /// The proto-model registry snapshot (`<prototype model=…>` resolution;
-    /// models are fixed after cspec init).
-    models: std::collections::BTreeMap<String, Rc<ProtoModel>>,
-    /// The default prototype model.
-    defaultfp: Option<Rc<ProtoModel>>,
     /// Per-space "has a cspec `<global>` range" gate (C++ `spacerange`):
     /// spaces outside it are never queried.
     spacerange: Vec<bool>,
@@ -1057,8 +1138,6 @@ impl RemoteScope {
         fetch: Rc<dyn RemoteProviderFetch>,
         manager: Rc<AddrSpaceManager>,
         types: Rc<TypeFactoryImpl>,
-        models: std::collections::BTreeMap<String, Rc<ProtoModel>>,
-        defaultfp: Option<Rc<ProtoModel>>,
         base: GlobalQuery,
     ) -> RemoteScope {
         // A space participates iff the global scope owns any range in it
@@ -1076,8 +1155,6 @@ impl RemoteScope {
             fetch,
             manager,
             types,
-            models,
-            defaultfp,
             spacerange,
             flagbase_default: flagbase_default.clone(),
             pristine_tracked: RefCell::new(std::collections::BTreeMap::new()),
@@ -1085,9 +1162,7 @@ impl RemoteScope {
                 holes: RangeList::default(),
                 answered: RangeList::default(),
                 entries: Vec::new(),
-                callee_pieces: Vec::new(),
                 functions: std::collections::BTreeMap::new(),
-                callee_models: std::collections::BTreeMap::new(),
                 tracked: std::collections::BTreeMap::new(),
                 pending_warnings: Vec::new(),
                 flagbase: flagbase_default,
@@ -1099,12 +1174,11 @@ impl RemoteScope {
         }
     }
 
-    /// The prototype model registry lookup (C++ `Architecture::getModel`).
-    fn model_by_name(&self, nm: &str) -> Option<Rc<ProtoModel>> {
-        if nm.is_empty() || nm == "default" {
-            return self.defaultfp.clone();
-        }
-        self.models.get(nm).cloned().or_else(|| self.defaultfp.clone())
+    /// Bind newly decoded declarations against the current model context.
+    /// Previously materialized entry facts retain their selected model.
+    fn model_by_name(&self, nm: &str) -> KunaResult<Rc<ProtoModel>> {
+        let name = if nm.is_empty() || nm == "default" { None } else { Some(nm) };
+        Ok(self.types.model_binding(name)?.model().clone())
     }
 
     /// C++ `ScopeGhidra::clear()` (database_ghidra.cc:222-231) — the
@@ -1115,9 +1189,7 @@ impl RemoteScope {
         st.holes = RangeList::default();
         st.answered = RangeList::default();
         st.entries.clear();
-        st.callee_pieces.clear();
         st.functions.clear();
-        st.callee_models.clear();
         st.tracked.clear();
         st.pending_warnings.clear();
         st.namespaces.clear();
@@ -1168,7 +1240,9 @@ impl RemoteScope {
                 if rec.extern_ref.is_some() {
                     self.resolve_external_ref(addr);
                 }
-                self.materialize(rec);
+                if let Err(e) = self.materialize(rec) {
+                    self.cache_failure(addr, &format!("getMappedSymbols prototype failed: {}", e.explain()));
+                }
             }
             Err(e) => {
                 self.cache_failure(
@@ -1224,7 +1298,9 @@ impl RemoteScope {
         match self.fetch.fetch_external_ref(pointer, &mut dec) {
             Ok(true) => match decode_mapped_answer(&mut dec, &self.types) {
                 Ok(RemoteMapAnswer::Symbol(rec)) if rec.func.is_some() => {
-                    self.materialize(*rec);
+                    if let Err(e) = self.materialize(*rec) {
+                        self.note_failure(pointer, &format!("getExternalRef prototype failed: {}", e.explain()));
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => self.note_failure(
@@ -1316,19 +1392,6 @@ impl RemoteScope {
         }
     }
 
-    /// The host-declared prototype model of a LOCKED callee signature at
-    /// `entry` (query-through), when it resolved — the remote arm of the
-    /// callee-model consumer in `ActionDefaultParams`.
-    pub fn callee_model_at(&self, entry: &Address) -> Option<Rc<ProtoModel>> {
-        self.ensure_queried(entry);
-        let spc = entry.get_space()?;
-        self.state
-            .borrow()
-            .callee_models
-            .get(&(spc.get_index(), entry.get_offset()))
-            .cloned()
-    }
-
     fn record_hole(&self, range: Range, flags: uint4) {
         let mut st = self.state.borrow_mut();
         st.holes.insert_range(
@@ -1360,129 +1423,66 @@ impl RemoteScope {
 
     /// Materialize one decoded symbol into the cache (the kuna analog of C++
     /// `dump2Cache`'s post-processing, database_ghidra.cc:143-171).
-    fn materialize(&self, rec: RemoteSymbolRecord) {
-        // Resolve the namespace path once per scope id.
+    fn materialize(&self, rec: RemoteSymbolRecord) -> KunaResult<()> {
         let scope_path = if rec.scope_id != 0 {
             self.namespace_path(rec.scope_id)
         } else {
             Vec::new()
         };
-        let mut st = self.state.borrow_mut();
         let display = if rec.display_name.is_empty() {
             rec.name.clone()
         } else {
             rec.display_name.clone()
         };
-        // Function facts + parked prototype for the callee seams.
-        let mut symbol_type: Option<Rc<Datatype>> = rec.dtype.clone();
-        let mut func_no_return = false;
         let is_function = rec.func.is_some();
+        // A function symbol needs a code datatype for classification, but its
+        // storage/locks belong to its entry, not to structural type identity.
+        let symbol_type = if is_function {
+            Some(self.types.get_type_code()?)
+        } else {
+            rec.dtype.clone()
+        };
+        let mut func_no_return = false;
+        let mut function_fact = None;
         if let Some(func) = &rec.func {
             func_no_return =
-                func.no_return || func.proto.as_ref().map(|p| p.no_return).unwrap_or(false);
-            // The upstream Funcdata name/displayName split: the RAW name is the
-            // Java-side identity (the HighFunction.decode echo); the label is
-            // only ever a display form.
-            let raw_name = func.name.clone();
-            let fname = if func.display_name.is_empty() {
-                func.name.clone()
+                func.no_return || func.proto.as_ref().is_some_and(|p| p.no_return);
+            let prototype = if let Some(p) = &func.proto {
+                let model = self.model_by_name(&p.model)?;
+                let mut proto = p.to_func_proto(model, &self.types, &self.manager,
+                    crate::fspec::FirstVarArgCoordinate::Declared)?;
+                proto.set_no_return(func_no_return);
+                proto.set_inline(func.inline || proto.is_inline());
+                Some(Rc::new(proto))
             } else {
-                func.display_name.clone()
+                None
             };
-            if !func.entry.is_invalid() {
-                if let Some(spc) = func.entry.get_space() {
-                    let key = (spc.get_index(), func.entry.get_offset());
-                    let mut pieces: Option<PrototypePieces> = None;
-                    if let Some(p) = &func.proto {
-                        if p.is_input_locked() {
-                            let pc = p.to_pieces(&fname);
-                            // Park the locked signature as a TypeCode carrying
-                            // the HOST-DECLARED prototype model, so storage
-                            // assignment for a non-default-model callee
-                            // (__fastcall on x86-32, ...) uses the right
-                            // convention (the `parse line extern` shape).
-                            let model = self.model_by_name(&p.model);
-                            let parked = match &model {
-                                Some(m) => self
-                                    .types
-                                    .get_type_code_proto_model(&pc, Rc::clone(m)),
-                                None => self.types.get_type_code_proto(&pc),
-                            };
-                            if let Ok(tc) = parked {
-                                symbol_type = Some(tc);
-                            }
-                            if let Some(m) = model {
-                                st.callee_models.insert(key, m);
-                            }
-                            st.callee_pieces.push((
-                                key.0,
-                                key.1,
-                                pc.clone(),
-                            ));
-                            pieces = Some(pc);
-                        }
-                    }
-                    // The host's committed parameter storage + convention,
-                    // carried verbatim so the echoed `<localdb>`/`<prototype>`
-                    // match the database (Java's `checkFullCommit`).  Only
-                    // meaningful for a locked signature — an unlocked one is
-                    // kuna's to recover.
-                    let mut param_storage: Vec<(int4, String, crate::fspec::ParameterPieces)> =
-                        Vec::new();
-                    let mut model_name: Option<String> = None;
-                    if let Some(p) = &func.proto {
-                        if p.is_input_locked() {
-                            if !p.model.is_empty() {
-                                model_name = Some(p.model.clone());
-                            }
-                            // SLOT BASIS: the storage overrides address the
-                            // slots of the FuncProto store.  This counts the
-                            // model's hidden-return slot at input 0, matching
-                            // Java's cat-0 numbering even though `to_pieces`
-                            // omits the host's copy.  It COMPACTS OUT any
-                            // parameter with no decodable type
-                            // — so count in that same compacted basis, never
-                            // `rp.index`.  A host cat-0 parameter whose type
-                            // failed to decode would otherwise shift every
-                            // later `pieces` slot while these overrides stayed
-                            // absolute, and the resulting index/count disagreement
-                            // is exactly what Java's `checkFullCommit` reacts to
-                            // by force-rewriting the user's signature.
-                            let mut slot: int4 = 0;
-                            for rp in &p.params {
-                                let Some(dt) = rp.dtype.clone() else { continue };
-                                let this_slot = slot;
-                                slot += 1;
-                                if rp.storage.is_invalid() {
-                                    continue;
-                                }
-                                param_storage.push((
-                                    this_slot,
-                                    rp.name.clone(),
-                                    crate::fspec::ParameterPieces {
-                                        addr: rp.storage.clone(),
-                                        type_: Some(dt),
-                                        flags: crate::fspec::parameter_pieces_flags::TYPELOCK
-                                            | crate::fspec::parameter_pieces_flags::NAMELOCK,
-                                    },
-                                ));
-                            }
-                        }
-                    }
-                    st.functions.insert(
-                        key,
-                        RemoteFunctionFacts {
-                            name: raw_name,
-                            display_name: fname,
-                            no_return: func_no_return,
-                            pieces,
-                            locals: func.locals.clone(),
-                            model: model_name,
-                            param_storage,
-                        },
-                    );
-                }
+            let mut overrides = crate::overrides::Override::new();
+            for (callpoint, decoded) in &func.proto_overrides {
+                let model = self.model_by_name(&decoded.model)?;
+                overrides.insert_proto_override(
+                    callpoint.clone(), decoded.to_func_proto(model, &self.types, &self.manager,
+                        crate::fspec::FirstVarArgCoordinate::Effective)?,
+                );
             }
+            if let Some(spc) = func.entry.get_space() {
+                function_fact = Some(((spc.get_index(), func.entry.get_offset()), RemoteFunctionFacts {
+                    name: func.name.clone(),
+                    display_name: if func.display_name.is_empty() {
+                        func.name.clone()
+                    } else {
+                        func.display_name.clone()
+                    },
+                    no_return: func_no_return,
+                    prototype,
+                    overrides,
+                    locals: func.locals.clone(),
+                }));
+            }
+        }
+        let mut st = self.state.borrow_mut();
+        if let Some((key, facts)) = function_fact {
+            st.functions.insert(key, facts);
         }
         // Materialize the mapped entries as GlobalEntry records.
         for e in &rec.entries {
@@ -1535,6 +1535,7 @@ impl RemoteScope {
             // the function facts; nothing to range-mark.
         }
         st.dirty = true;
+        Ok(())
     }
 
     /// The namespace display path for a host scope id (cached;
@@ -1560,8 +1561,10 @@ impl RemoteScope {
     pub fn snapshot(&self) -> Rc<GlobalQuery> {
         let mut st = self.state.borrow_mut();
         if st.dirty {
-            let mut entries = self.base.entries_cloned();
+            // Equal-extent host mappings take precedence over processor defaults.
+            let mut entries = Vec::with_capacity(st.entries.len() + self.base.entries().len());
             entries.extend(st.entries.iter().cloned());
+            entries.extend(self.base.entries().iter().cloned());
             st.snapshot = Rc::new(GlobalQuery::new(
                 entries,
                 self.base.owned.clone(),
@@ -1589,18 +1592,22 @@ impl RemoteScope {
             .cloned()
     }
 
-    /// The locked callee prototype pieces at an entry address (queries
-    /// through) — the remote arm of `ArchContext::callee_proto_pieces`.
-    pub fn callee_pieces_at(&self, entry: &Address) -> Option<PrototypePieces> {
+    /// The authoritative prototype at this exact function entry (query-through).
+    pub fn prototype_at(&self, entry: &Address) -> Option<Rc<FuncProto>> {
         self.ensure_queried(entry);
-        let spc = entry.get_space()?;
-        let key = (spc.get_index(), entry.get_offset());
-        self.state
-            .borrow()
-            .callee_pieces
-            .iter()
-            .find(|(si, off, _)| (*si, *off) == key)
-            .map(|(_, _, p)| p.clone())
+        let space = entry.get_space()?;
+        self.state.borrow().functions
+            .get(&(space.get_index(), entry.get_offset()))?
+            .prototype.clone()
+    }
+
+    /// Caller-owned seed, without cloning unrelated local-symbol facts.
+    pub fn overrides_at(&self, entry: &Address) -> Option<crate::overrides::Override> {
+        self.ensure_queried(entry);
+        let space = entry.get_space()?;
+        self.state.borrow().functions
+            .get(&(space.get_index(), entry.get_offset()))
+            .map(|facts| facts.overrides.clone())
     }
 
     /// Fill the (stand-in) comment database once per function from the host's
@@ -1634,11 +1641,6 @@ impl RemoteScope {
         Ok(())
     }
 
-    /// The proto model resolved for a decoded prototype (kept for Phase-4
-    /// prototype seeding; currently the pieces flow is model-agnostic).
-    pub fn resolve_model(&self, nm: &str) -> Option<Rc<ProtoModel>> {
-        self.model_by_name(nm)
-    }
 }
 
 #[cfg(test)]

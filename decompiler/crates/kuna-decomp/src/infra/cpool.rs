@@ -20,16 +20,10 @@
 //!     (records are emitted in `CheapSorter` order, each as a `<ref>` followed
 //!     by a `<cpoolrec>`).
 //!
-//! STUB(W6): the data-type half of the record (`Datatype *type`,
-//! `type->encodeRef`, `typegrp.decodeType`/`decodeTypeWithCodeFlags`) belongs
-//! to the W6 `type.{hh,cc}` / `TypeFactory` port.  Until then the record holds
-//! an [`Rc<Datatype>`](crate::dtype::Datatype) (the W6 skeleton, exactly where
-//! the C++ holds `Datatype *`) and the encode/decode of the type reference goes
-//! through the local [`CPoolTypeFactory`] / [`CPoolTypeRef`] access traits; W6
-//! supplies an impl of these over the real `TypeFactory`.
+//! Records retain graph-owned [`TypeRoot`]s. Encoding uses each retained root's
+//! nominal type reference; decoding obtains roots through [`CPoolTypeFactory`].
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::marshal::{
@@ -37,7 +31,7 @@ use kuna_base::marshal::{
 };
 use kuna_base::types::{int4, int8, uint1, uint4, uintb};
 
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 
 // ---------------------------------------------------------------------------
 // AttributeId / ElementId  (C++ `cpool.cc:20-28`)
@@ -64,31 +58,14 @@ pub const ELEM_REF: ElementId = ElementId::new("ref", 111);
 pub const ELEM_TOKEN: ElementId = ElementId::new("token", 112);
 
 // ---------------------------------------------------------------------------
-// STUB(W6): the TypeFactory / Datatype-reference operations cpool reaches.
+// Type factory operations needed by constant-pool decoding.
 // ---------------------------------------------------------------------------
 
-/// STUB(W6): the slice of a `Datatype` reference cpool needs to *encode*
-/// (`type->encodeRef(encoder)`).
-///
-/// W6's real `Datatype` implements this over its `encodeRef`; until then the
-/// record carries an [`Rc<Datatype>`](crate::dtype::Datatype) and the encode
-/// path is the W6 stub.  The [`crate::dtype::Datatype`] skeleton itself only
-/// carries `size`/`metatype`/`id`, not enough to reproduce `encodeRef`, so the
-/// encode is parameterized on a borrowed `&dyn CPoolTypeRef` rather than
-/// reaching into the skeleton.
-pub trait CPoolTypeRef {
-    /// Encode a *reference* to this data-type (C++ `Datatype::encodeRef`).
-    fn encode_ref(&self, encoder: &mut dyn Encoder) -> KunaResult<()>;
-}
-
-/// STUB(W6): the slice of `TypeFactory` cpool needs to *decode* a data-type
+/// The slice of `TypeFactory` cpool needs to *decode* a data-type
 /// reference (`typegrp.decodeType` / `typegrp.decodeTypeWithCodeFlags`).
-///
-/// W6's real `TypeFactory` implements this; the W4/W6 caller supplies it to
-/// [`CPoolRecord::decode`] / [`ConstantPool::decode_record`].
 pub trait CPoolTypeFactory {
     /// Decode a data-type reference (C++ `TypeFactory::decodeType`).
-    fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<Rc<Datatype>>;
+    fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<TypeRoot>;
 
     /// Decode a data-type reference, marking it as code with the given
     /// constructor/destructor flags (C++ `TypeFactory::decodeTypeWithCodeFlags`).
@@ -97,7 +74,7 @@ pub trait CPoolTypeFactory {
         decoder: &mut dyn Decoder,
         is_constructor: bool,
         is_destructor: bool,
-    ) -> KunaResult<Rc<Datatype>>;
+    ) -> KunaResult<TypeRoot>;
 }
 
 // ---------------------------------------------------------------------------
@@ -159,9 +136,9 @@ pub struct CPoolRecord {
     value: uintb,
     /// Data-type associated with the object (C++ `Datatype *type`).
     ///
-    /// STUB(W6): `None` == the C++ null `type` pointer.  An empty (just
+    /// `None` == the C++ null `type` pointer.  An empty (just
     /// `createRecord`'d) record has no type until `decode`/`putRecord` sets it.
-    type_: Option<Rc<Datatype>>,
+    type_: Option<TypeRoot>,
     /// For string literals, the raw byte data of the string (C++ `byteData`).
     ///
     /// `None` == the C++ null `byteData` pointer.  `byteDataLen` is `data.len()`.
@@ -206,8 +183,8 @@ impl CPoolRecord {
 
     /// Get the data-type associated with \b this (C++ `getType`).
     ///
-    /// STUB(W6): `None` == the C++ null `type` pointer.
-    pub fn get_type(&self) -> Option<&Rc<Datatype>> {
+    /// `None` == the C++ null `type` pointer.
+    pub fn get_type(&self) -> Option<&TypeRoot> {
         self.type_.as_ref()
     }
 
@@ -229,15 +206,13 @@ impl CPoolRecord {
     /// Encode \b this CPoolRecord description as a \<cpoolrec> element
     /// (C++ `CPoolRecord::encode`).
     ///
-    /// STUB(W6): the trailing `type->encodeRef(encoder)` goes through the
-    /// `type_ref` argument (the W6 `Datatype` reference encoder).  The C++
-    /// dereferences `type` unconditionally here, so an encode with no type is
-    /// an internal-invariant violation.
+    /// A record without a decoded or supplied type cannot be encoded.
     pub fn encode(
         &self,
         encoder: &mut dyn Encoder,
-        type_ref: &dyn CPoolTypeRef,
     ) -> KunaResult<()> {
+        let dtype = self.type_.as_ref()
+            .ok_or_else(|| KunaError::lowlevel("Constant-pool record has no type"))?;
         encoder.open_element(&ELEM_CPOOLREC);
         // The tag-string mapping (C++ `cpool.cc:36-51`).
         let tagstr: &[u8] = if self.tag == cpool_tag::POINTER_METHOD {
@@ -293,7 +268,7 @@ impl CPoolRecord {
             encoder.write_string(&ATTRIB_CONTENT, &self.token);
             encoder.close_element(&ELEM_TOKEN);
         }
-        type_ref.encode_ref(encoder)?;
+        dtype.encode_ref(encoder)?;
         encoder.close_element(&ELEM_CPOOLREC);
         Ok(())
     }
@@ -487,14 +462,7 @@ pub trait ConstantPool {
 
     /// Encode all records in this container to a stream
     /// (C++ pure-virtual `encode`).
-    ///
-    /// STUB(W6): the per-record `type->encodeRef` goes through `type_provider`,
-    /// which resolves a record's [`Datatype`] to its W6 reference encoder.
-    fn encode(
-        &self,
-        encoder: &mut dyn Encoder,
-        type_provider: &dyn CPoolTypeRefProvider,
-    ) -> KunaResult<()>;
+    fn encode(&self, encoder: &mut dyn Encoder) -> KunaResult<()>;
 
     /// Restore constant pool records from the given stream decoder
     /// (C++ pure-virtual `decode`).
@@ -514,7 +482,7 @@ pub trait ConstantPool {
         refs: &[uintb],
         tag: uint4,
         tok: &[u8],
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
     ) -> KunaResult<()> {
         let newrec = self.create_record(refs)?;
         newrec.tag = tag;
@@ -542,23 +510,6 @@ pub trait ConstantPool {
         *slot = newrec;
         Ok(())
     }
-}
-
-/// STUB(W6): resolves a [`CPoolRecord`]'s [`Datatype`] to its reference encoder
-/// for the container `encode` path.
-///
-/// The C++ calls `record.type->encodeRef(encoder)` directly; with the W6
-/// `Datatype` skeleton that has no `encodeRef`, the container `encode` asks the
-/// provider for a `&dyn CPoolTypeRef` per record.  W6 supplies a provider that
-/// returns the `Datatype` itself.
-pub trait CPoolTypeRefProvider {
-    /// Encode a reference to the given record's data-type
-    /// (C++ `record.type->encodeRef(encoder)`).
-    fn encode_record_type_ref(
-        &self,
-        record: &CPoolRecord,
-        encoder: &mut dyn Encoder,
-    ) -> KunaResult<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -677,22 +628,13 @@ impl ConstantPool for ConstantPoolInternal {
     fn encode(
         &self,
         encoder: &mut dyn Encoder,
-        type_provider: &dyn CPoolTypeRefProvider,
     ) -> KunaResult<()> {
         encoder.open_element(&ELEM_CONSTANTPOOL);
         // BTreeMap iterates in CheapSorter (lexicographic) order, matching the
         // C++ `map` iteration.  Each entry emits its <ref> then its <cpoolrec>.
         for (sorter, record) in self.cpool_map.iter() {
             sorter.encode(encoder);
-            // The C++ calls `record.encode(encoder)`, which ends in
-            // `type->encodeRef(encoder)`.  With the W6 type skeleton lacking
-            // `encodeRef`, route the record's type-ref through the provider via
-            // a per-record adaptor (STUB(W6)).
-            let adaptor = ProviderTypeRef {
-                provider: type_provider,
-                record,
-            };
-            record.encode(encoder, &adaptor)?;
+            record.encode(encoder)?;
         }
         encoder.close_element(&ELEM_CONSTANTPOOL);
         Ok(())
@@ -716,23 +658,6 @@ impl ConstantPool for ConstantPoolInternal {
     }
 }
 
-/// Per-record adaptor that satisfies [`CPoolTypeRef`] (needed by
-/// [`CPoolRecord::encode`]) by delegating to a [`CPoolTypeRefProvider`].
-///
-/// STUB(W6): bridges the C++ `record.type->encodeRef(encoder)` call — which
-/// the W6 `Datatype` skeleton cannot do directly — to the provider supplied to
-/// the container `encode`.
-struct ProviderTypeRef<'a> {
-    provider: &'a dyn CPoolTypeRefProvider,
-    record: &'a CPoolRecord,
-}
-
-impl CPoolTypeRef for ProviderTypeRef<'_> {
-    fn encode_ref(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
-        self.provider.encode_record_type_ref(self.record, encoder)
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -742,39 +667,18 @@ mod tests {
     use super::*;
     use kuna_base::marshal::{IdRegistry, XmlDecode, XmlEncode};
     use kuna_base::space::AddrSpaceManager;
-    use crate::dtype::type_metatype;
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
 
-    /// A trivial type factory/provider access impl for round-trip tests: every
-    /// data-type reference encodes as an empty `<void/>` element and decodes
-    /// back to a fixed skeleton.  This lets the cpool encode/decode round-trip
-    /// be exercised without the W6 `TypeFactory`.
+    /// Decoder for the void types used by the constant-pool fixtures.
     struct VoidTypeAccess;
 
-    fn void_type() -> Rc<Datatype> {
-        Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))
-    }
-
-    impl CPoolTypeRef for VoidTypeAccess {
-        fn encode_ref(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
-            encoder.open_element(&kuna_base::marshal::ELEM_VOID);
-            encoder.close_element(&kuna_base::marshal::ELEM_VOID);
-            Ok(())
-        }
-    }
-
-    impl CPoolTypeRefProvider for VoidTypeAccess {
-        fn encode_record_type_ref(
-            &self,
-            _record: &CPoolRecord,
-            encoder: &mut dyn Encoder,
-        ) -> KunaResult<()> {
-            self.encode_ref(encoder)
-        }
+    fn void_type() -> TypeRoot {
+        TypeFactoryImpl::new().get_type_void().unwrap()
     }
 
     impl CPoolTypeFactory for VoidTypeAccess {
-        fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<Rc<Datatype>> {
-            let id = decoder.open_element()?;
+        fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<TypeRoot> {
+            let id = decoder.open_element_id(&kuna_base::marshal::ELEM_VOID)?;
             decoder.close_element(id)?;
             Ok(void_type())
         }
@@ -784,10 +688,8 @@ mod tests {
             decoder: &mut dyn Decoder,
             _is_constructor: bool,
             _is_destructor: bool,
-        ) -> KunaResult<Rc<Datatype>> {
-            let id = decoder.open_element()?;
-            decoder.close_element(id)?;
-            Ok(void_type())
+        ) -> KunaResult<TypeRoot> {
+            self.decode_type(decoder)
         }
     }
 
@@ -809,7 +711,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut enc = XmlEncode::new(&mut buf);
-            pool.encode(&mut enc, &VoidTypeAccess).unwrap();
+            pool.encode(&mut enc).unwrap();
         }
         let mut dec = XmlDecode::new(&mgr, &reg);
         dec.ingest_stream(&buf).unwrap();

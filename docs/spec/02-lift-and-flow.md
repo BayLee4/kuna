@@ -87,6 +87,11 @@ route through `flow.rs (FlowInfo::handle_out_of_bounds)`, which under the defaul
 flow options continues rather than failing the decompile — `errorreinterpreted`-style
 hard failure needs `error_outofbounds`.
 
+An already-decoded instruction at the inclusive endpoint remains a join target.
+Fall-through reuses its recorded operations rather than decoding it again merely
+because its address also equals the range limit. An unvisited endpoint is still
+decoded, and a successor beyond it still follows the out-of-bounds policy.
+
 Continuing quietly would be the wrong contract for a *declared* bound, because the
 caller cannot otherwise tell a correct boundary from one that truncated the body:
 both just produce a shorter function. So the out-of-bounds handler emits the C++
@@ -291,7 +296,10 @@ signatures before flow runs). A CALLIND keeps its computed target as input 0
 (`setup_callind_specs`) unless a previous decompilation pass planted an
 indirect override (de-indirection), which converts it to a direct CALL before
 the spec is built. `flow.rs (FlowInfo::check_for_flow_modification)` then
-applies the callee's flow effects: an *inline* callee queues the op for
+applies callee flow effects only when the site has no model or the callee is
+inline. A complete returning site override therefore outranks a non-inline
+callee's no-return declaration; explicit instruction flow overrides remain
+authoritative. An *inline* callee queues the op for
 injection; a *no-return* callee gets an artificial halt planted directly after
 the call plus the `"Subroutine does not return"` warning, so flow never runs
 off past the call (§2.4 covers who supplies the no-return facts).
@@ -1440,7 +1448,9 @@ together with `jtsharepartial off`.
 
 The mechanism is §2.1's halt plant: if `check_for_flow_modification` believes a
 call never returns, an artificial noreturn RETURN lands right after the CALL
-and flow stops. The *facts* come from
+and flow stops. The completed callsite prototype is checked first; global
+callee facts do not override a returning modeled site except for the
+intentional inline-callee case. The global *facts* come from
 `decompile_drive.rs (ArchFlowEnv::query_call_no_return)` as an OR of three
 sources, checked in order:
 

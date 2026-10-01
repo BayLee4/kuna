@@ -2,9 +2,8 @@
 //!
 //! The "extraction/placement matrix" is exercised against ground-truth values
 //! generated from the C++ `BitRange` (address.cc:630-868) so the port is pinned
-//! field-by-field.  The rule layer is checked for op-list and `specs()`
-//! definition-order fidelity (the part that is output-determining even while the
-//! transform hand-off is a recorded W6 seam).
+//! field-by-field. Graph-backed rule tests exercise registration filtering
+//! alongside enabled insertion, extraction, and absorption transforms.
 
 use super::*;
 use crate::action::Rule;
@@ -249,14 +248,16 @@ fn vn() -> VarnodeId {
 /// Build a `TypeBitField` whose `bits()` matches `field_bits` and whose
 /// underlying type has the given metatype.  The transforms only read
 /// `field->type->getMetatype()` and `field->bits.numBits`/range off the field.
-fn bf(field_bits: &BitRange, meta: type_metatype) -> TypeBitField {
+fn bf(field_bits: &BitRange, meta: type_metatype) -> (TypeBitField, TypeRoot) {
     use crate::dtype::TypeBitField as TBF;
+    let types = TypeFactoryImpl::new();
+    let owner = types.intern(Datatype::new(field_bits.byte_size.max(1), meta)).unwrap();
     let mut f = TBF::new(0, field_bits.num_bits, field_bits.is_big_endian, "f",
-        Rc::new(Datatype::new(field_bits.byte_size.max(1), meta)));
+        owner.id());
     f.byte_offset = field_bits.byte_offset;
     f.byte_size = field_bits.byte_size;
     f.least_sig_bit = field_bits.least_sig_bit;
-    f
+    (f, owner)
 }
 
 #[test]
@@ -265,12 +266,13 @@ fn node_state_follow_field() {
     // bitsField = BitRange(field.bits, 0, 8) => lsb 16, nb 16 (LE oracle).
     let used = BitRange::byte_range(0, 8, false);
     let field_bits = BitRange::new(2, 2, 0, 16, false);
-    let st = BitFieldNodeState::follow_field(&used, vn(), &bf(&field_bits, type_metatype::TYPE_INT));
+    let (field, owner) = bf(&field_bits, type_metatype::TYPE_INT);
+    let st = BitFieldNodeState::follow_field(&used, vn(), &field, &owner);
     assert_eq!((st.bits_field.least_sig_bit, st.bits_field.num_bits), (16, 16));
     assert_eq!(st.orig_least_sig_bit, 16);
     // isMostSignificant of bitsField (8*8=64 == 16+16=32?) -> false, so no sign ext.
     assert!(!st.is_sign_extended);
-    assert_eq!(st.field().unwrap().field_type.get_metatype(), type_metatype::TYPE_INT);
+    assert_eq!(st.field_type().unwrap().get_metatype(), type_metatype::TYPE_INT);
     // does_sign_extension_match: is_sign_extended(false) == is_int(true) -> false.
     assert!(!st.does_sign_extension_match());
 }
@@ -282,7 +284,8 @@ fn node_state_follow_field_top_aligned_signext() {
     // field bits that translate to bitsField lsb 48 nb 16 in an 8-byte container:
     // a field at byteOffset 6, byteSize 2 (LE) -> translateLSB = 8*(6-0)=48.
     let field_bits = BitRange::new(6, 2, 0, 16, false);
-    let st = BitFieldNodeState::follow_field(&used, vn(), &bf(&field_bits, type_metatype::TYPE_INT));
+    let (field, owner) = bf(&field_bits, type_metatype::TYPE_INT);
+    let st = BitFieldNodeState::follow_field(&used, vn(), &field, &owner);
     assert_eq!((st.bits_field.least_sig_bit, st.bits_field.num_bits), (48, 16));
     assert!(st.bits_field.is_most_significant()); // 8*8 == 48+16
     assert!(st.is_sign_extended);
@@ -293,10 +296,11 @@ fn node_state_follow_field_top_aligned_signext() {
 fn node_state_follow_field_unsigned_no_signext() {
     let used = BitRange::byte_range(0, 8, false);
     let field_bits = BitRange::new(6, 2, 0, 16, false);
-    let st = BitFieldNodeState::follow_field(&used, vn(), &bf(&field_bits, type_metatype::TYPE_UINT));
+    let (field, owner) = bf(&field_bits, type_metatype::TYPE_UINT);
+    let st = BitFieldNodeState::follow_field(&used, vn(), &field, &owner);
     // is_int false -> never sign extended even if most significant.
     assert!(!st.is_sign_extended);
-    assert_eq!(st.field().unwrap().field_type.get_metatype(), type_metatype::TYPE_UINT);
+    assert_eq!(st.field_type().unwrap().get_metatype(), type_metatype::TYPE_UINT);
     // does_sign_extension_match: false == false -> true.
     assert!(st.does_sign_extension_match());
 }
@@ -327,14 +331,15 @@ fn node_state_with_new_field() {
     // bitfield.cc:44-51.  field/origLeastSigBit copied; bitsField/node/signExt replaced.
     let used = BitRange::byte_range(0, 8, false);
     let field_bits = BitRange::new(2, 2, 0, 16, false);
-    let base = BitFieldNodeState::follow_field(&used, vn(), &bf(&field_bits, type_metatype::TYPE_INT));
+    let (field, owner) = bf(&field_bits, type_metatype::TYPE_INT);
+    let base = BitFieldNodeState::follow_field(&used, vn(), &field, &owner);
     let new_field = BitRange::new(0, 8, 0, 8, false);
     let st = BitFieldNodeState::with_new_field(&base, &new_field, vn(), /*sgn_ext*/ true);
     assert_eq!(st.bits_field, new_field);
     // field is copied from base (both follow the same TypeBitField).
     assert_eq!(
-        st.field().unwrap().field_type.get_metatype(),
-        base.field().unwrap().field_type.get_metatype()
+        st.field_type().unwrap().get_metatype(),
+        base.field_type().unwrap().get_metatype()
     );
     assert_eq!(st.orig_least_sig_bit, base.orig_least_sig_bit);
     assert!(st.is_sign_extended);
@@ -360,15 +365,15 @@ fn node_state_is_field_aligned() {
 // BitFieldTransform (base): constructor + establish_fields
 // =============================================================================
 
-use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeBitField};
-use std::rc::Rc;
+use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeBitField, TypeFactoryImpl, TypeRoot};
 
 /// `myfoo`'s first byte (`bitfields.xml`): `uint4 field3:3` (lsb0,3b),
 /// `int4 sfield4:4` (lsb3,4b), `bool fieldb:1` (lsb7,1b).  All little-endian,
 /// byteOffset 0, byteSize 1.
-fn myfoo_byte0_struct() -> Rc<Datatype> {
+fn myfoo_byte0_struct(types: &TypeFactoryImpl) -> TypeRoot {
     let mk = |id, lsb, nb, name: &str, meta| {
-        let mut bf = TypeBitField::new(id, nb, false, name, Rc::new(Datatype::new(4, meta)));
+        let field_type = types.intern(Datatype::new(4, meta)).unwrap();
+        let mut bf = TypeBitField::new(id, nb, false, name, field_type.id());
         bf.least_sig_bit = lsb;
         bf.byte_offset = 0;
         bf.byte_size = 1;
@@ -382,12 +387,12 @@ fn myfoo_byte0_struct() -> Rc<Datatype> {
     let mut s = Datatype::new_with_align(1, 4, type_metatype::TYPE_STRUCT);
     s.flags |= flags::has_bitfields;
     s.kind = DatatypeKind::Struct { field: vec![], bitfield };
-    Rc::new(s)
+    types.intern(s).unwrap()
 }
 
 #[test]
 fn transform_ctor_struct_sets_parent_and_offset() {
-    let dt = myfoo_byte0_struct();
+    let dt = myfoo_byte0_struct(&TypeFactoryImpl::new());
     let t = BitFieldTransform::new(&dt, 0, false);
     assert!(t.parent_struct.is_some());
     assert_eq!(t.initial_offset, 0);
@@ -397,7 +402,8 @@ fn transform_ctor_struct_sets_parent_and_offset() {
 
 #[test]
 fn transform_ctor_non_struct_leaves_parent_null() {
-    let dt = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let types = TypeFactoryImpl::new();
+    let dt = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
     let t = BitFieldTransform::new(&dt, 0, false);
     assert!(t.parent_struct.is_none());
     assert_eq!(t.initial_offset, -1);
@@ -407,12 +413,12 @@ fn transform_ctor_non_struct_leaves_parent_null() {
 fn establish_fields_one_byte_no_holes() {
     // A 1-byte Varnode fully covered by field3(3)+sfield4(4)+fieldb(1) = 8 bits.
     // With follow_holes=false, only the three field records appear.
-    let dt = myfoo_byte0_struct();
+    let dt = myfoo_byte0_struct(&TypeFactoryImpl::new());
     let mut t = BitFieldTransform::new(&dt, 0, false);
     t.establish_fields(vn(), /*vn_size*/ 1, /*follow_holes*/ false);
     // Three field records, each a FieldRef::Field, none a hole.
     assert_eq!(t.work_list.len(), 3);
-    assert!(t.work_list.iter().all(|s| matches!(s.field, FieldRef::Field(_))));
+    assert!(t.work_list.iter().all(|s| matches!(s.field, FieldRef::Field { .. })));
     // field3 occupies bits [0,3); least significant first.
     assert_eq!(t.work_list[0].bits_field.least_sig_bit, 0);
     assert_eq!(t.work_list[0].bits_field.num_bits, 3);
@@ -424,27 +430,29 @@ fn establish_fields_one_byte_no_holes() {
     assert_eq!(t.work_list[2].bits_field.num_bits, 1);
     // sfield4 is int4 -> FieldRef::Field { is_int: true }; its bits are not at the
     // top of the 1-byte container ([3,7) != most significant), so not sign ext.
-    assert_eq!(t.work_list[1].field().unwrap().field_type.get_metatype(), type_metatype::TYPE_INT);
+    assert_eq!(t.work_list[1].field_type().unwrap().get_metatype(), type_metatype::TYPE_INT);
     assert!(!t.work_list[1].is_sign_extended);
 }
 
 #[test]
 fn establish_fields_partial_coverage_emits_final_hole() {
+    let types = TypeFactoryImpl::new();
     // Only field3(3 bits) present in a struct; a 1-byte Varnode leaves a 5-bit
     // final hole [3,8).  With follow_holes the hole record is emitted.
     let mut s = Datatype::new_with_align(1, 4, type_metatype::TYPE_STRUCT);
     s.flags |= flags::has_bitfields;
-    let mut bf = TypeBitField::new(0, 3, false, "field3", Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)));
+    let field_type = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
+    let mut bf = TypeBitField::new(0, 3, false, "field3", field_type.id());
     bf.byte_offset = 0;
     bf.byte_size = 1;
     s.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![bf] };
-    let dt = Rc::new(s);
+    let dt = types.intern(s).unwrap();
 
     let mut t = BitFieldTransform::new(&dt, 0, true);
     t.establish_fields(vn(), 1, /*follow_holes*/ true);
     // field3 record + the final hole [3,8).
     assert_eq!(t.work_list.len(), 2);
-    assert!(matches!(t.work_list[0].field, FieldRef::Field(_)));
+    assert!(matches!(t.work_list[0].field, FieldRef::Field { .. }));
     assert!(matches!(t.work_list[1].field, FieldRef::Hole));
     assert_eq!(t.work_list[1].bits_field.least_sig_bit, 3);
     assert_eq!(t.work_list[1].bits_field.num_bits, 5);
@@ -453,7 +461,7 @@ fn establish_fields_partial_coverage_emits_final_hole() {
     let mut t2 = BitFieldTransform::new(&dt, 0, true);
     t2.establish_fields(vn(), 1, false);
     assert_eq!(t2.work_list.len(), 1);
-    assert!(matches!(t2.work_list[0].field, FieldRef::Field(_)));
+    assert!(matches!(t2.work_list[0].field, FieldRef::Field { .. }));
 }
 
 #[test]
@@ -464,7 +472,8 @@ fn establish_fields_non_struct_parent_collects_nothing() {
     // overlap loop runs zero times.  With follow_holes=true the trailing
     // whole-Varnode hole branch (bitfield.cc:88-90) still fires, exactly as it
     // would for an empty struct (no bitfields).
-    let dt = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+    let types = TypeFactoryImpl::new();
+    let dt = types.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
     let mut t = BitFieldTransform::new(&dt, 0, false);
     t.establish_fields(vn(), 4, false);
     // follow_holes=false: nothing at all.
@@ -479,77 +488,188 @@ fn establish_fields_non_struct_parent_collects_nothing() {
     assert_eq!(t2.work_list[0].bits_field.num_bits, 32);
 }
 
-// =============================================================================
-// Rules: op-list + specs() definition-order fidelity
-// =============================================================================
+// Graph-backed membership checks: a positive rewrite for every rule prevents
+// an inactive fixture from making the restricted-pool checks vacuous.
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
+use crate::context::{ArchContext, BlockId, OpId};
+use crate::dtype::TypeFactory;
+use kuna_base::address::Address;
+use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace};
+use std::rc::Rc;
 
-#[test]
-fn rule_op_lists_match_cpp() {
-    assert_eq!(RuleBitFieldStore.get_op_list(), vec![OpCode::CPUI_STORE]);
-    assert_eq!(RuleBitFieldLoad.get_op_list(), vec![OpCode::CPUI_LOAD]);
-    assert_eq!(
-        RulePullAbsorb.get_op_list(),
-        vec![OpCode::CPUI_ZPULL, OpCode::CPUI_SPULL]
-    );
-    assert_eq!(RuleInsertAbsorb.get_op_list(), vec![OpCode::CPUI_INSERT]);
+fn rule_fixture() -> (Funcdata, BlockId) {
+    let mut manager = AddrSpaceManager::new();
+    manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+    manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+    manager.insert_space(Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 2,
+        addrspace_flags::hasphysical, 1, 1,
+    ))).unwrap();
+    let arch = Rc::new(ArchContext::new(manager));
+    let ram = arch.manage().get_space_by_name("ram").unwrap().clone();
+    let mut fd = Funcdata::new("bitfields", "bitfields", arch, Address::new(ram, 0x1000), 0x10000000, 0x40).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    (fd, block)
+}
+
+fn fixture_op(fd: &mut Funcdata, block: BlockId, code: OpCode, inputs: &[VarnodeId], size: i32) -> OpId {
+    let ram = fd.get_arch().manage().get_space_by_name("ram").unwrap().clone();
+    let op = fd.new_op(inputs.len() as i32, Address::new(ram, 0x1000));
+    fd.op_set_opcode_code(op, code);
+    for (slot, &input) in inputs.iter().enumerate() {
+        fd.op_set_input(op, input, slot as i32).unwrap();
+    }
+    if size != 0 {
+        fd.new_unique_out(size, op).unwrap();
+    }
+    fd.op_insert_end(op, block);
+    op
+}
+
+fn fixture_out(fd: &Funcdata, op: OpId) -> VarnodeId {
+    fd.obank().get(op).unwrap().get_out().unwrap()
+}
+
+fn fixture_input(fd: &mut Funcdata, size: i32, offset: u64, ty: Option<TypeRoot>) -> VarnodeId {
+    let ram = fd.get_arch().manage().get_space_by_name("ram").unwrap().clone();
+    let input = fd.new_varnode(size, &Address::new(ram, offset), ty);
+    fd.set_input_varnode(input).unwrap()
 }
 
 #[test]
-fn rule_bitfield_in_op_list_exact_order() {
-    // bitfield.cc:1739-1745 — the explicit 17-entry list, in exactly that order.
-    assert_eq!(
-        RuleBitFieldIn.get_op_list(),
-        vec![
-            OpCode::CPUI_COPY,
-            OpCode::CPUI_INT_EQUAL,
-            OpCode::CPUI_INT_NOTEQUAL,
-            OpCode::CPUI_INT_SLESS,
-            OpCode::CPUI_INT_SLESSEQUAL,
-            OpCode::CPUI_INT_LESS,
-            OpCode::CPUI_INT_LESSEQUAL,
-            OpCode::CPUI_INT_ZEXT,
-            OpCode::CPUI_INT_SEXT,
-            OpCode::CPUI_INT_ADD,
-            OpCode::CPUI_INT_NEGATE,
-            OpCode::CPUI_INT_AND,
-            OpCode::CPUI_INT_LEFT,
-            OpCode::CPUI_INT_RIGHT,
-            OpCode::CPUI_INT_SRIGHT,
-            OpCode::CPUI_INT_MULT,
-            OpCode::CPUI_SUBPIECE,
-        ]
-    );
-}
-
-#[test]
-fn rule_bitfield_out_op_list_is_allowed_writes_plus_indirect() {
-    // bitfield.cc:1694-1699 — allowedFinalWrites, then CPUI_INDIRECT last.
-    let oplist = RuleBitFieldOut.get_op_list();
-    assert_eq!(oplist.len(), ALLOWED_FINAL_WRITES.len() + 1);
-    assert_eq!(&oplist[..ALLOWED_FINAL_WRITES.len()], ALLOWED_FINAL_WRITES);
-    assert_eq!(*oplist.last().unwrap(), OpCode::CPUI_INDIRECT);
-    // Spot-check the head/tail of allowedFinalWrites itself.
-    assert_eq!(oplist[0], OpCode::CPUI_COPY);
-    assert_eq!(ALLOWED_FINAL_WRITES[0], OpCode::CPUI_COPY);
-    assert_eq!(*ALLOWED_FINAL_WRITES.last().unwrap(), OpCode::CPUI_SUBPIECE);
-}
-
-#[test]
-fn specs_definition_order() {
-    // bitfield.hh declaration order: store, out, load, in, pull_absorb, insert_absorb.
-    let specs = specs();
-    assert_eq!(specs.len(), 6);
-    // Build each and check its op-list signature identifies the right rule, since
-    // RuleSpec carries only group + ctor.
-    let mk = |i: usize| (specs[i].ctor)();
-    assert_eq!(mk(0).get_op_list(), vec![OpCode::CPUI_STORE]); // bitfield_store
-    assert_eq!(mk(1).get_op_list().last().copied(), Some(OpCode::CPUI_INDIRECT)); // bitfield_out
-    assert_eq!(mk(2).get_op_list(), vec![OpCode::CPUI_LOAD]); // bitfield_load
-    assert_eq!(mk(3).get_op_list().len(), 17); // bitfield_in
-    assert_eq!(mk(4).get_op_list(), vec![OpCode::CPUI_ZPULL, OpCode::CPUI_SPULL]); // pull_absorb
-    assert_eq!(mk(5).get_op_list(), vec![OpCode::CPUI_INSERT]); // insert_absorb
-    // All carry the empty group placeholder (W8 assigns the real stage group).
-    for s in &specs {
-        assert_eq!(s.group, "");
+fn all_bitfield_rules_require_registered_group_for_real_rewrites() {
+    for (index, name) in ["bitfield_store", "bitfield_out", "bitfield_load", "bitfield_in", "pull_absorb", "insert_absorb"].into_iter().enumerate() {
+        let mut pool = ActionPool::new(0, "bitfields");
+        pool.add_rule(RuleState::new("bitfields", 0, name), (specs()[index].ctor)());
+        for enabled in [false, true] {
+            let (mut fd, block) = rule_fixture();
+            let mut groups = ActionGroupList::new();
+            groups.insert("base");
+            if enabled {
+                groups.insert("bitfields");
+            }
+            let field_type = myfoo_byte0_struct(fd.get_arch().types_impl().unwrap());
+            let value = fd.new_constant(1, 0x55);
+            let mask = fd.new_constant(1, 7);
+            let pos = fd.new_constant(4, 0);
+            let width = fd.new_constant(4, 3);
+            let input = fixture_input(&mut fd, 1, 0x2000, None);
+            let (observe, original_code, expected_code, expected_input) = match index {
+                0 | 2 => {
+                    let pointer_type = fd.get_arch().types_impl().unwrap()
+                        .get_type_pointer(8, field_type, 1).unwrap();
+                    let pointer = fixture_input(&mut fd, 8, 0x2100, Some(pointer_type));
+                    let space = fd.new_constant(8, 2);
+                    if index == 0 {
+                        let store = fixture_op(&mut fd, block, OpCode::CPUI_STORE, &[space, pointer, value], 0);
+                        (store, OpCode::CPUI_STORE, OpCode::CPUI_STORE, None)
+                    } else {
+                        let load = fixture_op(&mut fd, block, OpCode::CPUI_LOAD, &[space, pointer], 1);
+                        let loaded = fixture_out(&fd, load);
+                        let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[loaded, mask], 1);
+                        (and, OpCode::CPUI_INT_AND, OpCode::CPUI_ZPULL, None)
+                    }
+                }
+                1 => {
+                    let copy = fixture_op(&mut fd, block, OpCode::CPUI_COPY, &[value], 1);
+                    let out = fixture_out(&fd, copy);
+                    let vn = fd.vbank_mut().get_mut(out).unwrap();
+                    vn.update_type(field_type);
+                    vn.mark_mapped_addr_tied();
+                    (copy, OpCode::CPUI_COPY, OpCode::CPUI_INSERT, None)
+                }
+                3 => {
+                    fd.vbank_mut().get_mut(input).unwrap().update_type(field_type);
+                    let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[input, mask], 1);
+                    (and, OpCode::CPUI_INT_AND, OpCode::CPUI_ZPULL, None)
+                }
+                4 => {
+                    let pull = fixture_op(&mut fd, block, OpCode::CPUI_SPULL, &[input, pos, width], 1);
+                    let pulled = fixture_out(&fd, pull);
+                    let ext = fixture_op(&mut fd, block, OpCode::CPUI_INT_SEXT, &[pulled], 4);
+                    (ext, OpCode::CPUI_INT_SEXT, OpCode::CPUI_SPULL, None)
+                }
+                5 => {
+                    let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[input, mask], 1);
+                    let masked = fixture_out(&fd, and);
+                    let insert = fixture_op(&mut fd, block, OpCode::CPUI_INSERT, &[value, masked, pos, width], 1);
+                    (insert, OpCode::CPUI_INSERT, OpCode::CPUI_INSERT, Some((masked, input)))
+                }
+                _ => unreachable!(),
+            };
+            let mut filtered = pool.clone_filtered(&groups);
+            if let Some(action) = filtered.as_mut() {
+                action.reset(&mut fd);
+                assert!(action.perform(&mut fd, &mut ActionContext::new()) >= 0, "{name}");
+            }
+            if !enabled {
+                assert!(filtered.is_none(), "{name} escaped the base-only pool");
+                assert_eq!(fd.obank().get(observe).unwrap().code(), original_code, "{name}");
+            } else if index == 0 {
+                let written = fd.obank().get(observe).unwrap().get_in(2).unwrap();
+                let definition = fd.vbank().get(written).unwrap().get_def().unwrap();
+                assert_eq!(fd.obank().get(definition).unwrap().code(), OpCode::CPUI_INSERT, "{name}");
+            } else if index == 2 || index == 3 {
+                assert!(fd.bb_ops(block).iter().any(|&op| fd.obank().get(op).unwrap().code() == expected_code), "{name} did not recover a pull");
+            } else {
+                assert_eq!(fd.obank().get(observe).unwrap().code(), expected_code, "{name}");
+            }
+            if let Some((before, after)) = expected_input {
+                assert_eq!(fd.obank().get(observe).unwrap().get_in(1), Some(if enabled { after } else { before }), "{name}");
+            }
+        }
     }
 }
+
+#[test]
+fn schedule_registration_controls_unconditional_analysis_clone() {
+    use crate::universalaction::{universal_sched, ActionListFilter, RuleRow};
+    // Architecture registration is authoritative, even when both the rule's
+    // usual primary group and its name are absent from the filter.
+    for (groups, enabled) in [
+        (&["base"][..], false),
+        (&["trivialarith"][..], false),
+        (&["cpu_alias"][..], true),
+        (&["cpu_primary"][..], true),
+    ] {
+        let (mut fd, block) = rule_fixture();
+        let input = fixture_input(&mut fd, 4, 0x2000, None);
+        let xor = fixture_op(&mut fd, block, OpCode::CPUI_INT_XOR, &[input, input], 4);
+        let schedule = universal_sched(None, None, vec![RuleRow {
+            name: "cpu_identity",
+            group: "cpu_primary",
+            aliases: &["cpu_alias"],
+            ctor: || Box::new(crate::ruleaction_2::RuleTrivialArith),
+        }]);
+        let dump = schedule.list_action_dump(&ActionListFilter::from_names(groups.iter().copied()));
+        assert_eq!(dump.contains("cpu_identity"), enabled);
+        let universal = schedule.materialize();
+        let mut filter = ActionGroupList::new();
+        for &group in groups {
+            filter.insert(group);
+        }
+        // Inspect the base-only clone but don't run unrelated base Actions on
+        // the minimal IR fixture: the isolated pool below exercises execution.
+        if groups != ["base"] {
+            if let Some(mut root) = universal.clone_filtered(&filter) {
+                root.reset(&mut fd);
+                assert!(root.perform(&mut fd, &mut ActionContext::new()) >= 0);
+            }
+        } else {
+            let mut pool = ActionPool::new(0, "analysis");
+            pool.add_rule(RuleState::new("analysis", 0, "trivialarith"), Box::new(crate::ruleaction_2::RuleTrivialArith));
+            let mut root = crate::action::ActionGroup::new(0, "restricted");
+            root.add_action(Box::new(pool));
+            assert!(root.clone_filtered(&filter).is_none());
+        }
+        assert_eq!(fd.obank().get(xor).unwrap().code(), if enabled { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_XOR });
+        if enabled {
+            let zero = fd.obank().get(xor).unwrap().get_in(0).unwrap();
+            assert!(fd.vbank().get(zero).unwrap().is_constant());
+            assert_eq!(fd.vbank().get(zero).unwrap().get_offset(), 0);
+        }
+    }
+}
+
+

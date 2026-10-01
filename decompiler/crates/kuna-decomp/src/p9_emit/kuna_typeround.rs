@@ -184,14 +184,13 @@
 //! against DWARF.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{HighVariableId, OpId, VarnodeId};
-use crate::dtype::{sub_metatype, type_metatype, Datatype, TypeFactory};
+use crate::dtype::{sub_metatype, type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 
 /// The narrowest declaration this pass will re-sign, in bytes.
@@ -295,9 +294,9 @@ impl Evidence {
 #[derive(Debug, Default)]
 pub struct SignPlan {
     /// Declared type override, per HighVariable.
-    decls: HashMap<HighVariableId, Rc<Datatype>>,
+    decls: HashMap<HighVariableId, TypeRoot>,
     /// The declaration overrides the printer actually emitted.
-    applied: HashMap<HighVariableId, Rc<Datatype>>,
+    applied: HashMap<HighVariableId, TypeRoot>,
 }
 
 impl SignPlan {
@@ -309,13 +308,13 @@ impl SignPlan {
 
     /// The declared type this pass wants for `high`, if any.
     #[inline]
-    pub fn decl_type(&self, high: HighVariableId) -> Option<&Rc<Datatype>> {
+    pub fn decl_type(&self, high: HighVariableId) -> Option<&TypeRoot> {
         self.decls.get(&high)
     }
 
     /// Record that the printer emitted `ty` as `high`'s declaration, which is what
     /// authorizes [`Self::drop_cast`] to suppress a now-redundant cast on it.
-    pub fn record_applied(&mut self, high: HighVariableId, ty: Rc<Datatype>) {
+    pub fn record_applied(&mut self, high: HighVariableId, ty: TypeRoot) {
         self.applied.insert(high, ty);
     }
 
@@ -387,10 +386,14 @@ impl SignPlan {
         let Some(declared) = self.applied.get(&high) else { return false };
         let Some(outv) = fd.vbank().get(outvn) else { return false };
         let target = outv.get_type_def_facing();
+        let target_view = target.read();
+        let declared_view = declared.read();
+        let target_record = target_view.get(target.id()).expect("live cast target");
+        let declared_record = declared_view.get(declared.id()).expect("live declaration type");
         target.get_size() == declared.get_size()
             && target.get_metatype() == declared.get_metatype()
             && target.get_sub_meta() == declared.get_sub_meta()
-            && target.get_name() == declared.get_name()
+            && target_record.get_name() == declared_record.get_name()
     }
 }
 
@@ -398,7 +401,7 @@ impl SignPlan {
 ///
 /// Deliberately narrow: `char`, `wchar`, enums, bitfields, bools, typedefs and
 /// anything with a name of its own keep whatever type inference gave them.
-fn is_plain_integer(dt: &Datatype) -> bool {
+fn is_plain_integer(dt: &TypeRoot) -> bool {
     if dt.get_typedef().is_some() {
         return false;
     }
@@ -752,7 +755,7 @@ pub fn plan(
     policy: SignPolicy,
     castsign: bool,
     types: &dyn TypeFactory,
-    decl_type_of: impl Fn(HighVariableId) -> Option<Rc<Datatype>>,
+    decl_type_of: impl Fn(HighVariableId) -> Option<TypeRoot>,
 ) -> SignPlan {
     let mut out = SignPlan::default();
     if !policy.is_active() {

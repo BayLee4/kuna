@@ -1,0 +1,861 @@
+--- a/decompiler/crates/kuna-analysis/src/loader/format/mod.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/format/mod.rs
+@@ -46,8 +46,7 @@
+ /// clean name. [`ImportSymKind`] distinguishes genuine imported call targets
+ /// from the defined exports PE and Mach-O append to the same loader stream.
+ ///
+-/// Structurally identical to today's [`elf::PltSymCompat`] /
+-/// `elf_plt::PltSym` — the universal currency of the import/symbol boundary, so a
++/// The universal currency of the import/symbol boundary: a
+ /// PE IAT slot, a Mach-O `__stubs` entry, and an ELF PLT stub all flow through
+ /// the same downstream commit path (`seen`-dedup → `FuncSym` → `FunctionSymbol`).
+ pub struct ImportSym {
+@@ -57,6 +56,8 @@
+     pub name: Vec<u8>,
+     /// Whether this address represents an imported target or a defined export.
+     pub kind: ImportSymKind,
++    /// Exact loader-owned provider and raw symbol; never inferred from the clean name.
++    pub native_import: Option<std::rc::Rc<kuna_decomp::kuna_nativeimport::NativeImportIdentity>>,
+ }
+ 
+ /// The file-backed **header page** a format maps ahead of its first section:
+--- a/decompiler/crates/kuna-analysis/src/loader/macho_stubs.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/macho_stubs.rs
+@@ -60,6 +60,8 @@
+ use super::macho_fat::{select_fat_slice, SlicePref};
+ 
+ use super::format::{ImportSym, ImportSymKind};
++use std::rc::Rc;
++use kuna_decomp::kuna_nativeimport::{ImportPlatform, NativeImportIdentity};
+ 
+ /// Resolve a Mach-O image's `__stubs` entries and symbol-pointer slots to their
+ /// imported function names.
+@@ -153,6 +155,9 @@
+         Err(_) => return finish_with_exports(neutral, out),
+     };
+ 
++    // Keep missing/unreadable names in ordinal order; never shift later ordinals.
++    let mut libraries: Vec<Option<&[u8]>> = Vec::new();
++    let mut commands_valid = true;
+     let mut symtab: Option<SymbolTable<Mach>> = None;
+     let mut indirect: &[object::U32<Endianness>] = &[];
+     // Collect the typed sections so we can read `reserved1`/`reserved2`/`addr`
+@@ -164,7 +169,17 @@
+     // sections (for the per-section `reserved1`/`reserved2`/`addr`). This is the
+     // canonical `object`-crate dispatch (`Segment::from_command` / `command
+     // .symtab()` / `command.dysymtab()`), the same one `MachOFile::parse` uses.
+-    while let Ok(Some(command)) = commands.next() {
++    loop {
++        let command = match commands.next() {
++            Ok(Some(command)) => command,
++            Ok(None) => break,
++            Err(_) => { commands_valid = false; break; }
++        };
++        match command.dylib() {
++            Ok(Some(dylib)) => libraries.push(command.string(endian, dylib.dylib.name).ok()),
++            Ok(None) => {},
++            Err(_) => { commands_valid = false; },
++        }
+         if let Ok(Some((segment, section_data))) = Mach::Segment::from_command(command) {
+             if let Ok(secs) = segment.sections(endian, section_data) {
+                 for sec in secs {
+@@ -187,6 +202,7 @@
+         None => return finish_with_exports(neutral, out),
+     };
+     let strings = symtab.strings();
++    let mut identities = std::collections::HashMap::new();
+ 
+     for sec in sections {
+         // `Section::indirect_symbols` returns this section's window into the
+@@ -237,10 +253,28 @@
+             if nlist.n_strx(endian) == 0 {
+                 continue; // no name
+             }
+-            let name = match nlist.name(endian, strings) {
+-                Ok(n) if !n.is_empty() => strip_leading_underscore(n),
++            let raw_name = match nlist.name(endian, strings) {
++                Ok(n) if !n.is_empty() => n,
+                 _ => continue,
+             };
++            let name = strip_leading_underscore(raw_name);
++            let ordinal = nlist.library_ordinal(endian);
++            let native_import = identities.entry(raw).or_insert_with(|| (commands_valid
++                && header.flags(endian) & object::macho::MH_TWOLEVEL != 0
++                && nlist.is_undefined()
++                && nlist.n_type() & object::macho::N_EXT != 0
++                && Into::<u64>::into(nlist.n_value(endian)) == 0
++                && ordinal > 0 && ordinal < object::macho::DYNAMIC_LOOKUP_ORDINAL)
++                .then(|| libraries.get(ordinal as usize - 1).copied().flatten())
++                .flatten()
++                .and_then(|library| {
++                    let library = std::str::from_utf8(library).ok()?;
++                    let symbol = std::str::from_utf8(raw_name).ok()?;
++                    (!library.is_empty()).then(|| Rc::new(NativeImportIdentity {
++                        platform: ImportPlatform::MachO,
++                        library: library.to_owned(), symbol: symbol.to_owned(),
++                    }))
++                })).clone();
+             if name.is_empty() {
+                 continue;
+             }
+@@ -254,6 +288,7 @@
+                 addr,
+                 name,
+                 kind: ImportSymKind::Import,
++                native_import,
+             });
+             if import_slot {
+                 if let Some(last_open) = addr.checked_add(stride) {
+@@ -299,6 +334,7 @@
+                     addr: e.address(),
+                     name: strip_leading_underscore(name),
+                     kind: ImportSymKind::Export,
++                    native_import: None,
+                 });
+             }
+         }
+@@ -379,6 +415,7 @@
+                 addr,
+                 name,
+                 kind: ImportSymKind::Import,
++                native_import: None,
+             });
+         }
+ 
+@@ -404,6 +441,7 @@
+                 addr: slot_base + (i as u64) * ptr,
+                 name,
+                 kind: ImportSymKind::Import,
++                native_import: None,
+             });
+             let _ = raw;
+         }
+--- a/decompiler/crates/kuna-analysis/src/loader/pe_iat.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/pe_iat.rs
+@@ -60,6 +60,11 @@
+ use std::collections::{HashMap, HashSet};
+ 
+ use super::format::{ImportSym, ImportSymKind};
++use std::rc::Rc;
++use kuna_decomp::kuna_nativeimport::{ImportPlatform, NativeImportIdentity};
++
++/// Display name plus optional exact named-import provenance at an IAT slot.
++type ImportName = (Vec<u8>, Option<Rc<NativeImportIdentity>>);
+ 
+ /// Resolve PE import slots (and the thunk veneers that jump through them) to
+ /// their imported function names.
+@@ -111,7 +116,7 @@
+ /// [`resolve_pe_import_slots`] over a typed `PeFile`: reuse the INT/IAT lockstep
+ /// walk purely for its slot-VA side table, then widen each slot to its pointer.
+ fn slot_ranges<Pe: ImageNtHeaders>(pe: &PeFile<Pe>, ptr: u64) -> Vec<(u64, u64)> {
+-    let mut slot_to_name: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
++    let mut slot_to_name: std::collections::HashMap<u64, ImportName> = std::collections::HashMap::new();
+     let mut discard: Vec<ImportSym> = Vec::new();
+     if let Ok(Some(it)) = pe.import_table() {
+         walk_import_table::<Pe>(
+@@ -141,7 +146,7 @@
+     let image_base = pe.relative_address_base(); // = optional-header ImageBase
+ 
+     // The IAT slot VA → name map, also used to name the `FF 25` thunk veneers.
+-    let mut slot_to_name: std::collections::HashMap<u64, Vec<u8>> = std::collections::HashMap::new();
++    let mut slot_to_name: std::collections::HashMap<u64, ImportName> = std::collections::HashMap::new();
+ 
+     if let Ok(Some(it)) = pe.import_table() {
+         walk_import_table::<Pe>(&it, image_base, ptr, &mut out, &mut slot_to_name);
+@@ -165,6 +170,7 @@
+                     addr: e.address(),
+                     name: name.to_vec(),
+                     kind: ImportSymKind::Export,
++                    native_import: None,
+                 });
+             }
+         }
+@@ -180,7 +186,7 @@
+     image_base: u64,
+     ptr: u64,
+     out: &mut Vec<ImportSym>,
+-    slot_to_name: &mut std::collections::HashMap<u64, Vec<u8>>,
++    slot_to_name: &mut std::collections::HashMap<u64, ImportName>,
+ ) {
+     let mut descs = match it.descriptors() {
+         Ok(d) => d,
+@@ -212,19 +218,34 @@
+                 _ => break, // end of this descriptor's thunk list (or a read error)
+             };
+             let slot_va = image_base.wrapping_add(iat_rva).wrapping_add(i.wrapping_mul(ptr));
+-            let name: Vec<u8> = match it.import::<Pe>(thunk) {
+-                Ok(object::read::pe::Import::Name(_hint, n)) => n.to_vec(),
+-                Ok(object::read::pe::Import::Ordinal(ord)) => synth_ordinal_name(dll, ord),
++            let (name, native_import) = match it.import::<Pe>(thunk) {
++                Ok(object::read::pe::Import::Name(_hint, n)) => {
++                    let identity = std::str::from_utf8(dll).ok().zip(std::str::from_utf8(n).ok())
++                        .filter(|(library, symbol)| !library.is_empty() && !symbol.is_empty())
++                        .map(|(library, symbol)| Rc::new(NativeImportIdentity {
++                            platform: ImportPlatform::Pe,
++                            library: library.to_owned(), symbol: symbol.to_owned(),
++                        }));
++                    (n.to_vec(), identity)
++                },
++                // An ordinal has no raw named symbol; the synthetic label is not authority.
++                Ok(object::read::pe::Import::Ordinal(ord)) => (synth_ordinal_name(dll, ord), None),
+                 Err(_) => {
+                     i += 1;
+                     continue;
+                 }
+             };
+-            slot_to_name.insert(slot_va, name.clone());
++            slot_to_name.entry(slot_va).and_modify(|(old_name, old_identity)| {
++                // Keep the existing last-name behavior, but never authorize an
++                // alias through an IAT slot claimed by different providers.
++                if *old_identity != native_import { *old_identity = None; }
++                old_name.clone_from(&name);
++            }).or_insert_with(|| (name.clone(), native_import.clone()));
+             out.push(ImportSym {
+                 addr: slot_va,
+                 name,
+                 kind: ImportSymKind::Import,
++                native_import,
+             });
+             i += 1;
+         }
+@@ -253,7 +274,7 @@
+ fn decode_iat_thunks(
+     file: &object::File,
+     starts: &[u64],
+-    slot_to_name: &std::collections::HashMap<u64, Vec<u8>>,
++    slot_to_name: &std::collections::HashMap<u64, ImportName>,
+     out: &mut Vec<ImportSym>,
+ ) {
+     if slot_to_name.is_empty() {
+@@ -300,7 +321,7 @@
+     starts: &[u64],
+     is_64: bool,
+     reject_rex: bool,
+-    slot_to_name: &HashMap<u64, Vec<u8>>,
++    slot_to_name: &HashMap<u64, ImportName>,
+     out: &mut Vec<ImportSym>,
+ ) {
+     let first = out.len();
+@@ -329,7 +350,7 @@
+     vma: u64,
+     data: &[u8],
+     is_64: bool,
+-    slot_to_name: &HashMap<u64, Vec<u8>>,
++    slot_to_name: &HashMap<u64, ImportName>,
+     out: &mut Vec<ImportSym>,
+     mut rex_tails: Option<&mut HashSet<u64>>,
+ ) {
+@@ -345,7 +366,7 @@
+                 // x86: the disp32 IS the absolute IAT slot address.
+                 disp as u32 as u64
+             };
+-            if let Some(name) = slot_to_name.get(&slot) {
++            if let Some((name, native_import)) = slot_to_name.get(&slot) {
+                 // The thunk entry is the `FF` byte (the `call` target).  MinGW
+                 // veneers have no CET `endbr` prefix, so no back-up is needed.
+                 if let Some(tails) = rex_tails.as_deref_mut() {
+@@ -357,6 +378,7 @@
+                     addr: insn_addr,
+                     name: name.clone(),
+                     kind: ImportSymKind::Import,
++                    native_import: native_import.clone(),
+                 });
+             }
+             i += 6;
+@@ -392,8 +414,8 @@
+         let slot = vma + 6 + disp as u64;
+         assert_eq!(slot, 0x14000d33c);
+ 
+-        let mut map: HashMap<u64, Vec<u8>> = HashMap::new();
+-        map.insert(slot, b"puts".to_vec());
++        let mut map: HashMap<u64, ImportName> = HashMap::new();
++        map.insert(slot, (b"puts".to_vec(), None));
+         let mut out: Vec<ImportSym> = Vec::new();
+         decode_ff25(vma, &data, /*is_64*/ true, &map, &mut out, None);
+ 
+@@ -411,8 +433,8 @@
+         let mut data = vec![0xFFu8, 0x25];
+         data.extend_from_slice(&slot.to_le_bytes());
+ 
+-        let mut map: HashMap<u64, Vec<u8>> = HashMap::new();
+-        map.insert(slot as u64, b"printf".to_vec());
++        let mut map: HashMap<u64, ImportName> = HashMap::new();
++        map.insert(slot as u64, (b"printf".to_vec(), None));
+         let mut out: Vec<ImportSym> = Vec::new();
+         decode_ff25(vma, &data, /*is_64*/ false, &map, &mut out, None);
+ 
+@@ -428,7 +450,7 @@
+         let vma = 0x140007240u64;
+         let mut data = vec![0xFFu8, 0x25];
+         data.extend_from_slice(&0x10i32.to_le_bytes());
+-        let map: HashMap<u64, Vec<u8>> = HashMap::new(); // empty: nothing known
++        let map: HashMap<u64, ImportName> = HashMap::new(); // empty: nothing known
+         let mut out: Vec<ImportSym> = Vec::new();
+         decode_ff25(vma, &data, true, &map, &mut out, None);
+         assert!(out.is_empty());
+@@ -441,7 +463,7 @@
+         b
+     }
+ 
+-    fn thunk_addrs(code: &[(u64, &[u8])], is_64: bool, reject_rex: bool, map: &HashMap<u64, Vec<u8>>) -> Vec<u64> {
++    fn thunk_addrs(code: &[(u64, &[u8])], is_64: bool, reject_rex: bool, map: &HashMap<u64, ImportName>) -> Vec<u64> {
+         let mut out: Vec<ImportSym> = Vec::new();
+         decode_thunks(code, code, &[], is_64, reject_rex, map, &mut out);
+         out.iter().map(|s| s.addr).collect()
+@@ -461,7 +483,7 @@
+         data.extend_from_slice(&[0xCC, 0xCC]);
+         let thunk = data.len();
+         data.extend(rel32(&[0xFF, 0x25], vma + thunk as u64, slot));
+-        let map = HashMap::from([(slot, b"InitializeSListHead".to_vec())]);
++        let map = HashMap::from([(slot, (b"InitializeSListHead".to_vec(), None))]);
+ 
+         let code = [(vma, &data[..])];
+         assert_eq!(thunk_addrs(&code, true, true, &map), vec![vma + thunk as u64]);
+@@ -479,7 +501,7 @@
+         let thunk = vma + 4;
+         let mut text = vec![0x48u8, 0xFF, 0x60, 0x48];
+         text.extend(rel32(&[0xFF, 0x25], thunk, slot));
+-        let map = HashMap::from([(slot, b"ExitProcess".to_vec())]);
++        let map = HashMap::from([(slot, (b"ExitProcess".to_vec(), None))]);
+         let caller_at = 0x140005000u64;
+ 
+         for op in [&[0xE8u8][..], &[0xE9], &[0x0F, 0x85], &[0x48, 0x8D, 0x0D]] {
+@@ -499,7 +521,7 @@
+         let slot = 0x403000u64;
+         let mut data = vec![0x48u8, 0xFF, 0x25];
+         data.extend_from_slice(&(slot as u32).to_le_bytes());
+-        let map = HashMap::from([(slot, b"printf".to_vec())]);
++        let map = HashMap::from([(slot, (b"printf".to_vec(), None))]);
+         assert_eq!(thunk_addrs(&[(vma, &data[..])], false, true, &map), vec![vma + 1]);
+     }
+ 
+--- a/decompiler/crates/kuna-analysis/src/loader/kuna_rexthunk.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/kuna_rexthunk.rs
+@@ -49,7 +49,7 @@
+ 
+ /// Whether the thunk decoded at `data[i]` (section base `vma`) is a REX tail: the
+ /// byte before it is a REX prefix and no resolving `FF 25` ends at `i`.
+-pub(crate) fn is_rex_tail(vma: u64, data: &[u8], i: usize, slot_to_name: &HashMap<u64, Vec<u8>>) -> bool {
++pub(crate) fn is_rex_tail<T>(vma: u64, data: &[u8], i: usize, slot_to_name: &HashMap<u64, T>) -> bool {
+     if i == 0 || !(0x40..=0x4F).contains(&data[i - 1]) {
+         return false;
+     }
+--- a/decompiler/crates/kuna-analysis/src/loader/elf_plt.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/elf_plt.rs
+@@ -42,6 +42,8 @@
+ 
+ use object::read::{Object, ObjectSection, ObjectSymbol};
+ use object::{Architecture, RelocationTarget};
++use std::rc::Rc;
++use kuna_decomp::kuna_nativeimport::{ImportPlatform, NativeImportIdentity};
+ 
+ /// One resolved PLT-stub import: the stub entry address (the CALL target the
+ /// decompiler sees) and the clean imported name.
+@@ -50,6 +52,9 @@
+     pub addr: u64,
+     /// Imported function name (raw `.dynstr` bytes, `@VERSION` stripped).
+     pub name: Vec<u8>,
++    /// Exact slot used by the resolver; absent for non-symbol IFUNCs.
++    pub got_slot: Option<u64>,
++    pub native_import: Option<Rc<NativeImportIdentity>>,
+ }
+ 
+ /// Resolve PLT-stub call targets to their imported function names.
+@@ -76,6 +81,7 @@
+ /// intact — which is every image that ever reached this code before.
+ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
+     let arch = file.architecture();
++    let identities = native_imports_by_symbol(file);
+ 
+     // MIPS has no regular `.plt` code section and emits NO `R_MIPS_JUMP_SLOT`
+     // relocations for its lazy imports: the stub→name correspondence is carried by
+@@ -84,7 +90,7 @@
+     // *before* the relocation-driven path below, which would otherwise early-return
+     // on the empty `build_got_name_map`.  See [`resolve_mips_imports`].
+     if matches!(arch, Architecture::Mips | Architecture::Mips64) {
+-        return resolve_mips_imports(file);
++        return resolve_mips_imports(file, &identities);
+     }
+ 
+     let got_to_name = build_got_name_map(file);
+@@ -177,10 +183,63 @@
+     // per-section scan above does not carry.  See [`decode_ppc64_text`].
+     if matches!(arch, Architecture::PowerPc64 | Architecture::PowerPc) {
+         decode_ppc_text(file, arch, &got_to_name, &mut out, &mut named_got);
+-        out.extend(super::elfv1_imports::resolve(file));
+-    }
+-
++        out.extend(super::elfv1_imports::resolve(file, &identities));
++    }
++
++    // Correlate through the exact relocation slot, never through the cleaned name.
++    let mut slots: HashMap<u64, Option<Rc<NativeImportIdentity>>> = HashMap::new();
++    if let Some(relocs) = file.dynamic_relocations() {
++        for (slot, reloc) in relocs {
++            let identity = match reloc.target() {
++                RelocationTarget::Symbol(index) => identities.get(&index.0).cloned(),
++                _ => None,
++            };
++            slots.entry(slot).and_modify(|old| {
++                if *old != identity { *old = None; }
++            }).or_insert(identity);
++        }
++    }
++    for import in &mut out {
++        if let Some(slot) = import.got_slot {
++            import.native_import = slots.get(&slot).cloned().flatten();
++        }
++    }
+     out
++}
++
++/// Version requirements identify a provider by dynamic-symbol index. Definitions,
++/// unversioned symbols and absent/corrupt version tables carry no authority.
++/// DT_NEEDED is deliberately not consulted: it is not a per-symbol binding.
++pub(super) fn native_imports_by_symbol(file: &object::File) -> HashMap<usize, Rc<NativeImportIdentity>> {
++    fn collect<Elf: object::read::elf::FileHeader>(
++        file: &object::read::elf::ElfFile<'_, Elf>,
++    ) -> HashMap<usize, Rc<NativeImportIdentity>> {
++        use object::read::elf::Sym;
++        let mut out = HashMap::new();
++        let endian = file.endian();
++        let Ok(Some(versions)) = file.elf_section_table().versions(endian, file.data()) else {
++            return out;
++        };
++        let symbols = file.elf_dynamic_symbol_table();
++        for (index, sym) in symbols.iter().enumerate() {
++            if !sym.is_undefined(endian) { continue; }
++            let version_index = versions.version_index(endian, object::SymbolIndex(index));
++            let Ok(Some(version)) = versions.version(version_index) else { continue };
++            let Some(library) = version.file() else { continue };
++            let Ok(symbol) = sym.name(endian, symbols.strings()) else { continue };
++            let (Ok(library), Ok(symbol)) = (std::str::from_utf8(library), std::str::from_utf8(symbol)) else { continue };
++            if library.is_empty() || symbol.is_empty() { continue; }
++            out.insert(index, Rc::new(NativeImportIdentity {
++                platform: ImportPlatform::Elf, library: library.to_owned(), symbol: symbol.to_owned(),
++            }));
++        }
++        out
++    }
++    match file {
++        object::File::Elf32(file) => collect(file),
++        object::File::Elf64(file) => collect(file),
++        _ => HashMap::new(),
++    }
+ }
+ 
+ /// Sectionless fallback: name the PLT stubs of an ELF whose section table is
+@@ -243,6 +302,9 @@
+             &mut out,
+             &mut named_got,
+         );
++    }
++    for import in &mut out {
++        import.native_import = import.got_slot.and_then(|slot| imports.got_to_identity.get(&slot).cloned().flatten());
+     }
+     out
+ }
+@@ -348,7 +410,7 @@
+                 if !named.contains_key(&got) && named_got.insert(got) {
+                     let stub =
+                         vma + x86_stub_start(data, i, &[0xF3, 0x0F, 0x1E, 0xFA]) as u64;
+-                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes() });
++                    out.push(PltSym { addr: stub, name: format!("ifunc_{resolver:x}").into_bytes(), got_slot: None, native_import: None });
+                 }
+             }
+             i += 6;
+@@ -425,7 +487,7 @@
+ ) {
+     if let Some(name) = map.get(&got) {
+         if named_got.insert(got) {
+-            out.push(PltSym { addr: stub, name: name.clone() });
++            out.push(PltSym { addr: stub, name: name.clone(), got_slot: Some(got), native_import: None });
+         }
+     }
+ }
+@@ -971,14 +1033,14 @@
+ /// itself (in case a future pass names the slot directly).  Everything degrades
+ /// gracefully: a missing `DT_MIPS_*` tag, a missing GOT, or a 0 slot yields fewer
+ /// (or zero) entries and leaves behavior unchanged — this never panics or errors.
+-fn resolve_mips_imports(file: &object::File) -> Vec<PltSym> {
++fn resolve_mips_imports(file: &object::File, identities: &HashMap<usize, Rc<NativeImportIdentity>>) -> Vec<PltSym> {
+     let mut out: Vec<PltSym> = Vec::new();
+     for ext in mips_external_got_entries(file) {
+         // The GOT slot's static contents = the `.MIPS.stubs` stub address (the
+         // import's `refAddr`); this is the indirect call target the decompiler
+         // resolves after $gp recovery.  Skip a 0 slot (unresolvable).
+         if ext.stub_addr != 0 {
+-            out.push(PltSym { addr: ext.stub_addr, name: ext.name });
++            out.push(PltSym { addr: ext.stub_addr, name: ext.name, got_slot: Some(ext.slot_addr), native_import: identities.get(&ext.symbol_index).cloned() });
+         }
+     }
+     out
+@@ -1005,6 +1067,7 @@
+ /// One external-symbol GOT entry on MIPS: the dynsym name, the GOT slot address,
+ /// and the slot's static contents (the `.MIPS.stubs` stub address it points at).
+ struct MipsExtGot {
++    symbol_index: usize,
+     name: Vec<u8>,
+     slot_addr: u64,
+     stub_addr: u64,
+@@ -1054,7 +1117,7 @@
+         let got_index = local_gotno + (idx as u64 - gotsym);
+         let slot_addr = got_base.wrapping_add(got_index * ptr as u64);
+         let stub_addr = read_word_at_vma(file, slot_addr, ptr, le).unwrap_or(0);
+-        out.push(MipsExtGot { name, slot_addr, stub_addr });
++        out.push(MipsExtGot { symbol_index: idx, name, slot_addr, stub_addr });
+     }
+ 
+     out
+--- a/decompiler/crates/kuna-analysis/src/loader/format/elf.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/format/elf.rs
+@@ -122,12 +122,13 @@
+     }
+ 
+     fn resolve_imports(&self, file: &object::File, bytes: &[u8]) -> Vec<ImportSym> {
+-        // `elf_plt`'s internals are unchanged; just re-wrap each PltSym.
++        // Preserve the resolver's exact provider receipt alongside its cleaned name.
+         crate::loader::elf_plt::resolve_plt_imports(file, bytes)
+             .into_iter()
+             .map(|p| ImportSym {
+                 addr: p.addr,
+                 name: p.name,
++                native_import: p.native_import,
+                 kind: super::ImportSymKind::Import,
+             })
+             .collect()
+--- a/decompiler/crates/kuna-analysis/src/loader/elfv1_imports.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/elfv1_imports.rs
+@@ -3,7 +3,10 @@
+ use std::collections::{BTreeSet, HashMap};
+ use super::{elf_plt::PltSym, elfv1::Descriptors};
+ 
+-pub(super) fn resolve(file: &object::File<'_>) -> Vec<PltSym> {
++pub(super) fn resolve(
++    file: &object::File<'_>,
++    identities: &HashMap<usize, std::rc::Rc<kuna_decomp::kuna_nativeimport::NativeImportIdentity>>,
++) -> Vec<PltSym> {
+     let descriptors=Descriptors::read_for_imports(file);
+     if descriptors.0.is_empty() {return Vec::new();}
+     let Some(tocs): Option<BTreeSet<_>>=descriptors.0.iter().map(|d|d.toc).collect() else {return Vec::new();};
+@@ -11,12 +14,17 @@
+         s.name_bytes().ok().filter(|n|!n.is_empty()).map(|n|(s.index().0,super::elf_plt::strip_version(n)))
+     ).collect();
+     let mut slots=HashMap::new();
++    let mut providers=HashMap::new();
+     if let Some(relocations)=file.dynamic_relocations() {
+         for (slot,reloc) in relocations {
+             if !matches!(reloc.flags(),RelocationFlags::Elf {r_type} if r_type==object::elf::R_PPC64_JMP_SLOT) {continue;}
+             if reloc.has_implicit_addend() || reloc.addend()!=0 {continue;}
+             let RelocationTarget::Symbol(index)=reloc.target() else {continue;};
+             if let Some(name)=names.get(&index.0) {slots.insert(slot,name.clone());}
++            let identity = identities.get(&index.0).cloned();
++            providers.entry(slot).and_modify(|old| {
++                if *old != identity { *old = None; }
++            }).or_insert(identity);
+         }
+     }
+     if slots.is_empty() {return Vec::new();}
+@@ -37,7 +45,14 @@
+                 let Some(slot)=lazy.as_ref().and_then(|r|r.slot(file,addr.wrapping_add(branch as u64))) else {continue;};
+                 if !tocs.iter().all(|toc|toc.wrapping_add(delta as u64)==slot) {continue;}
+             }
+-            if let Some(name)=unique_import(delta,&tocs,&slots) {out.push(PltSym {addr,name});}
++            if let Some(name)=unique_import(delta,&tocs,&slots) {
++                // Every possible TOC binding must agree on the exact receipt, not just its name.
++                let mut targets = tocs.iter().map(|toc|
++                    providers.get(&toc.wrapping_add(delta as u64)).cloned().flatten());
++                let first = targets.next().flatten();
++                let native_import = first.filter(|identity| targets.all(|other| other.as_ref() == Some(identity)));
++                out.push(PltSym {addr, name, got_slot: None, native_import});
++            }
+         }
+     }
+     out
+--- a/decompiler/crates/kuna-analysis/src/loader/elf_dynseg.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/elf_dynseg.rs
+@@ -36,6 +36,8 @@
+ //! file yields `None`/empty and leaves the caller's behavior unchanged.
+ 
+ use std::collections::HashMap;
++use std::rc::Rc;
++use kuna_decomp::kuna_nativeimport::{ImportPlatform, NativeImportIdentity};
+ 
+ const PT_LOAD: u32 = 1;
+ const PT_DYNAMIC: u32 = 2;
+@@ -59,6 +61,7 @@
+     /// GOT slot VMA → imported symbol name (`@VERSION` stripped), from every
+     /// symbol-bearing dynamic relocation.
+     pub got_to_name: HashMap<u64, Vec<u8>>,
++    pub got_to_identity: HashMap<u64, Option<Rc<NativeImportIdentity>>>,
+     /// `DT_PLTGOT` — the GOT base, i.e. `_GLOBAL_OFFSET_TABLE_`. `None` when the
+     /// image declares no PLT GOT.
+     pub pltgot: Option<u64>,
+@@ -199,7 +202,7 @@
+     let get = |t: u64| tags.iter().rev().find(|&&(tag, _)| tag == t).map(|&(_, v)| v);
+     let pltgot = get(DT_PLTGOT);
+     let (Some(symtab), Some(strtab)) = (get(DT_SYMTAB), get(DT_STRTAB)) else {
+-        return Some(DynImports { got_to_name: HashMap::new(), pltgot });
++        return Some(DynImports { got_to_name: HashMap::new(), got_to_identity: HashMap::new(), pltgot });
+     };
+     // `DT_SYMENT` is mandatory alongside `DT_SYMTAB`, and an image that omits it or
+     // declares a stride shorter than the symbol it strides over is not readable at
+@@ -208,6 +211,9 @@
+     let syment = get(DT_SYMENT).filter(|&s| s >= abi_syment).unwrap_or(abi_syment);
+ 
+     let mut got_to_name: HashMap<u64, Vec<u8>> = HashMap::new();
++    let mut got_to_identity = HashMap::new();
++    let versions = VersionRequirements::read(&img, &tags, strtab);
++    let mut identities = HashMap::new();
+     // `DT_JMPREL` is read first because its `JUMP_SLOT` entries are the stub
+     // targets and `DT_RELA`/`DT_REL` may cover the same slots in a `-z now` image
+     // whose linker folded the two tables.  `DT_PLTREL` says which of the two entry
+@@ -224,10 +230,10 @@
+         let (Some(base), Some(size)) = (base, size) else {
+             continue;
+         };
+-        read_reloc_table(&img, base, size, rela, symtab, syment, strtab, &mut got_to_name);
+-    }
+-
+-    Some(DynImports { got_to_name, pltgot })
++        read_reloc_table(&img, base, size, rela, symtab, syment, strtab, &mut got_to_name, versions.as_ref(), &mut identities, &mut got_to_identity);
++    }
++
++    Some(DynImports { got_to_name, got_to_identity, pltgot })
+ }
+ 
+ /// The `(d_tag, d_un)` pairs of the `PT_DYNAMIC` segment, up to `DT_NULL`.
+@@ -262,6 +268,9 @@
+     syment: u64,
+     strtab: u64,
+     out: &mut HashMap<u64, Vec<u8>>,
++    versions: Option<&VersionRequirements<'_>>,
++    identities: &mut HashMap<u64, Option<Rc<NativeImportIdentity>>>,
++    got_to_identity: &mut HashMap<u64, Option<Rc<NativeImportIdentity>>>,
+ ) {
+     let entsz: u64 = match (img.is64, rela) {
+         (true, true) => 24,
+@@ -305,6 +314,78 @@
+             continue;
+         }
+         out.entry(r_offset).or_insert_with(|| super::elf_plt::strip_version(name));
++        let identity = identities.entry(sym).or_insert_with(|| {
++            // A defined dynamic symbol is never an external import receipt.
++            let shndx = img.u16at(st_off.checked_add(if img.is64 { 6 } else { 14 })?)?;
++            if shndx != object::elf::SHN_UNDEF { return None; }
++            let versions = versions?;
++            let at = versions.versym.checked_add(sym.checked_mul(2)?)?;
++            let index = img.u16at(img.off_of(at)?)? & 0x7fff;
++            let library = versions.libraries.get(&index).copied().flatten()?;
++            let symbol = std::str::from_utf8(name).ok()?;
++            Some(Rc::new(NativeImportIdentity {
++                platform: ImportPlatform::Elf, library: library.to_owned(), symbol: symbol.to_owned(),
++            }))
++        }).clone();
++        got_to_identity.entry(r_offset).and_modify(|old| {
++            if *old != identity { *old = None; }
++        }).or_insert(identity);
++    }
++}
++
++/// Sectionless equivalent of versym -> verneed.vn_file. No loaded-library
++/// resolver exists here; unversioned symbols remain unknown, even with DT_NEEDED.
++struct VersionRequirements<'a> {
++    versym: u64,
++    libraries: HashMap<u16, Option<&'a str>>,
++}
++
++impl<'a> VersionRequirements<'a> {
++    fn read(img: &Image<'a>, tags: &[(u64, u64)], strtab: u64) -> Option<Self> {
++        let unique = |tag| {
++            let mut values = tags.iter().filter(|&&(t, _)| t == tag).map(|&(_, v)| v);
++            let value = values.next()?;
++            values.next().is_none().then_some(value)
++        };
++        // A malformed duplicate table pointer must not authenticate a name read
++        // through the name-only parser's best-effort last-tag behavior.
++        unique(DT_SYMTAB)?;
++        unique(DT_STRTAB)?;
++        unique(DT_SYMENT)?;
++        let versym = unique(object::elf::DT_VERSYM as u64)?;
++        let mut need = unique(object::elf::DT_VERNEED as u64)?;
++        let count = unique(object::elf::DT_VERNEEDNUM as u64)?;
++        if count > img.bytes.len() as u64 / 16 { return None; }
++        let mut libraries = HashMap::new();
++        for i in 0..count {
++            let off = img.off_of(need)?;
++            if img.u16at(off)? != 1 { return None; }
++            let aux_count = img.u16at(off.checked_add(2)?)?;
++            let file = img.u32at(off.checked_add(4)?)?;
++            let library = std::str::from_utf8(img.cstr_at(strtab.checked_add(file as u64)?)?).ok()?;
++            if library.is_empty() { return None; }
++            let mut aux = need.checked_add(img.u32at(off.checked_add(8)?)? as u64)?;
++            for j in 0..aux_count {
++                let at = img.off_of(aux)?;
++                let index = img.u16at(at.checked_add(6)?)? & 0x7fff;
++                if index > 1 {
++                    libraries.entry(index).and_modify(|old| {
++                        if *old != Some(library) { *old = None; }
++                    }).or_insert(Some(library));
++                }
++                if j + 1 < aux_count {
++                    let next = img.u32at(at.checked_add(12)?)?;
++                    if next < 16 { return None; }
++                    aux = aux.checked_add(next as u64)?;
++                }
++            }
++            if i + 1 < count {
++                let next = img.u32at(off.checked_add(12)?)?;
++                if next < 16 { return None; }
++                need = need.checked_add(next as u64)?;
++            }
++        }
++        Some(Self { versym, libraries })
+     }
+ }
+ 
+--- a/decompiler/crates/kuna-analysis/src/loadimage_object.rs
++++ b/decompiler/crates/kuna-analysis/src/loadimage_object.rs
+@@ -502,6 +502,8 @@
+     /// a whole-binary enumeration needs to keep them out of the decompile set.
+     /// Empty for every non-PE image and for a relocatable object.
+     import_slots: Vec<(u64, u64)>,
++    /// Loader receipts at exact resolver entries, never a by-name prototype cache.
++    native_imports: Vec<(u64, Rc<kuna_decomp::kuna_nativeimport::NativeImportIdentity>)>,
+     elfv1: crate::loader::elfv1::Descriptors,
+     /// The address space the file bytes map to (C++ `spaceid`, null until
+     /// `attachToSpace`).
+@@ -868,7 +870,18 @@
+         // (F) Per-format import resolution goes through the boundary; for ELF
+         // `ElfFormat::resolve_imports` just calls the unchanged
+         // `elf_plt::resolve_plt_imports`.
++        let mut native_imports = std::collections::BTreeMap::new();
+         for p in fmt.resolve_imports(&file, bytes) {
++            let identity = if p.kind == crate::loader::format::ImportSymKind::Import {
++                p.native_import
++            } else {
++                None
++            };
++            // Unknown/conflicting aliases and exports poison this address. A
++            // previously installed local function must never inherit a receipt.
++            native_imports.entry(p.addr).and_modify(|old| {
++                if *old != identity { *old = None; }
++            }).or_insert_with(|| if seen.contains(&p.addr) { None } else { identity });
+             if seen.insert(p.addr) {
+                 funcsyms.push(FuncSym { addr: p.addr, name: demangle_funcsym_name(p.name, namechars) });
+             }
+@@ -901,6 +914,15 @@
+                 funcsyms.push(FuncSym { addr, name });
+             }
+         }
++
++        for sym in file.symbols().chain(file.dynamic_symbols()) {
++            if !sym.is_undefined() && sym.kind() == SymbolKind::Text {
++                native_imports.remove(&elfv1.code_address(sym.address()));
++            }
++        }
++        let native_imports = native_imports.into_iter()
++            .filter_map(|(entry, identity)| identity.map(|identity| (entry, identity)))
++            .collect();
+ 
+         if !elfv1.0.is_empty() {
+             let mut aliases = HashSet::new();
+@@ -953,6 +975,7 @@
+             const_ranges,
+             dynreloc_const,
+             import_slots,
++            native_imports,
+             elfv1,
+             spaceid: None,
+             buffer: RefCell::new(vec![0u8; BUFSIZE]),
+@@ -1096,6 +1119,7 @@
+             // A pre-link object has no Import Address Table: its external calls
+             // are relocations, resolved by the layout pass.
+             import_slots: Vec::new(),
++            native_imports: Vec::new(),
+             elfv1: Default::default(),
+             spaceid: None,
+             buffer: RefCell::new(vec![0u8; BUFSIZE]),
+@@ -1198,6 +1222,12 @@
+     /// without inventing a body for every import.
+     pub fn import_slot_ranges(&self) -> &[(u64, u64)] {
+         &self.import_slots
++    }
++
++    /// Move the immutable load receipts into the source-scoped analysis commit.
++    /// Relocatable objects and non-import-bearing sources return no authority.
++    pub fn take_native_imports(&mut self) -> Vec<(u64, Rc<kuna_decomp::kuna_nativeimport::NativeImportIdentity>)> {
++        std::mem::take(&mut self.native_imports)
+     }
+ 
+     /// The loader's function symbols as `(load_vma, name)` pairs — the SAME list
+--- a/decompiler/crates/kuna-analysis/src/pass.rs
++++ b/decompiler/crates/kuna-analysis/src/pass.rs
+@@ -302,6 +302,9 @@
+ pub struct AnalysisOutput {
+     /// `(addr, name, kind)` -> seed `Database::add_function` / symbol map.
+     pub symbols: Vec<SymFact>,
++    /// Exact loader receipts, independent of by-name declarations and prototype models.
++    /// Raw provider/symbol strings are not display names and must not be sanitized.
++    pub native_imports: Vec<(u64, std::rc::Rc<kuna_decomp::kuna_nativeimport::NativeImportIdentity>)>,
+     /// Named, sized DWARF data globals. Mapped into the global scope with their
+     /// source root and storage properties when recovered; unresolved types keep
+     /// an `undefined<size>` fallback. Container queries retain the object's name. See
+@@ -578,6 +581,7 @@
+     /// Fold another output into this one (concatenation; dedup is the driver's job).
+     pub fn merge(&mut self, other: AnalysisOutput) {
+         self.symbols.extend(other.symbols);
++        self.native_imports.extend(other.native_imports);
+         self.data_objects.extend(other.data_objects);
+         self.typed_data.extend(other.typed_data);
+         self.entries.extend(other.entries);
+--- a/decompiler/crates/kuna-analysis/src/loader/kuna_relocrebase.rs
++++ b/decompiler/crates/kuna-analysis/src/loader/kuna_relocrebase.rs
+@@ -415,6 +415,7 @@
+     let keep_range = |&(lo, hi): &(u64, u64)| view.contains(lo) && (hi <= lo || view.contains(hi - 1));
+ 
+     out.symbols.retain(|s| keep(s.addr));
++    out.native_imports.retain(|(addr, _)| keep(*addr));
+     out.data_objects.retain(|d| keep(d.addr));
+     out.entries.retain(|&a| keep(a));
+     out.fde_bodies.retain(keep_range);
+--- a/decompiler/crates/kuna-console/src/engine.rs
++++ b/decompiler/crates/kuna-console/src/engine.rs
+@@ -2379,7 +2379,7 @@
+                 input_context_paints.extend(out.context_paints);
+                 continue;
+             }
+-            if analysis_pass_enabled(self.arch(), id) {
++            if id == "native_imports" || analysis_pass_enabled(self.arch(), id) {
+                 merged.merge(out);
+             }
+         }
+@@ -3838,6 +3838,11 @@
+         sleigh.base().unwrap().translate(),
+     );
+     pending_analysis.extend(input_isa_stash(input_context_paints));
++    // Format metadata is source-owned, not an optional prototype analyzer. The
++    // stash is drained once at read-symbols; a new load creates a new Architecture.
++    let mut native_imports = kuna_analysis::pass::AnalysisOutput::default();
++    native_imports.native_imports = loader.take_native_imports();
++    pending_analysis.push(("native_imports", native_imports));
+ 
+     // (kuna `dynrelocs`) The PT_GNU_RELRO-frozen dynamic-relocation slots, read
+     // off the same loader while it is still in hand. `readonly_ranges` above
+@@ -4025,6 +4030,16 @@
+     use kuna_analysis::pass::SymKind;
+ 
+     let num_spaces = prog.arch().manage().num_spaces();
++
++    // Only loader-origin receipts arrive here. A --define-function declaration
++    // cannot populate this stream. Keep the entry in byte coordinates, matching
++    // Architecture's source prototype maps and the immutable ArchContext copy.
++    for (entry, identity) in &out.native_imports {
++        let addr = Address::new(Rc::clone(code_space), *entry);
++        if prog.arch().symboltab.find_function_across_scopes(&addr).is_some() {
++            Rc::make_mut(&mut prog.arch_mut().native_imports).insert((code_space.get_index(), *entry), Rc::clone(identity));
++        }
++    }
+ 
+     // 0. (kuna `cppproto`) The DWARF C++ arm's facts. The producing pass runs at
+     //    `load file`, upstream of the `option` commands, so it stashes them apart

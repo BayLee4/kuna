@@ -13,7 +13,7 @@ use kuna_num::opcodes::OpCode;
 
 use super::*;
 use crate::action::Rule;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
@@ -42,7 +42,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -52,8 +57,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> kuna_base::error::KunaResult<()>
@@ -115,7 +121,7 @@ fn build_idiom(fd: &mut Funcdata, sa: u64, boolval: u64) -> (OpId, VarnodeId) {
     let sa_const_l = fd.new_constant(1, sa);
     wire_no_descend(fd, boolvn, leftshift, 0);
     wire(fd, sa_const_l, leftshift, 1);
-    let shiftin = fd.new_unique(1, Some(unk(1)));
+    let shiftin = fd.new_unique(1, Some(unk(fd, 1)));
     let shiftin = set_def(fd, shiftin, leftshift);
 
     // op = INT_SRIGHT(shiftin, #sa)
@@ -123,7 +129,7 @@ fn build_idiom(fd: &mut Funcdata, sa: u64, boolval: u64) -> (OpId, VarnodeId) {
     let sa_const_r = fd.new_constant(1, sa);
     wire(fd, shiftin, op, 0);
     wire(fd, sa_const_r, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(fd, 1)));
     let _out = set_def(fd, out, op);
     let _ = r;
 
@@ -193,14 +199,14 @@ fn mismatched_shift_amounts_decline() {
     let l_sa = fd.new_constant(1, 7);
     wire(&mut fd, boolvn, leftshift, 0);
     wire(&mut fd, l_sa, leftshift, 1);
-    let shiftin = fd.new_unique(1, Some(unk(1)));
+    let shiftin = fd.new_unique(1, Some(unk(&fd, 1)));
     let shiftin = set_def(&mut fd, shiftin, leftshift);
 
     let op = mk_op(&mut fd, 0x104, 2, OpCode::CPUI_INT_SRIGHT);
     let r_sa = fd.new_constant(1, 6); // different amount
     wire(&mut fd, shiftin, op, 0);
     wire(&mut fd, r_sa, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     let _ = r;
 

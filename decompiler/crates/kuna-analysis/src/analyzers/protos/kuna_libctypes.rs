@@ -56,15 +56,11 @@
 //! alias is tried too; without it the image would carry two stream types and the
 //! body would cast between them.
 //!
-//! The order is not cosmetic. A pointee is captured as an `Rc<Datatype>` when the
-//! signature is built, and completing a struct re-keys it into a NEW `Rc`
-//! (`TypeFactory::set_fields_struct` — the C++ mutates a `TypeStruct` in place,
-//! the Rust clones). A shell minted first and completed by DWARF afterwards is
-//! therefore completed for everyone EXCEPT the pointers this table already
-//! built, and `st->st_mode` degrades to `*(int *)&st->field_0x18`. Running
-//! second removes the window: this table never completes, re-keys or alters a
-//! type it did not establish, and declines the signature outright when the name
-//! is held by something else.
+//! Running after DWARF gives the platform's own definitions precedence over
+//! the built-in layout facts. Graph edges retain stable nominal identity when
+//! a pending aggregate is completed, including pointers already published in
+//! signatures. This table still never alters a definition it did not establish,
+//! and declines the signature when the name is held by an incompatible type.
 //!
 //! ## Names are the bare DWARF spelling
 //!
@@ -115,11 +111,9 @@
 //! blanket `VoidPtr -> NamedPtr` retarget would assert a false type at every one
 //! of those call sites, so the retarget is enumerated by hand, slot by slot.
 
-use std::rc::Rc;
-
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{flags, type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{flags, type_metatype, TypeFactory, TypeRoot};
 
 use super::{
     resolved_import_addrs, seed_named_prototypes, seed_resolved_prototypes,
@@ -214,9 +208,8 @@ pub(super) const NAMED_AGGREGATES: &[NamedAggregate] = &[
 ///   non-struct, or the width-0 type a bare forward declaration interns as
 ///   (whose pointee would survive `RulePtrsubUndo` and print as a functional
 ///   `PTRSUB`) — and the whole signature is declined. This table never alters,
-///   completes or re-keys a definition it did not establish: completion mints a
-///   NEW `Rc` (`TypeFactory::set_fields_struct`), so re-keying another owner's
-///   shell would strand every pointer already minted against it;
+///   completes or corrects a definition it did not establish: the held facts
+///   belong to their original source, not this built-in table;
 /// * nothing is held — mint the sized, still-incomplete shell.
 ///
 /// Completeness is deliberately not part of the test. Requiring it would make
@@ -224,14 +217,14 @@ pub(super) const NAMED_AGGREGATES: &[NamedAggregate] = &[
 /// would silently degrade to `void *` everywhere.
 ///
 /// Idempotent by construction: the second call finds the interned type by name
-/// and hands back the same `Rc`, so every `FILE *` in the table is the same
-/// pointee object.
+/// and hands back the same graph identity, so every `FILE *` in the table has
+/// the same pointee.
 pub(super) fn named_aggregate(
     name: &str,
     types: &dyn TypeFactory,
     word_size: uint4,
     layout: Layout,
-) -> KunaResult<Rc<Datatype>> {
+) -> KunaResult<TypeRoot> {
     let Some(agg) = NAMED_AGGREGATES.iter().find(|a| a.name == name) else {
         return Err(KunaError::lowlevel(format!(
             "libctypes: no width is known for `{name}`"
@@ -243,7 +236,7 @@ pub(super) fn named_aggregate(
     // else is somebody else's `stat`: a program type that shares the spelling, a
     // non-struct, or a zero-width forward declaration whose pointee would survive
     // `RulePtrsubUndo` as a functional `PTRSUB`.
-    let usable = |held: &Rc<Datatype>| {
+    let usable = |held: &TypeRoot| {
         held.get_metatype() == type_metatype::TYPE_STRUCT && held.get_size() == agg.size
     };
     if let Some(held) = types.find_by_name(name)? {

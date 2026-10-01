@@ -54,7 +54,7 @@
 use kuna_base::error::{KunaError, KunaResult};
 
 use crate::context::VarnodeId;
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 use crate::funcdata::Funcdata;
 
 /// (kuna) Whether a record needs an access at offset 0.
@@ -100,7 +100,7 @@ impl OptionStructHeadless {
 /// parameter of a function whose callers are all known direct calls, under
 /// `closed`, that did not take the type those callers pass?  A caller's `char **`
 /// read only at `argv[1]` and `argv[2]` is the vector, not a record past its start.
-pub(crate) fn admits(data: &Funcdata, base: VarnodeId, ct: &Datatype) -> bool {
+pub(crate) fn admits(data: &Funcdata, base: VarnodeId, ct: &TypeRoot) -> bool {
     data.get_arch().struct_headless.fires()
         && data.kuna_calleevote_closed()
         && data.vbank().get(base).is_some_and(|v| v.is_input())
@@ -114,7 +114,7 @@ pub(crate) fn admits(data: &Funcdata, base: VarnodeId, ct: &Datatype) -> bool {
 /// group past its start, and `tail`'s `main` hands `getopt_long` the `char **argv`
 /// it passes to a function reading only `argv[1]` and `argv[2]`; either callee's
 /// own record would otherwise retype the variable.
-pub(crate) fn yields_to_a_declared_pointer(data: &Funcdata, vn: VarnodeId, vote: &Datatype) -> bool {
+pub(crate) fn yields_to_a_declared_pointer(data: &Funcdata, vn: VarnodeId, vote: &TypeRoot) -> bool {
     if !data.get_arch().struct_headless.fires() || !crate::kuna_structsynth::points_at_synthesized_record(vote) {
         return false;
     }
@@ -152,7 +152,7 @@ pub(crate) fn yields_to_a_declared_pointer(data: &Funcdata, vn: VarnodeId, vote:
 /// `long`. The fallback is what such a callee states when it declines the
 /// record. It stands in for a headless record only: any other refused record
 /// is one `off` refuses too, where the vote says nothing.
-pub(crate) fn bare_pointer_for(data: &Funcdata, vote: &Datatype) -> Option<std::rc::Rc<Datatype>> {
+pub(crate) fn bare_pointer_for(data: &Funcdata, vote: &TypeRoot) -> Option<TypeRoot> {
     if !data.get_arch().struct_headless.fires() || !crate::kuna_structsynth::points_at_headless_record(vote) {
         return None;
     }
@@ -163,7 +163,7 @@ pub(crate) fn bare_pointer_for(data: &Funcdata, vote: &Datatype) -> Option<std::
 
 /// Is `ct` a pointer to something -- a named record, a `char`, a `char *` --
 /// that no synthesized record may replace?
-pub(crate) fn gives_a_pointee(ct: &Datatype) -> bool {
+pub(crate) fn gives_a_pointee(ct: &TypeRoot) -> bool {
     ct.get_ptr_to().is_some_and(|p| {
         !matches!(p.get_metatype(), crate::dtype::type_metatype::TYPE_VOID | crate::dtype::type_metatype::TYPE_UNKNOWN)
     }) && !crate::kuna_structsynth::points_at_synthesized_record(ct)
@@ -176,14 +176,14 @@ pub(crate) fn gives_a_pointee(ct: &Datatype) -> bool {
 /// integer: `tar`'s `wsnode_remove` copies `ws_head` as a word, and
 /// `wordsplit_varexp`, which walks the list from it, took its record at the
 /// call it makes and lost `int8 *` for `int8`.
-pub(crate) fn types_a_pointer_as_a_word(data: &Funcdata, vote: &Datatype, member: &Datatype) -> bool {
+pub(crate) fn types_a_pointer_as_a_word(data: &Funcdata, vote: &TypeRoot, member: &TypeRoot) -> bool {
     data.get_arch().struct_headless.fires()
         && data.get_arch().types().is_some_and(|t| minted_word(vote, member, t.get_size_of_pointer()))
 }
 
 /// Is `member` a pointer-width integer or undefined word of the record `vote`
 /// points at, one `structsynth` minted from reads past its start?
-fn minted_word(vote: &Datatype, member: &Datatype, ptr_size: kuna_base::types::int4) -> bool {
+fn minted_word(vote: &TypeRoot, member: &TypeRoot, ptr_size: kuna_base::types::int4) -> bool {
     use crate::dtype::type_metatype;
     crate::kuna_structsynth::points_at_headless_record(vote)
         && matches!(member.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
@@ -203,6 +203,7 @@ pub(crate) fn is_headless<'a>(mut offsets: impl Iterator<Item = &'a kuna_base::t
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::{Datatype, TypeFactory, TypeFactoryImpl};
 
     #[test]
     fn option_parses_both_modes_and_rejects_anything_else() {
@@ -214,12 +215,8 @@ mod tests {
         assert_eq!(StructHeadlessMode::default(), StructHeadlessMode::Off);
     }
 
-    fn ptr_to(ptrto: std::rc::Rc<Datatype>) -> Datatype {
-        use crate::dtype::{sub_metatype, type_metatype, DatatypeKind};
-        let mut p = Datatype::new(8, type_metatype::TYPE_PTR);
-        p.submeta = sub_metatype::SUB_PTR;
-        p.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize: 1 };
-        p
+    fn ptr_to(factory: &TypeFactoryImpl, ptrto: TypeRoot) -> TypeRoot {
+        factory.get_type_pointer(8, ptrto, 1).unwrap()
     }
 
     /// A `char **` a caller passes, a `char *` and a declared record give their
@@ -227,43 +224,47 @@ mod tests {
     /// `structsynth` minted do not.
     #[test]
     fn a_declared_character_vector_gives_a_pointee_and_void_does_not() {
-        use crate::dtype::{flags, type_metatype, DatatypeKind, TypeField};
-        use std::rc::Rc;
+        use crate::dtype::{flags, type_metatype, TypeField};
+        let factory = TypeFactoryImpl::new();
+        factory.set_default_alignment_map();
+        factory.set_max_basetype_size(8);
         let mut ch = Datatype::new(1, type_metatype::TYPE_INT);
         ch.flags |= flags::chartype;
-        let ch = Rc::new(ch);
-        let charp = Rc::new(ptr_to(Rc::clone(&ch)));
-        assert!(gives_a_pointee(&ptr_to(Rc::clone(&charp))));
+        let ch = factory.intern(ch).unwrap();
+        let charp = ptr_to(&factory, ch);
+        assert!(gives_a_pointee(&ptr_to(&factory, charp.clone())));
         assert!(gives_a_pointee(&charp));
-        let mut named = Datatype::new(0x20, type_metatype::TYPE_STRUCT);
-        named.name = "group".to_string();
-        assert!(gives_a_pointee(&ptr_to(Rc::new(named))));
-        assert!(!gives_a_pointee(&ptr_to(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)))));
-        let mut minted = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
-        minted.name = "struct_19".to_string();
+        let named = factory.get_type_struct("group").unwrap();
+        let named = factory.set_fields_struct_raw(&named, Vec::new(), Vec::new(), 0x20, 1, 0).unwrap();
+        let group = ptr_to(&factory, named);
+        assert!(gives_a_pointee(&group));
+        assert!(!gives_a_pointee(&ptr_to(&factory, factory.get_type_void().unwrap())));
+        let word = factory.intern(Datatype::new(8, type_metatype::TYPE_INT)).unwrap();
         let field = |offset: i32| TypeField {
             ident: offset,
             offset,
             name: format!("field_0x{offset:x}"),
-            field_type: Rc::new(Datatype::new(8, type_metatype::TYPE_INT)),
+            field_type: word.id(),
         };
-        minted.kind = DatatypeKind::Struct { field: vec![field(8), field(0x10)], bitfield: Vec::new() };
-        let minted = ptr_to(Rc::new(minted));
+        let minted = factory.reserve_inferred("struct_19", 0, type_metatype::TYPE_STRUCT).unwrap();
+        let minted = factory.set_fields_struct_raw(
+            &minted, vec![field(8), field(0x10)], Vec::new(), 0x18, 8, 0,
+        ).unwrap();
+        let minted = ptr_to(&factory, minted);
         assert!(!gives_a_pointee(&minted));
         assert!(crate::kuna_structsynth::points_at_headless_record(&minted));
-        assert!(!gives_a_pointee(&Datatype::new(8, type_metatype::TYPE_INT)));
+        assert!(!gives_a_pointee(&word));
 
         // `ws_head` copied as a word by one headless reader is no member for a
         // function that walks the list from it; a declared record's word is its
         // own.
-        let word = Datatype::new(8, type_metatype::TYPE_INT);
         assert!(minted_word(&minted, &word, 8));
-        assert!(minted_word(&minted, &Datatype::new(8, type_metatype::TYPE_UNKNOWN), 8));
-        assert!(!minted_word(&minted, &Datatype::new(4, type_metatype::TYPE_INT), 8));
+        let unknown = factory.intern(Datatype::new(8, type_metatype::TYPE_UNKNOWN)).unwrap();
+        let narrow = factory.intern(Datatype::new(4, type_metatype::TYPE_INT)).unwrap();
+        assert!(minted_word(&minted, &unknown, 8));
+        assert!(!minted_word(&minted, &narrow, 8));
         assert!(!minted_word(&minted, &charp, 8));
-        let mut group = Datatype::new(0x20, type_metatype::TYPE_STRUCT);
-        group.name = "group".to_string();
-        assert!(!minted_word(&ptr_to(Rc::new(group)), &word, 8));
+        assert!(!minted_word(&group, &word, 8));
     }
 
     #[test]

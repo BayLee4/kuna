@@ -12,7 +12,7 @@
 //!     `LowlevelError` thrown from `assignMap` propagates.  The port routes
 //!     every error through `unassigned_err` (built as a *Lowlevel* variant) and
 //!     catches with a bare `Err(_)`, so a non-ParamUnassigned error (e.g. the
-//!     STUB hidden-return path) is SWALLOWED instead of propagating.  (F1)
+//!     missing-space hidden-return path) is SWALLOWED instead of propagating.  (F1)
 //!   - **`ScoreProtoModel::doScore` arithmetic** (fspec.cc:2743): the slot
 //!     comparator is slot-only (`sort_unstable_by_key`), the hole penalty table
 //!     saturates past index 4 (`penaltyfinal`), and the duplication branch
@@ -29,13 +29,13 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
-use kuna_base::error::{KunaError, KunaResult};
+use kuna_base::error::KunaError;
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
-use kuna_base::types::{int4, uint4};
+use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_class, type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_class, type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::fspec::{
-    FuncProto, ParamActive, ParamEntry, ParamListType, ParameterPieces, ProtoModel,
+    FuncProto, ParamActive, ParamEntry, ParameterPieces, ProtoModel,
     PrototypePieces, ScoreProtoModel,
 };
 
@@ -85,15 +85,17 @@ fn excl_entry(
 }
 
 /// A 4-byte general-purpose integer data-type.
-fn int4_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(4, 4, type_metatype::TYPE_INT))
+fn int4_type(tf: &TypeFactoryImpl) -> TypeRoot {
+    tf.intern(Datatype::new_with_align(4, 4, type_metatype::TYPE_INT))
+        .unwrap()
 }
 /// An 8-byte general-purpose integer data-type (too big for a 4-byte out reg).
-fn int8_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT))
+fn int8_type(tf: &TypeFactoryImpl) -> TypeRoot {
+    tf.intern(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT))
+        .unwrap()
 }
-fn void_type() -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID))
+fn void_type(tf: &TypeFactoryImpl) -> TypeRoot {
+    tf.get_type_void().unwrap()
 }
 
 /// Build a standard ProtoModel with two int register input entries (groups 0/1
@@ -117,176 +119,16 @@ fn two_reg_proto_model(mgr: &AddrSpaceManager, reg: &Rc<AddrSpace>) -> ProtoMode
     model
 }
 
-/// A minimal TypeFactory that only answers `get_type_void`; every other method
-/// panics (the assign paths in scope never reach them for register models with
-/// no `<modelrule>`s).  Mirrors the in-crate `PanicTypeFactory`.
-struct VoidTypeFactory;
-macro_rules! unreached {
-    () => {
-        panic!("TypeFactory method should not be reached in this test")
-    };
-}
-#[allow(unused_variables)]
-impl TypeFactory for VoidTypeFactory {
-    fn get_size_of_int(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_long(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_char(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_wchar(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_pointer(&self) -> int4 {
-        unreached!()
-    }
-    fn get_size_of_alt_pointer(&self) -> int4 {
-        unreached!()
-    }
-    fn get_alignment(&self, _size: uint4) -> KunaResult<int4> {
-        unreached!()
-    }
-    fn get_primitive_align_size(&self, _size: uint4) -> KunaResult<int4> {
-        unreached!()
-    }
-    fn get_type_void(&self) -> KunaResult<Rc<Datatype>> {
-        Ok(void_type())
-    }
-    fn get_base_no_char(&self, _s: int4, _m: type_metatype) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_base(&self, _s: int4, _m: type_metatype) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_base_named(&self, _s: int4, _m: type_metatype, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_char(&self, _s: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_code(&self) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_strip_array(
-        &self,
-        _s: int4,
-        _pt: Rc<Datatype>,
-        _ws: uint4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer(&self, _s: int4, _pt: Rc<Datatype>, _ws: uint4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_named(
-        &self,
-        _s: int4,
-        _pt: Rc<Datatype>,
-        _ws: uint4,
-        _n: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn resize_pointer(&self, _ptr: Rc<Datatype>, _new_size: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_rel(
-        &self,
-        _parent_ptr: Rc<Datatype>,
-        _ptr_to: Rc<Datatype>,
-        _off: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_rel_full(
-        &self,
-        _sz: int4,
-        _parent: Rc<Datatype>,
-        _ptr_to: Rc<Datatype>,
-        _ws: int4,
-        _off: int4,
-        _nm: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_pointer_with_space(
-        &self,
-        _ptr_to: Rc<Datatype>,
-        _spc: Rc<AddrSpace>,
-        _nm: &str,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_array(&self, _as_: int4, _ao: Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_struct(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_struct(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_union(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_union(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_partial_enum(
-        &self,
-        _contain: Rc<Datatype>,
-        _off: int4,
-        _sz: int4,
-    ) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_enum(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_type_spacebase(&self, _id: Rc<AddrSpace>, _addr: &Address) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn resize_integer(&self, _ct: Rc<Datatype>, _new_size: int4) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-    fn get_exact_piece(
-        &self,
-        _ct: Rc<Datatype>,
-        _offset: int4,
-        _size: int4,
-    ) -> KunaResult<Option<Rc<Datatype>>> {
-        unreached!()
-    }
-    fn find_by_name(&self, _n: &str) -> KunaResult<Option<Rc<Datatype>>> {
-        unreached!()
-    }
-    fn concretize(&self, _ct: Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
-        unreached!()
-    }
-}
-
 // ===========================================================================
 // F1: Exception -> Result parity — the over-broad `Err(_)` catch swallows a
 //     non-ParamUnassigned error that C++ would propagate.
 // ===========================================================================
 
 /// C++ `assignParameterStorage(..., ignoreOutputError=true)` (fspec.cc:2437)
-/// catches ONLY `ParamUnassignedError`.  In the kuna port the output assign of
-/// a return value too big for the output register reaches the STUB(W4)
-/// hidden-return path, which returns a *Lowlevel* error (NOT ParamUnassigned).
+/// catches ONLY `ParamUnassignedError`.  A return value too big for the output
+/// register requires a hidden-return pointer.  This fixture intentionally has
+/// neither a stack nor a default data space, so pointer synthesis returns a
+/// *Lowlevel* error (NOT ParamUnassigned).
 ///
 /// After the F1 repair the catch is `Err(KunaError::ParamUnassigned { .. })`
 /// only, so a non-ParamUnassigned `LowlevelError` PROPAGATES rather than being
@@ -297,13 +139,13 @@ fn assign_parameter_storage_ignore_output_propagates_nonparamunassigned_w6s4f2()
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let model = two_reg_proto_model(&mgr, &reg);
-    let tf = VoidTypeFactory;
-    // 8-byte return, only a 4-byte output register -> output assign fails ->
-    // hidden-return STUB(W4) Lowlevel error.
+    let tf = TypeFactoryImpl::new();
+    // An 8-byte return needs a hidden pointer, but the manager intentionally
+    // has no space from which to derive its size.
     let proto = PrototypePieces {
         name: "f".to_string(),
-        outtype: Some(int8_type()),
-        intypes: vec![int4_type()],
+        outtype: Some(int8_type(&tf)),
+        intypes: vec![int4_type(&tf)],
         innames: vec!["a".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -311,39 +153,39 @@ fn assign_parameter_storage_ignore_output_propagates_nonparamunassigned_w6s4f2()
     };
     let mut res: Vec<ParameterPieces> = Vec::new();
     // ignore_output_error = true: C++ catches ParamUnassignedError only.  A
-    // non-ParamUnassigned Lowlevel (stub) error must escape, NOT be swallowed.
+    // non-ParamUnassigned Lowlevel (missing-space) error must escape, NOT be swallowed.
     let r = model.assign_parameter_storage(&proto, &mut res, true, &tf, &mgr);
     assert!(
         matches!(r, Err(KunaError::Lowlevel { .. })),
-        "the STUB Lowlevel error must propagate past the ParamUnassigned-only \
+        "the missing-space Lowlevel error must propagate past the ParamUnassigned-only \
          catch (got {:?})",
         r
     );
 }
 
 /// `FuncProto::updateAllTypes` (fspec.cc:4199) calls `assignParameterStorage`
-/// with `ignoreOutputError=false`, so the STUB(W4) hidden-return Lowlevel error
+/// with `ignoreOutputError=false`, so the missing-space hidden-return Lowlevel error
 /// propagates INTO updateAllTypes' own `try`.  C++ catches ONLY
 /// `ParamUnassignedError`; a `LowlevelError` escapes `updateAllTypes` entirely.
 ///
 /// After the F1 repair the catch is `Err(KunaError::ParamUnassigned { .. })`
-/// only, so the STUB Lowlevel error PROPAGATES out of `update_all_types` rather
+/// only, so the missing-space Lowlevel error PROPAGATES out of `update_all_types` rather
 /// than being swallowed into `error_inputparam` — matching C++ control flow.
 #[test]
-fn update_all_types_propagates_stub_lowlevel_w6s4f1() {
+fn update_all_types_propagates_missing_space_lowlevel_w6s4f1() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let model = Rc::new(two_reg_proto_model(&mgr, &reg));
-    let tf = VoidTypeFactory;
+    let tf = TypeFactoryImpl::new();
 
     let mut fp = FuncProto::new();
-    fp.set_internal(Rc::clone(&model), void_type());
+    fp.set_internal(Rc::clone(&model), void_type(&tf));
 
-    // 8-byte return -> output assign hits the STUB hidden-return Lowlevel error.
+    // 8-byte return -> output assign hits the missing-space hidden-return Lowlevel error.
     let proto = PrototypePieces {
         name: "g".to_string(),
-        outtype: Some(int8_type()),
-        intypes: vec![int4_type()],
+        outtype: Some(int8_type(&tf)),
+        intypes: vec![int4_type(&tf)],
         innames: vec!["a".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -369,15 +211,15 @@ fn update_all_types_happy_path_assigns_output_no_error_w6s4() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
     let model = Rc::new(two_reg_proto_model(&mgr, &reg));
-    let tf = VoidTypeFactory;
+    let tf = TypeFactoryImpl::new();
 
     let mut fp = FuncProto::new();
-    fp.set_internal(Rc::clone(&model), void_type());
+    fp.set_internal(Rc::clone(&model), void_type(&tf));
 
     let proto = PrototypePieces {
         name: "h".to_string(),
-        outtype: Some(int4_type()),
-        intypes: vec![int4_type(), int4_type()],
+        outtype: Some(int4_type(&tf)),
+        intypes: vec![int4_type(&tf), int4_type(&tf)],
         innames: vec!["a".into(), "b".into()],
         first_var_arg_slot: -1,
         output_storage: None,
@@ -544,27 +386,4 @@ fn select_model_empty_trials_returns_first_w6s4() {
     let active = ParamActive::new(false); // no trials
     let chosen = merged.select_model(&active).expect("selectModel no trials");
     assert!(Rc::ptr_eq(&chosen, &m0));
-}
-
-// ===========================================================================
-// Sanity: the model-built ParamList types match the strategy strings, so the
-// fixtures above exercise the real `p_standard`/`p_standardout` resources.
-// ===========================================================================
-
-#[test]
-fn fixture_model_uses_standard_resource_lists_w6s4() {
-    let mgr = AddrSpaceManager::new();
-    let reg = reg_space_le();
-    let model = two_reg_proto_model(&mgr, &reg);
-    assert_eq!(model.input().get_type(), ParamListType::Standard);
-    assert_eq!(model.output().get_type(), ParamListType::StandardOut);
-    // Compatibility is reflexive (guards is_compatible identity arm).
-    assert!(model.is_compatible(&model));
-}
-
-/// Helper to surface KunaError variant kind in failure messages (used to make
-/// the F1 finding's "which error kind" explicit if a future change alters it).
-#[allow(dead_code)]
-fn err_is_param_unassigned(e: &KunaError) -> bool {
-    matches!(e, KunaError::ParamUnassigned { .. })
 }

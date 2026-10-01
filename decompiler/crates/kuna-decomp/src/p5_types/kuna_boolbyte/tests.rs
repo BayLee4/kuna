@@ -35,7 +35,7 @@ fn factory() -> TypeFactoryImpl {
 fn the_one_byte_int_vote_is_the_ascii_char() {
     let f = factory();
     let vote = f.get_base(1, type_metatype::TYPE_INT).unwrap();
-    assert_eq!(vote.get_name(), "char");
+    assert!(crate::kuna_charbyte::is_char(&vote));
 }
 
 /// The candidate beats every one-byte integer vote — that is what makes a flag
@@ -66,14 +66,14 @@ fn candidate_does_not_clobber_a_named_type() {
     assert!(!folds_over(&cand, &named));
 }
 
-/// Two candidates are the same `Rc`, so a second propagation pass sees no type
-/// change that is only identity churn (`write_back` compares by pointer first).
+/// Two candidates have the same graph identity, so a second propagation pass
+/// sees no type change that is only identity churn.
 #[test]
 fn candidate_is_stable_across_calls() {
     let f = factory();
     let a = f.get_base(1, type_metatype::TYPE_BOOL).unwrap();
     let b = f.get_base(1, type_metatype::TYPE_BOOL).unwrap();
-    assert!(Rc::ptr_eq(&a, &b));
+    assert_eq!(a, b);
 }
 
 /// The printer arm: a truncation into this rule's `bool` prints as a cast rather

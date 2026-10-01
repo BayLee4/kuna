@@ -1056,11 +1056,8 @@ impl Rule for RuleOrPredicate {
         vec![OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.state.basegroup) {
-            return None;
-        }
-        Some(Box::new(RuleOrPredicate::new(self.state.basegroup.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOrPredicate::new(self.state.basegroup.clone()))
     }
 }
 
@@ -1192,7 +1189,7 @@ impl RuleOrPredicate {
 /// rule, `RuleOrPredicate`; [`ActionConditionalExe`] is a leaf [`Action`], not a
 /// [`Rule`], and is registered separately by the action-group builder.
 pub fn specs() -> Vec<RuleSpec> {
-    vec![RuleSpec { group: "condexe", ctor: RuleOrPredicate::boxed }]
+    vec![RuleSpec { group: "condexe", aliases: &[], ctor: RuleOrPredicate::boxed }]
 }
 
 #[cfg(test)]

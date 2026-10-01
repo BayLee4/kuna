@@ -1,0 +1,1336 @@
+--- a/ghidra/program/model/pcode/PcodeDataTypeManager.java
++++ b/ghidra/program/model/pcode/PcodeDataTypeManager.java
+@@ -19,8 +19,12 @@
+ import static ghidra.program.model.pcode.ElementId.*;
+ 
+ import java.io.IOException;
++import java.io.ByteArrayOutputStream;
++import java.io.UncheckedIOException;
+ import java.util.HashMap;
+ import java.util.Map;
++import java.util.UUID;
++import java.util.HexFormat;
+ 
+ import ghidra.app.plugin.processors.sleigh.SleighLanguage;
+ import ghidra.docking.settings.FormatSettingsDefinition;
+@@ -77,6 +81,7 @@
+ 		public boolean isChar;		// Is this a character data-type
+ 		public boolean isUtf;		// Is this a UTF encoded character data-type
+ 		public long id;				// Calculated id for type
++		public final boolean sourceBacked;
+ 
+ 		public TypeMap(DecompilerLanguage lang, BuiltIn d, String meta, boolean isChar,
+ 				boolean isUtf, DataTypeManager manager) {
+@@ -86,6 +91,7 @@
+ 			this.isChar = isChar;
+ 			this.isUtf = isUtf;
+ 			id = manager.getID(d.clone(manager)) | BUILTIN_ID_HEADER;
++			sourceBacked = true;
+ 		}
+ 
+ 		public TypeMap(DataType d, String nm, String meta, boolean isChar, boolean isUtf, long id) {
+@@ -95,6 +101,7 @@
+ 			this.isChar = isChar;
+ 			this.isUtf = isUtf;
+ 			this.id = id;
++			sourceBacked = false; // Synthetic core entry, not an ordinary builtin source root.
+ 		}
+ 	}
+ 
+@@ -111,6 +118,8 @@
+ 	private Map<Long, TypeMap> coreBuiltin;			// Core decompiler datatypes and how they map to full datatype objects
+ 	private Map<Long, DataType> mapIDToNonDBDataType = null;	// Map from temporary Id to non-database data-types
+ 	private Map<UniversalID, Long> mapNonDBDataTypeToID = null;	// Map from a data-type's universal Id to its temporary Id
++	private boolean encodingSourceWitness;
++	private String sourceScope = UUID.randomUUID().toString();
+ 	private long tempIDCounter = 0;				// Counter for assigning data-type temporary Id
+ 	private VoidDataType voidDt;
+ 	private TypeMap charMap;
+@@ -375,7 +384,7 @@
+ 			encoder.writeString(ATTRIB_NAME, "");
+ 		}
+ 		else {
+-			encodeNameIdAttributes(encoder, typeDef);	// Use the typedef name and id
++			encodeNameIdAttributes(encoder, typeDef, type.getLength() > 0 ? type.getLength() : size);	// Use the typedef name and id
+ 		}
+ 		encoder.writeString(ATTRIB_METATYPE, "ptr");
+ 		int ptrLen = type.getLength();
+@@ -446,7 +455,7 @@
+ 		Pointer pointer = (Pointer) type.getBaseDataType();
+ 		encoder.openElement(ELEM_TYPE);
+ 		encoder.writeString(ATTRIB_METATYPE, "ptrrel");
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, pointer.getLength());
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, pointer.getLength());
+ 		if (pointerWordSize != 1) {
+ 			encoder.writeUnsignedInteger(ATTRIB_WORDSIZE, pointerWordSize);
+@@ -499,7 +508,7 @@
+ 	 */
+ 	private void encodeStructure(Encoder encoder, Structure type, int size) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength() == 0 ? 1 : type.getLength());
+ 		int sz = type.getLength();
+ 		if (sz == 0) {
+ 			type = new StructureDataType(type.getCategoryPath(), type.getName(), 1);
+@@ -550,7 +559,7 @@
+ 	 */
+ 	public void encodeUnion(Encoder encoder, Union unionType) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, unionType);
++		encodeNameIdAttributes(encoder, unionType, unionType.getLength());
+ 		encoder.writeString(ATTRIB_METATYPE, "union");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, unionType.getLength());
+ 		encoder.writeSignedInteger(ATTRIB_ALIGNMENT, unionType.getAlignment());
+@@ -583,7 +592,7 @@
+ 	 */
+ 	private void encodeEnum(Encoder encoder, Enum type, int size) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength());
+ 		String metatype = type.isSigned() ? "enum_int" : "enum_uint";
+ 		String[] names = type.getNames();
+ 		encoder.writeString(ATTRIB_METATYPE, metatype);
+@@ -607,7 +616,7 @@
+ 	private void encodeCharDataType(Encoder encoder, CharDataType type, int size)
+ 			throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength() > 0 ? type.getLength() : size);
+ 		boolean signed = type.isSigned();
+ 		int sz = type.getLength();
+ 		if (sz <= 0) {
+@@ -632,7 +641,7 @@
+ 	 */
+ 	private void encodeWideCharDataType(Encoder encoder, DataType type) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength());
+ 		encoder.writeString(ATTRIB_METATYPE, "int");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, type.getLength());
+ 		encoder.writeBool(ATTRIB_UTF, true);
+@@ -712,7 +721,7 @@
+ 	private void encodeFunctionDefinition(Encoder encoder, FunctionDefinition type)
+ 			throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, 1);
+ 		encoder.writeString(ATTRIB_METATYPE, "code");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, 1);		// Force size of 1
+ 		CompilerSpec cspec = program.getCompilerSpec();
+@@ -729,7 +738,7 @@
+ 	 */
+ 	private void encodeBooleanDataType(Encoder encoder, DataType type) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength());
+ 		encoder.writeString(ATTRIB_METATYPE, "bool");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, type.getLength());
+ 		encoder.closeElement(ELEM_TYPE);
+@@ -750,7 +759,7 @@
+ 		if (sz <= 0) {
+ 			sz = size;
+ 		}
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, sz);
+ 		encoder.writeString(ATTRIB_METATYPE, signed ? "int" : "uint");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, sz);
+ 		encoder.closeElement(ELEM_TYPE);
+@@ -764,7 +773,7 @@
+ 	 */
+ 	private void encodeAbstractFloatDataType(Encoder encoder, DataType type) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type.getLength());
+ 		encoder.writeString(ATTRIB_METATYPE, "float");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, type.getLength());
+ 		encoder.closeElement(ELEM_TYPE);
+@@ -785,7 +794,7 @@
+ 			sz = size;
+ 			isVarLength = true;
+ 		}
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, sz);
+ 		if (sz < 16) {
+ 			encoder.writeString(ATTRIB_METATYPE, "unknown");
+ 		}
+@@ -809,7 +818,7 @@
+ 	 */
+ 	private void encodeOpaqueString(Encoder encoder, DataType type, int size) throws IOException {
+ 		encoder.openElement(ELEM_TYPE);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, size);
+ 		encoder.writeString(ATTRIB_METATYPE, "struct");
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, size);
+ 		encoder.writeBool(ATTRIB_OPAQUESTRING, true);
+@@ -861,6 +870,7 @@
+ 		encoder.openElement(ELEM_TYPE);
+ 		encoder.writeString(ATTRIB_NAME, type.getDisplayName());
+ 		encoder.writeUnsignedInteger(ATTRIB_ID, progDataTypes.getID(type));
++		encodeSourceIdentity(encoder, type, progDataTypes.getID(type), type.getLength());
+ 		encoder.writeString(ATTRIB_METATYPE, metaString);
+ 		encoder.writeSignedInteger(ATTRIB_SIZE, type.getLength());
+ 		encoder.writeSignedInteger(ATTRIB_ALIGNMENT, type.getAlignment());
+@@ -917,7 +927,7 @@
+ 		}
+ 
+ 		encoder.openElement(ELEM_DEF);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, sz);
+ 		if (format != null) {
+ 			encoder.writeString(ATTRIB_FORMAT, format);
+ 		}
+@@ -973,7 +983,8 @@
+ 			return;
+ 		}
+ 		encoder.openElement(ELEM_TYPEREF);
+-		encodeNameIdAttributes(encoder, type);
++		encodeNameIdAttributes(encoder, type, type instanceof FunctionDefinition ? 1 :
++			(type.getLength() > 0 ? type.getLength() : size));
+ 		if (type.getLength() <= 0 && size > 0) {
+ 			encoder.writeSignedInteger(ATTRIB_SIZE, size);
+ 		}
+@@ -1010,6 +1021,9 @@
+ 				return tempId.longValue();
+ 			}
+ 		}
++		if (tempIDCounter == ~TEMP_ID_MASK) {
++			throw new IllegalStateException("Transient datatype identity space exhausted");
++		}
+ 		tempIDCounter += 1;
+ 		tempId = Long.valueOf(tempIDCounter | NONDB_ID_HEADER);
+ 		mapNonDBDataTypeToID.put(type.getUniversalID(), tempId);
+@@ -1018,13 +1032,13 @@
+ 	}
+ 
+ 	/**
+-	 * Throw out any temporary ids (from previous function decompilation) and
+-	 * reset the counter.
++	 * Throw out the previous request's temporary lookup inventory. Wire identities are never
++	 * reused within this manager: the native architecture can still retain an older type.
+ 	 */
+ 	public void clearTemporaryIds() {
++		sourceScope = UUID.randomUUID().toString();
+ 		mapNonDBDataTypeToID = null;
+ 		mapIDToNonDBDataType = null;
+-		tempIDCounter = 0;
+ 	}
+ 
+ 	/**
+@@ -1034,30 +1048,101 @@
+ 	 * @param type is the given data-type
+ 	 * @throws IOException for errors in the underlying stream
+ 	 */
+-	private void encodeNameIdAttributes(Encoder encoder, DataType type) throws IOException {
+-		long id;
++	private static final AttributeId KUNA_SOURCE_PROGRAM = new AttributeId("kuna_source_program", 4041);
++	private static final AttributeId KUNA_SOURCE_REVISION = new AttributeId("kuna_source_revision", 4042);
++	private static final AttributeId KUNA_SOURCE_KIND = new AttributeId("kuna_source_kind", 4044);
++	private static final AttributeId KUNA_SOURCE_SIZE = new AttributeId("kuna_source_size", 4045);
++	private static final AttributeId KUNA_SOURCE_SCOPE = new AttributeId("kuna_source_scope", 4046);
++	private static final AttributeId KUNA_SOURCE_BINDING = new AttributeId("kuna_source_binding", 4047);
++
++	/** The exact producer identity and Program revision, not a name or layout approximation. */
++	public record SourceIdentity(long program, long revision, String kind, long id, int size,
++			String scope, String binding) {
++	}
++
++	/**
++	 * Return the identity used by the type producer. Transient identities are scoped to this
++	 * manager; they must never be used to suppress persisted Program definitions.
++	 */
++	public SourceIdentity getSourceIdentity(DataType type) {
++		return getSourceIdentity(type, type.getLength());
++	}
++
++	/** Replay the exact producer for the encoded instance, including dynamically supplied size. */
++	public SourceIdentity getSourceIdentity(DataType type, int encodedSize) {
++		return sourceIdentity(type, getEncodedTypeId(type), encodedSize);
++	}
++
++	private SourceIdentity sourceIdentity(DataType type, long id, int encodedSize) {
++		String kind;
++		if (type instanceof BuiltIn || type instanceof DefaultDataType) {
++			kind = "builtin";
++		}
++		else if (type.getDataTypeManager() == progDataTypes &&
++				progDataTypes.getDataType(id) == type) {
++			kind = "program";
++		}
++		else {
++			kind = "transient";
++		}
++		return new SourceIdentity(program.getUniqueProgramID(), program.getModificationNumber(),
++			kind, id, encodedSize, kind.equals("transient") ? sourceScope : "",
++			kind.equals("builtin") ? builtinWitness(type, encodedSize) : "");
++	}
++
++	private String builtinWitness(DataType type, int encodedSize) {
++		boolean previous = encodingSourceWitness;
++		encodingSourceWitness = true;
++		try {
++			ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++			encodeType(new PackedEncode(bytes), type, encodedSize);
++			return HexFormat.of().formatHex(bytes.toByteArray());
++		}
++		catch (IOException e) { throw new UncheckedIOException(e); }
++		finally { encodingSourceWitness = previous; }
++	}
++
++	/** Return the exact wire identity without rendering or allocating a layout witness. */
++	public long getEncodedTypeId(DataType type) {
+ 		if (type instanceof BuiltIn) {
+-			String nm = ((BuiltIn) type).getDecompilerDisplayName(displayLanguage);
+-			encoder.writeString(ATTRIB_NAME, nm);
+-			id = builtInDataTypes.getID(type.clone(builtInDataTypes)) | BUILTIN_ID_HEADER;
++			return builtInDataTypes.getID(type.clone(builtInDataTypes)) | BUILTIN_ID_HEADER;
++		}
++		if (type instanceof DefaultDataType) {
++			return DEFAULT_DECOMPILER_ID;
++		}
++		long id = progDataTypes.getID(type);
++		return id > 0 ? id : assignTemporaryId(type);
++	}
++
++	private void encodeSourceIdentity(Encoder encoder, DataType type, long id, int encodedSize) throws IOException {
++		if (encodingSourceWitness) { return; }
++		SourceIdentity source = sourceIdentity(type, id, encodedSize);
++		encoder.writeUnsignedInteger(KUNA_SOURCE_PROGRAM, source.program());
++		encoder.writeUnsignedInteger(KUNA_SOURCE_REVISION, source.revision());
++		encoder.writeString(KUNA_SOURCE_KIND, source.kind());
++		encoder.writeSignedInteger(KUNA_SOURCE_SIZE, source.size());
++		encoder.writeString(KUNA_SOURCE_SCOPE, source.scope());
++		encoder.writeString(KUNA_SOURCE_BINDING, source.binding());
++	}
++
++	private void encodeNameIdAttributes(Encoder encoder, DataType type, int encodedSize) throws IOException {
++		if (type instanceof BuiltIn) {
++			encoder.writeString(ATTRIB_NAME, ((BuiltIn) type).getDecompilerDisplayName(displayLanguage));
+ 		}
+ 		else if (type instanceof DefaultDataType) {
+ 			encoder.writeString(ATTRIB_NAME, type.getName());
+-			id = DEFAULT_DECOMPILER_ID;
+ 		}
+ 		else {
+ 			String name = type.getName();
+ 			String displayName = nameTransformer.simplify(name);
+-			encoder.writeString(ATTRIB_NAME, type.getName());
++			encoder.writeString(ATTRIB_NAME, name);
+ 			if (!name.equals(displayName)) {
+ 				encoder.writeString(ATTRIB_LABEL, displayName);
+ 			}
+-			id = progDataTypes.getID(type);
+-			if (id <= 0) {
+-				id = assignTemporaryId(type);
+-			}
+-		}
++		}
++		long id = getEncodedTypeId(type);
+ 		encoder.writeUnsignedInteger(ATTRIB_ID, id);
++		encodeSourceIdentity(encoder, type, id, encodedSize);
+ 	}
+ 
+ 	/**
+@@ -1286,6 +1371,9 @@
+ 				encoder.writeBool(ATTRIB_UTF, true);
+ 			}
+ 			encoder.writeUnsignedInteger(ATTRIB_ID, typeMap.id);
++			if (typeMap.sourceBacked) {
++				encodeSourceIdentity(encoder, typeMap.dt, typeMap.id, typeMap.dt.getLength());
++			}
+ 			encoder.closeElement(ELEM_TYPE);
+ 		}
+ 		encoder.closeElement(ELEM_CORETYPES);
+--- a/ghidra/program/model/data/DataTypeWriter.java
++++ b/ghidra/program/model/data/DataTypeWriter.java
+@@ -18,6 +18,7 @@
+ import java.io.IOException;
+ import java.io.Writer;
+ import java.util.*;
++import java.util.function.Predicate;
+ 
+ import org.apache.commons.lang3.StringUtils;
+ 
+@@ -52,6 +53,7 @@
+ 	private DataOrganization dataOrganization;
+ 	private AnnotationHandler annotator;
+ 	private boolean cppStyleComments = false;
++	private final Predicate<DataType> externallyDefined;
+ 
+ 	/**
+ 	 * Constructs a new instance of this class using the given writer. The default annotation
+@@ -99,6 +101,29 @@
+ 	 */
+ 	public DataTypeWriter(DataTypeManager dtm, Writer writer, AnnotationHandler annotator,
+ 			boolean cppStyleComments) throws IOException {
++		this(dtm, writer, annotator, cppStyleComments, type -> false);
++	}
++
++	/**
++	 * Construct a writer whose caller owns definitions for an authenticated set of source
++	 * identities. The predicate is consulted for every root and recursive dependency, before
++	 * cloning, name resolution, or built-in declaration emission. It must not infer ownership
++	 * from names or structural equivalence. The caller emits those complete definitions before
++	 * invoking write on the remaining source types.
++	 * @param dtm target data-type manager
++	 * @param writer destination
++	 * @param cppStyleComments whether to use C++ comments
++	 * @param externallyDefined exact source-identity ownership predicate
++	 * @throws IOException if output fails
++	 */
++	public DataTypeWriter(DataTypeManager dtm, Writer writer, boolean cppStyleComments,
++			Predicate<DataType> externallyDefined) throws IOException {
++		this(dtm, writer, new DefaultAnnotationHandler(), cppStyleComments, externallyDefined);
++	}
++
++	private DataTypeWriter(DataTypeManager dtm, Writer writer, AnnotationHandler annotator,
++			boolean cppStyleComments, Predicate<DataType> externallyDefined) throws IOException {
++		this.externallyDefined = Objects.requireNonNull(externallyDefined);
+ 		this.dtm = dtm;
+ 		if (dtm != null) {
+ 			dataOrganization = dtm.getDataOrganization();
+@@ -222,7 +247,7 @@
+ 	 */
+ 	private void doWrite(DataType dt, TaskMonitor monitor, boolean throwExceptionOnInvalidType)
+ 			throws IOException, CancelledException {
+-		if (dt == null) {
++		if (dt == null || externallyDefined.test(dt)) {
+ 			return;
+ 		}
+ 		if (dt instanceof FunctionDefinition) {
+--- a/ghidra/app/decompiler/DecompileResults.java
++++ b/ghidra/app/decompiler/DecompileResults.java
+@@ -14,6 +14,8 @@
+  * limitations under the License.
+  */
+ package ghidra.app.decompiler;
++
++import java.util.Optional;
+ 
+ import static ghidra.program.model.pcode.ElementId.*;
+ 
+@@ -58,6 +60,7 @@
+ 	private PcodeDataTypeManager dtmanage;
+ 	private HighFunction hfunc; // HighFunction parsed from xml
+ 	private HighParamID hparamid; //Parameter ID information
++	private CallableSupport callableSupport;
+ 	private ClangTokenGroup docroot; // C code parsed from XML
+ 	private String errMsg; // Error message from decompiler
+ 	private DecompileProcess.DisposeState processState;
+@@ -209,7 +212,13 @@
+ 		}
+ 		PrettyPrinter printer =
+ 			new PrettyPrinter(function, docroot, new IllegalCharCppTransformer());
+-		return printer.print();
++		DecompiledFunction printed = printer.print();
++		return new DecompiledFunction(printed.getSignature(), printed.getC(), callableSupport);
++	}
++
++	/** Immutable actual-body support; absence preserves the ordinary stock-native contract. */
++	public Optional<CallableSupport> getCallableSupport() {
++		return Optional.ofNullable(callableSupport);
+ 	}
+ 
+ 	private void decodeStream(Decoder decoder) {
+@@ -220,6 +229,7 @@
+ 			hfunc = null;
+ 			hparamid = null;
+ 			docroot = null;
++			callableSupport = null;
+ 			int docel = decoder.openElement(ELEM_DOC);
+ 			for (;;) {
+ 				int el = decoder.peekElement();
+@@ -238,25 +248,34 @@
+ 						}
+ 					}
+ 				}
++				else if (el == CallableSupport.SUPPORT.id()) {
++					if (callableSupport != null) {
++						throw new DecoderException("Duplicate callable support sibling");
++					}
++					callableSupport = CallableSupport.decode(decoder, function.getEntryPoint());
++				}
+ 				else if (el == ELEM_PARAMMEASURES.id()) {
+ 					hparamid = new HighParamID(function, language, compilerSpec, dtmanage);
+ 					hparamid.decode(decoder);
+ 				}
+ 				else {
+-					errMsg = "Unknown decompiler tag";
+-					return;
++					throw new DecoderException("Unknown decompiler tag");
+ 				}
+ 			}
+ 			decoder.closeElement(docel);
+ 		}
+ 		catch (DecoderException e) {		// Error while walking the DOM
+ 			errMsg = e.getMessage();
++			callableSupport = null;
++			docroot = null;
+ 			hfunc = null;
+ 			hparamid = null;
+ 			return;
+ 		}
+ 		catch (Exception e) {				// Exception with the underlying stream
+ 			errMsg = e.getMessage();
++			callableSupport = null;
++			docroot = null;
+ 			hfunc = null;
+ 			hparamid = null;
+ 			return;
+--- a/ghidra/app/decompiler/DecompiledFunction.java
++++ b/ghidra/app/decompiler/DecompiledFunction.java
+@@ -16,12 +16,15 @@
+  */
+ package ghidra.app.decompiler;
+ 
++import java.util.Optional;
++
+ /**
+  * A class to hold pieces of a decompiled function.
+  */
+ public class DecompiledFunction {
+ 	private String signature;
+ 	private String c;
++	private final CallableSupport callableSupport;
+ 
+ 	/**
+ 	 * Constructs a new decompiled function.
+@@ -29,8 +32,18 @@
+ 	 * @param c the complete C code of the function.
+ 	 */
+ 	public DecompiledFunction(String signature, String c) {
++		this(signature, c, null);
++	}
++
++	DecompiledFunction(String signature, String c, CallableSupport callableSupport) {
+ 		this.signature = signature;
+ 		this.c = c;
++		this.callableSupport = callableSupport;
++	}
++
++	/** Actual-body support and publication status; absent for an ordinary stock-native result. */
++	public Optional<CallableSupport> getCallableSupport() {
++		return Optional.ofNullable(callableSupport);
+ 	}
+ 
+ 	/**
+--- a/ghidra/app/util/exporter/CppExporter.java
++++ b/ghidra/app/util/exporter/CppExporter.java
+@@ -16,6 +16,7 @@
+ package ghidra.app.util.exporter;
+ 
+ import java.io.*;
++import java.nio.file.*;
+ import java.util.*;
+ 
+ import org.apache.commons.lang3.StringUtils;
+@@ -34,6 +35,8 @@
+ import ghidra.program.model.address.AddressSetView;
+ import ghidra.program.model.data.*;
+ import ghidra.program.model.listing.*;
++import ghidra.program.model.pcode.PcodeDataTypeManager;
++import ghidra.program.model.symbol.IllegalCharCppTransformer;
+ import ghidra.program.model.symbol.Equate;
+ import ghidra.util.HelpLocation;
+ import ghidra.util.Msg;
+@@ -108,15 +111,6 @@
+ 		}
+ 
+ 		File header = getHeaderFile(file);
+-		PrintWriter headerWriter = null;
+-		if (isCreateHeaderFile) {
+-			headerWriter = new PrintWriter(header);
+-		}
+-
+-		PrintWriter cFileWriter = null;
+-		if (isCreateCFile) {
+-			cFileWriter = new PrintWriter(file);
+-		}
+ 
+ 		CachingPool<DecompInterface> decompilerPool =
+ 			new CachingPool<>(new DecompilerFactory(program));
+@@ -125,16 +119,34 @@
+ 		ChunkingParallelDecompiler<CPPResult> parallelDecompiler =
+ 			ParallelDecompiler.createChunkingParallelDecompiler(callback, chunkingMonitor);
+ 
+-		try {
++		try (StagedFiles staged = new StagedFiles(header, file, isCreateHeaderFile, isCreateCFile);
++				CallableSupport.Publication publication = new CallableSupport.Publication()) {
++			decompileAndCollect(addrSet, program, parallelDecompiler, publication, chunkingMonitor);
++			publication.validate();
++			chunkingMonitor.checkCancelled();
++			long revision = program.getModificationNumber();
++			if (publication.isPresent() && !emitDataTypeDefinitions) {
++				publication.sourceOwnership(
++					new PcodeDataTypeManager(program, new IllegalCharCppTransformer()));
++			}
++			PrintWriter headerWriter = staged.headerWriter;
++			PrintWriter cFileWriter = staged.cFileWriter;
+ 			if (emitDataTypeDefinitions) {
+ 				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
+-				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
++				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor, publication);
++			}
++			Writer declarations = headerWriter != null ? headerWriter : cFileWriter;
++			if (declarations != null) { publication.writeDeclarations(declarations, emitReferencedGlobals); }
++			if (headerWriter != null) { publication.writeLegacyHeaders(headerWriter); }
++			if (cFileWriter != null) {
++				publication.writeBodies(cFileWriter);
++				publication.writeLegacyBodies(cFileWriter, emitReferencedGlobals);
+ 			}
+ 			chunkingMonitor.checkCancelled();
+-
+-			decompileAndExport(addrSet, program, headerWriter, cFileWriter, parallelDecompiler,
+-				chunkingMonitor);
+-
++			if (publication.isPresent() && program.getModificationNumber() != revision) {
++				throw new IOException("Program changed during callable publication");
++			}
++			staged.publish();
+ 			return true;
+ 		}
+ 		catch (CancelledException e) {
+@@ -147,21 +159,13 @@
+ 		finally {
+ 			decompilerPool.dispose();
+ 			parallelDecompiler.dispose();
+-
+-			if (headerWriter != null) {
+-				headerWriter.close();
+-			}
+-			if (cFileWriter != null) {
+-				cFileWriter.close();
+-			}
+-		}
+-
+-	}
+-
+-	private void decompileAndExport(AddressSetView addrSet, Program program,
+-			PrintWriter headerWriter, PrintWriter cFileWriter,
++		}
++
++	}
++
++	private void decompileAndCollect(AddressSetView addrSet, Program program,
+ 			ChunkingParallelDecompiler<CPPResult> parallelDecompiler,
+-			ChunkingTaskMonitor chunkingMonitor)
++			CallableSupport.Publication publication, ChunkingTaskMonitor chunkingMonitor)
+ 			throws InterruptedException, Exception, CancelledException {
+ 
+ 		int functionCount = program.getFunctionManager().getFunctionCount();
+@@ -170,14 +174,13 @@
+ 		Listing listing = program.getListing();
+ 		FunctionIterator iterator = listing.getFunctions(addrSet, true);
+ 		List<Function> functions = new ArrayList<>();
+-		Set<String> processedGlobals = new HashSet<>();
+ 		for (int i = 0; iterator.hasNext(); i++) {
+ 			//
+ 			// Write results every so many items so that we don't blow out memory
+ 			//
+ 			if (i % 10000 == 0) {
+ 				List<CPPResult> results = parallelDecompiler.decompileFunctions(functions);
+-				writeResults(results, processedGlobals, headerWriter, cFileWriter, chunkingMonitor);
++				collectResults(results, publication, chunkingMonitor);
+ 				functions.clear();
+ 			}
+ 
+@@ -191,7 +194,7 @@
+ 
+ 		// handle any remaining functions
+ 		List<CPPResult> results = parallelDecompiler.decompileFunctions(functions);
+-		writeResults(results, processedGlobals, headerWriter, cFileWriter, chunkingMonitor);
++		collectResults(results, publication, chunkingMonitor);
+ 	}
+ 
+ 	private boolean excludeFunction(Function currentFunction) {
+@@ -212,51 +215,15 @@
+ 		return excludeMatchingTags == hasTag;
+ 	}
+ 
+-	private void writeResults(List<CPPResult> results, Set<String> processedGlobals,
+-			PrintWriter headerWriter, PrintWriter cFileWriter, TaskMonitor monitor)
+-			throws CancelledException {
++	private void collectResults(List<CPPResult> results, CallableSupport.Publication publication,
++			TaskMonitor monitor) throws CancelledException, IOException {
+ 		monitor.checkCancelled();
+-
+ 		Collections.sort(results);
+-
+-		StringBuilder globalDecls = new StringBuilder();
+-		StringBuilder headers = new StringBuilder();
+-		StringBuilder bodies = new StringBuilder();
+-
+ 		for (CPPResult result : results) {
+ 			monitor.checkCancelled();
+-			if (result == null) {
+-				continue;
+-			}
+-			if (emitReferencedGlobals) {
+-				for (String global : result.globals()) {
+-					if (processedGlobals.add(global)) {
+-						globalDecls.append(global);
+-						globalDecls.append(EOL);
+-					}
+-				}
+-			}
+-			String headerCode = result.headerCode();
+-			if (headerCode != null) {
+-				headers.append(headerCode);
+-				headers.append(EOL);
+-			}
+-
+-			String bodyCode = result.bodyCode();
+-			if (bodyCode != null) {
+-				bodies.append(bodyCode);
+-				bodies.append(EOL);
+-			}
+-		}
+-
+-		monitor.checkCancelled();
+-
+-		if (headerWriter != null) {
+-			headerWriter.println(headers.toString());
+-		}
+-		if (cFileWriter != null) {
+-			cFileWriter.print(globalDecls.toString());
+-			cFileWriter.print(bodies.toString());
++			if (result == null) { continue; }
++			if (result.support() != null) { publication.add(result.support()); }
++			else { publication.addLegacy(result.headerCode(), result.bodyCode(), result.globals()); }
+ 		}
+ 	}
+ 
+@@ -292,33 +259,28 @@
+ 	}
+ 
+ 	private void writeProgramDataTypes(Program program, File header, PrintWriter headerWriter,
+-			PrintWriter cFileWriter, TaskMonitor monitor) throws IOException, CancelledException {
+-		if (headerWriter != null) {
+-			DataTypeManager dtm = program.getDataTypeManager();
+-			DataTypeWriter dataTypeWriter =
+-				new DataTypeWriter(dtm, headerWriter, isUseCppStyleComments);
+-			headerWriter.write(getFakeCTypeDefinitions(dtm.getDataOrganization()));
+-			dataTypeWriter.write(dtm, monitor);
+-
+-			headerWriter.println("");
+-			headerWriter.println("");
+-
+-			if (cFileWriter != null) {
+-				cFileWriter.println("#include \"" + header.getName() + "\"");
+-			}
+-		}
+-		else if (cFileWriter != null) {
+-			DataTypeManager dtm = program.getDataTypeManager();
+-			DataTypeWriter dataTypeWriter =
+-				new DataTypeWriter(dtm, cFileWriter, isUseCppStyleComments);
+-			dataTypeWriter.write(dtm, monitor);
+-		}
+-
+-		if (cFileWriter != null) {
+-			cFileWriter.println("");
+-			cFileWriter.println("");
+-		}
+-
++			PrintWriter cFileWriter, TaskMonitor monitor, CallableSupport.Publication publication)
++			throws IOException, CancelledException {
++		Writer output = headerWriter != null ? headerWriter : cFileWriter;
++		if (output == null) { return; }
++		DataTypeManager dtm = program.getDataTypeManager();
++		DataTypeWriter dataTypeWriter;
++		if (publication.isPresent()) {
++			PcodeDataTypeManager identities = new PcodeDataTypeManager(program, new IllegalCharCppTransformer());
++			dataTypeWriter = new DataTypeWriter(dtm, output, isUseCppStyleComments,
++				publication.sourceOwnership(identities));
++			publication.writeTypes(output);
++		}
++		else {
++			dataTypeWriter = new DataTypeWriter(dtm, output, isUseCppStyleComments);
++			if (headerWriter != null) { output.write(getFakeCTypeDefinitions(dtm.getDataOrganization())); }
++		}
++		dataTypeWriter.write(dtm, monitor);
++		output.write(EOL + EOL);
++		if (headerWriter != null && cFileWriter != null) {
++			cFileWriter.println("#include \"" + header.getName() + "\"");
++		}
++		if (cFileWriter != null) { cFileWriter.println(); cFileWriter.println(); }
+ 	}
+ 
+ 	private void writeEquates(Program program, File header, PrintWriter headerWriter,
+@@ -475,8 +437,58 @@
+ // Inner Classes
+ //==================================================================================================
+ 
++	/** Both files remain private until the complete invocation has passed publication checks. */
++	private static final class StagedFiles implements AutoCloseable {
++		private final Path headerTarget, cTarget;
++		private Path headerStage, cStage;
++		private PrintWriter headerWriter, cFileWriter;
++
++		StagedFiles(File header, File cFile, boolean writeHeader, boolean writeC) throws IOException {
++			headerTarget = header.toPath().toAbsolutePath();
++			cTarget = cFile.toPath().toAbsolutePath();
++			try {
++				if (writeHeader) {
++					headerStage = Files.createTempFile(headerTarget.getParent(), "ghidra-cpp-header-", ".tmp");
++					headerWriter = new PrintWriter(headerStage.toFile());
++				}
++				if (writeC) {
++					cStage = Files.createTempFile(cTarget.getParent(), "ghidra-cpp-body-", ".tmp");
++					cFileWriter = new PrintWriter(cStage.toFile());
++				}
++			}
++			catch (IOException e) { close(); throw e; }
++		}
++
++		void publish() throws IOException {
++			if ((headerWriter != null && headerWriter.checkError()) ||
++					(cFileWriter != null && cFileWriter.checkError())) {
++				throw new IOException("Unable to write staged C/C++ output");
++			}
++			closeWriters();
++			if (headerStage != null) {
++				Files.move(headerStage, headerTarget, StandardCopyOption.REPLACE_EXISTING);
++				headerStage = null;
++			}
++			if (cStage != null) {
++				Files.move(cStage, cTarget, StandardCopyOption.REPLACE_EXISTING);
++				cStage = null;
++			}
++		}
++
++		private void closeWriters() {
++			if (headerWriter != null) { headerWriter.close(); headerWriter = null; }
++			if (cFileWriter != null) { cFileWriter.close(); cFileWriter = null; }
++		}
++
++		@Override public void close() throws IOException {
++			closeWriters();
++			try { if (headerStage != null) { Files.deleteIfExists(headerStage); } }
++			finally { if (cStage != null) { Files.deleteIfExists(cStage); } }
++		}
++	}
++
+ 	private record CPPResult(Address address, String headerCode, String bodyCode,
+-			List<String> globals) implements Comparable<CPPResult> {
++			List<String> globals, CallableSupport support) implements Comparable<CPPResult> {
+ 		@Override
+ 		public int compareTo(CPPResult other) {
+ 			return address.compareTo(other.address);
+@@ -531,32 +543,33 @@
+ 		}
+ 
+ 		private CPPResult doWork(Function function, DecompInterface decompiler,
+-				TaskMonitor monitor) {
++				TaskMonitor monitor) throws IOException {
+ 			Address entryPoint = function.getEntryPoint();
+ 			CodeUnit codeUnitAt = function.getProgram().getListing().getCodeUnitAt(entryPoint);
+ 			if (codeUnitAt == null || !(codeUnitAt instanceof Instruction)) {
+ 				return new CPPResult(entryPoint, function.getPrototypeString(false, false) + ';',
+-					null, List.of());
++					null, List.of(), null);
+ 			}
+ 
+ 			monitor.setMessage("Decompiling " + function.getName());
+ 
+ 			DecompileResults dr =
+ 				decompiler.decompileFunction(function, options.getDefaultTimeout(), monitor);
++			DecompiledFunction decompiledFunction = dr.getDecompiledFunction();
++			if (!dr.decompileCompleted() || decompiledFunction == null || dr.isCancelled() ||
++					dr.isTimedOut() || dr.failedToStart()) {
++				throw new IOException("Unable to decompile '" + function.getName() +
++					"': " + dr.getErrorMessage());
++			}
+ 			String errorMessage = dr.getErrorMessage();
+-			if (!"".equals(errorMessage)) {
+-				Msg.warn(CppExporter.this, "Error decompiling: " + errorMessage);
+-				if (options.isWARNCommentIncluded()) {
+-					monitor.incrementProgress(1);
+-					return new CPPResult(entryPoint, null,
+-						"/*" + EOL + "Unable to decompile '" + function.getName() + "'" + EOL +
+-							"Cause: " + errorMessage + EOL + "*/" + EOL,
+-						List.of());
+-				}
+-				return null;
+-			}
+-
+-			DecompiledFunction decompiledFunction = dr.getDecompiledFunction();
++			if (errorMessage != null && !errorMessage.isBlank()) {
++				Msg.warn(CppExporter.this, "Decompiler warning: " + errorMessage);
++			}
++			CallableSupport support = decompiledFunction.getCallableSupport().orElse(null);
++			if (support != null) {
++				return new CPPResult(entryPoint, decompiledFunction.getSignature(),
++					decompiledFunction.getC(), List.of(), support);
++			}
+ 			List<String> globals =
+ 				CollectionUtils.asStream(dr.getHighFunction().getGlobalSymbolMap().getSymbols())
+ 						.map(hsym -> {
+@@ -567,7 +580,7 @@
+ 						})
+ 						.toList();
+ 			return new CPPResult(entryPoint, decompiledFunction.getSignature(),
+-				decompiledFunction.getC(), globals);
++				decompiledFunction.getC(), globals, decompiledFunction.getCallableSupport().orElse(null));
+ 		}
+ 	}
+ 
+--- /dev/null
++++ b/ghidra/app/decompiler/CallableSupport.java
+@@ -0,0 +1,457 @@
++/*
++ * Licensed under the Apache License, Version 2.0.
++ */
++package ghidra.app.decompiler;
++
++import static ghidra.program.model.pcode.AttributeId.ATTRIB_CONTENT;
++import java.io.*;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.*;
++import java.util.*;
++import java.util.function.Predicate;
++import ghidra.program.model.address.Address;
++import ghidra.program.model.data.DataType;
++import ghidra.program.model.pcode.*;
++import ghidra.program.model.pcode.PcodeDataTypeManager.SourceIdentity;
++
++/** Immutable actual-body receipts and complete C support for one decompilation request. */
++public final class CallableSupport {
++	static final ElementId SUPPORT = new ElementId("callable_support", 4030);
++	private static final ElementId BODY = new ElementId("callable_body", 4031);
++	private static final ElementId ARTIFACT = new ElementId("callable_artifact", 4032);
++	private static final ElementId DECLARATION = new ElementId("callable_declaration", 4033);
++	private static final ElementId DEFINITION = new ElementId("callable_definition", 4034);
++	private static final ElementId PRELUDE = new ElementId("callable_prelude", 4035);
++	private static final ElementId GLOBAL = new ElementId("callable_global", 4036);
++	private static final ElementId TYPE = new ElementId("callable_type", 4037);
++	private static final ElementId BODYTEXT = new ElementId("callable_bodytext", 4038);
++	private static final ElementId SOURCE = new ElementId("callable_source", 4039);
++	private static final AttributeId VERSION = new AttributeId("kuna_version", 4030);
++	private static final AttributeId STATUS = new AttributeId("kuna_status", 4031);
++	private static final AttributeId REASON = new AttributeId("kuna_reason", 4032);
++	private static final AttributeId ADDRESS = new AttributeId("kuna_address", 4033);
++	private static final AttributeId CURRENT = new AttributeId("kuna_current", 4034);
++	private static final AttributeId COMPLETE = new AttributeId("kuna_complete", 4035);
++	private static final AttributeId REQUIRED = new AttributeId("kuna_required", 4036);
++	private static final AttributeId DEFERRED = new AttributeId("kuna_deferred", 4037);
++	private static final AttributeId KIND = new AttributeId("kuna_definition_kind", 4038);
++	private static final AttributeId KEY = new AttributeId("kuna_key", 4039);
++	private static final AttributeId SPACE = new AttributeId("kuna_space", 4040);
++	private static final AttributeId SOURCE_PROGRAM = new AttributeId("kuna_source_program", 4041);
++	private static final AttributeId SOURCE_REVISION = new AttributeId("kuna_source_revision", 4042);
++	private static final AttributeId SOURCE_ID = new AttributeId("kuna_source_id", 4043);
++	private static final AttributeId SOURCE_KIND = new AttributeId("kuna_source_kind", 4044);
++	private static final AttributeId SOURCE_SIZE = new AttributeId("kuna_source_size", 4045);
++	private static final AttributeId SOURCE_SCOPE = new AttributeId("kuna_source_scope", 4046);
++	private static final AttributeId SOURCE_BINDING = new AttributeId("kuna_source_binding", 4047);
++	private static final AttributeId PROVIDER = new AttributeId("kuna_provider", 4048);
++
++	public enum Status { COMPLETE, REFUSED }
++	public enum DefinitionKind { NONE, WRAPPER, EXISTING, BODYPROOF }
++	public record BodyId(int space, long byteAddress) {}
++	public record Artifact(String key, String declaration, DefinitionKind kind,
++			String definition, String providerKey, boolean required, boolean deferred) {}
++	public record Body(BodyId id, boolean current, boolean complete, String declaration,
++			String text, List<Artifact> artifacts) {
++		public Body { artifacts = List.copyOf(artifacts); }
++	}
++	public record SupportText(String key, String text, List<SourceIdentity> sources) {
++		public SupportText { sources = List.copyOf(sources); }
++	}
++	private final Status status;
++	private final String reason;
++	private final List<Body> bodies;
++	private final List<SupportText> prelude, types, globals;
++
++	private CallableSupport(Status status, String reason, List<Body> bodies,
++			List<SupportText> prelude, List<SupportText> types, List<SupportText> globals) {
++		this.status = status;
++		this.reason = reason;
++		this.bodies = List.copyOf(bodies);
++		this.prelude = List.copyOf(prelude);
++		this.types = List.copyOf(types);
++		this.globals = List.copyOf(globals);
++	}
++	public Status getStatus() { return status; }
++	public String getReason() { return reason; }
++	public List<Body> getBodies() { return bodies; }
++	public List<SupportText> getPrelude() { return prelude; }
++	public List<SupportText> getTypes() { return types; }
++	public List<SupportText> getGlobals() { return globals; }
++
++	static CallableSupport decode(Decoder decoder, Address entry) throws DecoderException {
++		int el = decoder.openElement(SUPPORT);
++		if (decoder.readSignedInteger(VERSION) != 2) {
++			throw new DecoderException("Unsupported callable support version");
++		}
++		Status status;
++		switch (decoder.readString(STATUS)) {
++			case "complete": status = Status.COMPLETE; break;
++			case "refused": status = Status.REFUSED; break;
++			default: throw new DecoderException("Invalid callable support status");
++		}
++		String reason = decoder.readString(REASON);
++		List<Body> bodies = new ArrayList<>();
++		List<SupportText> prelude = new ArrayList<>(), types = new ArrayList<>(), globals = new ArrayList<>();
++		while (decoder.peekElement() != 0) {
++			int child = decoder.peekElement();
++			if (child == BODY.id()) { bodies.add(decodeBody(decoder)); }
++			else if (child == PRELUDE.id()) { prelude.add(decodeText(decoder, PRELUDE)); }
++			else if (child == TYPE.id()) { types.add(decodeText(decoder, TYPE)); }
++			else if (child == GLOBAL.id()) { globals.add(decodeText(decoder, GLOBAL)); }
++			else { throw new DecoderException("Unknown callable support child"); }
++		}
++		decoder.closeElement(el);
++		BodyId requested = new BodyId(entry.getAddressSpace().getUnique(), entry.getOffset());
++		int current = 0;
++		for (Body body : bodies) {
++			if (status == Status.COMPLETE && (!body.complete() || body.text().isBlank())) {
++				throw new DecoderException("Complete callable support has no actual rendered body");
++			}
++			if (body.current()) {
++				++current;
++				if (!body.id().equals(requested)) { throw new DecoderException("Callable current receipt has wrong entry"); }
++			}
++		}
++		if (current > 1 || (status == Status.COMPLETE && current != 1)) {
++			throw new DecoderException("Complete callable support must have exactly one current body");
++		}
++		if (status == Status.REFUSED && reason.isBlank()) {
++			throw new DecoderException("Callable refusal has no reason");
++		}
++		return new CallableSupport(status, reason, bodies, prelude, types, globals);
++	}
++	private static String text(Decoder decoder, ElementId element) throws DecoderException {
++		int el = decoder.openElement(element);
++		String value = decoder.readString(ATTRIB_CONTENT);
++		decoder.closeElement(el);
++		return value;
++	}
++	private static SupportText decodeText(Decoder decoder, ElementId element) throws DecoderException {
++		int el = decoder.openElement(element);
++		String key = decoder.readString(KEY), text = decoder.readString(ATTRIB_CONTENT);
++		List<SourceIdentity> sources = new ArrayList<>();
++		while (decoder.peekElement() != 0) {
++			int sourceEl = decoder.openElement(SOURCE);
++			long program = decoder.readUnsignedInteger(SOURCE_PROGRAM);
++			long revision = decoder.readUnsignedInteger(SOURCE_REVISION);
++			long id = decoder.readUnsignedInteger(SOURCE_ID);
++			String kind = decoder.readString(SOURCE_KIND), scope = decoder.readString(SOURCE_SCOPE);
++			String binding = decoder.readString(SOURCE_BINDING);
++			int size = Math.toIntExact(decoder.readSignedInteger(SOURCE_SIZE));
++			if (!(kind.equals("program") || kind.equals("builtin") || kind.equals("transient")) ||
++					(kind.equals("transient") == scope.isEmpty()) ||
++					(kind.equals("builtin") == binding.isEmpty())) {
++				throw new DecoderException("Invalid callable source identity");
++			}
++			sources.add(new SourceIdentity(program, revision, kind, id, size, scope, binding));
++			decoder.closeElement(sourceEl);
++		}
++		decoder.closeElement(el);
++		if (element == GLOBAL && !sources.isEmpty()) {
++			throw new DecoderException("Global support cannot own source datatype definitions");
++		}
++		return new SupportText(key, text, sources);
++	}
++	private static Body decodeBody(Decoder decoder) throws DecoderException {
++		int el = decoder.openElement(BODY);
++		BodyId id = new BodyId(Math.toIntExact(decoder.readSignedInteger(SPACE)), decoder.readUnsignedInteger(ADDRESS));
++		boolean current = decoder.readBool(CURRENT), complete = decoder.readBool(COMPLETE);
++		String declaration = text(decoder, DECLARATION), body = text(decoder, BODYTEXT);
++		List<Artifact> artifacts = new ArrayList<>();
++		while (decoder.peekElement() != 0) {
++			int artifactEl = decoder.openElement(ARTIFACT);
++			String key = decoder.readString(KEY), kindText = decoder.readString(KIND);
++			boolean required = decoder.readBool(REQUIRED), deferred = decoder.readBool(DEFERRED);
++			DefinitionKind kind;
++			switch (kindText) {
++				case "none": kind = DefinitionKind.NONE; break;
++				case "wrapper": kind = DefinitionKind.WRAPPER; break;
++				case "existing": kind = DefinitionKind.EXISTING; break;
++				case "bodyproof": kind = DefinitionKind.BODYPROOF; break;
++				default: throw new DecoderException("Invalid callable definition kind");
++			}
++			String providerKey = "";
++			boolean hasProvider = false;
++			decoder.rewindAttributes();
++			for (int attribute = decoder.getNextAttributeId(); attribute != 0;
++					attribute = decoder.getNextAttributeId()) {
++				if (attribute == PROVIDER.id()) {
++					if (hasProvider) { throw new DecoderException("Duplicate callable proof provider"); }
++					providerKey = decoder.readString();
++					hasProvider = true;
++				}
++			}
++			if ((kind == DefinitionKind.BODYPROOF) != hasProvider ||
++					(hasProvider && providerKey.isEmpty())) {
++				throw new DecoderException("Callable proof provider does not match definition kind");
++			}
++			String artifactDeclaration = text(decoder, DECLARATION);
++			String definition = kind == DefinitionKind.WRAPPER ? text(decoder, DEFINITION) : "";
++			if (deferred && !required) { throw new DecoderException("Deferred callable edge is not required"); }
++			artifacts.add(new Artifact(key, artifactDeclaration, kind, definition, providerKey, required, deferred));
++			decoder.closeElement(artifactEl);
++		}
++		decoder.closeElement(el);
++		return new Body(id, current, complete, declaration, body, artifacts);
++	}
++
++	/** Invocation-local publication. Bodies spool to disk; no process-global result cache. */
++	public static final class Publication implements AutoCloseable {
++		private record StoredBody(String declaration, List<Artifact> artifacts, long offset, int length) {}
++		private record StoredFragment(long offset, int length) {}
++		private record Provider(BodyId owner, Artifact artifact) {}
++		private record Edge(BodyId target, boolean deferred) {}
++		private final Path path;
++		private final RandomAccessFile spool;
++		private final Map<BodyId, StoredBody> bodies = new LinkedHashMap<>();
++		private final Map<String, SupportText> prelude = new LinkedHashMap<>(), types = new LinkedHashMap<>(), globals = new LinkedHashMap<>();
++		private final Map<String, Provider> providers = new LinkedHashMap<>();
++		private final Map<String, String> declarations = new LinkedHashMap<>();
++		private final StringBuilder legacyHeaders = new StringBuilder();
++		private final Set<String> legacyGlobals = new LinkedHashSet<>();
++		private final List<StoredFragment> legacyBodies = new ArrayList<>();
++		private boolean validated;
++		public Publication() throws IOException {
++			path = Files.createTempFile("ghidra-callable-bodies-", ".tmp");
++			RandomAccessFile opened;
++			try { opened = new RandomAccessFile(path.toFile(), "rw"); }
++			catch (IOException e) { Files.deleteIfExists(path); throw e; }
++			spool = opened;
++		}
++		public boolean isPresent() { return !bodies.isEmpty(); }
++		/** Preserve ordinary stock-native fragments without inventing native body receipts. */
++		public void addLegacy(String header, String body, List<String> globals) throws IOException {
++			if (validated) { throw new IOException("Callable publication already finalized"); }
++			if (header != null) { legacyHeaders.append(header).append('\n'); }
++			legacyGlobals.addAll(globals);
++			if (body != null) {
++				byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
++				long offset = spool.length(); spool.seek(offset); spool.write(bytes);
++				legacyBodies.add(new StoredFragment(offset, bytes.length));
++			}
++		}
++		public void add(CallableSupport support) throws IOException {
++			if (validated) { throw new IOException("Callable publication already finalized"); }
++			if (support.status != Status.COMPLETE) { throw new IOException("Callable transport: " + support.reason); }
++			mergeText(prelude, support.prelude); mergeText(types, support.types); mergeText(globals, support.globals);
++			for (Body body : support.bodies) {
++				if (!body.complete() || body.text().isBlank()) { throw new IOException("Callable body lacks successful render receipt"); }
++				StoredBody previous = bodies.get(body.id());
++				if (previous != null) {
++					if (!previous.declaration().equals(body.declaration()) || !previous.artifacts().equals(body.artifacts()) ||
++							!readBody(previous).equals(body.text())) { throw new IOException("Conflicting callable body receipt: " + body.id()); }
++					continue;
++				}
++				byte[] bytes = body.text().getBytes(StandardCharsets.UTF_8);
++				long offset = spool.length(); spool.seek(offset); spool.write(bytes);
++				bodies.put(body.id(), new StoredBody(body.declaration(), body.artifacts(), offset, bytes.length));
++			}
++		}
++		private static void mergeText(Map<String, SupportText> target, List<SupportText> values) throws IOException {
++			for (SupportText value : values) {
++				SupportText previous = target.putIfAbsent(value.key(), value);
++				if (previous != null && !previous.equals(value)) { throw new IOException("Conflicting callable support: " + value.key()); }
++			}
++		}
++		private String readBody(StoredBody body) throws IOException {
++			byte[] bytes = new byte[body.length()]; spool.seek(body.offset()); spool.readFully(bytes);
++			return new String(bytes, StandardCharsets.UTF_8);
++		}
++		private static BodyId targetOf(String key) throws IOException {
++			String[] parts = key.split("_", 5);
++			try {
++				if (parts.length != 5 || !parts[0].equals("kuna") || !parts[1].equals("entry") || parts[4].isEmpty()) {
++					throw new NumberFormatException();
++				}
++				return new BodyId(Integer.parseInt(parts[2]), Long.parseUnsignedLong(parts[3]));
++			}
++			catch (NumberFormatException e) { throw new IOException("Invalid callable key: " + key, e); }
++		}
++		private static boolean isQualifiedProof(String key, String providerKey) {
++			String prefix = providerKey + "_internal_";
++			if (providerKey.contains("_internal_") || !key.startsWith(prefix)) { return false; }
++			String[] role = key.substring(prefix.length()).split("_", -1);
++			if (role.length != 3) { return false; }
++			try {
++				int space = Integer.parseInt(role[0]);
++				long address = Long.parseUnsignedLong(role[1]);
++				int size = Integer.parseInt(role[2]);
++				return space >= 0 && size > 0 && Long.compareUnsigned(address + size, address) > 0 &&
++					role[0].equals(Integer.toString(space)) &&
++					role[1].equals(Long.toUnsignedString(address)) && role[2].equals(Integer.toString(size));
++			}
++			catch (NumberFormatException e) { return false; }
++		}
++		public void validate() throws IOException {
++			if (validated) { return; }
++			Map<BodyId, List<Edge>> edges = new LinkedHashMap<>();
++			for (var entry : bodies.entrySet()) {
++				edges.put(entry.getKey(), new ArrayList<>());
++				Set<String> localKeys = new HashSet<>();
++				for (Artifact artifact : entry.getValue().artifacts()) {
++					if (!localKeys.add(artifact.key())) { throw new IOException("Duplicate owner-local callable key"); }
++					String prior = declarations.putIfAbsent(artifact.key(), artifact.declaration());
++					if (prior != null && !prior.equals(artifact.declaration())) { throw new IOException("Conflicting callable declaration"); }
++					if (artifact.kind() != DefinitionKind.NONE) {
++						if (!targetOf(artifact.key()).equals(entry.getKey())) { throw new IOException("Callable definition has wrong owning body"); }
++						if (artifact.kind() == DefinitionKind.EXISTING &&
++								!artifact.declaration().equals(entry.getValue().declaration())) {
++							throw new IOException("Existing callable declaration differs from its actual body ABI");
++						}
++						Provider previous = providers.putIfAbsent(artifact.key(), new Provider(entry.getKey(), artifact));
++						if (previous != null) { throw new IOException("Callable key has multiple owning bodies"); }
++					}
++				}
++			}
++			for (Provider provider : providers.values()) {
++				Artifact proof = provider.artifact();
++				if (proof.kind() != DefinitionKind.BODYPROOF) { continue; }
++				Provider concrete = providers.get(proof.providerKey());
++				if (concrete == null ||
++						(concrete.artifact().kind() != DefinitionKind.WRAPPER &&
++						 concrete.artifact().kind() != DefinitionKind.EXISTING) ||
++						!provider.owner().equals(concrete.owner()) ||
++						!proof.declaration().equals(concrete.artifact().declaration()) ||
++						!isQualifiedProof(proof.key(), proof.providerKey())) {
++					throw new IOException("Callable body proof lacks its exact concrete provider: " + proof.key());
++				}
++			}
++			for (var entry : bodies.entrySet()) {
++				for (Artifact artifact : entry.getValue().artifacts()) {
++					if (!artifact.required()) { continue; }
++					Provider provider = providers.get(artifact.key());
++					if (provider == null) { throw new IOException("Missing actual callable provider: " + artifact.key()); }
++					if (provider.artifact().kind() == DefinitionKind.BODYPROOF && !artifact.deferred()) {
++						throw new IOException("Required callable body proof must retain its deferred assumption: " + artifact.key());
++					}
++					edges.get(entry.getKey()).add(new Edge(provider.owner(), artifact.deferred()));
++				}
++			}
++			checkDeferredComponents(edges);
++			validated = true;
++		}
++		private static void checkDeferredComponents(Map<BodyId, List<Edge>> edges) throws IOException {
++			Map<BodyId, List<BodyId>> reverse = new HashMap<>();
++			for (BodyId id : edges.keySet()) { reverse.put(id, new ArrayList<>()); }
++			for (var entry : edges.entrySet()) { for (Edge edge : entry.getValue()) { reverse.get(edge.target()).add(entry.getKey()); } }
++			Set<BodyId> seen = new HashSet<>(); List<BodyId> order = new ArrayList<>();
++			Deque<BodyId> nodes = new ArrayDeque<>(); Deque<Iterator<Edge>> cursors = new ArrayDeque<>();
++			for (BodyId root : edges.keySet()) {
++				if (!seen.add(root)) { continue; }
++				nodes.push(root); cursors.push(edges.get(root).iterator());
++				while (!nodes.isEmpty()) {
++					if (cursors.peek().hasNext()) {
++						BodyId next = cursors.peek().next().target();
++						if (seen.add(next)) { nodes.push(next); cursors.push(edges.get(next).iterator()); }
++					}
++					else { order.add(nodes.pop()); cursors.pop(); }
++				}
++			}
++			Map<BodyId, Integer> component = new HashMap<>(); int number = 0;
++			for (int i = order.size() - 1; i >= 0; --i) {
++				BodyId root = order.get(i); if (component.containsKey(root)) { continue; }
++				component.put(root, number); nodes.push(root);
++				while (!nodes.isEmpty()) {
++					for (BodyId next : reverse.get(nodes.pop())) {
++						if (component.putIfAbsent(next, number) == null) { nodes.push(next); }
++					}
++				}
++				++number;
++			}
++			for (var entry : edges.entrySet()) { for (Edge edge : entry.getValue()) {
++				if (edge.deferred() && component.get(entry.getKey()).equals(component.get(edge.target()))) {
++					throw new IOException("Deferred callable assumption participates in a body cycle");
++				}
++			} }
++		}
++		/** Authenticate exact source revisions before excluding any Program definition. */
++		public Predicate<DataType> sourceOwnership(PcodeDataTypeManager manager) throws IOException {
++			if (!validated) { throw new IOException("Callable publication is not finalized"); }
++			Set<DataType> programRoots = Collections.newSetFromMap(new IdentityHashMap<>());
++			Map<Long, SourceIdentity> builtins = new HashMap<>();
++			Map<String, SourceIdentity> identities = new HashMap<>();
++			Map<SourceIdentity, SupportText> sourceOwners = new HashMap<>();
++			long revision = manager.getProgram().getModificationNumber();
++			for (Map<String, SupportText> group : List.of(prelude, types)) {
++				for (SupportText text : group.values()) { for (SourceIdentity source : text.sources()) {
++					if (source.program() != manager.getProgram().getUniqueProgramID() ||
++							(!source.kind().equals("builtin") && source.revision() != revision)) {
++						throw new IOException("Stale callable source revision");
++					}
++					String key = source.kind() + ':' + source.scope() + ':' + Long.toUnsignedString(source.id());
++					SourceIdentity prior = identities.putIfAbsent(key, source);
++					if (prior != null && !prior.equals(source)) { throw new IOException("Conflicting sized source identities"); }
++					SupportText priorOwner = sourceOwners.putIfAbsent(source, text);
++					if (priorOwner != null && !priorOwner.equals(text)) {
++						throw new IOException("Source identity has conflicting definition owners");
++					}
++					if (source.kind().equals("program")) {
++						DataType root = manager.getProgram().getDataTypeManager().getDataType(source.id());
++						if (root == null || !manager.getSourceIdentity(root, source.size()).equals(source)) { throw new IOException("Source receipt does not identify the Program root"); }
++						programRoots.add(root);
++					}
++					else if (source.kind().equals("builtin")) {
++						DataType root = manager.findBaseType("", source.id());
++						if (root == null || !sameBuiltin(source, manager.getSourceIdentity(root, source.size()))) {
++							throw new IOException("Builtin source layout no longer matches the actual producer");
++						}
++						builtins.put(source.id(), source);
++					}
++				} }
++			}
++			return type -> {
++				if (manager.getProgram().getModificationNumber() != revision) {
++					throw new IllegalStateException("Program changed during callable source publication");
++				}
++				if (programRoots.contains(type)) { return true; }
++				if (!(type instanceof ghidra.program.model.data.BuiltIn ||
++						type instanceof ghidra.program.model.data.DefaultDataType)) { return false; }
++				SourceIdentity owned = builtins.get(manager.getEncodedTypeId(type));
++				return owned != null && sameBuiltin(owned,
++					manager.getSourceIdentity(type, owned.size()));
++			};
++		}
++		private static boolean sameBuiltin(SourceIdentity old, SourceIdentity current) {
++			return old.kind().equals("builtin") && current.kind().equals("builtin") &&
++				old.program() == current.program() && old.id() == current.id() &&
++				old.size() == current.size() && old.scope().equals(current.scope()) &&
++				!old.binding().isEmpty() && old.binding().equals(current.binding());
++		}
++		private void ready() throws IOException { if (!validated) { throw new IOException("Callable publication is not finalized"); } }
++		public void writeTypes(Writer output) throws IOException {
++			ready(); for (SupportText value : prelude.values()) { output.write(value.text()); output.write('\n'); }
++			for (SupportText value : types.values()) { output.write(value.text()); output.write('\n'); }
++		}
++		public void writeDeclarations(Writer output, boolean emitGlobals) throws IOException {
++			ready(); if (emitGlobals) { for (SupportText value : globals.values()) { output.write(value.text()); output.write('\n'); } }
++			for (StoredBody body : bodies.values()) { output.write(body.declaration()); output.write('\n'); }
++			for (var entry : declarations.entrySet()) {
++				Provider provider = providers.get(entry.getKey());
++				if (provider != null && (provider.artifact().kind() == DefinitionKind.EXISTING ||
++						provider.artifact().kind() == DefinitionKind.BODYPROOF)) { continue; }
++				output.write(entry.getValue()); output.write('\n');
++			}
++		}
++		public void writeBodies(Writer output) throws IOException {
++			ready(); for (Provider provider : providers.values()) {
++				if (provider.artifact().kind() == DefinitionKind.WRAPPER) { output.write(provider.artifact().definition()); output.write('\n'); }
++			}
++			for (StoredBody body : bodies.values()) { output.write(readBody(body)); output.write('\n'); }
++		}
++		public void writeLegacyHeaders(Writer output) throws IOException {
++			ready(); output.write(legacyHeaders.toString());
++		}
++		public void writeLegacyBodies(Writer output, boolean emitGlobals) throws IOException {
++			ready();
++			if (emitGlobals) { for (String global : legacyGlobals) { output.write(global); output.write('\n'); } }
++			for (StoredFragment fragment : legacyBodies) {
++				byte[] bytes = new byte[fragment.length()]; spool.seek(fragment.offset()); spool.readFully(bytes);
++				output.write(new String(bytes, StandardCharsets.UTF_8)); output.write('\n');
++			}
++		}
++		@Override public void close() throws IOException {
++			try { spool.close(); } finally { Files.deleteIfExists(path); }
++		}
++	}
++}

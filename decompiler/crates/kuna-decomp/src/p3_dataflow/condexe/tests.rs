@@ -22,8 +22,8 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{Action, ActionGroupList, Rule};
-use crate::dtype::{type_metatype, Datatype};
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, Rule, RuleState};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
@@ -57,7 +57,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -71,8 +76,9 @@ fn const_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space(0).unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn opcode_flags(opc: OpCode) -> kuna_base::types::uint4 {
@@ -97,7 +103,8 @@ fn new_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// A formal input varnode (multiple descendants allowed).
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(size, Address::new(ram, off), dt(size));
+    let datatype = dt(fd, size);
+    let vn = fd.vbank_mut().create(size, Address::new(ram, off), datatype);
     let mut noop_thunk = |_b: &mut crate::varnode::VarnodeBank,
                           _o: VarnodeId,
                           _n: VarnodeId|
@@ -107,7 +114,8 @@ fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
 
 fn mk_const(fd: &mut Funcdata, val: u64, size: int4) -> VarnodeId {
     let c = const_space(fd);
-    fd.vbank_mut().create(size, Address::new(c, val), dt(size))
+    let datatype = dt(fd, size);
+    fd.vbank_mut().create(size, Address::new(c, val), datatype)
 }
 
 /// Output varnode defined by `op` (sets the `written` flag).  Distinct address
@@ -121,8 +129,9 @@ fn mk_out(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
                               _o: VarnodeId,
                               _n: VarnodeId|
          -> kuna_base::error::KunaResult<()> { panic!("mk_out: collision") };
+        let datatype = dt(fd, size);
         fd.vbank_mut()
-            .create_def(size, Address::new(ram, off), dt(size), def, &mut noop_thunk)
+            .create_def(size, Address::new(ram, off), datatype, def, &mut noop_thunk)
             .unwrap()
     };
     fd.obank_mut().get_mut(op).unwrap().set_output(Some(vn));
@@ -531,18 +540,6 @@ fn specs_lists_orpredicate_in_condexe_group() {
 }
 
 #[test]
-fn orpredicate_clone_filters_by_group() {
-    let rule = RuleOrPredicate::new("condexe");
-    // In-group => clones.
-    let mut gl = ActionGroupList::new();
-    gl.insert("condexe");
-    assert!(rule.clone_rule(&gl).is_some());
-    // Out-of-group => filtered out.
-    let other = ActionGroupList::from_names(["analysis"]);
-    assert!(rule.clone_rule(&other).is_none());
-}
-
-#[test]
 fn action_conditionalexe_clone_filters_by_group() {
     let act = ActionConditionalExe::new("condexe");
     assert_eq!(act.get_name(), "conditionalexe");
@@ -602,18 +599,10 @@ fn orpredicate_noop_on_nonpredicate_inputs() {
     assert_eq!(rule.apply_op(or, &mut fd), 0, "no predicate form => no change");
 }
 
-/// PIN the W6 opcode-resolution stub: building the predicate form and driving
-/// `applyOp` to the `opSetOpcode(op,CPUI_COPY)` step surfaces the documented
-/// `Err` from `resolve_typeop`; the public `apply_op` degrades it to 0.
-///
-/// We reach the single-form (`checkSingle`) path: `result = tmp1 | val2` where
-/// tmp1 = MULTIEQUAL(COPY(#0), val1) and val2 plays the (val2==0)?val1:0 role.
-/// The discovery succeeds through `opSetInput`/`opSetOpcode`; with the W6
-/// `resolve_typeop` stub now closed (it resolves through the canonical
-/// `typeop::type_op_for` op-info table), `apply_op_inner` runs the rewrite to
-/// completion and returns `Ok`.
+/// Registered membership controls the predicate rewrite, independently of the
+/// concrete constructor group.
 #[test]
-fn orpredicate_single_form_applies_w6_stub_closed() {
+fn orpredicate_registered_pool_rewrites_single_form() {
     let mut fd = build_fd();
     let condb = new_bb(&mut fd);
     let zero_bl = new_bb(&mut fd);
@@ -670,11 +659,26 @@ fn orpredicate_single_form_applies_w6_stub_closed() {
 
     fd.structure_reset();
 
-    let rule = RuleOrPredicate::new("condexe");
-    // apply_op_inner now runs to completion (the W6 resolve_typeop stub is closed).
-    let res = rule.apply_op_inner(or, &mut fd);
-    assert!(res.is_ok(), "discovery reaches opSetOpcode and now completes: {res:?}");
-    assert_eq!(res.unwrap(), 1, "the OR-predicate rewrite reports a change");
+    let mut pool = ActionPool::new(0, "predicate-pool");
+    pool.add_rule(
+        RuleState::new("registered-predicate", 0, "orpredicate"),
+        Box::new(RuleOrPredicate::new("condexe")),
+    );
+    assert!(pool.clone_filtered(&ActionGroupList::from_names(["condexe"])).is_none());
+    assert_eq!(fd.obank().get(or).unwrap().code(), OpCode::CPUI_INT_OR);
+    let mut selected = pool
+        .clone_filtered(&ActionGroupList::from_names(["registered-predicate"]))
+        .unwrap();
+    selected.reset(&mut fd);
+    let mut ctx = ActionContext::new();
+    assert_eq!(selected.perform(&mut fd, &mut ctx), 1);
+    assert!(!ctx.has_error());
+    let rewritten = fd.obank().get(or).unwrap();
+    assert_eq!(rewritten.code(), OpCode::CPUI_COPY);
+    assert_eq!(rewritten.num_input(), 1);
+    assert_eq!(rewritten.get_in(0), Some(tmp1));
+    assert_eq!(fd.obank().get(me).unwrap().get_in(0), Some(val2));
+    assert_eq!(fd.obank().get(me).unwrap().get_in(1), Some(val1));
 }
 
 /// `new_unique_out` (the `newUniqueOut`→`opSetOutput` helper): the

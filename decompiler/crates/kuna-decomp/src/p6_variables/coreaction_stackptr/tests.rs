@@ -64,7 +64,12 @@ fn build_fd() -> Funcdata {
     let sp_data = VarnodeStorage { space: Some(regspc), offset: SP_OFF, size: SP_SIZE as u32 };
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
 
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let code = Rc::clone(glb.manage().get_space_by_name("register").unwrap());
     let entry = Address::new(code, 0x1000);
     Funcdata::new("func", "func", glb, entry, 0x1000_0000, 0x40).unwrap()
@@ -497,6 +502,10 @@ fn adv_w10_rspelim_analyze_extrapop_known_defaultfp_suppresses_solve() {
 
     // Build an arch carrying a defaultfp with a KNOWN (non-unknown) extrapop.
     let mut arch = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    arch.types = Some(Rc::new(types));
     let mut fp = crate::fspec::ProtoModel::new(arch.manage());
     fp.set_extra_pop(0x20); // known: callee pops 0x20 bytes
     arch.defaultfp = Some(Rc::new(fp));
@@ -530,6 +539,10 @@ fn adv_w10_rspelim_analyze_extrapop_unknown_defaultfp_does_not_suppress() {
     manage.add_spacebase_pointer(&stackspc, &sp_data, SP_SIZE, true).unwrap();
 
     let mut arch = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    arch.types = Some(Rc::new(types));
     let mut fp = crate::fspec::ProtoModel::new(arch.manage());
     fp.set_extra_pop(EXTRAPOP_UNKNOWN); // explicitly unknown
     arch.defaultfp = Some(Rc::new(fp));

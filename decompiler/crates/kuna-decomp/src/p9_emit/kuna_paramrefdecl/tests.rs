@@ -52,12 +52,12 @@ fn scope_with_param_and_local() -> (ScopeLocal, Rc<AddrSpace>, SymbolId, SymbolI
     let param_addr = Address::new(ram(&m), 4);
     let usepoint = Address::new(ram(&m), 0x401570);
     let param = lm
-        .add_param_symbol(0, "a0", Rc::clone(&int4_t), &param_addr, &usepoint)
+        .add_param_symbol(0, "a0", int4_t.clone(), &param_addr, &usepoint, 0)
         .unwrap()
         .expect("param created");
     let local_addr = Address::new(ram(&m), 0x100);
     let local = lm
-        .add_symbol("v7", Rc::clone(&int4_t), &local_addr, &Address::new_invalid())
+        .add_symbol("v7", int4_t.clone(), &local_addr, &Address::new_invalid())
         .unwrap();
     (lm, ram(&m), param, local)
 }

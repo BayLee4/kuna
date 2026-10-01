@@ -23,7 +23,7 @@
 use kuna_base::error::{KunaError, KunaResult};
 
 use crate::architecture::Architecture;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::fspec::PrototypePieces;
 
 /// One call-site override the load-time resolver parked, with the answer it was
@@ -122,7 +122,7 @@ impl VarargAbi {
     /// May an override declare a variadic argument of type `ty`? `ptr_size` is
     /// the target's pointer width, the widest integer [`VarargAbi::Integer`]
     /// admits.
-    pub fn admits(self, ty: &Datatype, ptr_size: i32) -> bool {
+    pub fn admits(self, ty: &TypeRoot, ptr_size: i32) -> bool {
         match self {
             VarargAbi::Named => true,
             VarargAbi::Integer => {

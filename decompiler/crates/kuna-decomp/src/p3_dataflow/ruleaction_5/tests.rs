@@ -11,6 +11,7 @@
 use super::*;
 
 use std::rc::Rc;
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
 
 use kuna_base::address::{Address, SeqNum};
 use kuna_base::types::uint4;
@@ -18,7 +19,7 @@ use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, VarnodeId};
 use crate::varnode::DefOpInfo;
@@ -46,7 +47,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -56,8 +62,9 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 /// Minimal flag bits for input ops in the test fixtures (so def ops carry the
@@ -97,7 +104,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// A free register varnode at `off` of size `s`.
 fn mk_vn(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(s, Address::new(ram, off), dt(s))
+    let datatype = dt(fd, s);
+    fd.vbank_mut().create(s, Address::new(ram, off), datatype)
 }
 
 /// A formal-input register varnode at `off` of size `s`: non-free and
@@ -106,7 +114,8 @@ fn mk_vn(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
 /// (`avn->isFree()` / `isHeritageKnown`).
 fn mk_input(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(s, Address::new(ram, off), dt(s));
+    let datatype = dt(fd, s);
+    let vn = fd.vbank_mut().create(s, Address::new(ram, off), datatype);
     fd.vbank_mut().set_input(vn, &mut |_b, _a, _c| Ok(())).expect("set_input")
 }
 
@@ -158,9 +167,17 @@ fn boolnegate_flips_def_and_copies_negates() {
     let op2 = mk_op(&mut fd, 1, 0x120, OpCode::CPUI_BOOL_NEGATE);
     fd.op_set_input(op2, vn, 0).unwrap();
 
-    let mut rule = RuleBoolNegate::new("analysis");
-    let res = rule.apply_op(op, &mut fd);
-    assert_eq!(res, 1);
+    for live in [flip, op, op2] {
+        fd.obank_mut().mark_alive(live);
+    }
+    let mut pool = ActionPool::new(0, "boolnegate");
+    pool.add_rule(
+        RuleState::new("registered", 0, "boolnegate"),
+        Box::new(RuleBoolNegate::new("analysis")),
+    );
+    assert!(pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).is_none());
+    let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["registered"])).unwrap();
+    assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
     // flip_op INT_EQUAL -> INT_NOTEQUAL (get_booleanflip, no reorder)
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_NOTEQUAL);
     // both negates become COPY
@@ -771,18 +788,6 @@ fn op_lists_match_cpp() {
         vec![OpCode::CPUI_LOAD, OpCode::CPUI_STORE]
     );
     assert_eq!(RulePushPtr::new("g").get_op_list(), vec![OpCode::CPUI_INT_ADD]);
-}
-
-#[test]
-fn clone_filters_by_group() {
-    let inlist = ActionGroupList::from_names(["analysis"]);
-    let empty = ActionGroupList::new();
-    assert!(RuleBoolNegate::new("analysis").clone_rule(&inlist).is_some());
-    assert!(RuleBoolNegate::new("analysis").clone_rule(&empty).is_none());
-    // pointer rules belong to typerecovery
-    let tr = ActionGroupList::from_names(["typerecovery"]);
-    assert!(RulePtrArith::new("typerecovery").clone_rule(&tr).is_some());
-    assert!(RulePtrArith::new("typerecovery").clone_rule(&inlist).is_none());
 }
 
 #[test]

@@ -39,7 +39,7 @@
 //! what a `_Bool` parameter looks like from the inside.
 //!
 //! The candidate is FOLDED into the same `getLocalType` fold by
-//! `Datatype::type_order`, never installed as a replacement: `SUB_BOOL` is 10 and
+//! `TypeRoot::type_order`, never installed as a replacement: `SUB_BOOL` is 10 and
 //! beats `SUB_INT_CHAR` 19 and `SUB_UINT_PLAIN` 16, so `bool` wins over `char` and
 //! `uint1` -- and loses to anything more specific, such as a callee's locked
 //! parameter type.  Nothing else in the type system changes: the `TYPE_BOOL`
@@ -52,10 +52,9 @@
 //! reachable.
 
 use std::collections::{HashSet, VecDeque};
-use std::rc::Rc;
 
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use kuna_num::opcodes::OpCode;
 use kuna_base::address::calc_mask;
@@ -88,8 +87,8 @@ enum Use {
 pub fn truth_value_type(
     data: &Funcdata,
     vn: VarnodeId,
-    cur: &Rc<Datatype>,
-) -> Option<Rc<Datatype>> {
+    cur: &TypeRoot,
+) -> Option<TypeRoot> {
     if !data.get_arch().bool_byte {
         return None;
     }
@@ -154,7 +153,7 @@ pub fn truth_value_type(
 
 /// Whether the candidate `cand` is more specific than the current vote `cur`,
 /// the same fold `getLocalType` applies to every other candidate.
-pub fn folds_over(cand: &Rc<Datatype>, cur: &Rc<Datatype>) -> bool {
+pub fn folds_over(cand: &TypeRoot, cur: &TypeRoot) -> bool {
     0 > cand.type_order(cur).unwrap_or(0)
 }
 
@@ -427,8 +426,8 @@ pub enum TruncationForm {
 /// SUBPIECE.  Inert with the option off.
 pub fn truncation_form(
     enabled: bool,
-    outtype: &Rc<Datatype>,
-    intype: &Rc<Datatype>,
+    outtype: &TypeRoot,
+    intype: &TypeRoot,
     offset: u32,
     out_size: i32,
     in_nz_mask: impl FnOnce() -> u64,

@@ -435,6 +435,75 @@ mod engine {
     }
 
     #[test]
+    fn trait_queue_error_is_reported_at_flush_and_document_can_restart() {
+        let mut pp = EmitPrettyPrint::new();
+        // An indent end without a group fails while scanning, before flush.
+        pp.stop_indent(0);
+        pp.print("must not leak", SyntaxHighlight::NoColor);
+        assert!(pp.flush().unwrap_err().is_lowlevel());
+        pp.set_output_stream();
+        case_a(&mut pp);
+        pp.flush().unwrap();
+        assert_eq!(pp.output(), "a = b;");
+    }
+
+    #[test]
+    fn wrapped_markup_capture_tracks_committed_lines_and_host_field_identity() {
+        use kuna_base::marshal::{Decoder, PackedDecode};
+        use kuna_base::space::AddrSpaceManager;
+        for (width, expected_line) in [(20, 2), (100, 1)] {
+            let mut pp = EmitPrettyPrint::new();
+            pp.set_max_line_size(width).unwrap();
+            pp.set_markup(true);
+            if let LowLevel::Markup(e) = pp.lowlevel_mut() {
+                e.set_capture_tokens(true);
+            }
+            let group = pp.begin_document();
+            pp.tag_line();
+            pp.tag_variable("long_variable", SyntaxHighlight::VarColor,
+                &MarkupRef { opref: Some(17), varref: Some(9), ..MarkupRef::none() });
+            pp.spaces(1, 0);
+            pp.tag_op("+", SyntaxHighlight::NoColor, &MarkupRef::op(Some(17)));
+            pp.spaces(1, 0);
+            pp.tag_field("next_member", SyntaxHighlight::NoColor, 8,
+                &MarkupRef { type_name: Some("Node".into()),
+                    type_id: Some(72_057_594_037_927_936), opref: Some(17),
+                    ..MarkupRef::none() });
+            pp.end_document(group);
+            pp.flush().unwrap();
+            let LowLevel::Markup(e) = pp.lowlevel_mut() else { unreachable!() };
+            let tokens = e.take_tokens();
+            let member = tokens.iter().find(|token| token.kind == TokenKind::Field).unwrap();
+            assert_eq!(member.line, expected_line);
+            assert_eq!(member.opref, Some(17));
+            assert_eq!(member.text, "next_member");
+            assert!(e.take_provenance().associations.iter()
+                .any(|entry| entry.line_number == expected_line && entry.opref == Some(17)));
+
+            let bytes = e.take_output();
+            let manager = AddrSpaceManager::new();
+            let mut decoder = PackedDecode::new(&manager);
+            decoder.ingest_stream(&bytes).unwrap();
+            let root = decoder.open_element().unwrap();
+            let mut member_metadata = None;
+            while decoder.peek_element().unwrap() != 0 {
+                let element = decoder.open_element().unwrap();
+                if element == ids::ELEM_FIELD.get_id() {
+                    member_metadata = Some((
+                        decoder.read_string_id(&ids::ATTRIB_NAME).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_ID).unwrap(),
+                        decoder.read_signed_integer_id(&ids::ATTRIB_OFF).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_OPREF).unwrap(),
+                    ));
+                }
+                decoder.close_element_skipping(element).unwrap();
+            }
+            decoder.close_element(root).unwrap();
+            assert_eq!(member_metadata, Some((b"Node".to_vec(), 72_057_594_037_927_936, 8, 17)));
+        }
+    }
+
+    #[test]
     fn bad_max_line_size_rejected() {
         let mut pp = EmitPrettyPrint::new();
         assert!(pp.set_max_line_size_pretty(19).is_err());
@@ -726,5 +795,196 @@ mod capture {
         drive(&mut markup, &spc);
         markup.set_output_stream();
         assert!(markup.take_tokens().is_empty());
+    }
+}
+
+mod type_identity {
+    use super::*;
+    use crate::kuna_langtypes::{TypeSpan, TypeText, TypeTokenPolicy};
+    use kuna_base::marshal::{Decoder, PackedDecode};
+    use kuna_base::space::AddrSpaceManager;
+
+    fn leaf(text: &str, id: u64) -> TypeText {
+        TypeText { text: text.into(), spans: vec![TypeSpan {
+            start: 0, end: text.len(), id, policy: TypeTokenPolicy::NominalName,
+        }] }
+    }
+
+    fn wire_types(bytes: &[u8]) -> Vec<(String, Option<u64>)> {
+        fn visit(decoder: &mut PackedDecode<'_>, types: &mut Vec<(String, Option<u64>)>) {
+            let element = decoder.open_element().unwrap();
+            if element == ids::ELEM_TYPE.get_id() {
+                let mut name = String::new();
+                let mut id = None;
+                loop {
+                    let attr = decoder.get_next_attribute_id().unwrap();
+                    if attr == 0 { break; }
+                    if attr == ids::ATTRIB_CONTENT.get_id() {
+                        name = String::from_utf8(decoder.read_string().unwrap()).unwrap();
+                    } else if attr == ids::ATTRIB_ID.get_id() {
+                        id = Some(decoder.read_unsigned_integer().unwrap());
+                    }
+                }
+                types.push((name, id));
+            }
+            while decoder.peek_element().unwrap() != 0 { visit(decoder, types); }
+            decoder.close_element(element).unwrap();
+        }
+        let manager = AddrSpaceManager::new();
+        let mut decoder = PackedDecode::new(&manager);
+        decoder.ingest_stream(bytes).unwrap();
+        let mut types = Vec::new();
+        visit(&mut decoder, &mut types);
+        types
+    }
+
+    #[test]
+    fn atomic_names_bind_wire_leaves_without_changing_raw_captures() {
+        let mut front = leaf("Node *64 __((offset(0x8)))", 11);
+        front.push_str(" *");
+        let mut back = TypeText::plain(")(");
+        back.append(leaf("Other alias", 22));
+        back.push_str(" *, ");
+        back.append(leaf("Transform (next)", 33));
+        back.push_str(")");
+        let markup = MarkupRef {
+            type_id: Some(999), type_name: Some("existing capture metadata".into()),
+            opref: Some(17), varref: Some(9), ..MarkupRef::none()
+        };
+        let mut raw = EmitMarkup::new();
+        raw.set_capture_tokens(true);
+        let doc = raw.begin_document();
+        raw.print("\u{1f600} ", SyntaxHighlight::NoColor);
+        raw.tag_type(&front.text, SyntaxHighlight::TypeColor, &markup);
+        raw.print(&back.text, SyntaxHighlight::NoColor);
+        raw.end_document(doc);
+        let expected_capture = raw.take_tokens();
+
+        let mut annotated = EmitMarkup::new();
+        annotated.set_capture_tokens(true);
+        let doc = annotated.begin_document();
+        annotated.print("\u{1f600} ", SyntaxHighlight::NoColor);
+        let (text, spans) = front.into_parts();
+        annotated.tag_type_text(&text, SyntaxHighlight::TypeColor, &markup, spans, TypeTextOrigin::Type);
+        let (text, spans) = back.into_parts();
+        annotated.tag_type_text(&text, SyntaxHighlight::NoColor, &markup, spans, TypeTextOrigin::Syntax);
+        annotated.end_document(doc);
+        let captured = annotated.take_tokens();
+        assert_eq!(captured, expected_capture);
+        assert_eq!(captured[1].col, 3, "UTF-16 display columns are independent of UTF-8 spans");
+        assert_eq!(captured[2].kind, TokenKind::Syntax);
+        assert_eq!(wire_types(&annotated.take_output()), vec![
+            ("Node *64 __((offset(0x8)))".into(), Some(11)),
+            ("Other alias".into(), Some(22)), ("Transform (next)".into(), Some(33)),
+        ]);
+    }
+
+    #[test]
+    fn c_spelling_distinguishes_builtin_words_from_nominal_pointer_array_names() {
+        use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+        use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_core_type("uint8", 8, type_metatype::TYPE_UINT, false).unwrap();
+        types.cache_core_types().unwrap();
+        let integer = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
+        let alias = types.get_typedef(&integer, "Counter alias (v2)", 0x101, 0).unwrap();
+        let array = types.get_type_array(2, alias).unwrap();
+        let alias_pointer = types.get_type_pointer(8, array, 1).unwrap();
+        let integer_pointer = types.get_type_pointer(8, integer.clone(), 1).unwrap();
+        let cx = SpellCtx { ctypes: true, ..SpellCtx::OFF };
+        let mut markup = EmitMarkup::new();
+        let doc = markup.begin_document();
+        for root in [&integer_pointer, &alias_pointer] {
+            let (front, back) = crate::kuna_langc::C_SPELLER.declarator_annotated(&cx, root, true);
+            let plain = crate::kuna_langc::C_SPELLER.declarator(&cx, root);
+            assert_eq!((&front.text, &back.text), (&plain.0, &plain.1));
+            let (text, spans) = front.into_parts();
+            markup.tag_type_text(&text, SyntaxHighlight::TypeColor, &MarkupRef::none(),
+                spans, TypeTextOrigin::Type);
+            markup.tag_variable("p", SyntaxHighlight::VarColor, &MarkupRef::none());
+            let (text, spans) = back.into_parts();
+            markup.tag_type_text(&text, SyntaxHighlight::NoColor, &MarkupRef::none(),
+                spans, TypeTextOrigin::Syntax);
+            markup.print(";", SyntaxHighlight::NoColor);
+        }
+        markup.end_document(doc);
+        let integer_id = integer.get_unsized_id().unwrap();
+        assert_eq!(wire_types(&markup.take_output()), vec![
+            ("unsigned".into(), Some(integer_id)), ("long".into(), Some(integer_id)),
+            ("Counter alias (v2)".into(), Some(0x101)),
+        ]);
+    }
+
+    #[test]
+    fn atomic_boundaries_do_not_depend_on_ids_or_adjacent_lexical_runs() {
+        let mut text = TypeText::plain("unsigned ");
+        text.append(leaf("No ID (name)", 0));
+        text.append(leaf("Next name", 22));
+        text.push_str(" long");
+        let mut markup = EmitMarkup::new();
+        let doc = markup.begin_document();
+        let (text, spans) = text.into_parts();
+        markup.tag_type_text(&text, SyntaxHighlight::TypeColor,
+            &MarkupRef { type_id: Some(999), ..MarkupRef::none() },
+            spans, TypeTextOrigin::Type);
+        markup.end_document(doc);
+        assert_eq!(wire_types(&markup.take_output()), vec![
+            ("unsigned".into(), None), ("No ID (name)".into(), None),
+            ("Next name".into(), Some(22)), ("long".into(), None),
+        ]);
+    }
+
+    #[test]
+    fn rust_type_paths_remain_language_grammar_in_host_markup() {
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+        let types = TypeFactoryImpl::new();
+        let record = types.get_type_struct("module::Record").unwrap();
+        let pointer = types.get_type_pointer(8, record.clone(), 1).unwrap();
+        let cx = SpellCtx { lang: crate::kuna_lang::OutLang::Rust, ..SpellCtx::OFF };
+        let (front, _) = crate::kuna_rusttypes::RUST_SPELLER.declarator_annotated(&cx, &pointer, true);
+        assert_eq!(front.text, "*mut module::Record");
+        let (text, spans) = front.into_parts();
+        let mut markup = EmitMarkup::new();
+        let doc = markup.begin_document();
+        markup.tag_type_text(&text, SyntaxHighlight::TypeColor, &MarkupRef::none(),
+            spans, TypeTextOrigin::Type);
+        markup.end_document(doc);
+        let id = record.get_unsized_id().unwrap();
+        assert_eq!(wire_types(&markup.take_output()), vec![
+            ("mut".into(), None), ("module".into(), Some(id)), ("Record".into(), Some(id)),
+        ]);
+    }
+
+    #[test]
+    fn queue_wrap_replaces_annotations_on_type_and_syntax_slots() {
+        let mut pp = EmitPrettyPrint::new();
+        pp.set_max_line_size(20).unwrap();
+        pp.set_markup(true);
+        let doc = pp.begin_document();
+        let mut expected = Vec::new();
+        for index in 0..180 {
+            match index % 4 {
+                0 | 2 => {
+                    let id = 700 + index;
+                    let (text, spans) = leaf("Leaf name", id).into_parts();
+                    let origin = if index % 4 == 0 { TypeTextOrigin::Type } else { TypeTextOrigin::Syntax };
+                    pp.tag_type_text(&text, SyntaxHighlight::TypeColor, &MarkupRef::none(), spans, origin);
+                    expected.push(("Leaf name".into(), Some(id)));
+                }
+                1 => {
+                    pp.tag_type("Leaf name", SyntaxHighlight::TypeColor, &MarkupRef::none());
+                    expected.push(("Leaf".into(), None));
+                    expected.push(("name".into(), None));
+                }
+                _ => pp.print("Leaf name", SyntaxHighlight::NoColor),
+            }
+            pp.spaces(1, 0);
+        }
+        pp.end_document(doc);
+        pp.flush().unwrap();
+        let LowLevel::Markup(markup) = pp.lowlevel_mut() else { unreachable!() };
+        assert_eq!(wire_types(&markup.take_output()), expected);
     }
 }

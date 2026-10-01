@@ -41,7 +41,7 @@ use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
 use crate::cover::{Cover, CoverPoint, PcodeOpSet};
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 use crate::expression::PcodeOpNode;
 use crate::funcdata::Funcdata;
 use crate::merge::{AddrTiedRange, HighGroupInfo, MergeContext, MergePieceId};
@@ -82,7 +82,7 @@ impl HighContext for Funcdata {
         VarnodeView {
             flags: v.get_flags(),
             size: v.get_size(),
-            type_: Rc::clone(v.get_type()),
+            type_: v.get_type().clone(),
             type_lock: v.is_type_lock(),
             merge_group: v.get_merge_group(),
             written: v.is_written(),
@@ -306,12 +306,14 @@ impl MergeContext for Funcdata {
     fn high_is_type_lock(&mut self, high: HighVariableId) -> bool {
         self.with_high_split(|hb, ctx| hb.get_mut(high).map(|h| h.is_type_lock(ctx, None)).unwrap_or(false))
     }
-    fn high_get_type(&mut self, high: HighVariableId) -> Rc<Datatype> {
+    fn high_get_type(&mut self, high: HighVariableId) -> TypeRoot {
         self.with_high_split(|hb, ctx| {
             hb.get_mut(high)
                 .map(|h| h.get_type(ctx, None))
-                .unwrap_or_else(|| Rc::new(Datatype::new(1, crate::dtype::type_metatype::TYPE_UNKNOWN)))
         })
+        .unwrap_or_else(|| self.get_arch().types().expect("merge requires type factory")
+            .get_base(1, crate::dtype::type_metatype::TYPE_UNKNOWN)
+            .expect("merge unknown type must be available"))
     }
     fn high_is_addr_tied(&mut self, high: HighVariableId) -> bool {
         self.with_high_split(|hb, ctx| hb.get_mut(high).map(|h| h.is_addr_tied(ctx)).unwrap_or(false))
@@ -791,10 +793,10 @@ impl MergeContext for Funcdata {
     fn op_previous(&self, op: OpId) -> Option<OpId> {
         self.op_previous_op(op)
     }
-    fn op_output_type_local(&self, op: OpId) -> Rc<Datatype> {
+    fn op_output_type_local(&self, op: OpId) -> TypeRoot {
         self.op_output_type_local_pub(op)
     }
-    fn op_input_type_local(&self, op: OpId, slot: int4) -> Rc<Datatype> {
+    fn op_input_type_local(&self, op: OpId, slot: int4) -> TypeRoot {
         self.op_input_type_local_pub(op, slot)
     }
     fn op_cover_point(&self, op: OpId) -> (int4, CoverPoint) {

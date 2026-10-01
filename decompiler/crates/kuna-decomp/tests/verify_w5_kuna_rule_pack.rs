@@ -34,7 +34,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use kuna_decomp::action::Rule;
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::kuna_addcarrychain::RuleAddCarryChain;
 use kuna_decomp::kuna_arraystride::RuleArrayStride;
@@ -66,7 +66,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -76,8 +83,8 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -124,7 +131,7 @@ fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_byte(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op_dead(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(1, &Address::new(r, off), Some(unk(1)));
+    let vn = fd.new_varnode(1, &Address::new(r, off), Some(unk(fd, 1)));
     set_def(fd, vn, defop)
 }
 
@@ -148,7 +155,7 @@ fn mk_induction_phi(
     self_first: bool,
 ) -> (OpId, VarnodeId) {
     let phi = mk_op_dead(fd, base_off, 2, OpCode::CPUI_MULTIEQUAL);
-    let out = fd.new_unique(sz, Some(unk(sz)));
+    let out = fd.new_unique(sz, Some(unk(fd, sz)));
     let out = set_def(fd, out, phi);
     // back-edge add
     let add = mk_op_dead(fd, base_off + 8, 2, OpCode::CPUI_INT_ADD);
@@ -160,7 +167,7 @@ fn mk_induction_phi(
         wire(fd, step_c, add, 0);
         wire(fd, out, add, 1);
     }
-    let add_out = fd.new_unique(sz, Some(unk(sz)));
+    let add_out = fd.new_unique(sz, Some(unk(fd, sz)));
     let add_out = set_def(fd, add_out, add);
     let zero = fd.new_constant(sz, 0);
     wire(fd, zero, phi, init_slot);
@@ -181,7 +188,7 @@ fn w5_arraystride_swapped_sibling_edges_decline() {
     // External reader of acc so a successful fold would be observable.
     let reader = mk_op_dead(&mut fd, 0x130, 1, OpCode::CPUI_COPY);
     wire(&mut fd, acc_out, reader, 0);
-    let rout = fd.new_unique(4, Some(unk(4)));
+    let rout = fd.new_unique(4, Some(unk(&fd, 4)));
     let _ = set_def(&mut fd, rout, reader);
     // Sibling counter with SWAPPED edges (init slot 1, back slot 0).
     let (_cnt_phi, _cnt_out) = mk_induction_phi(&mut fd, bl, 0x110, 4, 1, 1, 0, true);
@@ -208,7 +215,7 @@ fn w5_arraystride_commuted_back_edge_add_folds() {
         mk_induction_phi(&mut fd, bl, 0x100, 4, 0x10, 0, 1, /*self_first=*/ false);
     let reader = mk_op_dead(&mut fd, 0x130, 1, OpCode::CPUI_COPY);
     wire(&mut fd, acc_out, reader, 0);
-    let rout = fd.new_unique(4, Some(unk(4)));
+    let rout = fd.new_unique(4, Some(unk(&fd, 4)));
     let _ = set_def(&mut fd, rout, reader);
     let (_cnt_phi, cnt_out) =
         mk_induction_phi(&mut fd, bl, 0x110, 4, 1, 0, 1, /*self_first=*/ false);
@@ -248,19 +255,19 @@ fn build_piece_with_carry(
     let loadd = mk_op_dead(fd, 0x100, 2, OpCode::CPUI_INT_ADD);
     wire(fd, a, loadd, 0);
     wire(fd, b, loadd, 1);
-    let lovn = fd.new_unique(1, Some(unk(1)));
+    let lovn = fd.new_unique(1, Some(unk(fd, 1)));
     let lovn = set_def(fd, lovn, loadd);
     // hi = INT_ADD(hipart, carry)
     let hiadd = mk_op_dead(fd, 0x110, 2, OpCode::CPUI_INT_ADD);
     wire(fd, hipart, hiadd, 0);
     wire(fd, carryvn, hiadd, 1);
-    let hivn = fd.new_unique(1, Some(unk(1)));
+    let hivn = fd.new_unique(1, Some(unk(fd, 1)));
     let hivn = set_def(fd, hivn, hiadd);
     // op = PIECE(hi, lo)
     let op = mk_op_dead(fd, 0x118, 2, OpCode::CPUI_PIECE);
     wire(fd, hivn, op, 0);
     wire(fd, lovn, op, 1);
-    let out = fd.new_unique(2, Some(unk(2)));
+    let out = fd.new_unique(2, Some(unk(fd, 2)));
     let _ = set_def(fd, out, op);
     fd.op_insert(op, bl, None);
     op
@@ -278,7 +285,7 @@ fn w5_addcarrychain_commuted_int_carry_operands_fold() {
     let carryop = mk_op_dead(&mut fd, 0x108, 2, OpCode::CPUI_INT_CARRY);
     wire(&mut fd, b, carryop, 0); // swapped: b first
     wire(&mut fd, a, carryop, 1);
-    let carryvn = fd.new_unique(1, Some(unk(1)));
+    let carryvn = fd.new_unique(1, Some(unk(&fd, 1)));
     let carryvn = set_def(&mut fd, carryvn, carryop);
 
     let op = build_piece_with_carry(&mut fd, bl, a, b, hipart, carryvn);
@@ -323,22 +330,22 @@ fn w5_addcarrychain_carryelim_const_baselo_dedups_and_completes() {
     let leop = mk_op_dead(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
     wire(&mut fd, negc_c, leop, 0);
     wire(&mut fd, b, leop, 1);
-    let carryvn = fd.new_unique(1, Some(unk(1)));
+    let carryvn = fd.new_unique(1, Some(unk(&fd, 1)));
     let carryvn = set_def(&mut fd, carryvn, leop);
     let loadd = mk_op_dead(&mut fd, 0x100, 2, OpCode::CPUI_INT_ADD);
     wire(&mut fd, a_const, loadd, 0); // constant low-add operand (a / cAdd)
     wire(&mut fd, b, loadd, 1);
-    let lovn = fd.new_unique(1, Some(unk(1)));
+    let lovn = fd.new_unique(1, Some(unk(&fd, 1)));
     let lovn = set_def(&mut fd, lovn, loadd);
     let hiadd = mk_op_dead(&mut fd, 0x110, 2, OpCode::CPUI_INT_ADD);
     wire(&mut fd, hipart, hiadd, 0);
     wire(&mut fd, carryvn, hiadd, 1);
-    let hivn = fd.new_unique(1, Some(unk(1)));
+    let hivn = fd.new_unique(1, Some(unk(&fd, 1)));
     let hivn = set_def(&mut fd, hivn, hiadd);
     let op = mk_op_dead(&mut fd, 0x118, 2, OpCode::CPUI_PIECE);
     wire(&mut fd, hivn, op, 0);
     wire(&mut fd, lovn, op, 1);
-    let out = fd.new_unique(2, Some(unk(2)));
+    let out = fd.new_unique(2, Some(unk(&fd, 2)));
     let _ = set_def(&mut fd, out, op);
     fd.op_insert(op, bl, None);
 
@@ -372,7 +379,7 @@ fn w5_addcarrychain_carryelim_wrong_negc_declines() {
     let leop = mk_op_dead(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
     wire(&mut fd, wrong_c, leop, 0);
     wire(&mut fd, a, leop, 1);
-    let carryvn = fd.new_unique(1, Some(unk(1)));
+    let carryvn = fd.new_unique(1, Some(unk(&fd, 1)));
     let carryvn = set_def(&mut fd, carryvn, leop);
 
     let op = build_piece_with_carry(&mut fd, bl, a, b_const, hipart, carryvn);
@@ -401,7 +408,7 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
     let r = ram(&fd);
     // V (a written value)
     let vdef = mk_op_dead(&mut fd, 0x40, 1, OpCode::CPUI_COPY);
-    let v = fd.new_varnode(sz, &Address::new(Rc::clone(&r), 0x40), Some(unk(sz)));
+    let v = fd.new_varnode(sz, &Address::new(Rc::clone(&r), 0x40), Some(unk(&fd, sz)));
     let v = set_def(&mut fd, v, vdef);
 
     // helper: build R = INT_ADD(V, #5).  Each add owns a fresh K constant (a
@@ -412,7 +419,7 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
         let kc = fd.new_constant(sz, 5);
         wire(fd, v, add, 0);
         wire(fd, kc, add, 1);
-        let o = fd.new_unique(sz, Some(unk(sz)));
+        let o = fd.new_unique(sz, Some(unk(fd, sz)));
         set_def(fd, o, add)
     };
     let r1 = mk_add(&mut fd, 0x100);
@@ -423,7 +430,7 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
     let zero = fd.new_constant(sz, 0);
     wire(&mut fd, r1, sless0, 0);
     wire(&mut fd, zero, sless0, 1);
-    let in0 = fd.new_unique(1, Some(unk(1)));
+    let in0 = fd.new_unique(1, Some(unk(&fd, 1)));
     let in0 = set_def(&mut fd, in0, sless0);
 
     // slessHi = INT_SLESS(C, R2)  with C = 7 (NOT -1)
@@ -431,27 +438,27 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
     let slesshi = mk_op_dead(&mut fd, 0x118, 2, OpCode::CPUI_INT_SLESS);
     wire(&mut fd, bad_c, slesshi, 0);
     wire(&mut fd, r2, slesshi, 1);
-    let hi = fd.new_unique(1, Some(unk(1)));
+    let hi = fd.new_unique(1, Some(unk(&fd, 1)));
     let hi = set_def(&mut fd, hi, slesshi);
 
     // signTest: any written boolean (unused by the rewrite)
     let sign = mk_op_dead(&mut fd, 0x120, 1, OpCode::CPUI_COPY);
     wire(&mut fd, v, sign, 0);
-    let signo = fd.new_unique(1, Some(unk(1)));
+    let signo = fd.new_unique(1, Some(unk(&fd, 1)));
     let signo = set_def(&mut fd, signo, sign);
 
     // andop = BOOL_AND(signTest, slessHi)
     let andop = mk_op_dead(&mut fd, 0x128, 2, OpCode::CPUI_BOOL_AND);
     wire(&mut fd, signo, andop, 0);
     wire(&mut fd, hi, andop, 1);
-    let in1 = fd.new_unique(1, Some(unk(1)));
+    let in1 = fd.new_unique(1, Some(unk(&fd, 1)));
     let in1 = set_def(&mut fd, in1, andop);
 
     // op = INT_NOTEQUAL(in0, in1)
     let op = mk_op_live(&mut fd, 0x130, 2, OpCode::CPUI_INT_NOTEQUAL);
     wire(&mut fd, in0, op, 0);
     wire(&mut fd, in1, op, 1);
-    let oout = fd.new_unique(1, Some(unk(1)));
+    let oout = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, oout, op);
 
     let mut rule = RuleOvLessSimplify::new(true);
@@ -479,7 +486,7 @@ fn w5_booleanmask_byte_aligned_shift_declines() {
     let sa = fd.new_constant(2, 8);
     fd.obank_mut().get_mut(leftshift).unwrap().set_input(Some(boolvn), 0); // shared const
     wire(&mut fd, sa, leftshift, 1);
-    let shiftout = fd.new_unique(2, Some(unk(2)));
+    let shiftout = fd.new_unique(2, Some(unk(&fd, 2)));
     let shiftout = set_def(&mut fd, shiftout, leftshift);
 
     // op = INT_SRIGHT(shiftout, 8)
@@ -487,7 +494,7 @@ fn w5_booleanmask_byte_aligned_shift_declines() {
     let sa2 = fd.new_constant(2, 8);
     wire(&mut fd, shiftout, op, 0);
     wire(&mut fd, sa2, op, 1);
-    let out = fd.new_unique(2, Some(unk(2)));
+    let out = fd.new_unique(2, Some(unk(&fd, 2)));
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignShift::new(true);

@@ -53,7 +53,7 @@ use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, intb, uint4, uint8, uintb, Wrap};
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 
 // ===========================================================================
 // RangeType + RangeHint flag constants (varmap.hh:95-104)
@@ -104,7 +104,7 @@ pub struct RangeHint {
     /// A signed version of the starting offset (C++ `sstart`).
     pub sstart: intb,
     /// Putative data-type for a single element of this range (C++ `type`).
-    pub type_: Rc<Datatype>,
+    pub type_: TypeRoot,
     /// Additional boolean properties of this range (C++ `flags`).
     pub flags: uint4,
     /// The type of range (C++ `rangeType`).
@@ -121,7 +121,7 @@ impl RangeHint {
         st: uintb,
         sz: int4,
         sst: intb,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         fl: uint4,
         rt: RangeType,
         hi: int4,
@@ -198,7 +198,7 @@ impl RangeHint {
         }
 
         // Walk down `a`'s subtypes until the align-size no longer exceeds `b`'s.
-        let mut sub: Option<Rc<Datatype>> = Some(Rc::clone(&a.type_));
+        let mut sub: Option<TypeRoot> = Some(a.type_.clone());
         let b_align = b.type_.get_align_size();
         while let Some(cur) = sub.clone() {
             if cur.get_align_size() <= b_align {
@@ -328,13 +328,13 @@ impl RangeHint {
         if self.highind < 0 {
             return false;
         }
-        let mut settype = Rc::clone(&self.type_); // Assume we will keep this data-type
+        let mut settype = self.type_.clone(); // Assume we will keep this data-type
         if settype.get_align_size() != b.type_.get_align_size() {
             return false;
         }
-        if !Rc::ptr_eq(&settype, &b.type_) {
-            let mut a_test_type = Rc::clone(&self.type_);
-            let mut b_test_type = Rc::clone(&b.type_);
+        if settype != b.type_ {
+            let mut a_test_type = self.type_.clone();
+            let mut b_test_type = b.type_.clone();
             while a_test_type.get_metatype() == type_metatype::TYPE_PTR {
                 if b_test_type.get_metatype() != type_metatype::TYPE_PTR {
                     break;
@@ -360,12 +360,12 @@ impl RangeHint {
             // The middle three branches are all "keep settype"; collapsed here
             // (the empty C++ blocks would trip clippy's `if_same_then_else`).
             if am == type_metatype::TYPE_UNKNOWN {
-                settype = Rc::clone(&b.type_);
+                settype = b.type_.clone();
             } else {
                 let keep = bm == type_metatype::TYPE_UNKNOWN
                     || (am == type_metatype::TYPE_INT && bm == type_metatype::TYPE_UINT)
                     || (am == type_metatype::TYPE_UINT && bm == type_metatype::TYPE_INT);
-                if !keep && !Rc::ptr_eq(&a_test_type, &b_test_type) {
+                if !keep && a_test_type != b_test_type {
                     // If they are both not unknown, they must be the same
                     return false;
                 }
@@ -464,10 +464,12 @@ impl RangeHint {
         // Check for really problematic cases
         if !did_reconcile && self.is_type_lock() {
             if b.is_type_lock() {
+                let self_view = self.type_.read();
+                let b_view = b.type_.read();
                 return Err(KunaError::lowlevel(format!(
                     "Overlapping forced variable types : {}   {}",
-                    self.type_.get_name(),
-                    b.type_.get_name()
+                    self_view.get(self.type_.id())?.get_name(),
+                    b_view.get(b.type_.id())?.get_name()
                 )));
             }
             if self.start != b.start {
@@ -479,7 +481,7 @@ impl RangeHint {
             self.absorb(b);
         } else if res_type == 1 {
             let copy_range = self.clone();
-            self.type_ = Rc::clone(&b.type_);
+            self.type_ = b.type_.clone();
             self.flags = b.flags;
             self.range_type = b.range_type;
             self.highind = b.highind;
@@ -803,7 +805,7 @@ pub struct SyncOverlap {
     pub entry_size: int4,
     /// C++ `entry->getSizedType(addr, size)` — the type to assign the access, or
     /// `None` when not updating types / no exact piece.
-    pub sized_type: Option<Rc<Datatype>>,
+    pub sized_type: Option<TypeRoot>,
     /// The owning Symbol id (so the naming pass can read its name).
     pub symbol_id: crate::database::SymbolId,
     /// C++ `entry->extraflags` — the per-entry extra flags.  For a join-piece
@@ -832,7 +834,7 @@ pub struct LinkEntryInfo {
     /// access within the Symbol (0 for a whole-symbol/scalar access).
     pub sym_off: int4,
     /// `entry->getSymbol()->getType()`.
-    pub sym_type: Option<Rc<Datatype>>,
+    pub sym_type: Option<TypeRoot>,
     /// `entry->getAddr()` — the base of the containing entry (the conflict scan
     /// iterates `beginLoc(entry->getSize(), entry->getAddr())`).
     pub entry_addr: Address,
@@ -868,7 +870,7 @@ pub struct StringContainerEntry {
     /// `entry->getSize()` — the byte width of the containing entry.
     pub size: int4,
     /// `entry->getSymbol()->getType()` — the owning Symbol's whole data-type.
-    pub sym_type: Rc<Datatype>,
+    pub sym_type: TypeRoot,
 }
 
 // ===========================================================================
@@ -1059,7 +1061,7 @@ impl ScopeLocal {
     /// data-type with a storage address.  If an input Varnode appears at this
     /// address with no other type info, the data-type is applied later by
     /// `applyTypeRecommendations`.
-    pub fn add_type_recommendation(&mut self, addr: Address, dt: Rc<Datatype>) {
+    pub fn add_type_recommendation(&mut self, addr: Address, dt: TypeRoot) {
         self.type_recommend.push(TypeRecommend::new(addr, dt));
     }
 
@@ -1233,7 +1235,7 @@ impl ScopeLocal {
     pub fn add_symbol(
         &mut self,
         name: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         addr: &Address,
         usepoint: &Address,
     ) -> KunaResult<crate::database::SymbolId> {
@@ -1259,9 +1261,10 @@ impl ScopeLocal {
         &mut self,
         i: int4,
         name: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         addr: &Address,
         restricted_usepoint: &Address,
+        parameter_flags: uint4,
     ) -> KunaResult<Option<crate::database::SymbolId>> {
         if addr.is_invalid() || ct.get_size() < 1 {
             return Ok(None);
@@ -1305,45 +1308,32 @@ impl ScopeLocal {
                         i,
                     );
                 }
+                if self.db.symbol(sym).get_category_index() as int4 == i {
+                    // An existing symbol can carry an independent map-addr or
+                    // host-local commitment. Recovery's unlocked parameter is
+                    // not an instruction to revoke that symbol's locks.
+                    use crate::fspec::parameter_pieces_flags as pf;
+                    let symbol = self.db.symbol(sym);
+                    let mut flags = parameter_flags;
+                    if symbol.is_type_locked() {
+                        flags |= pf::TYPELOCK;
+                    }
+                    if symbol.is_name_locked() {
+                        flags |= pf::NAMELOCK;
+                    }
+                    self.set_parameter_attributes(sym, flags);
+                }
             }
             return Ok(None);
         }
-        // C++ `ProtoStoreSymbol::setInput` (fspec.cc:3170-3171): the usepoint is
-        // empty (whole-function) only when some Scope already *owns* the
-        // parameter's storage range — otherwise it is the function's
-        // `restricted_usepoint` (entry-1).  A register parameter's storage is NOT
-        // owned by the local stack scope, so `discoverScope` returns null and the
-        // usepoint becomes `restricted_usepoint`.  This keeps the SymbolEntry's
-        // `uselimit` NON-empty so `addMapInternal` does NOT mark the register
-        // parameter `addrtied` (database.cc:1154) — matching C++, where `a0(i)` is
-        // `mapped` but not `tied`.  Passing an invalid usepoint here (the prior
-        // kuna behavior) made every register parameter `addrtied`, which let
-        // `mergeAddrTied` over-merge the input register version with any later
-        // same-register value (the LOSS-247 Gp-#2 `&v1`->`a0` over-merge).
-        // C++ `ProtoStoreSymbol::setInput` (fspec.cc:3170): usepoint stays empty
-        // (whole-function ⇒ `addrtied`) only when a Scope already *owns* the
-        // parameter's storage; otherwise it is `restricted_usepoint` (entry-1),
-        // keeping the SymbolEntry NON-empty ⇒ NOT `addrtied`.
-        //
-        // The over-merge this corrects is specifically a REGISTER input parameter
-        // (the LOSS-247 Gp-#2 `&v1`->`a0`): a register's storage is owned by no
-        // Scope, so `discoverScope` returns null and the register parameter is NOT
-        // addrtied — which is what stops `mergeAddrTied` from grouping the input
-        // register version with later same-register values.  Restricting the
-        // restricted-usepoint to register storage keeps the join/stack struct
-        // parameter path (`d` in Stack-spill) byte-identical to its prior behavior:
-        // those go through `Scope::addMap`'s join arm (the per-piece stack entries),
-        // whose kuna rendering already inlines `d.field_b`, and which the
-        // single-point `restricted_usepoint` uselimit would otherwise de-tie and
-        // split.  `discover_scope` already returns null for a register, so this is a
-        // faithful subset of the C++ condition (it never *adds* a usepoint the C++
-        // would not).
-        let is_register = addr
-            .get_space()
-            .map(|s| s.get_type() == kuna_base::space::spacetype::IPTR_PROCESSOR)
-            .unwrap_or(false);
-        let usepoint = if is_register
-            && self.db.discover_scope(self.scope, addr, ct.get_size(), &Address::new_invalid()).is_none()
+        // C++ ProtoStoreSymbol::setInput: only storage owned by a scope has a
+        // whole-function mapping. Otherwise the incoming value is valid at
+        // entry-1, not at later definitions reusing its physical storage.
+        // Ownership concerns the complete address: a synthetic JOIN is not
+        // owned merely because one piece is in the scope's real stack window.
+        // add_map propagates this lifetime to every JOIN piece; the real stack
+        // range independently retains its memory-ownership properties.
+        let usepoint = if self.db.discover_scope(self.scope, addr, ct.get_size(), &Address::new_invalid()).is_none()
         {
             restricted_usepoint.clone()
         } else {
@@ -1356,7 +1346,33 @@ impl ScopeLocal {
             crate::database::symbol_category::FUNCTION_PARAMETER,
             i,
         );
+        self.set_parameter_attributes(sym, parameter_flags);
         Ok(Some(sym))
+    }
+
+    /// Mirror parameter metadata without changing mapping/usepoint properties.
+    fn set_parameter_attributes(&mut self, sym: crate::database::SymbolId, flags: uint4) {
+        use crate::fspec::parameter_pieces_flags as pf;
+        use crate::varnode::varnode_flags as vf;
+        let mut attrs = 0;
+        for (parameter, symbol) in [
+            (pf::TYPELOCK, vf::typelock),
+            (pf::NAMELOCK, vf::namelock),
+            (pf::INDIRECTSTORAGE, vf::indirectstorage),
+            (pf::HIDDENRETPARM, vf::hiddenretparm),
+        ] {
+            if (flags & parameter) != 0 {
+                attrs |= symbol;
+            }
+        }
+        let symbol = self.db.symbol_mut(sym);
+        let mask = vf::typelock | vf::namelock | vf::indirectstorage | vf::hiddenretparm;
+        symbol.flags = (symbol.flags & !mask) | attrs;
+        symbol.set_this_pointer((flags & pf::ISTHIS) != 0);
+        symbol.check_size_type_lock();
+        if flags & pf::SIZELOCK != 0 {
+            symbol.dispflags |= crate::database::symbol_dispflags::SIZE_TYPELOCK;
+        }
     }
 
     /// C++ `Scope::addCodeLabel` reached via `getScopeLocal()->addCodeLabel`
@@ -1365,7 +1381,7 @@ impl ScopeLocal {
         &mut self,
         addr: &Address,
         name: &str,
-        lab_type: Rc<Datatype>,
+        lab_type: TypeRoot,
     ) -> KunaResult<crate::database::SymbolId> {
         self.db.add_code_label(self.scope, addr, name, lab_type)
     }
@@ -1376,7 +1392,7 @@ impl ScopeLocal {
     pub fn add_dynamic_symbol(
         &mut self,
         name: &str,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         caddr: &Address,
         hash: uint8,
     ) -> KunaResult<crate::database::SymbolId> {
@@ -1390,7 +1406,7 @@ impl ScopeLocal {
     pub fn add_union_facet_symbol(
         &mut self,
         name: &str,
-        dt: Rc<Datatype>,
+        dt: TypeRoot,
         field_num: int4,
         addr: &Address,
         hash: uint8,
@@ -1457,6 +1473,33 @@ impl ScopeLocal {
         self.db.symbol(sym).get_category()
     }
 
+    /// Invalidate superseded formal identities, retaining unchanged host SymbolIds.
+    pub fn reconcile_parameter_symbols(&mut self, proto: &crate::fspec::FuncProto, angr_names: bool) {
+        let stale: Vec<_> = self.db.category_symbols(self.scope,
+            crate::database::symbol_category::FUNCTION_PARAMETER).filter(|&id| {
+                let symbol = self.db.symbol(id);
+                let slot = symbol.get_category_index() as int4;
+                let Some(parameter) = proto.source_param(slot) else { return true };
+                let name = crate::database::kuna_materialized_param_name(angr_names, slot, parameter.get_name());
+                symbol.get_name() != name || symbol.dtype.as_ref() != parameter.get_type()
+                    || !symbol.mapentry.iter().any(|&entry| {
+                        let entry = self.db.entry(self.scope, entry);
+                        entry.get_addr() == &parameter.get_address()
+                            && entry.get_size() == parameter.get_size()
+                    })
+            }).collect();
+        for id in stale { self.db.remove_symbol(id); }
+        for slot in 0..proto.num_params() {
+            if let (Some(id), Some(parameter)) = (self.parameter_symbol_for_slot(slot), proto.source_param(slot)) {
+                self.set_parameter_attributes(id, parameter.get_flags());
+            }
+        }
+    }
+
+    pub fn parameter_symbol_for_slot(&self, slot: int4) -> Option<crate::database::SymbolId> {
+        self.db.get_category_symbol(self.scope, crate::database::symbol_category::FUNCTION_PARAMETER, slot)
+    }
+
     /// C++ `Scope::renameSymbol(sym,newname)` against this local scope.
     pub fn rename_symbol(
         &mut self,
@@ -1470,7 +1513,7 @@ impl ScopeLocal {
     pub fn retype_symbol(
         &mut self,
         sym: crate::database::SymbolId,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
     ) -> KunaResult<()> {
         self.db.retype_symbol(sym, ct)
     }
@@ -1485,7 +1528,7 @@ impl ScopeLocal {
         value: uintb,
         addr: &Address,
         hash: uint8,
-        base1: Rc<Datatype>,
+        base1: TypeRoot,
     ) -> KunaResult<crate::database::SymbolId> {
         self.db.add_equate_symbol(self.scope, nm, format, value, addr, hash, base1)
     }
@@ -1541,7 +1584,7 @@ impl ScopeLocal {
     fn create_entry(&mut self, a: &RangeHint, types: &dyn TypeFactory) -> KunaResult<()> {
         let addr = Address::new(self.space.clone(), a.start);
         let usepoint = Address::new_invalid();
-        let mut ct = types.concretize(Rc::clone(&a.type_))?;
+        let mut ct = types.concretize(a.type_.clone())?;
         let align = ct.get_align_size();
         // C++ `a.size / ct->getAlignSize()` (int4 division); guard a 0 align.
         let num = if align != 0 { a.size / align } else { a.size };
@@ -1623,7 +1666,7 @@ impl ScopeLocal {
     /// `decompile`, where C++ reuses the same `fd`; this carries the `map addr`
     /// symbols across that rebuild).  Returns `(name, type, addr, all_flags)`
     /// per non-dynamic, address-tied SymbolEntry.
-    pub fn mapped_symbol_specs(&self) -> Vec<(String, Rc<Datatype>, Address, uint4)> {
+    pub fn mapped_symbol_specs(&self) -> Vec<(String, TypeRoot, Address, uint4)> {
         let idx = self.space.get_index() as usize;
         let mut out = self.db.scope_space_symbol_specs(self.scope, idx);
         // The console `map addr <ramaddr> <type> <name>` form maps a global RAM/data
@@ -1645,13 +1688,13 @@ impl ScopeLocal {
     /// (see [`crate::database::Database::scope_usepoint_symbol_specs`]).
     pub fn usepoint_symbol_specs(
         &self,
-    ) -> Vec<(String, Rc<Datatype>, Address, uint4, Address, bool)> {
+    ) -> Vec<(String, TypeRoot, Address, uint4, Address, bool)> {
         self.db.scope_usepoint_symbol_specs(self.scope)
     }
 
     /// The `(start, type, type_locked)` hints for every Symbol mapped into this
     /// scope's space, in EntryMap list order (C++ `MapState::gatherSymbols`).
-    pub fn gather_symbol_hints(&self) -> Vec<(uintb, Rc<Datatype>, bool)> {
+    pub fn gather_symbol_hints(&self) -> Vec<(uintb, TypeRoot, bool)> {
         let idx = self.space.get_index() as usize;
         self.db.scope_space_symbol_hints(self.scope, idx)
     }
@@ -1666,7 +1709,7 @@ impl ScopeLocal {
         &self,
         addr: &Address,
         size: int4,
-    ) -> Option<(String, int4, Option<Rc<Datatype>>)> {
+    ) -> Option<(String, int4, Option<TypeRoot>)> {
         let eref = self.db.find_overlap(self.scope, addr, size)?;
         let entry = self.db.entry(self.scope, eref);
         let entry_addr_off = entry.get_addr().get_offset();
@@ -1690,7 +1733,7 @@ impl ScopeLocal {
         addr: &Address,
         size: int4,
         base: &mut int4,
-    ) -> Option<(String, int4, Option<Rc<Datatype>>)> {
+    ) -> Option<(String, int4, Option<TypeRoot>)> {
         self.resolve_default_name_override(addr, size, base, None)
     }
 
@@ -1706,7 +1749,7 @@ impl ScopeLocal {
         size: int4,
         base: &mut int4,
         override_name: Option<&str>,
-    ) -> Option<(String, int4, Option<Rc<Datatype>>)> {
+    ) -> Option<(String, int4, Option<TypeRoot>)> {
         let eref = self.db.find_overlap(self.scope, addr, size)?;
         let (sym, entry_addr_off, entry_off, entry_size) = {
             let entry = self.db.entry(self.scope, eref);
@@ -1926,7 +1969,7 @@ impl ScopeLocal {
         &mut self,
         addr: &Address,
         base: &mut int4,
-    ) -> Option<(String, int4, Option<Rc<Datatype>>)> {
+    ) -> Option<(String, int4, Option<TypeRoot>)> {
         let eref = self.db.find_container(self.scope, addr, 1, &Address::default())?;
         let (sym, entry_addr_off, entry_off) = {
             let entry = self.db.entry(self.scope, eref);
@@ -1991,7 +2034,7 @@ impl ScopeLocal {
     pub fn containing_symbol_for_storage(
         &self,
         addr: &Address,
-    ) -> Option<(crate::database::SymbolId, Option<Rc<Datatype>>)> {
+    ) -> Option<(crate::database::SymbolId, Option<TypeRoot>)> {
         let eref = self.db.find_container_ignore_usepoint(self.scope, addr, 1)?;
         let sym = self.db.entry(self.scope, eref).symbol;
         Some((sym, self.db.symbol(sym).dtype.clone()))
@@ -2080,7 +2123,7 @@ impl ScopeLocal {
         let sized = symbol.dtype.as_ref().and_then(|cur| {
             let off = (addr.get_offset().wrapping_sub(entry_addr_off) as int4)
                 .wrapping_add(entry_off);
-            types.get_exact_piece(Rc::clone(cur), off, size).ok().flatten()
+            types.get_exact_piece(cur.clone(), off, size).ok().flatten()
         });
         Some(SyncOverlap { all_flags, entry_size, sized_type: sized, symbol_id: sym, extraflags })
     }
@@ -2099,17 +2142,17 @@ impl ScopeLocal {
     ///   "let the data-type float even though the parent symbol is type-locked").
     ///
     /// `vn->getSymbolEntry()` is the SymbolEntry `linkSymbol`/`coverVarnodes`
-    /// cache on the Varnode; here it is resolved freshly via `findOverlap`
-    /// (`queryProperties`), the exact lookup that cache mirrors, so the seed is
-    /// available on every InferTypes round without depending on the link pass
-    /// having already run.
+    /// cache on the Varnode; here it is resolved freshly by containment at the
+    /// Varnode's usepoint. A register parameter's entry-1 commitment must not
+    /// become type authority over later SSA definitions in the same register.
     pub fn build_localtype_seed(
         &self,
         addr: &Address,
         size: int4,
+        usepoint: &Address,
         types: &dyn TypeFactory,
-    ) -> Option<Rc<Datatype>> {
-        let eref = self.db.find_overlap(self.scope, addr, size)?;
+    ) -> Option<TypeRoot> {
+        let eref = self.db.find_container(self.scope, addr, size, usepoint)?;
         let entry = self.db.entry(self.scope, eref);
         let entry_off = entry.get_offset();
         let entry_addr_off = entry.get_addr().get_offset();
@@ -2119,7 +2162,7 @@ impl ScopeLocal {
         if !symbol.is_type_locked() {
             return None;
         }
-        let sym_type = Rc::clone(symbol.dtype.as_ref()?);
+        let sym_type = symbol.dtype.as_ref()?.clone();
         let cur_off = (addr.get_offset().wrapping_sub(entry_addr_off) as int4).wrapping_add(entry_off);
         let ct = types.get_exact_piece(sym_type, cur_off, size).ok().flatten()?;
         // TYPE_UNKNOWN piece: let the type float.
@@ -2146,7 +2189,7 @@ impl ScopeLocal {
         &self,
         off: int8,
         types: &dyn TypeFactory,
-    ) -> KunaResult<(Rc<Datatype>, int8)> {
+    ) -> KunaResult<(TypeRoot, int8)> {
         // addrOff = byteToAddress(off, wordSize); addr = resolveConstant(...) for the
         // stack space reduces to Address(space, wrapOffset(off)).
         let word_size = self.space.get_word_size();
@@ -2304,9 +2347,9 @@ impl ScopeLocal {
     pub fn build_variable_name_stack(
         &self,
         addr: &Address,
-        ct: Option<&Datatype>,
+        ct: Option<&TypeRoot>,
         flags: uint4,
-        type_name_base: &dyn Fn(&Datatype) -> String,
+        type_name_base: &dyn Fn(&TypeRoot) -> String,
         in_local_range: bool,
     ) -> Option<String> {
         use crate::varnode::varnode_flags;
@@ -2417,12 +2460,12 @@ pub struct TypeRecommend {
     /// Storage address of the Varnode (C++ `addr`).
     pub addr: Address,
     /// Data-type to assign to the Varnode (C++ `dataType`).
-    pub data_type: Rc<Datatype>,
+    pub data_type: TypeRoot,
 }
 
 impl TypeRecommend {
     /// C++ constructor `TypeRecommend(ad,dt)` (`varmap.hh:78`).
-    pub fn new(addr: Address, data_type: Rc<Datatype>) -> TypeRecommend {
+    pub fn new(addr: Address, data_type: TypeRoot) -> TypeRecommend {
         TypeRecommend { addr, data_type }
     }
 }
@@ -2450,7 +2493,7 @@ pub struct MapState {
     /// The current iterator position into the RangeHints (C++ `iter`).
     iter: usize,
     /// The default data-type to use for RangeHints (C++ `defaultType`).
-    default_type: Rc<Datatype>,
+    default_type: TypeRoot,
     /// A collection of pointer Varnodes into our address space (C++ `checker`).
     checker: AliasChecker,
     /// (kuna `nulterminator`) Per constant-COPY `(offset, size)`: is every such
@@ -2466,7 +2509,7 @@ impl MapState {
         spc: Rc<AddrSpace>,
         rn: &kuna_base::address::RangeList,
         pm: &kuna_base::address::RangeList,
-        dt: Rc<Datatype>,
+        dt: TypeRoot,
     ) -> MapState {
         let mut range = rn.clone();
         // Clear possible input symbols.
@@ -2489,10 +2532,10 @@ impl MapState {
     /// A specific range of bytes is described for the hint.  A `None`/zero-size
     /// data-type falls back to the default.  Hints outside the analysis range
     /// are dropped.
-    fn add_range(&mut self, st: uintb, ct: Option<Rc<Datatype>>, fl: uint4, rt: RangeType, hi: int4) {
+    fn add_range(&mut self, st: uintb, ct: Option<TypeRoot>, fl: uint4, rt: RangeType, hi: int4) {
         let ct = match ct {
             Some(c) if c.get_size() != 0 => c,
-            _ => Rc::clone(&self.default_type),
+            _ => self.default_type.clone(),
         };
         let sz = ct.get_size();
         if !self.range.in_range(&Address::new(Rc::clone(&self.spaceid), st), sz) {
@@ -2512,16 +2555,16 @@ impl MapState {
     ///
     /// If the data-type is an array, partial struct, or partial union, the
     /// reference may be added as \e open.
-    fn add_fixed_type(&mut self, start: uintb, ct: Rc<Datatype>, flags: uint4, types: &dyn TypeFactory) {
+    fn add_fixed_type(&mut self, start: uintb, ct: TypeRoot, flags: uint4, types: &dyn TypeFactory) {
         let meta = ct.get_metatype();
         if meta == type_metatype::TYPE_PARTIALSTRUCT {
             // TypePartialStruct: getParent() is the container, getOffset() the offset.
-            let parent = ct.get_partial_base().unwrap_or_else(|| Rc::clone(&ct));
+            let parent = ct.get_partial_base().unwrap_or_else(|| ct.clone());
             let offset = ct.get_partial_offset().unwrap_or(0);
             let pmeta = parent.get_metatype();
             if pmeta == type_metatype::TYPE_STRUCT && offset == 0 {
                 // Initial fields of a TYPE_STRUCT moved here: treat as open.
-                self.add_range(start, Some(Rc::clone(&parent)), 0, RangeType::Open, -1);
+                self.add_range(start, Some(parent.clone()), 0, RangeType::Open, -1);
             } else if pmeta == type_metatype::TYPE_ARRAY {
                 // Elements of an array moved here.
                 if let Some(base) = parent.get_array_base() {
@@ -2567,7 +2610,7 @@ impl MapState {
         let mut start_hint_start = old[0].start;
         let mut start_hint_size = old[0].size;
         let mut start_hint_flags = old[0].flags;
-        let mut start_datatype = Rc::clone(&old[0].type_);
+        let mut start_datatype = old[0].type_.clone();
         new_list.push(old[0].clone());
 
         let mut cur_pos = 1usize;
@@ -2578,7 +2621,7 @@ impl MapState {
                 && cur_hint.size == start_hint_size
                 && cur_hint.flags == start_hint_flags
             {
-                let cur_datatype = Rc::clone(&cur_hint.type_);
+                let cur_datatype = cur_hint.type_.clone();
                 if cur_datatype.type_order(&start_datatype)? < 0 {
                     // Take the most specific variant of data-type
                     start_datatype = cur_datatype;
@@ -2589,18 +2632,18 @@ impl MapState {
                 // else: drop (the C++ `delete`s the heap RangeHint)
             } else {
                 while start_pos < new_list.len() {
-                    new_list[start_pos].type_ = Rc::clone(&start_datatype);
+                    new_list[start_pos].type_ = start_datatype.clone();
                     start_pos += 1;
                 }
                 start_hint_start = cur_hint.start;
                 start_hint_size = cur_hint.size;
                 start_hint_flags = cur_hint.flags;
-                start_datatype = Rc::clone(&cur_hint.type_);
+                start_datatype = cur_hint.type_.clone();
                 new_list.push(cur_hint.clone());
             }
         }
         while start_pos < new_list.len() {
-            new_list[start_pos].type_ = Rc::clone(&start_datatype);
+            new_list[start_pos].type_ = start_datatype.clone();
             start_pos += 1;
         }
         self.maplist = new_list;
@@ -2633,7 +2676,7 @@ impl MapState {
             high,
             1,
             sst,
-            Rc::clone(&self.default_type),
+            self.default_type.clone(),
             0,
             RangeType::Endpoint,
             -2,
@@ -2694,10 +2737,10 @@ impl MapState {
     /// each `SymbolEntry` in the per-space rangemap.  The C++ reads these off
     /// the `EntryMap` list (`begin_list`/`end_list`); the iteration order is
     /// the rangemap's, which the caller preserves.
-    pub fn gather_symbols(&mut self, symbols: &[(uintb, Rc<Datatype>, bool)]) {
+    pub fn gather_symbols(&mut self, symbols: &[(uintb, TypeRoot, bool)]) {
         for (start, ct, type_locked) in symbols {
             let flags = if *type_locked { TYPELOCK } else { 0 };
-            self.add_range(*start, Some(Rc::clone(ct)), flags, RangeType::Fixed, -1);
+            self.add_range(*start, Some(ct.clone()), flags, RangeType::Fixed, -1);
         }
     }
 
@@ -2713,7 +2756,7 @@ impl MapState {
     pub fn add_fixed_type_pub(
         &mut self,
         start: uintb,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         flags: uint4,
         types: &dyn TypeFactory,
     ) {
@@ -2736,7 +2779,7 @@ impl MapState {
     /// Append an open/range hint directly (the public entry `gatherOpen` and
     /// `addGuard` use; both are `MapState` methods calling the private
     /// `addRange`).
-    pub fn add_range_pub(&mut self, st: uintb, ct: Option<Rc<Datatype>>, fl: uint4, rt: RangeType, hi: int4) {
+    pub fn add_range_pub(&mut self, st: uintb, ct: Option<TypeRoot>, fl: uint4, rt: RangeType, hi: int4) {
         self.add_range(st, ct, fl, rt, hi);
     }
 

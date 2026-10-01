@@ -28,18 +28,18 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn int(f: &TypeFactoryImpl, size: i32) -> Rc<Datatype> {
+fn int(f: &TypeFactoryImpl, size: i32) -> TypeRoot {
     f.get_base(size, type_metatype::TYPE_INT).unwrap()
 }
 
-fn uint(f: &TypeFactoryImpl, size: i32) -> Rc<Datatype> {
+fn uint(f: &TypeFactoryImpl, size: i32) -> TypeRoot {
     f.get_base(size, type_metatype::TYPE_UINT).unwrap()
 }
 
 /// C's conversion of the value `v` to the integer type `t` (C11 6.3.1.3): kept
 /// when representable, else reduced modulo 2^N -- the unsigned rule, and what gcc
 /// and clang define for the signed case.
-fn c_convert(v: i128, t: &Datatype) -> i128 {
+fn c_convert(v: i128, t: &TypeRoot) -> i128 {
     let bits = 8 * t.get_size() as u32;
     let m = v.rem_euclid(1i128 << bits);
     if t.get_metatype() == type_metatype::TYPE_INT && m >= 1i128 << (bits - 1) {
@@ -69,9 +69,9 @@ fn a_float_a_pointer_or_an_undecided_type_is_never_an_integer() {
     let unknown = f.get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
     let ptr = f.get_type_pointer(8, int(&f, 4), 1).unwrap();
     for t in [&float4, &unknown, &ptr] {
-        assert_eq!(int_range(t), None, "{}", t.get_name());
-        assert!(!preserves(t, &int(&f, 8)), "{}", t.get_name());
-        assert!(!preserves(&int(&f, 4), t), "{}", t.get_name());
+        assert_eq!(int_range(t), None, "{t:?}");
+        assert!(!preserves(t, &int(&f, 8)), "{t:?}");
+        assert!(!preserves(&int(&f, 4), t), "{t:?}");
     }
 }
 
@@ -98,7 +98,7 @@ fn widenings_that_keep_the_value_are_accepted() {
         (uint(&f, 4), uint(&f, 8)),
         (int(&f, 4), int(&f, 4)),
     ] {
-        assert!(preserves(&src, &dst), "{} -> {}", src.get_name(), dst.get_name());
+        assert!(preserves(&src, &dst), "{src:?} -> {dst:?}");
     }
 }
 
@@ -115,7 +115,7 @@ fn sign_changes_and_narrowings_are_refused() {
         (uint(&f, 4), uint(&f, 2)),
         (uint(&f, 1), int(&f, 1)),
     ] {
-        assert!(!preserves(&src, &dst), "{} -> {}", src.get_name(), dst.get_name());
+        assert!(!preserves(&src, &dst), "{src:?} -> {dst:?}");
     }
 }
 
@@ -140,7 +140,7 @@ fn preserves_is_exactly_every_value_surviving_c_conversion() {
                 .iter()
                 .filter(|&&v| lo <= v && v <= hi)
                 .all(|&v| c_convert(v, dst) == v);
-            assert_eq!(preserves(src, dst), survives, "{} -> {}", src.get_name(), dst.get_name());
+            assert_eq!(preserves(src, dst), survives, "{src:?} -> {dst:?}");
         }
     }
 }

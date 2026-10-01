@@ -249,6 +249,8 @@ impl StringManager {
     ///
     /// `manager` is the [`AddrSpaceManager`] reached in C++ via
     /// `addr.getSpace()->getManager()` (boundary: see module docs).
+    /// Graph callers borrow `char_type` under a scoped datatype read guard;
+    /// this consumer reads only character width and encoding flags.
     pub fn register_internal_string_data(
         &mut self,
         addr: &Address,
@@ -650,6 +652,8 @@ impl StringManagerUnicode {
     ///
     /// `is_trunc` passes back whether the cached string was truncated.  Endianness
     /// is read off `addr` (`addr.isBigEndian()`), exactly as the C++ does.
+    /// Graph callers pass the scalar record borrowed under their read guard;
+    /// no datatype graph edge is retained by the string cache.
     pub fn get_string_data(
         &mut self,
         addr: &Address,

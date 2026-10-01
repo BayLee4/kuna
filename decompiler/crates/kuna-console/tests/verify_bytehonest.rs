@@ -62,7 +62,7 @@ fn variables_for(byte_honest: bool) -> Option<Vec<(String, Vec<VarInfo>)>> {
     for (name, addr) in entries {
         let mapped = prog.dwarf_locals_for(addr.get_offset());
         let Ok(fd) = decompile_func_full_with_override_dyn(
-            prog.arch_mut(), &name, addr, 0, &mapped, &[], &[], None, &[], &[], &[],
+            prog.arch_mut(), &name, addr, 0, &mapped, &[], &[], None, &[], &kuna_decomp::overrides::Override::new(), &[],
         ) else {
             continue;
         };

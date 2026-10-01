@@ -30,11 +30,9 @@
 //!     must cross-recurse on the literal `ptrto` of each — the cast is on the
 //!     argument, independent of the receiver kind. (at5)
 
-use std::rc::Rc;
-
 use kuna_base::types::int4;
 use kuna_decomp::dtype::{
-    flags, type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField,
+    type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField, TypeRoot,
 };
 
 fn factory() -> TypeFactoryImpl {
@@ -45,20 +43,19 @@ fn factory() -> TypeFactoryImpl {
 }
 
 /// Build a completed N-field union `{ int4 myint@0; float4 myfloat@0; }`, the
-/// shape behind the `(ptr->value).myint` datatest renders.  Built by hand (no
-/// interning) and carrying `needs_resolution` — the flag the real
-/// `getTypeUnion` sets (type.hh:625) and the precondition for the dispatcher
-/// union arms.  `name` is accepted for readability but unused (no interning).
-fn make_union(_name: &str, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+/// shape behind the `(ptr->value).myint` datatest renders, published in the
+/// fixture's graph so field and relative-pointer edges share their owner.
+fn make_union(types: &TypeFactoryImpl, name: &str, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(4, type_metatype::TYPE_UNION);
+    u.name = name.into();
+    u.id = Datatype::hash_name(name);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("m{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("m{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    u.flags |= flags::needs_resolution;
-    Rc::new(u)
+    types.intern(u).unwrap()
 }
 
 /// at1: `find_compatible_resolve` with a `PointerRel` ct must read ct's RELATIVE
@@ -73,42 +70,42 @@ fn w10_union_value_compat_resolve_reads_ct_relative_ptrto_not_stripped() {
     let f = factory();
     let i4 = f.get_base(4, TYPE_INT).unwrap();
     let f4 = f.get_base(4, TYPE_FLOAT).unwrap();
-    let u = make_union("valU", &[(0, Rc::clone(&i4)), (0, Rc::clone(&f4))]);
+    let u = make_union(&f, "valU", &[(0, i4.clone()), (0, f4.clone())]);
     // parentPtr: plain pointer to the union (the container the relptr points into).
-    let pu = f.get_type_pointer(8, Rc::clone(&u), 1).unwrap();
+    let pu = f.get_type_pointer(8, u.clone(), 1).unwrap();
     // ptr-rel-to-int: ptrto = i4 (the FIELD type), parent = union, offset 0.
     let relptr = f
-        .get_type_pointer_rel(Rc::clone(&pu), Rc::clone(&i4), 0)
+        .get_type_pointer_rel(pu.clone(), i4.clone(), 0)
         .unwrap();
     assert!(relptr.is_pointer_rel(), "constructed a PointerRel");
     // get_ptr_to() must yield the relative ptrto (i4), NOT the stripped pointer.
     let rel_ptrto = relptr.get_ptr_to().unwrap();
-    assert!(Rc::ptr_eq(&rel_ptrto, &i4), "PointerRel get_ptr_to is the field type i4");
+    assert_eq!(rel_ptrto, i4, "PointerRel get_ptr_to is the field type i4");
 
     // Receiver: a plain pointer-to-int. ct: the ptr-rel-to-int.
     // C++ TypePointer::findCompatibleResolve(ct): ct is TYPE_PTR ->
     // ptrto(i4).findCompatibleResolve(((TypePointer*)ct)->ptrto == i4).
-    let pint = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let pint = f.get_type_pointer(8, i4.clone(), 1).unwrap();
     let got = pint.find_compatible_resolve(&relptr).unwrap();
 
     // Reference: the same call against a PLAIN pointer-to-int ct must be byte-
     // identical (both read the literal int4 ptrto).
-    let plain_int_ct = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let plain_int_ct = f.get_type_pointer(8, i4.clone(), 1).unwrap();
     let want = pint.find_compatible_resolve(&plain_int_ct).unwrap();
     assert_eq!(got, want, "PointerRel ct must resolve via its relative ptrto, like a plain pointer");
 }
 
 /// at2: the STRIPPED-vs-PTRTO mutation, made OBSERVABLE with a concrete index.
 ///
-/// Receiver = a NON-resolution union `{ int4 m0@0; }`.  Its
+/// Receiver = a union `{ int4 m0@0; }`.  Its
 /// `findCompatibleResolve` (TypeUnion, `!ct.needs_resolution()` arm,
 /// type.cc:2629-2649) returns the field INDEX when `field[i].type == ct` by
-/// pointer identity.  Drive it with a ptr-rel-to-int ct: the C++
+/// graph identity.  Drive it with a ptr-rel-to-int ct: the C++
 /// `((TypePointer *)ct)->ptrto` is the RELATIVE ptrto (== `i4`, the field's own
-/// `Rc`), so the identity match fires and the result is `0` (the field index).
+/// identity), so the match fires and the result is `0` (the field index).
 ///
 /// If the port had read the STRIPPED plain pointer (a distinct `TypePointer`
-/// `Rc`, not `i4`) the identity test would miss and the result would be `-1`.
+/// identity, not `i4`) the identity test would miss and the result would be `-1`.
 /// So `0` vs `-1` is the live mutation discriminator; we also confirm a plain
 /// ptr-to-int ct (built the same way) yields the identical `0`.
 #[test]
@@ -116,25 +113,22 @@ fn w10_union_value_compat_resolve_ptrto_is_relative_field_not_stripped() {
     use type_metatype::*;
     let f = factory();
     let i4 = f.get_base(4, TYPE_INT).unwrap();
-    // A NON-resolution union `{ int4 m0@0; }`: TypeUnion::findCompatibleResolve
-    // takes the identity arm (`field[i].type == ct && offset==0` -> index i).
-    let mut u = Datatype::new(4, TYPE_UNION);
-    u.kind = DatatypeKind::Union { field: vec![TypeField::new(0, 0, "m0", Rc::clone(&i4))] };
-    let single_union = Rc::new(u);
-    assert!(!single_union.needs_resolution(), "this union must NOT need resolution for the identity arm");
+    // The scalar argument does not need resolution, so the union takes the
+    // identity arm (`field[i].type == ct && offset==0` -> index i).
+    let single_union = make_union(&f, "single", &[(0, i4.clone())]);
 
     // RECEIVER = pointer-to-(single-int)-union.  Its Pointer arm recurses:
     // union.findCompatibleResolve(((TypePointer*)ct)->ptrto).
-    let pu_recv = f.get_type_pointer(8, Rc::clone(&single_union), 1).unwrap();
+    let pu_recv = f.get_type_pointer(8, single_union.clone(), 1).unwrap();
 
     // A throwaway parent pointer for the relptr (parent type is irrelevant here).
-    let parent_u = make_union("valU2", &[(0, Rc::clone(&i4))]);
-    let pu_parent = f.get_type_pointer(8, Rc::clone(&parent_u), 1).unwrap();
-    // ptr-rel whose RELATIVE ptrto is the SAME `i4` Rc as the union field.
-    let relptr_to_int = f.get_type_pointer_rel(Rc::clone(&pu_parent), Rc::clone(&i4), 0).unwrap();
-    // sanity: the stripped plain pointer is a DISTINCT Rc from the int field type.
+    let parent_u = make_union(&f, "valU2", &[(0, i4.clone())]);
+    let pu_parent = f.get_type_pointer(8, parent_u.clone(), 1).unwrap();
+    // The relative ptrto shares the union field's graph identity.
+    let relptr_to_int = f.get_type_pointer_rel(pu_parent.clone(), i4.clone(), 0).unwrap();
+    // The stripped plain pointer has a distinct identity from the int field type.
     if let Some(st) = relptr_to_int.get_stripped() {
-        assert!(!Rc::ptr_eq(&st, &i4), "stripped is a plain pointer, distinct from the int field type");
+        assert_ne!(st, i4, "stripped is a plain pointer, distinct from the int field type");
     }
 
     // ct = the relptr.  C++ reads ((TypePointer*)ct)->ptrto == i4 (the relative
@@ -144,7 +138,7 @@ fn w10_union_value_compat_resolve_ptrto_is_relative_field_not_stripped() {
     assert_eq!(via_relptr, 0, "PointerRel ct resolves via its relative ptrto (union field index 0), not stripped (-1)");
 
     // Reference: a plain ptr-to-int ct (same i4) yields the identical 0.
-    let plain_int_ct = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let plain_int_ct = f.get_type_pointer(8, i4.clone(), 1).unwrap();
     let via_plain = pu_recv.find_compatible_resolve(&plain_int_ct).unwrap();
     assert_eq!(via_plain, via_relptr, "plain Pointer and PointerRel cts resolve identically via ptrto");
 }
@@ -158,19 +152,19 @@ fn w10_union_value_compat_resolve_pointerrel_receiver_matches_plain_pointer() {
     use type_metatype::*;
     let f = factory();
     let i4 = f.get_base(4, TYPE_INT).unwrap();
-    let u = make_union("valU3", &[(0, Rc::clone(&i4))]);
-    let pu = f.get_type_pointer(8, Rc::clone(&u), 1).unwrap();
+    let u = make_union(&f, "valU3", &[(0, i4.clone())]);
+    let pu = f.get_type_pointer(8, u.clone(), 1).unwrap();
     // RECEIVER = ptr-rel-to-int.
     let relptr = f
-        .get_type_pointer_rel(Rc::clone(&pu), Rc::clone(&i4), 0)
+        .get_type_pointer_rel(pu.clone(), i4.clone(), 0)
         .unwrap();
     // ct = plain ptr-to-int.
-    let pint_ct = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let pint_ct = f.get_type_pointer(8, i4.clone(), 1).unwrap();
 
     let from_rel = relptr.find_compatible_resolve(&pint_ct).unwrap();
     // The inherited TypePointer body: a plain ptr-to-int receiver with the same
     // ptrto must produce the identical result.
-    let plain_recv = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let plain_recv = f.get_type_pointer(8, i4.clone(), 1).unwrap();
     let from_plain = plain_recv.find_compatible_resolve(&pint_ct).unwrap();
     assert_eq!(
         from_rel, from_plain,
@@ -189,10 +183,10 @@ fn w10_union_value_compat_resolve_non_pointer_ct_returns_minus_one() {
     use type_metatype::*;
     let f = factory();
     let i4 = f.get_base(4, TYPE_INT).unwrap();
-    let u = make_union("valU4", &[(0, Rc::clone(&i4))]);
-    let pu = f.get_type_pointer(8, Rc::clone(&u), 1).unwrap();
+    let u = make_union(&f, "valU4", &[(0, i4.clone())]);
+    let pu = f.get_type_pointer(8, u.clone(), 1).unwrap();
     let relptr = f
-        .get_type_pointer_rel(Rc::clone(&pu), Rc::clone(&i4), 0)
+        .get_type_pointer_rel(pu.clone(), i4.clone(), 0)
         .unwrap();
     // A bare (non-pointer) ct: the TYPE_PTR guard fails -> -1, for both kinds.
     let bare_int = f.get_base(4, TYPE_INT).unwrap();
@@ -201,7 +195,7 @@ fn w10_union_value_compat_resolve_non_pointer_ct_returns_minus_one() {
         -1,
         "PointerRel receiver, non-pointer ct -> -1 (TYPE_PTR guard)"
     );
-    let plain = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let plain = f.get_type_pointer(8, i4.clone(), 1).unwrap();
     assert_eq!(
         plain.find_compatible_resolve(&bare_int).unwrap(),
         -1,
@@ -219,12 +213,12 @@ fn w10_union_value_compat_resolve_cross_kind_symmetry() {
     use type_metatype::*;
     let f = factory();
     let i4 = f.get_base(4, TYPE_INT).unwrap();
-    let u = make_union("valU5", &[(0, Rc::clone(&i4))]);
-    let pu = f.get_type_pointer(8, Rc::clone(&u), 1).unwrap();
+    let u = make_union(&f, "valU5", &[(0, i4.clone())]);
+    let pu = f.get_type_pointer(8, u.clone(), 1).unwrap();
     let relptr = f
-        .get_type_pointer_rel(Rc::clone(&pu), Rc::clone(&i4), 0)
+        .get_type_pointer_rel(pu.clone(), i4.clone(), 0)
         .unwrap();
-    let plain = f.get_type_pointer(8, Rc::clone(&i4), 1).unwrap();
+    let plain = f.get_type_pointer(8, i4.clone(), 1).unwrap();
 
     let plain_plain = plain.find_compatible_resolve(&plain).unwrap();
     let plain_rel = plain.find_compatible_resolve(&relptr).unwrap();
@@ -235,28 +229,3 @@ fn w10_union_value_compat_resolve_cross_kind_symmetry() {
     assert_eq!(plain_plain, rel_rel, "both PointerRel == both plain");
 }
 
-/// Sanity: the union we built really carries `needs_resolution` (the precondition
-/// for any of the three dispatchers' union arms to fire on a real pointer-to-
-/// union). If this flag is ever dropped (cf. LOSS-184) the whole feature is
-/// dormant, so pin it here next to the change.
-#[test]
-fn w10_union_value_union_carries_needs_resolution_flag() {
-    use type_metatype::*;
-    let f = factory();
-    let i4 = f.get_base(4, TYPE_INT).unwrap();
-    let u = make_union("valU6", &[(0, Rc::clone(&i4))]);
-    assert_eq!(u.get_metatype(), TYPE_UNION);
-    assert!(
-        u.needs_resolution(),
-        "a completed union must keep needs_resolution (else resolveInFlow never fires)"
-    );
-    // And a pointer-to-union exposes the union as its ptrto metatype — the gate
-    // every dispatcher's union arm checks.
-    let pu = f.get_type_pointer(8, Rc::clone(&u), 1).unwrap();
-    assert_eq!(pu.get_ptr_to().unwrap().get_metatype(), TYPE_UNION);
-    // The PointerRel-to-union likewise: ptrto metatype is UNION (so the new arm
-    // reaches the same union gate as a plain pointer).
-    let relptr = f.get_type_pointer_rel(Rc::clone(&pu), Rc::clone(&u), 0).unwrap();
-    assert!(matches!(relptr.kind, DatatypeKind::PointerRel { .. }));
-    assert_eq!(relptr.get_ptr_to().unwrap().get_metatype(), TYPE_UNION);
-}

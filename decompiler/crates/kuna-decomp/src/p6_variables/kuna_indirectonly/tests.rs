@@ -54,7 +54,11 @@ impl Fx {
         let stack = Rc::clone(manage.get_stack_space().unwrap());
         let sp_data = VarnodeStorage { space: Some(Rc::clone(&reg)), offset: SP_OFF, size: 8 };
         manage.add_spacebase_pointer(&stack, &sp_data, 8, true).unwrap();
-        let glb = ArchContext::new(manage);
+        let mut glb = ArchContext::new(manage);
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        glb.types = Some(Rc::new(types));
         let entry = Address::new(Rc::clone(&reg), 0x1000);
         let mut fd =
             Funcdata::new("io", "io", Rc::new(glb), entry, 0x1000_0000, 0x40).unwrap();

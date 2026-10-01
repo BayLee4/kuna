@@ -24,20 +24,18 @@
 //! Verifier-authored (independent of the porter), landing on the porter branch
 //! per docs/rust-port/verification.md.
 
-use std::rc::Rc;
-
 use kuna_decomp::bitfield::BitRange;
-use kuna_decomp::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeBitField};
+use kuna_decomp::dtype::{flags, type_metatype, Datatype, DatatypeKind, TypeBitField, TypeFactoryImpl, TypeRoot};
 
 /// Build a bitfield with an explicit container layout (byte offset / size, LSB,
 /// width, endianness).
-fn bf(id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> TypeBitField {
+fn bf(types: &TypeFactoryImpl, id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> TypeBitField {
     let mut b = TypeBitField::new(
         id,
         nb,
         big,
         format!("f{id}"),
-        Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)),
+        types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap().id(),
     );
     b.byte_offset = byte_off;
     b.byte_size = byte_sz;
@@ -45,13 +43,13 @@ fn bf(id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> Typ
     b
 }
 
-fn struct_with(bitfield: Vec<TypeBitField>, size: i32) -> Datatype {
+fn struct_with(types: &TypeFactoryImpl, bitfield: Vec<TypeBitField>, size: i32) -> TypeRoot {
     let mut s = Datatype::new_with_align(size, 4, type_metatype::TYPE_STRUCT);
     if !bitfield.is_empty() {
         s.flags |= flags::has_bitfields;
     }
     s.kind = DatatypeKind::Struct { field: vec![], bitfield };
-    s
+    types.intern(s).unwrap()
 }
 
 /// The exact `myfoo` first-word bitfield layout from `bitfields2.xml`, in BIG
@@ -65,15 +63,15 @@ fn struct_with(bitfield: Vec<TypeBitField>, size: i32) -> Datatype {
 /// type.cc:2350-2353).  This is the order `findMatchingBitField`'s binary search
 /// (which probes with the big-endian `overlapTest` sign) is built to walk; a
 /// vector left in ascending order would mis-search.
-fn myfoo_word0_be() -> Datatype {
+fn myfoo_word0_be(types: &TypeFactoryImpl) -> TypeRoot {
     let mut v = vec![
-        bf(0, 0, 1, 0, 1, true), // fieldb  (lsb 0)
-        bf(1, 0, 1, 1, 3, true), // field3  (lsb 1)
-        bf(2, 0, 1, 4, 4, true), // sfield4 (lsb 4)
+        bf(types, 0, 0, 1, 0, 1, true), // fieldb  (lsb 0)
+        bf(types, 1, 0, 1, 1, 3, true), // field3  (lsb 1)
+        bf(types, 2, 0, 1, 4, 4, true), // sfield4 (lsb 4)
     ];
     // The big-endian post-layout order (most- to least-significant in memory).
     v.reverse();
-    struct_with(v, 4)
+    struct_with(types, v, 4)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +84,8 @@ fn myfoo_word0_be() -> Datatype {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bff_find_matching_be_matches_every_field() {
-    let s = myfoo_word0_be();
+    let types = TypeFactoryImpl::new();
+    let s = myfoo_word0_be(&types);
     // The recovery builds the query range with the STORE space's endianness (BE)
     // and the field's bit position.
     for (name_id, lsb, nb) in [(0, 0, 1), (1, 1, 3), (2, 4, 4)] {
@@ -113,7 +112,8 @@ fn w10bff_find_matching_be_matches_every_field() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bff_find_matching_endianness_is_load_bearing() {
-    let s = myfoo_word0_be();
+    let types = TypeFactoryImpl::new();
+    let s = myfoo_word0_be(&types);
     // A returned match always covers exactly the queried (lsb,nb).
     for (lsb, nb) in [(0, 1), (1, 3), (4, 4)] {
         if let Some(m) = s.find_matching_bit_field(&BitRange::new(0, 1, lsb, nb, true)) {
@@ -144,9 +144,10 @@ fn w10bff_find_matching_endianness_is_load_bearing() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bff_find_matching_multiprobe_narrowing() {
+    let types = TypeFactoryImpl::new();
     // Six 1-bit LE fields across byte 0, lsb 0..6, vector ascending.
-    let bits: Vec<TypeBitField> = (0..6).map(|i| bf(i, 0, 1, i, 1, false)).collect();
-    let s = struct_with(bits, 4);
+    let bits: Vec<TypeBitField> = (0..6).map(|i| bf(&types, i, 0, 1, i, 1, false)).collect();
+    let s = struct_with(&types, bits, 4);
     for lsb in 0..6 {
         let m = s
             .find_matching_bit_field(&BitRange::new(0, 1, lsb, 1, false))
@@ -163,7 +164,8 @@ fn w10bff_find_matching_multiprobe_narrowing() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bff_find_matching_partial_and_empty() {
-    let s = myfoo_word0_be();
+    let types = TypeFactoryImpl::new();
+    let s = myfoo_word0_be(&types);
     // A 2-bit range starting at lsb 3 straddles field3 (lsb1..4) and sfield4
     // (lsb4..8) — partial overlap with one of them, no exact match.
     let straddle = BitRange::new(0, 1, 3, 2, true);
@@ -175,10 +177,10 @@ fn w10bff_find_matching_partial_and_empty() {
     let beyond = BitRange::new(1, 1, 0, 1, true);
     assert!(s.find_matching_bit_field(&beyond).is_none(), "out-of-range query is no match");
     // Empty struct: max = bitfield.len() - 1 = -1, loop skipped, no panic.
-    let empty = struct_with(vec![], 4);
+    let empty = struct_with(&types, vec![], 4);
     assert!(empty.find_matching_bit_field(&BitRange::new(0, 1, 0, 1, false)).is_none());
     // A non-struct (a plain int) must also safely return None.
-    let prim = Datatype::new(4, type_metatype::TYPE_UINT);
+    let prim = types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap();
     assert!(prim.find_matching_bit_field(&BitRange::new(0, 1, 0, 1, false)).is_none());
 }
 
@@ -191,7 +193,8 @@ fn w10bff_find_matching_partial_and_empty() {
 // ---------------------------------------------------------------------------
 #[test]
 fn w10bff_find_matching_requires_exact_range() {
-    let s = myfoo_word0_be();
+    let types = TypeFactoryImpl::new();
+    let s = myfoo_word0_be(&types);
     // Exact field3 (lsb1, nb3) -> match.
     assert_eq!(
         s.find_matching_bit_field(&BitRange::new(0, 1, 1, 3, true)).map(|m| m.ident),

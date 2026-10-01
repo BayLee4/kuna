@@ -387,8 +387,8 @@ fn project(binary: &str, prog: &mut ConsoleProgram, display: &str) -> Result<Str
     let prelude = print_c_recompile_prelude(prog.arch());
     let types = print_c_types(prog.arch_mut());
 
-    let header = build_header(display, &prelude, &types, &results);
-    let c_file = build_c(display, &results);
+    let header = build_header(display, &prelude, &types, &results)?;
+    let c_file = build_c(display, &results)?;
     let dat_addrs = collect_dat_addrs(&results);
     let asm = build_asm(prog, &results, &dat_addrs, display);
     // The wasm surface labels the README with the virtual display name (the
@@ -672,6 +672,7 @@ fn result_json(
     kinds: &[&'static str],
     assertions: &[Outcome],
 ) -> String {
+    let required_callables = kuna_console::project::required_callable_keys(funcs);
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"binary\": {},\n", json_str(binary)));
     s.push_str(&format!("  \"language\": {},\n", json_str(language)));
@@ -709,6 +710,15 @@ fn result_json(
                 Obj::new().str("name", &t.name).str("definition", &t.definition).num("size", t.size).end()
             }))
         ));
+        let mut artifacts = f.callable_artifacts.iter()
+            .filter(|artifact| required_callables.contains(artifact.key.as_str())).peekable();
+        if artifacts.peek().is_some() {
+            s.push_str(&format!("      \"callable_artifacts\": {},\n",
+                crate::json::callable_artifacts_json(artifacts)));
+        }
+        if let Some(error) = &f.callable_export_error {
+            s.push_str(&format!("      \"callable_export_error\": {},\n", json_str(error)));
+        }
         s.push_str("      \"variables\": [");
         for (j, v) in f.variables.iter().enumerate() {
             s.push_str(if j == 0 { "\n" } else { ",\n" });

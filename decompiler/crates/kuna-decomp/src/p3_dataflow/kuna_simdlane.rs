@@ -77,7 +77,7 @@ use kuna_base::marshal::ElementId;
 use kuna_base::types::{int4, uint4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::context::{OpId, TypeOp, VarnodeId};
 use crate::funcdata::Funcdata;
 use crate::p0_knowledge::options::on_or_off;
@@ -165,11 +165,8 @@ impl Rule for RuleSimdShuffleLane {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleSimdShuffleLane { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSimdShuffleLane { enabled: self.enabled, group: self.group.clone() })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -261,6 +258,7 @@ impl Rule for RuleSimdShuffleLane {
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option simdlane on`.
         ctor: || Box::new(RuleSimdShuffleLane::with_group(true, "analysis")),
     }]

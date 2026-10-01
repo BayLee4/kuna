@@ -19,8 +19,13 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn field<'a>(ct: &'a Datatype, name: &str) -> &'a TypeField {
-    (0..ct.num_depend()).filter_map(|i| ct.get_field(i)).find(|f| f.name == name).expect(name)
+fn field_type(ct: &TypeRoot, name: &str) -> TypeRoot {
+    let view = ct.read();
+    let field = (0..ct.num_depend())
+        .filter_map(|i| view.get_field(ct.id(), i).unwrap())
+        .find(|f| f.name == name)
+        .expect(name);
+    ct.related(field.field_type).unwrap()
 }
 
 #[test]
@@ -96,17 +101,17 @@ fn the_built_teb_resolves_its_peb_and_its_self_pointer() {
     assert!(is_teb_pointer(&ptr, &LAYOUT64));
     assert!(!is_teb_pointer(&ptr, &LAYOUT32));
     let teb = ptr.get_ptr_to().unwrap();
-    assert_eq!((teb.get_name(), teb.get_size()), ("TEB", 0x1878));
-    let peb = field(&teb, "ProcessEnvironmentBlock").field_type.get_ptr_to().unwrap();
-    assert_eq!((peb.get_name(), peb.get_size()), ("PEB", 0x7d0));
-    assert_eq!(field(&peb, "BeingDebugged").field_type.get_size(), 1);
-    let heap = &field(&peb, "ProcessHeap").field_type;
+    assert_eq!((teb.read().get(teb.id()).unwrap().get_name(), teb.get_size()), ("TEB", 0x1878));
+    let peb = field_type(&teb, "ProcessEnvironmentBlock").get_ptr_to().unwrap();
+    assert_eq!((peb.read().get(peb.id()).unwrap().get_name(), peb.get_size()), ("PEB", 0x7d0));
+    assert_eq!(field_type(&peb, "BeingDebugged").get_size(), 1);
+    let heap = field_type(&peb, "ProcessHeap");
     assert_eq!((heap.get_metatype(), heap.get_size()), (type_metatype::TYPE_UNKNOWN, 8));
-    let inner = field(&teb, "Self").field_type.get_ptr_to().unwrap();
-    assert_eq!(inner.get_name(), "_TEB");
+    let inner = field_type(&teb, "Self").get_ptr_to().unwrap();
+    assert_eq!(inner.read().get(inner.id()).unwrap().get_name(), "_TEB");
     assert!(!inner.is_incomplete(), "Self must point at a completed structure");
-    let inner_peb = field(&inner, "ProcessEnvironmentBlock").field_type.get_ptr_to().unwrap();
-    assert!(Rc::ptr_eq(&inner_peb, &peb));
+    let inner_peb = field_type(&inner, "ProcessEnvironmentBlock").get_ptr_to().unwrap();
+    assert_eq!(inner_peb, peb);
 }
 
 #[test]
@@ -114,7 +119,7 @@ fn building_twice_reuses_the_same_types() {
     let f = factory();
     let a = teb_pointer_type(&f, &LAYOUT32).unwrap();
     let b = teb_pointer_type(&f, &LAYOUT32).unwrap();
-    assert!(Rc::ptr_eq(&a.get_ptr_to().unwrap(), &b.get_ptr_to().unwrap()));
+    assert_eq!(a.get_ptr_to().unwrap(), b.get_ptr_to().unwrap());
 }
 
 #[test]
@@ -123,7 +128,7 @@ fn a_foreign_type_under_either_name_makes_the_build_decline() {
         let f = factory();
         let shell = f.get_type_struct(taken).unwrap();
         let int4 = f.get_base(4, type_metatype::TYPE_INT).unwrap();
-        f.set_fields_struct_raw(&shell, vec![TypeField::new(0, 0, "x", int4)], Vec::new(), 4, 4, 0)
+        f.set_fields_struct_raw(&shell, vec![TypeField::new(0, 0, "x", int4.id())], Vec::new(), 4, 4, 0)
             .unwrap();
         assert!(teb_pointer_type(&f, &LAYOUT64).is_none(), "built over a foreign {taken}");
     }
@@ -148,12 +153,12 @@ fn every_structure_is_variable_length_at_the_largest_published_size() {
     for layout in [&LAYOUT64, &LAYOUT32] {
         let f = factory();
         let teb = teb_pointer_type(&f, layout).unwrap().get_ptr_to().unwrap();
-        let peb = field(&teb, "ProcessEnvironmentBlock").field_type.get_ptr_to().unwrap();
-        let inner = field(&teb, "Self").field_type.get_ptr_to().unwrap();
+        let peb = field_type(&teb, "ProcessEnvironmentBlock").get_ptr_to().unwrap();
+        let inner = field_type(&teb, "Self").get_ptr_to().unwrap();
         for t in [&teb, &peb, &inner] {
-            assert!(t.is_variable_length(), "{} must not be indexed like an array", t.get_name());
+            assert!(t.is_variable_length(), "{} must not be indexed like an array", t.read().get(t.id()).unwrap().get_name());
         }
-        let inner_self = &field(&inner, "Self").field_type;
+        let inner_self = field_type(&inner, "Self");
         assert_eq!(inner_self.get_metatype(), type_metatype::TYPE_UNKNOWN, "a second Self hop stays untyped");
     }
 }
@@ -163,7 +168,7 @@ fn a_same_shaped_fixed_length_type_is_not_reused() {
     let f = factory();
     let shell = f.get_type_struct("PEB").unwrap();
     let byte = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
-    f.set_fields_struct_raw(&shell, vec![TypeField::new(0, 2, "BeingDebugged", byte)], Vec::new(), 0x7d0, 8, 0)
+    f.set_fields_struct_raw(&shell, vec![TypeField::new(0, 2, "BeingDebugged", byte.id())], Vec::new(), 0x7d0, 8, 0)
         .unwrap();
     assert!(teb_pointer_type(&f, &LAYOUT64).is_none(), "a fixed-length PEB would wrap offsets into a neighbour");
 }

@@ -16,19 +16,20 @@
 //! f(a: i32, ...)` parses and does not compile — so the shape assertions here
 //! carry the rules a parser alone would miss.
 //!
-//! # Parseable, not compilable
+//! # Broad syntax coverage, not a whole-program compilation guarantee
 //!
 //! The scope boundary, deliberately: decompiled output calls functions that have
 //! no definition, `CARRY4(a, b)` has no Rust spelling, `>>` signedness follows
 //! the operand type, and `[u8; 3]` does not do arithmetic. Making the output
-//! *compile* is a different and much larger project. This gate asserts it
-//! parses.
+//! *compile* requires recovered types and dependencies too. This gate asserts it
+//! parses; the decompiler's language execution regressions exercise supported
+//! arithmetic and pointer expressions with a real compiler separately.
 //!
 //! ## `.sla` precondition
 //!
 //! Bootstrapping needs the built x86 `.sla` under `specs/` (gitignored; `make
-//! specs`). When it is absent the bootstrap fails; the test prints that and
-//! returns early (a specs-less CI is a visible skip, never a false green).
+//! specs`). Only its absence permits a visible skip. A bootstrap failure with
+//! the prerequisite present is a failure, not evidence of missing specs.
 
 use std::path::PathBuf;
 
@@ -57,20 +58,19 @@ fn grep() -> PathBuf {
 fn decompile_as(bin: &PathBuf, func: &str, lang: &str) -> Option<String> {
     let root = repo_root();
     let specs = root.join("specs");
+    let sla = specs.join("Ghidra/Processors/x86/data/languages/x86-64.sla");
+    if !sla.is_file() {
+        eprintln!(
+            "verify_outlang_rust_syntax: skipping (missing {}; run `make specs`)",
+            sla.display()
+        );
+        return None;
+    }
     let spec_roots = vec![specs.to_str().unwrap().to_string()];
 
-    let path = bin.to_str()?.to_string();
-    let mut prog = match bootstrap_from_object(&path, "", &spec_roots) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!(
-                "verify_outlang_rust_syntax: skipping (bootstrap failed, build `.sla` with \
-                 `make specs`): {}",
-                e.explain()
-            );
-            return None;
-        }
-    };
+    let path = bin.to_str().expect("fixture path is UTF-8").to_string();
+    let mut prog = bootstrap_from_object(&path, "", &spec_roots)
+        .unwrap_or_else(|e| panic!("bootstrap {} failed: {}", bin.display(), e.explain()));
     prog.commit_pending_analysis().expect("analysis commit succeeds");
 
     let cmds: Vec<String> = vec![
@@ -90,6 +90,12 @@ fn decompile_as(bin: &PathBuf, func: &str, lang: &str) -> Option<String> {
     for _ in 0..count {
         execute(&mut status);
     }
+    assert!(
+        status.optr.contains("Decompilation complete"),
+        "decompilation of {}:{func} did not complete:\n{}",
+        bin.display(),
+        status.optr
+    );
     Some(strip_console_chatter(&status.optr))
 }
 
@@ -121,7 +127,10 @@ fn strip_console_chatter(out: &str) -> String {
 /// The emitted document is a function item, so it parses as a file on its own.
 fn assert_parses_as_rust(code: &str, what: &str) {
     match syn::parse_file(code) {
-        Ok(_) => {}
+        Ok(file) => assert!(
+            file.items.iter().any(|item| matches!(item, syn::Item::Fn(_))),
+            "{what}: emitted document has no function:\n{code}"
+        ),
         Err(e) => panic!("{what}: emitted document is not valid Rust: {e}\n--- document ---\n{code}"),
     }
 }

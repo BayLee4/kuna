@@ -1,0 +1,123 @@
+--- a/integrations/ghidra/KunaDecompiler/build.gradle
++++ b/integrations/ghidra/KunaDecompiler/build.gradle
+@@ -74,6 +74,7 @@
+ def producerApplication = file("${ghidraInstallDir}/Ghidra/application.properties")
+ def producerPatch = file('producer/call-return-origin.patch')
+ def consumerPatch = file('producer/callable-support.patch')
++def importPatch = file('producer/native-import.patch')
+ def consumerSourceArchive = file("${ghidraInstallDir}/Ghidra/Features/Decompiler/lib/Decompiler-src.zip")
+ def consumerJar = file("${ghidraInstallDir}/Ghidra/Features/Decompiler/lib/Decompiler.jar")
+ def consumerNames = [
+@@ -86,11 +87,12 @@
+ 	'ghidra/app/plugin/processors/sleigh/PcodeEmit.java',
+ 	'ghidra/app/plugin/processors/sleigh/PcodeEmitPacked.java',
+ 	'ghidra/program/model/pcode/PcodeDataTypeManager.java',
++	'ghidra/program/model/pcode/HighFunction.java',
+ 	'ghidra/program/model/data/DataTypeWriter.java'
+ ]
+ 
+ def prepareProducerSources = tasks.register('prepareProducerSources') {
+-	inputs.files(producerSourceArchive, producerPatch, consumerSourceArchive, consumerPatch)
++	inputs.files(producerSourceArchive, producerPatch, consumerSourceArchive, consumerPatch, importPatch)
+ 	outputs.dir(producerSources)
+ 	doLast {
+ 		delete producerSources
+@@ -110,7 +112,7 @@
+ 			}
+ 		}
+ 		// Exact context application fails closed if an upstream seam changes.
+-		[producerPatch, consumerPatch].each { delta ->
++		[producerPatch, consumerPatch, importPatch].each { delta ->
+ 			providers.exec {
+ 				workingDir producerSources.get().asFile.toPath().root.toFile()
+ 				commandLine 'git', 'apply', '--check', '--unsafe-paths',
+@@ -159,7 +161,7 @@
+ 			'Ghidra-Application-SHA256': sha256(producerApplication),
+ 			'Ghidra-SoftwareModeling-SHA256': sha256(producerModelJar),
+ 			'Ghidra-Source-SHA256': sha256(producerSourceArchive),
+-			'Kuna-Callable-Support-Protocol': '2-e4030-4039-a4030-4048',
++			'Kuna-Callable-Support-Protocol': '2-e4030-4039-a4030-4048-i4050-4053',
+ 			'Ghidra-Decompiler-SHA256': sha256(consumerJar),
+ 			'Ghidra-Decompiler-Source-SHA256': sha256(consumerSourceArchive))
+ 	}
+--- a/integrations/ghidra/KunaDecompiler/src/main/java/kuna/KunaIntegratedInstall.java
++++ b/integrations/ghidra/KunaDecompiler/src/main/java/kuna/KunaIntegratedInstall.java
+@@ -75,7 +75,7 @@
+ 			verifyHash(source.resolve(APPLICATION), attributes, "Ghidra-Application-SHA256");
+ 			verifyHash(source.resolve(MODEL), attributes, "Ghidra-SoftwareModeling-SHA256");
+ 			verifyHash(source.resolve(SOURCES), attributes, "Ghidra-Source-SHA256");
+-			if (!"2-e4030-4039-a4030-4048".equals(attributes.getValue("Kuna-Callable-Support-Protocol"))) {
++			if (!"2-e4030-4039-a4030-4048-i4050-4053".equals(attributes.getValue("Kuna-Callable-Support-Protocol"))) {
+ 				throw new IOException("Unsupported Kuna callable support protocol: " + producer);
+ 			}
+ 			verifyHash(source.resolve(DECOMPILER), attributes, "Ghidra-Decompiler-SHA256");
+--- /dev/null
++++ b/integrations/ghidra/KunaDecompiler/producer/native-import.patch
+@@ -0,0 +1,67 @@
++--- a/ghidra/program/model/pcode/HighFunction.java
+++++ b/ghidra/program/model/pcode/HighFunction.java
++@@ -441,6 +441,7 @@
++ 			encoder.writeString(ATTRIB_LABEL, altName);
++ 		}
++ 		encoder.writeSignedInteger(ATTRIB_SIZE, size);
+++		KunaNativeImport.encode(encoder, func);
++ 		if (func.isInline()) {
++ 			encoder.writeBool(ATTRIB_INLINE, true);
++ 		}
++--- /dev/null
+++++ b/ghidra/program/model/pcode/KunaNativeImport.java
++@@ -0,0 +1,54 @@
+++package ghidra.program.model.pcode;
+++
+++import java.io.IOException;
+++
+++import ghidra.program.model.listing.Function;
+++import ghidra.program.model.listing.Library;
+++import ghidra.program.model.listing.Program;
+++import ghidra.program.model.symbol.ExternalLocation;
+++import ghidra.program.model.symbol.SourceType;
+++
+++/** Exact imported provider identity; never canonical C text or a body waiver. */
+++final class KunaNativeImport {
+++    private static final AttributeId LIBRARY = new AttributeId("kuna_import_library", 4050);
+++    private static final AttributeId SYMBOL = new AttributeId("kuna_import_symbol", 4051);
+++    private static final AttributeId PLATFORM = new AttributeId("kuna_import_platform", 4052);
+++    private static final AttributeId ID = new AttributeId("kuna_import_id", 4053);
+++
+++    private KunaNativeImport() { }
+++
+++    static void encode(Encoder encoder, Function function) throws IOException {
+++        Program program = function.getProgram();
+++        Function external = function.isThunk() ? function.getThunkedFunction(true) : function;
+++        if (external == null || !external.isExternal()) {
+++            return;
+++        }
+++        ExternalLocation location = program.getExternalManager().getExternalLocation(external.getSymbol());
+++        if (location == null || location.getSource() != SourceType.IMPORTED ||
+++            location.getSymbol() == null || location.getSymbol().getID() <= 0 ||
+++            Library.UNKNOWN.equals(location.getLibraryName())) {
+++            return;
+++        }
+++        String platform = switch (program.getExecutableFormat()) {
+++            case "Mac OS X Mach-O" -> "macho";
+++            case "Executable and Linking Format (ELF)" -> "elf";
+++            case "Portable Executable (PE)" -> "pe";
+++            default -> null;
+++        };
+++        if (platform == null) {
+++            return;
+++        }
+++        String symbol = location.getOriginalImportedName();
+++        if (symbol == null) {
+++            symbol = location.getLabel();
+++        }
+++        String library = location.getLibraryName();
+++        if (library == null || library.isEmpty() || symbol == null || symbol.isEmpty()) {
+++            return;
+++        }
+++        encoder.writeString(LIBRARY, library);
+++        encoder.writeString(SYMBOL, symbol);
+++        encoder.writeString(PLATFORM, platform);
+++        encoder.writeUnsignedInteger(ID, location.getSymbol().getID());
+++    }
+++}

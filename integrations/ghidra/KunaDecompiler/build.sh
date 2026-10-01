@@ -50,7 +50,9 @@ chmod +x "$EXT_DIR/os/$PLATFORM/$EXE"
 if [ -n "${GHIDRA_INSTALL_DIR:-}" ]; then
 	echo ">> packaging the extension against $GHIDRA_INSTALL_DIR"
 	( cd "$EXT_DIR" && gradle -PGHIDRA_INSTALL_DIR="$GHIDRA_INSTALL_DIR" buildExtension )
-	echo ">> done. Install the zip in $EXT_DIR/dist/ via Ghidra: File -> Install Extensions..."
+	echo ">> done. Extract the zip in $EXT_DIR/dist/ and run its isolated installer:"
+	echo "   java -cp <extracted>/KunaDecompiler/lib/KunaDecompiler.jar kuna.KunaIntegratedInstall '$GHIDRA_INSTALL_DIR' <new-output-directory>"
+	echo "   Then launch the new copy; the original Ghidra installation is unchanged."
 else
 	echo ">> binary staged at os/$PLATFORM/$EXE."
 	echo "   - release install: set GHIDRA_INSTALL_DIR and re-run to build the installable zip; or"

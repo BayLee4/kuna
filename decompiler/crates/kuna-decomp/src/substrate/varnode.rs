@@ -41,7 +41,7 @@ use slotmap::SlotMap;
 use smallvec::SmallVec;
 
 use crate::cover::{Cover, CoverContext};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::context::{HighVariableId, OpId, VarnodeId};
 
 /// Boolean attributes of a [`Varnode`] (C++ `Varnode::varnode_flags`).
@@ -515,12 +515,12 @@ pub struct Varnode {
     def_seqnum: Option<SeqNum>,
     /// High-level variable of which this is an instantiation (STUB(W7))
     high: Option<HighVariableId>,
-    /// Datatype associated with this varnode (STUB(W6): minimal skeleton)
-    type_: Rc<Datatype>,
+    /// Retained datatype identity associated with this varnode.
+    type_: TypeRoot,
     /// Temporary Datatype used during type propagation (C++ `union temp { Datatype
     /// *dataType; ... } temp` — the `dataType` field).  Set/read only by
     /// `ActionInferTypes`; `None` outside a propagation pass.
-    temp_type: Option<Rc<Datatype>>,
+    temp_type: Option<TypeRoot>,
     /// Cached key into the loc tree (replaces the C++ `lociter`)
     lociter: Option<LocKey>,
     /// Cached key into the def tree (replaces the C++ `defiter`)
@@ -548,7 +548,7 @@ impl Varnode {
     /// `def` is unset, flags/nzm are seeded from the space type exactly as the
     /// C++ constructor (`varnode.cc:597-626`).  Most callers go through
     /// [`VarnodeBank`]; this is the raw, unmanaged construction.
-    pub fn new(s: int4, m: Address, dt: Rc<Datatype>) -> Varnode {
+    pub fn new(s: int4, m: Address, dt: TypeRoot) -> Varnode {
         let mut vn = Varnode {
             flags: 0,
             size: s,
@@ -627,7 +627,7 @@ impl Varnode {
         self.addlflags
     }
     /// Get the Datatype (C++ `getType`).
-    pub fn get_type(&self) -> &Rc<Datatype> {
+    pub fn get_type(&self) -> &TypeRoot {
         &self.type_
     }
     /// C++ `Varnode::getTypeReadFacing(op)` (varnode.cc:658).  Generally just the
@@ -636,13 +636,13 @@ impl Varnode {
     /// is a deferred W8 surface, so when the type does not need resolution this is
     /// exactly `getType()` — faithful for the pointer/array/struct corpus (no
     /// unions). // STUB(W8 union findResolve)
-    pub fn get_type_read_facing(&self, _op: OpId) -> &Rc<Datatype> {
+    pub fn get_type_read_facing(&self, _op: OpId) -> &TypeRoot {
         &self.type_
     }
     /// C++ `Varnode::getTypeDefFacing()` (varnode.cc:645).  The def-facing analogue
     /// of [`get_type_read_facing`]; identical when the type does not need union
     /// resolution. // STUB(W8 union findResolve)
-    pub fn get_type_def_facing(&self) -> &Rc<Datatype> {
+    pub fn get_type_def_facing(&self) -> &TypeRoot {
         &self.type_
     }
     /// If this has a data-type built out of separate pieces, return it (C++
@@ -654,20 +654,20 @@ impl Varnode {
     /// returns the Varnode's own `type` when it `isPieceStructured()`, which is
     /// the full-Varnode case (a whole struct value flowing through a CONCAT tree).
     /// // STUB(W4): `mapentry->getSymbol()->getType()` partial path.
-    pub fn get_structured_type(&self) -> Option<Rc<Datatype>> {
+    pub fn get_structured_type(&self) -> Option<TypeRoot> {
         let ct = &self.type_;
         if ct.is_piece_structured() {
-            return Some(Rc::clone(ct));
+            return Some(ct.clone());
         }
         None
     }
     /// Set the temporary Datatype used during type propagation (C++ `setTempType`).
-    pub fn set_temp_type(&mut self, t: Rc<Datatype>) {
+    pub fn set_temp_type(&mut self, t: TypeRoot) {
         self.temp_type = Some(t);
     }
     /// Get the temporary Datatype used during type propagation (C++ `getTempType`).
     /// `None` if no propagation pass has seeded a temp type yet.
-    pub fn get_temp_type(&self) -> Option<&Rc<Datatype>> {
+    pub fn get_temp_type(&self) -> Option<&TypeRoot> {
         self.temp_type.as_ref()
     }
     /// Get the creation index (C++ `getCreateIndex`).
@@ -1473,9 +1473,8 @@ impl Varnode {
 
     /// Set the Datatype if not locked (C++ `updateType(Datatype*)`).
     /// Returns true if the Datatype changed.
-    pub fn update_type(&mut self, ct: Rc<Datatype>) -> bool {
-        // pointer identity
-        if Rc::ptr_eq(&self.type_, &ct) || self.is_type_lock() {
+    pub fn update_type(&mut self, ct: TypeRoot) -> bool {
+        if self.type_ == ct || self.is_type_lock() {
             return false;
         }
         self.type_ = ct;
@@ -1485,14 +1484,14 @@ impl Varnode {
 
     /// (Possibly) set the Datatype given lock/override restrictions
     /// (C++ `updateType(Datatype*,bool,bool)`).
-    pub fn update_type_locked(&mut self, ct: Rc<Datatype>, mut lock: bool, over: bool) -> bool {
+    pub fn update_type_locked(&mut self, ct: TypeRoot, mut lock: bool, over: bool) -> bool {
         if ct.get_metatype() == type_metatype::TYPE_UNKNOWN {
             lock = false; // Unknown data type is ALWAYS unlocked
         }
         if self.is_type_lock() && !over {
             return false;
         }
-        if Rc::ptr_eq(&self.type_, &ct) && (self.is_type_lock() == lock) {
+        if self.type_ == ct && (self.is_type_lock() == lock) {
             return false;
         }
         self.flags &= !varnode_flags::typelock;
@@ -1515,7 +1514,7 @@ impl Varnode {
     /// restoring `V <= c` from the canonical `V < c+1`, where the original
     /// constant was typed `int1`/enum by inference and the fresh constant would
     /// otherwise be `TYPE_UNKNOWN`).
-    pub fn copy_symbol_fields(&mut self, src_type: Rc<Datatype>, src_flags: uint4) {
+    pub fn copy_symbol_fields(&mut self, src_type: TypeRoot, src_flags: uint4) {
         self.type_ = src_type; // Copy any type
         // mapentry = vn->mapentry;  -- STUB(W4): no mapentry link in the merged tree
         self.flags &= !(varnode_flags::typelock | varnode_flags::namelock);
@@ -1675,7 +1674,7 @@ impl VarnodeBank {
     }
 
     /// Create a \e free Varnode and insert it into both trees (C++ `create`).
-    pub fn create(&mut self, s: int4, m: Address, ct: Rc<Datatype>) -> VarnodeId {
+    pub fn create(&mut self, s: int4, m: Address, ct: TypeRoot) -> VarnodeId {
         let mut vn = Varnode::new(s, m, ct);
         vn.create_index = self.create_index;
         self.create_index = self.create_index.wadd(1);
@@ -1691,7 +1690,7 @@ impl VarnodeBank {
     }
 
     /// Create a temporary varnode in the unique space (C++ `createUnique`).
-    pub fn create_unique(&mut self, s: int4, ct: Rc<Datatype>) -> VarnodeId {
+    pub fn create_unique(&mut self, s: int4, ct: TypeRoot) -> VarnodeId {
         let addr = Address::new(Rc::clone(&self.uniq_space), self.uniqid as u64);
         self.uniqid = self.uniqid.wadd(s as uintm);
         self.create(s, addr, ct)
@@ -1823,7 +1822,7 @@ impl VarnodeBank {
         &mut self,
         s: int4,
         m: Address,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         def: DefOpInfo,
         replace_reads: &mut ReplaceReads,
     ) -> KunaResult<VarnodeId> {
@@ -1840,7 +1839,7 @@ impl VarnodeBank {
     pub fn create_def_unique(
         &mut self,
         s: int4,
-        ct: Rc<Datatype>,
+        ct: TypeRoot,
         def: DefOpInfo,
         replace_reads: &mut ReplaceReads,
     ) -> KunaResult<VarnodeId> {
@@ -2392,8 +2391,9 @@ mod tests {
     use kuna_base::space::{addrspace_flags, AddrSpace, ConstantSpace, UniqueSpace};
     use std::cmp::Ordering;
 
-    fn dt(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn dt(size: int4) -> TypeRoot {
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        TypeFactoryImpl::new().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
     }
 
     /// Build a manager with const(0), unique(1), ram(2), register(3).

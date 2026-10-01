@@ -66,14 +66,12 @@
 //! `getTypePartialEnum` accessors not exposed here) — see the stub note at the
 //! end of the file.
 
-use std::rc::Rc;
-
 use kuna_base::address::calc_mask;
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uint4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::op::pcodeop_flags as pf;
 use crate::context::TypeOp;
 
@@ -261,7 +259,7 @@ impl TypeOpInfo {
         &self,
         tlst: &dyn TypeFactory,
         out_size: int4,
-    ) -> KunaResult<Rc<Datatype>> {
+    ) -> KunaResult<TypeRoot> {
         match self.opcode {
             // TypeOpPtradd::getOutputLocal / TypeOpPtrsub::getOutputLocal:
             // getBase(out_size, TYPE_INT) (typeop.cc:2240-2244, 2310-2314).
@@ -290,7 +288,7 @@ impl TypeOpInfo {
         tlst: &dyn TypeFactory,
         slot: int4,
         in_size: int4,
-    ) -> KunaResult<Rc<Datatype>> {
+    ) -> KunaResult<TypeRoot> {
         match self.opcode {
             // TypeOpIntLeft/IntRight/IntSright::getInputLocal: slot 1 is the
             // shift amount -> getBaseNoChar(size, TYPE_INT); else fall to the

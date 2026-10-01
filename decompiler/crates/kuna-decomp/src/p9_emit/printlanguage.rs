@@ -282,9 +282,9 @@ impl NodePending {
 
 /// The meta-data a non-`casetoken` [`Atom`] carries beside its name (C++ union
 /// `Atom::ptr_second`, printlanguage.hh:216-221).  Carried as a Rust enum (a
-/// tagged union) so the right variant is statically tracked.  The pointer
-/// members are opaque indices (STUB(printc)); `IntValue` is a real `uintb`.
-#[derive(Debug, Clone, Copy)]
+/// tagged union) so the right variant is statically tracked. Data-flow objects
+/// use arena keys; a datatype root retains its graph while the atom is buffered.
+#[derive(Debug, Clone)]
 pub enum AtomData {
     /// No associated data-flow annotation.
     None,
@@ -293,7 +293,9 @@ pub enum AtomData {
     /// A function associated with the token (C++ `fd`).
     Fd(usize),
     /// A type associated with the token (C++ `ct`).
-    Ct(usize),
+    Ct(crate::dtype::TypeRoot),
+    /// Wire-only identities of the nominal leaves inside one composite type.
+    TypeSpans(std::rc::Rc<[crate::kuna_langtypes::TypeSpan]>),
     /// An integer value associated with a `casetoken` (C++ `intValue`).
     IntValue(uintb),
 }
@@ -331,7 +333,7 @@ impl Atom {
 
     /// Construct a token for a data-type name (C++ `Atom(nm,t,hl,c)`,
     /// printlanguage.hh:229-230).
-    pub fn typed(name: impl Into<String>, tag: TagType, hl: SyntaxHighlight, ct: usize) -> Atom {
+    pub fn typed(name: impl Into<String>, tag: TagType, hl: SyntaxHighlight, ct: crate::dtype::TypeRoot) -> Atom {
         Atom { name: name.into(), tag, highlight: hl, op: None, data: AtomData::Ct(ct), offset: 0 }
     }
 
@@ -341,7 +343,7 @@ impl Atom {
         name: impl Into<String>,
         tag: TagType,
         hl: SyntaxHighlight,
-        ct: usize,
+        ct: crate::dtype::TypeRoot,
         off: int4,
         op: IrKey,
     ) -> Atom {
@@ -428,19 +430,22 @@ pub const OPEN_PAREN: &str = "(";
 /// The `")"` token (C++ `PrintLanguage::CLOSE_PAREN`).
 pub const CLOSE_PAREN: &str = ")";
 
-/// Comment-type bits this base touches (C++ `Comment::*`, comment.hh).  Only the
-/// bits `resetDefaultsInternal` ORs together are needed here.  STUB(comment): the
-/// full set lives in the (stub) `comment` module.
-pub mod comment_type {
-    use super::uint4;
-    /// `Comment::warning` — an in-body warning comment.
-    pub const WARNING: uint4 = 2;
-    /// `Comment::user2` — a user instruction comment.
-    pub const USER2: uint4 = 4;
-    /// `Comment::header` — a function-header comment.
-    pub const HEADER: uint4 = 8;
-    /// `Comment::warningheader` — a warning in the function header.
-    pub const WARNINGHEADER: uint4 = 16;
+pub use crate::comment::comment_type;
+
+/// The comment delimiters selected by `commentstyle`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentStyle {
+    C,
+    CPlusPlus,
+}
+
+impl CommentStyle {
+    pub fn delimiters(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Self::C => ("/* ", " */", "   "),
+            Self::CPlusPlus => ("// ", "", "// "),
+        }
+    }
 }
 
 /// The printing-context state shared by every back-end: the printing-modification
@@ -470,6 +475,9 @@ pub struct PrintContext {
     instr_comment_type: uint4,
     /// Type of header comments to display (C++ `head_comment_type`).
     head_comment_type: uint4,
+    /// Ordinary/header/banner delimiters; `warnstyle inline` independently uses
+    /// single-line `//` warning slugs.
+    comment_style: CommentStyle,
     /// How namespace tokens are displayed (C++ `namespc_strategy`).
     namespc_strategy: NamespaceStrategy,
 }
@@ -493,6 +501,7 @@ impl PrintContext {
             line_commentindent: 0,
             instr_comment_type: 0,
             head_comment_type: 0,
+            comment_style: CommentStyle::C,
             namespc_strategy: NamespaceStrategy::MinimalNamespaces,
         };
         ctx.reset_defaults_internal();
@@ -506,6 +515,7 @@ impl PrintContext {
         self.line_commentindent = 20;
         self.namespc_strategy = NamespaceStrategy::MinimalNamespaces;
         self.instr_comment_type = comment_type::USER2 | comment_type::WARNING;
+        self.comment_style = CommentStyle::C;
     }
 
     // -- Routines consistent across languages (printlanguage.hh:285-291) -----
@@ -561,6 +571,18 @@ impl PrintContext {
         self.mods = m;
     }
 
+    /// Save transient document traversal state without copying persistent options.
+    pub(crate) fn checkpoint(&self) -> (usize, usize, uint4, Option<usize>) {
+        (self.modstack.len(), self.scopestack.len(), self.mods, self.curscope)
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, state: (usize, usize, uint4, Option<usize>)) {
+        self.modstack.truncate(state.0);
+        self.scopestack.truncate(state.1);
+        self.mods = state.2;
+        self.curscope = state.3;
+    }
+
     /// The current symbol scope (C++ `curscope`).
     #[inline]
     pub fn cur_scope(&self) -> Option<usize> {
@@ -589,6 +611,22 @@ impl PrintContext {
     #[inline]
     pub fn set_header_comment(&mut self, val: uint4) {
         self.head_comment_type = val;
+    }
+
+    pub fn set_comment_style(&mut self, style: &str) -> KunaResult<()> {
+        let style = if style == "c" || style.starts_with("/*") {
+            CommentStyle::C
+        } else if style == "cplusplus" || style.starts_with("//") {
+            CommentStyle::CPlusPlus
+        } else {
+            return Err(KunaError::lowlevel("Unknown comment style. Use \"c\" or \"cplusplus\""));
+        };
+        self.comment_style = style;
+        Ok(())
+    }
+
+    pub fn comment_style(&self) -> CommentStyle {
+        self.comment_style
     }
 
     /// Set how namespace tokens are displayed (C++ `setNamespaceStrategy`).

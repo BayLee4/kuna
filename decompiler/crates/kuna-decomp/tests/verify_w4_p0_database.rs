@@ -13,6 +13,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
@@ -21,7 +22,7 @@ use kuna_base::types::int4;
 use kuna_decomp::database::{
     kuna_global_data_name, Database, DatabaseArch, ScopeId, TranslateAccess, TypeFactoryAccess,
 };
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::varnode::varnode_flags;
 use kuna_base::types::{uintb, uint4};
 
@@ -31,14 +32,14 @@ use kuna_base::types::{uintb, uint4};
 /// test for the x-form boundary.
 struct AngrArch {
     num_spaces: int4,
+    types: TypeFactoryImpl,
 }
-struct NoTypes;
-impl TypeFactoryAccess for NoTypes {
-    fn get_base(&self, size: int4, meta: type_metatype) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, meta))
+impl TypeFactoryAccess for AngrArch {
+    fn get_base(&self, size: int4, meta: type_metatype) -> KunaResult<TypeRoot> {
+        self.types.get_base(size, meta)
     }
-    fn get_type_code(&self) -> Rc<Datatype> {
-        Rc::new(Datatype::new(1, type_metatype::TYPE_CODE))
+    fn get_type_code(&self) -> KunaResult<TypeRoot> {
+        self.types.get_type_code()
     }
 }
 impl TranslateAccess for AngrArch {
@@ -51,7 +52,7 @@ impl DatabaseArch for AngrArch {
         self.num_spaces
     }
     fn types(&self) -> &dyn TypeFactoryAccess {
-        &NoTypes
+        self
     }
     fn translate(&self) -> &dyn TranslateAccess {
         self
@@ -62,13 +63,13 @@ impl DatabaseArch for AngrArch {
     fn name_style_angr(&self) -> bool {
         true
     }
-    fn type_name_base(&self, _dt: &Datatype) -> String {
+    fn type_name_base(&self, _dt: &TypeRoot) -> String {
         String::new()
     }
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(size: int4) -> TypeRoot {
+    TypeFactoryImpl::new().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 /// const(0), unique(1), ram(2, 8-byte), register(3, 4-byte).
@@ -192,7 +193,7 @@ fn w4_p0_database_make_name_unique_xform_boundary() {
     let m = build_manager();
     let ram = space(&m, 2);
     let (mut db, g) = db_with_global(m.num_spaces());
-    let arch = AngrArch { num_spaces: m.num_spaces() };
+    let arch = AngrArch { num_spaces: m.num_spaces(), types: TypeFactoryImpl::new() };
 
     let addr = Address::new(Rc::clone(&ram), 0x4000);
     let basebare = kuna_global_data_name(&addr); // dat_4000
@@ -212,7 +213,7 @@ fn w4_p0_database_make_name_unique_xform_boundary() {
             g,
             &addr,
             &Address::new_invalid(),
-            Some(&Datatype::new(4, type_metatype::TYPE_UNKNOWN)),
+            Some(&dt(4)),
             &mut index,
             varnode_flags::persist,
             &arch,
@@ -231,7 +232,7 @@ fn w4_p0_database_make_name_unique_ignores_wrong_digit_count() {
     let m = build_manager();
     let ram = space(&m, 2);
     let (mut db, g) = db_with_global(m.num_spaces());
-    let arch = AngrArch { num_spaces: m.num_spaces() };
+    let arch = AngrArch { num_spaces: m.num_spaces(), types: TypeFactoryImpl::new() };
 
     let addr = Address::new(Rc::clone(&ram), 0x5000);
     let basebare = kuna_global_data_name(&addr); // dat_5000
@@ -246,7 +247,7 @@ fn w4_p0_database_make_name_unique_ignores_wrong_digit_count() {
             g,
             &addr,
             &Address::new_invalid(),
-            Some(&Datatype::new(4, type_metatype::TYPE_UNKNOWN)),
+            Some(&dt(4)),
             &mut index,
             varnode_flags::persist,
             &arch,
@@ -393,7 +394,7 @@ fn w4_p0_database_make_name_unique_continues_xform() {
     let m = build_manager();
     let ram = space(&m, 2);
     let (mut db, g) = db_with_global(m.num_spaces());
-    let arch = AngrArch { num_spaces: m.num_spaces() };
+    let arch = AngrArch { num_spaces: m.num_spaces(), types: TypeFactoryImpl::new() };
 
     let addr = Address::new(Rc::clone(&ram), 0x6000);
     let basebare = kuna_global_data_name(&addr); // dat_6000
@@ -408,7 +409,7 @@ fn w4_p0_database_make_name_unique_continues_xform() {
             g,
             &addr,
             &Address::new_invalid(),
-            Some(&Datatype::new(4, type_metatype::TYPE_UNKNOWN)),
+            Some(&dt(4)),
             &mut index,
             varnode_flags::persist,
             &arch,

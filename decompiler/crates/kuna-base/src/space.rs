@@ -1226,6 +1226,15 @@ impl AddrSpace {
         }
     }
 
+    /// Find the JoinRecord containing a byte offset, including interior slices
+    /// of the unified range. An unlinked offset has no containing record.
+    pub fn find_join_containing(&self, offset: u64) -> KunaResult<Option<Rc<JoinRecord>>> {
+        match self.join_state() {
+            Some(state) => Ok(state.borrow().find_join_internal(offset)),
+            None => Err(KunaError::lowlevel("find_join_containing on a non-join space")),
+        }
+    }
+
     /// \brief Determine if a given point is contained in an address range in
     /// \b this address space
     ///

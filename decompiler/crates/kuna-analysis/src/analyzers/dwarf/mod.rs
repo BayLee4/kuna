@@ -105,13 +105,12 @@
 //! (real source) prototype wins (last-write in `set_function_prototype_pieces`).
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use object::{Object, ObjectSection};
 
 use kuna_base::types::uint4;
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
-use kuna_decomp::fspec::PrototypePieces;
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeRoot};
+use kuna_decomp::fspec::{func_proto_flags, LogicalCallable, PrototypePieces};
 
 use crate::pass::{AnalysisCtx, AnalysisOutput, AnalysisPass, Phase, SymFact, SymKind};
 
@@ -213,6 +212,9 @@ pub struct DwarfPass;
 struct DieSnap {
     /// The DIE tag (`DW_TAG_*`).
     tag: gimli::DwTag,
+    /// Absolute `.debug_info` offset, including the compilation unit's offset.
+    /// Synthetic test trees use their unit-local map key instead.
+    source_id: Option<u64>,
     /// `DW_AT_name`, resolved through `.debug_str`/`.debug_line_str` (may be empty).
     name: String,
     /// `DW_AT_low_pc` resolved to a VMA, if present (marks a *defined* function).
@@ -255,6 +257,14 @@ struct DieSnap {
     const_value: Option<i64>,
     /// True if `DW_AT_declaration` is set (a declaration-only DIE — skip).
     declaration: bool,
+    /// `DW_AT_noreturn` on a callable declaration.
+    noreturn: bool,
+    /// An explicit non-default calling convention must not be guessed.
+    calling_convention: Option<gimli::DwCc>,
+    /// Presence matters for C prototype-versus-nonprototype declarations.
+    prototyped: Option<bool>,
+    /// Compilation-unit language, not the C++ feature gate.
+    language: Option<gimli::DwLang>,
     /// True if the DIE carries a `DW_AT_location` (a global var has a real address).
     has_location: bool,
     /// `DW_OP_addr` operand of a simple `DW_AT_location`, if that is its form.
@@ -287,6 +297,7 @@ impl DieSnap {
     fn new(tag: gimli::DwTag, depth: isize) -> Self {
         DieSnap {
             tag,
+            source_id: None,
             name: String::new(),
             low_pc: None,
             type_ref: None,
@@ -302,6 +313,10 @@ impl DieSnap {
             array_count: None,
             const_value: None,
             declaration: false,
+            noreturn: false,
+            calling_convention: None,
+            prototyped: None,
+            language: None,
             has_location: false,
             addr_location: None,
             fbreg_location: None,
@@ -325,6 +340,7 @@ fn snapshot_unit(
     // Parent stack of (offset, depth) to attach children to their parent.
     let mut stack: Vec<(usize, isize)> = Vec::new();
 
+    let mut language = None;
     let mut cursor = unit.entries();
     while let Ok(Some(entry)) = cursor.next_dfs() {
         let off = entry.offset().0;
@@ -345,7 +361,15 @@ fn snapshot_unit(
             }
         }
 
+        if let Some(gimli::AttributeValue::Language(value)) = entry.attr_value(gimli::DW_AT_language) {
+            language = Some(value);
+        }
         let mut snap = DieSnap::new(entry.tag(), depth);
+        snap.language = language;
+        if let Some(gimli::AttributeValue::Flag(value)) = entry.attr_value(gimli::DW_AT_prototyped) {
+            snap.prototyped = Some(value);
+        }
+        snap.source_id = entry.offset().to_debug_info_offset(&unit.header).map(|off| off.0 as u64);
         snap.parent = parent_off;
         // (kuna `cppproto`) The one-hop definition->declaration link. gcc/clang put
         // an out-of-line member or namespace definition at CU top level with only
@@ -432,6 +456,10 @@ fn snapshot_unit(
         if matches!(entry.attr_value(gimli::DW_AT_declaration), Some(gimli::AttributeValue::Flag(true)))
         {
             snap.declaration = true;
+        }
+        snap.noreturn = matches!(entry.attr_value(gimli::DW_AT_noreturn), Some(gimli::AttributeValue::Flag(true)));
+        if let Some(gimli::AttributeValue::CallingConvention(cc)) = entry.attr_value(gimli::DW_AT_calling_convention) {
+            snap.calling_convention = Some(cc);
         }
         if let Some(loc) = entry.attr_value(gimli::DW_AT_location) {
             snap.has_location = true;
@@ -530,6 +558,20 @@ fn read_sleb128(buf: &[u8]) -> Option<(i64, usize)> {
     }
 }
 
+/// Storage volatility follows aliases/qualifiers only; a pointer stops the
+/// walk so a pointer-to-volatile object does not become a volatile pointer.
+fn object_is_volatile(mut off: Option<usize>, dies: &BTreeMap<usize, DieSnap>) -> bool {
+    for _ in 0..MAX_QUALIFIER_HOPS {
+        let Some(die) = off.and_then(|off| dies.get(&off)) else { return false; };
+        match die.tag {
+            gimli::DW_TAG_volatile_type => return true,
+            gimli::DW_TAG_typedef | gimli::DW_TAG_const_type | gimli::DW_TAG_restrict_type => off = die.type_ref,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Build the kuna [`Datatype`] for the type DIE at `off`, recursing through the
 /// DWARF type chain (faithful reduction of `DWARFDataTypeImporter.getDataType`'s
 /// tag switch). `None` for a missing/unbuildable type; the caller skips that one
@@ -548,11 +590,14 @@ fn build_datatype(
     word_size: uint4,
     walk: &mut TypeWalk,
     cpp: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     // A null DW_AT_type means `void` (the C++ getDataTypeForVariable null case).
     let Some(off) = off else {
         return types.get_type_void().ok();
     };
+    if let Some(root) = walk.reserved(off) {
+        return Some(root);
+    }
     if !walk.enter(off) {
         // Refused (a type cycle, or a bound): void keeps the chain finite while a
         // pointer to it still renders as a pointer.
@@ -571,16 +616,74 @@ fn build_datatype_at(
     word_size: uint4,
     walk: &mut TypeWalk,
     cpp: bool,
-) -> Option<Rc<Datatype>> {
-    let die = dies.get(&off)?;
-    // Collapse the transparent qualifier hops before recursing: they carry no
-    // structure, and collapsing is what carries an anonymous aggregate's typedef
-    // name onto it (`mbstate_t`, not the shared `anon_struct`). Stripping cannot
-    // loop (the hop count is bounded) and leaves the cycle guard where it belongs,
-    // on the pointer/array/struct arms that actually recurse. (kuna `cppproto`
-    // introduced it for C++; `typedepth` extends it to the C callers.)
-    let (die, alias) =
-        if cpp || walk.collapse_qualifiers() { strip_qualifiers(die, dies) } else { (die, None) };
+) -> Option<TypeRoot> {
+    let mut off = off;
+    let mut die = dies.get(&off)?;
+    if cpp || walk.collapse_qualifiers() {
+        for _ in 0..MAX_QUALIFIER_HOPS {
+            if !matches!(die.tag,
+                gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type
+            ) {
+                break;
+            }
+            let Some(next) = die.type_ref else { break };
+            let Some(target) = dies.get(&next) else { break };
+            off = next;
+            die = target;
+        }
+        if let Some(root) = walk.reserved(off) {
+            return Some(root);
+        }
+    }
+    // Typedefs are nominal nodes, reserved before descending into their target.
+    // A recursive member retains this identity when the alias is completed.
+    if die.tag == gimli::DW_TAG_typedef && !die.name.is_empty() {
+        let name = kuna_dwarfstructs::qualified_name(die, dies, None, "", None);
+        // C's typedef and tag namespaces can contain the same spelling. The
+        // alias's source DIE identity is independent of its display name.
+        let host_id = die.source_id.unwrap_or(off as u64);
+        let alias = types.reserve_alias(&name, host_id).ok()?;
+        walk.reserve(off, alias.clone());
+        if alias.get_typedef().is_some() {
+            return Some(alias);
+        }
+        let mut target_off = die.type_ref;
+        for _ in 0..MAX_QUALIFIER_HOPS {
+            let Some(o) = target_off else { break };
+            let Some(target) = dies.get(&o) else { break };
+            if matches!(target.tag, gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type) {
+                target_off = target.type_ref;
+                continue;
+            }
+            if target.name.is_empty() && matches!(target.tag,
+                gimli::DW_TAG_structure_type | gimli::DW_TAG_class_type | gimli::DW_TAG_union_type
+            ) {
+                walk.name_anonymous(o, name.clone());
+            }
+            break;
+        }
+        let target = build_datatype(die.type_ref, dies, types, word_size, walk, cpp);
+        let Some(target) = target else {
+            let _ = types.fail(&alias, "Unbuildable DWARF typedef target".into());
+            walk.forget(off);
+            return None;
+        };
+        let mut draft = Datatype::new_with_align(
+            target.get_size(), target.get_alignment(), target.get_metatype(),
+        );
+        draft.name = name.clone();
+        draft.display_name = name;
+        draft.id = alias.get_id();
+        draft.kind = DatatypeKind::Alias;
+        draft.typedef_imm = Some(target.id());
+        if types.complete(&alias, draft).is_err() {
+            walk.forget(off);
+            return None;
+        }
+        return Some(alias);
+    }
+    let aggregate_alias = walk.anonymous_name(off);
+    let alias = aggregate_alias.as_deref();
     let ptr = types.get_size_of_pointer();
     match die.tag {
         gimli::DW_TAG_base_type => {
@@ -589,8 +692,14 @@ fn build_datatype_at(
                 return None;
             }
             match die.encoding {
-                Some(gimli::DW_ATE_signed_char) | Some(gimli::DW_ATE_unsigned_char) => {
+                Some(gimli::DW_ATE_signed_char) if die.name == "char" => {
                     types.get_type_char(size).ok()
+                }
+                Some(gimli::DW_ATE_signed_char) => {
+                    types.get_base_no_char(size, type_metatype::TYPE_INT).ok()
+                }
+                Some(gimli::DW_ATE_unsigned_char) => {
+                    types.get_base(size, type_metatype::TYPE_UINT).ok()
                 }
                 Some(gimli::DW_ATE_boolean) => types.get_base(size, type_metatype::TYPE_BOOL).ok(),
                 Some(gimli::DW_ATE_float) => types.get_base(size, type_metatype::TYPE_FLOAT).ok(),
@@ -614,7 +723,7 @@ fn build_datatype_at(
             let psize = die.byte_size.map(|b| b as i32).unwrap_or(ptr);
             types.get_type_pointer(psize, pointee, word_size).ok()
         }
-        // typedef/const/volatile/restrict: transparent — pass through to the
+        // Unnamed typedefs and transparent qualifiers pass through to their
         // underlying DW_AT_type (a null underlying => void).
         gimli::DW_TAG_typedef
         | gimli::DW_TAG_const_type
@@ -656,25 +765,97 @@ fn build_datatype_at(
                 // what this arm always used to produce.
                 .or_else(|| types.get_base(size, type_metatype::TYPE_INT).ok())
         }
-        // Any other tag (e.g. subroutine_type) -> give up on this type cleanly.
+        gimli::DW_TAG_subroutine_type => {
+            build_callable(off, die, dies, types, word_size, walk, cpp)
+        }
+        // Any other tag -> give up on this type cleanly.
         _ => None,
     }
 }
 
+/// Import a declaration, not an ABI slot list. Reserve the source identity before
+/// descending so recursive callback edges refer to this same completed Code node.
+#[allow(clippy::too_many_arguments)]
+fn build_callable(
+    off: usize,
+    die: &DieSnap,
+    dies: &BTreeMap<usize, DieSnap>,
+    types: &dyn TypeFactory,
+    word_size: uint4,
+    walk: &mut TypeWalk,
+    cpp: bool,
+) -> Option<TypeRoot> {
+    if die.calling_convention.is_some_and(|cc| cc != gimli::DW_CC_normal) {
+        return None;
+    }
+    let host_id = die.source_id.unwrap_or(off as u64);
+    let code = types.reserve(&die.name, host_id, type_metatype::TYPE_CODE).ok()?;
+    if code.read().get_code_prototype(code.id()).ok()?.is_some() {
+        return Some(code);
+    }
+    walk.reserve(off, code.clone());
+    let built = (|| {
+        // Capture the selected model before any recursive declaration is visited.
+        let binding = types.model_binding(None).ok()?;
+        types.begin(&code).ok()?;
+        let outtype = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?;
+        let mut intypes = Vec::new();
+        let mut innames = Vec::new();
+        let mut first_var_arg_slot = -1;
+        for &child_off in &die.children {
+            let child = dies.get(&child_off)?;
+            match child.tag {
+                gimli::DW_TAG_formal_parameter => {
+                    // A missing formal type is not an invented void parameter.
+                    let ty = build_datatype(Some(child.type_ref?), dies, types, word_size, walk, cpp)?;
+                    if ty.get_metatype() == type_metatype::TYPE_VOID {
+                        return None;
+                    }
+                    intypes.push(ty);
+                    innames.push(child.name.clone());
+                }
+                gimli::DW_TAG_unspecified_parameters => {
+                    first_var_arg_slot = intypes.len() as i32;
+                }
+                _ => {}
+            }
+        }
+        // DW_AT_prototyped distinguishes C's int() from int(void). Its absence
+        // in other languages does not make their fixed signatures open.
+        let c_nonprototype = matches!(die.language,
+            Some(gimli::DW_LANG_C | gimli::DW_LANG_C89 | gimli::DW_LANG_C99
+                | gimli::DW_LANG_C11 | gimli::DW_LANG_C17 | gimli::DW_LANG_ObjC))
+            && die.prototyped != Some(true);
+        let variadic = first_var_arg_slot >= 0 && !c_nonprototype;
+        if c_nonprototype {
+            first_var_arg_slot = -1;
+        }
+        let pieces = PrototypePieces {
+            name: die.name.clone(), outtype: Some(outtype), intypes, innames,
+            first_var_arg_slot, output_storage: None, input_storage: Vec::new(),
+        };
+        let flags = if die.noreturn { func_proto_flags::NO_RETURN } else { 0 };
+        let logical = LogicalCallable::from_declaration(binding, &pieces, variadic, !variadic && !c_nonprototype, flags).ok()?;
+        let mut draft = Datatype::new_with_align(1, 1, type_metatype::TYPE_CODE);
+        draft.name = die.name.clone();
+        draft.display_name = die.name.clone();
+        draft.id = host_id;
+        draft.flags |= kuna_decomp::dtype::flags::variable_length;
+        draft.kind = DatatypeKind::Code { proto: Some(logical) };
+        types.complete(&code, draft).ok()?;
+        Some(code.clone())
+    })();
+    if built.is_none() {
+        let _ = types.fail(&code, "Unbuildable DWARF callable declaration".into());
+        walk.forget(off);
+    }
+    built
+}
+
 /// Intern the aggregate for `die`: its `DW_AT_byte_size` + `DW_TAG_member`
-/// layout under `--option dwarfstructs on` ([`kuna_dwarfstructs`]), else the
-/// pre-`dwarfstructs` NAMED OPAQUE below — interned under [`aggregate_name`] and
-/// falling back to the anonymous `fallback` name when the BORROWED typedef name
-/// is not a name the type factory can hold an aggregate under.
-///
-/// The alias is a name from another namespace, and it can already be taken: kuna
-/// registers a core type called `code`, and zlib's `inftrees.h` typedefs an
-/// anonymous struct to exactly that. The factory then refuses the redefinition,
-/// the aggregate builds as `None`, and the pointer arm's `.or_else(get_type_void)`
-/// turns `code *next` into `void *next` — the very degradation this pass exists
-/// to remove. Only an aggregate that had no name of its own falls back: a
-/// genuinely named type keeps the pre-existing behavior (no new name is asserted
-/// on kuna's behalf).
+/// layout under `--option dwarfstructs on` ([`kuna_dwarfstructs`]), else a named
+/// opaque declaration. Typedefs retain their own source identity even when the
+/// aggregate must use an anonymous fallback because a core type owns its name.
 #[allow(clippy::too_many_arguments)]
 fn intern_aggregate(
     types: &dyn TypeFactory,
@@ -686,7 +867,7 @@ fn intern_aggregate(
     word_size: uint4,
     cpp: bool,
     union: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     // (kuna `dwarfvariants`) A `DW_TAG_variant_part` child means the aggregate is
     // a discriminated union, whose layout the member walk below cannot see (there
     // are no `DW_TAG_member` children to walk). `None` here means the arm REFUSED
@@ -722,14 +903,9 @@ fn intern_aggregate(
     None
 }
 
-/// (kuna `cppproto`) Follow the transparent qualifier chain
-/// (`typedef`/`const`/`volatile`/`restrict`) to the first DIE that describes real
-/// structure, also returning the innermost `DW_TAG_typedef` name seen on the way.
-///
-/// That alias is what names an ANONYMOUS aggregate: `mbstate_t` is a typedef of an
-/// unnamed struct, and calling every unnamed struct `anon_struct` would fuse
-/// unrelated types under one interned name. Ghidra's importer names an anonymous
-/// aggregate after its typedef for the same reason.
+/// (kuna `cppproto`) Follow typedefs and qualifiers only to inspect a source
+/// storage width when a parameter cannot be built. Nominal construction does
+/// not use this helper: typedefs remain separate graph identities.
 ///
 /// Bounded by [`MAX_QUALIFIER_HOPS`]; a chain that ends in a null `DW_AT_type` (a
 /// qualified `void`) or exceeds the bound is returned as-is, so the caller's own
@@ -737,8 +913,7 @@ fn intern_aggregate(
 fn strip_qualifiers<'a>(
     mut die: &'a DieSnap,
     dies: &'a BTreeMap<usize, DieSnap>,
-) -> (&'a DieSnap, Option<&'a str>) {
-    let mut alias: Option<&str> = None;
+) -> &'a DieSnap {
     for _ in 0..MAX_QUALIFIER_HOPS {
         if !matches!(
             die.tag,
@@ -749,22 +924,19 @@ fn strip_qualifiers<'a>(
         ) {
             break;
         }
-        if die.tag == gimli::DW_TAG_typedef && !die.name.is_empty() {
-            alias = Some(&die.name);
-        }
         match die.type_ref.and_then(|t| dies.get(&t)) {
             Some(next) => die = next,
             None => break,
         }
     }
-    (die, alias)
+    die
 }
 
 /// Bound on the [`strip_qualifiers`] walk (a real qualifier chain is 1-3 hops).
 const MAX_QUALIFIER_HOPS: u32 = 16;
 
 /// The interned name for an aggregate DIE: its own `DW_AT_name`, else the typedef
-/// it was reached through ([`strip_qualifiers`]), else `fallback`.
+/// it was reached through, else `fallback`.
 fn aggregate_name<'a>(die: &'a DieSnap, alias: Option<&'a str>, fallback: &'a str) -> &'a str {
     if !die.name.is_empty() {
         &die.name
@@ -794,7 +966,7 @@ fn build_enum(
     dies: &BTreeMap<usize, DieSnap>,
     types: &dyn TypeFactory,
     size: i32,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if die.name.is_empty() {
         return None;
     }
@@ -830,7 +1002,7 @@ fn build_enum(
     // longer matches the filled definition already installed — so look first and
     // reuse. Guarded on shape: a same-named type that is not an enum of this width
     // owns the name, and we do not fight it.
-    if let Ok(Some(existing)) = types.find_by_name(&die.name) {
+    if let Some(existing) = types.find_by_source_id(&die.name, Datatype::hash_name(&die.name)).ok()? {
         return (existing.is_enum_type() && existing.get_size() == size).then_some(existing);
     }
     let ct = types.get_type_enum_sized(&die.name, size, meta).ok()?;
@@ -841,7 +1013,10 @@ fn build_enum(
 /// `getFunctionParamList`): return type from `DW_AT_type`, parameter types/names
 /// from `DW_TAG_formal_parameter` children, `first_var_arg_slot` from a trailing
 /// `DW_TAG_unspecified_parameters`. Returns `None` if any required type can't be
-/// built (the whole prototype is then skipped — never a hard failure).
+/// built with the layout required for ABI assignment (the whole prototype is
+/// then skipped, leaving native recovery in place). Pointers to opaque types
+/// remain admissible; a missing by-value layout is never replaced by a guessed
+/// scalar width or hidden return parameter.
 fn build_pieces(
     name: &str,
     sub: &DieSnap,
@@ -851,7 +1026,10 @@ fn build_pieces(
 ) -> Option<PrototypePieces> {
     // Return type: a null DW_AT_type is `void` (build_datatype handles None).
     let mut walk = TypeWalk::new();
-    let outtype = build_datatype(sub.type_ref, dies, types, word_size, &mut walk, false);
+    let outtype = build_datatype(sub.type_ref, dies, types, word_size, &mut walk, false)?;
+    if !outtype.read().layout_ready(outtype.id()).ok()? {
+        return None;
+    }
 
     let mut intypes = Vec::new();
     let mut innames = Vec::new();
@@ -862,6 +1040,9 @@ fn build_pieces(
         match child.tag {
             gimli::DW_TAG_formal_parameter => {
                 let ty = build_datatype(child.type_ref, dies, types, word_size, &mut walk, false)?;
+                if !ty.read().layout_ready(ty.id()).ok()? {
+                    return None;
+                }
                 intypes.push(ty);
                 innames.push(child.name.clone());
             }
@@ -875,7 +1056,7 @@ fn build_pieces(
 
     Some(PrototypePieces {
         name: name.to_string(),
-        outtype,
+        outtype: Some(outtype),
         intypes,
         innames,
         first_var_arg_slot,
@@ -1074,27 +1255,20 @@ impl AnalysisPass for DwarfPass {
                             continue;
                         }
                         if let Some(addr) = snap.addr_location {
-                            // Resolve the variable's DW_AT_type to its byte size so
-                            // the commit maps a covering SymbolEntry of the right
-                            // extent (a size-1 code type would miss a 4-/8-byte
-                            // memory access and leave the global `dat_<addr>`). A
-                            // type that cannot be sized falls back to 1 (the prior
-                            // behavior for the 1-byte globals).
-                            let size = build_datatype(
-                                snap.type_ref,
-                                &dies,
-                                types,
-                                word_size,
-                                &mut TypeWalk::new(),
-                                false,
-                            )
-                                .map(|t| t.get_size())
-                                .filter(|&s| s >= 1)
-                                .unwrap_or(1) as u32;
+                            // Preserve the same source graph root used by signatures,
+                            // including nominal callback/record aliases. Volatility
+                            // belongs to this storage, not the pointee's type.
+                            let type_ = build_datatype(
+                                snap.type_ref, &dies, types, word_size,
+                                &mut TypeWalk::new(), false,
+                            ).filter(|type_| type_.get_size() >= 1);
+                            let size = type_.as_ref().map_or(1, |type_| type_.get_size()) as u32;
                             out.data_objects.push(crate::pass::DataObjectFact {
                                 addr,
                                 name: snap.name.clone(),
                                 size,
+                                type_,
+                                volatile: object_is_volatile(snap.type_ref, &dies),
                             });
                         }
                     }
@@ -1110,6 +1284,7 @@ impl AnalysisPass for DwarfPass {
 mod tests {
     use super::*;
     use kuna_decomp::dtype::TypeFactoryImpl;
+    use std::rc::Rc;
 
     /// A configured [`TypeFactory`] for the mapper unit tests (the dtype-test
     /// recipe: default alignment map, max base size 8, 64-bit sizes, core-type
@@ -1121,6 +1296,396 @@ mod tests {
         f.setup_sizes(Some(8), 8, 4);
         let _ = f.cache_core_types();
         f
+    }
+
+    fn callable_factory() -> TypeFactoryImpl {
+        let types = factory();
+        let manager = Rc::new(kuna_base::space::AddrSpaceManager::new());
+        let model = Rc::new(kuna_decomp::fspec::ProtoModel::new(&manager));
+        types.set_proto_context(Some(model), manager).unwrap();
+        types
+    }
+
+    #[test]
+    fn dwarf_callback_declarations_keep_logical_formals_and_variadic_boundary() {
+        for variadic in [false, true] {
+            let types = callable_factory();
+            let mut dies = BTreeMap::new();
+            let mut byte = DieSnap::new(gimli::DW_TAG_base_type, 1);
+            byte.name = "unsigned char".into();
+            byte.encoding = Some(gimli::DW_ATE_unsigned_char);
+            byte.byte_size = Some(1);
+            dies.insert(1, byte);
+            let mut flags = DieSnap::new(gimli::DW_TAG_typedef, 1);
+            flags.name = "Flags".into();
+            flags.type_ref = Some(1);
+            dies.insert(2, flags);
+            let mut integer = DieSnap::new(gimli::DW_TAG_base_type, 1);
+            integer.encoding = Some(gimli::DW_ATE_signed);
+            integer.byte_size = Some(4);
+            dies.insert(3, integer);
+            let mut code = DieSnap::new(gimli::DW_TAG_subroutine_type, 1);
+            code.source_id = Some(0xabc);
+            code.type_ref = Some(3);
+            code.noreturn = true;
+            code.children.push(5);
+            if variadic {
+                code.children.push(6);
+                dies.insert(6, DieSnap::new(gimli::DW_TAG_unspecified_parameters, 2));
+            }
+            dies.insert(4, code);
+            let mut parameter = DieSnap::new(gimli::DW_TAG_formal_parameter, 2);
+            parameter.type_ref = Some(2);
+            dies.insert(5, parameter);
+            let mut pointer = DieSnap::new(gimli::DW_TAG_pointer_type, 1);
+            pointer.type_ref = Some(4);
+            dies.insert(7, pointer);
+            let mut callback = DieSnap::new(gimli::DW_TAG_typedef, 1);
+            callback.name = "Callback".into();
+            callback.type_ref = Some(7);
+            dies.insert(8, callback);
+            let mut value = DieSnap::new(gimli::DW_TAG_formal_parameter, 2);
+            value.name = "value".into();
+            value.type_ref = Some(2);
+            dies.insert(10, value);
+            let mut callback = DieSnap::new(gimli::DW_TAG_formal_parameter, 2);
+            callback.name = "callback".into();
+            callback.type_ref = Some(8);
+            dies.insert(11, callback);
+            let mut invoke = DieSnap::new(gimli::DW_TAG_subprogram, 1);
+            invoke.type_ref = Some(3);
+            invoke.children = vec![10, 11];
+            let pieces = build_pieces("invoke", &invoke, &dies, &types, 1).unwrap();
+            assert_eq!(pieces.innames, ["value", "callback"]);
+            let code = pieces.intypes[1].get_ptr_to().unwrap();
+            let view = code.read();
+            let logical = view.get_code_prototype(code.id()).unwrap().unwrap();
+            assert_eq!(logical.inputs, vec![pieces.intypes[0].id()]);
+            assert_eq!(view.get(logical.output).unwrap().get_size(), 4);
+            assert_eq!(logical.binding, types.model_binding(None).unwrap());
+            assert_eq!(logical.variadic, variadic);
+            assert_eq!(logical.input_closed, !variadic);
+            assert_eq!(logical.logical_first, variadic.then_some(1));
+            assert_ne!(logical.flags & func_proto_flags::NO_RETURN, 0);
+        }
+    }
+
+    #[test]
+    fn dwarf_c_unprototyped_closed_and_variadic_callables_stay_distinct() {
+        for (prototyped, fixed, unspecified, expected) in [
+            (None, false, true, (false, false, None)),
+            (Some(true), false, false, (false, true, None)),
+            (Some(true), true, true, (true, false, Some(1))),
+        ] {
+            let types = callable_factory();
+            let mut dies = BTreeMap::new();
+            let mut integer = DieSnap::new(gimli::DW_TAG_base_type, 1);
+            integer.byte_size = Some(4);
+            integer.encoding = Some(gimli::DW_ATE_signed);
+            dies.insert(1, integer);
+            let mut code = DieSnap::new(gimli::DW_TAG_subroutine_type, 1);
+            code.type_ref = Some(1);
+            code.language = Some(gimli::DW_LANG_C11);
+            code.prototyped = prototyped;
+            if fixed {
+                let mut parameter = DieSnap::new(gimli::DW_TAG_formal_parameter, 2);
+                parameter.type_ref = Some(1);
+                dies.insert(3, parameter);
+                code.children.push(3);
+            }
+            if unspecified {
+                dies.insert(4, DieSnap::new(gimli::DW_TAG_unspecified_parameters, 2));
+                code.children.push(4);
+            }
+            dies.insert(2, code);
+            let code = build_datatype(Some(2), &dies, &types, 1, &mut TypeWalk::with_gate(true), false).unwrap();
+            let view = code.read();
+            let logical = view.get_code_prototype(code.id()).unwrap().unwrap();
+            assert_eq!((logical.variadic, logical.input_closed, logical.logical_first), expected);
+            assert_eq!(logical.inputs.len(), usize::from(fixed));
+        }
+    }
+
+    #[test]
+    fn dwarf_recursive_callable_reserves_identity_and_rejects_untyped_formals() {
+        let types = callable_factory();
+        let mut dies = BTreeMap::new();
+        let mut code = DieSnap::new(gimli::DW_TAG_subroutine_type, 1);
+        code.children.push(2);
+        dies.insert(1, code);
+        let mut parameter = DieSnap::new(gimli::DW_TAG_formal_parameter, 2);
+        parameter.type_ref = Some(3);
+        dies.insert(2, parameter);
+        let mut pointer = DieSnap::new(gimli::DW_TAG_pointer_type, 1);
+        pointer.type_ref = Some(1);
+        dies.insert(3, pointer);
+        let code = build_datatype(Some(1), &dies, &types, 1, &mut TypeWalk::with_gate(true), false).unwrap();
+        {
+            let view = code.read();
+            let logical = view.get_code_prototype(code.id()).unwrap().unwrap();
+            assert_eq!(view.get(logical.output).unwrap().get_metatype(), type_metatype::TYPE_VOID);
+            let input = code.related(logical.inputs[0]).unwrap();
+            assert_eq!(input.get_ptr_to().unwrap().id(), code.id());
+        }
+        let again = build_datatype(Some(1), &dies, &types, 1, &mut TypeWalk::with_gate(true), false).unwrap();
+        assert_eq!(again.id(), code.id());
+        let mut invalid = DieSnap::new(gimli::DW_TAG_subroutine_type, 1);
+        invalid.children.push(5);
+        dies.insert(4, invalid);
+        dies.insert(5, DieSnap::new(gimli::DW_TAG_formal_parameter, 2));
+        let mut walk = TypeWalk::with_gate(true);
+        for _ in 0..3 {
+            assert!(build_datatype(Some(4), &dies, &types, 1, &mut walk, false).is_none());
+        }
+    }
+
+    #[test]
+    fn prototypes_preserve_character_input_and_return_signedness() {
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.setup_sizes(Some(8), 8, 4);
+        types.set_core_type("int1", 1, type_metatype::TYPE_INT, false).unwrap();
+        types.set_core_type("char", 1, type_metatype::TYPE_INT, true).unwrap();
+        types.cache_core_types().unwrap();
+        for (name, encoding, expected, text) in [
+            ("unsigned char", gimli::DW_ATE_unsigned_char, type_metatype::TYPE_UINT, false),
+            ("signed char", gimli::DW_ATE_signed_char, type_metatype::TYPE_INT, false),
+            ("char", gimli::DW_ATE_signed_char, type_metatype::TYPE_INT, true),
+            ("char", gimli::DW_ATE_unsigned_char, type_metatype::TYPE_UINT, false),
+        ] {
+            let mut dies = BTreeMap::new();
+            let mut scalar = DieSnap::new(gimli::DW_TAG_base_type, 1);
+            scalar.name = name.into();
+            scalar.encoding = Some(encoding);
+            scalar.byte_size = Some(1);
+            dies.insert(1, scalar);
+            let mut parameter = DieSnap::new(gimli::DW_TAG_formal_parameter, 1);
+            parameter.name = "value".into();
+            parameter.type_ref = Some(1);
+            dies.insert(2, parameter);
+            let mut sub = DieSnap::new(gimli::DW_TAG_subprogram, 1);
+            sub.name = "character_identity".into();
+            sub.type_ref = Some(1);
+            sub.children.push(2);
+
+            let resolved = kuna_cppproto::resolve_subprogram(&sub, &dies).unwrap();
+            for pieces in [
+                build_pieces(&sub.name, &sub, &dies, &types, 1),
+                kuna_cppproto::build_pieces(&resolved, &dies, &types, 1),
+            ] {
+                let pieces = pieces.unwrap();
+                let output = pieces.outtype.unwrap();
+                assert_eq!(output.get_metatype(), expected, "return: {name}");
+                assert_eq!(output.get_size(), 1);
+                assert_eq!(output.is_ascii(), text, "return: {name}");
+                assert_eq!(pieces.intypes[0].get_metatype(), expected, "input: {name}");
+                assert_eq!(pieces.intypes[0].get_size(), 1);
+                assert_eq!(pieces.intypes[0].is_ascii(), text, "input: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn prototypes_omit_unavailable_value_layout_but_keep_opaque_pointers() {
+        let types = factory();
+        let mut dies = BTreeMap::new();
+        let mut opaque = DieSnap::new(gimli::DW_TAG_structure_type, 1);
+        opaque.name = "Forward".into();
+        opaque.declaration = true;
+        dies.insert(1, opaque);
+        let mut alias = DieSnap::new(gimli::DW_TAG_typedef, 1);
+        alias.name = "ForwardAlias".into();
+        alias.type_ref = Some(1);
+        dies.insert(2, alias);
+        let mut pointer = DieSnap::new(gimli::DW_TAG_pointer_type, 1);
+        pointer.type_ref = Some(2);
+        dies.insert(3, pointer);
+        let mut parameter = DieSnap::new(gimli::DW_TAG_formal_parameter, 1);
+        parameter.name = "value".into();
+        dies.insert(4, parameter);
+        let mut sub = DieSnap::new(gimli::DW_TAG_subprogram, 1);
+        sub.name = "consume".into();
+        sub.children.push(4);
+
+        for (output, input, ready) in [
+            (Some(1), Some(3), false),
+            (Some(2), Some(3), false),
+            (None, Some(1), false),
+            (None, Some(2), false),
+            (Some(3), Some(3), true),
+            (None, Some(3), true),
+        ] {
+            sub.type_ref = output;
+            dies.get_mut(&4).unwrap().type_ref = input;
+            let resolved = kuna_cppproto::resolve_subprogram(&sub, &dies).unwrap();
+            for pieces in [
+                build_pieces(&sub.name, &sub, &dies, &types, 1),
+                kuna_cppproto::build_pieces(&resolved, &dies, &types, 1),
+            ] {
+                assert_eq!(pieces.is_some(), ready, "output={output:?}, input={input:?}");
+                if let Some(pieces) = pieces {
+                    let pointee = pieces.intypes[0].get_ptr_to().unwrap();
+                    assert_eq!(pointee.read().get(pointee.id()).unwrap().get_name(), "ForwardAlias");
+                    assert!(!pointee.read().layout_ready(pointee.id()).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_code_typedef_does_not_replace_core_callable_identity() {
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.setup_sizes(Some(8), 8, 4);
+        types.set_core_type("code", 1, type_metatype::TYPE_CODE, false).unwrap();
+        types.cache_core_types().unwrap();
+        let core = types.get_type_code().unwrap();
+        let mut dies = BTreeMap::new();
+        let mut alias = DieSnap::new(gimli::DW_TAG_typedef, 1);
+        alias.name = "code".into();
+        alias.source_id = Some(0x1001);
+        alias.type_ref = Some(2);
+        dies.insert(1, alias);
+        let mut record = DieSnap::new(gimli::DW_TAG_structure_type, 1);
+        record.byte_size = Some(4);
+        record.children.push(4);
+        dies.insert(2, record);
+        let mut pointer = DieSnap::new(gimli::DW_TAG_pointer_type, 1);
+        pointer.type_ref = Some(1);
+        dies.insert(3, pointer);
+        let mut field = DieSnap::new(gimli::DW_TAG_member, 2);
+        field.name = "val".into();
+        field.type_ref = Some(5);
+        field.data_member_location = Some(2);
+        dies.insert(4, field);
+        let mut scalar = DieSnap::new(gimli::DW_TAG_base_type, 1);
+        scalar.name = "unsigned short".into();
+        scalar.encoding = Some(gimli::DW_ATE_unsigned);
+        scalar.byte_size = Some(2);
+        dies.insert(5, scalar);
+        let mut walk = TypeWalk::with_gate(true);
+        // Install the actual member layout independently of the global gate.
+        let record = kuna_dwarfstructs::intern_aggregate(
+            &types, &dies[&2], &dies, Some("code"), "anon_struct",
+            &mut walk, 1, false, false,
+        ).unwrap();
+        walk.reserve(2, record.clone());
+        let pointer = build_datatype(Some(3), &dies, &types, 1, &mut walk, false).unwrap();
+        let alias = pointer.get_ptr_to().unwrap();
+        assert_eq!(alias.read().get(alias.id()).unwrap().get_name(), "code");
+        assert_eq!(alias.get_id(), 0x1001);
+        assert_eq!(alias.get_metatype(), type_metatype::TYPE_STRUCT);
+        assert_ne!(alias.id(), core.id());
+        assert_eq!(alias.get_typedef().unwrap().id(), record.id());
+        assert_eq!(alias.get_size(), 4);
+        let view = alias.read();
+        let field = view.get_field(alias.id(), 0).unwrap().unwrap();
+        assert_eq!(field.name, "val");
+        assert_eq!(field.offset, 2);
+        let scalar = view.get(field.field_type).unwrap();
+        assert_eq!(scalar.get_metatype(), type_metatype::TYPE_UINT);
+        assert_eq!(scalar.get_size(), 2);
+        drop(view);
+        assert_eq!(types.get_type_code().unwrap().id(), core.id());
+        assert_eq!(
+            types.find_by_source_id("code", core.get_id()).unwrap().unwrap().id(),
+            core.id(),
+        );
+    }
+
+    #[test]
+    fn recursive_typedef_and_tag_share_completed_layout_in_both_query_orders() {
+        for alias_first in [false, true] {
+            let types = factory();
+            let mut dies = BTreeMap::new();
+            let mut alias = DieSnap::new(gimli::DW_TAG_typedef, 1);
+            alias.name = "Node".into();
+            alias.source_id = Some(0x1001);
+            alias.type_ref = Some(2);
+            dies.insert(1, alias);
+            let mut node = DieSnap::new(gimli::DW_TAG_structure_type, 1);
+            node.name = "Node".into();
+            node.byte_size = Some(8);
+            node.children.push(3);
+            dies.insert(2, node);
+            let mut next = DieSnap::new(gimli::DW_TAG_member, 2);
+            next.name = "next".into();
+            next.type_ref = Some(4);
+            next.data_member_location = Some(0);
+            dies.insert(3, next);
+            let mut pointer = DieSnap::new(gimli::DW_TAG_pointer_type, 1);
+            pointer.byte_size = Some(8);
+            pointer.type_ref = Some(1);
+            dies.insert(4, pointer);
+
+            let mut walk = TypeWalk::with_gate(true);
+            let early_alias = alias_first.then(|| {
+                build_datatype(Some(1), &dies, &types, 1, &mut walk, false).unwrap()
+            });
+            // Invoke the layout arm directly so the test is independent of the
+            // process-wide dwarfstructs gate.
+            let node = kuna_dwarfstructs::intern_aggregate(
+                &types, &dies[&2], &dies, None, "anon_struct", &mut walk, 1, false, false,
+            ).unwrap();
+            let alias = build_datatype(Some(1), &dies, &types, 1, &mut walk, false).unwrap();
+            if let Some(early_alias) = early_alias {
+                assert_eq!(early_alias.id(), alias.id());
+            }
+            assert_ne!(alias.id(), node.id());
+            assert_eq!(alias.get_id(), 0x1001);
+            assert_eq!(alias.get_typedef().unwrap().id(), node.id());
+            assert_eq!(alias.get_size(), 8);
+            assert!(!alias.is_incomplete());
+            let mut revisit = TypeWalk::with_gate(true);
+            assert_eq!(
+                build_datatype(Some(1), &dies, &types, 1, &mut revisit, false).unwrap().id(),
+                alias.id(),
+            );
+            let pointer_id = node.read().get_field(node.id(), 0).unwrap().unwrap().field_type;
+            let pointer = node.related(pointer_id).unwrap();
+            assert_eq!(pointer.get_ptr_to().unwrap().id(), alias.id());
+
+            drop(types);
+            let view = alias.read();
+            assert_eq!(view.get(alias.id()).unwrap().get_name(), "Node");
+            assert_eq!(view.get(node.id()).unwrap().get_name(), "Node");
+            assert_eq!(view.get_field(node.id(), 0).unwrap().unwrap().name, "next");
+            assert_eq!(view.resolve_alias(alias.id()).unwrap(), node.id());
+        }
+    }
+
+    #[test]
+    fn same_spelled_enum_typedef_preserves_nominal_name_and_enumerators() {
+        let types = factory();
+        let mut dies = BTreeMap::new();
+        let mut alias = DieSnap::new(gimli::DW_TAG_typedef, 1);
+        alias.name = "Mode".into();
+        alias.type_ref = Some(2);
+        dies.insert(1, alias);
+        let mut enumeration = DieSnap::new(gimli::DW_TAG_enumeration_type, 1);
+        enumeration.name = "Mode".into();
+        enumeration.byte_size = Some(4);
+        enumeration.children.push(3);
+        dies.insert(2, enumeration);
+        let mut enumerator = DieSnap::new(gimli::DW_TAG_enumerator, 2);
+        enumerator.name = "Seven".into();
+        enumerator.const_value = Some(7);
+        dies.insert(3, enumerator);
+        let mut walk = TypeWalk::with_gate(true);
+        let alias = build_datatype(Some(1), &dies, &types, 1, &mut walk, false).unwrap();
+        let enumeration = alias.get_typedef().unwrap();
+        assert_ne!(alias.id(), enumeration.id());
+        assert!(alias.is_enum_type());
+        assert_eq!(alias.get_size(), 4);
+        let view = alias.read();
+        assert_eq!(view.get(alias.id()).unwrap().get_name(), "Mode");
+        let enum_ref = view.get(enumeration.id()).unwrap();
+        let DatatypeKind::Enum { namemap } = &enum_ref.kind else {
+            panic!("typedef must preserve its nominal enum target");
+        };
+        assert_eq!(namemap.get(&7).map(String::as_str), Some("Seven"));
     }
 
     /// A FORGED `.debug_info` whose type chain closes on itself must terminate.
@@ -1219,7 +1784,7 @@ mod tests {
         let mut guard = TypeWalk::with_gate(true);
         let new = build_datatype(Some(14), &dies, &types, 1, &mut guard, false)
             .expect("a pointer always builds");
-        let inner = |t: &Rc<Datatype>| -> i32 {
+        let inner = |t: &TypeRoot| -> i32 {
             let one = t.get_ptr_to().expect("pointer");
             let two = one.get_ptr_to().expect("pointer to pointer");
             two.get_size()

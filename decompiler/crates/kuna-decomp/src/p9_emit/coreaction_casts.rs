@@ -56,12 +56,13 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use kuna_base::address::Address;
 use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
 
 use crate::cast::{CastContext, CastStrategy, CastStrategyC, OpRef, VnRef};
 use crate::coreaction_infertypes::{declared_input_type_local as input_type_local, output_type_local};
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::unionresolve::ResolvedUnion;
@@ -87,7 +88,7 @@ pub struct FuncdataCastContext<'a> {
     fd: RefCell<&'a mut Funcdata>,
     vn_intern: RefCell<Vec<VarnodeId>>,
     op_intern: RefCell<Vec<OpId>>,
-    byte_as: Option<Rc<Datatype>>,
+    byte_as: Option<TypeRoot>,
 }
 
 impl<'a> FuncdataCastContext<'a> {
@@ -103,19 +104,19 @@ impl<'a> FuncdataCastContext<'a> {
 
     /// (kuna) Report a non-constant one-byte TYPE_UNKNOWN as `ty` instead, so the
     /// promotion queries see the type the printer spells it as.
-    pub(crate) fn with_unknown_byte_as(mut self, ty: Rc<Datatype>) -> Self {
+    pub(crate) fn with_unknown_byte_as(mut self, ty: TypeRoot) -> Self {
         self.byte_as = Some(ty);
         self
     }
 
-    fn view(&self, vn: VarnodeId, ty: Rc<Datatype>) -> Rc<Datatype> {
+    fn view(&self, vn: VarnodeId, ty: TypeRoot) -> TypeRoot {
         match &self.byte_as {
             Some(b)
                 if ty.get_size() == 1
                     && ty.get_metatype() == type_metatype::TYPE_UNKNOWN
                     && !self.fd.borrow().vbank().get(vn).is_some_and(|v| v.is_constant()) =>
             {
-                Rc::clone(b)
+                Clone::clone(b)
             }
             _ => ty,
         }
@@ -229,19 +230,19 @@ impl CastContext for FuncdataCastContext<'_> {
         lone.map(|op| self.op_ref(op))
     }
 
-    fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype> {
+    fn vn_high_type(&self, vn: VnRef) -> TypeRoot {
         let vnk = self.vn_key(vn);
         // high->getType(): the merged HighVariable's data-type (lazy recompute ->
         // &mut), else the bare Varnode type when no HighVariable exists.
         let ty = {
             let mut fd = self.fd.borrow_mut();
             fd.high_get_type(vnk)
-                .unwrap_or_else(|| Rc::clone(fd.vbank().get(vnk).expect("cast ctx: stale vn").get_type()))
+                .unwrap_or_else(|| Clone::clone(fd.vbank().get(vnk).expect("cast ctx: stale vn").get_type()))
         };
         self.view(vnk, ty)
     }
 
-    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> Rc<Datatype> {
+    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> TypeRoot {
         let vnk = self.vn_key(vn);
         let opk = self.op_key(op);
         let ty = self.fd.borrow_mut().vn_high_type_read_facing(vnk, opk);
@@ -298,7 +299,7 @@ impl CastContext for FuncdataCastContext<'_> {
 /// are dispatched first.
 ///
 /// `data` is borrowed immutably for the local-type lookup; the read-facing types
-/// are read mutably up-front by the caller and threaded in as `Rc<Datatype>` so
+/// are read mutably up-front by the caller and threaded in as `TypeRoot` so
 /// this stays a pure decision over types (the C++ reaches them through the
 /// Varnode `*`, here they are precomputed).  The promotion-sensitive comparison /
 /// extension arms run their predicates through `ctx`.
@@ -307,8 +308,129 @@ pub(crate) fn get_input_cast(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let opc = data.obank().get(op)?.code();
+    if let Some(dtype) = abi_variadic_parameter(data, op, slot) {
+        // A C variadic parameter has no formal type to supply its conversion.
+        // Retain the closed host signature's type on the actual expression.
+        return Some(Clone::clone(dtype));
+    }
+    if opc == OpCode::CPUI_CALLIND && slot == 0 {
+        let call = data.get_call_specs_index(op)?;
+        if data.get_arch().execution_callable_c
+            && crate::kuna_callabletransport::raw_boundary(data, op).ok()? { return None; }
+        if let Some(code) = data.get_call_specs(call).execution_callable().cloned()
+            .filter(|_| data.get_arch().execution_callable_c) {
+            let target = data.obank().get(op)?.get_in(0)?;
+            let size = data.vbank().get(target)?.get_size();
+            let wordsize = data.obank().get(op)?.get_addr().get_space()?.get_word_size();
+            let arch = data.get_arch().clone();
+            let types = arch.types()?;
+            let desired = types.get_type_pointer(size, code, wordsize).ok()?;
+            let current = data.vn_high_type_read_facing(target, op);
+            let printed = crate::kuna_callabletransport::normalize_type(&current, arch.manage(), types).ok()?;
+            return (printed != desired).then_some(desired);
+        }
+        let proto = data.get_call_specs(call).proto();
+        if proto.has_store() {
+            let has_declaration = proto.logical_callable().is_some();
+            let code = if let Some(declaration) = proto.logical_callable() {
+                // Materialized ABI slots may include hidden results and indirect
+                // aggregate parameters. Their retained source declaration stays
+                // semantic even when force_set pins the site across a restart.
+                declaration.clone()
+            } else {
+                // This signature describes the operation, not every use of the
+                // target variable. Preserve declared parts and complete only
+                // recovered parts in a local cast, leaving shared datatypes alone.
+                let mut signature = crate::fspec::FuncProto::new();
+                signature.copy(proto);
+                let recovered_inputs = !signature.is_input_locked();
+                if recovered_inputs {
+                    // Recovery commits the actual arguments on the operation, not
+                    // the optional prototype store. Use those facts, not an empty
+                    // default-model signature or a fabricated declaration.
+                    signature.store_clear_all_inputs();
+                    let count = data.obank().get(op)?.num_input();
+                    for slot in 1..count {
+                        let vn = data.obank().get(op)?.get_in(slot)?;
+                        let dtype = data.vn_high_type_read_facing(vn, op);
+                        let addr = data.vbank().get(vn)?.get_addr().clone();
+                        signature.set_param(slot - 1, "", &crate::fspec::ParameterPieces {
+                            addr, type_: Some(dtype), flags: 0,
+                        });
+                    }
+                    signature.set_dotdotdot(false);
+                }
+                if !signature.is_output_locked() {
+                    let output = data.obank().get(op)?.get_out();
+                    let (addr, dtype) = if let Some(vn) = output {
+                        let dtype = data.vn_high_type_def_facing(vn);
+                        (data.vbank().get(vn)?.get_addr().clone(), dtype)
+                    } else {
+                        (Address::new_invalid(), data.get_arch().types()?.get_type_void().ok()?)
+                    };
+                    signature.set_output(&crate::fspec::ParameterPieces {
+                        addr, type_: Some(dtype), flags: 0,
+                    });
+                }
+                if let Some(first) = signature.get_abi_first_vararg() {
+                    // This is only the C callable view. Analysis keeps the full
+                    // closed list and cannot recover additional operands here.
+                    while signature.num_params() > first {
+                        signature.remove_param(signature.num_params() - 1);
+                    }
+                    signature.set_dotdotdot(true);
+                }
+                // Local C presentation only: keep committed site storage and the
+                // shared declaration intact while interning its semantic signature.
+                use crate::fspec::func_proto_flags;
+                let types = data.get_arch().types()?;
+                let mut flags = 0;
+                if signature.has_this_pointer() { flags |= func_proto_flags::HAS_THISPTR; }
+                if signature.is_constructor() { flags |= func_proto_flags::IS_CONSTRUCTOR; }
+                if signature.is_destructor() { flags |= func_proto_flags::IS_DESTRUCTOR; }
+                if signature.is_no_return() { flags |= func_proto_flags::NO_RETURN; }
+                let logical = crate::fspec::LogicalCallable {
+                    binding: types.model_binding_for(signature.model().clone()).ok()?,
+                    output: signature.get_output_type()?.id(),
+                    inputs: (0..signature.num_params())
+                        .map(|slot| signature.get_param(slot)?.get_type().map(TypeRoot::id))
+                        .collect::<Option<Vec<_>>>()?,
+                    variadic: signature.is_dotdotdot(),
+                    input_closed: true,
+                    logical_first: signature.is_dotdotdot().then_some(signature.num_params()),
+                    flags,
+                };
+                types.get_type_code_proto(&logical).ok()?
+            };
+            let target = data.obank().get(op)?.get_in(0)?;
+            let size = data.vbank().get(target)?.get_size();
+            let wordsize = data.obank().get(op)?.get_addr().get_space()?.get_word_size();
+            let desired = data.get_arch().types()?
+                .get_type_pointer(size, code, wordsize).ok()?;
+            let current = data.vn_high_type_read_facing(target, op);
+            let generic_target = current.get_ptr_to().is_none_or(|base| {
+                base.get_metatype() != type_metatype::TYPE_CODE
+                    || base.read().get_code_prototype(base.id()).expect("live callable datatype").is_none()
+            });
+            // A concrete target supplied independently is authoritative even if
+            // the callsite itself is unlocked. Only a view produced here may be
+            // projected back to generic code syntax by the pseudotype dialect.
+            // Keep that provenance when this pass revisits its own cast/constant.
+            let inferred_target = !has_declaration && (generic_target
+                || data.get_call_specs(call).inferred_target_view() == Some(&current));
+            data.get_call_specs_mut(call).set_inferred_target_view(
+                inferred_target.then(|| desired.clone()),
+            );
+            if generic_target {
+                // An object pointer or generic code* is not a C-callable
+                // signature. The finalized call supplies one at this site.
+                return Some(desired);
+            }
+            return strat.cast_standard(&desired, &current, false, true);
+        }
+    }
     match opc {
         // TypeOpCopy::getInputCast (typeop.cc:398-404): require input == output type.
         OpCode::CPUI_COPY => {
@@ -381,13 +503,28 @@ pub(crate) fn get_input_cast(
     }
 }
 
+/// A closed internal-list parameter that uses variadic ABI passing, not a
+/// standalone format tail or an unconstrained recovered argument.
+fn abi_variadic_parameter(data: &Funcdata, op: OpId, slot: int4) -> Option<&TypeRoot> {
+    if slot <= 0
+        || !matches!(data.obank().get(op)?.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND)
+    {
+        return None;
+    }
+    let proto = data.get_call_specs(data.get_call_specs_index(op)?).proto();
+    if slot - 1 < proto.get_abi_first_vararg()? { return None; }
+    let param = proto.get_param(slot - 1)?;
+    if !param.is_type_locked() { return None; }
+    param.get_type()
+}
+
 /// TypeOpLoad::getInputCast (typeop.cc:441-471).
 fn get_input_cast_load(
     data: &mut Funcdata,
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if slot != 1 {
         return None;
     }
@@ -405,7 +542,7 @@ fn get_input_cast_load(
     } else {
         return tlst.get_type_pointer(in_size, reqtype, wordsize).ok();
     }
-    if !Rc::ptr_eq(&curtype, &reqtype) && curtype.get_size() == reqtype.get_size() {
+    if !TypeRoot::eq(&curtype, &reqtype) && curtype.get_size() == reqtype.get_size() {
         let curmeta = curtype.get_metatype();
         if curmeta != type_metatype::TYPE_STRUCT
             && curmeta != type_metatype::TYPE_ARRAY
@@ -438,7 +575,7 @@ fn get_input_cast_store(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if slot == 0 {
         return None;
     }
@@ -455,11 +592,11 @@ fn get_input_cast_store(
     let tlst = data.get_arch().types_rc()?;
 
     let (pointed_to, dest_size) = if pointer_type.get_metatype() == type_metatype::TYPE_PTR {
-        let pt = resolve_self_pointer(data, pointer_type.get_ptr_to()?);
+        let pt = pointer_type.get_ptr_to()?;
         let sz = pt.get_size();
         (pt, sz)
     } else {
-        (Rc::clone(&pointer_type), -1)
+        (Clone::clone(&pointer_type), -1)
     };
     if dest_size != value_type.get_size() {
         if slot == 1 {
@@ -478,8 +615,8 @@ fn get_input_cast_store(
             && data.vbank().get(pointer_vn)?.is_implied()
             && data.lone_descend(pointer_vn) == Some(op)
         {
-            let new_type = tlst.get_type_pointer(pointer_size, Rc::clone(&value_type), wordsize).ok()?;
-            if !Rc::ptr_eq(&pointer_type, &new_type) {
+            let new_type = tlst.get_type_pointer(pointer_size, Clone::clone(&value_type), wordsize).ok()?;
+            if !TypeRoot::eq(&pointer_type, &new_type) {
                 return Some(new_type);
             }
         }
@@ -507,7 +644,7 @@ fn get_input_cast_equal(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let in0 = data.obank().get(op)?.get_in(0)?;
     let in1 = data.obank().get(op)?.get_in(1)?;
     let mut reqtype = data.vn_high_type_read_facing(in0, op);
@@ -541,7 +678,7 @@ fn get_input_cast_less(
     op: OpId,
     slot: int4,
     care_ptr_uint: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let reqtype = input_type_local(data, op, slot);
     let needs_promote = {
         let ctx = FuncdataCastContext::new(data);
@@ -562,7 +699,7 @@ fn get_input_cast_extension(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let needs = {
         let ctx = FuncdataCastContext::new(data);
         let opr = ctx.op_ref(op);
@@ -588,7 +725,7 @@ fn get_input_cast_ptradd(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if slot == 0 {
         let in0 = data.obank().get(op)?.get_in(0)?;
         let reqtype = data.vn_type_read_facing(in0, op);
@@ -618,12 +755,12 @@ fn get_input_cast_ptrsub(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if slot == 0 {
         let in0 = data.obank().get(op)?.get_in(0)?;
         let reqtype = data.vn_type_read_facing(in0, op);
         let curtype = data.vn_high_type_read_facing(in0, op);
-        if Rc::ptr_eq(&curtype, &reqtype) {
+        if TypeRoot::eq(&curtype, &reqtype) {
             return None;
         }
         if reqtype.get_metatype() != type_metatype::TYPE_PTR {
@@ -643,14 +780,12 @@ fn get_input_cast_ptrsub(
             }
         }
         while let Some(td) = reqbase.get_typedef() {
-            let td = Rc::clone(td);
             reqbase = td;
         }
         while let Some(td) = curbase.get_typedef() {
-            let td = Rc::clone(td);
             curbase = td;
         }
-        if Rc::ptr_eq(&curbase, &reqbase) {
+        if TypeRoot::eq(&curbase, &reqbase) {
             return None;
         }
         return Some(reqtype);
@@ -667,7 +802,7 @@ fn get_input_cast_promote_div(
     op: OpId,
     slot: int4,
     signed_ext: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     // INT_RIGHT / INT_SRIGHT only special-case slot 0; their slot 1 defers to the
     // binary default.  INT_DIV/SDIV/REM/SREM special-case every slot.
     let opc = data.obank().get(op)?.code();
@@ -702,7 +837,7 @@ fn get_input_cast_int2float(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     // Absorbing an INT_ZEXT.
     if float_int2float_absorb_zext(data, op).is_some() {
         return None;
@@ -752,7 +887,7 @@ fn get_input_cast_default(
     strat: &CastStrategyC,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let invn = data.obank().get(op)?.get_in(slot)?;
     if data.vbank().get(invn)?.is_annotation() {
         return None;
@@ -772,7 +907,7 @@ pub(crate) fn get_output_token(
     data: &mut Funcdata,
     strat: &CastStrategyC,
     op: OpId,
-) -> Rc<Datatype> {
+) -> TypeRoot {
     let opc = match data.obank().get(op) {
         Some(o) => o.code(),
         None => return output_type_local(data, op),
@@ -835,7 +970,7 @@ pub(crate) fn get_output_token(
 
 /// The shift getOutputToken body (typeop.cc:1520-1527 etc.): the shiftee's
 /// read-facing type, mapping BOOL -> INT of the same size.
-fn get_output_token_shift(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
+fn get_output_token_shift(data: &mut Funcdata, op: OpId) -> TypeRoot {
     let in0 = match data.obank().get(op).and_then(|o| o.get_in(0)) {
         Some(v) => v,
         None => return output_type_local(data, op),
@@ -854,7 +989,7 @@ fn get_output_token_shift(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
 /// TypeOpPtrsub::getOutputToken (typeop.cc:2351-2366): walk down the pointed-to
 /// composite by the constant byte offset; if it lands at offset 0 on a sub-type,
 /// that sub-type is the token; otherwise a `void *` of the output size.
-fn get_output_token_ptrsub(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
+fn get_output_token_ptrsub(data: &mut Funcdata, op: OpId) -> TypeRoot {
     let in0 = match data.obank().get(op).and_then(|o| o.get_in(0)) {
         Some(v) => v,
         None => return output_type_local(data, op),
@@ -926,7 +1061,7 @@ fn get_output_token_ptrsub(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
 }
 
 /// TypeOpSubpiece::getOutputToken (typeop.cc:2144-2161).
-fn get_output_token_subpiece(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
+fn get_output_token_subpiece(data: &mut Funcdata, op: OpId) -> TypeRoot {
     let (in0, out_vn, out_size) = {
         let o = match data.obank().get(op) {
             Some(o) => o,
@@ -971,12 +1106,16 @@ fn get_output_token_subpiece(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
         // For a partial-union receiver the resolved field index is into the
         // container union; for a union/struct it is into `ct` directly.  Read the
         // field type back from the same datatype the truncation resolved against.
-        let field_ty = match ct.get_metatype() {
-            type_metatype::TYPE_PARTIALUNION => ct
-                .get_partial_base()
-                .and_then(|c| c.get_field(field_idx).map(|f| Rc::clone(&f.field_type))),
-            _ => ct.get_field(field_idx).map(|f| Rc::clone(&f.field_type)),
+        let container = if ct.get_metatype() == type_metatype::TYPE_PARTIALUNION {
+            ct.get_partial_base()
+        } else {
+            Some(ct.clone())
         };
+        let field_ty = container.and_then(|container| {
+            let view = container.read();
+            let field = view.get_field(container.id(), field_idx).ok()??;
+            container.related(field.field_type).ok()
+        });
         if let Some(field_ty) = field_ty {
             if out_size == field_ty.get_size() {
                 return field_ty;
@@ -996,7 +1135,7 @@ fn get_output_token_subpiece(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
 }
 
 /// TypeOpPiece::getOutputToken (typeop.cc:2065-2074).
-fn get_output_token_piece(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
+fn get_output_token_piece(data: &mut Funcdata, op: OpId) -> TypeRoot {
     let outvn = match data.obank().get(op).and_then(|o| o.get_out()) {
         Some(v) => v,
         None => return output_type_local(data, op),
@@ -1048,18 +1187,8 @@ fn subpiece_composite_byte_offset(data: &Funcdata, op: OpId) -> i64 {
     }
 }
 
-/// (kuna `structsynth nest`) `ct`, or the completed record when `ct` is a
-/// synthesized record's pointer to its own shell
-/// (`kuna_structsynth::resolve_self_pointer`).
-fn resolve_self_pointer(data: &Funcdata, ct: Rc<Datatype>) -> Rc<Datatype> {
-    match data.get_arch().types() {
-        Some(tlst) => crate::kuna_structsynth::resolve_self_pointer(tlst, &ct).unwrap_or(ct),
-        None => ct,
-    }
-}
-
 /// TypeOpLoad::getOutputToken (typeop.cc:473-486).
-fn get_output_token_load(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
+fn get_output_token_load(data: &mut Funcdata, op: OpId) -> TypeRoot {
     let invn = match data.obank().get(op).and_then(|o| o.get_in(1)) {
         Some(v) => v,
         None => return output_type_local(data, op),
@@ -1075,7 +1204,7 @@ fn get_output_token_load(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
     if ct.get_metatype() == type_metatype::TYPE_PTR {
         if let Some(pt) = ct.get_ptr_to() {
             if pt.get_size() == outsize {
-                return resolve_self_pointer(data, pt);
+                return pt;
             }
         }
     }
@@ -1089,7 +1218,7 @@ fn get_output_token_load(data: &mut Funcdata, op: OpId) -> Rc<Datatype> {
 
 /// `castStrategy->arithmeticOutputStandard(op)` driven through the bridge
 /// (cast.cc:394-409).
-fn arithmetic_output_standard(data: &mut Funcdata, strat: &CastStrategyC, op: OpId) -> Rc<Datatype> {
+fn arithmetic_output_standard(data: &mut Funcdata, strat: &CastStrategyC, op: OpId) -> TypeRoot {
     let fallback = output_type_local(data, op);
     let ctx = FuncdataCastContext::new(data);
     let opr = ctx.op_ref(op);
@@ -1209,7 +1338,7 @@ impl Funcdata {
                 }
                 if self.obank().get(op).and_then(|o| o.get_out()).is_some() {
                     count += match &diff_token {
-                        Some(t) => self.cast_output_token(op, &strat, Rc::clone(t)),
+                        Some(t) => self.cast_output_token(op, &strat, Clone::clone(t)),
                         None => self.cast_output(op, &strat),
                     };
                 }
@@ -1297,11 +1426,11 @@ impl Funcdata {
         // (the side effect is `setUnionField`, populating the cache), then re-reads
         // `getUnionField` exactly as C++ `dt->resolveInFlow(op,slot)` does.
         let field_and_dt = match self.get_union_field(&dt, op, slot) {
-            Some(r) => Some((r.get_field_num(), Rc::clone(r.get_datatype()))),
+            Some(r) => Some((r.get_field_num(), Clone::clone(r.get_datatype()))),
             None => {
                 let _ = self.resolve_in_flow(&dt, op, slot); // populates the cache
                 self.get_union_field(&dt, op, slot)
-                    .map(|r| (r.get_field_num(), Rc::clone(r.get_datatype())))
+                    .map(|r| (r.get_field_num(), Clone::clone(r.get_datatype())))
             }
         };
         let (field_num, res_dt) = match field_and_dt {
@@ -1345,6 +1474,7 @@ impl Funcdata {
 
     /// `ActionSetCasts::castInput` (coreaction.cc:2743-2810).
     fn cast_input(&mut self, op: OpId, slot: int4, strat: &CastStrategyC) -> int4 {
+        let explicit_vararg = abi_variadic_parameter(self, op, slot).is_some();
         let ct = match get_input_cast(self, strat, op, slot) {
             Some(c) => c,
             None => {
@@ -1359,10 +1489,27 @@ impl Funcdata {
                 return 0;
             }
         };
-        let vn = match self.obank().get(op).and_then(|o| o.get_in(slot)) {
+        let mut vn = match self.obank().get(op).and_then(|o| o.get_in(slot)) {
             Some(v) => v,
             None => return 0,
         };
+        if explicit_vararg && ct.get_metatype() == type_metatype::TYPE_FLOAT {
+            if let Some(value) = self.vbank().get(vn).filter(|v| v.is_constant()) {
+                // CAST preserves p-code bits; it is not FLOAT_INT2FLOAT.
+                // The explicit C cast must wrap a floating literal, not turn
+                // its integer bit pattern into a numeric floating conversion.
+                let shared_or_locked = value.num_descend() > 1 || value.is_type_lock();
+                let size = value.get_size();
+                let bits = value.get_offset();
+                if !TypeRoot::eq(value.get_type(), &ct) {
+                    if shared_or_locked {
+                        vn = self.new_constant(size, bits);
+                        let _ = self.op_set_input(op, vn, slot);
+                    }
+                    let _ = self.vn_update_type(vn, Clone::clone(&ct));
+                }
+            }
+        }
         let vnin = vn;
         // Guard against double-casts.
         let vn_is_written = self.vbank().get(vn).map(|v| v.is_written()).unwrap_or(false);
@@ -1377,12 +1524,12 @@ impl Funcdata {
         if vn_def_is_cast {
             if self.vbank().get(vn).map(|v| v.is_implied()).unwrap_or(false) {
                 if self.lone_descend(vn) == Some(op) {
-                    let changed = self.vn_update_type(vn, Rc::clone(&ct));
+                    let changed = self.vn_update_type(vn, Clone::clone(&ct));
                     let _ = changed;
                     if self
                         .vbank()
                         .get(vn)
-                        .map(|v| Rc::ptr_eq(v.get_type(), &ct))
+                        .map(|v| TypeRoot::eq(v.get_type(), &ct))
                         .unwrap_or(false)
                     {
                         return 1;
@@ -1399,7 +1546,7 @@ impl Funcdata {
                     if self
                         .vbank()
                         .get(vnin2)
-                        .map(|v| Rc::ptr_eq(v.get_type(), &ct))
+                        .map(|v| TypeRoot::eq(v.get_type(), &ct))
                         .unwrap_or(false)
                     {
                         let _ = self.op_set_input(op, vnin2, slot);
@@ -1407,16 +1554,16 @@ impl Funcdata {
                     }
                 }
             }
-        } else if self.vbank().get(vn).map(|v| v.is_constant()).unwrap_or(false) {
-            let _ = self.vn_update_type(vn, Rc::clone(&ct));
-            if self.vbank().get(vn).map(|v| Rc::ptr_eq(v.get_type(), &ct)).unwrap_or(false) {
+        } else if !explicit_vararg && self.vbank().get(vn).map(|v| v.is_constant()).unwrap_or(false) {
+            let _ = self.vn_update_type(vn, Clone::clone(&ct));
+            if self.vbank().get(vn).map(|v| TypeRoot::eq(v.get_type(), &ct)).unwrap_or(false) {
                 return 1;
             }
-        } else if ct.get_metatype() == type_metatype::TYPE_PTR {
+        } else if !explicit_vararg && ct.get_metatype() == type_metatype::TYPE_PTR {
             let cur = self.vn_high_type_read_facing(vn, op);
             if test_struct_offset0(&ct, &cur, strat) {
                 // Insert a PTRSUB(vn,#0) instead of a CAST.
-                let newop = self.cast_insert_ptrsub_zero(op, slot, Rc::clone(&ct));
+                let newop = self.cast_insert_ptrsub_zero(op, slot, Clone::clone(&ct));
                 let high = self.high_get_type(vn);
                 if let Some(h) = high {
                     if h.needs_resolution() {
@@ -1427,7 +1574,7 @@ impl Funcdata {
             } else if self.cast_input_resolution(op, slot, &ct, strat) {
                 return 1;
             }
-        } else if self.cast_input_resolution(op, slot, &ct, strat) {
+        } else if !explicit_vararg && self.cast_input_resolution(op, slot, &ct, strat) {
             return 1;
         }
         // Generate the CAST op.
@@ -1441,7 +1588,7 @@ impl Funcdata {
             Ok(v) => v,
             Err(_) => return 0,
         };
-        let _ = self.vn_update_type(vnout, Rc::clone(&ct));
+        let _ = self.vn_update_type(vnout, Clone::clone(&ct));
         let _ = self.vbank_mut().get_mut(vnout).map(|v| {
             v.set_implied();
         });
@@ -1450,7 +1597,7 @@ impl Funcdata {
         let _ = self.op_set_input(op, vnout, slot);
         self.op_insert_before(newop, op);
         if ct.needs_resolution() {
-            let _ = self.force_facing_type(Rc::clone(&ct), -1, newop, -1);
+            let _ = self.force_facing_type(Clone::clone(&ct), -1, newop, -1);
         }
         let high = self.high_get_type(vn);
         if let Some(h) = high {
@@ -1468,7 +1615,7 @@ impl Funcdata {
         &mut self,
         op: OpId,
         slot: int4,
-        ct: &Rc<Datatype>,
+        ct: &TypeRoot,
         _strat: &CastStrategyC,
     ) -> bool {
         let opc = self.obank().get(op).map(|o| o.code());
@@ -1486,18 +1633,18 @@ impl Funcdata {
     }
 
     /// [`Self::cast_output`] against a given output token.
-    fn cast_output_token(&mut self, op: OpId, strat: &CastStrategyC, tokenct: Rc<Datatype>) -> int4 {
+    fn cast_output_token(&mut self, op: OpId, strat: &CastStrategyC, tokenct: TypeRoot) -> int4 {
         let outvn = match self.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
             None => return 0,
         };
         let out_high_type = match self.high_get_type(outvn) {
             Some(t) => t,
-            None => Rc::clone(self.vbank().get(outvn).expect("castOutput: stale outvn").get_type()),
+            None => Clone::clone(self.vbank().get(outvn).expect("castOutput: stale outvn").get_type()),
         };
-        if Rc::ptr_eq(&tokenct, &out_high_type) {
+        if TypeRoot::eq(&tokenct, &out_high_type) {
             if tokenct.needs_resolution() {
-                let resolve = ResolvedUnion::new(Rc::clone(&tokenct));
+                let resolve = ResolvedUnion::new(Clone::clone(&tokenct));
                 self.set_union_field(&tokenct, op, -1, resolve);
             }
             return 0; // Same type, no cast.
@@ -1515,7 +1662,7 @@ impl Funcdata {
                     force = !is_op_identical(&out_high_resolve, &tokenct);
                 }
             } else if out_high_resolve.get_metatype() != type_metatype::TYPE_PTR {
-                let _ = self.vn_update_type(outvn, Rc::clone(&tokenct));
+                let _ = self.vn_update_type(outvn, Clone::clone(&tokenct));
                 out_high_resolve = self.vn_high_type_def_facing(outvn);
             } else if tokenct.get_metatype() == type_metatype::TYPE_PTR {
                 if let Some(outct) = out_high_resolve.get_ptr_to() {
@@ -1524,7 +1671,7 @@ impl Funcdata {
                         && meta != type_metatype::TYPE_STRUCT
                         && meta != type_metatype::TYPE_UNION
                     {
-                        let _ = self.vn_update_type(outvn, Rc::clone(&tokenct));
+                        let _ = self.vn_update_type(outvn, Clone::clone(&tokenct));
                         out_high_resolve = self.vn_high_type_def_facing(outvn);
                     }
                 }
@@ -1547,7 +1694,7 @@ impl Funcdata {
         // Generate the cast op.
         let outvn_size = self.vbank().get(outvn).map(|v| v.get_size()).unwrap_or(1);
         let vn = self.new_unique(outvn_size, None);
-        let _ = self.vn_update_type(vn, Rc::clone(&tokenct));
+        let _ = self.vn_update_type(vn, Clone::clone(&tokenct));
         let _ = self.vbank_mut().get_mut(vn).map(|v| {
             v.set_implied();
         });
@@ -1567,7 +1714,7 @@ impl Funcdata {
         let _ = self.op_set_output(op, vn);
         self.op_insert_after(newop, op);
         if tokenct.needs_resolution() {
-            let _ = self.force_facing_type(Rc::clone(&tokenct), -1, newop, 0);
+            let _ = self.force_facing_type(Clone::clone(&tokenct), -1, newop, 0);
         }
         if out_high_type.needs_resolution() {
             self.inherit_union_field(&out_high_type, newop, -1, op, -1);
@@ -1576,7 +1723,7 @@ impl Funcdata {
     }
 
     /// `ActionSetCasts::insertPtrsubZero` (coreaction.cc:2718-2732).
-    fn cast_insert_ptrsub_zero(&mut self, op: OpId, slot: int4, ct: Rc<Datatype>) -> OpId {
+    fn cast_insert_ptrsub_zero(&mut self, op: OpId, slot: int4, ct: TypeRoot) -> OpId {
         let vn = self
             .obank()
             .get(op)
@@ -1586,7 +1733,7 @@ impl Funcdata {
         let addr = self.obank().get(op).expect("insertPtrsubZero: stale op").get_addr().clone();
         let newop = self.new_op(2, addr);
         let vnout = self.new_unique_out(vn_size, newop).expect("insertPtrsubZero: new unique out");
-        let _ = self.vn_update_type(vnout, Rc::clone(&ct));
+        let _ = self.vn_update_type(vnout, Clone::clone(&ct));
         let _ = self.vbank_mut().get_mut(vnout).map(|v| {
             v.set_implied();
         });
@@ -1600,7 +1747,7 @@ impl Funcdata {
     }
 
     /// `ActionSetCasts::tryResolutionAdjustment` (coreaction.cc:2482-2504).
-    fn cast_try_resolution_adjustment(&mut self, dt: &Rc<Datatype>, op: OpId, slot: int4) -> bool {
+    fn cast_try_resolution_adjustment(&mut self, dt: &TypeRoot, op: OpId, slot: int4) -> bool {
         if dt.needs_resolution() {
             return false;
         }
@@ -1631,7 +1778,7 @@ impl Funcdata {
             Some(r) => r,
             None => return false,
         };
-        let resolve_dt = Rc::clone(resolve.get_datatype());
+        let resolve_dt = Clone::clone(resolve.get_datatype());
         if !self.set_union_field(&cur_type, op, slot, resolve) {
             return false;
         }
@@ -1649,7 +1796,7 @@ impl Funcdata {
                             o.code() != OpCode::CPUI_PTRSUB
                                 || o.get_in(0)
                                     .and_then(|iv| self.vbank().get(iv))
-                                    .map(|iv| !Rc::ptr_eq(iv.get_type(), &cur_type))
+                                    .map(|iv| !TypeRoot::eq(iv.get_type(), &cur_type))
                                     .unwrap_or(true)
                         })
                         .unwrap_or(true);
@@ -1747,14 +1894,14 @@ impl Funcdata {
 
     /// Rebuild a `ResolvedUnion` for `(unres_type, field_num)` (the C++ constructs
     /// a fresh `ResolvedUnion resolve(curType, fieldNum, *typegrp)` at each use).
-    fn rebuild_resolved(&self, unres_type: &Rc<Datatype>, field_num: int4) -> Option<ResolvedUnion> {
+    fn rebuild_resolved(&self, unres_type: &TypeRoot, field_num: int4) -> Option<ResolvedUnion> {
         let tlst = self.get_arch().types_rc()?;
-        ResolvedUnion::new_field(Rc::clone(unres_type), field_num, tlst.as_ref()).ok()
+        ResolvedUnion::new_field(Clone::clone(unres_type), field_num, tlst.as_ref()).ok()
     }
 }
 
 /// `ActionSetCasts::testStructOffset0` (coreaction.cc:2443-2472).
-pub fn test_struct_offset0(reqtype: &Rc<Datatype>, curtype: &Rc<Datatype>, strat: &CastStrategyC) -> bool {
+pub fn test_struct_offset0(reqtype: &TypeRoot, curtype: &TypeRoot, strat: &CastStrategyC) -> bool {
     if curtype.get_metatype() != type_metatype::TYPE_PTR {
         return false;
     }
@@ -1762,16 +1909,17 @@ pub fn test_struct_offset0(reqtype: &Rc<Datatype>, curtype: &Rc<Datatype>, strat
         Some(p) => p,
         None => return false,
     };
-    let mut reqt: Rc<Datatype>;
-    let curt: Rc<Datatype>;
+    let mut reqt: TypeRoot;
+    let curt: TypeRoot;
     match high_ptr_to.get_metatype() {
         type_metatype::TYPE_STRUCT => {
             if high_ptr_to.num_depend() == 0 {
                 return false;
             }
-            let first = match high_ptr_to.get_field(0) {
-                Some(f) => f,
-                None => return false,
+            let view = high_ptr_to.read();
+            let first = match view.get_field(high_ptr_to.id(), 0) {
+                Ok(Some(f)) => f,
+                _ => return false,
             };
             if first.offset != 0 {
                 return false;
@@ -1780,7 +1928,11 @@ pub fn test_struct_offset0(reqtype: &Rc<Datatype>, curtype: &Rc<Datatype>, strat
                 Some(p) => p,
                 None => return false,
             };
-            curt = Rc::clone(&first.field_type);
+            curt = match high_ptr_to.related(first.field_type) {
+                Ok(t) => t,
+                Err(_) => return false,
+            };
+            drop(view);
             if reqt.get_metatype() == type_metatype::TYPE_ARRAY {
                 if let Some(b) = reqt.get_array_base() {
                     reqt = b;
@@ -1815,9 +1967,9 @@ pub fn test_struct_offset0(reqtype: &Rc<Datatype>, curtype: &Rc<Datatype>, strat
 }
 
 /// `ActionSetCasts::isOpIdentical` (coreaction.cc:2559-2571).
-pub fn is_op_identical(ct1: &Rc<Datatype>, ct2: &Rc<Datatype>) -> bool {
-    let mut a = Rc::clone(ct1);
-    let mut b = Rc::clone(ct2);
+pub fn is_op_identical(ct1: &TypeRoot, ct2: &TypeRoot) -> bool {
+    let mut a = Clone::clone(ct1);
+    let mut b = Clone::clone(ct2);
     while a.get_metatype() == type_metatype::TYPE_PTR && b.get_metatype() == type_metatype::TYPE_PTR {
         a = match a.get_ptr_to() {
             Some(p) => p,
@@ -1829,14 +1981,12 @@ pub fn is_op_identical(ct1: &Rc<Datatype>, ct2: &Rc<Datatype>) -> bool {
         };
     }
     while let Some(td) = a.get_typedef() {
-        let td = Rc::clone(td);
         a = td;
     }
     while let Some(td) = b.get_typedef() {
-        let td = Rc::clone(td);
         b = td;
     }
-    Rc::ptr_eq(&a, &b)
+    TypeRoot::eq(&a, &b)
 }
 
 // ===========================================================================
@@ -1862,7 +2012,7 @@ pub fn is_op_identical(ct1: &Rc<Datatype>, ct2: &Rc<Datatype>) -> bool {
 mod verify_w10_merge_casts_r2 {
     use super::*;
     use crate::cast::CastStrategy;
-    use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl};
+    use crate::dtype::{type_metatype, Datatype, TypeRoot, TypeFactoryImpl};
     use crate::funcdata::Funcdata;
     use crate::context::{ArchContext, TypeOp};
     use kuna_base::address::Address;
@@ -1900,10 +2050,10 @@ mod verify_w10_merge_casts_r2 {
         let tf = Rc::new(tf);
 
         let mut arch = ArchContext::new(m);
-        arch.types = Some(Rc::clone(&tf));
+        arch.types = Some(Clone::clone(&tf));
         let glb = Rc::new(arch);
-        let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
-        let addr = Address::new(Rc::clone(&ram), 0x1000);
+        let ram = Clone::clone(glb.manage().get_space_by_name("ram").unwrap());
+        let addr = Address::new(Clone::clone(&ram), 0x1000);
         let fd = Funcdata::new("f", "f", glb, addr, 0x1000_0000, 0x40).unwrap();
         assert!(
             fd.get_arch().types().is_some(),
@@ -1913,8 +2063,10 @@ mod verify_w10_merge_casts_r2 {
         (fd, strat, ram)
     }
 
-    fn ity(size: int4, m: type_metatype) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, m))
+    fn ity(size: int4, m: type_metatype) -> TypeRoot {
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.intern(Datatype::new(size, m)).unwrap()
     }
 
     /// Build a binary op `opc` with two 4-byte input varnodes typed `t0`/`t1`.
@@ -1923,10 +2075,10 @@ mod verify_w10_merge_casts_r2 {
         ram: &Rc<AddrSpace>,
         off: u64,
         opc: OpCode,
-        t0: Rc<Datatype>,
-        t1: Rc<Datatype>,
+        t0: TypeRoot,
+        t1: TypeRoot,
     ) -> OpId {
-        let pc = Address::new(Rc::clone(ram), 0x2000 + off);
+        let pc = Address::new(Clone::clone(ram), 0x2000 + off);
         let op = fd.new_op(2, pc);
         fd.op_set_opcode(op, TypeOp::new(opc, 0, "OP"));
         let a = fd.new_unique(4, Some(t0));
@@ -1943,31 +2095,176 @@ mod verify_w10_merge_casts_r2 {
         ram: &Rc<AddrSpace>,
         off: u64,
         opc: OpCode,
-        t0: Rc<Datatype>,
+        t0: TypeRoot,
     ) -> OpId {
-        let pc = Address::new(Rc::clone(ram), 0x2000 + off);
+        let pc = Address::new(Clone::clone(ram), 0x2000 + off);
         let op = fd.new_op(1, pc);
         fd.op_set_opcode(op, TypeOp::new(opc, 0, "OP"));
         let a = fd.new_unique(4, Some(t0));
         fd.op_set_input(op, a, 0).unwrap();
-        let outaddr = Address::new(Rc::clone(ram), 0x3000 + off);
+        let outaddr = Address::new(Clone::clone(ram), 0x3000 + off);
         let out = fd.new_varnode(8, &outaddr, None);
         fd.op_set_output(op, out).unwrap();
         op
     }
 
     /// Structural equality on the (metatype, size) the cast decision turns on.
-    /// `cast_standard` returns freshly-built `Rc<Datatype>` per call, so
-    /// `Rc::ptr_eq` would spuriously fail; this compares the load-bearing fields.
-    fn opt_ptr_eq(a: &Option<Rc<Datatype>>, b: &Option<Rc<Datatype>>) -> bool {
+    /// The fixture may compare roots from distinct factories, so graph identity
+    /// alone does not describe the scalar conversion this predicate observes.
+    fn opt_ptr_eq(a: &Option<TypeRoot>, b: &Option<TypeRoot>) -> bool {
         match (a, b) {
             (None, None) => true,
             (Some(x), Some(y)) => {
-                Rc::ptr_eq(x, y)
+                TypeRoot::eq(x, y)
                     || (x.get_metatype() == y.get_metatype() && x.get_size() == y.get_size())
             }
             _ => false,
         }
+    }
+
+    #[test]
+    fn variadic_float_constant_cast_preserves_bits_and_other_integer_uses() {
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::varnode::varnode_flags;
+
+        for (shared, locked) in [(false, false), (true, false), (false, true)] {
+            let (mut fd, strat, ram) = build();
+            let types = fd.get_arch().types().unwrap();
+            let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let uint8 = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
+            let float8 = types.get_base(8, type_metatype::TYPE_FLOAT).unwrap();
+            let void = types.get_type_void().unwrap();
+            let mut model = ProtoModel::new(fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(model), void);
+            proto.set_override(true);
+            proto.set_abi_first_vararg(Some(1));
+            for (slot, dtype) in [(0, int4), (1, float8)] {
+                proto.set_param(slot, "argument", &ParameterPieces {
+                    addr: Address::new(Clone::clone(&ram), 0x80 + slot as u64 * 8),
+                    type_: Some(dtype), flags: parameter_pieces_flags::TYPELOCK,
+                });
+            }
+            let root = fd.bblocks_root_pub();
+            let block = fd.bblocks_mut().new_block_basic(root);
+            let bits = 2.5_f64.to_bits();
+            let raw = fd.new_constant(8, bits);
+            fd.vn_update_type(raw, Clone::clone(&uint8));
+            if locked {
+                fd.vbank_mut().get_mut(raw).unwrap().set_flags_pub(varnode_flags::typelock);
+            }
+            let integer_use = if shared {
+                let copy = fd.new_op(1, Address::new(Clone::clone(&ram), 0x2000));
+                fd.op_set_opcode(copy, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
+                fd.op_set_input(copy, raw, 0).unwrap();
+                fd.new_unique_out(8, copy).unwrap();
+                fd.op_insert_end(copy, block);
+                Some(copy)
+            } else { None };
+            let call = fd.new_op(3, Address::new(Clone::clone(&ram), 0x2004));
+            fd.op_set_opcode(call, TypeOp::new(
+                OpCode::CPUI_CALLIND, crate::op::pcodeop_flags::call, "CALLIND",
+            ));
+            let target = fd.new_unique(8, None);
+            let fixed = fd.new_constant(4, 7);
+            fd.op_set_input(call, target, 0).unwrap();
+            fd.op_set_input(call, fixed, 1).unwrap();
+            fd.op_set_input(call, raw, 2).unwrap();
+            fd.op_insert_end(call, block);
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().copy(&proto);
+            fd.push_call_specs(specs);
+
+            fd.cast_input(call, 2, &strat);
+            let cast_output = fd.obank().get(call).unwrap().get_in(2).unwrap();
+            let output = fd.vbank().get(cast_output).unwrap();
+            assert_eq!(output.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
+            assert_eq!(output.get_type().get_size(), 8);
+            let cast = fd.obank().get(output.get_def().expect("explicit variadic cast")).unwrap();
+            assert_eq!(cast.code(), OpCode::CPUI_CAST);
+            let input_id = cast.get_in(0).unwrap();
+            let input = fd.vbank().get(input_id).unwrap();
+            assert!(input.is_constant());
+            assert_eq!(input.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
+            assert_eq!(input.get_type().get_size(), 8);
+            assert_eq!(input.get_offset(), bits, "2.5 is an IEEE value, not numeric conversion of its integer encoding");
+            if shared || locked {
+                assert_ne!(input_id, raw);
+                assert_eq!(fd.vbank().get(raw).unwrap().get_type().get_metatype(), type_metatype::TYPE_UINT);
+                assert_eq!(fd.vbank().get(raw).unwrap().get_offset(), bits);
+            }
+            if let Some(integer_use) = integer_use {
+                assert_eq!(fd.obank().get(integer_use).unwrap().get_in(0), Some(raw));
+            }
+        }
+    }
+
+    #[test]
+    fn closed_variadic_override_cast_preserves_abi_and_concrete_argument_types() {
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+
+        let (mut fd, strat, ram) = build();
+        let types = fd.get_arch().types().unwrap();
+        let void = types.get_type_void().unwrap();
+        let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let uint8 = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
+        let target_type = types.get_type_pointer(8, Clone::clone(&void), 1).unwrap();
+        let target = fd.new_unique(8, Some(Clone::clone(&target_type)));
+        let mut model = ProtoModel::new(fd.get_arch().manage());
+        model.build_param_list("standard").unwrap();
+        let model = Rc::new(model);
+        fd.get_arch().types_impl().unwrap().set_proto_context(
+            Some(model.clone()), fd.get_arch().manage.clone(),
+        ).unwrap();
+        let mut proto = FuncProto::new();
+        proto.set_internal(model, void);
+        proto.set_override(true);
+        proto.set_abi_first_vararg(Some(1));
+        for slot in 0..3 {
+            proto.set_param(slot, "arg", &ParameterPieces {
+                addr: Address::new(Clone::clone(&ram), 0x80 + slot as u64 * 8),
+                type_: Some(Clone::clone(&int4)),
+                flags: parameter_pieces_flags::TYPELOCK,
+            });
+        }
+        proto.set_output(&ParameterPieces {
+            addr: Address::new(Clone::clone(&ram), 0x10),
+            type_: Some(Clone::clone(&int4)),
+            flags: parameter_pieces_flags::TYPELOCK,
+        });
+        let op = fd.new_op(4, Address::new(Clone::clone(&ram), 0x2000));
+        fd.op_set_opcode(op, TypeOp::new(
+            OpCode::CPUI_CALLIND, crate::op::pcodeop_flags::call, "CALLIND",
+        ));
+        fd.op_set_input(op, target, 0).unwrap();
+        for slot in 1..4 {
+            let argument = fd.new_unique(8, Some(Clone::clone(&uint8)));
+            fd.op_set_input(op, argument, slot).unwrap();
+        }
+        let mut specs = FuncCallSpecs::new(op, Address::new_invalid());
+        specs.proto_mut().copy(&proto);
+        fd.push_call_specs(specs);
+
+        let callable = get_input_cast(&mut fd, &strat, op, 0).unwrap();
+        let code = callable.get_ptr_to().unwrap();
+        {
+            let view = code.read();
+            let signature = view.get_code_prototype(code.id()).unwrap().unwrap();
+            assert!(signature.variadic);
+            assert_eq!(signature.inputs.len(), 1);
+            assert_eq!(view.get(signature.inputs[0]).unwrap().get_size(), 4);
+        }
+        let variadic_argument = get_input_cast(&mut fd, &strat, op, 2).unwrap();
+        assert_eq!(variadic_argument.get_metatype(), type_metatype::TYPE_INT);
+        assert_eq!(variadic_argument.get_size(), 4);
+        let original = fd.get_call_specs(fd.get_call_specs_index(op).unwrap());
+        assert_eq!(original.proto().num_params(), 3);
+        assert_eq!(original.proto().get_abi_first_vararg(), Some(1));
+        assert!(!original.proto().is_dotdotdot());
+        assert_eq!(original.format_arity(), None);
+        assert!(TypeRoot::eq(&fd.vn_high_type_read_facing(target, op), &target_type),
+            "one callsite cast must not change the shared target datatype");
     }
 
     // -- AT1 (B1) -- INT_SLESS over a uint4-typed operand MUST route to the
@@ -1984,8 +2281,8 @@ mod verify_w10_merge_casts_r2 {
             &ram,
             0x10,
             OpCode::CPUI_INT_SLESS,
-            Rc::clone(&uint4),
-            Rc::clone(&uint4),
+            Clone::clone(&uint4),
+            Clone::clone(&uint4),
         );
 
         // Independently computed FAITHFUL result for slot 0:
@@ -2034,16 +2331,16 @@ mod verify_w10_merge_casts_r2 {
             &ram,
             0x20,
             OpCode::CPUI_INT_SLESS,
-            Rc::clone(&uint4),
-            Rc::clone(&uint4),
+            Clone::clone(&uint4),
+            Clone::clone(&uint4),
         );
         let less = binop(
             &mut fd,
             &ram,
             0x28,
             OpCode::CPUI_INT_LESS,
-            Rc::clone(&uint4),
-            Rc::clone(&uint4),
+            Clone::clone(&uint4),
+            Clone::clone(&uint4),
         );
         // SLESS local type is signed (TYPE_INT); LESS local type is unsigned
         // (TYPE_UINT).  If SLESS were misrouted to the EQUAL body its reqtype
@@ -2063,7 +2360,7 @@ mod verify_w10_merge_casts_r2 {
     fn at3_zext_dispatch_uses_true_false_not_inverted() {
         let (mut fd, strat, ram) = build();
         let int4s = ity(4, type_metatype::TYPE_INT); // signed input -> differs from ZEXT local uint
-        let op = unop(&mut fd, &ram, 0x30, OpCode::CPUI_INT_ZEXT, Rc::clone(&int4s));
+        let op = unop(&mut fd, &ram, 0x30, OpCode::CPUI_INT_ZEXT, Clone::clone(&int4s));
 
         let reqtype = input_type_local(&fd, op, 0);
         assert_eq!(
@@ -2101,7 +2398,7 @@ mod verify_w10_merge_casts_r2 {
     fn at4_sext_dispatch_uses_signed_local_true_false() {
         let (mut fd, strat, ram) = build();
         let uint4 = ity(4, type_metatype::TYPE_UINT); // unsigned input -> differs from SEXT local int
-        let op = unop(&mut fd, &ram, 0x38, OpCode::CPUI_INT_SEXT, Rc::clone(&uint4));
+        let op = unop(&mut fd, &ram, 0x38, OpCode::CPUI_INT_SEXT, Clone::clone(&uint4));
 
         let reqtype = input_type_local(&fd, op, 0);
         assert_eq!(
@@ -2130,8 +2427,8 @@ mod verify_w10_merge_casts_r2 {
             &ram,
             0x40,
             OpCode::CPUI_INT_EQUAL,
-            Rc::clone(&int4s),
-            Rc::clone(&uint4),
+            Clone::clone(&int4s),
+            Clone::clone(&uint4),
         );
         // Faithful EQUAL: reqtype = max-read-facing(in0,in1); for slot 0 the
         // curtype is in0's read-facing type; tail = (false,false).

@@ -29,15 +29,15 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintm};
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::op::{
     get_cse_hash, get_nz_mask_local, is_collapsible, pcodeop_flags, PcodeOpBank,
 };
 use kuna_decomp::context::TypeOp;
 use kuna_decomp::varnode::VarnodeBank;
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(types: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    types.intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 /// const(0), unique(1), ram(2, 8-byte addressable so we can hold wide offsets).
@@ -66,14 +66,14 @@ fn ram(m: &AddrSpaceManager, off: u64) -> Address {
 
 /// A constant varnode of `size` bytes holding `val`: its nzmask == offset == val
 /// (Varnode::new seeds a constant's nzm from its offset).
-fn konst(vbank: &mut VarnodeBank, m: &AddrSpaceManager, size: int4, val: u64) -> kuna_decomp::context::VarnodeId {
+fn konst(vbank: &mut VarnodeBank, types: &TypeFactoryImpl, m: &AddrSpaceManager, size: int4, val: u64) -> kuna_decomp::context::VarnodeId {
     let caddr = Address::new(Rc::clone(m.get_space(0).unwrap()), val);
-    vbank.create(size, caddr, dt(size))
+    vbank.create(size, caddr, dt(types, size))
 }
 
 /// A free (non-constant) varnode in ram: nzm defaults to full mask (u64::MAX).
-fn freevn(vbank: &mut VarnodeBank, m: &AddrSpaceManager, size: int4, off: u64) -> kuna_decomp::context::VarnodeId {
-    vbank.create(size, ram(m, off), dt(size))
+fn freevn(vbank: &mut VarnodeBank, types: &TypeFactoryImpl, m: &AddrSpaceManager, size: int4, off: u64) -> kuna_decomp::context::VarnodeId {
+    vbank.create(size, ram(m, off), dt(types, size))
 }
 
 fn no_loop(_: int4) -> bool {
@@ -115,11 +115,12 @@ fn build_op(
 #[test]
 fn nzmask_int_right_wide_large_shift_diverges() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 17, 0x1000); // size 17 (> sizeof uintb), nz=full
-    let sh = konst(&mut vbank, &m, 17, 130); // constant shift amount 130
-    let outp = freevn(&mut vbank, &m, 17, 0x2000); // output size 17
+    let inp = freevn(&mut vbank, &types, &m, 17, 0x1000); // size 17 (> sizeof uintb), nz=full
+    let sh = konst(&mut vbank, &types, &m, 17, 130); // constant shift amount 130
+    let outp = freevn(&mut vbank, &types, &m, 17, 0x2000); // output size 17
     let id = build_op(&mut bank, OpCode::CPUI_INT_RIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
 
@@ -141,11 +142,12 @@ fn nzmask_int_right_wide_large_shift_diverges() {
 #[test]
 fn nzmask_int_right_wide_moderate_shift_ok() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 17, 0x1000);
-    let sh = konst(&mut vbank, &m, 17, 70);
-    let outp = freevn(&mut vbank, &m, 17, 0x2000);
+    let inp = freevn(&mut vbank, &types, &m, 17, 0x1000);
+    let sh = konst(&mut vbank, &types, &m, 17, 70);
+    let outp = freevn(&mut vbank, &types, &m, 17, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_INT_RIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
     // sz1=17>8, sa=70: pcode_right(full,70)=0; sa<8*17=136, sa>=64 ->
@@ -162,12 +164,13 @@ fn nzmask_int_right_wide_moderate_shift_ok() {
 #[test]
 fn nzmask_int_sright_const_shift_ge_64_diverges() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
     // 8-byte value with an unknown sign bit (nz=full), constant shift 64.
-    let inp = freevn(&mut vbank, &m, 8, 0x1000); // nz=full -> sign bit unknown
-    let sh = konst(&mut vbank, &m, 8, 64); // shift amount == 64
-    let outp = freevn(&mut vbank, &m, 8, 0x2000);
+    let inp = freevn(&mut vbank, &types, &m, 8, 0x1000); // nz=full -> sign bit unknown
+    let sh = konst(&mut vbank, &types, &m, 8, 64); // shift amount == 64
+    let outp = freevn(&mut vbank, &types, &m, 8, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_INT_SRIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
     // C++ (x86): sa=64 masks to 0; pcode_right(full,64)=0; (full>>0)^full == 0;
@@ -188,11 +191,12 @@ fn nzmask_int_sright_const_shift_ge_64_diverges() {
 #[test]
 fn cse_hash_order_sensitive_and_copy_zero() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let out = freevn(&mut vbank, &m, 4, 0x10);
-    let c1 = konst(&mut vbank, &m, 4, 0x11);
-    let c2 = konst(&mut vbank, &m, 4, 0x22);
+    let out = freevn(&mut vbank, &types, &m, 4, 0x10);
+    let c1 = konst(&mut vbank, &types, &m, 4, 0x11);
+    let c2 = konst(&mut vbank, &types, &m, 4, 0x22);
 
     // binary eval-type cached so getCseHash doesn't early-return 0.
     let bin = pcodeop_flags::binary;
@@ -258,21 +262,22 @@ fn move_sequence_dead_to_front_boundary() {
 #[test]
 fn is_collapsible_output_size_boundary() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
-    let c0 = konst(&mut vbank, &m, 8, 0x1);
-    let c1 = konst(&mut vbank, &m, 8, 0x2);
+    let c0 = konst(&mut vbank, &types, &m, 8, 0x1);
+    let c1 = konst(&mut vbank, &types, &m, 8, 0x2);
 
     let mut bank = PcodeOpBank::new();
-    let out8 = freevn(&mut vbank, &m, 8, 0x100);
+    let out8 = freevn(&mut vbank, &types, &m, 8, 0x100);
     let op8 = build_op(&mut bank, OpCode::CPUI_INT_ADD, 0, Some(out8), &[c0, c1], &m);
     assert!(is_collapsible(bank.get(op8).unwrap(), &vbank), "size 8 == sizeof(uintb) collapses");
 
-    let out9 = freevn(&mut vbank, &m, 9, 0x200);
+    let out9 = freevn(&mut vbank, &types, &m, 9, 0x200);
     let op9 = build_op(&mut bank, OpCode::CPUI_INT_ADD, 0, Some(out9), &[c0, c1], &m);
     assert!(!is_collapsible(bank.get(op9).unwrap(), &vbank), "size 9 > sizeof(uintb) does not");
 
     // No inputs -> not collapsible (op.cc:120).
-    let out_ni = freevn(&mut vbank, &m, 4, 0x300);
+    let out_ni = freevn(&mut vbank, &types, &m, 4, 0x300);
     let op_ni = build_op(&mut bank, OpCode::CPUI_INT_ADD, 0, Some(out_ni), &[], &m);
     assert!(!is_collapsible(bank.get(op_ni).unwrap(), &vbank));
 }
@@ -320,12 +325,13 @@ fn mark_incidental_copy_through_tail() {
 #[test]
 fn nzmask_int_sright_signzero_large_shift_ok() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
     // 8-byte CONSTANT input with a known small value -> nz == 0x7f (sign bit clear).
-    let inp = konst(&mut vbank, &m, 8, 0x7f);
-    let sh = konst(&mut vbank, &m, 8, 100);
-    let outp = freevn(&mut vbank, &m, 8, 0x2000);
+    let inp = konst(&mut vbank, &types, &m, 8, 0x7f);
+    let sh = konst(&mut vbank, &types, &m, 8, 100);
+    let outp = freevn(&mut vbank, &types, &m, 8, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_INT_SRIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
     // sign bit of fullmask(8) is clear in 0x7f -> sign-zero arm -> pcode_right(0x7f,100)=0.
@@ -338,11 +344,12 @@ fn nzmask_int_sright_signzero_large_shift_ok() {
 #[test]
 fn nzmask_int_right_wide_shift_exactly_64() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 17, 0x1000); // sz1 == 17 > 8
-    let sh = konst(&mut vbank, &m, 17, 64); // sa == 64 == 8*sizeof(uintb)
-    let outp = freevn(&mut vbank, &m, 17, 0x2000);
+    let inp = freevn(&mut vbank, &types, &m, 17, 0x1000); // sz1 == 17 > 8
+    let sh = konst(&mut vbank, &types, &m, 17, 64); // sa == 64 == 8*sizeof(uintb)
+    let outp = freevn(&mut vbank, &types, &m, 17, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_INT_RIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
     // sz1=17>8, sa=64: sa<8*17=136, sa>=64 -> resmask=calc_mask(17-8)=calc_mask(9)=full;
@@ -359,11 +366,12 @@ fn nzmask_int_right_wide_shift_exactly_64() {
 #[test]
 fn nzmask_int_right_wide_zero_shift_ok() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 17, 0x1000); // nz == full (free)
-    let sh = konst(&mut vbank, &m, 17, 0); // sa == 0
-    let outp = freevn(&mut vbank, &m, 17, 0x2000);
+    let inp = freevn(&mut vbank, &types, &m, 17, 0x1000); // nz == full (free)
+    let sh = konst(&mut vbank, &types, &m, 17, 0); // sa == 0
+    let outp = freevn(&mut vbank, &types, &m, 17, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_INT_RIGHT, 0, Some(outp), &[inp, sh], &m);
     let op = bank.get(id).unwrap();
     // sz1=17>8, sa=0: pcode_right(full,0)=full; sa<8*17, sa<64 -> else arm:
@@ -379,18 +387,19 @@ fn nzmask_int_right_wide_zero_shift_ok() {
 #[test]
 fn nzmask_subpiece_offset_at_sizeof_boundary() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 8, 0x1000); // size 8 (<= sizeof uintb)
-    let off = konst(&mut vbank, &m, 4, 8); // truncation offset == 8 (== sizeof uintb)
-    let outp = freevn(&mut vbank, &m, 1, 0x2000);
+    let inp = freevn(&mut vbank, &types, &m, 8, 0x1000); // size 8 (<= sizeof uintb)
+    let off = konst(&mut vbank, &types, &m, 4, 8); // truncation offset == 8 (== sizeof uintb)
+    let outp = freevn(&mut vbank, &types, &m, 1, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_SUBPIECE, 0, Some(outp), &[inp, off], &m);
     let op = bank.get(id).unwrap();
     // sz1=8, in_size(0)=8<=8: sz1<8 false -> resmask=0; &= fullmask(1) -> 0.
     assert_eq!(get_nz_mask_local(op, &vbank, false, &no_loop), 0u64);
 
     // offset 7 (< 8): resmask = full >> 56 == 0xff, & fullmask(1)==0xff -> 0xff.
-    let off7 = konst(&mut vbank, &m, 4, 7);
+    let off7 = konst(&mut vbank, &types, &m, 4, 7);
     let id7 = build_op(&mut bank, OpCode::CPUI_SUBPIECE, 0, Some(outp), &[inp, off7], &m);
     assert_eq!(
         get_nz_mask_local(bank.get(id7).unwrap(), &vbank, false, &no_loop),
@@ -414,12 +423,13 @@ fn nzmask_subpiece_offset_at_sizeof_boundary() {
 #[should_panic] // documents the divergence: C++ returns 0, Rust panics in debug
 fn nzmask_subpiece_negative_offset_diverges() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
-    let inp = freevn(&mut vbank, &m, 8, 0x1000); // small input
+    let inp = freevn(&mut vbank, &types, &m, 8, 0x1000); // small input
     // offset 0x80000000 -> (int4) == i32::MIN (negative). 8-byte const can hold it.
-    let off = konst(&mut vbank, &m, 8, 0x8000_0000);
-    let outp = freevn(&mut vbank, &m, 1, 0x2000);
+    let off = konst(&mut vbank, &types, &m, 8, 0x8000_0000);
+    let outp = freevn(&mut vbank, &types, &m, 1, 0x2000);
     let id = build_op(&mut bank, OpCode::CPUI_SUBPIECE, 0, Some(outp), &[inp, off], &m);
     let op = bank.get(id).unwrap();
     // C++-faithful expectation would be 0. The Rust panics first (this is why the
@@ -435,12 +445,13 @@ fn nzmask_subpiece_negative_offset_diverges() {
 #[test]
 fn nzmask_int_mult_total_shift_max_count() {
     let m = build_manager();
+    let types = TypeFactoryImpl::new();
     let mut vbank = VarnodeBank::new(&m, 0).unwrap();
     let mut bank = PcodeOpBank::new();
     // two constants each with a single bit set at position 0 -> nz == 1.
-    let a = konst(&mut vbank, &m, 8, 1);
-    let b = konst(&mut vbank, &m, 8, 1);
-    let outp = freevn(&mut vbank, &m, 8, 0x2000); // size 8 == sizeof uintb
+    let a = konst(&mut vbank, &types, &m, 8, 1);
+    let b = konst(&mut vbank, &types, &m, 8, 1);
+    let outp = freevn(&mut vbank, &types, &m, 8, 0x2000); // size 8 == sizeof uintb
     let id = build_op(&mut bank, OpCode::CPUI_INT_MULT, 0, Some(outp), &[a, b], &m);
     let op = bank.get(id).unwrap();
     // val=1,resmask=1: msb=0,lsb=0 both; sa=0; sz1b=1,sz2b=1 -> total=2, then -=1 ->1.

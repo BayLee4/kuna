@@ -38,6 +38,7 @@ use std::sync::Mutex;
 
 use kuna_base::address::Address;
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram};
+use kuna_decomp::dtype::TypeRoot;
 use kuna_decomp::kuna_libctypes::LIBCTYPES_ENV;
 
 /// `bump` in the MIPS fixture; `next_byte` in the x86-64 one. Any code address
@@ -56,7 +57,7 @@ fn repo_root() -> PathBuf {
 /// Bootstrap `fixture` with `libctypes` asking for `glibc`, declare `getgrnam` at
 /// `entry`, and hand back the `group` the declaration minted, if any. `None` ⇒ a
 /// specs-less skip.
-fn declared_group(fixture: &str, entry: u64) -> Option<Option<Rc<kuna_decomp::dtype::Datatype>>> {
+fn declared_group(fixture: &str, entry: u64) -> Option<Option<TypeRoot>> {
     let root = repo_root();
     let spec_roots = vec![root.join("specs").to_str().unwrap().to_string()];
     let bin = root.join("decompiler/crates/kuna-analysis/tests/fixtures").join(fixture);
@@ -92,7 +93,8 @@ fn an_accepted_target_mints_the_published_group() {
     let group = group.expect("an x86-64 glibc ELF takes the named declaration");
     assert!(!group.is_incomplete(), "an x86-64 glibc ELF takes the fields");
     assert_eq!(group.get_size(), 32, "the published width");
-    let first = group.get_field(0).expect("a first member");
+    let view = group.read();
+    let first = view.get_field(group.id(), 0).expect("read group fields").expect("a first member");
     assert_eq!(first.name, "gr_name");
     assert_eq!(first.offset, 0);
 }

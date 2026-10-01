@@ -62,7 +62,6 @@
 //! [`crate::loader::kuna_dynrelocs`]'s; the other three are never reached.
 
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
 
 use kuna_base::types::uint4;
 use kuna_decomp::dtype::TypeFactory;
@@ -174,7 +173,7 @@ pub(super) fn stream_data_symbols(
         let Some(&(name, size, undefined)) = by_index.get(&idx.0) else { continue };
         let (sym_name, ct) = if r_type == r_copy && !undefined && size == ptr_width {
             // The copy destination holds what libc's own `stdout` holds.
-            (name.to_string(), Rc::clone(&stream_ptr))
+            (name.to_string(), stream_ptr.clone())
         } else if r_type == r_glob_dat && undefined {
             // The GOT slot holds the ADDRESS of the stream pointer. The name is
             // minted here, so it is only usable while the image does not
@@ -183,7 +182,7 @@ pub(super) fn stream_data_symbols(
             if taken.contains(&minted) {
                 continue;
             }
-            let Ok(pp) = types.get_type_pointer(ptr, Rc::clone(&stream_ptr), word_size) else {
+            let Ok(pp) = types.get_type_pointer(ptr, stream_ptr.clone(), word_size) else {
                 continue;
             };
             (minted, pp)

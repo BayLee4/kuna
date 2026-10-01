@@ -83,7 +83,7 @@ fn caller_body(option_on: bool) -> Option<String> {
         entry,
         declared,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the caller decompiles");
     Some(kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd))
@@ -129,7 +129,7 @@ fn a_name_the_tables_do_not_know_parks_nothing() {
         entry,
         0,
         &DecompileSeed::plain(&[], &[]),
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     let fd = step.result.expect("the caller decompiles");
     let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);

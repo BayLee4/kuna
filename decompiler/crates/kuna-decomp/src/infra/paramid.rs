@@ -27,15 +27,13 @@
 //! REQUIRED by `ParamMeasure.decode`, so `moredetail` should stay `true` on
 //! the wire path, matching both upstream ghidra_process call sites).
 
-use std::rc::Rc;
-
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
 use kuna_base::marshal::ElementId;
 use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
 
-use crate::dtype::Datatype;
+use crate::dtype::TypeRoot;
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::varnode::varnode_flags;
@@ -123,7 +121,7 @@ pub struct ParamMeasure {
     /// Storage location (space/offset/size) (C++ `vndata`).
     vndata: VarnodeData,
     /// Data-type of the location (`None` for the C++ null) (C++ `vntype`).
-    vntype: Option<Rc<Datatype>>,
+    vntype: Option<TypeRoot>,
     /// The computed rank (C++ `rank`).
     rank: i32,
     /// Input or output (C++ `io`).
@@ -135,7 +133,7 @@ pub struct ParamMeasure {
 impl ParamMeasure {
     /// Construct a measure for a given storage location (C++
     /// `ParamMeasure::ParamMeasure`, paramid.hh:62-63).
-    pub fn new(addr: &Address, sz: i32, dt: Option<Rc<Datatype>>, io_in: ParamIDIO) -> ParamMeasure {
+    pub fn new(addr: &Address, sz: i32, dt: Option<TypeRoot>, io_in: ParamIDIO) -> ParamMeasure {
         ParamMeasure {
             vndata: VarnodeData {
                 space: addr.get_space().cloned(),
@@ -575,6 +573,7 @@ impl ParamIDAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
 
     use kuna_base::space::{
         addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,

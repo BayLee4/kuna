@@ -158,17 +158,20 @@ impl ArchOptionContext for RecordingContext {
     fn set_hide_implied_exts(&mut self, val: bool) {
         self.log.push(format!("hide_exts={val}"));
     }
-    fn set_max_line_size(&mut self, val: int4) {
+    fn set_max_line_size(&mut self, val: int4) -> KunaResult<()> {
         self.log.push(format!("max_line={val}"));
+        Ok(())
     }
     fn set_indent_increment(&mut self, val: int4) {
         self.log.push(format!("indent={val}"));
     }
-    fn set_line_comment_indent(&mut self, val: int4) {
+    fn set_line_comment_indent(&mut self, val: int4) -> KunaResult<()> {
         self.log.push(format!("comment_indent={val}"));
+        Ok(())
     }
-    fn set_comment_style(&mut self, style: &str) {
+    fn set_comment_style(&mut self, style: &str) -> KunaResult<()> {
         self.log.push(format!("comment_style={style}"));
+        Ok(())
     }
     fn header_comment_flags(&self) -> uint4 {
         self.header_comment
@@ -182,8 +185,9 @@ impl ArchOptionContext for RecordingContext {
     fn set_instruction_comment_flags(&mut self, flags: uint4) {
         self.instruction_comment = flags;
     }
-    fn set_integer_format(&mut self, fmt: &str) {
+    fn set_integer_format(&mut self, fmt: &str) -> KunaResult<()> {
         self.log.push(format!("int_format={fmt}"));
+        Ok(())
     }
     fn set_namespace_strategy(&mut self, strategy: NamespaceStrategy) {
         self.log.push(format!("namespace={strategy:?}"));
@@ -201,17 +205,20 @@ impl ArchOptionContext for RecordingContext {
         self.log.push(format!("warning[{name}]={val}"));
         true
     }
-    fn clone_action_group(&mut self, from: &str, to: &str) {
+    fn clone_action_group(&mut self, from: &str, to: &str) -> KunaResult<()> {
         self.log.push(format!("clone {from}->{to}"));
+        Ok(())
     }
-    fn set_current_action(&mut self, name: &str) {
+    fn set_current_action(&mut self, name: &str) -> KunaResult<()> {
         self.current_action = name.to_string();
+        Ok(())
     }
     fn current_action_name(&self) -> String {
         self.current_action.clone()
     }
-    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) {
+    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) -> KunaResult<()> {
         self.log.push(format!("toggle[{group}.{sub}]={val}"));
+        Ok(())
     }
     fn enable_rule(&mut self, path: &str) -> bool {
         self.log.push(format!("enable {path}"));
@@ -1143,7 +1150,7 @@ fn test_decode_lenient_skips_unknown_and_applies_known() {
     // open).
     let xml = br#"<optionslist>
         <maxinstruction>77777</maxinstruction>
-        <notarealoption>x</notarealoption>
+        <notarealoption><param1><future>x</future></param1></notarealoption>
         <jumptablemax>512</jumptablemax>
     </optionslist>"#;
     let manager = AddrSpaceManager::new();
@@ -1160,6 +1167,28 @@ fn test_decode_lenient_skips_unknown_and_applies_known() {
     // Exactly one warning, phrased to pass Java's isErrorMessage "warning" test.
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].starts_with("Warning"), "{}", warnings[0]);
+}
+
+#[test]
+fn compatible_decode_rejects_known_errors_without_applying_later_entries() {
+    for invalid in [
+        "<maxinstruction>-1</maxinstruction>",
+        "<maxinstruction><future>1</future></maxinstruction>",
+        "<maxinstruction><param1>1</param1><param1>2</param1></maxinstruction>",
+        "<setlanguage>java-language</setlanguage>",
+    ] {
+        let xml = format!("<optionslist><maxinstruction>777</maxinstruction>{invalid}\
+            <jumptablemax>512</jumptablemax></optionslist>");
+        let manager = AddrSpaceManager::new();
+        let mut registry = IdRegistry::with_base_ids();
+        register_option_elements(&mut registry);
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(xml.as_bytes()).unwrap();
+        let mut context = RecordingContext::default();
+        assert!(OptionDatabase::new().decode_lenient(&mut decoder, &mut context).is_err(), "{invalid}");
+        assert_eq!(context.max_instructions, 777);
+        assert_eq!(context.max_jumptable_size, 0);
+    }
 }
 
 /// `UPSTREAM_OPTION_ELEMENTS` is what `kuna-cli` validates a `--option NAME`

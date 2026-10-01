@@ -102,10 +102,10 @@ fn absorbed_evidence_is_the_replay_of_every_access() {
     let int4 = f.get_base(4, type_metatype::TYPE_INT).unwrap();
     let uint4 = f.get_base(4, type_metatype::TYPE_UINT).unwrap();
     let mut first = Evidence::default();
-    first.record(0, 8, Some(Rc::clone(&long)));
-    first.record(8, 4, Some(Rc::clone(&int4)));
+    first.record(0, 8, Some(long.clone()));
+    first.record(8, 4, Some(int4.clone()));
     let mut second = Evidence::default();
-    second.record(8, 4, Some(Rc::clone(&uint4)));
+    second.record(8, 4, Some(uint4.clone()));
     second.record(8, 2, None);
     second.record(0x10, 1, None);
     second.phi_reached = true;
@@ -114,9 +114,9 @@ fn absorbed_evidence_is_the_replay_of_every_access() {
     merged.absorb(&first);
     merged.absorb(&second);
     let mut replay = Evidence::default();
-    replay.record(0, 8, Some(Rc::clone(&long)));
-    replay.record(8, 4, Some(Rc::clone(&int4)));
-    replay.record(8, 4, Some(Rc::clone(&uint4)));
+    replay.record(0, 8, Some(long.clone()));
+    replay.record(8, 4, Some(int4.clone()));
+    replay.record(8, 4, Some(uint4.clone()));
     replay.record(8, 2, None);
     replay.record(0x10, 1, None);
 
@@ -133,10 +133,10 @@ fn absorbed_evidence_is_the_replay_of_every_access() {
     let mut untyped_first = Evidence::default();
     untyped_first.record(0, 8, None);
     let mut typed = Evidence::default();
-    typed.record(0, 8, Some(Rc::clone(&long)));
+    typed.record(0, 8, Some(long.clone()));
     let mut replay_untyped = Evidence::default();
     replay_untyped.record(0, 8, None);
-    replay_untyped.record(0, 8, Some(Rc::clone(&long)));
+    replay_untyped.record(0, 8, Some(long.clone()));
     let mut merged_untyped = Evidence::default();
     merged_untyped.absorb(&untyped_first);
     merged_untyped.absorb(&typed);
@@ -145,60 +145,40 @@ fn absorbed_evidence_is_the_replay_of_every_access() {
 }
 
 /// grep's kwset `treenext`: a tree node's `llink` holds a node. The record is
-/// minted around its own shell, its layout spells the field as a self pointer,
+/// completed on its reserved identity, its layout spells the field as a self pointer,
 /// the same measurement is answered by it, and a reader that measured a plain
 /// pointer at that offset is a different record.
 #[test]
-fn a_record_that_points_at_itself_is_minted_around_its_shell() {
+fn a_recursive_record_exposes_completed_fields_through_its_early_pointer() {
     let f = core_factory();
     let long = f.get_base(8, type_metatype::TYPE_INT).unwrap();
     let ulong_ptr = f.get_type_pointer(8, f.get_base(8, type_metatype::TYPE_UINT).unwrap(), 1).unwrap();
     let fields = vec![
-        TypeField::new(0, 0, "field_0x0", Rc::clone(&ulong_ptr)),
-        TypeField::new(1, 8, "field_0x8", Rc::clone(&ulong_ptr)),
-        TypeField::new(2, 0x10, "field_0x10", Rc::clone(&long)),
+        TypeField::new(0, 0, "field_0x0", ulong_ptr.id()),
+        TypeField::new(1, 8, "field_0x8", ulong_ptr.id()),
+        TypeField::new(2, 0x10, "field_0x10", long.id()),
     ];
     let st = ledger::lookup_or_mint(&f, fields.clone(), 0x18, &[], &[0, 8], OFF).unwrap();
     assert!(!st.is_incomplete());
-    for i in 0..2 {
-        let pointee = st.get_field(i).unwrap().field_type.get_ptr_to().unwrap();
-        assert_eq!(pointee.get_name(), st.get_name());
-        assert!(pointee.is_incomplete(), "the self pointer names the shell");
+    {
+        let view = st.read();
+        for i in 0..2 {
+            let field_type = view.get_field(st.id(), i).unwrap().unwrap().field_type;
+            let pointee = view.get_ptr_to(field_type).unwrap().unwrap();
+            assert_eq!(pointee, st.id());
+            let member = view.get_field(pointee, 2).unwrap().unwrap();
+            assert_eq!((member.offset, member.field_type), (0x10, long.id()));
+        }
     }
     let layout = ledger::layout_of(&st).unwrap();
     assert_eq!(layout.fields[0].ty, ledger::SELF_KEY);
     assert_eq!(layout.fields[1].ty, ledger::SELF_KEY);
-    assert_eq!(layout, ledger::layout_of_fields(&fields, 0x18, &[0, 8]));
+    assert_eq!(layout, ledger::layout_of_fields(&f, &fields, 0x18, &[0, 8]));
 
     let again = ledger::lookup_or_mint(&f, fields.clone(), 0x18, &[], &[0, 8], OFF).unwrap();
-    assert!(Rc::ptr_eq(&again, &st));
+    assert_eq!(again, st);
     let plain = ledger::lookup_or_mint(&f, fields, 0x18, &[], &[], OFF).unwrap();
-    assert_ne!(plain.get_name(), st.get_name());
-}
-
-/// A value loaded through the self pointer names the shell, which has no
-/// members; the value type resolves to the completed record so the reads
-/// through it render as fields. Nothing else resolves.
-#[test]
-fn only_a_records_own_shell_resolves_to_the_record() {
-    let f = core_factory();
-    let long = f.get_base(8, type_metatype::TYPE_INT).unwrap();
-    let fields = vec![
-        TypeField::new(0, 0, "field_0x0", f.get_type_pointer(8, Rc::clone(&long), 1).unwrap()),
-        TypeField::new(1, 8, "field_0x8", Rc::clone(&long)),
-    ];
-    let st = ledger::lookup_or_mint(&f, fields, 0x10, &[], &[0], OFF).unwrap();
-    let shell_ptr = Rc::clone(&st.get_field(0).unwrap().field_type);
-    let resolved = resolve_self_pointer(&f, &shell_ptr).unwrap();
-    assert!(Rc::ptr_eq(&resolved.get_ptr_to().unwrap(), &st));
-    assert_eq!(resolved.get_size(), 8);
-
-    let complete = f.get_type_pointer(8, Rc::clone(&st), 1).unwrap();
-    assert!(resolve_self_pointer(&f, &complete).is_none(), "already the completed record");
-    let orphan = f.get_type_struct("struct_7").unwrap();
-    let orphan_ptr = f.get_type_pointer(8, orphan, 1).unwrap();
-    assert!(resolve_self_pointer(&f, &orphan_ptr).is_none(), "a shell with no completed record");
-    assert!(resolve_self_pointer(&f, &long).is_none());
+    assert_ne!(plain, st);
 }
 
 #[test]
@@ -536,20 +516,20 @@ fn accesses_that_disagree_on_sign_leave_the_field_undefined() {
 
     for (first, second) in [(&short, &undef2), (&undef2, &short), (&short, &ushort)] {
         let mut e = Evidence::default();
-        e.record(0x68, 2, Some(Rc::clone(first)));
-        e.record(0x68, 2, Some(Rc::clone(second)));
-        e.record(0x68, 2, Some(Rc::clone(&short)));
+        e.record(0x68, 2, Some(first.clone()));
+        e.record(0x68, 2, Some(second.clone()));
+        e.record(0x68, 2, Some(short.clone()));
         assert!(e.slots[&0x68].committed().is_none(), "a contested sign stays contested");
     }
 
     let mut agree = Evidence::default();
-    agree.record(8, 4, Some(Rc::clone(&int4)));
-    agree.record(8, 4, Some(Rc::clone(&int4)));
+    agree.record(8, 4, Some(int4.clone()));
+    agree.record(8, 4, Some(int4.clone()));
     assert!(agree.slots[&8].committed().is_some(), "agreeing accesses keep their type");
 
     let mut pointers = Evidence::default();
-    pointers.record(0, 8, Some(Rc::clone(&ptr)));
-    pointers.record(0, 8, Some(Rc::clone(&void_ptr)));
+    pointers.record(0, 8, Some(ptr.clone()));
+    pointers.record(0, 8, Some(void_ptr.clone()));
     assert!(pointers.slots[&0].committed().is_some(), "pointer spellings are not sign evidence");
 
     // `find`'s `sub_f620`: a pointer field also read as `long` and `unsigned long`
@@ -558,14 +538,14 @@ fn accesses_that_disagree_on_sign_leave_the_field_undefined() {
     let ulong = f.get_base(8, type_metatype::TYPE_UINT).unwrap();
     let mut ptr_first = Evidence::default();
     for t in [&ptr, &long, &ulong] {
-        ptr_first.record(8, 8, Some(Rc::clone(t)));
+        ptr_first.record(8, 8, Some(t.clone()));
     }
     assert!(ptr_first.slots[&8].committed().is_some_and(|t| t.get_metatype() == type_metatype::TYPE_PTR));
 
     let mut widened = Evidence::default();
-    widened.record(0x68, 2, Some(Rc::clone(&short)));
-    widened.record(0x68, 2, Some(Rc::clone(&undef2)));
-    widened.record(0x68, 4, Some(Rc::clone(&int4)));
+    widened.record(0x68, 2, Some(short.clone()));
+    widened.record(0x68, 2, Some(undef2.clone()));
+    widened.record(0x68, 4, Some(int4.clone()));
     assert!(widened.slots[&0x68].committed().is_some(), "a wider access starts a new contest");
 }
 
@@ -589,11 +569,11 @@ fn a_float_and_an_integer_of_one_width_make_the_field_raw_bytes() {
     for other in [&long, &undef8, &ptr] {
         for (first, second) in [(&double, other), (other, &double)] {
             let mut e = Evidence::default();
-            e.record(0, 4, Some(Rc::clone(&int4)));
-            e.record(8, 8, Some(Rc::clone(first)));
-            e.record(8, 8, Some(Rc::clone(second)));
+            e.record(0, 4, Some(int4.clone()));
+            e.record(8, 8, Some(first.clone()));
+            e.record(8, 8, Some(second.clone()));
             let slot = &e.slots[&8];
-            assert!(slot.reinterpreted() && slot.committed().is_none(), "{} beside {}", first.get_name(), second.get_name());
+            assert!(slot.reinterpreted() && slot.committed().is_none(), "{first:?} beside {second:?}");
             let (plan, size) = layout_plan(&e.slots).unwrap();
             assert_eq!(size, 0x10);
             assert!(plan.contains(&(8, 8, true)), "the union member is filler: {plan:?}");
@@ -602,15 +582,15 @@ fn a_float_and_an_integer_of_one_width_make_the_field_raw_bytes() {
 
     // A sign contest that already cleared the type does not hide a later float.
     let mut late = Evidence::default();
-    late.record(8, 8, Some(Rc::clone(&long)));
-    late.record(8, 8, Some(Rc::clone(&ulong)));
-    late.record(8, 8, Some(Rc::clone(&double)));
+    late.record(8, 8, Some(long.clone()));
+    late.record(8, 8, Some(ulong.clone()));
+    late.record(8, 8, Some(double.clone()));
     assert!(late.slots[&8].reinterpreted());
 
     let mut floats = Evidence::default();
-    floats.record(8, 8, Some(Rc::clone(&double)));
-    floats.record(8, 8, Some(Rc::clone(&double)));
-    floats.record(8, 4, Some(Rc::clone(&int4)));
+    floats.record(8, 8, Some(double.clone()));
+    floats.record(8, 8, Some(double.clone()));
+    floats.record(8, 4, Some(int4.clone()));
     assert!(!floats.slots[&8].reinterpreted(), "a narrower access is not this field's evidence");
     assert!(floats.slots[&8].committed().is_some(), "agreeing float accesses keep their type");
 }
@@ -630,11 +610,11 @@ fn unclaimed_ranges_cover_pruned_accesses_and_raw_byte_fields() {
     let long = f.get_base(8, type_metatype::TYPE_INT).unwrap();
     let uint = f.get_base(4, type_metatype::TYPE_UINT).unwrap();
     let mut e = Evidence::default();
-    e.record(0, 4, Some(Rc::clone(&uint)));
-    e.record(7, 4, Some(Rc::clone(&uint)));
-    e.record(0x10, 8, Some(Rc::clone(&double)));
-    e.record(0x10, 8, Some(Rc::clone(&long)));
-    e.record(0x18, 8, Some(Rc::clone(&long)));
+    e.record(0, 4, Some(uint.clone()));
+    e.record(7, 4, Some(uint.clone()));
+    e.record(0x10, 8, Some(double.clone()));
+    e.record(0x10, 8, Some(long.clone()));
+    e.record(0x18, 8, Some(long.clone()));
     e.prune();
     let mut got = e.unclaimed_ranges();
     got.sort();

@@ -11,6 +11,8 @@
 
 use std::rc::Rc;
 
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
+
 use kuna_base::address::{calc_mask, Address};
 use kuna_base::error::KunaResult;
 use kuna_base::space::{
@@ -21,7 +23,7 @@ use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
 use super::*;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
@@ -52,7 +54,12 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -62,8 +69,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -95,7 +103,7 @@ fn make_op_n(fd: &mut Funcdata, off: u64, opc: OpCode, ninputs: int4, flags: u32
 /// Inputs are not `isFree()` and carry a full NZ mask, matching the typical
 /// operand the rules see in a heritaged function.
 fn make_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(fd, size)));
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -112,7 +120,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
     let defop = fd.obank_mut().create_at(2, pc);
     fd.obank_mut().mark_alive(defop);
     fd.obank_mut().change_opcode(defop, TypeOp::new(defopc, 0, format!("{defopc:?}")));
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(fd, size)));
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -123,7 +131,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
 /// Attach an output varnode to an existing op (used after creating ops with
 /// `make_op`).  Returns the new output varnode id.
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(fd, size)));
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -151,36 +159,6 @@ fn off_of(fd: &Funcdata, vn: VarnodeId) -> u64 {
 }
 fn is_const(fd: &Funcdata, vn: VarnodeId) -> bool {
     fd.vbank().get(vn).unwrap().is_constant()
-}
-
-/// The `"analysis"` grouplist all these rules clone into.
-fn group() -> ActionGroupList {
-    ActionGroupList::from_names(["analysis"])
-}
-
-// -----------------------------------------------------------------------------
-// clone_rule / specs() registration
-// -----------------------------------------------------------------------------
-
-#[test]
-fn specs_lists_25_rules_in_cpp_order() {
-    let s = specs();
-    assert_eq!(s.len(), 25);
-    // First and last by their cloned rule's apply behavior is hard to assert
-    // here, but every spec must clone into the analysis grouplist.
-    let gl = group();
-    for spec in &s {
-        let r = (spec.ctor)();
-        assert!(r.clone_rule(&gl).is_some(), "every spec clones into its group");
-    }
-}
-
-#[test]
-fn clone_rule_filters_on_group() {
-    let r = RuleOrMask::new("analysis");
-    assert!(r.clone_rule(&group()).is_some());
-    let empty = ActionGroupList::new();
-    assert!(r.clone_rule(&empty).is_none());
 }
 
 // -----------------------------------------------------------------------------
@@ -361,8 +339,28 @@ fn ormask_full_mask_completes_copy_of_duplicated_constant() {
     wire_input(&mut fd, op, w, 0);
     wire_input(&mut fd, op, full, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
-    let mut r = RuleOrMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1, "transform completes since the constant-dup guard");
+    // Dynamic registration, not the concrete constructor group, owns filtering.
+    let mut pool = ActionPool::new(0, "masks");
+    pool.add_rule(
+        RuleState::new("selected", 0, "ormask"),
+        Box::new(RuleOrMask::new("analysis")),
+    );
+    for groups in [
+        ActionGroupList::new(),
+        ActionGroupList::from_names(["analysis"]),
+        ActionGroupList::from_names(["ormask"]),
+    ] {
+        if let Some(mut excluded) = pool.clone_filtered(&groups) {
+            assert_eq!(excluded.apply(&mut fd, &mut ActionContext::new()), 0);
+        }
+        assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_OR);
+        assert_eq!(in_of(&fd, op, 0), Some(w));
+        assert_eq!(in_of(&fd, op, 1), Some(full));
+    }
+    let mut selected = pool
+        .clone_filtered(&ActionGroupList::from_names(["selected"]))
+        .expect("registered group survives");
+    assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
     // op is now a single-input COPY of a constant equal to the full mask.
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1, "the slot-1 constant input was removed");

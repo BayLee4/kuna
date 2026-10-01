@@ -32,9 +32,7 @@
 //! Gated by [`Architecture::ptrdepthcap`](crate::architecture::Architecture)
 //! (option `ptrdepthcap on|off`); inert when off.
 
-use std::rc::Rc;
-
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeFactory, TypeRoot};
 
 /// Deepest pointer nesting the propagation may adopt over a concrete base type.
 /// Upstream `getTypePointerNoDepth` enforces the same value implicitly: it
@@ -47,7 +45,7 @@ pub const MAX_INFERRED_PTR_DEPTH: u32 = 2;
 /// Returns `None` when `dt` is acceptable as-is (the overwhelmingly common
 /// case): anything that is not a pointer, and any pointer nested no deeper than
 /// [`MAX_INFERRED_PTR_DEPTH`] over a concrete base.
-pub fn cap_pointer_depth(tlst: &dyn TypeFactory, dt: &Rc<Datatype>) -> Option<Rc<Datatype>> {
+pub fn cap_pointer_depth(tlst: &dyn TypeFactory, dt: &TypeRoot) -> Option<TypeRoot> {
     if dt.get_metatype() != type_metatype::TYPE_PTR {
         return None;
     }
@@ -73,9 +71,9 @@ pub fn cap_pointer_depth(tlst: &dyn TypeFactory, dt: &Rc<Datatype>) -> Option<Rc
 }
 
 /// Pointer nesting depth of `dt`, saturating at `limit` (test/diagnostic helper).
-pub fn pointer_depth(dt: &Rc<Datatype>, limit: u32) -> u32 {
+pub fn pointer_depth(dt: &TypeRoot, limit: u32) -> u32 {
     let mut depth = 0;
-    let mut cur = Rc::clone(dt);
+    let mut cur = dt.clone();
     while depth < limit && cur.get_metatype() == type_metatype::TYPE_PTR {
         match cur.get_ptr_to() {
             Some(next) => {

@@ -67,11 +67,9 @@
 //! while its fields are being built. The interned shell is registered BEFORE the
 //! members are walked, so the inner resolution finds it by name and the pointer
 //! is built against it; [`TypeWalk::begin_aggregate`] additionally refuses the
-//! re-entrant *population* so the recursion cannot restart. Documented LOSS: the
-//! `Rc<Datatype>` the inner pointer captured is the pre-completion shell (kuna's
-//! interned types are immutable, so completing one mints a new `Rc` — the same
-//! model the wire `decode_composite` path lives with), so `n->next->val` chains
-//! one level less than `n->val`. The name still renders.
+//! re-entrant *population* so the recursion cannot restart. Completing the
+//! reserved graph node preserves the identity captured by recursive pointers;
+//! every retained root observes the completed layout.
 //!
 //! ## Out of scope for THIS module
 //!
@@ -85,10 +83,9 @@
 //! [`aggregate_alignment`]) are shared with it rather than restated.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeBitField, TypeField, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeRoot, TypeBitField, TypeField, TypeFactory};
 
 use super::kuna_typedepth::TypeWalk;
 use super::DieSnap;
@@ -126,7 +123,7 @@ pub(super) fn intern_aggregate(
     word_size: uint4,
     cpp: bool,
     union: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let want = if union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
     let size = aggregate_size(die);
     let base = qualified_name(die, dies, alias, fallback, size);
@@ -136,24 +133,11 @@ pub(super) fn intern_aggregate(
     // an earlier compilation unit or the shell an enclosing frame just interned
     // for a self-reference. Either way it is the answer; only an INCOMPLETE one
     // that nothing is currently populating may still be filled in below.
-    let existing = match types.find_by_name(&name) {
-        Ok(Some(t)) if t.get_metatype() == want => Some(t),
-        Ok(_) => None,
-        Err(_) => return None,
-    };
-    if let Some(t) = &existing {
-        if !t.is_incomplete() {
-            return Some(Rc::clone(t));
-        }
+    let shell = if union { types.get_type_union(&name) } else { types.get_type_struct(&name) }
+        .ok()?;
+    if !shell.is_incomplete() {
+        return Some(shell);
     }
-
-    let shell = match existing {
-        Some(t) => t,
-        None => {
-            let built = if union { types.get_type_union(&name) } else { types.get_type_struct(&name) };
-            built.ok().filter(|t| t.get_metatype() == want)?
-        }
-    };
 
     // Nothing to install: a forward declaration, or an aggregate the producer
     // gave no width. Leave the named opaque (the pre-`dwarfstructs` mapping).
@@ -166,11 +150,12 @@ pub(super) fn intern_aggregate(
         // shell it interned so the self-referential pointer still names it.
         return Some(shell);
     }
-    let members = collect_members(die, dies, types, word_size, walk, cpp, union);
+    walk.reserve_current(shell.clone());
+    let members = collect_members(die, dies, types, &shell, word_size, walk, cpp, union);
     walk.end_aggregate(&name);
 
     let (fields, bits) = members;
-    let align = aggregate_alignment(die, size, &fields, &bits);
+    let align = aggregate_alignment(&shell, die, size, &fields, &bits);
     let done = if union {
         types.set_fields_union_raw(&shell, fields, size, align)
     } else {
@@ -275,11 +260,13 @@ pub(super) fn resolve_name(
             (1, Some(s)) => format!("{base}_{s}"),
             (n, Some(s)) => format!("{base}_{s}_{n}"),
         };
-        match types.find_by_name(&name) {
-            Ok(None) => return Some(name),
-            Ok(Some(t)) => {
+        // Exact nominal lookup distinguishes a C tag from a same-spelled
+        // typedef. A name-only lookup can return the alias instead of the tag.
+        match types.find_by_source_id(&name, Datatype::hash_name(&name)).ok()? {
+            None => return Some(name),
+            Some(t) => {
                 if t.get_metatype() != want {
-                    continue; // the name belongs to something else entirely
+                    continue;
                 }
                 if t.is_incomplete() {
                     return Some(name); // an opaque shell we may complete or reuse
@@ -289,7 +276,6 @@ pub(super) fn resolve_name(
                     _ => return Some(name),
                 }
             }
-            Err(_) => return None,
         }
     }
     None
@@ -314,13 +300,14 @@ fn collect_members(
     die: &DieSnap,
     dies: &BTreeMap<usize, DieSnap>,
     types: &dyn TypeFactory,
+    owner: &TypeRoot,
     word_size: uint4,
     walk: &mut TypeWalk,
     cpp: bool,
     union: bool,
 ) -> (Vec<TypeField>, Vec<TypeBitField>) {
     let mut fields: Vec<TypeField> = Vec::new();
-    let mut raw_bits: Vec<(i64, int4, String, Rc<Datatype>)> = Vec::new();
+    let mut raw_bits: Vec<(i64, int4, String, TypeRoot)> = Vec::new();
     let big_endian = types.is_big_endian();
     for &coff in &die.children {
         let Some(m) = dies.get(&coff) else { continue };
@@ -340,14 +327,14 @@ fn collect_members(
             continue;
         }
         if union {
-            fields.push(TypeField::new(fields.len() as int4, 0, m.name.clone(), ty));
+            fields.push(TypeField::new(fields.len() as int4, 0, m.name.clone(), ty.id()));
             continue;
         }
         let off = m.data_member_location.unwrap_or(0);
         if off < 0 || off > int4::MAX as i64 {
             continue;
         }
-        fields.push(TypeField::new(off as int4, off as int4, m.name.clone(), ty));
+        fields.push(TypeField::new(off as int4, off as int4, m.name.clone(), ty.id()));
     }
     // A "bitfield" that is byte-aligned AND a whole number of natural-width bytes
     // is not one: on a little-endian target `unsigned c:16` at bit 16 of a 4-byte
@@ -357,19 +344,20 @@ fn collect_members(
     // A union has no bitfield list to install into (`TypeUnion::setFields` takes
     // fields only), so a union's true bitfields are a documented LOSS; its
     // byte-exact ones still land as ordinary members at offset 0.
-    let mut true_bits: Vec<(i64, int4, String, Rc<Datatype>)> = Vec::new();
+    let mut true_bits: Vec<(i64, int4, String, TypeRoot)> = Vec::new();
     for (abs_start, num_bits, name, ty) in raw_bits {
         match byte_exact_bitfield(abs_start, num_bits, big_endian, types, &ty) {
             Some((off, plain)) => {
                 let off = if union { 0 } else { off };
-                fields.push(TypeField::new(off, off, name, plain));
+                fields.push(TypeField::new(off, off, name, plain.id()));
             }
             None if union => {}
             None => true_bits.push((abs_start, num_bits, name, ty)),
         }
     }
     if !union {
-        fields.sort_by_key(|f| (f.offset, f.field_type.get_size()));
+        let view = owner.read();
+        fields.sort_by_key(|f| (f.offset, view.get(f.field_type).expect("member in graph").get_size()));
         fields.dedup_by_key(|f| f.offset);
     }
     let mut bits = group_bitfields(true_bits, big_endian);
@@ -431,8 +419,8 @@ fn byte_exact_bitfield(
     num_bits: int4,
     big_endian: bool,
     types: &dyn TypeFactory,
-    ty: &Rc<Datatype>,
-) -> Option<(int4, Rc<Datatype>)> {
+    ty: &TypeRoot,
+) -> Option<(int4, TypeRoot)> {
     if big_endian || abs_start % 8 != 0 || num_bits % 8 != 0 {
         return None;
     }
@@ -442,9 +430,9 @@ fn byte_exact_bitfield(
     }
     let off = int4::try_from(abs_start / 8).ok()?;
     let plain = if ty.get_size() == bytes {
-        Rc::clone(ty)
+        ty.clone()
     } else {
-        types.resize_integer(Rc::clone(ty), bytes).ok()?
+        types.resize_integer(ty.clone(), bytes).ok()?
     };
     (plain.get_size() == bytes).then_some((off, plain))
 }
@@ -461,7 +449,7 @@ fn byte_exact_bitfield(
 /// the `PTRSUB` is then not skipped, and the access renders `p.b` on a pointer --
 /// invalid C. The minimal span is what the access geometry agrees with.
 fn group_bitfields(
-    raw: Vec<(i64, int4, String, Rc<Datatype>)>,
+    raw: Vec<(i64, int4, String, TypeRoot)>,
     big_endian: bool,
 ) -> Vec<TypeBitField> {
     let mut out: Vec<TypeBitField> = Vec::new();
@@ -469,7 +457,7 @@ fn group_bitfields(
         let byte_offset = (abs_start / 8) as int4;
         let least_sig_bit = (abs_start % 8) as int4;
         let byte_size = (least_sig_bit + num_bits + 7) / 8;
-        let mut b = TypeBitField::new(byte_offset, num_bits, big_endian, name, ty);
+        let mut b = TypeBitField::new(byte_offset, num_bits, big_endian, name, ty.id());
         b.byte_offset = byte_offset;
         b.byte_size = byte_size;
         b.least_sig_bit = least_sig_bit;
@@ -483,16 +471,18 @@ fn group_bitfields(
 /// itself (`calc_align_size` would otherwise pad a recovered type past the width
 /// DWARF just gave us).
 pub(super) fn aggregate_alignment(
+    owner: &TypeRoot,
     die: &DieSnap,
     size: int4,
     fields: &[TypeField],
     bits: &[TypeBitField],
 ) -> int4 {
     let stated = die.alignment.filter(|&a| a > 0 && a <= 64).map(|a| a as int4);
+    let view = owner.read();
     let derived = fields
         .iter()
-        .map(|f| f.field_type.get_alignment())
-        .chain(bits.iter().map(|b| b.field_type.get_alignment()))
+        .map(|f| view.get(f.field_type).expect("member in graph").get_alignment())
+        .chain(bits.iter().map(|b| view.get(b.field_type).expect("bitfield in graph").get_alignment()))
         .max()
         .unwrap_or(1)
         .max(1);

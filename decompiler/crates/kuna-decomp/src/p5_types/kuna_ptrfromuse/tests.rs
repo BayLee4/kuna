@@ -24,7 +24,7 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
-fn byte_ptr(f: &TypeFactoryImpl) -> Rc<Datatype> {
+fn byte_ptr(f: &TypeFactoryImpl) -> TypeRoot {
     let to = f.get_base(1, type_metatype::TYPE_UNKNOWN).unwrap();
     f.get_type_pointer(8, to, 1).unwrap()
 }
@@ -71,10 +71,10 @@ fn candidate_does_not_clobber_a_named_struct_pointer() {
     assert!(folds_over(&file_ptr, &cand));
 }
 
-/// Two candidates of the same shape are the same `Rc`, so nothing downstream sees
+/// Two candidates of the same shape have the same graph identity, so nothing downstream sees
 /// a type change that is only identity churn.
 #[test]
 fn candidate_is_stable_across_calls() {
     let f = factory();
-    assert!(Rc::ptr_eq(&byte_ptr(&f), &byte_ptr(&f)));
+    assert_eq!(byte_ptr(&f), byte_ptr(&f));
 }

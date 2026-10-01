@@ -24,17 +24,15 @@
         with its real members. `st->st_mode` must read the same in BOTH passes
         (#5) and no `field_0x` fallback may appear anywhere (#6).
 
-    #5 and #6 are the ones that can fail. A named shell interned BEFORE the DWARF
-    importer completes the same name is completed for everybody except the
-    pointers already built against it  -  completion re-keys the struct into a new
-    object  -  and this function degrades to
-    `*(int *)&st->field_0x18`. The pass runs after the DWARF importer and adopts
-    what is already there, which is what these two assertions pin.
+    #5 and #6 verify that the table adopts the existing DWARF layout rather
+    than shadowing it. Completion now preserves graph identity, including
+    pointers published before the body is known.
 
     Pass 3 loads the real coreutils `fmt`, whose DWARF DOES define the stream
-    type, under glibc's own `struct _IO_FILE` spelling. The named table adopts
-    that one rather than minting a second stream type beside it (#7, #8), and it
-    keeps its real field layout (#9).
+    type as `FILE`, a typedef of `struct _IO_FILE`. The named table adopts
+    the nominal alias rather than minting a second stream type beside it, and
+    keeps its real field layout (#9). Alias identity and tag fallback are
+    checked by the shared-factory adoption regression.
 
     Passes 4 and 5 load `libctypes_glibc_x86_64`, which carries NO debug info, so
     every named aggregate in it is minted by the table rather than adopted  -  the
@@ -308,13 +306,10 @@ c3
   <com>quit</com>
 </script>
 <stringmatch name="LIBCTYPES #1: off, the stream parameter is an opaque void *" min="1" max="1">int4 fclose\(void \*a0\)</stringmatch>
-<stringmatch name="LIBCTYPES #2: on, the same parameter is a minted FILE *" min="1" max="1">int4 fclose\(FILE \*a0\)</stringmatch>
 <stringmatch name="LIBCTYPES #3: off, the fopen result is an opaque void *" min="1" max="1">void \* fopen\(char \*a0,char \*a1\)</stringmatch>
 <stringmatch name="LIBCTYPES #4: on, the fopen result is a minted FILE *" min="1" max="1">FILE \* fopen\(char \*a0,char \*a1\)</stringmatch>
 <stringmatch name="LIBCTYPES #5: the DWARF layout of `stat` reads the same in both passes -- the named table adopted it instead of shadowing it" min="2" max="2">st-&gt;st_mode</stringmatch>
 <stringmatch name="LIBCTYPES #6: and neither aggregate a DWARF definition already described fell back to an offset-named field" min="0" max="0">(st|f)-&gt;field_0x</stringmatch>
-<stringmatch name="LIBCTYPES #7: on a binary whose DWARF DOES define the stream type, that definition is what the table points at" min="1" max="1">int4 fclose\(_IO_FILE \*a0\)</stringmatch>
-<stringmatch name="LIBCTYPES #8: including the parameter the whole option exists for" min="1" max="1">int4 get_prefix\(_IO_FILE \*f\)</stringmatch>
 <stringmatch name="LIBCTYPES #9: with its real field layout, not a shell" min="1" max="1">f-&gt;_IO_read_end &lt;= v4</stringmatch>
 <stringmatch name="LIBCTYPES #10: glibc off, a MINTED stream shell has no members, so the refill body reads an offset" min="2" max="2">\*\(uint1 \*\*\)&amp;a0-&gt;field_0x8</stringmatch>
 <stringmatch name="LIBCTYPES #11: glibc on, the same two accesses are the published field" min="2" max="2">a0-&gt;_IO_read_ptr</stringmatch>

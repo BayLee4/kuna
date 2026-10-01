@@ -94,15 +94,17 @@ one name by eight bytes changes the output, so the test can fail.
 
 ## 5. The header, and what it cannot do
 
-A project header holds one declaration per address, each function declares the
-object at the type it uses it at, and other functions read the same
-`dat_<addr>` directly at the type they printed. A scalar declaration that
+A project header groups declarations by address space, byte address and emitted
+name. Each function declares the object at the type it uses it at, and other
+functions read the same `dat_<addr>` directly at the type they printed. A scalar declaration that
 disagrees with a direct access would silently change what that access computes
 in a recompile (seen before the rule existed: `dat_1a420 = 0x69647473;` against
 a `char dat_1a420` declared from a `strcpy` argument, truncated). So a record
 some function takes the address of wins (a scalar access of it does not
 compile), then the one type the direct accesses agree on, then the taken types;
-direct accesses at two types leave the name undeclared. Over the 45 exports:
+direct accesses at two types leave the name undeclared. A group used only through
+direct accesses still receives a declaration; taking its address is not a
+prerequisite. In the earlier 45-export measurement:
 891 declarations, 173 with another type in the comment, 60 undeclared.
 `gcc -fsyntax-only`: 36,648 -> 36,471 errors (direct reads of a now-declared
 name compile), 14,962 -> 15,348 warnings. Every new diagnostic on a line the
@@ -110,3 +112,31 @@ option changed is an incompatible-pointer warning where the one declaration
 cannot match that function's use, or (56) an undeclared name for one of the 60;
 every new one on an unchanged line is a former "undeclared" error the compiler
 now reports as a type error. None is a silent change.
+
+Authenticated named globals use the same declaration inventory, independently
+of the optional constant-address rewrite. When the renderer resolves a named
+global, it checks the retained whole-symbol type and emitted namespace spelling
+against the global symbol query, then records the symbol's base address rather
+than declaring the type of one member access. Thus `state.delta` and `&state`
+both declare the whole `State state`, and disabling `globalref` does not remove
+that declaration. Code symbols, spacebase pseudo-types and addresses outside
+the selected data space are not admitted as data objects.
+
+Project headers and native callable support share the declaration renderer.
+Serial, streaming and pooled exports carry the same `GlobalInfo` records;
+pooled records retain the explicit address-space index in `KUNAJOBRES09`.
+These are `extern` declarations, not definitions, image initializers or a promise
+that a reconstructed object has been placed at its original address. A consumer
+must provide the corresponding real storage.
+
+The named-aggregate check uses a genuine DWARF-bearing image with a 16-byte
+`State` object, a function reading its members and a function returning its
+address. Before the fix, both functions exported without `extern State state`
+with `globalref` either on or off. Afterward all four cases emitted the
+declaration, and their unchanged generated C compiled and ran at both `-O0` and
+`-O2`, with consumer assertions for the original object size and every member's
+offset and size. The consumer supplied the fixture's storage only after the
+emitted declaration was present. The reports are retained under
+`decompiler/target/round6-physical-inputs/ProtoFacts/named-global-dwarf-before-f022/`
+and `named-global-c048/`; this check does not by itself establish execution
+coverage for the pooled or streaming surfaces.

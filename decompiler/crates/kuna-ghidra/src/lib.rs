@@ -45,6 +45,7 @@
 //! the targeted Ghidra release, and the deliberate divergences (setOptions
 //! tolerance, malformed-archid handling).
 
+mod callable_support;
 pub mod client;
 pub mod ids;
 pub mod process;

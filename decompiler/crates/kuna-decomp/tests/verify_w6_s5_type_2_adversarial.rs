@@ -18,29 +18,32 @@
 //!
 //! C++ oracle: `decompiler/cpp/type.cc` (the cited line ranges) and
 //! `decompiler/cpp/address.cc` (`coveringmask`, `calc_mask`).
+//!
+//! All participating types belong to the test's shared factory graph. Layout
+//! assignment is exercised through factory publication and inspected by guards.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_decomp::dtype::{
     flags, type_metatype, Datatype, DatatypeKind, TypeBitField, TypeField,
+    TypeFactory, TypeFactoryImpl, TypeRoot,
 };
 use kuna_decomp::context::OpId;
 
-fn scalar(size: i32, align: i32, m: type_metatype) -> Rc<Datatype> {
+fn scalar(types: &TypeFactoryImpl, size: i32, align: i32, m: type_metatype) -> TypeRoot {
     let mut dt = Datatype::new_with_align(size, align, m);
     dt.align_size = Datatype::calc_align_size(size, align);
-    Rc::new(dt)
+    types.intern(dt).unwrap()
 }
 
-fn make_struct(size: i32, align: i32, fields: Vec<TypeField>) -> Datatype {
+fn make_struct(types: &TypeFactoryImpl, size: i32, align: i32, fields: Vec<TypeField>) -> TypeRoot {
     let mut s = Datatype::new_with_align(size, align, type_metatype::TYPE_STRUCT);
     s.align_size = Datatype::calc_align_size(size, align);
     s.kind = DatatypeKind::Struct { field: fields, bitfield: vec![] };
-    s
+    types.intern(s).unwrap()
 }
 
-fn make_enum(size: i32, entries: &[(u64, &str)]) -> Datatype {
+fn make_enum(types: &TypeFactoryImpl, size: i32, entries: &[(u64, &str)]) -> TypeRoot {
     let mut dt = Datatype::new_with_align(size, size, type_metatype::TYPE_INT);
     dt.flags |= flags::enumtype;
     let mut namemap: BTreeMap<u64, String> = BTreeMap::new();
@@ -48,7 +51,7 @@ fn make_enum(size: i32, entries: &[(u64, &str)]) -> Datatype {
         namemap.insert(*v, (*n).to_string());
     }
     dt.kind = DatatypeKind::Enum { namemap };
-    dt
+    types.intern(dt).unwrap()
 }
 
 // ===========================================================================
@@ -64,13 +67,15 @@ fn make_enum(size: i32, entries: &[(u64, &str)]) -> Datatype {
 ///     upper-rounding selects the right element).
 #[test]
 fn struct_binary_search_with_holes() {
-    let int_t = scalar(4, 4, type_metatype::TYPE_INT);
+    let types = TypeFactoryImpl::new();
+    let int_t = scalar(&types, 4, 4, type_metatype::TYPE_INT);
     let s = make_struct(
+        &types,
         16,
         4,
         vec![
-            TypeField::new(0, 0, "a", Rc::clone(&int_t)),
-            TypeField::new(8, 8, "c", Rc::clone(&int_t)),
+            TypeField::new(0, 0, "a", int_t.id()),
+            TypeField::new(8, 8, "c", int_t.id()),
         ],
     );
 
@@ -119,10 +124,11 @@ fn struct_binary_search_with_holes() {
 /// (max = -1, loop body never runs).
 #[test]
 fn struct_lower_bound_before_first_and_empty() {
-    let int_t = scalar(4, 4, type_metatype::TYPE_INT);
+    let types = TypeFactoryImpl::new();
+    let int_t = scalar(&types, 4, 4, type_metatype::TYPE_INT);
 
     // First field starts at offset 4 (a leading hole [0,4)).
-    let s = make_struct(8, 4, vec![TypeField::new(4, 4, "a", Rc::clone(&int_t))]);
+    let s = make_struct(&types, 8, 4, vec![TypeField::new(4, 4, "a", int_t.id())]);
     // getHoleSize(0): getLowerBoundField(0) -> -1 (only field starts at 4 > 0);
     // i becomes 0, field[0].offset(4) - 0 = 4.
     assert_eq!(s.get_hole_size(0).unwrap(), 4);
@@ -134,7 +140,7 @@ fn struct_lower_bound_before_first_and_empty() {
     assert_eq!(newoff, 1);
 
     // Empty struct: getSubType / getHoleSize on the degenerate search.
-    let empty = make_struct(8, 1, vec![]);
+    let empty = make_struct(&types, 8, 1, vec![]);
     let (sub, newoff) = empty.get_sub_type(3).unwrap();
     assert!(sub.is_none());
     assert_eq!(newoff, 3);
@@ -147,13 +153,14 @@ fn struct_lower_bound_before_first_and_empty() {
 /// `(min + max + 1)/2` mid to converge on the correct (upper) element.
 #[test]
 fn struct_lower_bound_rounding() {
-    let int1 = scalar(1, 1, type_metatype::TYPE_INT);
+    let types = TypeFactoryImpl::new();
+    let int1 = scalar(&types, 1, 1, type_metatype::TYPE_INT);
     // Fields at 0,1,2,3,4,5 (six contiguous 1-byte fields), size 6.
     let mut fields = Vec::new();
     for i in 0..6 {
-        fields.push(TypeField::new(i, i, format!("f{i}"), Rc::clone(&int1)));
+        fields.push(TypeField::new(i, i, format!("f{i}"), int1.id()));
     }
-    let s = make_struct(6, 1, fields);
+    let s = make_struct(&types, 6, 1, fields);
 
     // getSubType at each offset hits exactly the field with that offset.
     for off in 0..6i64 {
@@ -182,7 +189,8 @@ fn struct_lower_bound_rounding() {
 /// No direct match; complement likewise fails -> empty representation.
 #[test]
 fn enum_getmatches_restrict_branch() {
-    let e = make_enum(1, &[(0x05, "FIVE"), (0x02, "TWO")]);
+    let types = TypeFactoryImpl::new();
+    let e = make_enum(&types, 1, &[(0x05, "FIVE"), (0x02, "TWO")]);
     let rep = e.get_matches(0x06).unwrap();
     assert!(
         rep.match_name.is_empty(),
@@ -220,7 +228,8 @@ fn enum_getmatches_restrict_branch() {
 ///     >= bitsleft -> break -> fail.  Empty representation.
 #[test]
 fn enum_getmatches_begin_boundary() {
-    let e = make_enum(1, &[(0x10, "X")]);
+    let types = TypeFactoryImpl::new();
+    let e = make_enum(&types, 1, &[(0x10, "X")]);
     let rep = e.get_matches(0x08).unwrap();
     assert!(rep.match_name.is_empty());
     assert!(!rep.complement);
@@ -243,7 +252,8 @@ fn enum_getmatches_begin_boundary() {
 /// { 0x08:"EIGHT", 0x04:"FOUR", 0x01:"ONE" } (size 1), value 0x0d = 8|4|1.
 #[test]
 fn enum_getmatches_end_boundary() {
-    let e = make_enum(1, &[(0x08, "EIGHT"), (0x04, "FOUR"), (0x01, "ONE")]);
+    let types = TypeFactoryImpl::new();
+    let e = make_enum(&types, 1, &[(0x08, "EIGHT"), (0x04, "FOUR"), (0x01, "ONE")]);
     let rep = e.get_matches(0x0d).unwrap();
     assert_eq!(
         rep.match_name,
@@ -273,29 +283,35 @@ fn enum_getmatches_end_boundary() {
 /// assignment.
 #[test]
 fn assign_field_offsets_interleaved_bitfields_bigendian() {
-    let char_t = scalar(1, 1, type_metatype::TYPE_INT);
-    let mut list = vec![
-        TypeField::new(-1, -1, "a", Rc::clone(&char_t)),
-        TypeField::new(-1, -1, "b", Rc::clone(&char_t)),
+    let types = TypeFactoryImpl::new();
+    let char_t = scalar(&types, 1, 1, type_metatype::TYPE_INT);
+    let list = vec![
+        TypeField::new(-1, -1, "a", char_t.id()),
+        TypeField::new(-1, -1, "b", char_t.id()),
     ];
     // Both bit-fields carry ident 1 => contiguous group inserted before field 1.
-    let mut bitlist = vec![
-        TypeBitField::new(1, 3, /*big_endian=*/ true, "bf_lo", Rc::clone(&char_t)),
-        TypeBitField::new(1, 5, /*big_endian=*/ true, "bf_hi", Rc::clone(&char_t)),
+    let bitlist = vec![
+        TypeBitField::new(1, 3, /*big_endian=*/ true, "bf_lo", char_t.id()),
+        TypeBitField::new(1, 5, /*big_endian=*/ true, "bf_hi", char_t.id()),
     ];
 
-    let (new_size, new_align, fl) =
-        Datatype::assign_field_offsets(&mut list, &mut bitlist).unwrap();
+    let shell = types.get_type_struct("Interleaved").unwrap();
+    let structure = types.assign_raw_fields_struct(&shell, list, bitlist).unwrap();
+    let view = structure.read();
+    let node = view.get(structure.id()).unwrap();
+    let DatatypeKind::Struct { field: list, bitfield: bitlist } = &node.kind else {
+        panic!("expected completed structure");
+    };
 
     // Regular field offsets straddle the bit-field byte.
     assert_eq!(list[0].offset, 0, "a at 0");
     assert_eq!(list[1].offset, 2, "b after the 1-byte bitfield container");
-    assert_eq!(new_align, 1);
-    assert_eq!(new_size, 3);
-    assert_eq!(fl & flags::has_bitfields, flags::has_bitfields);
+    assert_eq!(structure.get_alignment(), 1);
+    assert_eq!(structure.get_size(), 3);
+    assert!(structure.has_bitfields());
 
     // The contiguous group totals 3+5 = 8 bits = 1 byte at offset 1.
-    for bf in &bitlist {
+    for bf in bitlist {
         assert_eq!(bf.byte_offset, 1, "bitfield container offset");
         assert_eq!(bf.byte_size, 1, "bitfield container size");
     }
@@ -312,19 +328,25 @@ fn assign_field_offsets_interleaved_bitfields_bigendian() {
 /// preserved.  Same layout, big_endian = false.
 #[test]
 fn assign_field_offsets_bitfields_littleendian_no_reversal() {
-    let char_t = scalar(1, 1, type_metatype::TYPE_INT);
-    let mut list = vec![TypeField::new(-1, -1, "a", Rc::clone(&char_t))];
-    let mut bitlist = vec![
-        TypeBitField::new(1, 3, false, "bf_lo", Rc::clone(&char_t)),
-        TypeBitField::new(1, 5, false, "bf_hi", Rc::clone(&char_t)),
+    let types = TypeFactoryImpl::new();
+    let char_t = scalar(&types, 1, 1, type_metatype::TYPE_INT);
+    let list = vec![TypeField::new(-1, -1, "a", char_t.id())];
+    let bitlist = vec![
+        TypeBitField::new(1, 3, false, "bf_lo", char_t.id()),
+        TypeBitField::new(1, 5, false, "bf_hi", char_t.id()),
     ];
-    let (new_size, _new_align, fl) =
-        Datatype::assign_field_offsets(&mut list, &mut bitlist).unwrap();
+    let shell = types.get_type_struct("Trailing").unwrap();
+    let structure = types.assign_raw_fields_struct(&shell, list, bitlist).unwrap();
+    let view = structure.read();
+    let node = view.get(structure.id()).unwrap();
+    let DatatypeKind::Struct { field: list, bitfield: bitlist } = &node.kind else {
+        panic!("expected completed structure");
+    };
 
     assert_eq!(list[0].offset, 0);
     // Bit-fields trail field a; byte container at offset 1, size 1, total 2.
-    assert_eq!(new_size, 2);
-    assert_eq!(fl & flags::has_bitfields, flags::has_bitfields);
+    assert_eq!(structure.get_size(), 2);
+    assert!(structure.has_bitfields());
     // No reversal: declaration order [lo(lsb0), hi(lsb3)] preserved.
     assert_eq!(bitlist[0].least_sig_bit, 0);
     assert_eq!(bitlist[0].num_bits, 3);

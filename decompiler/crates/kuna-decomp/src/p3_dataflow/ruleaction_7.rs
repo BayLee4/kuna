@@ -52,7 +52,7 @@ use kuna_base::address::{calc_mask, mostsigbit_set, popcount, signbit_negative};
 use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::expression::functional_equality;
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
@@ -194,12 +194,8 @@ impl Rule for RuleSignDiv2 {
         vec![OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignDiv2))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignDiv2)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -312,12 +308,8 @@ impl Rule for RuleDivChain {
         vec![OpCode::CPUI_INT_DIV, OpCode::CPUI_INT_SDIV]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleDivChain))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDivChain)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -410,12 +402,8 @@ impl Rule for RuleSignForm {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignForm))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignForm)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -475,12 +463,8 @@ impl Rule for RuleSignForm2 {
         vec![OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignForm2))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignForm2)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -596,12 +580,8 @@ impl Rule for RuleSignNearMult {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignNearMult))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignNearMult)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -735,12 +715,8 @@ impl Rule for RuleModOpt {
         vec![OpCode::CPUI_INT_DIV, OpCode::CPUI_INT_SDIV]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleModOpt))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleModOpt)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -860,12 +836,8 @@ impl Rule for RuleSignMod2nOpt {
         vec![OpCode::CPUI_INT_RIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignMod2nOpt))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignMod2nOpt)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1059,12 +1031,8 @@ impl Rule for RuleSignMod2Opt {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignMod2Opt))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignMod2Opt)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1353,12 +1321,8 @@ impl Rule for RuleSignMod2nOpt2 {
         vec![OpCode::CPUI_INT_MULT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleSignMod2nOpt2))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSignMod2nOpt2)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1464,12 +1428,8 @@ impl Rule for RuleSegment {
         vec![OpCode::CPUI_SEGMENTOP]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("segment") {
-            Some(Box::new(RuleSegment))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSegment)
     }
 
     fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> int4 {
@@ -1591,12 +1551,8 @@ impl Rule for RulePtrFlow {
         ]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("subvar") {
-            Some(Box::new(RulePtrFlow { has_truncations: self.has_truncations }))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePtrFlow { has_truncations: self.has_truncations })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1693,12 +1649,8 @@ impl Rule for RuleNegateNegate {
         vec![OpCode::CPUI_INT_NEGATE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("analysis") {
-            Some(Box::new(RuleNegateNegate))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleNegateNegate)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1866,12 +1818,8 @@ impl Rule for RuleConditionalMove {
         vec![OpCode::CPUI_MULTIEQUAL]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("conditionalexe") {
-            Some(Box::new(RuleConditionalMove))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConditionalMove)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2105,12 +2053,8 @@ impl Rule for RuleFloatCast {
         vec![OpCode::CPUI_FLOAT_FLOAT2FLOAT, OpCode::CPUI_FLOAT_TRUNC]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("floatprecision") {
-            Some(Box::new(RuleFloatCast))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleFloatCast)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2341,12 +2285,8 @@ impl Rule for RuleIgnoreNan {
         vec![OpCode::CPUI_FLOAT_NAN]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if grouplist.contains("floatprecision") {
-            Some(Box::new(RuleIgnoreNan))
-        } else {
-            None
-        }
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleIgnoreNan)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2449,21 +2389,21 @@ fn block_get_false_out(data: &Funcdata, bl: BlockId) -> BlockId {
 /// `RuleSegment` is `"segment"`.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignDiv2::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleDivChain::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignForm::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignForm2::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignNearMult::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleModOpt::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignMod2nOpt::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignMod2Opt::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSignMod2nOpt2::new()) },
-        RuleSpec { group: "segment", ctor: || Box::new(RuleSegment::new()) },
-        RuleSpec { group: "subvar", ctor: || Box::new(RulePtrFlow::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleNegateNegate::new()) },
-        RuleSpec { group: "conditionalexe", ctor: || Box::new(RuleConditionalMove::new()) },
-        RuleSpec { group: "floatprecision", ctor: || Box::new(RuleFloatCast::new()) },
-        RuleSpec { group: "floatprecision", ctor: || Box::new(RuleIgnoreNan::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignDiv2::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleDivChain::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignForm::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignForm2::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignNearMult::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleModOpt::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignMod2nOpt::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignMod2Opt::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSignMod2nOpt2::new()) },
+        RuleSpec { group: "segment", aliases: &[], ctor: || Box::new(RuleSegment::new()) },
+        RuleSpec { group: "subvar", aliases: &[], ctor: || Box::new(RulePtrFlow::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleNegateNegate::new()) },
+        RuleSpec { group: "conditionalexe", aliases: &[], ctor: || Box::new(RuleConditionalMove::new()) },
+        RuleSpec { group: "floatprecision", aliases: &[], ctor: || Box::new(RuleFloatCast::new()) },
+        RuleSpec { group: "floatprecision", aliases: &[], ctor: || Box::new(RuleIgnoreNan::new()) },
     ]
 }
 

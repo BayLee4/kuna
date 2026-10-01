@@ -31,6 +31,109 @@ use kuna_console::assertions::{self, Body, Directive, Outcome};
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram, EntrySelector};
 use kuna_console::project::decompile_targets;
 
+#[test]
+fn parsed_callee_cleanup_is_committed_for_own_entries_only_when_enabled() {
+    use std::rc::Rc;
+    use kuna_base::address::Address;
+    use kuna_base::xml::DocumentStorage;
+    use kuna_console::engine::bootstrap_program;
+    use kuna_console::grammar::{parse_c, DataOrg};
+    use kuna_decomp::fspec::EXTRAPOP_UNKNOWN;
+
+    let mut documents = DocumentStorage::new();
+    let image = documents.parse_document(r#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#.as_bytes())
+        .unwrap().get_root().clone();
+    let specs = vec![repo_root().join("specs").to_str().unwrap().to_owned()];
+    let mut program = bootstrap_program(image, "x86:LE:32:default:windows", &specs)
+        .expect("bootstrap x86 Windows compiler models");
+    for enabled in [true, false] {
+        program.arch_mut().set_kuna_option("calleeprotostack", if enabled { "on" } else { "off" }).unwrap();
+        let arch = program.arch();
+        let (addr_size, word_size) = arch.data_org();
+        let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+        for (declaration, model, cleanup, first_stack) in [
+            ("extern int __stdcall pop_std(int value);", "__stdcall", 8, true),
+            ("extern int __fastcall pop_fast(int value);", "__fastcall", 4, false),
+            ("extern int __fastcall pop_fast_stack(int a, int b, int c);", "__fastcall", 8, false),
+            ("extern int __cdecl pop_cdecl(int a, int b, int c);", "__cdecl", 4, true),
+        ] {
+            let mut parsed = None;
+            parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
+                parsed = Some((pieces, name.to_owned()));
+                Ok(())
+            }).unwrap();
+            let (pieces, selected) = parsed.expect("parsed function declaration");
+            assert_eq!(selected, model);
+            let model = arch.get_model(&selected).unwrap().clone();
+            let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
+            let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
+            fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
+            let proto = fd.get_func_proto();
+            assert!(Rc::ptr_eq(proto.model(), &model));
+            assert_eq!(proto.get_extra_pop(), if enabled || selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN });
+            let first = proto.get_param(0).unwrap().get_address();
+            assert_eq!(first.get_space().unwrap().get_name() == "stack", first_stack);
+        }
+    }
+}
+
+#[test]
+fn parsed_indirect_result_keeps_logical_origins_without_inventing_input_only_results() {
+    use kuna_base::address::Address;
+    use kuna_base::xml::DocumentStorage;
+    use kuna_console::engine::bootstrap_program;
+    use kuna_console::grammar::{parse_c, DataOrg};
+    use kuna_decomp::fspec::AbiInputOrigin;
+
+    let mut documents = DocumentStorage::new();
+    let image = documents.parse_document(r#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#.as_bytes())
+        .unwrap().get_root().clone();
+    let specs = vec![repo_root().join("specs").to_str().unwrap().to_owned()];
+    let program = bootstrap_program(image, "x86:LE:32:default:windows", &specs)
+        .expect("bootstrap x86 Windows compiler models");
+    let arch = program.arch();
+    let (addr_size, word_size) = arch.data_org();
+    let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+    parse_c("typedef struct SourceBig { unsigned long long a; unsigned long long b; unsigned long long c; } SourceBig;",
+        arch.types(), DataOrg { addr_size, word_size }, &models, |_, _| unreachable!()).unwrap();
+    for declaration in [
+        "extern SourceBig __cdecl source_big(int tag);",
+        "extern SourceBig __cdecl source_big_var(int tag, ...);",
+    ] {
+        let mut parsed = None;
+        parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
+            parsed = Some((pieces, name.to_owned()));
+            Ok(())
+        }).unwrap();
+        let (pieces, selected) = parsed.expect("parsed aggregate-result declaration");
+        let model = arch.get_model(&selected).unwrap().clone();
+        let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
+        let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
+        fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
+        {
+            let proto = fd.get_func_proto();
+            let code = proto.logical_callable().expect("original aggregate-result declaration");
+            let view = code.read();
+            let logical = view.get_code_prototype(code.id()).unwrap().unwrap();
+            assert_eq!(logical.output, pieces.outtype.as_ref().unwrap().id());
+            assert_eq!(logical.inputs, vec![pieces.intypes[0].id()]);
+            assert_eq!(logical.logical_first, (pieces.first_var_arg_slot >= 0).then_some(1));
+            assert_eq!(logical.variadic, pieces.first_var_arg_slot >= 0);
+            assert_eq!(proto.callable_input_origins(), &[AbiInputOrigin::HiddenResult, AbiInputOrigin::Declared(0)]);
+            assert!(proto.get_param(0).unwrap().is_hidden_return());
+            assert_eq!(proto.get_abi_first_vararg(), (pieces.first_var_arg_slot >= 0).then_some(2));
+        }
+        let mut input_only = pieces.clone();
+        input_only.outtype = None;
+        fd.apply_locked_prototype_with_model(&input_only, Some(model)).unwrap();
+        let proto = fd.get_func_proto();
+        assert!(proto.is_input_locked());
+        assert!(!proto.is_output_locked());
+        assert!(proto.logical_callable().is_none());
+        assert!(proto.callable_input_origins().is_empty());
+    }
+}
+
 const TARGET: &str = "authenticate";
 
 fn repo_root() -> PathBuf {
@@ -464,7 +567,7 @@ fn output_only_prototype_pieces_do_not_abort_the_drive() {
             flow_overrides: &[],
             mapped_params: &[],
         },
-        &[],
+        &kuna_decomp::overrides::Override::new(),
     );
     assert!(step.result.is_ok(), "an output-only prototype aborted the drive");
 }

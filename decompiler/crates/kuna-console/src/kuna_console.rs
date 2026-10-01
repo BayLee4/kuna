@@ -770,34 +770,12 @@ impl IfaceCommandAction for IfcKunaAssert {
                 "Symbol::setIsolated (IfaceDecompData::readSymbol) for kassert merge-aggressiveness",
             )),
             Dispatch::Rename => {
-                // C++ kassert naming-policy -> Scope::renameSymbol + namelock,
-                // exactly like IfcRename (ifacedecomp.rs IfcRename::execute).
-                use kuna_decomp::varnode::varnode_flags;
                 if tokens.len() < 2 {
                     return Err(IfaceError::parse(
                         "naming-policy assertion needs <oldname> <newname>",
                     ));
                 }
-                let oldname = tokens[0].clone();
-                let newname = tokens[1].clone();
-                let dcp = dcp_mut(status)?;
-                let sym_list = dcp.read_symbol(&oldname)?;
-                if sym_list.is_empty() {
-                    return Err(IfaceError::execution(format!("No symbol named: {oldname}")));
-                }
-                if sym_list.len() > 1 {
-                    return Err(IfaceError::execution(format!(
-                        "More than one symbol named: {oldname}"
-                    )));
-                }
-                let sym = sym_list[0];
-                let fd = dcp.fd.as_mut().expect("read_symbol succeeded => fd present");
-                let lm = fd
-                    .get_scope_local_mut()
-                    .ok_or_else(|| IfaceError::execution("Function has no local scope"))?;
-                lm.rename_symbol(sym, &newname)
-                    .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-                lm.set_attribute(sym, varnode_flags::namelock | varnode_flags::typelock);
+                crate::ifacedecomp::rename_symbol(status, &tokens[0], &tokens[1])?;
                 status.out(&applied_line);
                 self.assert_log.borrow_mut().push(record);
                 Ok(())

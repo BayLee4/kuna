@@ -21,7 +21,7 @@ use kuna_base::space::{
 use kuna_base::types::{int4, uintb};
 
 use crate::action::ActionContext;
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::context::{ArchContext, TypeOp, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
 
@@ -49,6 +49,10 @@ fn build_manager() -> AddrSpaceManager {
 fn build_fd() -> Funcdata {
     let manage = build_manager();
     let mut arch = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    arch.types = Some(Rc::new(types));
     // These unit fixtures drive the gate purely through the `ActionPresentCompareForm`
     // `enabled` constructor arg (the original seam-style contract); clear the
     // arch-flag default (DIV-2 default-on) so the flag does not also open the gate.
@@ -63,8 +67,9 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn unk(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn no_replace(
@@ -98,7 +103,7 @@ fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_var(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)));
     set_def(fd, vn, defop)
 }
 
@@ -128,7 +133,7 @@ fn restores_unsigned_le_right() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
     wire(&mut fd, v, op, 0);
     wire(&mut fd, c, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     // Canonicalize: V <= 5  =>  V < 6, with the provenance mark set.
@@ -154,7 +159,7 @@ fn restores_signed_le_right() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_SLESSEQUAL);
     wire(&mut fd, v, op, 0);
     wire(&mut fd, c, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     assert!(fd.replace_lessequal(op).unwrap());
@@ -177,7 +182,7 @@ fn restores_unsigned_le_left() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
     wire(&mut fd, c, op, 0);
     wire(&mut fd, v, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
 
     // Canonicalize: 5 <= V  =>  4 < V.
@@ -204,7 +209,7 @@ fn gate_off_leaves_canonical_form() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
     wire(&mut fd, v, op, 0);
     wire(&mut fd, c, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     assert!(fd.replace_lessequal(op).unwrap());
 
@@ -227,7 +232,7 @@ fn unmarked_less_is_skipped() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESS);
     wire(&mut fd, v, op, 0);
     wire(&mut fd, c, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     // No set_canonical_lessequal() here.
 
@@ -249,7 +254,7 @@ fn shape_changed_declines() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESS);
     wire(&mut fd, v0, op, 0);
     wire(&mut fd, v1, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     fd.obank_mut().get_mut(op).unwrap().set_canonical_lessequal();
 
@@ -272,7 +277,7 @@ fn unsigned_underflow_guard_declines() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_LESS);
     wire(&mut fd, v, op, 0);
     wire(&mut fd, zero, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     fd.obank_mut().get_mut(op).unwrap().set_canonical_lessequal();
 
@@ -293,7 +298,7 @@ fn signed_overflow_guard_declines() {
     let op = mk_op(&mut fd, 0x108, 2, OpCode::CPUI_INT_SLESS);
     wire(&mut fd, cmax, op, 0);
     wire(&mut fd, v, op, 1);
-    let out = fd.new_unique(1, Some(unk(1)));
+    let out = fd.new_unique(1, Some(unk(&fd, 1)));
     let _ = set_def(&mut fd, out, op);
     fd.obank_mut().get_mut(op).unwrap().set_canonical_lessequal();
 
@@ -349,7 +354,7 @@ fn parsed_form_drives_gate() {
         let op = mk_op(fd, 0x108, 2, OpCode::CPUI_INT_LESSEQUAL);
         wire(fd, v, op, 0);
         wire(fd, c, op, 1);
-        let out = fd.new_unique(1, Some(unk(1)));
+        let out = fd.new_unique(1, Some(unk(fd, 1)));
         let _ = set_def(fd, out, op);
         assert!(fd.replace_lessequal(op).unwrap()); // V <= 5  =>  V < 6 (marked)
         op

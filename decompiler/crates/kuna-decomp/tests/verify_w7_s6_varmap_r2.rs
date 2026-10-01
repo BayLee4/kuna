@@ -25,7 +25,7 @@ use std::rc::Rc;
 use kuna_base::address::RangeList;
 use kuna_base::space::{addrspace_flags, spacetype, AddrSpace};
 
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::varmap::{MapState, RangeHint, RangeType};
 
 fn space_ws(ws: u32) -> Rc<AddrSpace> {
@@ -42,8 +42,8 @@ fn space_ws(ws: u32) -> Rc<AddrSpace> {
     ))
 }
 
-fn base(size: i32, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new_with_align(size, size, meta))
+fn base(types: &TypeFactoryImpl, size: i32, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new_with_align(size, size, meta)).unwrap()
 }
 
 fn factory() -> TypeFactoryImpl {
@@ -80,7 +80,7 @@ fn verify_r2_gather_symbols_sstart_multiply_ws2() {
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
     // gatherSymbols path: (start_offset, type, type_locked).
-    let syms = [(0x20u64, base(4, type_metatype::TYPE_INT), false)];
+    let syms = [(0x20u64, base(&factory, 4, type_metatype::TYPE_INT), false)];
     state.gather_symbols(&syms);
     assert!(state.initialize().unwrap());
 
@@ -112,7 +112,7 @@ fn verify_r2_initialize_endpoint_sstart_multiply_ws2() {
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
     // One ordinary hint well below the endpoint so the endpoint sorts last.
-    state.gather_symbols(&[(0x10u64, base(2, type_metatype::TYPE_INT), false)]);
+    state.gather_symbols(&[(0x10u64, base(&factory, 2, type_metatype::TYPE_INT), false)]);
     assert!(state.initialize().unwrap());
 
     // Walk to the final (endpoint) hint.
@@ -153,8 +153,8 @@ fn verify_r2_initialize_sorts_on_multiplied_keys_ws2() {
     let mut state = MapState::new(Rc::clone(&space), &rn, &pm, dflt);
 
     state.gather_symbols(&[
-        (0x40u64, base(2, type_metatype::TYPE_INT), false),
-        (0x10u64, base(2, type_metatype::TYPE_INT), false),
+        (0x40u64, base(&factory, 2, type_metatype::TYPE_INT), false),
+        (0x10u64, base(&factory, 2, type_metatype::TYPE_INT), false),
     ]);
     assert!(state.initialize().unwrap());
 
@@ -202,14 +202,14 @@ fn verify_r2_merge_confuse_diff_plus_size_wraps_like_cpp() {
     let space = space_ws(1);
     let factory = factory();
 
-    let mut a = RangeHint::new(0, 4, 0, base(4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
+    let mut a = RangeHint::new(0, 4, 0, base(&factory, 4, type_metatype::TYPE_INT), 0, RangeType::Fixed, -1);
     // sstart chosen so (int4)b.sstart == i32::MAX - 1; size 4 pushes the add over.
     let b_sstart: i64 = 0x7FFF_FFFE;
     let b = RangeHint::new(
         b_sstart as u64,
         4,
         b_sstart,
-        base(4, type_metatype::TYPE_UINT),
+        base(&factory, 4, type_metatype::TYPE_UINT),
         0,
         RangeType::Fixed,
         -1,

@@ -74,6 +74,10 @@
 //! `uint4->u32`; arithmetic that the C++ relies on wrapping uses [`Wrap`].
 
 use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use kuna_base::address::{Address, RangeList};
 use kuna_base::error::{KunaError, KunaResult};
@@ -82,7 +86,376 @@ use kuna_base::types::{int4, uint4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
 
-use crate::dtype::{metatype2typeclass, type_class, type_metatype, Datatype, TypeFactory};
+use crate::dtype::{metatype2typeclass, type_class, type_metatype, TypeFactory, TypeId, TypeRoot};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelContextId(u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelBindingId(u64);
+static NEXT_MODEL_CONTEXT: AtomicU64 = AtomicU64::new(1);
+static NEXT_MODEL_BINDING: AtomicU64 = AtomicU64::new(1);
+
+/// Immutable ABI authority retained by a declaration, without datatype roots or
+/// an Architecture backpointer. Managers/models do not own datatype generations.
+#[derive(Clone, Debug)]
+pub struct ModelBinding {
+    context: ModelContextId,
+    identity: ModelBindingId,
+    model: Rc<ProtoModel>,
+    manager: Rc<AddrSpaceManager>,
+}
+impl ModelBinding {
+    pub fn context_id(&self) -> ModelContextId { self.context }
+    pub fn id(&self) -> ModelBindingId { self.identity }
+    pub fn model(&self) -> &Rc<ProtoModel> { &self.model }
+    pub fn manager(&self) -> &Rc<AddrSpaceManager> { &self.manager }
+}
+impl PartialEq for ModelBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context && self.identity == other.identity
+    }
+}
+impl Eq for ModelBinding {}
+impl PartialOrd for ModelBinding {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for ModelBinding {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.context, self.identity).cmp(&(other.context, other.identity))
+    }
+}
+impl Hash for ModelBinding {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.context.hash(state);
+        self.identity.hash(state);
+    }
+}
+
+/// Shared live model selection for future declarations. Existing bindings never
+/// consult this registry again, including declarations waiting on object layout.
+pub struct ModelContext {
+    id: ModelContextId,
+    manager: Rc<AddrSpaceManager>,
+    default: RefCell<Option<Rc<ProtoModel>>>,
+    models: RefCell<BTreeMap<String, Rc<ProtoModel>>>,
+    bindings: RefCell<Vec<ModelBinding>>,
+}
+impl ModelContext {
+    pub fn new(manager: Rc<AddrSpaceManager>) -> Rc<Self> {
+        Rc::new(Self {
+            id: ModelContextId(NEXT_MODEL_CONTEXT.fetch_add(1, Ordering::Relaxed)),
+            manager, default: RefCell::new(None), models: RefCell::new(BTreeMap::new()),
+            bindings: RefCell::new(Vec::new()),
+        })
+    }
+    pub fn id(&self) -> ModelContextId { self.id }
+    pub fn manager(&self) -> &Rc<AddrSpaceManager> { &self.manager }
+    pub fn register_model(&self, model: Rc<ProtoModel>) {
+        self.models.borrow_mut().insert(model.get_name().to_owned(), model);
+    }
+    pub fn set_default(&self, model: Option<Rc<ProtoModel>>) {
+        if let Some(model) = &model { self.register_model(model.clone()); }
+        *self.default.borrow_mut() = model;
+    }
+    pub fn bind(&self, name: Option<&str>) -> KunaResult<ModelBinding> {
+        let model = if let Some(name) = name.filter(|name| !name.is_empty() && *name != "default") {
+            let registered = { self.models.borrow().get(name).cloned() };
+            if let Some(model) = registered { model }
+            else {
+                let default = self.default.borrow().clone().ok_or_else(||
+                    KunaError::lowlevel("No default prototype model"))?;
+                let model = Rc::new(ProtoModel::new_unknown(name, &default));
+                self.register_model(model.clone());
+                model
+            }
+        } else {
+            self.default.borrow().clone().ok_or_else(||
+                KunaError::lowlevel("No default prototype model"))?
+        };
+        self.bind_model(model)
+    }
+    pub fn bind_model(&self, model: Rc<ProtoModel>) -> KunaResult<ModelBinding> {
+        // A model's parameter/effect spaces must belong to this actual manager,
+        // not merely have the same architecture or register names.
+        for list in model.input.iter().chain(model.output.iter()) {
+            for entry in &list.entry {
+                let space = entry.get_space();
+                let owned = self.manager.get_space_by_name(space.get_name()).is_some_and(|own| Rc::ptr_eq(own, space));
+                if !owned { return Err(KunaError::lowlevel("Prototype model context mismatch")); }
+            }
+        }
+        let mut bindings = self.bindings.borrow_mut();
+        if let Some(binding) = bindings.iter().find(|binding| Rc::ptr_eq(&binding.model, &model)) {
+            return Ok(binding.clone());
+        }
+        let binding = ModelBinding {
+            context: self.id,
+            identity: ModelBindingId(NEXT_MODEL_BINDING.fetch_add(1, Ordering::Relaxed)),
+            model, manager: self.manager.clone(),
+        };
+        bindings.push(binding.clone());
+        Ok(binding)
+    }
+}
+
+/// Semantic signature owned inside the datatype graph. Every datatype edge is
+/// an ID; effective ABI storage and exact entry/site facts are separate values.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LogicalCallable {
+    pub binding: ModelBinding,
+    pub output: TypeId,
+    pub inputs: Vec<TypeId>,
+    pub variadic: bool,
+    pub input_closed: bool,
+    pub logical_first: Option<int4>,
+    pub flags: uint4,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbiInputOrigin {
+    Declared(usize),
+    HiddenResult,
+}
+
+/// Coordinate of a supplied ABI boundary, established by its producer.
+/// Ordinary declarations index their input list. Ghidra callsite overrides
+/// report a target parameter index that includes generated hidden storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstVarArgCoordinate {
+    Declared,
+    Effective,
+}
+
+pub(crate) fn callable_input_origins(
+    assigned: &[ParameterPieces], declared_count: usize,
+) -> KunaResult<Vec<AbiInputOrigin>> {
+    let mut declared = 0;
+    let mut origins = Vec::with_capacity(assigned.len().saturating_sub(1));
+    for piece in assigned.iter().skip(1) {
+        if piece.flags & parameter_pieces_flags::HIDDENRETPARM != 0 {
+            origins.push(AbiInputOrigin::HiddenResult);
+        } else {
+            if declared == declared_count {
+                return Err(KunaError::lowlevel("Callable model emitted an unmapped declared input"));
+            }
+            origins.push(AbiInputOrigin::Declared(declared));
+            declared += 1;
+        }
+    }
+    if declared != declared_count {
+        return Err(KunaError::lowlevel("Callable model omitted a declared input"));
+    }
+    Ok(origins)
+}
+
+pub(crate) fn physical_vararg_boundary(
+    origins: &[AbiInputOrigin], first: Option<int4>,
+) -> Option<int4> {
+    first.map(|first| origins.iter().position(|origin|
+        matches!(origin, AbiInputOrigin::Declared(index) if *index >= first as usize))
+        .unwrap_or(origins.len()) as int4)
+}
+/// Factory-owned cache value, never stored in a generation. The prototype's
+/// external datatype roots keep the retired graph coherent across a flush.
+pub struct AbiView {
+    pub logical: LogicalCallable,
+    proto: Rc<FuncProto>,
+}
+impl AbiView {
+    pub fn root(&self) -> &TypeRoot { self.proto.logical_callable().expect("ABI view retains its declaration") }
+    pub fn prototype(&self) -> &Rc<FuncProto> { &self.proto }
+    pub fn input_origins(&self) -> &[AbiInputOrigin] { self.proto.callable_input_origins() }
+}
+
+/// Ordinary callable lookup. Exact supplied/committed callsite facts never use
+/// this cache; their assignment boundary and arity remain independent.
+pub fn materialize_callable(factory: &dyn TypeFactory, code: &TypeRoot) -> KunaResult<Option<Rc<AbiView>>> {
+    let (id, logical) = {
+        let view = code.read();
+        let id = view.resolve_alias(code.id())?;
+        let logical = view.get_code_prototype(id)?.ok_or_else(||
+            KunaError::lowlevel("Datatype has no callable declaration"))?;
+        if Some(logical.binding.context_id()) != factory.model_context_id() {
+            return Err(KunaError::lowlevel("Callable model context mismatch"));
+        }
+        if let Some(cached) = factory.get_abi_view(id) { return Ok(Some(cached)); }
+        if !view.abi_ready(id)? { return Ok(None); }
+        (id, logical.clone())
+    };
+    let root = factory.root(id)?;
+    if logical.logical_first.is_some_and(|first| first < 0 || first as usize > logical.inputs.len()) {
+        return Err(KunaError::lowlevel("Callable fixed boundary is outside its declared inputs"));
+    }
+    // No datatype read guard survives the model call. Type synthesis therefore
+    // interns real pointer/aggregate graph IDs, including hidden return storage.
+    let pieces = PrototypePieces {
+        outtype: Some(root.related(logical.output)?),
+        intypes: logical.inputs.iter().map(|&id| root.related(id)).collect::<KunaResult<_>>()?,
+        first_var_arg_slot: logical.logical_first.unwrap_or(-1),
+        ..Default::default()
+    };
+    let mut assigned = Vec::new();
+    logical.binding.model().assign_parameter_storage(&pieces, &mut assigned, false,
+        factory, logical.binding.manager())?;
+    let output = assigned.first().ok_or_else(||
+        KunaError::lowlevel("Callable model did not assign a result"))?;
+    let mut proto = FuncProto::new();
+    proto.set_internal(logical.binding.model().clone(), factory.get_type_void()?);
+    proto.set_output(output);
+    let origins = callable_input_origins(&assigned, logical.inputs.len())?;
+    for (slot, piece) in assigned.iter().skip(1).enumerate() {
+        proto.set_param(slot as int4, "", piece);
+    }
+    let physical_first = physical_vararg_boundary(&origins, logical.logical_first);
+    proto.set_dotdotdot(logical.variadic);
+    proto.set_abi_first_vararg(physical_first);
+    proto.set_input_lock(true);
+    proto.set_void_input_lock(logical.inputs.is_empty() && logical.input_closed);
+    proto.set_output_lock(true);
+    proto.set_model_lock(true);
+    proto.flags |= logical.flags & (func_proto_flags::HAS_THISPTR
+        | func_proto_flags::IS_CONSTRUCTOR | func_proto_flags::IS_DESTRUCTOR | func_proto_flags::NO_RETURN);
+    proto.update_this_pointer();
+    proto.logical_callable = Some(root);
+    proto.logical_input_origins = origins;
+    let view = Rc::new(AbiView { logical, proto: Rc::new(proto) });
+    factory.cache_abi_view(id, view.clone())?;
+    Ok(Some(view))
+}
+
+impl LogicalCallable {
+    /// Construct from producer-known declaration types. Storage commitments on
+    /// the surrounding function/site remain in its independent FuncProto.
+    pub fn from_declaration(binding: ModelBinding, pieces: &PrototypePieces,
+        variadic: bool, input_closed: bool, flags: uint4) -> KunaResult<Self> {
+        let output = pieces.outtype.as_ref().ok_or_else(||
+            KunaError::lowlevel("Callable declaration requires a result datatype"))?.id();
+        let first = (pieces.first_var_arg_slot >= 0).then_some(pieces.first_var_arg_slot);
+        if first.is_some_and(|first| first as usize > pieces.intypes.len()) {
+            return Err(KunaError::lowlevel("Callable declaration boundary exceeds input count"));
+        }
+        let mut flags = flags;
+        if binding.model().has_this_pointer() { flags |= func_proto_flags::HAS_THISPTR; }
+        if binding.model().is_constructor() { flags |= func_proto_flags::IS_CONSTRUCTOR; }
+        Ok(Self { binding, output, inputs: pieces.intypes.iter().map(TypeRoot::id).collect(),
+            variadic, input_closed, logical_first: first, flags })
+    }
+
+    pub fn encode(&self, encoder: &mut dyn kuna_base::marshal::Encoder,
+        context: &crate::dtype::TypeRef<'_>) -> KunaResult<()> {
+        use kuna_base::marshal::{ATTRIB_CONSTRUCTOR, ATTRIB_DESTRUCTOR, ATTRIB_MODEL};
+        use crate::remote_provider::{ATTRIB_DOTDOTDOT, ATTRIB_NORETURN, ATTRIB_VOIDLOCK,
+            ELEM_PROTOTYPE, ELEM_RETURNSYM, ELEM_INTERNALLIST, ELEM_PARAM};
+        encoder.open_element(&ELEM_PROTOTYPE);
+        encoder.write_string(&ATTRIB_MODEL, self.binding.model().get_name().as_bytes());
+        encoder.write_bool(&ATTRIB_DOTDOTDOT, self.variadic);
+        encoder.write_bool(&ATTRIB_VOIDLOCK, self.input_closed);
+        for (attribute, mask) in [(&ATTRIB_NORETURN, func_proto_flags::NO_RETURN),
+            (&ATTRIB_CONSTRUCTOR, func_proto_flags::IS_CONSTRUCTOR),
+            (&ATTRIB_DESTRUCTOR, func_proto_flags::IS_DESTRUCTOR)] {
+            if self.flags & mask != 0 { encoder.write_bool(attribute, true); }
+        }
+        encoder.open_element(&ELEM_RETURNSYM);
+        Address::new_invalid().encode(encoder)?;
+        context.related(self.output)?.encode_ref(encoder)?;
+        encoder.close_element(&ELEM_RETURNSYM);
+        encoder.open_element(&ELEM_INTERNALLIST);
+        if let Some(first) = self.logical_first {
+            encoder.write_signed_integer(&kuna_base::address::ATTRIB_FIRST, first as i64);
+        }
+        for &input in &self.inputs {
+            encoder.open_element(&ELEM_PARAM);
+            Address::new_invalid().encode(encoder)?;
+            context.related(input)?.encode_ref(encoder)?;
+            encoder.close_element(&ELEM_PARAM);
+        }
+        encoder.close_element(&ELEM_INTERNALLIST);
+        encoder.close_element(&ELEM_PROTOTYPE);
+        Ok(())
+    }
+}
+
+/// Decode declaration shape only. Recursive references are IDs, and missing
+/// storage is materialized later, after by-value layout readiness.
+pub fn decode_logical_callable(decoder: &mut dyn kuna_base::marshal::Decoder,
+    factory: &dyn TypeFactory) -> KunaResult<LogicalCallable> {
+    use kuna_base::marshal::{ATTRIB_CONSTRUCTOR, ATTRIB_DESTRUCTOR, ATTRIB_MODEL};
+    use crate::remote_provider::{ATTRIB_DOTDOTDOT, ATTRIB_NORETURN, ATTRIB_VOIDLOCK,
+        ELEM_PROTOTYPE, ELEM_RETURNSYM, ELEM_INTERNALLIST, ELEM_PARAM, ELEM_RETPARAM};
+    let elem = decoder.open_element_id(&ELEM_PROTOTYPE)?;
+    let mut model = String::new();
+    let mut variadic = false;
+    let mut input_closed = None;
+    let mut flags = 0;
+    loop {
+        let attribute = decoder.get_next_attribute_id()?;
+        if attribute == 0 { break; }
+        if attribute == ATTRIB_MODEL.get_id() { model = String::from_utf8_lossy(&decoder.read_string()?).into_owned(); }
+        else if attribute == ATTRIB_DOTDOTDOT.get_id() { variadic = decoder.read_bool()?; }
+        else if attribute == ATTRIB_VOIDLOCK.get_id() { input_closed = Some(decoder.read_bool()?); }
+        else {
+            let mask = if attribute == ATTRIB_CONSTRUCTOR.get_id() { func_proto_flags::IS_CONSTRUCTOR }
+                else if attribute == ATTRIB_DESTRUCTOR.get_id() { func_proto_flags::IS_DESTRUCTOR }
+                else if attribute == ATTRIB_NORETURN.get_id() { func_proto_flags::NO_RETURN } else { 0 };
+            if mask != 0 && decoder.read_bool()? { flags |= mask; }
+        }
+    }
+    // Bind before descending into potentially recursive type replies.
+    let binding = factory.model_binding(if model.is_empty() { None } else { Some(&model) })?;
+    if binding.model().has_this_pointer() { flags |= func_proto_flags::HAS_THISPTR; }
+    if binding.model().is_constructor() { flags |= func_proto_flags::IS_CONSTRUCTOR; }
+    let mut output = None;
+    let mut inputs = Vec::new();
+    let mut first = None;
+    while decoder.peek_element()? != 0 {
+        let child = decoder.peek_element()?;
+        if child == ELEM_RETURNSYM.get_id() {
+            let ret = decoder.open_element()?;
+            let storage = Address::decode(decoder)?;
+            if !storage.is_invalid() {
+                return Err(KunaError::lowlevel("Committed result storage is not a logical callable declaration"));
+            }
+            output = Some(factory.decode_type(decoder)?.id());
+            decoder.close_element_skipping(ret)?;
+        } else if child == ELEM_INTERNALLIST.get_id() {
+            let list = decoder.open_element()?;
+            loop {
+                let attribute = decoder.get_next_attribute_id()?;
+                if attribute == 0 { break; }
+                if attribute == kuna_base::address::ATTRIB_FIRST.get_id() {
+                    let value = decoder.read_signed_integer()?;
+                    if value >= 0 {
+                        first = Some(int4::try_from(value).map_err(|_| KunaError::lowlevel("Callable fixed boundary overflow"))?);
+                    }
+                }
+            }
+            while decoder.peek_element()? != 0 {
+                let param = decoder.open_element()?;
+                if param != ELEM_PARAM && param != ELEM_RETPARAM {
+                    return Err(KunaError::lowlevel("Unexpected callable parameter element"));
+                }
+                let storage = Address::decode(decoder)?;
+                if !storage.is_invalid() {
+                    return Err(KunaError::lowlevel("Committed parameter storage is not a logical callable declaration"));
+                }
+                let ty = factory.decode_type(decoder)?.id();
+                if param == ELEM_RETPARAM { output = Some(ty); } else { inputs.push(ty); }
+                decoder.close_element(param)?;
+            }
+            decoder.close_element(list)?;
+        } else {
+            return Err(KunaError::lowlevel("Function facts are not part of a logical callable datatype"));
+        }
+    }
+    decoder.close_element(elem)?;
+    if variadic && first.is_none() { first = Some(inputs.len() as int4); }
+    if first.is_some_and(|first| first as usize > inputs.len()) {
+        return Err(KunaError::lowlevel("Callable fixed boundary exceeds input count"));
+    }
+    Ok(LogicalCallable { binding, output: output.ok_or_else(||
+        KunaError::lowlevel("Callable declaration has no result type"))?,
+        inputs, variadic, input_closed: input_closed.unwrap_or(!variadic), logical_first: first, flags })
+}
 
 // -----------------------------------------------------------------------------
 // Wire marshaling ids owned by fspec (upstream numbers, fspec.cc:40-51;
@@ -1647,7 +2020,7 @@ pub struct ParameterPieces {
     /// Storage address of the parameter (C++ `addr`).
     pub addr: Address,
     /// The data-type of the parameter (C++ `type`); `None` is the C++ null.
-    pub type_: Option<Rc<Datatype>>,
+    pub type_: Option<TypeRoot>,
     /// Additional attributes of the parameter (C++ `flags`).
     pub flags: uint4,
 }
@@ -2495,7 +2868,7 @@ impl ParamListStandard {
     pub fn assign_address_fallback(
         &self,
         resource: type_class,
-        tp: &Rc<Datatype>,
+        tp: &TypeRoot,
         match_exact: bool,
         status: &mut [int4],
         param: &mut ParameterPieces,
@@ -2525,7 +2898,7 @@ impl ParamListStandard {
                     status[g as usize] = -1; // some groups are taken up
                 }
             }
-            param.type_ = Some(Rc::clone(tp));
+            param.type_ = Some(tp.clone());
             param.flags = 0;
             return Ok(AssignActionResponse::success);
         }
@@ -2538,7 +2911,7 @@ impl ParamListStandard {
     #[allow(clippy::too_many_arguments)] // mirrors C++ ParamListStandard::assignAddress
     pub fn assign_address(
         &self,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         proto: &PrototypePieces,
         pos: int4,
         tlist: &dyn TypeFactory,
@@ -2619,7 +2992,7 @@ impl ParamListStandard {
             res[1].flags |= parameter_pieces_flags::HIDDENRETPARM;
         }
         for i in 0..proto.intypes.len() {
-            let dt = Rc::clone(&proto.intypes[i]);
+            let dt = proto.intypes[i].clone();
             let mut back = ParameterPieces::default();
             let response =
                 self.assign_address(&dt, proto, i as i32, typefactory, &mut status, &mut back, manager)?;
@@ -3589,10 +3962,12 @@ impl ParamListStandard {
 
 /// Build the standard "cannot assign parameter address" error for a data-type
 /// (C++ `ParamUnassignedError`).
-fn unassigned_err(dt: &Rc<Datatype>) -> KunaError {
+fn unassigned_err(dt: &TypeRoot) -> KunaError {
+    let view = dt.read();
+    let value = view.get(dt.id());
     KunaError::param_unassigned(format!(
         "Cannot assign parameter address for {}",
-        dt.get_name()
+        value.as_ref().map(|t| t.get_name()).unwrap_or("<unavailable>")
     ))
 }
 
@@ -3613,9 +3988,9 @@ pub struct PrototypePieces {
     /// Identifier (function name) associated with prototype (C++ `name`).
     pub name: String,
     /// Return data-type (C++ `outtype`); `None` is the C++ null.
-    pub outtype: Option<Rc<Datatype>>,
+    pub outtype: Option<TypeRoot>,
     /// Input data-types (C++ `intypes`).
-    pub intypes: Vec<Rc<Datatype>>,
+    pub intypes: Vec<TypeRoot>,
     /// Identifiers for input types (C++ `innames`).
     pub innames: Vec<String>,
     /// First position of a variable argument, or -1 if not varargs (C++
@@ -3724,7 +4099,7 @@ pub struct ProtoModel {
     /// `true` if this model is a constructor (C++ `isConstruct`).
     is_construct: bool,
     /// `true` if this model should be printed in declarations (C++ `isPrinted`).
-    is_printed: bool,
+    is_printed: Cell<bool>,
     /// The merged-model state, present only for a [`ProtoModelMerged`] (C++
     /// subclass `ProtoModelMerged`).
     merged: Option<ProtoModelMerged>,
@@ -3788,7 +4163,7 @@ impl ProtoModel {
             stackgrowsnegative: true, // Normal stack parameter ordering
             has_this: false,
             is_construct: false,
-            is_printed: true,
+            is_printed: Cell::new(true),
             merged: None,
             is_unknown: false,
         };
@@ -3807,7 +4182,7 @@ impl ProtoModel {
         let mut res = op2.clone();
         res.id = ProtoModelId::fresh();
         res.name = nm.to_string();
-        res.is_printed = true; // Don't inherit. Always print unless setPrintInDecl called explicitly
+        res.is_printed.set(true);
         // input/output/effectlist/likelytrash/internalstorage/ranges already
         // copied by `clone`.
         if res.name == "__thiscall" {
@@ -3825,6 +4200,9 @@ impl ProtoModel {
     pub fn new_unknown(nm: &str, placeholder: &ProtoModel) -> ProtoModel {
         let mut res = ProtoModel::copy_named(nm, placeholder);
         res.is_unknown = true;
+        if nm == "unknown" {
+            res.set_print_in_decl(false);
+        }
         res
     }
 
@@ -3890,12 +4268,12 @@ impl ProtoModel {
     /// Return `true` if name should be printed in declarations (C++
     /// `printInDecl`).
     pub fn print_in_decl(&self) -> bool {
-        self.is_printed
+        self.is_printed.get()
     }
     /// Set whether this name should be printed in declarations (C++
     /// `setPrintInDecl`).
-    pub fn set_print_in_decl(&mut self, val: bool) {
-        self.is_printed = val;
+    pub fn set_print_in_decl(&self, val: bool) {
+        self.is_printed.set(val);
     }
     /// Maximum heritage delay across all input parameters (C++
     /// `getMaxInputDelay`).
@@ -4174,6 +4552,52 @@ impl ProtoModel {
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
+        self.assign_output_storage(proto, res, ignore_output_error, typefactory, manager)?;
+        self.assign_input_storage(proto, res, typefactory, manager)
+    }
+
+    /// Lower a supplied list once, translating only a producer-established
+    /// effective boundary. Output lowering determines whether an automatic
+    /// result parameter exists before the input rules inspect the boundary.
+    pub(crate) fn assign_parameter_storage_for_supplied(
+        &self,
+        proto: &mut PrototypePieces,
+        res: &mut Vec<ParameterPieces>,
+        ignore_output_error: bool,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+        coordinate: FirstVarArgCoordinate,
+    ) -> KunaResult<()> {
+        self.assign_output_storage(proto, res, ignore_output_error, typefactory, manager)?;
+        if coordinate == FirstVarArgCoordinate::Effective && proto.first_var_arg_slot >= 0 {
+            let hidden_position = if res.len() == 2 {
+                Some(if self.has_this && self.input().is_this_before_ret_pointer()
+                    && !proto.intypes.is_empty() { 1 } else { 0 })
+            } else {
+                None
+            };
+            let first = proto.first_var_arg_slot as usize;
+            let first = first.min(proto.intypes.len() + usize::from(hidden_position.is_some()));
+            proto.first_var_arg_slot = (first
+                - usize::from(hidden_position.is_some_and(|position| position < first))) as int4;
+        }
+        self.assign_input_storage(proto, res, typefactory, manager)
+    }
+
+    fn assign_output_storage(
+        &self,
+        proto: &PrototypePieces,
+        res: &mut Vec<ParameterPieces>,
+        ignore_output_error: bool,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+    ) -> KunaResult<()> {
+        for root in proto.outtype.iter().chain(proto.intypes.iter()) {
+            let view = root.read();
+            if !view.layout_ready(root.id())? {
+                return Err(KunaError::lowlevel("ABI assignment requires completed by-value datatype layout"));
+            }
+        }
         if ignore_output_error {
             match self.output().assign_map(proto, typefactory, res, manager) {
                 Ok(()) => {}
@@ -4192,6 +4616,16 @@ impl ProtoModel {
         } else {
             self.output().assign_map(proto, typefactory, res, manager)?;
         }
+        Ok(())
+    }
+
+    fn assign_input_storage(
+        &self,
+        proto: &PrototypePieces,
+        res: &mut Vec<ParameterPieces>,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+    ) -> KunaResult<()> {
         self.input().assign_map(proto, typefactory, res, manager)?;
 
         if self.has_this && res.len() > 1 {
@@ -4670,11 +5104,13 @@ impl ScoreProtoModel {
 /// kuna trait carries the shared query surface, and [`ParameterBasic`] is the
 /// stand-alone (no backing symbol) implementation.
 pub trait ProtoParameter {
+    /// Exact per-parameter flags, including explicit custom-storage provenance.
+    fn get_flags(&self) -> uint4;
     /// Get the name of the parameter ("" for return value) (C++ `getName`).
     fn get_name(&self) -> &str;
     /// Get the data-type associated with this (C++ `getType`); `None` is the
     /// C++ null.
-    fn get_type(&self) -> Option<&Rc<Datatype>>;
+    fn get_type(&self) -> Option<&TypeRoot>;
     /// Get the storage address for this parameter (C++ `getAddress`).
     fn get_address(&self) -> Address;
     /// Get the number of bytes occupied (C++ `getSize`).
@@ -4701,7 +5137,7 @@ pub trait ProtoParameter {
     fn set_this_pointer(&mut self, val: bool);
     /// Change (override) the data-type of a size-locked parameter (C++
     /// `overrideSizeLockType`).
-    fn override_size_lock_type(&mut self, ct: Rc<Datatype>) -> KunaResult<()>;
+    fn override_size_lock_type(&mut self, ct: TypeRoot) -> KunaResult<()>;
     /// Clear the data-type preserving any size-lock (C++ `resetSizeLockType`).
     fn reset_size_lock_type(&mut self, factory: &dyn TypeFactory) -> KunaResult<()>;
 }
@@ -4715,7 +5151,7 @@ pub fn proto_parameter_eq(a: &dyn ProtoParameter, b: &dyn ProtoParameter) -> boo
         return false;
     }
     match (a.get_type(), b.get_type()) {
-        (Some(x), Some(y)) => Rc::ptr_eq(x, y),
+        (Some(x), Some(y)) => x == y,
         (None, None) => true,
         _ => false,
     }
@@ -4730,21 +5166,35 @@ pub struct ParameterBasic {
     /// Storage address (C++ `addr`).
     addr: Address,
     /// Data-type (C++ `type`); `None` only for the rare null-typed void boundary.
-    type_: Option<Rc<Datatype>>,
+    type_: Option<TypeRoot>,
     /// Lock and other properties (C++ `flags`).
     flags: uint4,
 }
 
 impl ParameterBasic {
+    /// Copy a parameter without depending on its backing store or SymbolId.
+    pub fn from_parameter(parameter: &dyn ProtoParameter) -> Self {
+        Self {
+            name: parameter.get_name().to_string(),
+            addr: parameter.get_address(),
+            type_: parameter.get_type().cloned(),
+            flags: parameter.get_flags(),
+        }
+    }
+
+    pub fn pieces(&self) -> ParameterPieces {
+        ParameterPieces { addr: self.addr.clone(), type_: self.type_.clone(), flags: self.flags }
+    }
+
     /// Construct from components (C++
     /// `ParameterBasic(const string&,const Address&,Datatype*,uint4)`).
-    pub fn new(name: &str, addr: Address, type_: Rc<Datatype>, flags: uint4) -> ParameterBasic {
+    pub fn new(name: &str, addr: Address, type_: TypeRoot, flags: uint4) -> ParameterBasic {
         ParameterBasic { name: name.to_string(), addr, type_: Some(type_), flags }
     }
 
     /// Construct a void parameter (C++ `ParameterBasic(Datatype *tp)`).  The
     /// C++ leaves `addr` default-constructed (invalid).
-    pub fn new_void(type_: Rc<Datatype>) -> ParameterBasic {
+    pub fn new_void(type_: TypeRoot) -> ParameterBasic {
         ParameterBasic {
             name: String::new(),
             addr: Address::new_invalid(),
@@ -4755,10 +5205,11 @@ impl ParameterBasic {
 }
 
 impl ProtoParameter for ParameterBasic {
+    fn get_flags(&self) -> uint4 { self.flags }
     fn get_name(&self) -> &str {
         &self.name
     }
-    fn get_type(&self) -> Option<&Rc<Datatype>> {
+    fn get_type(&self) -> Option<&TypeRoot> {
         self.type_.as_ref()
     }
     fn get_address(&self) -> Address {
@@ -4814,7 +5265,7 @@ impl ProtoParameter for ParameterBasic {
             self.flags &= !parameter_pieces_flags::ISTHIS;
         }
     }
-    fn override_size_lock_type(&mut self, ct: Rc<Datatype>) -> KunaResult<()> {
+    fn override_size_lock_type(&mut self, ct: TypeRoot) -> KunaResult<()> {
         let cur_size = self.type_.as_ref().map(|t| t.get_size()).unwrap_or(0);
         if cur_size == ct.get_size() {
             if !self.is_size_type_locked() {
@@ -4881,7 +5332,7 @@ pub trait ProtoStore {
 #[derive(Debug, Clone)]
 pub struct ProtoStoreInternal {
     /// Cached reference to the void data-type (C++ `voidtype`).
-    voidtype: Rc<Datatype>,
+    voidtype: TypeRoot,
     /// Descriptions of input parameters; `None` is a C++ null slot (C++
     /// `inparam`).
     inparam: Vec<Option<ParameterBasic>>,
@@ -4892,8 +5343,8 @@ pub struct ProtoStoreInternal {
 impl ProtoStoreInternal {
     /// Construct with the given void data-type, seeding a void output (C++
     /// `ProtoStoreInternal(Datatype *vt)`).
-    pub fn new(vt: Rc<Datatype>) -> ProtoStoreInternal {
-        let mut res = ProtoStoreInternal { voidtype: Rc::clone(&vt), inparam: Vec::new(), outparam: None };
+    pub fn new(vt: TypeRoot) -> ProtoStoreInternal {
+        let mut res = ProtoStoreInternal { voidtype: vt.clone(), inparam: Vec::new(), outparam: None };
         let pieces = ParameterPieces { addr: Address::new_invalid(), type_: Some(vt), flags: 0 };
         res.set_output(&pieces);
         res
@@ -4955,7 +5406,7 @@ impl ProtoStore for ProtoStoreInternal {
         ));
     }
     fn clear_output(&mut self) {
-        self.outparam = Some(ParameterBasic::new_void(Rc::clone(&self.voidtype)));
+        self.outparam = Some(ParameterBasic::new_void(self.voidtype.clone()));
     }
     fn get_output(&self) -> &dyn ProtoParameter {
         self.outparam.as_ref().expect("ProtoStoreInternal::get_output: null")
@@ -5006,6 +5457,16 @@ pub mod func_proto_flags {
     pub const AUTO_KILLEDBYCALL: uint4 = 0x2000;
 }
 
+/// Authentic source input retained when execution needs a wider physical carrier.
+#[derive(Debug, Clone)]
+pub struct InputProjection {
+    pub slot: int4,
+    /// Authentic source/storage parameter, never a derived carrier.
+    pub source: ParameterBasic,
+    /// Least-significant-byte offset of the source within its carrier.
+    pub byte_offset: int4,
+}
+
 /// A function prototype: the parameters and return value for a specific
 /// function (C++ `FuncProto`, `fspec.hh:1343-1624`).
 ///
@@ -5033,6 +5494,22 @@ pub struct FuncProto {
     /// Number of bytes of return value consumed by callers (0 = all) (C++
     /// `returnBytesConsumed`).
     return_bytes_consumed: int4,
+    /// First variadic ABI operand in completed physical parameter order.
+    /// Independent of whether analysis has a closed or open-ended signature.
+    /// Describes the supplied list's assignment, not inferred original-callee
+    /// intent when a producer mixes logical and lowered parameter counts.
+    abi_first_vararg: Option<int4>,
+    /// Trusted semantic declaration for a type-derived ABI, retained through
+    /// site pinning/restart. Never reconstructed from effective storage/types.
+    logical_callable: Option<TypeRoot>,
+    logical_input_origins: Vec<AbiInputOrigin>,
+    /// Per-instance execution materialization; excluded from declaration ABI caches.
+    input_projections: Vec<InputProjection>,
+    /// Appended execution inputs with no declared source counterpart.
+    physical_only_inputs: Vec<int4>,
+    source_void_input_lock: Option<bool>,
+    source_variadic: Option<Option<int4>>,
+    source_output: Option<ParameterBasic>,
 }
 
 impl std::fmt::Debug for FuncProto {
@@ -5046,6 +5523,7 @@ impl std::fmt::Debug for FuncProto {
             .field("likelytrash", &self.likelytrash)
             .field("injectid", &self.injectid)
             .field("return_bytes_consumed", &self.return_bytes_consumed)
+            .field("abi_first_vararg", &self.abi_first_vararg)
             .finish_non_exhaustive()
     }
 }
@@ -5068,6 +5546,14 @@ impl FuncProto {
             likelytrash: Vec::new(),
             injectid: -1,
             return_bytes_consumed: 0,
+            abi_first_vararg: None,
+            logical_callable: None,
+            logical_input_origins: Vec::new(),
+            input_projections: Vec::new(),
+            physical_only_inputs: Vec::new(),
+            source_void_input_lock: None,
+            source_variadic: None,
+            source_output: None,
         }
     }
 
@@ -5080,6 +5566,279 @@ impl FuncProto {
         self.effectlist = op2.effectlist.clone();
         self.likelytrash = op2.likelytrash.clone();
         self.injectid = op2.injectid;
+        self.abi_first_vararg = op2.abi_first_vararg;
+        self.logical_callable = op2.logical_callable.clone();
+        self.logical_input_origins = op2.logical_input_origins.clone();
+        self.input_projections.clone_from(&op2.input_projections);
+        self.physical_only_inputs.clone_from(&op2.physical_only_inputs);
+        self.source_void_input_lock = op2.source_void_input_lock;
+        self.source_variadic = op2.source_variadic;
+        self.source_output.clone_from(&op2.source_output);
+    }
+
+    pub fn logical_callable(&self) -> Option<&TypeRoot> { self.logical_callable.as_ref() }
+    pub fn callable_input_origins(&self) -> &[AbiInputOrigin] { &self.logical_input_origins }
+
+    pub fn input_projections(&self) -> &[InputProjection] { &self.input_projections }
+
+    pub fn physical_only_inputs(&self) -> &[int4] { &self.physical_only_inputs }
+
+    pub fn has_execution_inputs(&self) -> bool {
+        !self.input_projections.is_empty() || !self.physical_only_inputs.is_empty()
+            || self.source_variadic.is_some()
+    }
+
+    pub fn has_execution_signature(&self) -> bool {
+        self.has_execution_inputs() || self.source_output.is_some()
+    }
+
+    pub fn is_execution_input(&self, slot: int4) -> bool {
+        self.input_projection(slot).is_some() || self.physical_only_inputs.contains(&slot)
+    }
+
+    pub fn set_execution_input_name(&mut self, slot: int4, name: &str) -> KunaResult<()> {
+        if !self.is_execution_input(slot) {
+            return Err(KunaError::lowlevel("Parameter is not a derived execution input"));
+        }
+        let parameter = self.get_param(slot)
+            .ok_or_else(|| KunaError::lowlevel("Execution input has no physical slot"))?;
+        if parameter.get_name() == name { return Ok(()); }
+        let pieces = ParameterBasic::from_parameter(parameter).pieces();
+        self.store_mut().set_input(slot, name, &pieces);
+        Ok(())
+    }
+
+    pub fn source_output(&self) -> &dyn ProtoParameter {
+        match &self.source_output { Some(source) => source, None => self.get_output() }
+    }
+
+    pub fn restore_source_output(&mut self) {
+        if let Some(source) = self.source_output.take() { self.store_mut().set_output(&source.pieces()); }
+    }
+
+    /// A normalized callable value has the same physical bits as its source
+    /// pointer, but a different execution datatype. Keep both authorities.
+    pub fn install_execution_input_type(&mut self, slot: int4, datatype: TypeRoot) -> KunaResult<bool> {
+        let current = self.get_param(slot).ok_or_else(|| KunaError::lowlevel("Missing execution input slot"))?;
+        if current.get_type().is_some_and(|ty| ty.id() == datatype.id()) { return Ok(false); }
+        let source = self.source_param(slot).ok_or_else(|| KunaError::lowlevel("Execution type requires a source input"))?;
+        if !source.is_type_locked() || datatype.get_size() != source.get_size() || current.get_size() != source.get_size() {
+            return Err(KunaError::lowlevel("Execution input type must preserve locked source storage"));
+        }
+        let source = ParameterBasic::from_parameter(source);
+        let mut pieces = source.pieces();
+        pieces.type_ = Some(datatype);
+        let mut name = format!("raw_{}", source.get_name());
+        while (0..self.num_params()).any(|index| self.get_param(index).is_some_and(|p| p.get_name() == name)) {
+            name.push('_');
+        }
+        self.store_mut().set_input(slot, &name, &pieces);
+        if self.input_projection(slot).is_none() {
+            self.input_projections.push(InputProjection { slot, source, byte_offset: 0 });
+        }
+        Ok(true)
+    }
+
+    pub fn install_execution_output_type(&mut self, datatype: TypeRoot) -> KunaResult<bool> {
+        let current = self.get_output();
+        if current.get_type().is_some_and(|ty| ty.id() == datatype.id()) { return Ok(false); }
+        if !current.is_type_locked() || datatype.get_size() != current.get_size() {
+            return Err(KunaError::lowlevel("Execution output type must preserve locked source storage"));
+        }
+        let source = self.source_output.as_ref().cloned().unwrap_or_else(|| ParameterBasic::from_parameter(current));
+        let mut pieces = source.pieces();
+        pieces.type_ = Some(datatype);
+        self.store_mut().set_output(&pieces);
+        self.source_output = Some(source);
+        Ok(true)
+    }
+
+    pub fn input_projection(&self, slot: int4) -> Option<&InputProjection> {
+        self.input_projections.iter().find(|projection| projection.slot == slot)
+    }
+
+    /// Source authority for editing/host encoding, rather than execution storage.
+    pub fn source_param(&self, slot: int4) -> Option<&dyn ProtoParameter> {
+        if self.physical_only_inputs.contains(&slot) { return None; }
+        match self.input_projection(slot) {
+            Some(projection) => Some(&projection.source),
+            None => self.get_param(slot),
+        }
+    }
+
+    pub fn source_prototype(&self) -> Self {
+        let mut source = Self::new();
+        source.copy(self);
+        source.restore_source_inputs();
+        source.restore_source_output();
+        source
+    }
+
+    /// Discard derived materialization before an authoritative source mutation.
+    pub fn restore_source_inputs(&mut self) {
+        self.restore_source_variadic();
+        for slot in std::mem::take(&mut self.physical_only_inputs).into_iter().rev() {
+            self.store_mut().clear_input(slot);
+        }
+        if let Some(locked) = self.source_void_input_lock.take() {
+            self.set_void_input_lock_bit(locked);
+        }
+        for projection in std::mem::take(&mut self.input_projections) {
+            self.store_mut().set_input(projection.slot, projection.source.get_name(),
+                &projection.source.pieces());
+        }
+    }
+
+    fn restore_source_variadic(&mut self) {
+        if let Some(first) = self.source_variadic.take() {
+            self.flags |= func_proto_flags::DOTDOTDOT;
+            self.abi_first_vararg = first;
+        }
+    }
+
+    /// The caller proves a complete body has a finite representable input set.
+    pub(crate) fn close_execution_inputs(&mut self) -> bool {
+        if !self.has_store() || !self.is_input_locked() || !self.is_dotdotdot() { return false; }
+        self.source_variadic = Some(self.abi_first_vararg);
+        self.flags &= !func_proto_flags::DOTDOTDOT;
+        self.abi_first_vararg = None;
+        true
+    }
+
+    /// Append an observed, finite machine input omitted by a closed source list.
+    /// The caller proves SSA demand and model eligibility before calling this.
+    pub fn install_physical_only_input(
+        &mut self, addr: &Address, size: int4, factory: &dyn TypeFactory,
+    ) -> KunaResult<bool> {
+        if !self.is_input_locked() || !self.has_store() || self.is_dotdotdot() || size <= 0 || size > 8 {
+            return Err(KunaError::lowlevel("Physical-only input requires a locked finite interface"));
+        }
+        if (0..self.num_params()).filter_map(|slot| self.source_param(slot)).any(|p| !p.is_type_locked()) {
+            return Err(KunaError::lowlevel("Physical-only input requires all source inputs locked"));
+        }
+        if let Some(code) = self.logical_callable() {
+            let view = code.read();
+            let id = view.resolve_alias(code.id())?;
+            if self.source_variadic.is_none()
+                && view.get_code_prototype(id)?.is_some_and(|declaration| !declaration.input_closed) {
+                return Err(KunaError::lowlevel("Physical-only input requires a closed source declaration"));
+            }
+        }
+        let end = addr.get_offset().checked_add(size as u64)
+            .ok_or_else(|| KunaError::lowlevel("Physical-only input overflows"))?;
+        let mut replace = None;
+        for slot in 0..self.num_params() {
+            let parameter = self.get_param(slot).expect("physical parameter slot");
+            if parameter.get_address() == *addr && parameter.get_size() == size { return Ok(false); }
+            let other = parameter.get_address();
+            if other.get_space().is_some_and(|space| space.get_type() == kuna_base::space::spacetype::IPTR_JOIN) {
+                return Err(KunaError::lowlevel("Cannot append across unresolved JOIN input storage"));
+            }
+            if addr.get_space().zip(other.get_space()).is_some_and(|(left, right)| Rc::ptr_eq(left, right))
+                && other.get_offset() < end && addr.get_offset() < other.get_offset() + parameter.get_size() as u64
+            {
+                if self.physical_only_inputs.contains(&slot) && replace.is_none()
+                    && addr.get_offset() <= other.get_offset()
+                    && end >= other.get_offset() + parameter.get_size() as u64
+                {
+                    replace = Some(slot);
+                } else {
+                    return Err(KunaError::lowlevel("Physical-only input overlaps existing storage"));
+                }
+            }
+        }
+        let slot = replace.unwrap_or_else(|| self.num_params());
+        let carrier = ParameterPieces {
+            addr: addr.clone(), type_: Some(factory.get_base(size, type_metatype::TYPE_UINT)?),
+            flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+        };
+        let mut name = format!("raw_input{slot}");
+        while (0..slot).any(|index| self.get_param(index).is_some_and(|p| p.get_name() == name)) {
+            name.push('_');
+        }
+        if replace.is_none() && self.physical_only_inputs.is_empty() {
+            self.source_void_input_lock = Some(self.flags & func_proto_flags::VOIDINPUTLOCK != 0);
+        }
+        self.set_void_input_lock_bit(false);
+        self.store_mut().set_input(slot, &name, &carrier);
+        if replace.is_none() { self.physical_only_inputs.push(slot); }
+        Ok(true)
+    }
+
+    /// Widen an observed scalar input requirement without changing source authority.
+    /// All overlap checks precede mutation. Independent source slots are never absorbed.
+    pub fn install_input_carrier(
+        &mut self, slot: int4, addr: &Address, size: int4, factory: &dyn TypeFactory,
+    ) -> KunaResult<bool> {
+        let parameter = self.get_param(slot)
+            .ok_or_else(|| KunaError::lowlevel("Physical input has no source slot"))?;
+        if parameter.get_address() == *addr && parameter.get_size() >= size {
+            return Ok(false);
+        }
+        if addr.justified_contain(size, &parameter.get_address(), parameter.get_size(), false) < 0 {
+            return Err(KunaError::lowlevel("Physical refinement drops an existing input range"));
+        }
+        let source = self.source_param(slot).expect("existing source slot");
+        let source_type = source.get_type()
+            .ok_or_else(|| KunaError::lowlevel("Physical input source has no type"))?;
+        if !source.is_type_locked() || source.is_hidden_return() || source.is_indirect_storage()
+            || !matches!(source_type.get_metatype(), type_metatype::TYPE_INT
+                | type_metatype::TYPE_UINT | type_metatype::TYPE_ENUM_INT
+                | type_metatype::TYPE_ENUM_UINT | type_metatype::TYPE_BOOL)
+            || size <= source.get_size() || size > 8
+        {
+            return Err(KunaError::lowlevel("Physical input requires a scalar carrier"));
+        }
+        let byte_offset = addr.justified_contain(size, &source.get_address(), source.get_size(), false);
+        if byte_offset < 0 {
+            return Err(KunaError::lowlevel("Physical carrier does not contain its source"));
+        }
+        let space = addr.get_space().ok_or_else(|| KunaError::lowlevel("Physical carrier has no space"))?;
+        let end = addr.get_offset().checked_add(size as u64)
+            .ok_or_else(|| KunaError::lowlevel("Physical carrier storage overflows"))?;
+        for other in 0..self.num_params() {
+            if other == slot { continue; }
+            let parameter = self.get_param(other).expect("physical parameter slot");
+            let other_addr = parameter.get_address();
+            if other_addr.get_space().is_some_and(|space|
+                space.get_type() == kuna_base::space::spacetype::IPTR_JOIN)
+            {
+                return Err(KunaError::lowlevel("Cannot widen across unresolved JOIN parameter storage"));
+            }
+            if other_addr.get_space().is_some_and(|other_space| Rc::ptr_eq(space, other_space)) {
+                let other_end = other_addr.get_offset().checked_add(parameter.get_size() as u64)
+                    .ok_or_else(|| KunaError::lowlevel("Parameter storage overflows"))?;
+                if other_addr.get_offset() < end && addr.get_offset() < other_end {
+                    return Err(KunaError::lowlevel("Physical carrier overlaps an independent parameter"));
+                }
+            }
+        }
+        let carrier_type = factory.get_base(size, type_metatype::TYPE_UINT)?;
+        let source = ParameterBasic::from_parameter(source);
+        let mut name = if source.name.is_empty() { format!("raw_a{slot}") }
+            else { format!("raw_{}", source.name) };
+        while (0..self.num_params()).any(|index|
+            self.source_param(index).is_some_and(|p| p.get_name() == name)
+                || (index != slot && self.get_param(index).is_some_and(|p| p.get_name() == name)))
+        {
+            name.push('_');
+        }
+        let carrier = ParameterPieces {
+            addr: addr.clone(), type_: Some(carrier_type),
+            flags: source.flags | parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+        };
+        self.store_mut().set_input(slot, &name, &carrier);
+        if let Some(projection) = self.input_projections.iter_mut().find(|p| p.slot == slot) {
+            projection.byte_offset = byte_offset;
+        } else {
+            self.input_projections.push(InputProjection { slot, source, byte_offset });
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn retain_logical_callable(&mut self, root: TypeRoot, origins: Vec<AbiInputOrigin>) {
+        self.logical_callable = Some(root);
+        self.logical_input_origins = origins;
     }
 
     /// Copy properties that affect data-flow (C++ `copyFlowEffects`).
@@ -5144,6 +5903,12 @@ impl FuncProto {
 
     /// Establish a specific prototype model (C++ `setModel`).
     pub fn set_model(&mut self, m: Option<Rc<ProtoModel>>) {
+        let changed = match (&self.model, &m) {
+            (Some(old), Some(new)) => !Rc::ptr_eq(old, new),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed { self.restore_source_inputs(); self.restore_source_output(); }
         match m {
             Some(m) => {
                 let expop = m.get_extra_pop();
@@ -5170,8 +5935,16 @@ impl FuncProto {
     }
 
     /// Set internal backing storage (C++ `setInternal`).
-    pub fn set_internal(&mut self, m: Rc<ProtoModel>, vt: Rc<Datatype>) {
+    pub fn set_internal(&mut self, m: Rc<ProtoModel>, vt: TypeRoot) {
+        self.restore_source_variadic();
+        self.source_output = None;
         self.store = Some(Box::new(ProtoStoreInternal::new(vt)));
+        self.input_projections.clear();
+        self.physical_only_inputs.clear();
+        self.source_void_input_lock = None;
+        self.abi_first_vararg = None;
+        self.logical_callable = None;
+        self.logical_input_origins.clear();
         if self.model.is_none() {
             self.set_model(Some(m));
         }
@@ -5194,11 +5967,27 @@ impl FuncProto {
     }
     /// Set parameter storage directly (C++ `setParam`).
     pub fn set_param(&mut self, i: int4, name: &str, piece: &ParameterPieces) {
+        self.restore_source_inputs();
         self.store_mut().set_input(i, name, piece);
     }
     /// Remove the i-th input parameter (C++ `removeParam`).
     pub fn remove_param(&mut self, i: int4) {
+        self.restore_source_inputs();
         self.store_mut().clear_input(i);
+        if let Some(first) = self.abi_first_vararg.as_mut() {
+            if i < *first { *first -= 1; }
+        }
+    }
+
+    pub fn get_abi_first_vararg(&self) -> Option<int4> {
+        self.abi_first_vararg
+    }
+
+    pub fn set_abi_first_vararg(&mut self, first: Option<int4>) {
+        if self.source_variadic.is_some() || first.filter(|first| *first >= 0) != self.abi_first_vararg {
+            self.restore_source_inputs();
+        }
+        self.abi_first_vararg = first.filter(|first| *first >= 0);
     }
     /// Get the number of input parameters (C++ `numParams`).
     pub fn num_params(&self) -> int4 {
@@ -5210,12 +5999,20 @@ impl FuncProto {
     }
     /// Set return value storage directly (C++ `setOutput`).
     pub fn set_output(&mut self, piece: &ParameterPieces) {
+        self.source_output = None;
         self.store_mut().set_output(piece);
     }
     /// Clear all input parameters from the store (C++ `store->clearAllInputs()`),
     /// used by `updateInputTypes`/`updateInputNoTypes` before re-registering the
     /// recovered parameters.  A no-op if no store is attached.
     pub fn store_clear_all_inputs(&mut self) {
+        self.restore_source_variadic();
+        if let Some(locked) = self.source_void_input_lock.take() {
+            self.set_void_input_lock_bit(locked);
+        }
+        self.input_projections.clear();
+        self.physical_only_inputs.clear();
+        self.source_void_input_lock = None;
         if self.store.is_some() {
             self.store_mut().clear_all_inputs();
         }
@@ -5224,12 +6021,13 @@ impl FuncProto {
     /// used by `updateInputTypes`/`updateInputNoTypes`.  A no-op if no store is
     /// attached.
     pub fn store_set_input(&mut self, i: int4, nm: &str, pieces: &ParameterPieces) {
+        self.restore_source_inputs();
         if self.store.is_some() {
             self.store_mut().set_input(i, nm, pieces);
         }
     }
     /// Get the return value data-type (C++ `getOutputType`).
-    pub fn get_output_type(&self) -> Option<&Rc<Datatype>> {
+    pub fn get_output_type(&self) -> Option<&TypeRoot> {
         // Borrow chain: get_output returns &dyn, get_type returns Option<&Rc>.
         // The lifetime is tied to &self via store(); safe.
         self.store().get_output().get_type()
@@ -5251,7 +6049,7 @@ impl FuncProto {
     /// given void type.  Idempotent: a no-op if a store is already present.  This
     /// is the merged-tree path for output/input recovery without the W4
     /// `ProtoStoreSymbol`/ScopeLocal.
-    pub fn attach_internal_store(&mut self, void_type: Rc<Datatype>) {
+    pub fn attach_internal_store(&mut self, void_type: TypeRoot) {
         if self.store.is_none() {
             self.store = Some(Box::new(ProtoStoreInternal::new(void_type)));
         }
@@ -5300,12 +6098,39 @@ impl FuncProto {
     pub fn has_custom_storage(&self) -> bool {
         (self.flags & func_proto_flags::CUSTOM_STORAGE) != 0
     }
+    /// Set the explicit empty-input-list lock without changing parameter flags.
+    pub fn set_void_input_lock(&mut self, val: bool) {
+        self.restore_source_inputs();
+        self.set_void_input_lock_bit(val);
+    }
+
+    fn set_void_input_lock_bit(&mut self, val: bool) {
+        if val {
+            self.flags |= func_proto_flags::VOIDINPUTLOCK;
+        } else {
+            self.flags &= !func_proto_flags::VOIDINPUTLOCK;
+        }
+    }
+    /// Mark storage as explicitly supplied rather than assigned by the model.
+    pub fn set_custom_storage(&mut self, val: bool) {
+        if val != self.has_custom_storage() { self.restore_source_output(); }
+        if val != self.has_custom_storage() { self.restore_source_inputs(); }
+        if val {
+            self.flags |= func_proto_flags::CUSTOM_STORAGE;
+        } else {
+            self.flags &= !func_proto_flags::CUSTOM_STORAGE;
+        }
+    }
     /// Toggle the data-type lock on input parameters (C++ `setInputLock`).
     pub fn set_input_lock(&mut self, val: bool) {
+        if !val { self.restore_source_inputs(); }
         if val {
             self.flags |= func_proto_flags::MODELLOCK; // Locking input locks the model
         }
-        let num = self.num_params();
+        // A failed late restriction can leave the call prototype unrecovered,
+        // with no parameter store. It still needs the empty-input lock while
+        // the pinned prototype awaits restart.
+        let num = self.store.as_deref().map_or(0, |store| store.get_num_inputs());
         if num == 0 {
             self.flags = if val {
                 self.flags | func_proto_flags::VOIDINPUTLOCK
@@ -5340,6 +6165,7 @@ impl FuncProto {
     }
     /// Toggle the data-type lock on the return value (C++ `setOutputLock`).
     pub fn set_output_lock(&mut self, val: bool) {
+        if !val { self.restore_source_output(); }
         if val {
             self.flags |= func_proto_flags::MODELLOCK; // Locking output locks the model
         }
@@ -5466,6 +6292,7 @@ impl FuncProto {
     }
     /// Toggle whether this takes variable arguments (C++ `setDotdotdot`).
     pub fn set_dotdotdot(&mut self, val: bool) {
+        if self.source_variadic.is_some() || val != self.is_dotdotdot() { self.restore_source_inputs(); }
         self.flags = if val {
             self.flags | func_proto_flags::DOTDOTDOT
         } else {
@@ -5524,16 +6351,19 @@ impl FuncProto {
     /// Assuming this prototype is locked, calculate the extrapop (C++
     /// `resolveExtraPop`).  Designed to work with 32-bit x86 binaries.
     pub fn resolve_extra_pop(&mut self) {
-        if !self.is_input_locked() {
-            return;
+        if let Some(extra_pop) = self.declared_extra_pop() {
+            self.set_extra_pop(extra_pop);
         }
+    }
+
+    /// The declared cleanup without mutating a cached ABI view or entry facts.
+    /// Callers still decide whether declaration-based resolution is enabled.
+    pub(crate) fn declared_extra_pop(&self) -> Option<int4> {
+        if !self.is_input_locked() { return None; }
         let numparams = self.num_params();
         if self.is_dotdotdot() {
-            if numparams != 0 {
-                // "standard" varargs with fixed initial parameters -> __cdecl
-                self.set_extra_pop(4);
-            }
-            return; // otherwise we can't resolve the extrapop
+            // "standard" varargs with fixed initial parameters -> __cdecl
+            return (numparams != 0).then_some(4);
         }
         let mut expop = 4; // Extrapop is at least 4 for the return address
         for i in 0..numparams {
@@ -5552,7 +6382,7 @@ impl FuncProto {
                 expop = cur;
             }
         }
-        self.set_extra_pop(expop);
+        Some(expop)
     }
 
     /// Clear input parameters that have not been locked (C++
@@ -5561,6 +6391,10 @@ impl FuncProto {
         if self.is_input_locked() {
             return;
         }
+        self.restore_source_variadic();
+        self.input_projections.clear();
+        self.physical_only_inputs.clear();
+        self.source_void_input_lock = None;
         // No store (merged-tree setScope boundary): no inputs to clear.
         if self.store.is_some() {
             self.store_mut().clear_all_inputs();
@@ -5587,6 +6421,10 @@ impl FuncProto {
 
     /// Clear all input parameters regardless of lock (C++ `clearInput`).
     pub fn clear_input(&mut self) {
+        self.restore_source_variadic();
+        self.input_projections.clear();
+        self.physical_only_inputs.clear();
+        self.source_void_input_lock = None;
         self.store_mut().clear_all_inputs();
         self.flags &= !func_proto_flags::VOIDINPUTLOCK; // If a void was locked in clear it
     }
@@ -5638,7 +6476,7 @@ impl FuncProto {
         for i in 0..num {
             if let Some(param) = self.store().get_input(i) {
                 if let Some(t) = param.get_type() {
-                    pieces.intypes.push(Rc::clone(t));
+                    pieces.intypes.push(t.clone());
                 }
                 pieces.innames.push(param.get_name().to_string());
             }
@@ -5655,10 +6493,21 @@ impl FuncProto {
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
+        self.set_pieces_with_source(pieces, model, typefactory, manager, true)
+    }
+
+    fn set_pieces_with_source(
+        &mut self,
+        pieces: &PrototypePieces,
+        model: Option<Rc<ProtoModel>>,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+        source_declared: bool,
+    ) -> KunaResult<()> {
         if model.is_some() {
             self.set_model(model);
         }
-        self.update_all_types(pieces, typefactory, manager)?;
+        let assignment = self.update_all_types_assigned(pieces, typefactory, manager)?;
         let custom_storage = pieces
             .input_storage
             .iter()
@@ -5704,6 +6553,26 @@ impl FuncProto {
         self.set_input_lock(true);
         self.set_output_lock(true);
         self.set_model_lock(true);
+        // Preserve the producer's declaration and this exact assignment, not
+        // a signature reconstructed from transformed physical pointer slots.
+        // Explicit storage commits and input-only declarations have no complete
+        // model-assigned source signature to retain here.
+        if source_declared && pieces.input_storage.is_empty() && pieces.output_storage.is_none()
+            && pieces.outtype.as_ref().is_some_and(|ty| ty.get_metatype() != type_metatype::TYPE_UNKNOWN)
+            && pieces.intypes.iter().all(|ty| ty.get_metatype() != type_metatype::TYPE_UNKNOWN)
+        {
+            if let Some(assigned) = assignment {
+                let origins = callable_input_origins(&assigned, pieces.intypes.len())?;
+                let logical = LogicalCallable::from_declaration(
+                    typefactory.model_binding_for(self.model().clone())?, pieces,
+                    self.is_dotdotdot(), !self.is_dotdotdot(), self.flags & (
+                        func_proto_flags::HAS_THISPTR | func_proto_flags::IS_CONSTRUCTOR
+                            | func_proto_flags::IS_DESTRUCTOR | func_proto_flags::NO_RETURN),
+                )?;
+                self.set_abi_first_vararg(physical_vararg_boundary(&origins, logical.logical_first));
+                self.retain_logical_callable(typefactory.get_type_code_proto(&logical)?, origins);
+            }
+        }
         Ok(())
     }
 
@@ -5743,17 +6612,17 @@ impl FuncProto {
         &mut self,
         pieces: &PrototypePieces,
         defaultfp: Rc<ProtoModel>,
-        void_type: Rc<Datatype>,
+        void_type: TypeRoot,
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
         // Seed the model + store the way setScope would, before update_all_types
         // (which needs both: it does setModel(model) and store->clearAllInputs()).
-        self.attach_internal_store(Rc::clone(&void_type));
+        self.attach_internal_store(void_type.clone());
         if pieces.outtype.is_none() && pieces.output_storage.is_none() {
             let mut input_only = pieces.clone();
             input_only.outtype = Some(void_type);
-            self.set_pieces(&input_only, Some(defaultfp), typefactory, manager)?;
+            self.set_pieces_with_source(&input_only, Some(defaultfp), typefactory, manager, false)?;
             self.set_output_lock(false);
             return Ok(());
         }
@@ -5785,11 +6654,28 @@ impl FuncProto {
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
+        self.update_all_types_assigned(proto, typefactory, manager).map(|_| ())
+    }
+
+    fn update_all_types_assigned(
+        &mut self,
+        proto: &PrototypePieces,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+    ) -> KunaResult<Option<Vec<ParameterPieces>>> {
+        self.source_variadic = None;
+        self.input_projections.clear();
+        self.source_output = None;
+        self.physical_only_inputs.clear();
+        self.source_void_input_lock = None;
+        self.logical_callable = None;
+        self.logical_input_origins.clear();
         self.set_model(self.model.clone()); // This resets extrapop
         self.store_mut().clear_all_inputs();
         self.store_mut().clear_output();
         self.flags &= !func_proto_flags::VOIDINPUTLOCK;
         self.set_dotdotdot(proto.first_var_arg_slot >= 0);
+        self.abi_first_vararg = None;
 
         let mut pieces: Vec<ParameterPieces> = Vec::new();
         let model = self.model().clone();
@@ -5811,11 +6697,13 @@ impl FuncProto {
             Err(KunaError::ParamUnassigned { .. }) => {
                 // ParamUnassignedError
                 self.flags |= func_proto_flags::ERROR_INPUTPARAM;
+                self.update_this_pointer();
+                return Ok(None);
             }
             Err(e) => return Err(e),
         }
         self.update_this_pointer();
-        Ok(())
+        Ok(Some(pieces))
     }
 
     // -- effect / query delegators (fspec.cc:4239-4622) ---------------------
@@ -5869,6 +6757,50 @@ impl FuncProto {
     pub fn push_effect_override(&mut self, eff: EffectRecord) {
         self.effectlist.push(eff);
         self.effectlist.sort_by(EffectRecord::compare_by_address);
+    }
+
+    /// Import host effect deltas over the model defaults (C++ `decodeEffect`).
+    /// Partial overlap is not an override of a whole storage record.
+    pub(crate) fn merge_effect_overrides(&mut self, effects: &[EffectRecord]) -> KunaResult<()> {
+        if effects.is_empty() {
+            return Ok(());
+        }
+        let mut merged = self.model().effect_list().to_vec();
+        let model_count = merged.len() as int4;
+        for effect in effects {
+            let slot = ProtoModel::lookup_record(
+                &merged, model_count, &effect.get_address(), effect.get_size(),
+            );
+            if slot == -2 {
+                return Err(KunaError::lowlevel(
+                    "Partial overlap of prototype override with existing effects",
+                ));
+            }
+            if slot >= 0 {
+                merged[slot as usize] = effect.clone();
+            } else {
+                merged.push(effect.clone());
+            }
+        }
+        merged.sort_by(EffectRecord::compare_by_address);
+        self.effectlist = merged;
+        Ok(())
+    }
+
+    /// Host likely-trash records augment, rather than replace, model defaults.
+    pub(crate) fn merge_likely_trash(&mut self, trash: &[VarnodeData]) {
+        if trash.is_empty() {
+            return;
+        }
+        let defaults = self.model().trash_list();
+        let mut merged = defaults.to_vec();
+        for register in trash {
+            if defaults.binary_search(register).is_err() {
+                merged.push(register.clone());
+            }
+        }
+        merged.sort_unstable();
+        self.likelytrash = merged;
     }
 
     /// Get the likely-trash list (C++ `trashBegin`/`trashEnd`).
@@ -6140,7 +7072,7 @@ impl FuncProto {
     /// `getThisPointerStorage`).
     pub fn get_this_pointer_storage(
         &self,
-        dt: Rc<Datatype>,
+        dt: TypeRoot,
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<Address> {
@@ -6330,6 +7262,20 @@ impl FuncProto {
     /// kuna's internal store follows the wire shape (input parameters travel
     /// as `<localdb>` category-0 symbols, `LocalSymbolMap.decodeSymbolList`).
     pub fn encode(&self, encoder: &mut dyn kuna_base::marshal::Encoder) -> KunaResult<()> {
+        self.encode_with_inputs(encoder, false)
+    }
+
+    /// Encode a self-contained call-site signature. Function responses instead
+    /// carry inputs in their localdb and continue to use `encode`.
+    pub fn encode_internal(&self, encoder: &mut dyn kuna_base::marshal::Encoder) -> KunaResult<()> {
+        self.encode_with_inputs(encoder, true)
+    }
+
+    fn encode_with_inputs(
+        &self,
+        encoder: &mut dyn kuna_base::marshal::Encoder,
+        include_inputs: bool,
+    ) -> KunaResult<()> {
         use kuna_base::marshal::{
             ATTRIB_CONSTRUCTOR, ATTRIB_DESTRUCTOR, ATTRIB_MODEL, ATTRIB_TYPELOCK,
         };
@@ -6383,6 +7329,9 @@ impl FuncProto {
         if outparam.is_type_locked() {
             encoder.write_bool(&ATTRIB_TYPELOCK, true);
         }
+        if outparam.is_indirect_storage() {
+            encoder.write_bool(&kuna_base::marshal::ATTRIB_INDIRECTSTORAGE, true);
+        }
         outparam.get_address().encode_sized(encoder, outparam.get_size())?;
         match outparam.get_type() {
             Some(t) => t.encode_ref(encoder)?,
@@ -6396,11 +7345,72 @@ impl FuncProto {
         encoder.close_element(&ELEM_RETURNSYM);
         self.encode_effect(encoder)?;
         self.encode_likely_trash(encoder)?;
+        if include_inputs {
+            use kuna_base::marshal::{
+                ATTRIB_NAME, ATTRIB_NAMELOCK, ATTRIB_THISPTR,
+                ATTRIB_INDIRECTSTORAGE, ATTRIB_HIDDENRETPARM,
+            };
+            use crate::remote_provider::{ELEM_INTERNALLIST, ELEM_PARAM};
+            encoder.open_element(&ELEM_INTERNALLIST);
+            if let Some(first) = self.abi_first_vararg {
+                encoder.write_signed_integer(&kuna_base::address::ATTRIB_FIRST, first as i64);
+            }
+            for slot in 0..self.num_params() {
+                let Some(param) = self.get_param(slot) else { continue };
+                encoder.open_element(&ELEM_PARAM);
+                if !param.get_name().is_empty() {
+                    encoder.write_string(&ATTRIB_NAME, param.get_name().as_bytes());
+                }
+                for (attribute, enabled) in [
+                    (&ATTRIB_TYPELOCK, param.is_type_locked()),
+                    (&ATTRIB_NAMELOCK, param.is_name_locked()),
+                    (&ATTRIB_THISPTR, param.is_this_pointer()),
+                    (&ATTRIB_INDIRECTSTORAGE, param.is_indirect_storage()),
+                    (&ATTRIB_HIDDENRETPARM, param.is_hidden_return()),
+                ] {
+                    if enabled { encoder.write_bool(attribute, true); }
+                }
+                param.get_address().encode_sized(encoder, param.get_size())?;
+                param.get_type().ok_or_else(|| {
+                    KunaError::lowlevel("Cannot encode an untyped prototype parameter")
+                })?.encode_ref(encoder)?;
+                encoder.close_element(&ELEM_PARAM);
+            }
+            encoder.close_element(&ELEM_INTERNALLIST);
+        }
         // <inject>: only when the caller resolved the fixup name (injectid>=0).
         // Without the resolver the id is silently dropped, matching a fixup-less
         // proto (Java skips the element anyway).
         encoder.close_element(&ELEM_PROTOTYPE);
         Ok(())
+    }
+
+    /// Describe the completed signature for override diagnostics.
+    pub fn print_raw(&self, name: &str, output: &mut String) {
+        use std::fmt::Write;
+        let model = self.model.as_ref().map(|m| m.get_name()).unwrap_or("(no model)");
+        fn write_type_name(p: &dyn ProtoParameter, output: &mut String) {
+            if let Some(root) = p.get_type() {
+                let view = root.read();
+                if let Ok(value) = view.get(root.id()) {
+                    output.push_str(value.get_name());
+                    return;
+                }
+            }
+            output.push_str("void");
+        }
+        let _ = write!(output, "{} ", model);
+        write_type_name(self.get_output(), output);
+        let _ = write!(output, " {}(", name);
+        for slot in 0..self.num_params() {
+            if slot != 0 { output.push(','); }
+            if let Some(param) = self.get_param(slot) { write_type_name(param, output); }
+        }
+        if self.is_dotdotdot() {
+            if self.num_params() != 0 { output.push(','); }
+            output.push_str("...");
+        }
+        let _ = write!(output, ") extrapop={}", self.extrapop);
     }
 
     /// Encode the effect-record overrides (C++ `FuncProto::encodeEffect`,
@@ -6521,6 +7531,22 @@ use crate::funcdata::Funcdata;
 use crate::kuna_restartlog::{KunaRestartReason, RestartLog};
 use crate::context::{OpId, VarnodeId};
 
+/// A locked call input selected before replacing the active trials.
+/// Byte selection is relative to the matched physical trial, not the SSA
+/// varnode's address, which may already be in unique space.
+#[derive(Debug, Clone, Copy)]
+pub enum CallInputTransfer {
+    Reuse { varnode: VarnodeId, lsb_offset: int4 },
+    Stack,
+}
+
+#[derive(Clone, Debug)]
+pub struct PhysicalCallInput {
+    pub operand_slot: int4,
+    pub address: Address,
+    pub size: int4,
+}
+
 /// A class for analyzing parameters to a sub-function call (C++
 /// `FuncCallSpecs`, `fspec.hh:1645`).
 ///
@@ -6590,6 +7616,16 @@ pub struct FuncCallSpecs {
     /// declares, while this call still carries the open tail it sheds after
     /// trial scoring. See [`crate::p4_calls::kuna_formattail`].
     format_arity: Option<int4>,
+    /// Operation-local target view synthesized by cast insertion from recovered
+    /// operands, rather than supplied by a callable declaration. Retaining its
+    /// exact identity lets dialect rendering distinguish inference from authority.
+    inferred_target_view: Option<TypeRoot>,
+    physical_requirements: Option<Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>,
+    execution_requirements: Option<Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>>,
+    execution_inputs_settled: bool,
+    physical_inputs: Vec<PhysicalCallInput>,
+    raw_call: bool,
+    execution_callable: Option<TypeRoot>,
 }
 
 impl FuncCallSpecs {
@@ -6624,6 +7660,13 @@ impl FuncCallSpecs {
             final_input_storage: Vec::new(), // (kuna) calleearity
             zext_trimmed: Vec::new(),        // (kuna) truncarg
             format_arity: None,              // (kuna) formatstring
+            inferred_target_view: None,
+            physical_requirements: None,
+            execution_requirements: None,
+            execution_inputs_settled: false,
+            physical_inputs: Vec::new(),
+            raw_call: false,
+            execution_callable: None,
         }
     }
 
@@ -6654,6 +7697,14 @@ impl FuncCallSpecs {
         res.isbadjumptable = self.isbadjumptable;
         res.proto.copy(&self.proto); // Copy the FuncProto portion
         res.format_arity = self.format_arity;
+        res.physical_requirements.clone_from(&self.physical_requirements);
+        res.execution_requirements.clone_from(&self.execution_requirements);
+        res.execution_inputs_settled = self.execution_inputs_settled;
+        res.physical_inputs.clone_from(&self.physical_inputs);
+        res.raw_call = self.raw_call;
+        res.execution_callable.clone_from(&self.execution_callable);
+        // Target-view inference belongs to late cast insertion at the original
+        // operation, not to a fresh analysis or jump-table recovery clone.
         res
     }
 
@@ -6665,7 +7716,230 @@ impl FuncCallSpecs {
     }
     /// The `FuncProto` base, mutably.
     pub fn proto_mut(&mut self) -> &mut FuncProto {
+        self.inferred_target_view = None;
         &mut self.proto
+    }
+
+    pub(crate) fn inferred_target_view(&self) -> Option<&TypeRoot> {
+        self.inferred_target_view.as_ref()
+    }
+
+    pub fn physical_requirements(&self) -> Option<&Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>> {
+        self.physical_requirements.as_ref()
+    }
+
+    pub fn physical_inputs(&self) -> &[PhysicalCallInput] { &self.physical_inputs }
+    pub fn requires_raw_call(&self) -> bool { self.raw_call }
+    pub fn execution_callable(&self) -> Option<&TypeRoot> { self.execution_callable.as_ref() }
+
+    /// Install metadata only after the named SSA operands have been attached.
+    pub fn set_physical_inputs(&mut self, inputs: Vec<PhysicalCallInput>, raw: bool) {
+        self.physical_inputs = inputs;
+        self.raw_call = raw;
+    }
+
+    pub fn set_execution_callable(&mut self, callable: Option<TypeRoot>) {
+        self.execution_callable = callable;
+    }
+
+    pub(crate) fn physical_input_inserted(&mut self, slot: int4) {
+        for input in &mut self.physical_inputs {
+            if input.operand_slot >= slot { input.operand_slot += 1; }
+        }
+    }
+
+    pub(crate) fn physical_input_removed(&mut self, slot: int4) {
+        self.physical_inputs.retain(|input| input.operand_slot != slot);
+        for input in &mut self.physical_inputs {
+            if input.operand_slot > slot { input.operand_slot -= 1; }
+        }
+    }
+
+    /// Rebuild a detached call specification's inputs without dropping machine
+    /// state that has no place in its source parameter list.
+    pub(crate) fn set_input_operands(&mut self, data: &mut Funcdata, inputs: &mut Vec<VarnodeId>) -> KunaResult<()> {
+        let mut extra_state = Vec::new();
+        for input in &self.physical_inputs {
+            let covered = (0..self.proto.num_params()).any(|slot| {
+                let parameter = self.proto.get_param(slot).expect("physical parameter");
+                let at = parameter.get_address();
+                at.get_space().zip(input.address.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+                    && at.get_offset() <= input.address.get_offset()
+                    && at.get_offset() + parameter.get_size() as u64 >= input.address.get_offset() + input.size as u64
+            });
+            if !covered {
+                let value = data.obank().get(self.op).and_then(|op| op.get_in(input.operand_slot))
+                    .ok_or_else(|| KunaError::lowlevel("Missing retained raw call state"))?;
+                if data.vbank().get(value).is_none_or(|value| value.get_size() != input.size) {
+                    return Err(KunaError::lowlevel("Retained raw call state has wrong width"));
+                }
+                let mut retained = input.clone();
+                retained.operand_slot = inputs.len() as int4;
+                inputs.push(value);
+                extra_state.push(retained);
+            }
+        }
+        if !extra_state.is_empty() { self.raw_call = true; }
+        data.op_set_all_input(self.op, inputs)?;
+        self.physical_inputs = self.collect_physical_inputs(data)?;
+        self.physical_inputs.extend(extra_state);
+        Ok(())
+    }
+
+    pub(crate) fn collect_physical_inputs(&self, data: &Funcdata) -> KunaResult<Vec<PhysicalCallInput>> {
+        if !self.proto.has_execution_signature() && self.execution_callable.is_none() && !self.raw_call { return Ok(Vec::new()); }
+        let operation = data.obank().get(self.op).ok_or_else(|| KunaError::lowlevel("Missing physical call operation"))?;
+        let mut inputs = Vec::with_capacity(self.proto.num_params() as usize);
+        for slot in 0..self.proto.num_params() {
+            let parameter = self.proto.get_param(slot).expect("physical call parameter");
+            let operand_slot = slot + 1;
+            let value = operation.get_in(operand_slot).and_then(|id| data.vbank().get(id))
+                .ok_or_else(|| KunaError::lowlevel("Missing physical call input operand"))?;
+            if value.get_size() != parameter.get_size() {
+                return Err(KunaError::lowlevel("Physical call input operand has wrong width"));
+            }
+            inputs.push(PhysicalCallInput { operand_slot, address: parameter.get_address(), size: parameter.get_size() });
+        }
+        Ok(inputs)
+    }
+
+    pub fn set_physical_requirements(&mut self, requirements: Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>) {
+        self.physical_requirements = Some(requirements);
+    }
+
+    pub fn clear_physical_requirements(&mut self) {
+        self.physical_requirements = None;
+        self.execution_requirements = None;
+        self.execution_inputs_settled = false;
+    }
+
+    pub fn execution_requirements(&self) -> Option<&Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>> {
+        self.execution_requirements.as_ref()
+    }
+
+    pub fn set_execution_requirements(&mut self, requirements: Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>) {
+        self.execution_requirements = Some(requirements);
+    }
+
+    pub fn execution_inputs_settled(&self) -> bool { self.execution_inputs_settled }
+
+    pub(crate) fn input_requirements(&self) -> Option<&Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>> {
+        if self.execution_inputs_settled { self.execution_requirements.as_ref() }
+        else { self.physical_requirements.as_ref() }
+    }
+
+    /// Settle a generated call's conditional input contract only after its
+    /// producer proof. Until then its raw requirements and real operands live.
+    /// If any selected read is not represented by the fixed interface, leave
+    /// the entire raw boundary intact rather than trimming part of its state.
+    pub fn discharge_execution_inputs(
+        &mut self, data: &mut Funcdata,
+        requirements: Rc<crate::p4_calls::kuna_physicalinputs::EntryRequirements>,
+    ) -> KunaResult<bool> {
+        if self.execution_callable.is_none() || self.is_input_active() || self.proto.is_dotdotdot()
+            || (!requirements.is_complete()
+                && requirements.execution.as_ref().is_none_or(|execution| !execution.complete))
+        { return Ok(false); }
+        for (read, size) in &requirements.reads {
+            let Some(space) = read.get_space() else { return Ok(false) };
+            let Some(end) = read.get_offset().checked_add(*size as u64).filter(|_| *size > 0) else { return Ok(false) };
+            let mut cursor = read.get_offset();
+            while cursor < end {
+                let mut covered = cursor;
+                let mut cover = |at: &Address, bytes: int4| {
+                    if bytes > 0 && at.get_space().is_some_and(|other| Rc::ptr_eq(space, other))
+                        && at.get_offset() <= cursor {
+                        covered = covered.max(at.get_offset().saturating_add(bytes as u64));
+                    }
+                };
+                for slot in 0..self.proto.num_params() {
+                    let parameter = self.proto.get_param(slot).expect("execution input");
+                    cover(&parameter.get_address(), parameter.get_size());
+                }
+                for (address, bytes) in &requirements.bookkeeping { cover(address, *bytes); }
+                if covered <= cursor { return Ok(false); }
+                cursor = covered.min(end);
+            }
+        }
+        // Validate before mutating: these are the actual raw values captured by
+        // FuncLink, not a freshly manufactured fallback after losing SSA state.
+        for input in &self.physical_inputs {
+            let value = data.obank().get(self.op).and_then(|op| op.get_in(input.operand_slot))
+                .and_then(|vn| data.vbank().get(vn))
+                .ok_or_else(|| KunaError::lowlevel("Missing conditional call input"))?;
+            if value.get_size() != input.size {
+                return Err(KunaError::lowlevel("Conditional call input changed width"));
+            }
+        }
+        let mut changed = self.raw_call || !self.execution_inputs_settled;
+        let count = data.obank().get(self.op).ok_or_else(|| KunaError::lowlevel("Missing conditional call"))?.num_input();
+        for slot in (self.proto.num_params() + 1..count).rev() {
+            if self.physical_inputs.iter().any(|input| input.operand_slot == slot) {
+                data.op_remove_input(self.op, slot);
+                self.physical_input_removed(slot);
+                changed = true;
+            }
+        }
+        self.execution_requirements = Some(requirements);
+        self.execution_inputs_settled = true;
+        self.raw_call = false;
+        Ok(changed)
+    }
+
+    /// Trim only an admitted mapped-body premise already replayed by the
+    /// current SSA consumer. Unlike complete-child discharge, this does not
+    /// manufacture or install a complete execution requirements summary.
+    pub(crate) fn discharge_deferred_inputs(&mut self, data: &mut Funcdata,
+        contract: Rc<crate::p4_calls::kuna_callabletransport::DeferredBodyContract>) -> KunaResult<bool>
+    {
+        if self.is_input_active() || self.proto.is_dotdotdot()
+            || !crate::p4_calls::kuna_callabletransport::deferred_family_matches(data, self, &contract)?
+        { return Ok(false); }
+        self.trim_proven_body_inputs(data)
+    }
+
+    /// Generated target bodies owe their exact current family and SSA proof;
+    /// discharging raw operands never upgrades their original raw summaries.
+    pub(crate) fn discharge_generated_inputs(&mut self, data: &mut Funcdata,
+        contract: Rc<crate::p4_calls::kuna_callabletransport::GeneratedCallContract>) -> KunaResult<bool>
+    {
+        if self.is_input_active() || self.proto.is_dotdotdot()
+            || !crate::p4_calls::kuna_callabletransport::generated_family_matches(data, self, &contract)?
+        { return Ok(false); }
+        self.trim_proven_body_inputs(data)
+    }
+
+    fn trim_proven_body_inputs(&mut self, data: &mut Funcdata) -> KunaResult<bool> {
+        // The caller proves exact family/source/callback/current SSA state
+        // immediately before replace_call_specs moves this same call out. No
+        // p-code edits intervene; validate all captured values before mutation.
+        for input in &self.physical_inputs {
+            let value = data.obank().get(self.op).and_then(|op| op.get_in(input.operand_slot))
+                .and_then(|vn| data.vbank().get(vn))
+                .ok_or_else(|| KunaError::lowlevel("Missing proven body call input"))?;
+            if value.get_size() != input.size {
+                return Err(KunaError::lowlevel("Proven body call input changed width"));
+            }
+        }
+        let count = data.obank().get(self.op)
+            .ok_or_else(|| KunaError::lowlevel("Missing proven body call"))?.num_input();
+        for slot in self.proto.num_params() + 1..count {
+            if !self.physical_inputs.iter().any(|input| input.operand_slot == slot) { return Ok(false); }
+        }
+        let mut changed = self.raw_call || !self.execution_inputs_settled;
+        for slot in (self.proto.num_params() + 1..count).rev() {
+            data.op_remove_input(self.op, slot);
+            self.physical_input_removed(slot);
+            changed = true;
+        }
+        self.execution_requirements = None;
+        self.execution_inputs_settled = true;
+        self.raw_call = false;
+        Ok(changed)
+    }
+
+    pub(crate) fn set_inferred_target_view(&mut self, view: Option<TypeRoot>) {
+        self.inferred_target_view = view;
     }
 
     // -- simple call-site accessors (fspec.hh:1680-1706) --------------------
@@ -7109,25 +8383,67 @@ impl FuncCallSpecs {
     /// Update this prototype to match a more specialized (locked) prototype
     /// (C++ `FuncCallSpecs::lateRestriction`, `fspec.cc:5413`).
     ///
-    /// On success `this` is converted to `restricted_proto` and the new input /
-    /// output Varnode lists are passed back.  When `restricted_proto` is
-    /// input/output locked the transfer of the existing Varnodes reaches the W3
-    /// CALL operands; that transfer (`transferLockedInput`/`Output`) is the
-    /// `// STUB(w6-fspec-3 W4)` path below.  The unlocked compatibility gate
-    /// (`hasModel`/`isCompatible`/dotdotdot) is ported in full.
+    /// On success `this` is converted to `restricted_proto`. Input transfers
+    /// preserve each matched trial's least-significant-byte offset, and output
+    /// Varnodes are selected for the later commit. Selection creates no Pcode:
+    /// an unavailable input or incompatible output can still request restart.
     pub fn late_restriction(
         &mut self,
         data: &Funcdata,
         restricted_proto: &FuncProto,
-        newinput: &mut Vec<Option<VarnodeId>>,
+        newinput: &mut Vec<CallInputTransfer>,
         newoutput: &mut Vec<VarnodeId>,
     ) -> KunaResult<bool> {
-        if !self.proto.has_model() {
-            self.proto.copy(restricted_proto);
-            return Ok(true);
-        }
-
-        if !self.proto.is_compatible(restricted_proto) {
+        let mut execution;
+        let restricted_proto = if self.execution_requirements.is_some() || self.physical_requirements.is_some() || self.execution_callable.is_some() {
+            execution = FuncProto::new();
+            execution.copy(restricted_proto);
+            let arch = data.get_arch();
+            let factory = arch.types().ok_or_else(|| KunaError::lowlevel("Physical call refinement requires a type factory"))?;
+            if !self.entryaddress.is_invalid()
+                && data.obank().get(self.op).is_some_and(|op| op.code() == OpCode::CPUI_CALL) {
+                if let Some(raw) = self.physical_requirements.as_ref() {
+                    crate::p4_calls::kuna_physicalinputs::close_finite_variadic_inputs(
+                        &mut execution, raw, arch.manage(),
+                    )?;
+                }
+            }
+            if let Some(requirements) = self.execution_requirements.as_ref().or(self.physical_requirements.as_ref()) {
+                crate::p4_calls::kuna_physicalinputs::apply_ssa_requirements(
+                    &mut execution, requirements, arch.manage(), factory,
+                )?;
+            }
+            if let Some(code) = self.execution_callable.as_ref() {
+                // The callable root describes C value types, not custom physical
+                // storage. Exact ranges come from this site's retained contract.
+                let (inputs, output) = {
+                    let view = code.read();
+                    let id = view.resolve_alias(code.id())?;
+                    let declaration = view.get_code_prototype(id)?.ok_or_else(||
+                        KunaError::lowlevel("Execution datatype has no callable signature"))?;
+                    (declaration.inputs.clone(), declaration.output)
+                };
+                if execution.num_params() as usize != inputs.len() {
+                    return Err(KunaError::lowlevel("Execution callable does not account for retained physical inputs"));
+                }
+                for (slot, datatype) in inputs.into_iter().enumerate() {
+                    let slot = slot as int4;
+                    let datatype = code.related(datatype)?;
+                    let current = execution.get_param(slot).expect("retained execution input");
+                    if current.get_size() != datatype.get_size() {
+                        return Err(KunaError::lowlevel("Execution callable type changes retained physical width"));
+                    }
+                    if current.get_type() == Some(&datatype) { continue; }
+                    if execution.source_param(slot).is_none() {
+                        return Err(KunaError::lowlevel("Physical-only execution input requires its numeric carrier type"));
+                    }
+                    execution.install_execution_input_type(slot, datatype)?;
+                }
+                execution.install_execution_output_type(code.related(output)?)?;
+            }
+            &execution
+        } else { restricted_proto };
+        if self.proto.has_model() && !self.proto.is_compatible(restricted_proto) {
             return Ok(false);
         }
         if restricted_proto.is_dotdotdot() && !self.isinputactive {
@@ -7156,12 +8472,10 @@ impl FuncCallSpecs {
     ///
     /// `newfd_entry`/`newfd_name`/`newproto` mirror the callee `Funcdata`'s
     /// `getAddress()`/`getDisplayName()`/`getFuncProto()` (a cross-function W4
-    /// reference).  The state mutation on `data` (the CALL op becomes a direct
-    /// `CPUI_CALL` annotated with the call-spec handle, the override store
-    /// gets an indirect override) reaches W4 `Funcdata` surfaces and is the
-    /// `// STUB(w6-fspec-3 W4)` path.  The **decision** — whether
-    /// `lateRestriction` succeeds, and the restart-recorder call when it does
-    /// not — is ported in full and observable through `restartlog`.
+    /// reference). The CALL becomes a direct `CPUI_CALL` with a call-spec
+    /// handle, and the override store retains the resolved destination.
+    /// Compatible locked inputs commit their selected physical byte ranges;
+    /// unavailable transfers request a restart recorded in `restartlog`.
     #[allow(clippy::too_many_arguments)]
     pub fn deindirect(
         &mut self,
@@ -7198,9 +8512,22 @@ impl FuncCallSpecs {
         data.get_override_mut().insert_indirect_override(site, newfd_entry);
 
         // Try our best to merge existing prototype with the one just handed.
-        let mut newinput: Vec<Option<VarnodeId>> = Vec::new();
+        let mut newinput = Vec::new();
         let mut newoutput: Vec<VarnodeId> = Vec::new();
         if !newproto_no_return && !newproto_inline {
+            // Target discovery happened after the translator-owning prepass.
+            // Request its physical requirements before any locked narrowing.
+            // Without a load image, reflow cannot recover target machine facts;
+            // retain the supplied IR restriction contract.
+            if data.get_arch().loader.is_some()
+                && self.physical_requirements.is_none()
+                && (crate::p4_calls::kuna_physicalinputs::has_narrow_source(newproto)
+                    || crate::p4_calls::kuna_physicalinputs::has_narrow_source(&self.proto))
+            {
+                data.set_restart_pending(true);
+                restartlog.record_at(data, KunaRestartReason::ProtoDeindirect, &self.op_addr(data));
+                return Ok(());
+            }
             if self.proto.is_override() {
                 // If we are overridden at the call-site, don't use the
                 // discovered function prototype.
@@ -7224,30 +8551,37 @@ impl FuncCallSpecs {
     /// Force a more restrictive prototype on this call site (C++
     /// `FuncCallSpecs::forceSet`, `fspec.cc:5491`).
     ///
-    /// The C++ records the recovered prototype into the override manager
-    /// (`insertProtoOverride`), tries `lateRestriction`, commits or schedules a
-    /// restart, then locks the input.  The override insertion and the
-    /// success-commit are W4 `Funcdata` surfaces (`// STUB(w6-fspec-3 W4)`); the
-    /// restart-recorder branch and the input-lock bookkeeping are ported in full.
+    /// Persist the recovered fact at this callpoint before attempting the late
+    /// restriction. Existing site authority is never replaced by a datatype.
+    /// A failed transfer restarts from the persisted fact; a successful transfer
+    /// updates the actual CALL operands and result immediately.
     pub fn force_set(
         &mut self,
         data: &mut Funcdata,
         fp: &FuncProto,
         restartlog: &mut RestartLog,
     ) -> KunaResult<()> {
-        let mut newinput: Vec<Option<VarnodeId>> = Vec::new();
+        let site = self.op_addr(data);
+        if self.proto.is_override() || data.get_override().find_proto_override(&site).is_some() {
+            return Ok(());
+        }
+        let mut newinput = Vec::new();
         let mut newoutput: Vec<VarnodeId> = Vec::new();
+        let mut restricted = FuncProto::new();
+        restricted.copy(fp);
+        restricted.set_input_lock(true);
+        let pinned = restricted.source_prototype();
+        data.get_override_mut().insert_proto_override(site.clone(), pinned);
 
-        // data.getOverride().insertProtoOverride(op->getAddr(), copy(fp));
-        // STUB(w6-fspec-3 W4): the override store is a W4 Funcdata surface.
-
-        if self.late_restriction(data, fp, &mut newinput, &mut newoutput)? {
-            // commitNewInputs/commitNewOutputs — STUB(w6-fspec-3 W4)
+        if !restricted.is_no_return() && !restricted.is_inline()
+            && self.late_restriction(data, &restricted, &mut newinput, &mut newoutput)? {
+            self.commit_new_inputs(data, &mut newinput)?;
+            self.commit_new_outputs(data, &mut newoutput)?;
+            self.proto.set_override(true);
         } else {
             // Too late to make restrictions to correct prototype: force a restart.
             data.set_restart_pending(true);
             // (kuna) restart observability
-            let site = self.op_addr(data);
             restartlog.record_at(data, KunaRestartReason::ProtoForced, &site);
         }
         // Regardless of what happened, lock the prototype so it doesn't happen again.
@@ -7336,6 +8670,7 @@ impl FuncCallSpecs {
             .num_input();
         let loadval = data.op_stack_load(spacebase, 0, 1, self.op, None, false)?;
         data.op_insert_input(self.op, loadval, slot)?;
+        self.physical_input_inserted(slot);
         self.set_stack_placeholder_slot(slot);
         if let Some(v) = data.vbank_mut().get_mut(loadval) {
             v.set_spacebase_placeholder();
@@ -7459,6 +8794,7 @@ impl FuncCallSpecs {
                 .expect("abortSpacebaseRelative: stale call op")
                 .get_in(slot);
             data.op_remove_input(self.op, slot);
+            self.physical_input_removed(slot);
             self.clear_stack_placeholder_slot();
             // Remove the op producing the placeholder as well, if it is a dead
             // internal write.
@@ -7483,47 +8819,55 @@ impl FuncCallSpecs {
 
     // -- locked-parameter transfer helpers (fspec.cc:5043-5144) -------------
 
-    /// Get the index of the CALL input Varnode matching `param`, or the encoded
-    /// slot (C++ `FuncCallSpecs::transferLockedInputParam`, `fspec.cc:5043`).
-    ///
-    /// Returns `0` if the Varnode can't be built, `slot#` (>0) to reuse an
-    /// input, or `-1` to build from the stack.
-    fn transfer_locked_input_param(&self, param: &dyn ProtoParameter) -> int4 {
+    /// Select the CALL operand and byte range matching `param`, or a stack
+    /// load. The trial describes physical storage even if the operand is an
+    /// unrelated unique-space SSA value.
+    fn transfer_locked_input_param(
+        &self, data: &Funcdata, param: &dyn ProtoParameter,
+    ) -> KunaResult<Option<CallInputTransfer>> {
         let numtrials = self.activeinput.get_num_trials();
-        let startaddr = param.get_address().clone();
+        let startaddr = param.get_address();
         let sz = param.get_size();
-        let lastaddr = &startaddr + ((sz - 1) as i64);
         for i in 0..numtrials {
             let curtrial = self.activeinput.get_trial(i);
-            if startaddr < *curtrial.get_address() {
+            let lsb_offset = storage_justified_contain(
+                curtrial.get_address(), curtrial.get_size(), &startaddr, sz,
+            )?;
+            if lsb_offset < 0 {
                 continue;
             }
-            let trialend = curtrial.get_address() + ((curtrial.get_size() - 1) as i64);
-            if trialend < lastaddr {
-                continue;
+            if curtrial.is_definitely_not_used() || curtrial.get_slot() <= 0 {
+                return Ok(None);
             }
-            if curtrial.is_definitely_not_used() {
-                return 0; // Trial has already been stripped
+            let Some(varnode) = data.obank().get(self.op)
+                .expect("transferLockedInputParam: stale call op").get_in(curtrial.get_slot())
+            else { return Ok(None) };
+            let operand_size = data.vbank().get(varnode)
+                .expect("transferLockedInputParam: stale input vn").get_size();
+            // build_input_from_trials anchors a wider operand's trial at its
+            // least-significant bytes. A narrower operand has no such guarantee.
+            if operand_size < curtrial.get_size()
+                || lsb_offset.checked_add(sz).is_none_or(|end| end > operand_size) {
+                return Ok(None);
             }
-            return curtrial.get_slot();
+            return Ok(Some(CallInputTransfer::Reuse { varnode, lsb_offset }));
         }
         if startaddr.get_space().map(|s| s.get_type()) == Some(spacetype::IPTR_SPACEBASE) {
-            return -1;
+            return Ok(Some(CallInputTransfer::Stack));
         }
-        0
+        Ok(None)
     }
 
     /// List and/or create a Varnode for each input parameter matching a source
     /// prototype (C++ `FuncCallSpecs::transferLockedInput`, `fspec.cc:5105`).
     ///
-    /// `None` entries in `newinput` indicate stack parameters.  The op-input
-    /// reuse path reads the CALL operands (the W3 op, via `data`); the stack
-    /// path needs a spacebase placeholder.  Returns `false` only if a stack
-    /// variable is needed and there is no placeholder.
+    /// Reused inputs retain their trial-derived byte selection. Stack inputs
+    /// need a spacebase placeholder. Missing operands or unavailable storage
+    /// return `false` without constructing any Pcode.
     fn transfer_locked_input(
         &self,
         data: &Funcdata,
-        newinput: &mut Vec<Option<VarnodeId>>,
+        newinput: &mut Vec<CallInputTransfer>,
         source: &FuncProto,
     ) -> KunaResult<bool> {
         // Always keep the call destination address (op->getIn(0)).
@@ -7532,24 +8876,17 @@ impl FuncCallSpecs {
             .get(self.op)
             .expect("transferLockedInput: stale call op")
             .get_in(0);
-        newinput.push(in0);
+        let Some(in0) = in0 else { return Ok(false) };
+        newinput.push(CallInputTransfer::Reuse { varnode: in0, lsb_offset: 0 });
         let numparams = source.num_params();
         let mut stackref: Option<VarnodeId> = None;
         let mut stackref_resolved = false;
         for i in 0..numparams {
             let param = source.get_param(i).expect("transferLockedInput: source param missing");
-            let reuse = self.transfer_locked_input_param(param);
-            if reuse == 0 {
+            let Some(transfer) = self.transfer_locked_input_param(data, param)? else {
                 return Ok(false);
-            }
-            if reuse > 0 {
-                let vn = data
-                    .obank()
-                    .get(self.op)
-                    .expect("transferLockedInput: stale call op")
-                    .get_in(reuse);
-                newinput.push(vn);
-            } else {
+            };
+            if matches!(transfer, CallInputTransfer::Stack) {
                 if !stackref_resolved {
                     stackref = self.get_spacebase_relative(data);
                     stackref_resolved = true;
@@ -7557,8 +8894,8 @@ impl FuncCallSpecs {
                 if stackref.is_none() {
                     return Ok(false);
                 }
-                newinput.push(None);
             }
+            newinput.push(transfer);
         }
         Ok(true)
     }
@@ -7581,7 +8918,18 @@ impl FuncCallSpecs {
         // param.  Before output recovery runs there is no output Varnode yet (the
         // common deindirect case): the list comes back empty and the result is still
         // accurate (the C++ always returns true).
-        self.transfer_locked_output_param(data, param, newoutput);
+        self.transfer_locked_output_param(data, param, newoutput)?;
+        // Expanding the restricted result back into an older JOIN requires
+        // reconstructing its other physical pieces, not arithmetic in JOIN
+        // space. Restart with the already-pinned ABI instead of manufacturing
+        // an invalid extension from cross-space containment.
+        if newoutput.iter().any(|&id| data.vbank().get(id).is_some_and(|vn|
+            vn.get_size() > param.get_size()
+                && vn.get_addr().get_space().is_some_and(|space|
+                    space.get_type() == spacetype::IPTR_JOIN)))
+        {
+            return Ok(false);
+        }
         Ok(true)
     }
 
@@ -7592,15 +8940,15 @@ impl FuncCallSpecs {
         data: &Funcdata,
         param: &dyn ProtoParameter,
         newoutput: &mut Vec<VarnodeId>,
-    ) {
+    ) -> KunaResult<()> {
         let paddr = param.get_address();
         let psize = param.get_size();
         if let Some(out) = data.obank().get(self.op).and_then(|o| o.get_out()) {
             if let Some(vn) = data.vbank().get(out) {
                 let vaddr = vn.get_addr();
                 let vsize = vn.get_size();
-                if paddr.justified_contain(psize, vaddr, vsize, false) >= 0
-                    || vaddr.justified_contain(vsize, &paddr, psize, false) >= 0
+                if storage_justified_contain(&paddr, psize, vaddr, vsize)? >= 0
+                    || storage_justified_contain(vaddr, vsize, &paddr, psize)? >= 0
                 {
                     newoutput.push(out);
                 }
@@ -7620,8 +8968,8 @@ impl FuncCallSpecs {
                     let vn = data.vbank().get(out).expect("transferLockedOutputParam: stale out");
                     let vaddr = vn.get_addr();
                     let vsize = vn.get_size();
-                    if paddr.justified_contain(psize, vaddr, vsize, false) >= 0
-                        || vaddr.justified_contain(vsize, &paddr, psize, false) >= 0
+                    if storage_justified_contain(&paddr, psize, vaddr, vsize)? >= 0
+                        || storage_justified_contain(vaddr, vsize, &paddr, psize)? >= 0
                     {
                         newoutput.push(out);
                     }
@@ -7629,25 +8977,26 @@ impl FuncCallSpecs {
             }
             indop = data.op_previous_op(io);
         }
+        Ok(())
     }
 
     /// Build the Varnode matching a (locked) input parameter from existing
-    /// data-flow (C++ `FuncCallSpecs::buildParam`, `fspec.cc:5010`).  `vn` is the
-    /// reused CALL input Varnode (or `None` for a stack parameter), `stackref` the
-    /// resolved spacebase Varnode.  Truncates an over-wide input through a SUBPIECE
-    /// or loads a stack parameter; returns the Varnode to install as the CALL input.
+    /// data-flow (C++ `FuncCallSpecs::buildParam`, `fspec.cc:5010`). `transfer`
+    /// selects bytes from a reused CALL input or requests a stack load using
+    /// `stackref`. SUBPIECE uses the physical trial's captured LSB offset,
+    /// not an offset inferred from the current SSA varnode's address.
     fn build_param(
         &self,
         data: &mut Funcdata,
-        vn: Option<VarnodeId>,
+        transfer: CallInputTransfer,
         param_addr: &Address,
         param_size: int4,
         stackref: Option<VarnodeId>,
     ) -> KunaResult<VarnodeId> {
         let opaddr =
             data.obank().get(self.op).expect("buildParam: stale call op").get_addr().clone();
-        let vn = match vn {
-            None => {
+        let (vn, lsb_offset) = match transfer {
+            CallInputTransfer::Stack => {
                 // Need to build a spacebase relative varnode.
                 let spc = std::rc::Rc::clone(
                     param_addr.get_space().expect("buildParam: param has no space"),
@@ -7662,10 +9011,10 @@ impl FuncCallSpecs {
                     false,
                 );
             }
-            Some(v) => v,
+            CallInputTransfer::Reuse { varnode, lsb_offset } => (varnode, lsb_offset),
         };
         let vsize = data.vbank().get(vn).expect("buildParam: stale input vn").get_size();
-        if vsize == param_size {
+        if vsize == param_size && lsb_offset == 0 {
             return Ok(vn);
         }
         let newop = data.new_op(2, opaddr);
@@ -7683,20 +9032,20 @@ impl FuncCallSpecs {
             }
         };
         data.op_set_input(newop, use_vn, 0)?;
-        let c0 = data.new_constant(4, 0);
-        data.op_set_input(newop, c0, 1)?;
+        let offset = data.new_constant(4, lsb_offset as uintb);
+        data.op_set_input(newop, offset, 1)?;
         data.op_insert_before(newop, self.op);
         Ok(newout)
     }
 
     /// Update the CALL input Varnodes to reflect the locked formal input parameters
     /// (C++ `FuncCallSpecs::commitNewInputs`, `fspec.cc:5155`).  `newinput` holds
-    /// the old input Varnodes (slot 0 = call destination) and is rewritten in place
-    /// to the new inputs before being installed with `opSetAllInput`.
+    /// the selected inputs (slot 0 = call destination), including byte offsets
+    /// captured before trial replacement, and is rewritten to committed inputs.
     fn commit_new_inputs(
         &mut self,
         data: &mut Funcdata,
-        newinput: &mut Vec<Option<VarnodeId>>,
+        newinput: &mut Vec<CallInputTransfer>,
     ) -> KunaResult<()> {
         if !self.is_input_locked() {
             return Ok(());
@@ -7729,7 +9078,7 @@ impl FuncCallSpecs {
                 (a, param.get_size(), is_sb)
             };
             let vn = self.build_param(data, newinput[(1 + i) as usize], &paddr, psize, stackref)?;
-            newinput[(1 + i) as usize] = Some(vn);
+            newinput[(1 + i) as usize] = CallInputTransfer::Reuse { varnode: vn, lsb_offset: 0 };
             self.activeinput.register_trial(&paddr, psize);
             self.activeinput.get_trial_mut(i).mark_active(); // not optional
             if noplacehold && pspace_is_spacebase {
@@ -7744,12 +9093,14 @@ impl FuncCallSpecs {
         }
         if let Some(ph) = placeholder {
             // Still need a placeholder: add it at the end of the parameters.
-            newinput.push(Some(ph));
+            newinput.push(CallInputTransfer::Reuse { varnode: ph, lsb_offset: 0 });
             self.set_stack_placeholder_slot((newinput.len() - 1) as int4);
         }
-        let all: Vec<VarnodeId> =
-            newinput.iter().map(|v| v.expect("commitNewInputs: null input after build")).collect();
-        data.op_set_all_input(self.op, &all)?;
+        let mut all: Vec<VarnodeId> = newinput.iter().map(|transfer| match transfer {
+            CallInputTransfer::Reuse { varnode, .. } => *varnode,
+            CallInputTransfer::Stack => unreachable!("commitNewInputs: unbuilt stack input"),
+        }).collect();
+        self.set_input_operands(data, &mut all)?;
         if !self.is_dotdotdot() {
             self.clear_active_input();
         } else if num_passes > 0 {
@@ -7789,7 +9140,8 @@ impl FuncCallSpecs {
         let exact_match = newoutput
             .iter()
             .copied()
-            .find(|v| data.vbank().get(*v).map(|vn| vn.get_size()) == Some(psize));
+            .find(|v| data.vbank().get(*v).is_some_and(|vn|
+                vn.get_size() == psize && vn.get_addr() == &paddr));
 
         let opaddr =
             data.obank().get(self.op).expect("commitNewOutputs: stale call op").get_addr().clone();
@@ -7840,8 +9192,13 @@ impl FuncCallSpecs {
                 };
                 let overlap = {
                     let ov = data.vbank().get(old_out).expect("commitNewOutputs: stale oldOut");
-                    overlap_addr(ov.get_addr(), ov.get_size(), &realout_addr, realout_size)
+                    storage_justified_contain(
+                        &realout_addr, realout_size, ov.get_addr(), ov.get_size(),
+                    )?
                 };
+                if overlap < 0 {
+                    return Err(KunaError::lowlevel("Return piece lies outside committed ABI storage"));
+                }
                 data.op_set_input(sub, real_out, 0)?;
                 let c = data.new_constant(4, overlap as uintb);
                 data.op_set_input(sub, c, 1)?;
@@ -7938,6 +9295,21 @@ impl FuncCallSpecs {
                     }
                     data.op_set_output(last_op, old_out)?; // redefinition complete
                 }
+            } else {
+                // Equivalent full-width physical storage can differ from the
+                // declared JOIN address (notably single-piece joins).
+                let copy = if let Some(io) = ind_op {
+                    data.op_uninsert(io);
+                    data.op_remove_input(io, 1);
+                    io
+                } else {
+                    let copy = data.new_op(1, opaddr.clone());
+                    data.op_set_output(copy, old_out)?;
+                    copy
+                };
+                data.op_set_opcode_code(copy, OpCode::CPUI_COPY);
+                data.op_set_input(copy, real_out, 0)?;
+                data.op_insert_after(copy, self.op);
             }
         }
         self.clear_active_output();
@@ -7945,22 +9317,43 @@ impl FuncCallSpecs {
     }
 }
 
-/// Relative point of overlap of `[addr, addr+size)` against another range
-/// (C++ `Varnode::overlap(const Address&,int4)` little-endian path,
-/// `varnode.cc`).  The deindirect commit only runs on processor (non-join)
-/// addresses; the big-endian justification is handled by the caller's address
-/// arithmetic, matching `Address::overlap`.
-fn overlap_addr(addr: &Address, size: int4, op: &Address, opsize: int4) -> int4 {
-    if !addr.is_big_endian() {
-        addr.overlap(0, op, opsize)
-    } else {
-        let over = addr.overlap(size - 1, op, opsize);
-        if over != -1 {
-            opsize - 1 - over
-        } else {
-            -1
-        }
+/// Least-significant-byte offset of a physical piece in ABI storage.
+/// JOIN records order pieces by significance, independently of register names.
+fn storage_justified_contain(
+    whole: &Address, whole_size: int4, part: &Address, part_size: int4,
+) -> KunaResult<int4> {
+    let direct = whole.justified_contain(whole_size, part, part_size, false);
+    if direct >= 0 {
+        return Ok(direct);
     }
+    let Some(space) = whole.get_space().filter(|s| s.get_type() == spacetype::IPTR_JOIN) else {
+        return Ok(-1);
+    };
+    let join = space.find_join_containing(whole.get_offset())?
+        .ok_or_else(|| KunaError::lowlevel("Join address not covered by a JoinRecord"))?;
+    let unified = join.get_unified();
+    let byte_offset = (whole.get_offset() - unified.offset) as int4;
+    let base = if whole.is_big_endian() {
+        unified.size as int4 - byte_offset - whole_size
+    } else {
+        byte_offset
+    };
+    let mut significance = 0;
+    for index in (0..join.num_pieces()).rev() {
+        let piece = join.get_piece(index);
+        let address = Address::new(
+            piece.space.as_ref().expect("JOIN piece has a space").clone(), piece.offset,
+        );
+        let within = address.justified_contain(piece.size as int4, part, part_size, false);
+        if within >= 0 {
+            let offset = significance + within - base;
+            if offset >= 0 && offset + part_size <= whole_size {
+                return Ok(offset);
+            }
+        }
+        significance += piece.size as int4;
+    }
+    Ok(-1)
 }
 
 #[cfg(test)]

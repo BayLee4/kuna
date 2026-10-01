@@ -29,7 +29,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl, TypeField, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use kuna_decomp::unionresolve::ResolvedUnion;
@@ -67,21 +67,21 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn base(size: int4, m: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, m))
+fn base(types: &TypeFactoryImpl, size: int4, m: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new(size, m)).unwrap()
 }
 
 /// A union of (offset, type) fields (C++ `TypeUnion`), mirroring the in-tree
 /// `make_union` helper in `verify_w10_typed_access.rs`.
-fn make_union(size: int4, fields: &[(int4, Rc<Datatype>)]) -> Rc<Datatype> {
+fn make_union(types: &TypeFactoryImpl, size: int4, fields: &[(int4, TypeRoot)]) -> TypeRoot {
     let mut u = Datatype::new(size, type_metatype::TYPE_UNION);
     let field: Vec<TypeField> = fields
         .iter()
         .enumerate()
-        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), Rc::clone(ct)))
+        .map(|(i, (off, ct))| TypeField::new(i as int4, *off, format!("f{i}"), ct.id()))
         .collect();
     u.kind = DatatypeKind::Union { field };
-    Rc::new(u)
+    types.intern(u).unwrap()
 }
 
 /// Allocate an op with `inputs` slots and set its op-code.
@@ -94,13 +94,9 @@ fn new_op_code(fd: &mut Funcdata, inputs: int4, opc: OpCode, name: &str) -> OpId
 
 /// A union-typed `ResolvedUnion` resolving to field `fld` of `u`.
 ///
-/// `ResolvedUnion::new_field` only consults the `TypeFactory` for the
-/// PTR/PARTIALUNION arms; for a bare `TYPE_UNION` the `_ => getDepend(fldNum)`
-/// branch runs and the factory is unused, so a throwaway [`TypeFactoryImpl`]
-/// suffices (the same construction `verify_w6_s5_unionresolve.rs` uses).
-fn resolve_field(u: &Rc<Datatype>, fld: int4) -> ResolvedUnion {
-    let factory = TypeFactoryImpl::new();
-    ResolvedUnion::new_field(Rc::clone(u), fld, &factory).expect("resolve field")
+/// Resolve using the same factory that owns the fixture's graph.
+fn resolve_field(types: &TypeFactoryImpl, u: &TypeRoot, fld: int4) -> ResolvedUnion {
+    ResolvedUnion::new_field(u.clone(), fld, types).expect("resolve field")
 }
 
 // ===========================================================================
@@ -110,12 +106,13 @@ fn resolve_field(u: &Rc<Datatype>, fld: int4) -> ResolvedUnion {
 #[test]
 fn w10_union_get_field_size_match_and_mismatch() {
     let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, Rc::clone(&int4t))]);
+    let types = fd.get_arch().types.as_ref().unwrap().clone();
+    let int4t = base(&types, 4, type_metatype::TYPE_INT);
+    let u = make_union(&types, 4, &[(0, int4t.clone())]);
     let op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY");
 
     // setUnionField stores a field-0 resolution (resolve dt is int4, size 4).
-    let res = resolve_field(&u, 0);
+    let res = resolve_field(&types, &u, 0);
     assert!(fd.set_union_field(&u, op, 0, res), "first set is unlocked -> true");
 
     // getUnionField with the size-4 union -> hit (size matches).
@@ -124,16 +121,12 @@ fn w10_union_get_field_size_match_and_mismatch() {
         "size-4 union matches the size-4 resolved type (funcdata.cc:925)"
     );
 
-    // A size-8 union keyed to the SAME base type id but different size: the edge
-    // strips to the same union id, so the lookup finds the entry, but the SIZE
-    // guard (unresType->getSize() == dt->getSize()) rejects it.
-    let u8 = make_union(8, &[(0, Rc::clone(&int4t))]);
-    // Same field-0 resolution still has a size-4 resolve dt; query with u8.
-    assert!(
-        fd.get_union_field(&u8, op, 0).is_none() || fd.get_union_field(&u8, op, 0).is_some(),
-        "lookup is well-defined either way"
-    );
-    // getUnionResolution ignores size: it must return the entry for the original.
+    // Replace the same graph-keyed resolution with a wider resolved type.
+    // getUnionField rejects the size mismatch while getUnionResolution ignores it.
+    let int8t = base(&types, 8, type_metatype::TYPE_INT);
+    let wider = ResolvedUnion::new_with_resolve(&resolve_field(&types, &u, 0), int8t);
+    assert!(fd.set_union_field(&u, op, 0, wider));
+    assert!(fd.get_union_field(&u, op, 0).is_none());
     assert!(
         fd.get_union_resolution(&u, op, 0).is_some(),
         "getUnionResolution returns the hit regardless of size (funcdata.cc:945)"
@@ -147,19 +140,20 @@ fn w10_union_get_field_size_match_and_mismatch() {
 #[test]
 fn w10_union_set_respects_lock() {
     let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let floatt = base(4, type_metatype::TYPE_FLOAT);
-    let u = make_union(4, &[(0, int4t), (0, floatt)]);
+    let types = fd.get_arch().types.as_ref().unwrap().clone();
+    let int4t = base(&types, 4, type_metatype::TYPE_INT);
+    let floatt = base(&types, 4, type_metatype::TYPE_FLOAT);
+    let u = make_union(&types, 4, &[(0, int4t), (0, floatt)]);
     let op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY");
 
     // Store a LOCKED field-0 resolution.
-    let mut locked = resolve_field(&u, 0);
+    let mut locked = resolve_field(&types, &u, 0);
     locked.set_lock(true);
     assert!(fd.set_union_field(&u, op, 0, locked), "first set returns true");
 
     // A second set to a DIFFERENT field cannot update a locked entry
     // (update() returns false; setUnionField returns !isLocked() == false).
-    let field1 = resolve_field(&u, 1);
+    let field1 = resolve_field(&types, &u, 1);
     assert!(
         !fd.set_union_field(&u, op, 0, field1),
         "locked entry rejects a different field (funcdata.cc:986-987)"
@@ -179,8 +173,9 @@ fn w10_union_set_respects_lock() {
 #[test]
 fn w10_union_set_multiequal_copies_to_duplicate_slots() {
     let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, Rc::clone(&int4t))]);
+    let types = fd.get_arch().types.as_ref().unwrap().clone();
+    let int4t = base(&types, 4, type_metatype::TYPE_INT);
+    let u = make_union(&types, 4, &[(0, int4t.clone())]);
 
     // A 3-input MULTIEQUAL whose slots 0 and 2 read the SAME Varnode, slot 1 a
     // different one.
@@ -195,7 +190,7 @@ fn w10_union_set_multiequal_copies_to_duplicate_slots() {
 
     // setUnionField on slot 0 must also populate slot 2 (same Varnode) but NOT
     // slot 1 (funcdata.cc:993-1001).
-    let res = resolve_field(&u, 0);
+    let res = resolve_field(&types, &u, 0);
     assert!(fd.set_union_field(&u, phi, 0, res));
 
     assert!(fd.get_union_resolution(&u, phi, 0).is_some(), "slot 0 set");
@@ -216,14 +211,15 @@ fn w10_union_set_multiequal_copies_to_duplicate_slots() {
 #[test]
 fn w10_union_inherit_field_copies_and_returns_fieldnum() {
     let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let floatt = base(4, type_metatype::TYPE_FLOAT);
-    let u = make_union(4, &[(0, int4t), (0, floatt)]);
+    let types = fd.get_arch().types.as_ref().unwrap().clone();
+    let int4t = base(&types, 4, type_metatype::TYPE_INT);
+    let floatt = base(&types, 4, type_metatype::TYPE_FLOAT);
+    let u = make_union(&types, 4, &[(0, int4t), (0, floatt)]);
     let old_op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY");
     let new_op = new_op_code(&mut fd, 1, OpCode::CPUI_COPY, "COPY");
 
     // Seed the OLD edge with field 1.
-    let res = resolve_field(&u, 1);
+    let res = resolve_field(&types, &u, 1);
     assert!(fd.set_union_field(&u, old_op, 0, res));
 
     // Inherit onto the NEW edge -> returns the inherited field number (1) and
@@ -248,15 +244,16 @@ fn w10_union_inherit_field_copies_and_returns_fieldnum() {
 #[test]
 fn w10_union_address_based_edge_independent() {
     let mut fd = build_fd();
-    let int4t = base(4, type_metatype::TYPE_INT);
-    let u = make_union(4, &[(0, int4t)]);
+    let types = fd.get_arch().types.as_ref().unwrap().clone();
+    let int4t = base(&types, 4, type_metatype::TYPE_INT);
+    let u = make_union(&types, 4, &[(0, int4t)]);
     let addr = Address::new(ram(&fd), 0x5000);
 
     // No address entry yet.
     assert!(fd.get_address_based_union_field(&u, &addr, 0).is_none());
 
     // Seed an address-based resolution; it must NOT collide with an op edge.
-    let res = resolve_field(&u, 0);
+    let res = resolve_field(&types, &u, 0);
     assert!(fd.set_address_based_union_field(&u, &addr, 0, res));
     assert!(
         fd.get_address_based_union_field(&u, &addr, 0).is_some(),
@@ -264,10 +261,10 @@ fn w10_union_address_based_edge_independent() {
     );
 
     // A locked address entry rejects overwrite (funcdata.cc:1021-1024).
-    let mut locked = resolve_field(&u, 0);
+    let mut locked = resolve_field(&types, &u, 0);
     locked.set_lock(true);
     assert!(fd.set_address_based_union_field(&u, &addr, 0, locked));
-    let again = resolve_field(&u, 0);
+    let again = resolve_field(&types, &u, 0);
     assert!(
         !fd.set_address_based_union_field(&u, &addr, 0, again),
         "locked address entry cannot be overwritten"

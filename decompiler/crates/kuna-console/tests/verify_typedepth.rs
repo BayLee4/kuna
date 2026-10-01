@@ -12,8 +12,8 @@
 //! The fixture `typedepth_x86_64` (source vendored alongside) is a `-g -O0` C
 //! binary whose every function carries one of those shapes, plus the
 //! self-referential and mutually recursive structs the budget claimed to be
-//! guarding against. Each test is TWO-PASS: `typedepth off` reproduces the bug,
-//! the default reproduces the fix.
+//! guarding against. Depth-sensitive cases compare the limited and full walks;
+//! nominal typedef identity must survive in both modes.
 //!
 //! ## Why the gate is set through the environment, not `set_kuna_option`
 //!
@@ -59,13 +59,8 @@ fn decompile(funcs: &[&str], typedepth: bool) -> Option<String> {
         .to_string();
 
     std::env::set_var(TYPEDEPTH_ENV, if typedepth { "on" } else { "off" });
-    // Pin the sibling `dwarfstructs` gate OFF so this file keeps measuring the
-    // one axis it is about. That arm renames the anonymous fallback after the
-    // shape it describes (`anon_struct_8_2`) and interns a name-colliding
-    // aggregate under a size-suffixed name with its fields (`code_4 *base`, whose
-    // members then resolve) instead of the shared anonymous fallback asserted
-    // below — both strict improvements on what these assertions pin, and both
-    // covered by `verify_dwarfstructs.rs`.
+    // Isolate depth/identity from aggregate field-layout import, which has its
+    // own coverage in verify_dwarfstructs.rs.
     std::env::set_var(DWARFSTRUCTS_ENV, "off");
     let prog = bootstrap_from_object(&path, "", &spec_roots);
     std::env::remove_var(TYPEDEPTH_ENV);
@@ -144,25 +139,29 @@ fn anonymous_aggregate_takes_its_typedef_name() {
     else {
         return;
     };
-    assert!(off.contains("anon_struct *cur"), "gate off should reproduce the bug, got:\n{off}");
-    assert!(
-        on.contains("state_t *cur"),
-        "the local should take its typedef name, got:\n{on}"
-    );
+    for output in [off, on] {
+        assert!(
+            output.contains("state_t *cur") && output.contains("state_t *ps"),
+            "the local and parameter must retain their source typedef:\n{output}"
+        );
+    }
 }
 
-/// ...unless that typedef name is already a kuna core type (`code`, which zlib's
-/// `inftrees.h` really does typedef an anonymous struct to). The factory refuses
-/// the redefinition, and the aggregate must fall back to the anonymous name
-/// instead of letting the pointer degrade to `void *`.
+/// A source typedef called `code` (as in zlib's `inftrees.h`) has a distinct
+/// identity from the built-in callable type. Its pointers must remain data
+/// pointers, including the two-byte field load and four-byte element stride.
 #[test]
-fn colliding_typedef_name_falls_back_not_to_void() {
+fn source_typedef_named_code_keeps_its_data_pointer_semantics() {
     let Some(on) = decompile(&["walk_codes"], true) else { return };
     assert!(
         !on.contains("void *base"),
         "a name collision must not degrade the pointer to void, got:\n{on}"
     );
-    assert!(on.contains("anon_struct *base"), "expected the anonymous fallback, got:\n{on}");
+    assert!(
+        on.contains("code *base") && on.contains("((uint2 *)next)[1]")
+            && on.contains("+ 4)") && on.contains("return total;"),
+        "the typedef must preserve the struct's field load and element stride:\n{on}"
+    );
 }
 
 /// A global whose element type is four DIEs deep was marked one byte wide, so it

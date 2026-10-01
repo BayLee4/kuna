@@ -31,14 +31,14 @@
 //! (option `codescalar on|off`); with the option off the upstream reading is
 //! restored exactly.
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 
 /// Whether `ptrto` — the target of a pointer being dereferenced — must not be
 /// adopted as the value's data-type.
 ///
 /// True for exactly the generic `code` type and any `code` carrying a prototype;
 /// everything else, including `code *` (metatype `TYPE_PTR`), is unaffected.
-pub fn blocks_value_type(ptrto: &Datatype) -> bool {
+pub fn blocks_value_type(ptrto: &TypeRoot) -> bool {
     ptrto.get_metatype() == type_metatype::TYPE_CODE
 }
 

@@ -78,7 +78,7 @@ use kuna_num::opcodes::OpCode;
 
 use kuna_base::address::Address;
 use crate::context::{HighVariableId, OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 
 /// How many highs in `fd` print each name.
@@ -99,7 +99,7 @@ pub(crate) fn whole_slot_local(
     high: HighVariableId,
     width: int4,
     names: &HashMap<String, u32>,
-    is_plain_integer: impl Fn(&Datatype) -> bool,
+    is_plain_integer: impl Fn(&TypeRoot) -> bool,
 ) -> bool {
     let Some(h) = fd.high_bank().get(high) else { return false };
     if h.kuna_symbol_offset() != 0 {
@@ -226,15 +226,19 @@ pub(crate) fn wide_literal(fd: &Funcdata, other: VarnodeId) -> bool {
 /// a call argument, an assignment or a `return`, where `castimplied` may already
 /// leave it out.  Under another conversion it prints too: a sign change never
 /// preserves the value, so `castimplied` keeps it there.
-pub(crate) fn drops_printed_cast(fd: &Funcdata, casts: &[OpId], newty: &Datatype) -> bool {
+pub(crate) fn drops_printed_cast(fd: &Funcdata, casts: &[OpId], newty: &TypeRoot) -> bool {
     casts.iter().any(|&op| {
         let Some(out) = fd.obank().get(op).and_then(|o| o.get_out()) else { return false };
         let Some(v) = fd.vbank().get(out) else { return false };
         let t = v.get_type_def_facing();
+        let type_view = t.read();
+        let new_view = newty.read();
+        let type_record = type_view.get(t.id()).expect("live cast type");
+        let new_record = new_view.get(newty.id()).expect("live planned type");
         if t.get_size() != newty.get_size()
             || t.get_metatype() != newty.get_metatype()
             || t.get_sub_meta() != newty.get_sub_meta()
-            || t.get_name() != newty.get_name()
+            || type_record.get_name() != new_record.get_name()
             || v.is_explicit()
         {
             return false;

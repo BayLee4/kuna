@@ -37,7 +37,7 @@ use kuna_base::types::int4;
 
 use kuna_decomp::action::Rule;
 use kuna_decomp::bitfield::{RuleInsertAbsorb, RulePullAbsorb};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::op::pcodeop_flags;
 use kuna_decomp::context::{ArchContext, OpId, TypeOp, VarnodeId};
@@ -77,8 +77,8 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn opcode_flags(opc: OpCode) -> u32 {
@@ -113,7 +113,8 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_input(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.vbank_mut().create(s, Address::new(ram, off), dt(s));
+    let ty = dt(fd, s);
+    let vn = fd.vbank_mut().create(s, Address::new(ram, off), ty);
     fd.vbank_mut()
         .set_input(vn, &mut |_b, _a, _c| Ok(()))
         .expect("set_input")
@@ -121,7 +122,8 @@ fn mk_input(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(s, Address::new(ram, off), dt(s))
+    let ty = dt(fd, s);
+    fd.vbank_mut().create(s, Address::new(ram, off), ty)
 }
 
 fn mk_const(fd: &mut Funcdata, val: u64, s: int4) -> VarnodeId {

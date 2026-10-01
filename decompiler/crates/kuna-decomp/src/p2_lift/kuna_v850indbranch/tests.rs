@@ -10,7 +10,7 @@ use kuna_base::space::{
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{ArchContext, OpId, TypeOp};
 
@@ -38,14 +38,20 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut context = ArchContext::new(manage);
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
 }
 
-fn unk_type(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn unk_type(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(size, type_metatype::TYPE_UNKNOWN)).unwrap()
 }
 
 fn proc_space(fd: &Funcdata) -> Rc<AddrSpace> {
@@ -63,9 +69,10 @@ fn build_op_with_input(
     let pc = Address::new(proc_space(fd), 0x1000);
     let op = fd.obank_mut().create_at(1, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, 0, "op"));
+    let datatype = unk_type(fd, 4);
     let vn = fd
         .vbank_mut()
-        .create(4, Address::new(space, off), unk_type(4));
+        .create(4, Address::new(space, off), datatype);
     // Read-only test IR: wire the input directly on the op (the hook never
     // inspects descend), mirroring op.rs's raw input-setter usage in tests.
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);

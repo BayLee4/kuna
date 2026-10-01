@@ -60,7 +60,7 @@ use kuna_base::space::spacetype;
 use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{BlockId, OpId, VarnodeId};
 
@@ -4826,11 +4826,8 @@ impl RuleDoubleIn {
 }
 
 impl Rule for RuleDoubleIn {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDoubleIn::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleIn::new(self.group.clone()))
     }
 
     fn reset(&mut self, data: &mut Funcdata) {
@@ -4938,11 +4935,8 @@ impl RuleDoubleOut {
 }
 
 impl Rule for RuleDoubleOut {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDoubleOut::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleOut::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -5092,11 +5086,8 @@ fn vn_space_index(data: &Funcdata, vn: VarnodeId) -> i32 {
 }
 
 impl Rule for RuleDoubleLoad {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDoubleLoad::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleLoad::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -5284,11 +5275,8 @@ impl RuleDoubleStore {
 }
 
 impl Rule for RuleDoubleStore {
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleDoubleStore::new(self.group.clone())))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDoubleStore::new(self.group.clone()))
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {
@@ -5390,17 +5378,17 @@ impl Rule for RuleDoubleStore {
 /// and with the exact groups the C++ `ActionDatabase::universalAction` registers
 /// them into the `actprop` pool (`coreaction.cc:5913-5916`).
 ///
-/// The order and the `getGroup()` string are output-determining (the engine's
-/// per-op rule list preserves insertion order, and `clone(grouplist)` filters on
-/// the group), so this mirrors the registration site rather than the header's
-/// class-declaration order.  Each row is `RuleSpec { group, ctor }` per the
+/// Registration order and group are output-determining: the engine's per-op
+/// rule list preserves insertion order, and registered rule entries filter pool
+/// clones by group. This mirrors the registration site rather than the header's
+/// class-declaration order.  Each row is `RuleSpec { group, aliases, ctor }` per the
 /// [`crate::action`] convention.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: "doubleload", ctor: || Box::new(RuleDoubleLoad::new("doubleload")) },
-        RuleSpec { group: "doubleprecis", ctor: || Box::new(RuleDoubleStore::new("doubleprecis")) },
-        RuleSpec { group: "doubleprecis", ctor: || Box::new(RuleDoubleIn::new("doubleprecis")) },
-        RuleSpec { group: "doubleprecis", ctor: || Box::new(RuleDoubleOut::new("doubleprecis")) },
+        RuleSpec { group: "doubleload", aliases: &[], ctor: || Box::new(RuleDoubleLoad::new("doubleload")) },
+        RuleSpec { group: "doubleprecis", aliases: &[], ctor: || Box::new(RuleDoubleStore::new("doubleprecis")) },
+        RuleSpec { group: "doubleprecis", aliases: &[], ctor: || Box::new(RuleDoubleIn::new("doubleprecis")) },
+        RuleSpec { group: "doubleprecis", aliases: &[], ctor: || Box::new(RuleDoubleOut::new("doubleprecis")) },
     ]
 }
 
@@ -5422,7 +5410,7 @@ mod tests {
         addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
     };
 
-    use crate::dtype::{type_metatype, Datatype};
+    use crate::dtype::type_metatype;
     use crate::op::pcodeop_flags;
     use crate::context::{ArchContext, TypeOp};
 
@@ -5447,7 +5435,11 @@ mod tests {
 
     fn build_fd() -> Funcdata {
         let manage = build_manager();
-        let glb = Rc::new(ArchContext::new(manage));
+        let arch = ArchContext::new(manage);
+        let types = arch.types_impl().unwrap();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x1000_0000, 0x40).unwrap()
@@ -5455,9 +5447,6 @@ mod tests {
 
     fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
-    }
-    fn dt(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
     }
 
     fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
@@ -5476,7 +5465,8 @@ mod tests {
     /// A plain Varnode in ram at `off` of `size` bytes (free, no def).
     fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        fd.vbank_mut().create(size, Address::new(r, off), dt(size))
+        let dt = fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap();
+        fd.vbank_mut().create(size, Address::new(r, off), dt)
     }
 
     /// A constant Varnode.

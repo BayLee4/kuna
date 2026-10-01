@@ -43,15 +43,13 @@
 //! op-shells are built with the [`TypeOp`] skeleton (zero flag word) until W6
 //! lands.  Noted in the structured losses.
 
-use std::rc::Rc;
-
 use kuna_base::address::{calc_mask, Address};
 use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::type_metatype;
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::varnode::{DefOpInfo, VarnodeBank};
@@ -82,11 +80,8 @@ impl Rule for RuleAddCarryChain {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleAddCarryChain { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleAddCarryChain { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleAddCarryChain::applyOp` (`kuna_addcarrychain.cc:77`) — transcribed.
@@ -208,6 +203,7 @@ impl Rule for RuleAddCarryChain {
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option addcarrychain on` (add_carry_chain = true;
         // kuna DIV-2 default-on, GH-8913).
         ctor: || Box::new(RuleAddCarryChain::with_group(true, "analysis")),
@@ -310,7 +306,7 @@ fn kuna_is_carry_of(data: &Funcdata, carryvn: VarnodeId, a: VarnodeId, b: Varnod
 /// create a unique varnode already defined by `op` and link it as the op's
 /// output.  See module docs (the `op_set_output` stub workaround).
 fn new_unique_out(data: &mut Funcdata, size: int4, op: OpId) -> KunaResult<VarnodeId> {
-    let ct: Rc<Datatype> = Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN));
+    let ct = data.get_arch().types().expect("type factory").get_base(size, type_metatype::TYPE_UNKNOWN)?;
     let seqnum = data.obank().get(op).expect("new_unique_out: stale op").get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum };
     // A freshly-created unique has no aliasing equivalent; xref never unifies it.

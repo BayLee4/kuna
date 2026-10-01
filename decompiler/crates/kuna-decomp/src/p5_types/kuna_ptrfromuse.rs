@@ -25,7 +25,7 @@
 //! descendants through copy-like identity and constant-offset addition, and returns
 //! a pointer when at least one terminal use is the address operand of a `LOAD` or
 //! `STORE` and nothing on the way is inconsistent with a pointer.  Because it folds
-//! by `Datatype::type_order`, a more specific vote still wins: a `FILE *` arriving
+//! by `TypeRoot::type_order`, a more specific vote still wins: a `FILE *` arriving
 //! from a callee's locked prototype (`SUB_PTR_STRUCT`) outranks this rule's
 //! `SUB_PTR` candidate and is kept.
 //!
@@ -45,7 +45,7 @@ use kuna_base::address::Address;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uintb};
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use kuna_num::opcodes::OpCode;
 use crate::context::{OpId, VarnodeId};
@@ -117,7 +117,7 @@ pub fn pointer_from_use(
     data: &Funcdata,
     vn: VarnodeId,
     mode: PtrFromUseMode,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if !mode.is_on() {
         return None;
     }
@@ -406,7 +406,7 @@ pub(crate) fn constant_may_be_global_base(data: &Funcdata, op: OpId, cvn: Varnod
 
 /// Is `cand` more specific than `cur` in the `getLocalType` fold?  The seed is one
 /// more vote, never a replacement — a `FILE *` (`SUB_PTR_STRUCT`) keeps its place.
-pub fn folds_over(cand: &Rc<Datatype>, cur: &Rc<Datatype>) -> bool {
+pub fn folds_over(cand: &TypeRoot, cur: &TypeRoot) -> bool {
     0 > cand.type_order(cur).unwrap_or(0)
 }
 

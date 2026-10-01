@@ -223,40 +223,32 @@ fn load_real_datatest_parses_script_and_tests() {
 }
 
 #[test]
-fn end_to_end_real_datatest_error_path_grammar() {
-    // Drive lzcount.xml end-to-end through the ported console.  The engine
-    // commands (`lo fu`/`decompile`/`print C`) are stubs in the merged tree, so
-    // the console enters its error state on the first one and runTests reports
-    // the faithful "Error: Did not apply tests in <f>" path -- exactly what a
-    // console in that engine state emits.  This exercises the WHOLE pipeline:
-    // XML parse -> buildProgram -> command feed -> mainloop -> error capture.
-    let files = vec![datatest("lzcount.xml")];
-    let mut out = String::new();
-    let failed = run_test_files(&files, &mut out);
-
-    // No assertion was APPLIED (the script never produced print-C output), so the
-    // totals are zero and the file lands in the capped Failures summary as an
-    // execution failure -- the byte grammar run_tests.py greps.
-    assert!(out.contains("Total tests applied = 0"), "out:\n{out}");
-    assert!(out.contains("Total passing tests = 0"), "out:\n{out}");
-    assert!(out.contains("Error: Did not apply tests in"), "out:\n{out}");
-    assert!(out.contains(&format!("Execution failed for {}", datatest("lzcount.xml"))), "out:\n{out}");
-    assert!(out.contains("Failures: "), "out:\n{out}");
-    // Zero applied -> zero failed assertions (the file error is tracked in the
-    // summary, not the assertion count).
-    assert_eq!(failed, 0);
+fn file_failures_cannot_pass_without_applying_assertions() {
+    for (name, xml) in [
+        ("status-parse.xml", "<wrongtag/>"),
+        ("status-execution.xml", "<decompilertest><script><com>load function missing</com></script><stringmatch name=\"unreached\" min=\"0\" max=\"0\">anything</stringmatch></decompilertest>"),
+        ("status-empty.xml", "<decompilertest><script><com>quit</com></script><stringmatch name=\"unreached\" min=\"0\" max=\"0\">anything</stringmatch></decompilertest>"),
+    ] {
+        let file = write_tmp(name, xml);
+        let mut out = String::new();
+        assert_eq!(run_test_files(&[file], &mut out), 1, "{name}:\n{out}");
+        assert!(out.contains("Total tests applied = 0"), "{name}:\n{out}");
+        assert!(out.contains("Total passing tests = 0"), "{name}:\n{out}");
+    }
 }
 
 #[test]
-fn end_to_end_multiple_files_accumulate() {
-    let files =
-        vec![datatest("lzcount.xml"), datatest("boolless.xml"), datatest("skipnext2.xml")];
+fn assertion_and_file_failures_accumulate_without_stopping_later_files() {
+    let files = [
+        write_tmp("mixed-parse.xml", "<wrongtag/>"),
+        write_tmp("mixed-fail.xml", &synth_xml(&["present"], &[("absent", 0, 0, "present")])),
+        write_tmp("mixed-pass.xml", &synth_xml(&["present"], &[("present", 1, 1, "present")])),
+    ];
     let mut out = String::new();
-    run_test_files(&files, &mut out);
-    // Each file enters the error path; the Failures summary lists all three
-    // (capped at 10), and the totals footer is present exactly once.
-    assert_eq!(out.matches("Error: Did not apply tests in").count(), 3, "out:\n{out}");
-    assert_eq!(out.matches("Total tests applied =").count(), 1, "out:\n{out}");
+    assert_eq!(run_test_files(&files, &mut out), 2, "{out}");
+    assert!(out.contains("Total tests applied = 2"), "{out}");
+    assert!(out.contains("Total passing tests = 1"), "{out}");
+    assert!(out.contains("Success -- present"), "{out}");
 }
 
 // ---------------------------------------------------------------------------
@@ -419,7 +411,7 @@ fn failures_summary_caps_at_ten() {
         files.push(write_tmp(&format!("bad{i}.xml"), "<wrongtag/>"));
     }
     let mut out = String::new();
-    run_test_files(&files, &mut out);
+    assert_eq!(run_test_files(&files, &mut out), 11, "{out}");
     // Eleven "Error parsing" lines at column 0 (one per file)...
     assert_eq!(out.matches("Error parsing ").count(), 11 + 10, "out:\n{out}");
     // ...but the indented Failures summary repeats only 10 of them (two-space
@@ -550,7 +542,7 @@ fn expected_command_error_is_matchable_and_the_next_command_runs() {
         ]).replace("<script>", &format!("<script>{script}"));
         let file = write_tmp("expected-error.xml", &xml);
         let mut out = String::new();
-        run_test_files(&[file], &mut out);
+        assert_eq!(run_test_files(&[file], &mut out), 0, "{out}");
         assert!(out.contains("Total passing tests = 2"), "{out}");
     }
 }
@@ -561,7 +553,7 @@ fn expected_command_error_rejects_a_successful_command() {
         .replace("<com>echo unexpected-success", "<com expecterror=\"true\">echo unexpected-success");
     let file = write_tmp("expected-error-success.xml", &xml);
     let mut out = String::new();
-    run_test_files(&[file], &mut out);
+    assert_eq!(run_test_files(&[file], &mut out), 1, "{out}");
     assert!(out.contains("Expected command to fail"), "{out}");
     assert!(out.contains("Total tests applied = 0"), "{out}");
 }

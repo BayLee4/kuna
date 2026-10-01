@@ -1,0 +1,1416 @@
+*** Begin Patch
+*** Update File: decompiler/crates/kuna-decomp/src/p4_calls/kuna_physicalinputs.rs
+@@
+     /// Bytes definitely defined on every reachable normal return. Unlike
+     /// may-writes, these can discharge a caller's later entry-state read.
+     pub definite_writes: Vec<(Address, int4)>,
++    /// A finite path to an actual normal RETURN, grounded through complete raw children.
++    pub has_normal_return: bool,
+     /// Conditional C execution contract, never a machine preservation proof.
+     pub execution: Option<Rc<ExecutionRequirements>>,
+     pub bookkeeping: Vec<(Address, int4)>,
+@@
+ impl Default for EntryRequirements {
+     fn default() -> Self {
+         Self { reads: Vec::new(), writes: Vec::new(), restored: Vec::new(), reads_memory: true, writes_memory: true,
+-            stack_adjustments: Vec::new(), definite_writes: Vec::new(), execution: None,
++            stack_adjustments: Vec::new(), definite_writes: Vec::new(), has_normal_return: false, execution: None,
+             bookkeeping: Vec::new(), unresolved: Vec::new(), incomplete_flow: true }
+     }
+ }
+@@
+     contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
+     flow: Option<&ConditionalFlowView>) -> bool
+ {
++    return_target_uses(fd, initial,
++        &|op| callees.get(&op).and_then(|facts| RawCallView::committed(facts)), contracts, flow)
++}
++
++pub(super) fn return_target_uses<'a>(fd: &Funcdata, initial: VarnodeId,
++    lookup: &impl Fn(OpId) -> Option<RawCallView<'a>>,
++    contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
++    flow: Option<&ConditionalFlowView>) -> bool
++{
+     let storage = |id| fd.vbank().get(id).and_then(|value| {
+         value.get_addr().get_space().map(|space| (space.get_index(), value.get_offset(), value.get_size()))
+     });
+@@
+                         && address.get_offset() < value.1.saturating_add(value.2 as u64)));
+                 if let Some(contract) = contracts.and_then(|contracts| contracts.get(&id)) {
+                     if contract.inputs.iter().any(|(address, size)| intersects(address, *size)) { return false; }
+-                } else if let Some(callee) = callees.get(&id).filter(|callee| callee.is_complete()) {
++                } else if let Some(callee) = lookup(id) {
+                     if callee.reads.iter().any(|(address, size)| intersects(address, *size)
+                         && !callee.is_bookkeeping(address, *size)) { return false; }
+                 } else if values.iter().any(|value| fd.get_arch().manage().get_space(value.0)
+@@
+     })
+ }
+ 
+-fn stack_address_only(
++fn stack_address_uses<'a>(
+     fd: &Funcdata, addr: &Address, size: int4,
+-    callees: &BTreeMap<OpId, Rc<EntryRequirements>>,
+-    raw_callees: &BTreeMap<OpId, Rc<EntryRequirements>>, contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
++    lookup: &impl Fn(OpId) -> Option<RawCallView<'a>>,
++    contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
+     flow: Option<&ConditionalFlowView>,
+-) -> bool {
+-    let Some(space) = addr.get_space() else { return false };
++) -> Option<BTreeSet<(int4, u64, int4)>> {
++    let Some(space) = addr.get_space() else { return None };
+     let mut tainted = BTreeSet::from([(space.get_index(), addr.get_offset(), size)]);
+     let intersects = |address: &Address, bytes: int4, tainted: &BTreeSet<(int4, u64, int4)>| {
+         address.get_space().is_some_and(|space| tainted.iter().any(|(id, offset, size)| {
+@@
+                 if !intersects(value.get_addr(), value.get_size(), &tainted) { continue; }
+                 if matches!(operation.code(), OpCode::CPUI_LOAD | OpCode::CPUI_STORE) && slot == 1 {
+                     if operation.code() == OpCode::CPUI_LOAD
+-                        && !operation.get_out().is_some_and(|output| return_target_only(fd, output, raw_callees, contracts, flow))
+-                    { return false; }
++                        && !operation.get_out().is_some_and(|output| return_target_uses(fd, output, lookup, contracts, flow))
++                    { return None; }
+                     continue;
+                 }
+                 let affine = operation.code() == OpCode::CPUI_COPY
+@@
+                         && (slot == 0 || operation.code() == OpCode::CPUI_INT_ADD)
+                         && operation.get_in(1 - slot).and_then(|id| fd.vbank().get(id))
+                             .is_some_and(|other| other.is_constant()));
+-                if !affine { return false; }
+-                let Some(output) = operation.get_out().and_then(|id| fd.vbank().get(id)) else { return false };
+-                let Some(output_space) = output.get_addr().get_space() else { return false };
++                if !affine { return None; }
++                let Some(output) = operation.get_out().and_then(|id| fd.vbank().get(id)) else { return None };
++                let Some(output_space) = output.get_addr().get_space() else { return None };
+                 changed |= tainted.insert((output_space.get_index(), output.get_offset(), output.get_size()));
+             }
+         }
+@@
+     let proto = fd.get_func_proto();
+     let model = if proto.has_model() { Some(proto.model()) } else { fd.get_arch().default_fp() };
+     for (space_index, offset, bytes) in &tainted {
+-        let Some(space) = fd.get_arch().manage().get_space(*space_index) else { return false };
++        let Some(space) = fd.get_arch().manage().get_space(*space_index) else { return None };
+         if space.get_name() != "register" { continue; }
+         let location = Address::new(space.clone(), *offset);
+-        if model.is_some_and(|model| model.possible_output_param(&location, *bytes)) { return false; }
++        if model.is_some_and(|model| model.possible_output_param(&location, *bytes)) { return None; }
+         if proto.has_store() && proto.is_output_locked() {
+             let output = proto.get_output();
+             let outaddr = output.get_address();
+             if outaddr.get_space().is_some_and(|space| space.get_type() == kuna_base::space::spacetype::IPTR_JOIN) {
+-                return false;
++                return None;
+             }
+             if outaddr.get_space().is_some_and(|other| Rc::ptr_eq(space, other))
+                 && outaddr.get_offset() < offset.saturating_add(*bytes as u64)
+                 && *offset < outaddr.get_offset().saturating_add(output.get_size().max(0) as u64)
+-            { return false; }
+-        }
+-    }
++            { return None; }
++        }
++    }
++    Some(tainted)
++}
++
++fn stack_address_only(
++    fd: &Funcdata, addr: &Address, size: int4,
++    callees: &BTreeMap<OpId, Rc<EntryRequirements>>,
++    raw_callees: &BTreeMap<OpId, Rc<EntryRequirements>>, contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
++    flow: Option<&ConditionalFlowView>,
++) -> bool {
++    let Some(tainted) = stack_address_uses(fd, addr, size,
++        &|op| raw_callees.get(&op).and_then(|facts| RawCallView::committed(facts)), contracts, flow) else { return false; };
+     callees.values().all(|callee| callee.reads.iter().all(|(at, bytes)| {
+-        !intersects(at, *bytes, &tainted) || callee.is_bookkeeping(at, *bytes)
++        !at.get_space().is_some_and(|space| tainted.iter().any(|(id, offset, size)|
++            *id == space.get_index() && *offset < at.get_offset().saturating_add(*bytes as u64)
++                && at.get_offset() < offset.saturating_add(*size as u64))) || callee.is_bookkeeping(at, *bytes)
+     }))
+ }
+ 
+@@
+     raw
+ }
+ 
++fn append_register_reads(fd: &Funcdata, id: OpId, domain: &[(int4, u64)], accesses: &mut Vec<Access>) {
++    let operation = fd.obank().get(id).expect("raw register access");
++    let code = operation.code();
++    let zero_idiom = matches!(code, OpCode::CPUI_INT_XOR | OpCode::CPUI_INT_SUB)
++        && operation.get_in(0).zip(operation.get_in(1)).is_some_and(|(left, right)| {
++            register_range(fd, left).is_some()
++                && register_range(fd, left) == register_range(fd, right)
++        });
++    if !zero_idiom {
++        for slot in 0..operation.num_input() {
++            let Some(input) = operation.get_in(slot) else { continue };
++            let Some((space, mut offset, mut size)) = register_range(fd, input) else { continue };
++            if code == OpCode::CPUI_SUBPIECE && slot == 0 {
++                if let Some(cut) = operation.get_in(1).and_then(|id| fd.vbank().get(id)) {
++                    if cut.is_constant() {
++                        let output_size = operation.get_out().and_then(|id| fd.vbank().get(id))
++                            .map_or(size, |value| value.get_size() as usize);
++                        let low = cut.get_offset() as usize;
++                        if low + output_size <= size {
++                            offset += if fd.vbank().get(input).unwrap().get_addr().is_big_endian() {
++                                (size - low - output_size) as u64
++                            } else { low as u64 };
++                            size = output_size;
++                        }
++                    }
++                }
++            }
++            if code == OpCode::CPUI_INT_AND && size <= 8 {
++                let mask = operation.get_in(1 - slot).and_then(|id| fd.vbank().get(id))
++                    .filter(|value| value.is_constant()).map(|value| value.get_offset());
++                if let Some(mask) = mask {
++                    for byte in 0..size {
++                        let shift = if fd.vbank().get(input).unwrap().get_addr().is_big_endian() {
++                            (size - 1 - byte) * 8
++                        } else { byte * 8 };
++                        if (mask >> shift) & 0xff != 0 {
++                            let index = domain.binary_search(&(space, offset + byte as u64)).unwrap();
++                            accesses.push(Access::Read(index..index + 1));
++                        }
++                    }
++                    continue;
++                }
++            }
++            let start = domain.binary_search(&(space, offset)).unwrap();
++            accesses.push(Access::Read(start..start + size));
++        }
++    }
++}
++
++fn raw_return_reads(fd: &Funcdata) -> Option<Vec<(Address, int4)>> {
++    let mut return_reads = Vec::new();
++    let prototype = fd.get_func_proto();
++    if prototype.has_store() && prototype.is_output_locked() {
++        let output = prototype.get_output();
++        if output.get_size() > 0 {
++            let address = output.get_address();
++            match address.get_space() {
++                Some(space) if space.get_name() == "register" => {
++                    return_reads.push((address.clone(), output.get_size()));
++                }
++                Some(space) if space.get_type() == kuna_base::space::spacetype::IPTR_JOIN => {
++                    match fd.get_arch().manage().find_join(address.get_offset()) {
++                        Ok(join) => {
++                            for index in 0..join.num_pieces() {
++                                let piece = join.get_piece(index);
++                                if let Some(space) = piece.space.as_ref().filter(|space| space.get_name() == "register") {
++                                    return_reads.push((Address::new(space.clone(), piece.offset), piece.size as int4));
++                                } else { return None; }
++                            }
++                        }
++                        Err(_) => { return None; }
++                    }
++                }
++                _ => { return None; }
++            }
++        }
++    }
++    Some(return_reads)
++}
++
++fn solve_register_accesses(fd: &Funcdata, domain: &[(int4, u64)], events: &[Vec<Access>],
++    edge_allowed: impl Fn(crate::context::BlockId, int4) -> bool,
++) -> (Vec<(Address, int4)>, Vec<(Address, int4)>, bool) {
++    let count = events.len();
++    let width = domain.len();
++    let blocks: Vec<_> = (0..count).map(|i| fd.bblocks_get_block(i as int4)).collect();
++    let positions: BTreeMap<_, _> = blocks.iter().enumerate().map(|(i, id)| (*id, i)).collect();
++    let mut reachable = vec![false; count];
++    let mut work = vec![0usize];
++    while let Some(index) = work.pop() {
++        if reachable[index] { continue; }
++        reachable[index] = true;
++        let block = fd.bblocks_ref().block(blocks[index]);
++        for edge in 0..block.size_out() {
++            if !edge_allowed(blocks[index], edge) { continue; }
++            if let Some(next) = positions.get(&block.get_out(edge)) { work.push(*next); }
++        }
++    }
++    let mut written_out = vec![vec![false; width]; count];
++    let mut written = vec![false; width];
++    loop {
++        let mut changed = false;
++        for index in 0..count {
++            if !reachable[index] { continue; }
++            written.fill(false);
++            if index != 0 {
++                let block = fd.bblocks_ref().block(blocks[index]);
++                let mut first = true;
++                for edge in 0..block.size_in() {
++                    if !edge_allowed(block.get_in(edge), block.get_in_rev_index(edge)) { continue; }
++                    let Some(predecessor) = positions.get(&block.get_in(edge)).copied() else { continue };
++                    if !reachable[predecessor] { continue; }
++                    if first { written.clone_from(&written_out[predecessor]); first = false; }
++                    else {
++                        for (value, incoming) in written.iter_mut().zip(&written_out[predecessor]) {
++                            *value &= *incoming;
++                        }
++                    }
++                }
++            }
++            for event in &events[index] {
++                if let Access::Write(range) = event { written[range.clone()].fill(true); }
++            }
++            if written_out[index] != written {
++                written_out[index].clone_from(&written);
++                changed = true;
++            }
++        }
++        if !changed { break; }
++    }
++    let mut live = vec![false; width];
++    let mut return_written = vec![true; width];
++    let mut has_return = false;
++    for index in 0..count {
++        if !reachable[index] { continue; }
++        written.fill(false);
++        if index != 0 {
++            let block = fd.bblocks_ref().block(blocks[index]);
++            let mut first = true;
++            for edge in 0..block.size_in() {
++                if !edge_allowed(block.get_in(edge), block.get_in_rev_index(edge)) { continue; }
++                let Some(predecessor) = positions.get(&block.get_in(edge)).copied() else { continue };
++                if !reachable[predecessor] { continue; }
++                if first { written.clone_from(&written_out[predecessor]); first = false; }
++                else {
++                    for (value, incoming) in written.iter_mut().zip(&written_out[predecessor]) {
++                        *value &= *incoming;
++                    }
++                }
++            }
++        }
++        for event in &events[index] {
++            match event {
++                Access::Write(range) => written[range.clone()].fill(true),
++                Access::Read(range) => {
++                    for byte in range.clone() { live[byte] |= !written[byte]; }
++                }
++                Access::Return => {
++                    has_return = true;
++                    for (guaranteed, current) in return_written.iter_mut().zip(&written) {
++                        *guaranteed &= *current;
++                    }
++                }
++            }
++        }
++    }
++    // No vacuous guarantees for non-returning functions or a closure whose
++    // unresolved control flow could return along an unobserved path.
++    if !has_return { return_written.fill(false); }
++    let mut reads = Vec::new();
++    let mut definite_writes = Vec::new();
++    for (mask, ranges) in [(&live, &mut reads), (&return_written, &mut definite_writes)] {
++        let mut index = 0;
++        while index < width {
++            if !mask[index] { index += 1; continue; }
++            let (space_index, offset) = domain[index];
++            let start = index;
++            index += 1;
++            while index < width && mask[index] && domain[index] == (space_index, offset + (index - start) as u64) {
++                index += 1;
++            }
++            if let Some(space) = fd.get_arch().manage().get_space(space_index) {
++                ranges.push((Address::new(Rc::clone(space), offset), (index - start) as int4));
++            }
++        }
++    }
++    (reads, definite_writes, has_return)
++}
++
++/// Only actual raw return paths count; a complete non-returning child does not
++/// ground a continuation merely because raw lifting retained its fallthrough.
++fn return_bookkeeping_candidates(fd: &Funcdata, reads: &[(Address, int4)],
++    flow: Option<&ConditionalFlowView>) -> Vec<((Address, int4), VarnodeId)>
++{
++    // Preserve positive raw reads; only classify exact registers whose actual
++    // uses are full-width COPYs ending exclusively in normal RETURN targets.
++    let storage = |id| fd.vbank().get(id).map(|node| (node.get_addr().clone(), node.get_size()));
++    let mut return_candidates = BTreeMap::new();
++    for id in fd.obank().iter_code(OpCode::CPUI_RETURN) {
++        if flow.is_some_and(|view| !view.op_reachable(fd, id)) { continue; }
++        let Some(value) = fd.obank().get(id).filter(|operation| operation.get_halt_type() == 0)
++            .and_then(|operation| operation.get_in(0)) else { continue; };
++        if let Some(storage) = storage(value) { return_candidates.insert(storage, value); }
++    }
++    loop {
++        let mut changed = false;
++        for id in fd.obank().iter_code(OpCode::CPUI_COPY) {
++            if flow.is_some_and(|view| !view.op_reachable(fd, id)) { continue; }
++            let operation = fd.obank().get(id).expect("raw COPY");
++            if operation.num_input() != 1 { continue; }
++            let Some(output) = operation.get_out().and_then(storage) else { continue; };
++            if !return_candidates.contains_key(&output) { continue; }
++            let Some(input) = operation.get_in(0) else { continue; };
++            let Some(storage) = storage(input).filter(|storage| storage.1 == output.1) else { continue; };
++            if let std::collections::btree_map::Entry::Vacant(entry) = return_candidates.entry(storage) {
++                entry.insert(input);
++                changed = true;
++            }
++        }
++        if !changed { break; }
++    }
++    let prototype = fd.get_func_proto();
++    let return_model = if prototype.has_model() { Some(prototype.model()) } else { fd.get_arch().default_fp() };
++    let mut candidates = Vec::new();
++    for ((address, size), value) in return_candidates {
++        if size <= 0 || address.get_space().is_none_or(|space| space.get_name() != "register") { continue; }
++        // The use proof must also start at an authentic incoming return-address
++        // role, not an arbitrary parameter used by a nonstandard RETURN.
++        if return_model.is_none_or(|model| model.effect_list().iter().all(|effect|
++            effect.get_type() != crate::fspec::effect_type::RETURN_ADDRESS
++                || effect.get_address() != address || effect.get_size() != size)) { continue; }
++        let Some(end) = address.get_offset().checked_add(size as u64) else { continue; };
++        if !reads.iter().any(|(at, bytes)| *bytes > 0
++            && at.get_space().zip(address.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
++            && at.get_offset() <= address.get_offset()
++            && at.get_offset().checked_add(*bytes as u64).is_some_and(|limit| end <= limit)) { continue; }
++        candidates.push(((address, size), value));
++    }
++    candidates
++}
++
++fn raw_has_finite_return(fd: &Funcdata, callees: &BTreeMap<OpId, Rc<EntryRequirements>>) -> bool {
++    if fd.bblocks_get_size() == 0 { return false; }
++    let mut visited = BTreeSet::new();
++    let mut work = vec![fd.bblocks_get_block(0)];
++    while let Some(block) = work.pop() {
++        if !visited.insert(block) { continue; }
++        let mut next = fd.bb_op_head(block);
++        let mut stopped = false;
++        while let Some(op) = next {
++            let operation = fd.obank().get(op).expect("live raw return path");
++            if operation.code() == OpCode::CPUI_RETURN && operation.get_halt_type() == 0 { return true; }
++            if callees.get(&op).is_some_and(|child| !child.has_normal_return) {
++                stopped = true;
++                break;
++            }
++            next = fd.bb_op_next(op);
++        }
++        if !stopped {
++            let basic = fd.bblocks_ref().block(block);
++            work.extend((0..basic.size_out()).map(|edge| basic.get_out(edge)));
++        }
++    }
++    false
++}
++
+ fn analyze_flow(
+     fd: &Funcdata, callees: &BTreeMap<OpId, Rc<EntryRequirements>>,
+     raw_callees: &BTreeMap<OpId, Rc<EntryRequirements>>,
+@@
+     // Raw RETURN exposes its branch target, not the function's declared result.
+     // Treat result storage as a read at each return so must-written analysis
+     // retains an incoming result register when some return path never defines it.
+-    let mut return_reads = Vec::new();
+-    let prototype = fd.get_func_proto();
+-    if prototype.has_store() && prototype.is_output_locked() {
+-        let output = prototype.get_output();
+-        if output.get_size() > 0 {
+-            let address = output.get_address();
+-            match address.get_space() {
+-                Some(space) if space.get_name() == "register" => {
+-                    return_reads.push((address.clone(), output.get_size()));
+-                }
+-                Some(space) if space.get_type() == kuna_base::space::spacetype::IPTR_JOIN => {
+-                    match fd.get_arch().manage().find_join(address.get_offset()) {
+-                        Ok(join) => {
+-                            for index in 0..join.num_pieces() {
+-                                let piece = join.get_piece(index);
+-                                if let Some(space) = piece.space.as_ref().filter(|space| space.get_name() == "register") {
+-                                    return_reads.push((Address::new(space.clone(), piece.offset), piece.size as int4));
+-                                } else { result.incomplete_flow = true; }
+-                            }
+-                        }
+-                        Err(_) => { result.incomplete_flow = true; }
+-                    }
+-                }
+-                _ => { result.incomplete_flow = true; }
+-            }
+-        }
+-    }
++    let return_reads = raw_return_reads(fd).unwrap_or_else(|| { result.incomplete_flow = true; Vec::new() });
+     let blocks: Vec<_> = (0..count).map(|i| fd.bblocks_get_block(i as int4)).collect();
+-    let positions: BTreeMap<_, _> = blocks.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+     let mut domain = Vec::new();
+     for vn in fd.vbank().iter_loc() {
+         if let Some((space, offset, size)) = register_range(fd, vn) {
+@@
+     }
+     domain.sort_unstable();
+     domain.dedup();
+-    let width = domain.len();
+     let mut events = Vec::with_capacity(count);
+     for block in &blocks {
+         let mut accesses = Vec::new();
+@@
+                 }
+             }
+             if operation.get_halt_type() != 0 { result.incomplete_flow = true; }
+-            let zero_idiom = matches!(code, OpCode::CPUI_INT_XOR | OpCode::CPUI_INT_SUB)
+-                && operation.get_in(0).zip(operation.get_in(1)).is_some_and(|(left, right)| {
+-                    register_range(fd, left).is_some()
+-                        && register_range(fd, left) == register_range(fd, right)
+-                });
+-            if !zero_idiom {
+-                for slot in 0..operation.num_input() {
+-                    let Some(input) = operation.get_in(slot) else { continue };
+-                    let Some((space, mut offset, mut size)) = register_range(fd, input) else { continue };
+-                    if code == OpCode::CPUI_SUBPIECE && slot == 0 {
+-                        if let Some(cut) = operation.get_in(1).and_then(|id| fd.vbank().get(id)) {
+-                            if cut.is_constant() {
+-                                let output_size = operation.get_out().and_then(|id| fd.vbank().get(id))
+-                                    .map_or(size, |value| value.get_size() as usize);
+-                                let low = cut.get_offset() as usize;
+-                                if low + output_size <= size {
+-                                    offset += if fd.vbank().get(input).unwrap().get_addr().is_big_endian() {
+-                                        (size - low - output_size) as u64
+-                                    } else { low as u64 };
+-                                    size = output_size;
+-                                }
+-                            }
+-                        }
+-                    }
+-                    if code == OpCode::CPUI_INT_AND && size <= 8 {
+-                        let mask = operation.get_in(1 - slot).and_then(|id| fd.vbank().get(id))
+-                            .filter(|value| value.is_constant()).map(|value| value.get_offset());
+-                        if let Some(mask) = mask {
+-                            for byte in 0..size {
+-                                let shift = if fd.vbank().get(input).unwrap().get_addr().is_big_endian() {
+-                                    (size - 1 - byte) * 8
+-                                } else { byte * 8 };
+-                                if (mask >> shift) & 0xff != 0 {
+-                                    let index = domain.binary_search(&(space, offset + byte as u64)).unwrap();
+-                                    accesses.push(Access::Read(index..index + 1));
+-                                }
+-                            }
+-                            continue;
+-                        }
+-                    }
+-                    let start = domain.binary_search(&(space, offset)).unwrap();
+-                    accesses.push(Access::Read(start..start + size));
+-                }
+-            }
++            append_register_reads(fd, id, &domain, &mut accesses);
+             // A known callee reads its incoming state before producing these
+             // guaranteed definitions. May-writes alone are never a kill.
+             if let Some(contract) = contracts.get(&id).filter(|_| conditional) {
+@@
+         }
+         events.push(accesses);
+     }
+-    let mut reachable = vec![false; count];
+-    let mut work = vec![0usize];
+-    while let Some(index) = work.pop() {
+-        if reachable[index] { continue; }
+-        reachable[index] = true;
+-        let block = fd.bblocks_ref().block(blocks[index]);
+-        for edge in 0..block.size_out() {
+-            if flow.is_some_and(|view| !view.edge_allowed(blocks[index], edge)) { continue; }
+-            if let Some(next) = positions.get(&block.get_out(edge)) { work.push(*next); }
+-        }
+-    }
+-    let mut written_out = vec![vec![false; width]; count];
+-    let mut written = vec![false; width];
+-    loop {
+-        let mut changed = false;
+-        for index in 0..count {
+-            if !reachable[index] { continue; }
+-            written.fill(false);
+-            if index != 0 {
+-                let block = fd.bblocks_ref().block(blocks[index]);
+-                let mut first = true;
+-                for edge in 0..block.size_in() {
+-                    if flow.is_some_and(|view| !view.edge_allowed(block.get_in(edge), block.get_in_rev_index(edge))) { continue; }
+-                    let Some(predecessor) = positions.get(&block.get_in(edge)).copied() else { continue };
+-                    if !reachable[predecessor] { continue; }
+-                    if first { written.clone_from(&written_out[predecessor]); first = false; }
+-                    else {
+-                        for (value, incoming) in written.iter_mut().zip(&written_out[predecessor]) {
+-                            *value &= *incoming;
+-                        }
+-                    }
+-                }
+-            }
+-            for event in &events[index] {
+-                if let Access::Write(range) = event { written[range.clone()].fill(true); }
+-            }
+-            if written_out[index] != written {
+-                written_out[index].clone_from(&written);
+-                changed = true;
+-            }
+-        }
+-        if !changed { break; }
+-    }
+-    let mut live = vec![false; width];
+-    let mut return_written = vec![true; width];
+-    let mut has_return = false;
+-    for index in 0..count {
+-        if !reachable[index] { continue; }
+-        written.fill(false);
+-        if index != 0 {
+-            let block = fd.bblocks_ref().block(blocks[index]);
+-            let mut first = true;
+-            for edge in 0..block.size_in() {
+-                if flow.is_some_and(|view| !view.edge_allowed(block.get_in(edge), block.get_in_rev_index(edge))) { continue; }
+-                let Some(predecessor) = positions.get(&block.get_in(edge)).copied() else { continue };
+-                if !reachable[predecessor] { continue; }
+-                if first { written.clone_from(&written_out[predecessor]); first = false; }
+-                else {
+-                    for (value, incoming) in written.iter_mut().zip(&written_out[predecessor]) {
+-                        *value &= *incoming;
+-                    }
+-                }
+-            }
+-        }
+-        for event in &events[index] {
+-            match event {
+-                Access::Write(range) => written[range.clone()].fill(true),
+-                Access::Read(range) => {
+-                    for byte in range.clone() { live[byte] |= !written[byte]; }
+-                }
+-                Access::Return => {
+-                    has_return = true;
+-                    for (guaranteed, current) in return_written.iter_mut().zip(&written) {
+-                        *guaranteed &= *current;
+-                    }
+-                }
+-            }
+-        }
+-    }
+-    // No vacuous guarantees for non-returning functions or a closure whose
+-    // unresolved control flow could return along an unobserved path.
+-    if !has_return || !result.is_complete() { return_written.fill(false); }
+-    for (mask, ranges) in [(&live, &mut result.reads), (&return_written, &mut result.definite_writes)] {
+-        let mut index = 0;
+-        while index < width {
+-            if !mask[index] { index += 1; continue; }
+-            let (space_index, offset) = domain[index];
+-            let start = index;
+-            index += 1;
+-            while index < width && mask[index] && domain[index] == (space_index, offset + (index - start) as u64) {
+-                index += 1;
+-            }
+-            if let Some(space) = fd.get_arch().manage().get_space(space_index) {
+-                ranges.push((Address::new(Rc::clone(space), offset), (index - start) as int4));
+-            }
+-        }
++    let (reads, definite_writes, has_return) = solve_register_accesses(fd, &domain, &events,
++        |block, edge| flow.is_none_or(|view| view.edge_allowed(block, edge)));
++    result.reads = reads;
++    if result.is_complete() {
++        result.definite_writes = definite_writes;
++        result.has_normal_return = has_return && (conditional || raw_has_finite_return(fd, callees));
+     }
+     coalesce_writes(&mut result.writes);
+     let restoration = if result.is_complete() {
+@@
+     result.restored = restoration.restored;
+     result.stack_adjustments = restoration.stack_adjustments;
+     result.bookkeeping = restoration.bookkeeping;
+-    // Preserve positive raw reads; only classify exact registers whose actual
+-    // uses are full-width COPYs ending exclusively in normal RETURN targets.
+-    let storage = |id| fd.vbank().get(id).map(|node| (node.get_addr().clone(), node.get_size()));
+-    let mut return_candidates = BTreeMap::new();
+-    for id in fd.obank().iter_code(OpCode::CPUI_RETURN) {
+-        if flow.is_some_and(|view| !view.op_reachable(fd, id)) { continue; }
+-        let Some(value) = fd.obank().get(id).filter(|operation| operation.get_halt_type() == 0)
+-            .and_then(|operation| operation.get_in(0)) else { continue; };
+-        if let Some(storage) = storage(value) { return_candidates.insert(storage, value); }
+-    }
+-    loop {
+-        let mut changed = false;
+-        for id in fd.obank().iter_code(OpCode::CPUI_COPY) {
+-            if flow.is_some_and(|view| !view.op_reachable(fd, id)) { continue; }
+-            let operation = fd.obank().get(id).expect("raw COPY");
+-            if operation.num_input() != 1 { continue; }
+-            let Some(output) = operation.get_out().and_then(storage) else { continue; };
+-            if !return_candidates.contains_key(&output) { continue; }
+-            let Some(input) = operation.get_in(0) else { continue; };
+-            let Some(storage) = storage(input).filter(|storage| storage.1 == output.1) else { continue; };
+-            if let std::collections::btree_map::Entry::Vacant(entry) = return_candidates.entry(storage) {
+-                entry.insert(input);
+-                changed = true;
+-            }
+-        }
+-        if !changed { break; }
+-    }
+-    let return_model = if prototype.has_model() { Some(prototype.model()) } else { fd.get_arch().default_fp() };
+-    for ((address, size), value) in return_candidates {
+-        if size <= 0 || address.get_space().is_none_or(|space| space.get_name() != "register") { continue; }
+-        // The use proof must also start at an authentic incoming return-address
+-        // role, not an arbitrary parameter used by a nonstandard RETURN.
+-        if return_model.is_none_or(|model| model.effect_list().iter().all(|effect|
+-            effect.get_type() != crate::fspec::effect_type::RETURN_ADDRESS
+-                || effect.get_address() != address || effect.get_size() != size)) { continue; }
+-        let Some(end) = address.get_offset().checked_add(size as u64) else { continue; };
+-        if !result.reads.iter().any(|(at, bytes)| *bytes > 0
+-            && at.get_space().zip(address.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
+-            && at.get_offset() <= address.get_offset()
+-            && at.get_offset().checked_add(*bytes as u64).is_some_and(|limit| end <= limit)) { continue; }
++    for ((address, size), value) in return_bookkeeping_candidates(fd, &result.reads, flow.map(Rc::as_ref)) {
+         if return_target_only(fd, value, raw_callees, conditional.then_some(contracts), flow.map(Rc::as_ref)) {
+             result.bookkeeping.push((address, size));
+         }
+@@
+     }
+     Ok(changed)
+ }
++
++#[path = "kuna_physicalinputs_recursive.rs"]
++mod recursive;
++pub(crate) use recursive::analyze_raw_recursive_component;
++pub(super) use recursive::{RawCallView, RawTransferFacts, RecursiveCalls};
+*** Update File: decompiler/crates/kuna-decomp/src/p4_calls/kuna_registerrestore.rs
+@@
+ 
+ fn transfer(
+     fd: &Funcdata, op: OpId, state: &mut State,
+-    callees: &BTreeMap<OpId, Rc<EntryRequirements>>, scratch: &mut Vec<Option<Byte>>,
++    callees: &BTreeMap<OpId, Rc<EntryRequirements>>, recursive: Option<&super::kuna_physicalinputs::RecursiveCalls<'_>>, scratch: &mut Vec<Option<Byte>>,
+     contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>, registers: &[Byte], roots: &[Storage],
+     direct: &BTreeMap<OpId, super::kuna_physicalinputs::DirectExecutionAssumption>,
+     observable: bool, return_loads: &BTreeSet<OpId>,
+@@
+                 }
+                 state.used_private_frame |= !state.stored.is_empty();
+             }
+-        } else if let Some(callee) = callees.get(&op).filter(|callee| callee.is_complete()) {
++        } else if let Some(callee) = recursive.and_then(|view| view.calls.get(&op)).and_then(|call| call.transfer_facts())
++            .or_else(|| callees.get(&op).and_then(|facts| super::kuna_physicalinputs::RawTransferFacts::committed(facts))) {
+             let obligation = direct.get(&op);
+             let mut aliases_stack = state.escaped_stack || state.private_frame_lost || !state.saved_pointers.is_empty();
+             // Source arguments can escape even when sink demand trimmed their
+@@
+             for (address, size) in obligation.into_iter().flat_map(|contract| &contract.inputs) {
+                 check_escape(address, *size);
+             }
+-            for (address, size) in &callee.reads {
++            for (address, size) in callee.reads {
+                 if callee.is_bookkeeping(address, *size) { continue; }
+                 if let Some(space) = address.get_space() {
+                     let range = (space.get_index(), address.get_offset(), *size);
+@@
+                 }
+             }
+             let loses_pointer = state.pointers.keys().any(|pointer| {
+-                let stack_delta = callee.stack_adjustments.iter().any(|(address, size, _)|
++                let stack_delta = callee.stack_adjustments().iter().any(|(address, size, _)|
+                     address.get_space().is_some_and(|space| space.get_index() == pointer.0)
+                         && address.get_offset() == pointer.1 && *size == pointer.2);
+                 !stack_delta && (0..pointer.2).any(|byte| {
+                     let key = (pointer.0, pointer.1 + byte as u64);
+-                    covered(&callee.writes, key) && !covered(&callee.restored, key)
++                    covered(callee.writes, key) && !covered(callee.restored(), key)
+                 }) && !(0..pointer.2).all(|byte|
+-                    covered(&callee.definite_writes, (pointer.0, pointer.1 + byte as u64)))
++                    covered(callee.definite_writes(), (pointer.0, pointer.1 + byte as u64)))
+             });
+             if loses_pointer {
+                 state.observe_roots(roots);
+@@
+             } else if callee.reads_memory {
+                 state.observed.extend(state.stack.values().copied());
+             }
+-            for (address, size) in &callee.writes {
++            for (address, size) in callee.writes {
+                 let Some(space) = address.get_space() else { continue };
+                 for byte in 0..*size {
+                     let address = address + byte as i64;
+                     if !callee.restores(&address, 1) {
+-                        let stack_adjustment = callee.stack_adjustments.iter().any(|(at, bytes, _)| {
++                        let stack_adjustment = callee.stack_adjustments().iter().any(|(at, bytes, _)| {
+                             at.get_space().is_some_and(|other| Rc::ptr_eq(space, other))
+                                 && at.get_offset() <= address.get_offset()
+                                 && address.get_offset() - at.get_offset() < *bytes as u64
+@@
+                         if stack_adjustment {
+                             state.values.insert((space.get_index(), address.get_offset()), None);
+                         } else {
+-                            if !covered(&callee.definite_writes, (space.get_index(), address.get_offset())) {
++                            if !covered(callee.definite_writes(), (space.get_index(), address.get_offset())) {
+                                 state.observe_range(fd, (space.get_index(), address.get_offset(), 1), roots);
+                             }
+                             state.invalidate((space.get_index(), address.get_offset(), 1));
+@@
+                     }
+                 }
+             }
+-            for (address, size, delta) in &callee.stack_adjustments {
++            for (address, size, delta) in callee.stack_adjustments() {
+                 let Some(space) = address.get_space() else { continue };
+                 let storage = (space.get_index(), address.get_offset(), *size);
+                 if let Some(offset) = state.pointers.get(&storage).and_then(|offset| offset.checked_add(*delta)) {
+@@
+     flow_returns: &BTreeMap<OpId, super::kuna_physicalinputs::FlowReturnAssumption>,
+     flow: Option<&super::kuna_physicalinputs::ConditionalFlowView>,
+ ) -> Restoration {
++    restored_registers_impl(fd, callees, raw_callees, writes, contracts, direct, flow_returns, flow, None)
++}
++
++pub(super) fn restored_recursive_registers(fd: &Funcdata,
++    recursive: &super::kuna_physicalinputs::RecursiveCalls<'_>, writes: &[(Address, int4)],
++) -> Restoration {
++    restored_registers_impl(fd, &BTreeMap::new(), &BTreeMap::new(), writes, None,
++        &BTreeMap::new(), &BTreeMap::new(), None, Some(recursive))
++}
++
++fn restored_registers_impl(
++    fd: &Funcdata, callees: &BTreeMap<OpId, Rc<EntryRequirements>>,
++    raw_callees: &BTreeMap<OpId, Rc<EntryRequirements>>, writes: &[(Address, int4)],
++    contracts: Option<&BTreeMap<OpId, &ExecutionCallEffects>>,
++    direct: &BTreeMap<OpId, super::kuna_physicalinputs::DirectExecutionAssumption>,
++    flow_returns: &BTreeMap<OpId, super::kuna_physicalinputs::FlowReturnAssumption>,
++    flow: Option<&super::kuna_physicalinputs::ConditionalFlowView>,
++    recursive: Option<&super::kuna_physicalinputs::RecursiveCalls<'_>>,
++) -> Restoration {
+     let mut result = Restoration::default();
+     if restore_trace(fd) { eprintln!("RESTORE begin entry={:?} conditional={} writes={:?} selected_children={} raw_children={}", trace_address(fd.get_address()), contracts.is_some(), trace_ranges(writes), callees.len(), raw_callees.len()); }
+     let blocks: Vec<_> = (0..fd.bblocks_get_size()).map(|index| fd.bblocks_get_block(index)).collect();
+@@
+     let positions: BTreeMap<_, _> = blocks.iter().enumerate().map(|(index, block)| (*block, index)).collect();
+     let operations: Vec<Vec<_>> = blocks.iter().map(|block| {
+         let mut operations = Vec::new();
+-        if flow.is_some_and(|view| !view.block_reachable(*block)) { return operations; }
++        if flow.is_some_and(|view| !view.block_reachable(*block))
++            || recursive.is_some_and(|view| !view.block_reachable(*block)) { return operations; }
+         let mut op = match fd.bblocks_ref().block(*block).kind() {
+             BlockKind::Basic(data) => data.op_head, _ => None,
+         };
+         while let Some(id) = op {
+             operations.push(id);
++            if recursive.is_some_and(|view| view.stops(id)) { break; }
+             op = fd.obank().get(id).expect("raw block operation").basic_neighbours().1;
+         }
+         operations
+@@
+             potential_outputs.push(range);
+         }
+     }
+-    if flow.is_some() {
++    if flow.is_some() || recursive.is_some() {
+         // Registers appearing only in an eliminated arm still belong to the
+         // original preservation obligation. A live call can clobber them even
+         // when no retained p-code operand mentions their storage.
+@@
+     } else { potential_outputs };
+     let mut retired_pointers = BTreeMap::new();
+     let mut dead_after = |call, range| *retired_pointers.entry((call, range))
+-        .or_insert_with(|| pointer_dead_after(fd, call, range, raw_callees, contracts, &return_outputs, flow));
++        .or_insert_with(|| recursive.is_none()
++            && pointer_dead_after(fd, call, range, raw_callees, contracts, &return_outputs, flow));
+     let return_loads = operations.iter().flatten().filter_map(|op| {
+         let operation = fd.obank().get(*op).expect("raw operation");
+         (operation.code() == OpCode::CPUI_LOAD
+-            && operation.get_out().is_some_and(|output| super::kuna_physicalinputs::return_target_only(fd, output, raw_callees, contracts, flow)))
++            && operation.get_out().is_some_and(|output| super::kuna_physicalinputs::return_target_uses(fd, output,
++                &|op| recursive.and_then(|view| view.calls.get(&op).copied())
++                    .or_else(|| raw_callees.get(&op).and_then(|facts| super::kuna_physicalinputs::RawCallView::committed(facts))),
++                contracts, flow)))
+             .then_some(*op)
+     }).collect::<BTreeSet<_>>();
+     // Raw register/temporary liveness suppresses dead arithmetic observations
+@@
+         let mut changed = false;
+         live_operations.clear();
+         for index in (0..blocks.len()).rev() {
+-            if flow.is_some_and(|view| !view.block_reachable(blocks[index])) { continue; }
++            if flow.is_some_and(|view| !view.block_reachable(blocks[index]))
++                || recursive.is_some_and(|view| !view.block_reachable(blocks[index])) { continue; }
+             let mut live = BTreeSet::new();
+             let block = fd.bblocks_ref().block(blocks[index]);
+             for edge in 0..block.size_out() {
+-                if flow.is_some_and(|view| !view.edge_allowed(blocks[index], edge)) { continue; }
++                if flow.is_some_and(|view| !view.edge_allowed(blocks[index], edge))
++                    || recursive.is_some_and(|view| !view.block_continues(blocks[index])) { continue; }
+                 if let Some(next) = positions.get(&block.get_out(edge)) { live.extend(live_in[*next].iter().copied()); }
+             }
+             for op in operations[index].iter().rev() {
+@@
+                 if let Some(contract) = contracts.and_then(|contracts| contracts.get(op)) {
+                     live.retain(|byte| !registers.binary_search(byte).is_ok() || covered(&contract.preserved, *byte));
+                     for (address, size) in &contract.inputs {
++                        if let Some(space) = address.get_space() {
++                            for byte in 0..*size { live.insert((space.get_index(), address.get_offset() + byte as u64)); }
++                        }
++                    }
++                } else if let Some(callee) = recursive.and_then(|view| view.calls.get(op)) {
++                    for (address, size) in callee.definite_writes() {
++                        if let Some(space) = address.get_space() {
++                            for byte in 0..*size {
++                                let at = address + byte as i64;
++                                if !callee.restores(&at, 1) { live.remove(&(space.get_index(), at.get_offset())); }
++                            }
++                        }
++                    }
++                    for (address, size) in callee.reads {
+                         if let Some(space) = address.get_space() {
+                             for byte in 0..*size { live.insert((space.get_index(), address.get_offset() + byte as u64)); }
+                         }
+@@
+     loop {
+         let mut changed = false;
+         for index in 0..blocks.len() {
+-            if flow.is_some_and(|view| !view.block_reachable(blocks[index])) { continue; }
++            if flow.is_some_and(|view| !view.block_reachable(blocks[index]))
++                || recursive.is_some_and(|view| !view.block_reachable(blocks[index])) { continue; }
+             let mut state = if index == 0 { Some(entry.clone()) } else { None };
+             let block = fd.bblocks_ref().block(blocks[index]);
+             for edge in 0..block.size_in() {
+-                if flow.is_some_and(|view| !view.edge_allowed(block.get_in(edge), block.get_in_rev_index(edge))) { continue; }
++                if flow.is_some_and(|view| !view.edge_allowed(block.get_in(edge), block.get_in_rev_index(edge)))
++                    || recursive.is_some_and(|view| !view.block_continues(block.get_in(edge))) { continue; }
+                 let Some(previous) = positions.get(&block.get_in(edge)).and_then(|index| outgoing[*index].as_ref()) else { continue };
+                 if let Some(state) = state.as_mut() { state.meet(previous, fd, &roots); }
+                 else { state = Some(previous.clone()); }
+@@
+             incoming[index].clone_from(&state);
+             if let Some(state) = state.as_mut() {
+                 for op in &operations[index] {
+-                    transfer(fd, *op, state, callees, &mut scratch, contracts, &registers, &roots,
++                    transfer(fd, *op, state, callees, recursive, &mut scratch, contracts, &registers, &roots,
+                         direct,
+                         live_operations.contains(op), &return_loads, &mut dead_after);
+                 }
+             }
++            if recursive.is_some_and(|view| !view.block_continues(blocks[index])) { state = None; }
+             if outgoing[index] != state { outgoing[index] = state; changed = true; }
+         }
+         if !changed { break; }
+@@
+                 Some((native, generated, stack, start, size))
+             });
+             let before = restore_trace(fd).then_some((state.private_frame_lost, state.escaped_stack, state.stack.len()));
+-            transfer(fd, *op, &mut state, callees, &mut scratch, contracts, &registers, &roots,
++            transfer(fd, *op, &mut state, callees, recursive, &mut scratch, contracts, &registers, &roots,
+                 direct,
+                 live_operations.contains(op), &return_loads, &mut dead_after);
+             if !state.private_frame_lost && !state.escaped_stack {
+@@
+                 let after = (state.private_frame_lost, state.escaped_stack, state.stack.len());
+                 if before != after { eprintln!("RESTORE transition entry={:?} site={:?} code={:?} before={before:?} after={after:?} pointers={:?}", trace_address(fd.get_address()), (trace_address(operation.get_addr()), operation.get_time()), operation.code(), state.pointers); }
+             }
++            if recursive.is_some_and(|view| view.stops(*op)) { break; }
+             if operation.code() != OpCode::CPUI_RETURN || operation.get_halt_type() != 0 { continue; }
+             has_return = true;
+             if restore_trace(fd) {
+*** Add File: decompiler/crates/kuna-decomp/src/p4_calls/kuna_physicalinputs_recursive.rs
++//! Private raw SCC domains. No snapshot is an EntryRequirements or a C premise.
++use super::*;
++
++type Ranges = Vec<(Address, int4)>;
++
++#[derive(Clone, Default, PartialEq, Eq)]
++struct RawMayEffects {
++    writes: Ranges,
++    reads_memory: bool,
++    writes_memory: bool,
++}
++
++#[derive(Clone, PartialEq, Eq)]
++struct ReturnFacts {
++    definite_writes: Ranges,
++    restored: Ranges,
++    stack_adjustments: Vec<(Address, int4, i64)>,
++}
++
++#[derive(Clone, Default, PartialEq, Eq)]
++enum FiniteReturns {
++    #[default]
++    NoFiniteReturn,
++    Returning(ReturnFacts),
++}
++
++#[derive(Clone, Default, PartialEq, Eq)]
++struct RecursiveSnapshot {
++    may: RawMayEffects,
++    returns: FiniteReturns,
++    reads: Ranges,
++    bookkeeping: Ranges,
++}
++
++#[derive(Clone, Copy)]
++pub(crate) struct RawCallView<'a> {
++    pub reads: &'a [(Address, int4)],
++    pub writes: &'a [(Address, int4)],
++    pub reads_memory: bool,
++    pub writes_memory: bool,
++    bookkeeping: &'a [(Address, int4)],
++    returns: Option<ReturnView<'a>>,
++}
++
++#[derive(Clone, Copy)]
++struct ReturnView<'a> {
++    definite_writes: &'a [(Address, int4)],
++    restored: &'a [(Address, int4)],
++    stack_adjustments: &'a [(Address, int4, i64)],
++}
++
++/// Provenance transfer facts do not themselves assert that a call returns.
++/// The ordinary solver preserves its existing control-flow semantics; only the
++/// recursive frontier decides when a snapshot may supply a continuation.
++pub(crate) struct RawTransferFacts<'a> {
++    pub reads: &'a [(Address, int4)],
++    pub writes: &'a [(Address, int4)],
++    pub reads_memory: bool,
++    pub writes_memory: bool,
++    bookkeeping: &'a [(Address, int4)],
++    returns: ReturnView<'a>,
++}
++
++impl<'a> RawTransferFacts<'a> {
++    pub(crate) fn committed(facts: &'a EntryRequirements) -> Option<Self> {
++        if !facts.is_complete() { return None; }
++        Some(Self {
++            reads: &facts.reads, writes: &facts.writes,
++            reads_memory: facts.reads_memory, writes_memory: facts.writes_memory,
++            bookkeeping: &facts.bookkeeping,
++            returns: ReturnView { definite_writes: &facts.definite_writes,
++                restored: &facts.restored, stack_adjustments: &facts.stack_adjustments },
++        })
++    }
++    pub(crate) fn definite_writes(&self) -> &'a [(Address, int4)] { self.returns.definite_writes }
++    pub(crate) fn restored(&self) -> &'a [(Address, int4)] { self.returns.restored }
++    pub(crate) fn stack_adjustments(&self) -> &'a [(Address, int4, i64)] { self.returns.stack_adjustments }
++    pub(crate) fn restores(&self, address: &Address, size: int4) -> bool {
++        covers(self.restored(), address, size)
++    }
++    pub(crate) fn is_bookkeeping(&self, address: &Address, size: int4) -> bool {
++        covers(self.bookkeeping, address, size)
++    }
++}
++
++fn covers(ranges: &[(Address, int4)], address: &Address, size: int4) -> bool {
++    let Some(end) = u64::try_from(size).ok().filter(|size| *size > 0)
++        .and_then(|size| address.get_offset().checked_add(size)) else { return false; };
++    let mut cursor = address.get_offset();
++    while cursor < end {
++        let next = ranges.iter().filter(|(at, size)| *size > 0
++            && at.get_space().zip(address.get_space()).is_some_and(|(a, b)| Rc::ptr_eq(a, b))
++            && at.get_offset() <= cursor)
++            .filter_map(|(at, size)| at.get_offset().checked_add(*size as u64)).max().unwrap_or(cursor);
++        if next <= cursor { return false; }
++        cursor = next.min(end);
++    }
++    true
++}
++
++impl<'a> RawCallView<'a> {
++    pub(crate) fn committed(facts: &'a EntryRequirements) -> Option<Self> {
++        if !facts.is_complete() { return None; }
++        Some(Self {
++            reads: &facts.reads, writes: &facts.writes,
++            reads_memory: facts.reads_memory, writes_memory: facts.writes_memory,
++            bookkeeping: &facts.bookkeeping,
++            returns: facts.has_normal_return.then_some(ReturnView { definite_writes: &facts.definite_writes,
++                restored: &facts.restored, stack_adjustments: &facts.stack_adjustments }),
++        })
++    }
++
++    fn snapshot(facts: &'a RecursiveSnapshot) -> Self {
++        Self {
++            reads: &facts.reads, writes: &facts.may.writes,
++            reads_memory: facts.may.reads_memory, writes_memory: facts.may.writes_memory,
++            bookkeeping: &facts.bookkeeping,
++            returns: match &facts.returns {
++                FiniteReturns::NoFiniteReturn => None,
++                FiniteReturns::Returning(returns) => Some(ReturnView {
++                    definite_writes: &returns.definite_writes, restored: &returns.restored,
++                    stack_adjustments: &returns.stack_adjustments,
++                }),
++            },
++        }
++    }
++
++    pub(crate) fn has_finite_return(&self) -> bool { self.returns.is_some() }
++    pub(crate) fn transfer_facts(&self) -> Option<RawTransferFacts<'a>> {
++        Some(RawTransferFacts {
++            reads: self.reads, writes: self.writes,
++            reads_memory: self.reads_memory, writes_memory: self.writes_memory,
++            bookkeeping: self.bookkeeping, returns: self.returns?,
++        })
++    }
++    pub(crate) fn definite_writes(&self) -> &'a [(Address, int4)] {
++        self.returns.map_or(&[], |returns| returns.definite_writes)
++    }
++    pub(crate) fn restored(&self) -> &'a [(Address, int4)] {
++        self.returns.map_or(&[], |returns| returns.restored)
++    }
++    pub(crate) fn stack_adjustments(&self) -> &'a [(Address, int4, i64)] {
++        self.returns.map_or(&[], |returns| returns.stack_adjustments)
++    }
++    pub(crate) fn restores(&self, address: &Address, size: int4) -> bool {
++        covers(self.restored(), address, size)
++    }
++    pub(crate) fn is_bookkeeping(&self, address: &Address, size: int4) -> bool {
++        covers(self.bookkeeping, address, size)
++    }
++}
++
++/// Borrowed only during one raw transfer. Never attached to a call or FD.
++pub(crate) struct RecursiveCalls<'a> {
++    pub calls: BTreeMap<OpId, RawCallView<'a>>,
++    reachable: BTreeSet<crate::context::BlockId>,
++    stopped_blocks: BTreeSet<crate::context::BlockId>,
++    stopped_calls: BTreeSet<OpId>,
++}
++
++impl RecursiveCalls<'_> {
++    pub(crate) fn block_reachable(&self, block: crate::context::BlockId) -> bool {
++        self.reachable.contains(&block)
++    }
++    pub(crate) fn block_continues(&self, block: crate::context::BlockId) -> bool {
++        self.reachable.contains(&block) && !self.stopped_blocks.contains(&block)
++    }
++    pub(crate) fn stops(&self, op: OpId) -> bool { self.stopped_calls.contains(&op) }
++}
++
++#[derive(Clone, PartialEq, Eq)]
++enum Target { Member(usize), External(Address) }
++
++#[derive(Clone, PartialEq, Eq)]
++struct CapturedGraph {
++    blocks: Vec<crate::context::BlockId>,
++    operations: Vec<Vec<OpId>>,
++    successors: Vec<Vec<crate::context::BlockId>>,
++    calls: BTreeMap<OpId, Target>,
++}
++
++fn capture(fd: &Funcdata, members: &BTreeMap<Address, usize>,
++    external: &BTreeMap<Address, Rc<EntryRequirements>>) -> Option<CapturedGraph>
++{
++    if fd.bblocks_get_size() == 0 || fd.has_unimplemented() || fd.has_bad_data() { return None; }
++    let blocks = (0..fd.bblocks_get_size()).map(|index| fd.bblocks_get_block(index)).collect::<Vec<_>>();
++    let positions = blocks.iter().copied().collect::<BTreeSet<_>>();
++    let mut result = CapturedGraph { blocks, operations: Vec::new(), successors: Vec::new(), calls: BTreeMap::new() };
++    for block in &result.blocks {
++        let basic = fd.bblocks_ref().block(*block);
++        let BlockKind::Basic(data) = basic.kind() else { return None; };
++        let successors = (0..basic.size_out()).map(|edge| basic.get_out(edge)).collect::<Vec<_>>();
++        if successors.iter().any(|next| !positions.contains(next)) { return None; }
++        let mut next = data.op_head;
++        let mut operations = Vec::new();
++        while let Some(op) = next {
++            let operation = fd.obank().get(op)?;
++            if operation.get_halt_type() != 0 { return None; }
++            let code = operation.code();
++            if matches!(code, OpCode::CPUI_CALLIND | OpCode::CPUI_CALLOTHER | OpCode::CPUI_BRANCHIND) { return None; }
++            if code == OpCode::CPUI_CALL {
++                let call = fd.get_call_specs(fd.get_call_specs_index(op)?);
++                let entry = call.get_entry_address();
++                let target = if let Some(index) = members.get(entry) { Target::Member(*index) }
++                    else {
++                        let facts = external.get(entry)?;
++                        if !facts.is_complete() { return None; }
++                        Target::External(entry.clone())
++                    };
++                result.calls.insert(op, target);
++            }
++            if matches!(code, OpCode::CPUI_LOAD | OpCode::CPUI_STORE) {
++                let memory = operation.get_in(0).and_then(|id| fd.vbank().get(id))
++                    .filter(|value| value.is_constant())
++                    .and_then(|value| int4::try_from(value.get_offset()).ok())
++                    .and_then(|index| fd.get_arch().manage().get_space(index))?;
++                if memory.get_name() == "register" { return None; }
++            }
++            operations.push(op);
++            next = operation.basic_neighbours().1;
++        }
++        let last = operations.last().and_then(|op| fd.obank().get(*op))?;
++        if successors.is_empty() && last.code() != OpCode::CPUI_RETURN { return None; }
++        result.operations.push(operations);
++        result.successors.push(successors);
++    }
++    Some(result)
++}
++
++fn calls<'a>(graph: &CapturedGraph, snapshots: &'a [RecursiveSnapshot],
++    external: &'a BTreeMap<Address, Rc<EntryRequirements>>) -> RecursiveCalls<'a>
++{
++    let calls = graph.calls.iter().map(|(op, target)| (*op, match target {
++        Target::Member(index) => RawCallView::snapshot(&snapshots[*index]),
++        Target::External(entry) => RawCallView::committed(&external[entry]).expect("captured complete external"),
++    })).collect::<BTreeMap<_, _>>();
++    let positions = graph.blocks.iter().enumerate().map(|(index, block)| (*block, index)).collect::<BTreeMap<_, _>>();
++    let mut result = RecursiveCalls { calls, reachable: BTreeSet::new(), stopped_blocks: BTreeSet::new(), stopped_calls: BTreeSet::new() };
++    let mut work = vec![0];
++    while let Some(index) = work.pop() {
++        let block = graph.blocks[index];
++        if !result.reachable.insert(block) { continue; }
++        if let Some(op) = graph.operations[index].iter().find(|op|
++            result.calls.get(op).is_some_and(|call| !call.has_finite_return()))
++        {
++            result.stopped_blocks.insert(block);
++            result.stopped_calls.insert(*op);
++        } else {
++            work.extend(graph.successors[index].iter().map(|block| positions[block]));
++        }
++    }
++    result
++}
++
++fn add_ranges(domain: &mut Vec<(int4, u64)>, ranges: &[(Address, int4)]) -> Option<()> {
++    for (address, size) in ranges {
++        let space = address.get_space()?;
++        let bytes = u64::try_from(*size).ok().filter(|size| *size > 0)?;
++        let end = address.get_offset().checked_add(bytes)?;
++        domain.extend((address.get_offset()..end).map(|offset| (space.get_index(), offset)));
++    }
++    Some(())
++}
++
++fn append_ranges(domain: &[(int4, u64)], ranges: &[(Address, int4)], events: &mut Vec<Access>, write: bool) {
++    for (address, size) in ranges {
++        let space = address.get_space().expect("validated raw range");
++        let start = domain.binary_search(&(space.get_index(), address.get_offset())).expect("raw domain contains range");
++        events.push(if write { Access::Write(start..start + *size as usize) }
++            else { Access::Read(start..start + *size as usize) });
++    }
++}
++
++fn local_accesses(fd: &Funcdata, graph: &CapturedGraph, domain: &[(int4, u64)],
++    returns: &[(Address, int4)], calls: &RecursiveCalls<'_>, demand: bool,
++) -> (Ranges, Ranges, bool)
++{
++    let events = graph.operations.iter().enumerate().map(|(index, operations)| {
++        let mut events = Vec::new();
++        if !calls.block_reachable(graph.blocks[index]) { return events; }
++        for op in operations {
++            let operation = fd.obank().get(*op).expect("captured raw operation");
++            if operation.code() == OpCode::CPUI_RETURN { append_ranges(domain, returns, &mut events, false); }
++            if demand {
++                if let Some(call) = calls.calls.get(op) { append_ranges(domain, call.reads, &mut events, false); }
++            }
++            append_register_reads(fd, *op, domain, &mut events);
++            if calls.stops(*op) { break; }
++            if let Some(call) = calls.calls.get(op) { append_ranges(domain, call.definite_writes(), &mut events, true); }
++            if let Some((space, offset, size)) = operation.get_out().and_then(|out| register_range(fd, out)) {
++                let start = domain.binary_search(&(space, offset)).expect("local output domain");
++                events.push(Access::Write(start..start + size));
++            }
++            if operation.code() == OpCode::CPUI_RETURN { events.push(Access::Return); }
++        }
++        events
++    }).collect::<Vec<_>>();
++    solve_register_accesses(fd, domain, &events, |block, _| calls.block_continues(block))
++}
++
++fn meet_ranges(previous: &[(Address, int4)], next: &[(Address, int4)]) -> Ranges {
++    let mut result = Vec::new();
++    for (address, size) in previous {
++        for byte in 0..*size {
++            let at = address + i64::from(byte);
++            if covers(next, &at, 1) { result.push((at, 1)); }
++        }
++    }
++    coalesce_writes(&mut result);
++    result
++}
++
++fn stack_candidates(fd: &Funcdata) -> Ranges {
++    let mut result = Vec::new();
++    if let Some(stack) = fd.get_arch().manage().get_stack_space() {
++        for index in 0..stack.num_spacebase() {
++            if let Ok(storage) = stack.get_spacebase(index) {
++                if let Some(space) = storage.space { result.push((Address::new(space, storage.offset), storage.size as int4)); }
++            }
++        }
++    }
++    result
++}
++
++fn close_bookkeeping(members: &[&Funcdata], graphs: &[CapturedGraph], snapshots: &mut [RecursiveSnapshot],
++    external: &BTreeMap<Address, Rc<EntryRequirements>>)
++{
++    // Greatest candidate elimination is safe only after positive raw demand is fixed.
++    // Every retained candidate still passes the actual local-use and child-use test.
++    for (fd, snapshot) in members.iter().zip(snapshots.iter_mut()) {
++        snapshot.bookkeeping = stack_candidates(fd);
++        snapshot.bookkeeping.extend(return_bookkeeping_candidates(fd, &snapshot.reads, None)
++            .into_iter().map(|(range, _)| range));
++    }
++    loop {
++        let next = members.iter().enumerate().map(|(index, fd)| {
++            let calls = calls(&graphs[index], snapshots, external);
++            let lookup = |op| calls.calls.get(&op).copied();
++            let return_candidates = return_bookkeeping_candidates(fd, &snapshots[index].reads, None);
++            snapshots[index].bookkeeping.iter().filter(|(address, size)| {
++                if return_candidates.iter().any(|((at, bytes), value)| at == address && bytes == size
++                    && return_target_uses(fd, *value, &lookup, None, None)) { return true; }
++                let Some(tainted) = stack_address_uses(fd, address, *size, &lookup, None, None) else { return false; };
++                calls.calls.values().all(|call| call.reads.iter().all(|(at, bytes)| {
++                    let intersects = at.get_space().is_some_and(|space| tainted.iter().any(|(id, offset, size)|
++                        *id == space.get_index() && *offset < at.get_offset().saturating_add(*bytes as u64)
++                            && at.get_offset() < offset.saturating_add(*size as u64)));
++                    !intersects || call.is_bookkeeping(at, *bytes)
++                }))
++            }).cloned().collect::<Ranges>()
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.bookkeeping != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.bookkeeping = next; }
++        if !changed { break; }
++    }
++}
++
++/// Close one genuine SCC. The caller stages every returned Rc before installing
++/// any of them. An ungrounded or unresolved component returns None, never an
++/// empty-complete cut. Root and child FDs remain borrowed and unchanged throughout.
++pub(crate) fn analyze_raw_recursive_component(members: &[&Funcdata],
++    external: &BTreeMap<Address, Rc<EntryRequirements>>) -> KunaResult<Option<Vec<EntryRequirements>>>
++{
++    if members.is_empty() { return Ok(None); }
++    let positions = members.iter().enumerate().map(|(index, fd)| (fd.get_address().clone(), index)).collect::<BTreeMap<_, _>>();
++    if positions.len() != members.len() { return Ok(None); }
++    let Some(graphs) = members.iter().map(|fd| capture(fd, &positions, external)).collect::<Option<Vec<_>>>() else { return Ok(None); };
++    let Some(return_reads) = members.iter().map(|fd| raw_return_reads(fd)).collect::<Option<Vec<_>>>() else { return Ok(None); };
++    let mut domain = Vec::new();
++    let mut snapshots = vec![RecursiveSnapshot::default(); members.len()];
++    for (index, fd) in members.iter().enumerate() {
++        for vn in fd.vbank().iter_loc() {
++            if let Some((space, offset, size)) = register_range(fd, vn) {
++                let Some(end) = offset.checked_add(size as u64) else { return Ok(None); };
++                domain.extend((offset..end).map(|offset| (space, offset)));
++            }
++        }
++        if add_ranges(&mut domain, &return_reads[index]).is_none() { return Ok(None); }
++        for op in graphs[index].operations.iter().flatten() {
++            let operation = fd.obank().get(*op).expect("captured operation");
++            snapshots[index].may.reads_memory |= operation.code() == OpCode::CPUI_LOAD;
++            snapshots[index].may.writes_memory |= operation.code() == OpCode::CPUI_STORE;
++            if let Some(output) = operation.get_out().filter(|out| register_range(fd, *out).is_some()) {
++                let output = fd.vbank().get(output).expect("actual output");
++                snapshots[index].may.writes.push((output.get_addr().clone(), output.get_size()));
++            }
++        }
++        coalesce_writes(&mut snapshots[index].may.writes);
++    }
++    for graph in &graphs {
++        for target in graph.calls.values() {
++            if let Target::External(entry) = target {
++                let child = &external[entry];
++                if add_ranges(&mut domain, &child.reads).is_none()
++                    || add_ranges(&mut domain, &child.writes).is_none()
++                    || add_ranges(&mut domain, &child.definite_writes).is_none() { return Ok(None); }
++            }
++        }
++    }
++    domain.sort_unstable();
++    domain.dedup();
++    // May-effects include original recursive-call continuations and every raw arm.
++    loop {
++        let next = graphs.iter().enumerate().map(|(index, graph)| {
++            let mut may = snapshots[index].may.clone();
++            for target in graph.calls.values() {
++                let call = match target {
++                    Target::Member(index) => RawCallView::snapshot(&snapshots[*index]),
++                    Target::External(entry) => RawCallView::committed(&external[entry]).expect("complete external"),
++                };
++                may.writes.extend_from_slice(call.writes);
++                may.reads_memory |= call.reads_memory;
++                may.writes_memory |= call.writes_memory;
++            }
++            coalesce_writes(&mut may.writes);
++            may
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.may != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.may = next; }
++        if !changed { break; }
++    }
++    // Actual normal RETURNs ground finite executions. Newly enabled continuations
++    // can only remove previous must facts; absence of a finite path grants none.
++    loop {
++        let next = members.iter().enumerate().map(|(index, fd)| {
++            let calls = calls(&graphs[index], &snapshots, external);
++            let (_, writes, returning) = local_accesses(fd, &graphs[index], &domain, &return_reads[index], &calls, false);
++            if !returning { return FiniteReturns::NoFiniteReturn; }
++            let definite_writes = match &snapshots[index].returns {
++                FiniteReturns::NoFiniteReturn => writes,
++                FiniteReturns::Returning(previous) => meet_ranges(&previous.definite_writes, &writes),
++            };
++            FiniteReturns::Returning(ReturnFacts { definite_writes, restored: Vec::new(), stack_adjustments: Vec::new() })
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.returns != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.returns = next; }
++        if !changed { break; }
++    }
++    if snapshots.iter().any(|snapshot| matches!(snapshot.returns, FiniteReturns::NoFiniteReturn)) { return Ok(None); }
++    // Stable definite writes now kill demand. Prefix reads before a recursive
++    // call remain positive; no initially empty must-write set pollutes the result.
++    loop {
++        let next = members.iter().enumerate().map(|(index, fd)| {
++            let calls = calls(&graphs[index], &snapshots, external);
++            let (mut reads, _, _) = local_accesses(fd, &graphs[index], &domain, &return_reads[index], &calls, true);
++            reads.extend_from_slice(&snapshots[index].reads);
++            coalesce_writes(&mut reads);
++            reads
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.reads != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.reads = next; }
++        if !changed { break; }
++    }
++    close_bookkeeping(members, &graphs, &mut snapshots, external);
++    let definite = snapshots.iter().map(|snapshot| match &snapshot.returns {
++        FiniteReturns::Returning(returns) => returns.definite_writes.clone(),
++        FiniteReturns::NoFiniteReturn => unreachable!("grounded component"),
++    }).collect::<Vec<_>>();
++    // Restoration starts a separate finite-return induction, with fixed effects,
++    // fixed positive demand and closed bookkeeping. It reuses the ordinary raw
++    // provenance transfer, including conservative saved-memory invalidation.
++    for snapshot in &mut snapshots { snapshot.returns = FiniteReturns::NoFiniteReturn; }
++    loop {
++        let next = members.iter().enumerate().map(|(index, fd)| {
++            let calls = calls(&graphs[index], &snapshots, external);
++            let (_, _, returning) = local_accesses(fd, &graphs[index], &domain, &return_reads[index], &calls, false);
++            if !returning { return FiniteReturns::NoFiniteReturn; }
++            let restored = super::super::kuna_registerrestore::restored_recursive_registers(fd, &calls, &snapshots[index].may.writes);
++            let (restored, stack_adjustments) = match &snapshots[index].returns {
++                FiniteReturns::NoFiniteReturn => (restored.restored, restored.stack_adjustments),
++                FiniteReturns::Returning(previous) => (meet_ranges(&previous.restored, &restored.restored),
++                    previous.stack_adjustments.iter().filter(|item| restored.stack_adjustments.contains(item)).cloned().collect()),
++            };
++            FiniteReturns::Returning(ReturnFacts { definite_writes: definite[index].clone(), restored, stack_adjustments })
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.returns != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.returns = next; }
++        if !changed { break; }
++    }
++    // Keep restoration's ordinary non-observation bookkeeping, too. Each new
++    // range is proved against the already closed positive reads and the previous
++    // round's actual child bookkeeping, not an initially empty demand summary.
++    loop {
++        let next = members.iter().enumerate().map(|(index, fd)| {
++            let calls = calls(&graphs[index], &snapshots, external);
++            let restored = super::super::kuna_registerrestore::restored_recursive_registers(fd, &calls, &snapshots[index].may.writes);
++            let mut bookkeeping = snapshots[index].bookkeeping.clone();
++            bookkeeping.extend(restored.bookkeeping);
++            coalesce_writes(&mut bookkeeping);
++            bookkeeping
++        }).collect::<Vec<_>>();
++        let changed = snapshots.iter().zip(&next).any(|(snapshot, next)| snapshot.bookkeeping != *next);
++        for (snapshot, next) in snapshots.iter_mut().zip(next) { snapshot.bookkeeping = next; }
++        if !changed { break; }
++    }
++    // Revalidate exact actual topology/calls before making publishable facts.
++    for (fd, graph) in members.iter().zip(&graphs) {
++        if capture(fd, &positions, external).as_ref() != Some(graph) { return Ok(None); }
++    }
++    let mut result = Vec::with_capacity(members.len());
++    for snapshot in snapshots {
++        let FiniteReturns::Returning(returns) = snapshot.returns else { return Ok(None); };
++        result.push(EntryRequirements {
++            reads: snapshot.reads, writes: snapshot.may.writes, restored: returns.restored,
++            reads_memory: snapshot.may.reads_memory, writes_memory: snapshot.may.writes_memory,
++            stack_adjustments: returns.stack_adjustments, definite_writes: returns.definite_writes,
++            bookkeeping: snapshot.bookkeeping, execution: None, unresolved: Vec::new(), incomplete_flow: false,
++            has_normal_return: true,
++        });
++    }
++    Ok(Some(result))
++}
+*** End Patch

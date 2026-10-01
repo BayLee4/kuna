@@ -88,7 +88,7 @@ use kuna_base::space::spacetype;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::context::{OpId, VarnodeId};
 use crate::funcdata::Funcdata;
 use crate::p0_knowledge::options::on_or_off;
@@ -136,11 +136,8 @@ impl Rule for RuleConstSpaceLoad {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleConstSpaceLoad { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConstSpaceLoad { enabled: self.enabled, group: self.group.clone() })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -227,6 +224,7 @@ fn is_constant_space(data: &Funcdata, vn: VarnodeId) -> bool {
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option constspaceload on`.
         ctor: || Box::new(RuleConstSpaceLoad::with_group(true, "analysis")),
     }]

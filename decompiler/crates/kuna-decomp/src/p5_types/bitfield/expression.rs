@@ -13,7 +13,7 @@
 //! Every method is a line-for-line transcription of the C++ named in its doc
 //! comment.  The field offsets/widths are read from the op's const inputs
 //! (`in(2)`/`in(3)` for INSERT, `in(1)`/`in(2)` for the pulls) and from the
-//! `TypeStruct` bitfield `TypeField`s via [`Datatype::find_matching_bit_field`];
+//! `TypeStruct` bitfield `TypeField`s via [`TypeRoot::find_matching_bit_field`];
 //! nothing is hardcoded and no field name / mask value / offset is special-cased.
 //!
 //! # API-surface adaptation
@@ -32,7 +32,7 @@ use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
 
 use super::BitRange;
-use crate::dtype::{type_metatype, Datatype, TypeBitField};
+use crate::dtype::{type_metatype, TypeRoot, TypeBitField};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 
@@ -49,7 +49,7 @@ const SIZEOF_UINTB: int4 = 8;
 pub struct BitFieldExpression {
     /// Parent structure containing the bitfield (C++ `theStruct`).  `None` when
     /// the structure could not be recovered.
-    pub the_struct: Option<Rc<Datatype>>,
+    pub the_struct: Option<TypeRoot>,
     /// Formal bitfield description (C++ `bitfield`).  `None` ⇒ invalid.
     pub bitfield: Option<TypeBitField>,
     /// Offset of byte range into the encompassing struct (C++ `byteRangeOffset`).
@@ -73,10 +73,10 @@ impl BitFieldExpression {
     /// given data-type, then — given the least significant bit of the bitfield —
     /// descend into the structure immediately containing the bitfield (which may
     /// be a different, nested structure).
-    fn get_structures(&mut self, dt: &Rc<Datatype>, init_byte_off: int4, least_bit_off: int4, is_big_endian: bool) {
+    fn get_structures(&mut self, dt: &TypeRoot, init_byte_off: int4, least_bit_off: int4, is_big_endian: bool) {
         self.the_struct = None;
         self.byte_range_offset = if init_byte_off < 0 { 0 } else { init_byte_off };
-        let encompass_struct: Rc<Datatype> = match dt.get_metatype() {
+        let encompass_struct: TypeRoot = match dt.get_metatype() {
             type_metatype::TYPE_PARTIALSTRUCT => {
                 // TypePartialStruct *partial = (TypePartialStruct *)dt;
                 let struct_tmp = match dt.get_partial_base() {
@@ -89,7 +89,7 @@ impl BitFieldExpression {
                 self.byte_range_offset += dt.get_partial_offset().unwrap_or(0);
                 struct_tmp
             }
-            type_metatype::TYPE_STRUCT => Rc::clone(dt),
+            type_metatype::TYPE_STRUCT => dt.clone(),
             _ => return,
         };
         // int8 offset = byteRangeOffset; leastBitOff /= 8;
@@ -153,7 +153,7 @@ impl BitFieldExpression {
 ///
 /// A static helper used by the simplification rules to identify the bitfield a
 /// pull reads, independent of full [`PullExpression`] recovery.
-pub fn get_pull_field(data: &Funcdata, pull: OpId) -> Option<TypeBitField> {
+pub fn get_pull_field(data: &Funcdata, pull: OpId) -> Option<(TypeBitField, TypeRoot)> {
     let mut expr = BitFieldExpression::default();
     let o = data.obank().get(pull)?;
     let in_vn = o.get_in(0)?;
@@ -171,7 +171,9 @@ pub fn get_pull_field(data: &Funcdata, pull: OpId) -> Option<TypeBitField> {
         bit_size,
         is_big,
     );
-    the_struct.find_matching_bit_field(&range)
+    let field = the_struct.find_matching_bit_field(&range)?;
+    let field_type = the_struct.related(field.field_type).ok()?;
+    Some((field, field_type))
 }
 
 /// A write to a bitfield stored in an explicit Varnode (C++ `InsertExpression`,
@@ -205,7 +207,7 @@ impl InsertExpression {
             let spc = v.get_space();
             let least_bit_off = data.vbank().get(o.get_in(2)?)?.get_offset() as int4;
             let bit_size = data.vbank().get(o.get_in(3)?)?.get_offset() as int4;
-            let sym_type = Rc::clone(sym_type);
+            let sym_type = sym_type.clone();
             expr.get_structures(&sym_type, hb.kuna_symbol_offset(), least_bit_off, spc.is_big_endian());
             let the_struct = expr.the_struct.as_ref()?;
             let range = BitRange::new(
@@ -310,7 +312,7 @@ impl InsertStoreExpression {
         let def_facing = data.vn_type_def_facing(value);
         self.expr.get_structures(&def_facing, 0, least_bit_off, spc.is_big_endian());
         let the_struct = match &self.expr.the_struct {
-            Some(s) => Rc::clone(s),
+            Some(s) => s.clone(),
             None => return None,
         };
         // structPtr = recoverStructurePointer(store->getIn(1), byteRangeOffset);
@@ -373,7 +375,7 @@ impl PullExpression {
         let po = data.obank().get(pull)?;
         let in_vn = po.get_in(0)?;
         let in_v = data.vbank().get(in_vn)?;
-        let dt: Rc<Datatype>;
+        let dt: TypeRoot;
         let offset: int4;
         let spc;
         if in_v.is_written()
@@ -391,14 +393,14 @@ impl PullExpression {
             let sym_type = hb.kuna_symbol_type()?;
             self.has_symbol = true;
             spc = Rc::clone(in_v.get_space());
-            dt = Rc::clone(sym_type);
+            dt = sym_type.clone();
             offset = hb.kuna_symbol_offset();
         }
         let least_bit_off = data.vbank().get(po.get_in(1)?)?.get_offset() as int4;
         let bit_size = data.vbank().get(po.get_in(2)?)?.get_offset() as int4;
         self.expr.get_structures(&dt, offset, least_bit_off, spc.is_big_endian());
         let the_struct = match &self.expr.the_struct {
-            Some(s) => Rc::clone(s),
+            Some(s) => s.clone(),
             None => return None,
         };
         if let Some(load_op) = self.load_op {

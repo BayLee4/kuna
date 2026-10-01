@@ -34,7 +34,7 @@ use kuna_num::opcodes::OpCode;
 use slotmap::{Key, KeyData};
 
 use kuna_decomp::cover::{Cover, CoverPoint, PcodeOpSet};
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::merge::{
     compare_copy_by_in_varnode, compare_high_by_block, AddrTiedRange, BlockVarnode,
     HighGroupInfo, Merge, MergeContext, MergeIntersect, MergePieceId,
@@ -61,8 +61,8 @@ fn vkey(vn: VarnodeId) -> u64 {
 fn okey(op: OpId) -> u64 {
     op.data().as_ffi()
 }
-fn dt(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, meta))
+fn dt(types: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    types.intern(Datatype::new(size, meta)).unwrap()
 }
 
 fn ram() -> Rc<AddrSpace> {
@@ -106,7 +106,7 @@ fn cover_block(blk: int4, start: uintm, stop: uintm) -> Cover {
 
 #[derive(Clone, Default)]
 struct HighState {
-    type_: Option<Rc<Datatype>>,
+    type_: Option<TypeRoot>,
     addr_tied: bool,
     has_cover: bool,
     cover_dirty: bool,
@@ -116,6 +116,7 @@ struct HighState {
 }
 
 struct Mock {
+    types: TypeFactoryImpl,
     highs: BTreeMap<u32, HighState>,
     vn_high: BTreeMap<u64, HighVariableId>,
     vn_def: BTreeMap<u64, OpId>,
@@ -131,7 +132,11 @@ struct Mock {
 
 impl Mock {
     fn new() -> Mock {
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
         Mock {
+            types,
             highs: BTreeMap::new(),
             vn_high: BTreeMap::new(),
             vn_def: BTreeMap::new(),
@@ -152,7 +157,7 @@ impl Mock {
         self.highs.get_mut(&h.0).expect("mock: missing high")
     }
     /// Create a high with one instance varnode that carries `cover`.
-    fn make_high(&mut self, h: u32, inst: u64, ty: Rc<Datatype>, cover: Cover) {
+    fn make_high(&mut self, h: u32, inst: u64, ty: TypeRoot, cover: Cover) {
         let v = vid(inst);
         self.vn_high.insert(vkey(v), hid(h));
         self.vn_cover.insert(vkey(v), cover.clone());
@@ -176,7 +181,7 @@ impl HighContext for Mock {
         VarnodeView {
             flags: 0,
             size: 0,
-            type_: dt(1, type_metatype::TYPE_UNKNOWN),
+            type_: dt(&self.types, 1, type_metatype::TYPE_UNKNOWN),
             type_lock: false,
             merge_group: 0,
             written: false,
@@ -233,7 +238,7 @@ impl MergeContext for Mock {
     fn kuna_tied_phi_trim(&self) -> bool {
         false
     }
-    fn high_get_type(&mut self, h: HighVariableId) -> Rc<Datatype> {
+    fn high_get_type(&mut self, h: HighVariableId) -> TypeRoot {
         self.hs(h).type_.clone().expect("mock: high has no type")
     }
     fn high_is_addr_tied(&mut self, h: HighVariableId) -> bool {
@@ -419,8 +424,8 @@ impl MergeContext for Mock {
         op_is_indirect_creation(OpId) -> bool;
         op_is_partial_root(OpId) -> bool;
         op_previous(OpId) -> Option<OpId>;
-        op_output_type_local(OpId) -> Rc<Datatype>;
-        op_input_type_local(OpId, int4) -> Rc<Datatype>;
+        op_output_type_local(OpId) -> TypeRoot;
+        op_input_type_local(OpId, int4) -> TypeRoot;
         op_cover_point(OpId) -> (int4, CoverPoint);
         indirect_effect_op(OpId) -> OpId;
         bblocks_get_size() -> int4;
@@ -580,7 +585,7 @@ fn reg_high(
     m.highs.insert(
         h,
         HighState {
-            type_: Some(dt(4, type_metatype::TYPE_UNKNOWN)),
+            type_: Some(dt(&m.types, 4, type_metatype::TYPE_UNKNOWN)),
             addr_tied: false,
             has_cover: true,
             cover_dirty: false,
@@ -703,10 +708,9 @@ fn w7_s6_merge_by_datatype_preserves_discovery_order() {
     // making them all mergeable, so mergeLinear collapses each type group into
     // its first member by repeated `merge(stack[0], h)`. The recorded merge
     // order witnesses the preserved discovery order.
-    let t_a = dt(4, type_metatype::TYPE_INT);
-    let t_b = dt(4, type_metatype::TYPE_UINT);
-
     let mut m = Mock::new();
+    let t_a = dt(&m.types, 4, type_metatype::TYPE_INT);
+    let t_b = dt(&m.types, 4, type_metatype::TYPE_UINT);
     // highs h1..h5 with instances 1..5; types A,B,A,B,A; covers on blocks 1..5.
     let types = [&t_a, &t_b, &t_a, &t_b, &t_a];
     for (k, ty) in types.iter().enumerate() {
@@ -757,10 +761,10 @@ fn w7_s6_merge_intersection_self_and_disjoint_and_overlap() {
     let mut m = Mock::new();
     // h1, h2 disjoint covers on DIFFERENT blocks -> intersect_list empty -> no
     // intersection.
-    m.make_high(1, 1, dt(4, type_metatype::TYPE_INT), cover_block(1, 0, 5));
-    m.make_high(2, 2, dt(4, type_metatype::TYPE_INT), cover_block(2, 0, 5));
+    m.make_high(1, 1, dt(&m.types, 4, type_metatype::TYPE_INT), cover_block(1, 0, 5));
+    m.make_high(2, 2, dt(&m.types, 4, type_metatype::TYPE_INT), cover_block(2, 0, 5));
     // h3 shares block 1 with h1 AND its instance cover overlaps at level 2.
-    m.make_high(3, 3, dt(4, type_metatype::TYPE_INT), cover_block(1, 1, 4));
+    m.make_high(3, 3, dt(&m.types, 4, type_metatype::TYPE_INT), cover_block(1, 1, 4));
 
     let mut cache = fresh_cache();
 
@@ -787,8 +791,8 @@ fn w7_s6_merge_intersection_cache_reused_when_clean() {
     // (proving the cache short-circuit fired) — matching the C++ which only
     // re-walks covers when a high is cover-dirty.
     let mut m = Mock::new();
-    m.make_high(1, 1, dt(4, type_metatype::TYPE_INT), cover_block(1, 0, 5));
-    m.make_high(2, 2, dt(4, type_metatype::TYPE_INT), cover_block(2, 0, 5));
+    m.make_high(1, 1, dt(&m.types, 4, type_metatype::TYPE_INT), cover_block(1, 0, 5));
+    m.make_high(2, 2, dt(&m.types, 4, type_metatype::TYPE_INT), cover_block(2, 0, 5));
 
     let mut cache = fresh_cache();
     assert!(!MergeIntersect::intersection(&mut m, &mut cache, hid(1), hid(2)));

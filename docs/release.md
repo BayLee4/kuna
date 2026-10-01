@@ -100,10 +100,16 @@ and 18 tags**.
    normalizes archive entry modes for reproducibility, which would strip the
    exec bits; the extension's `build.gradle` pins 0755 on the `kuna_ghidra`
    entries explicitly, so the zip is correct under both Gradle 8 and 9.)
-   The zip is fully self-contained (`kuna_ghidra` needs no `.sla` files —
-   specs arrive over the wire), so it installs airgapped; it is version-locked
-   to the pinned Ghidra release, other 12.x installs go through the
-   installer's "Install Anyway" dialog. See
+   The build also applies the maintained `call-return-origin.patch` and
+   `callable-support.patch` to the pinned installation's SoftwareModeling and
+   Decompiler source archives. It packages one bootstrap producer/consumer JAR,
+   bound to the exact application properties, both module JARs and source archives
+   by hashes, and to the callable-support protocol revision. The zip is self-contained (`kuna_ghidra` needs no
+   `.sla` files — specs arrive over the wire), so installation works airgapped.
+   `KunaIntegratedInstall` copies the matching Ghidra distribution into a new output
+   and installs both the native extension and bootstrap producer there, without
+   changing the original installation. Other distributions require a rebuild, not
+   the extension installer's "Install Anyway" option. See
    `integrations/ghidra/KunaDecompiler/README.md` for the install steps.
 5. **release** — `gh release create v<ver>` with all assets, tagging the built
    commit. This is what creates the git tag; no tags are pushed from anywhere
@@ -130,6 +136,7 @@ list of overrides is in `docs/cli.md`.
 (Inside a repo checkout none of this applies — binaries live in
 `decompiler/target/release/` and specs are found from the repo root.)
 
-The `kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip` asset is not an
-archive to extract — install it from inside Ghidra (**File → Install
-Extensions… → `+`**); see `integrations/ghidra/KunaDecompiler/README.md`.
+Extract the `kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip` asset and
+run its `kuna.KunaIntegratedInstall` Java installer against the matching Ghidra
+distribution. It creates a new integrated copy rather than modifying the original;
+see `integrations/ghidra/KunaDecompiler/README.md`.

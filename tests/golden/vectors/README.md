@@ -82,6 +82,27 @@ notes for the Rust port:
 - NaN-producing arithmetic re-encodes through the host's double pipeline;
   the C++ side canonicalizes NaNs via getNaNEncoding, so payloads are stable,
   but the sign of a NaN *result* follows host semantics.
+  Rust additionally leaves NaN signs unspecified across arithmetic, float
+  casts, and optimization levels ([NaN bit-pattern guarantees](https://doc.rust-lang.org/std/primitive.f32.html#nan-bit-patterns)).
+  Kuna makes compatibility with the pinned oracle independent of that host:
+  binary arithmetic selects the first NaN operand's encoded sign, otherwise
+  the second's, before performing host arithmetic. Subtraction does not flip
+  the second NaN's sign. Square root, ceiling, floor and rounding preserve a
+  NaN input's sign; negation flips it and absolute value clears it.
+  Invalid operations on non-NaN inputs produce a negative canonical quiet
+  NaN. All these arithmetic results discard payload/signaling distinctions.
+  This is an unconditional pinned-oracle compatibility policy, not a claim
+  about every target ISA or Ghidra build. Operand priority refers to the
+  operands received by FloatFormat, after any caller-side reordering.
+  Host-reference tests keep bit-exact finite, signed-zero and infinity
+  comparisons; NaN expectations use explicit bits rather than a host
+  arithmetic or float-cast result. Independent literal cases in
+  `decompiler/crates/kuna-num/tests/nan_policy.rs` exercise both signs,
+  operand orders, quiet/signaling payloads and generated invalid results.
+  Direct encoder tests use explicit `f64::from_bits` inputs and require exact
+  sign preservation and payload canonicalization in both output precisions;
+  they do not assume a Rust float-cast roundtrip preserves NaN signs.
+  The pinned golden vectors and their byte-for-byte comparisons are unchanged.
 - The decimal column of `dec` rows is C++ iostream `operator<<(double)` with
   default (6 significant digit) precision, e.g. `3.14159`, `1e+10`, `-inf`,
   `nan`.

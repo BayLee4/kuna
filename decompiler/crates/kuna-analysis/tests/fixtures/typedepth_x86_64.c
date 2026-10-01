@@ -84,8 +84,8 @@ int use_state(state_t *ps, int n)
 
 /* A typedef'd ANONYMOUS struct whose name is already taken by a kuna core type
    (`code`) -- zlib's `inftrees.h` does exactly this. Borrowing the alias makes
-   the type factory refuse the redefinition, and the aggregate must then fall
-   back to the anonymous name rather than degrade the pointer to `void *`. */
+   the aggregate use a separate identity. The source typedef must retain that
+   aggregate target rather than resolve to callable `code` or `void *`. */
 typedef struct { unsigned char op; unsigned short val; } code;
 
 int walk_codes(code *base, int n)

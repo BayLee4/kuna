@@ -26,7 +26,7 @@
 //!
 //!   * **Pure data-type lattice** (`cast_standard`, `arithmetic_output_standard`,
 //!     `is_subpiece_cast`, `is_subpiece_cast_endian`, `is_sext_cast`,
-//!     `is_zext_cast`) — depend only on the [`Datatype`] lattice and the
+//!     `is_zext_cast`) — depend only on the [`TypeRoot`] datatype graph and the
 //!     [`TypeFactory`].  These are transcribed *directly* against the W6
 //!     `dtype`/`typeop` surface and are exactly what `testtypes.cc`'s `cast_*`
 //!     tests validate (through `TypeOp::getInputCast`, which calls
@@ -65,7 +65,7 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, uint4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 
 /// Types of integer promotion (C++ `CastStrategy::IntPromotionCode`,
 /// cast.hh:48-54).  For many languages small integers are automatically
@@ -146,10 +146,10 @@ pub trait CastContext {
     /// `vn->loneDescend()` — the unique reader op, or `None`.
     fn vn_lone_descend(&self, vn: VnRef) -> Option<OpRef>;
     /// `vn->getHigh()->getType()` — the HighVariable data-type (`getHigh`).
-    fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype>;
+    fn vn_high_type(&self, vn: VnRef) -> TypeRoot;
     /// `vn->getHighTypeReadFacing(op)` — the read-facing HighVariable data-type
     /// (`getHigh()->getType()` resolved against the union read by `op`).
-    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> Rc<Datatype>;
+    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> TypeRoot;
 
     /// `op->getOpcode()->inheritsSign()` (the addlflags predicate of the op's
     /// op-code, `typeop::type_op_info(op->code()).inherits_sign()`).
@@ -219,11 +219,11 @@ pub trait CastStrategy {
     /// visible cast?  `None` for no cast, else the data-type to cast to.
     fn cast_standard(
         &self,
-        reqtype: &Rc<Datatype>,
-        curtype: &Rc<Datatype>,
+        reqtype: &TypeRoot,
+        curtype: &TypeRoot,
         care_uint_int: bool,
         care_ptr_uint: bool,
-    ) -> Option<Rc<Datatype>>;
+    ) -> Option<TypeRoot>;
 
     /// C++ `arithmeticOutputStandard` — the output data-type produced by integer
     /// arithmetic `op`.
@@ -231,27 +231,27 @@ pub trait CastStrategy {
         &self,
         ctx: &dyn CastContext,
         op: OpRef,
-    ) -> KunaResult<Rc<Datatype>>;
+    ) -> KunaResult<TypeRoot>;
 
     /// C++ `isSubpieceCast` — is truncating `intype` to `outtype` (SUBPIECE,
     /// byte `offset`) a cast?
-    fn is_subpiece_cast(&self, outtype: &Datatype, intype: &Datatype, offset: uint4) -> bool;
+    fn is_subpiece_cast(&self, outtype: &TypeRoot, intype: &TypeRoot, offset: uint4) -> bool;
 
     /// C++ `isSubpieceCastEndian` — `isSubpieceCast` adjusted for endianness when
     /// the truncation pulls bytes directly from memory.
     fn is_subpiece_cast_endian(
         &self,
-        outtype: &Datatype,
-        intype: &Datatype,
+        outtype: &TypeRoot,
+        intype: &TypeRoot,
         offset: uint4,
         isbigend: bool,
     ) -> bool;
 
     /// C++ `isSextCast` — is sign-extending `intype` to `outtype` a cast?
-    fn is_sext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool;
+    fn is_sext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool;
 
     /// C++ `isZextCast` — is zero-extending `intype` to `outtype` a cast?
-    fn is_zext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool;
+    fn is_zext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool;
 
     // -- Non-virtual base helpers (default methods) -------------------------
 
@@ -666,27 +666,27 @@ impl CastStrategy for CastStrategyC {
     // C++ CastStrategyC::castStandard (cast.cc:300-392).
     fn cast_standard(
         &self,
-        reqtype: &Rc<Datatype>,
-        curtype: &Rc<Datatype>,
+        reqtype: &TypeRoot,
+        curtype: &TypeRoot,
         care_uint_int: bool,
         care_ptr_uint: bool,
-    ) -> Option<Rc<Datatype>> {
+    ) -> Option<TypeRoot> {
         // Generic casting rules that apply for most ops
-        if Rc::ptr_eq(curtype, reqtype) {
+        if curtype.id() == reqtype.id() {
             return None; // Types are equal, no cast required
         }
         let mut care_uint_int = care_uint_int;
         if curtype.get_metatype() == type_metatype::TYPE_VOID {
-            return Some(Rc::clone(reqtype)); // If coming from "void" (a dereferenced pointer) we need a cast
+            return Some(Clone::clone(reqtype)); // If coming from "void" (a dereferenced pointer) we need a cast
         }
-        let mut reqbase: Rc<Datatype> = Rc::clone(reqtype);
-        let mut curbase: Rc<Datatype> = Rc::clone(curtype);
+        let mut reqbase: TypeRoot = Clone::clone(reqtype);
+        let mut curbase: TypeRoot = Clone::clone(curtype);
         let mut isptr = false;
         while reqbase.get_metatype() == type_metatype::TYPE_PTR
             && curbase.get_metatype() == type_metatype::TYPE_PTR
         {
             if reqbase.get_word_size() != curbase.get_word_size() {
-                return Some(Rc::clone(reqtype));
+                return Some(Clone::clone(reqtype));
             }
             let req_space = reqbase.get_pointer_space();
             let cur_space = curbase.get_pointer_space();
@@ -695,7 +695,7 @@ impl CastStrategy for CastStrategyC {
             #[allow(clippy::collapsible_if)]
             if !addr_space_eq(&req_space, &cur_space) {
                 if req_space.is_some() && cur_space.is_some() {
-                    return Some(Rc::clone(reqtype)); // Pointers to different address spaces.  We must cast
+                    return Some(Clone::clone(reqtype)); // Pointers to different address spaces.  We must cast
                 }
                 // If one pointer doesn't have an address, assume a conversion to/from
                 // sub-type and don't need a cast
@@ -709,14 +709,12 @@ impl CastStrategy for CastStrategyC {
         }
         // Strip typedefs.
         while let Some(td) = reqbase.get_typedef() {
-            let td = Rc::clone(td);
             reqbase = td;
         }
         while let Some(td) = curbase.get_typedef() {
-            let td = Rc::clone(td);
             curbase = td;
         }
-        if Rc::ptr_eq(&curbase, &reqbase) {
+        if curbase.id() == reqbase.id() {
             return None; // Different typedefs could point to the same type
         }
         if reqbase.get_metatype() == type_metatype::TYPE_VOID
@@ -731,7 +729,7 @@ impl CastStrategy for CastStrategyC {
             {
                 return None; // Don't need a cast
             }
-            return Some(Rc::clone(reqtype)); // Otherwise, always cast change in size
+            return Some(Clone::clone(reqtype)); // Otherwise, always cast change in size
         }
         match reqbase.get_metatype() {
             type_metatype::TYPE_UNKNOWN
@@ -812,7 +810,7 @@ impl CastStrategy for CastStrategyC {
             _ => {}
         }
 
-        Some(Rc::clone(reqtype))
+        Some(Clone::clone(reqtype))
     }
 
     // C++ CastStrategyC::arithmeticOutputStandard (cast.cc:394-409).
@@ -820,7 +818,7 @@ impl CastStrategy for CastStrategyC {
         &self,
         ctx: &dyn CastContext,
         op: OpRef,
-    ) -> KunaResult<Rc<Datatype>> {
+    ) -> KunaResult<TypeRoot> {
         let mut res1 = ctx.vn_high_type_read_facing(ctx.op_in(op, 0), op);
         if res1.get_metatype() == type_metatype::TYPE_BOOL {
             // Treat boolean as if it is cast to an integer
@@ -844,7 +842,7 @@ impl CastStrategy for CastStrategyC {
     }
 
     // C++ CastStrategyC::isSubpieceCast (cast.cc:411-432).
-    fn is_subpiece_cast(&self, outtype: &Datatype, intype: &Datatype, offset: uint4) -> bool {
+    fn is_subpiece_cast(&self, outtype: &TypeRoot, intype: &TypeRoot, offset: uint4) -> bool {
         if offset != 0 {
             return false;
         }
@@ -881,8 +879,8 @@ impl CastStrategy for CastStrategyC {
     // C++ CastStrategyC::isSubpieceCastEndian (cast.cc:434-441).
     fn is_subpiece_cast_endian(
         &self,
-        outtype: &Datatype,
-        intype: &Datatype,
+        outtype: &TypeRoot,
+        intype: &TypeRoot,
         offset: uint4,
         isbigend: bool,
     ) -> bool {
@@ -896,7 +894,7 @@ impl CastStrategy for CastStrategyC {
     }
 
     // C++ CastStrategyC::isSextCast (cast.cc:443-455).
-    fn is_sext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool {
+    fn is_sext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool {
         let metaout = outtype.get_metatype();
         if metaout != type_metatype::TYPE_UINT && metaout != type_metatype::TYPE_INT {
             return false;
@@ -911,7 +909,7 @@ impl CastStrategy for CastStrategyC {
     }
 
     // C++ CastStrategyC::isZextCast (cast.cc:457-469).
-    fn is_zext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool {
+    fn is_zext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool {
         let metaout = outtype.get_metatype();
         if metaout != type_metatype::TYPE_UINT && metaout != type_metatype::TYPE_INT {
             return false;
@@ -990,37 +988,37 @@ impl CastStrategy for CastStrategyJava {
         &self,
         ctx: &dyn CastContext,
         op: OpRef,
-    ) -> KunaResult<Rc<Datatype>> {
+    ) -> KunaResult<TypeRoot> {
         self.inner.arithmetic_output_standard(ctx, op)
     }
 
-    fn is_subpiece_cast(&self, outtype: &Datatype, intype: &Datatype, offset: uint4) -> bool {
+    fn is_subpiece_cast(&self, outtype: &TypeRoot, intype: &TypeRoot, offset: uint4) -> bool {
         self.inner.is_subpiece_cast(outtype, intype, offset)
     }
 
     fn is_subpiece_cast_endian(
         &self,
-        outtype: &Datatype,
-        intype: &Datatype,
+        outtype: &TypeRoot,
+        intype: &TypeRoot,
         offset: uint4,
         isbigend: bool,
     ) -> bool {
         self.inner.is_subpiece_cast_endian(outtype, intype, offset, isbigend)
     }
 
-    fn is_sext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool {
+    fn is_sext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool {
         self.inner.is_sext_cast(outtype, intype)
     }
 
     // C++ CastStrategyJava::castStandard (cast.cc:471-531).
     fn cast_standard(
         &self,
-        reqtype: &Rc<Datatype>,
-        curtype: &Rc<Datatype>,
+        reqtype: &TypeRoot,
+        curtype: &TypeRoot,
         care_uint_int: bool,
         _care_ptr_uint: bool,
-    ) -> Option<Rc<Datatype>> {
-        if Rc::ptr_eq(curtype, reqtype) {
+    ) -> Option<TypeRoot> {
+        if curtype.id() == reqtype.id() {
             return None; // Types are equal, no cast required
         }
         // Java has no typedef/pointer-chain stripping: reqbase == reqtype,
@@ -1039,7 +1037,7 @@ impl CastStrategy for CastStrategyJava {
             return None; // Don't cast from or to VOID
         }
         if reqbase.get_size() != curbase.get_size() {
-            return Some(Rc::clone(reqtype)); // Always cast change in size
+            return Some(Clone::clone(reqtype)); // Always cast change in size
         }
         match reqbase.get_metatype() {
             type_metatype::TYPE_UNKNOWN
@@ -1103,11 +1101,11 @@ impl CastStrategy for CastStrategyJava {
             _ => {}
         }
 
-        Some(Rc::clone(reqtype))
+        Some(Clone::clone(reqtype))
     }
 
     // C++ CastStrategyJava::isZextCast (cast.cc:533-544).
-    fn is_zext_cast(&self, outtype: &Datatype, intype: &Datatype) -> bool {
+    fn is_zext_cast(&self, outtype: &TypeRoot, intype: &TypeRoot) -> bool {
         let outmeta = outtype.get_metatype();
         if outmeta != type_metatype::TYPE_INT
             && outmeta != type_metatype::TYPE_UINT
@@ -1148,16 +1146,10 @@ fn addr_space_eq(a: &Option<Rc<AddrSpace>>, b: &Option<Rc<AddrSpace>>) -> bool {
 
 /// `((TypeCode *)base)->getPrototype() == (const FuncProto *)0` — true if the
 /// code data-type carries no prototype (a generic code pointer).  The W6 `Code`
-/// kind stores `proto: Option<Rc<FuncProto>>`; the prototype model itself is a
-/// W6 stub, but the *presence* test cast.cc makes is just the `Option`.
-fn code_prototype_is_null(ct: &Datatype) -> bool {
-    match &ct.kind {
-        DatatypeKind::Code { proto } => proto.is_none(),
-        // Caller only reaches here when metatype == TYPE_CODE; any non-Code kind
-        // with that metatype would be a malformed type, so treat as "null proto"
-        // (matches the C++ which would have a TypeCode here).
-        _ => true,
-    }
+/// kind stores an optional logical callable; only its presence matters here.
+fn code_prototype_is_null(ct: &TypeRoot) -> bool {
+    let view = ct.read();
+    view.get_code_prototype(ct.id()).expect("live cast datatype").is_none()
 }
 
 #[cfg(test)]

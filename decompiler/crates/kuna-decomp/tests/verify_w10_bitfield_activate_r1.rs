@@ -24,18 +24,16 @@
 //! The primitive is the only surface reachable without the (unwired) transform
 //! pass; these pin the arithmetic the `ptr->field` render ultimately depends on.
 
-use std::rc::Rc;
-
 use kuna_decomp::bitfield::BitRange;
-use kuna_decomp::dtype::{flags, type_metatype, BitFieldTriple, Datatype, DatatypeKind, TypeBitField};
+use kuna_decomp::dtype::{flags, type_metatype, BitFieldTriple, Datatype, DatatypeKind, TypeBitField, TypeFactoryImpl, TypeRoot};
 
-fn bf(id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> TypeBitField {
+fn bf(types: &TypeFactoryImpl, id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> TypeBitField {
     let mut b = TypeBitField::new(
         id,
         nb,
         big,
         format!("f{id}"),
-        Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)),
+        types.intern(Datatype::new(4, type_metatype::TYPE_UINT)).unwrap().id(),
     );
     b.byte_offset = byte_off;
     b.byte_size = byte_sz;
@@ -43,13 +41,13 @@ fn bf(id: i32, byte_off: i32, byte_sz: i32, lsb: i32, nb: i32, big: bool) -> Typ
     b
 }
 
-fn struct_with(bitfield: Vec<TypeBitField>, size: i32) -> Datatype {
+fn struct_with(types: &TypeFactoryImpl, bitfield: Vec<TypeBitField>, size: i32) -> TypeRoot {
     let mut s = Datatype::new_with_align(size, 4, type_metatype::TYPE_STRUCT);
     if !bitfield.is_empty() {
         s.flags |= flags::has_bitfields;
     }
     s.kind = DatatypeKind::Struct { field: vec![], bitfield };
-    s
+    types.intern(s).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -61,17 +59,18 @@ fn struct_with(bitfield: Vec<TypeBitField>, size: i32) -> Datatype {
 // ---------------------------------------------------------------------------
 #[test]
 fn r1_triple_compare_is_total_strict_weak_order_both_endians() {
+    let types = TypeFactoryImpl::new();
     for big in [false, true] {
         // Fields across two container bytes plus same-byte lsb variants — every
         // branch of compare (byte term both directions, lsb tie-break, exact tie).
         let triples: Vec<BitFieldTriple> = vec![
-            BitFieldTriple::new(bf(0, 0, 1, 0, 2, big), 0),
-            BitFieldTriple::new(bf(1, 0, 1, 2, 2, big), 0),
-            BitFieldTriple::new(bf(2, 1, 1, 0, 4, big), 0),
-            BitFieldTriple::new(bf(3, 1, 1, 4, 4, big), 0),
+            BitFieldTriple::new(bf(&types, 0, 0, 1, 0, 2, big), 0),
+            BitFieldTriple::new(bf(&types, 1, 0, 1, 2, 2, big), 0),
+            BitFieldTriple::new(bf(&types, 2, 1, 1, 0, 4, big), 0),
+            BitFieldTriple::new(bf(&types, 3, 1, 1, 4, 4, big), 0),
             // A duplicate-keyed pair (same byteOffset+lsb) to exercise the
             // "neither strictly less" equivalence tie.
-            BitFieldTriple::new(bf(4, 0, 1, 0, 2, big), 0),
+            BitFieldTriple::new(bf(&types, 4, 0, 1, 0, 2, big), 0),
         ];
         // Irreflexive + antisymmetric over every ordered pair.
         for a in &triples {
@@ -139,18 +138,19 @@ fn r1_triple_compare_is_total_strict_weak_order_both_endians() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r2_find_matching_be_multibyte_window_narrowing() {
+    let types = TypeFactoryImpl::new();
     // Build BE layout: within a byte, higher lsb is MORE significant; across
     // bytes, lower byteOffset is MORE significant (BE memory order).  The stored
     // order produced by assign_contiguous_bitfields is most- to least-significant
     // in memory: byte0 {lsb4,lsb2,lsb0} then byte1 {lsb4,lsb0}.
     let v = vec![
-        bf(0, 0, 1, 4, 4, true), // byte0 lsb4
-        bf(1, 0, 1, 2, 2, true), // byte0 lsb2
-        bf(2, 0, 1, 0, 2, true), // byte0 lsb0
-        bf(3, 1, 1, 4, 4, true), // byte1 lsb4
-        bf(4, 1, 1, 0, 4, true), // byte1 lsb0
+        bf(&types, 0, 0, 1, 4, 4, true), // byte0 lsb4
+        bf(&types, 1, 0, 1, 2, 2, true), // byte0 lsb2
+        bf(&types, 2, 0, 1, 0, 2, true), // byte0 lsb0
+        bf(&types, 3, 1, 1, 4, 4, true), // byte1 lsb4
+        bf(&types, 4, 1, 1, 0, 4, true), // byte1 lsb0
     ];
-    let s = struct_with(v, 4);
+    let s = struct_with(&types, v, 4);
 
     // Each (byteOffset, lsb, nb) must resolve to its own field, never a neighbour.
     let cases = [
@@ -190,13 +190,14 @@ fn r2_find_matching_be_multibyte_window_narrowing() {
 // ---------------------------------------------------------------------------
 #[test]
 fn r3_collect_upper_bound_boundary_is_strict() {
+    let types = TypeFactoryImpl::new();
     // Three 1-byte containers at byteOffset 0,1,2.  Field 0 ends at byte 1.
     let v = vec![
-        bf(0, 0, 1, 0, 8, false),
-        bf(1, 1, 1, 0, 8, false),
-        bf(2, 2, 1, 0, 8, false),
+        bf(&types, 0, 0, 1, 0, 8, false),
+        bf(&types, 1, 1, 1, 0, 8, false),
+        bf(&types, 2, 2, 1, 0, 8, false),
     ];
-    let s = struct_with(v, 4);
+    let s = struct_with(&types, v, 4);
 
     // Query offset 1, size 1: field0's container ends at exactly 1 -> compareMaxByte
     // (1 < 0+1) is FALSE, so upper_bound skips field0 and starts at field1.

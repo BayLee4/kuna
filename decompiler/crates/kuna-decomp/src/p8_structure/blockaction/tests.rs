@@ -367,7 +367,7 @@ use kuna_base::space::{
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, Datatype, TypeFactoryImpl};
 use crate::funcdata::Funcdata;
 use crate::op::pcodeop_flags;
 use crate::context::{ArchContext, OpId, TypeOp, VarnodeId};
@@ -392,7 +392,12 @@ fn cj_manager() -> AddrSpaceManager {
 }
 
 fn cj_fd() -> Funcdata {
-    let glb = Rc::new(ArchContext::new(cj_manager()));
+    let mut context = ArchContext::new(cj_manager());
+    let types = TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
+    let glb = Rc::new(context);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("nj", "nj", glb, addr, 0x10000000, 0x40).unwrap()
@@ -421,7 +426,9 @@ fn cj_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn cj_vn(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = cj_ram(fd);
-    fd.vbank_mut().create(4, Address::new(ram, off), Rc::new(Datatype::new(4, type_metatype::TYPE_UNKNOWN)))
+    let datatype = fd.get_arch().types_impl().unwrap()
+        .intern(Datatype::new(4, type_metatype::TYPE_UNKNOWN)).unwrap();
+    fd.vbank_mut().create(4, Address::new(ram, off), datatype)
 }
 
 #[test]

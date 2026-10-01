@@ -40,13 +40,15 @@
 //!
 //! ## The side table
 //!
-//! The recovered geometry is recorded in [`VariantLayout`], keyed by the interned
-//! type name, on the `TypeFactory`
+//! The recovered geometry is recorded in [`VariantLayout`], keyed by its owning
+//! graph identity and revision, in the datatype generation
 //! ([`crate::dtype::TypeFactory::kuna_record_variant_layout`]). It is the
 //! `kuna_wire_symbols` arrangement: a table that **never enters the analysis
 //! scope** and is read by nothing in this change, so it cannot perturb emitted C.
 //! It exists so a later pass can render `match` / `if let` / `Ok(v)` from the
 //! compiler's own answer instead of re-deriving it.
+
+use crate::dtype::TypeId;
 
 /// Environment variable that gates DWARF variant-part import (read by
 /// `kuna-analysis::analyzers::dwarf::kuna_dwarfvariants`). Absent or any value
@@ -94,13 +96,13 @@ pub struct VariantFacet {
     /// offset-derived `field_0x…` and no emitted field path claims a variant.
     /// **Empty for a FIELDLESS variant**, which gets no union member at all.
     pub label: String,
-    /// The interned name of the payload struct built for this facet, i.e. the
-    /// type of the union member [`Self::label`] names. **Empty for a FIELDLESS
+    /// The graph identity of the payload struct built for this facet, i.e. the
+    /// type of the union member [`Self::label`] names. **None for a FIELDLESS
     /// variant** (`None`, `Nil`, a unit variant), which overlays nothing and
     /// therefore gets no union member — see the importer's note on
     /// `ScoreUnionFields`. Its name and its discriminant value still live here,
     /// which is what a `match` renderer needs.
-    pub payload_type: String,
+    pub payload_type: Option<TypeId>,
     /// The variant's fields as `(name, offset within the ENUM)` — absolute, not
     /// relative to the payload struct, so a consumer never has to re-add
     /// [`VariantLayout::payload_offset`].
@@ -113,7 +115,10 @@ pub struct VariantFacet {
 /// the change that introduced it (see the module header).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantLayout {
-    /// The interned kuna type name the layout describes (the key).
+    /// Owning graph identity. The generation retains this metadata with
+    /// non-owning edges, so metadata never retains a retired generation.
+    pub type_id: TypeId,
+    /// Display name only, never a metadata lookup key.
     pub type_name: String,
     /// `DW_AT_byte_size` of the enum.
     pub size: i32,
@@ -133,9 +138,9 @@ pub struct VariantLayout {
     /// struct and no `tag` field), because a tag field would have to sit at an
     /// offset a variant already owns.
     pub niche: bool,
-    /// The interned name of the union that overlays the variants. Equal to
-    /// [`Self::type_name`] for a niche, where the union is the whole type.
-    pub union_type: String,
+    /// The graph identity of the union that overlays the variants. Equal to
+    /// [`Self::type_id`] for a niche, where the union is the whole type.
+    pub union_type: TypeId,
     /// The variants, in `DW_TAG_variant` order.
     pub variants: Vec<VariantFacet>,
 }
@@ -168,6 +173,7 @@ impl VariantLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dtype::{TypeFactory, TypeFactoryImpl, TypeField, TypeRoot};
 
     /// The gate defaults on (unset env) and only the off-tokens disable it.
     /// Serialized by being a single test (env is process-global).
@@ -190,39 +196,80 @@ mod tests {
         std::env::remove_var(DWARFVARIANTS_ENV);
     }
 
-    fn layout() -> VariantLayout {
-        VariantLayout {
+    fn layout() -> (TypeRoot, VariantLayout) {
+        let factory = TypeFactoryImpl::new();
+        layout_in(&factory)
+    }
+
+    fn layout_in(factory: &TypeFactoryImpl) -> (TypeRoot, VariantLayout) {
+        let owner = factory.get_type_union("Option<&u32>").unwrap();
+        let payload = factory.get_type_struct("Option<&u32>::Some").unwrap();
+        factory.set_fields_struct_raw(&payload, Vec::new(), Vec::new(), 8, 1, 0).unwrap();
+        factory
+            .set_fields_union_raw(
+                &owner,
+                vec![TypeField::new(0, 0, "Some", payload.id())],
+                8,
+                1,
+            )
+            .unwrap();
+        let layout = VariantLayout {
+            type_id: owner.id(),
             type_name: "Option<&u32>".into(),
             size: 8,
             tag_offset: 0,
             tag_size: 8,
             payload_offset: 0,
             niche: true,
-            union_type: "Option<&u32>::payload".into(),
+            union_type: owner.id(),
             variants: vec![
                 VariantFacet {
                     name: "None".into(),
                     discr: Some(0),
                     label: String::new(),
-                    payload_type: String::new(),
+                    payload_type: None,
                     fields: vec![],
                 },
                 VariantFacet {
                     name: "Some".into(),
                     discr: None,
                     label: "Some".into(),
-                    payload_type: "Option<&u32>::Some".into(),
+                    payload_type: Some(payload.id()),
                     fields: vec![("__0".into(), 0)],
                 },
             ],
-        }
+        };
+        (owner, layout)
+    }
+
+    #[test]
+    fn retained_variant_graph_does_not_alias_a_reused_name_after_flush() {
+        let factory = TypeFactoryImpl::new();
+        let (old, layout) = layout_in(&factory);
+        let payload = layout.variants[1].payload_type.unwrap();
+        factory.kuna_record_variant_layout(&old, layout).unwrap();
+        factory.clear_noncore().unwrap();
+
+        let (fresh, mut fresh_layout) = layout_in(&factory);
+        assert_ne!(old.id(), fresh.id());
+        assert!(fresh.read().variant_layout(fresh.id()).is_none());
+        fresh_layout.variants[1].discr = Some(1);
+        factory.kuna_record_variant_layout(&fresh, fresh_layout).unwrap();
+
+        let old_view = old.read();
+        let retained = old_view.variant_layout(old.id()).unwrap();
+        assert_eq!(retained.union_type, old.id());
+        assert_eq!(retained.variants[1].payload_type, Some(payload));
+        assert_eq!(old_view.get(payload).unwrap().get_size(), 8);
+        assert_eq!(retained.facet_for_discr(7).unwrap().name, "Some");
+        assert!(fresh.read().variant_layout(fresh.id()).unwrap().facet_for_discr(7).is_none());
     }
 
     /// A value a variant claims picks that variant; every other value falls to
     /// the DEFAULT variant, which is the whole point of the niche encoding.
     #[test]
     fn facet_for_discr_prefers_exact_then_default() {
-        let l = layout();
+        let (_owner, l) = layout();
         assert_eq!(l.facet_for_discr(0).unwrap().name, "None");
         assert_eq!(l.facet_for_discr(1).unwrap().name, "Some");
         assert_eq!(l.facet_for_discr(0xdeadbeef).unwrap().name, "Some");
@@ -234,23 +281,23 @@ mod tests {
     /// same bytes do not, and `names_any_variant` is what says which happened.
     #[test]
     fn names_any_variant_tracks_the_suppression() {
-        let l = layout();
+        let (_owner, l) = layout();
         assert!(l.names_any_variant(), "`Some` is the only payload variant here");
 
-        let mut r = layout();
+        let (_result_owner, mut r) = layout();
         r.type_name = "Result<u64, u64>".into();
         r.variants[0] = VariantFacet {
             name: "Ok".into(),
             discr: Some(0),
             label: "field_0x8".into(),
-            payload_type: "Result<u64, u64>::field_0x8".into(),
+            payload_type: r.variants[1].payload_type,
             fields: vec![("__0".into(), 8)],
         };
         r.variants[1] = VariantFacet {
             name: "Err".into(),
             discr: Some(1),
             label: "field_0x8".into(),
-            payload_type: "Result<u64, u64>::field_0x8".into(),
+            payload_type: r.variants[0].payload_type,
             fields: vec![("__0".into(), 8)],
         };
         assert!(!r.names_any_variant(), "two variants at one offset name neither");
@@ -263,7 +310,7 @@ mod tests {
     /// must not fall back to "the first one".
     #[test]
     fn facet_for_discr_without_default_refuses_unclaimed() {
-        let mut l = layout();
+        let (_owner, mut l) = layout();
         l.niche = false;
         l.variants[1].discr = Some(1);
         assert_eq!(l.facet_for_discr(1).unwrap().name, "Some");

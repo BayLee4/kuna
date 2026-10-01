@@ -113,7 +113,8 @@
 //!
 //! ## Name collisions
 //!
-//! `Datatype::hash_name` makes the registered name the type id, and rustc names
+//! `Datatype::hash_name` supplies the aggregate's host token (not its graph
+//! identity), and rustc names
 //! variant payload structs BARE. Reproducible from this repo alone: the
 //! committed `dwarfvariants_x86_64` fixture already carries **3 structure DIEs
 //! named `Some`** at **two different widths** (8 and 16) and 2 each named `Ok`
@@ -168,10 +169,9 @@
 //! catalog row promises.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use kuna_base::types::{int4, uint4};
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeField, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeRoot, TypeField, TypeFactory};
 use kuna_decomp::kuna_dwarfvariants::{VariantFacet, VariantLayout};
 
 use super::kuna_dwarfstructs::{aggregate_alignment, aggregate_size, qualified_name, resolve_name};
@@ -361,7 +361,7 @@ pub(super) fn intern_variant_aggregate(
     walk: &mut TypeWalk,
     word_size: uint4,
     cpp: bool,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     if die.declaration {
         return None;
     }
@@ -415,8 +415,9 @@ pub(super) fn intern_variant_aggregate(
         // interned is what the inner pointer must name.
         return Some(shell);
     }
+    walk.reserve_current(shell.clone());
     let built =
-        build_facets(types, dies, &raw, &name, size, payload_offset, tag_size, walk, word_size, cpp);
+        build_facets(types, &shell, dies, &raw, &name, size, payload_offset, tag_size, walk, word_size, cpp);
     walk.end_aggregate(&name);
 
     // From here on the name is ALREADY interned, so a refusal must not return
@@ -455,33 +456,34 @@ pub(super) fn intern_variant_aggregate(
 fn install_layout(
     types: &dyn TypeFactory,
     die: &DieSnap,
-    shell: &Rc<Datatype>,
+    shell: &TypeRoot,
     raw: &RawVariantPart,
     name: &str,
     size: int4,
     payload_offset: int4,
     tag_size: int4,
-    tag_type: Rc<Datatype>,
+    tag_type: TypeRoot,
     niche: bool,
     union_fields: Vec<TypeField>,
     facets: Vec<VariantFacet>,
-) -> Option<Rc<Datatype>> {
+) -> Option<TypeRoot> {
     let payload_size = size - payload_offset;
     let mut layout = VariantLayout {
+        type_id: shell.id(),
         type_name: name.to_string(),
         size,
         tag_offset: raw.tag_offset,
         tag_size,
         payload_offset,
         niche,
-        union_type: name.to_string(),
+        union_type: shell.id(),
         variants: facets,
     };
 
     if niche {
-        let align = facet_alignment(die.alignment, size, &union_fields);
+        let align = facet_alignment(shell, die.alignment, size, &union_fields);
         let done = types.set_fields_union_raw(shell, union_fields, size, align).ok()?;
-        types.kuna_record_variant_layout(layout);
+        types.kuna_record_variant_layout(&done, layout).ok()?;
         return Some(done);
     }
 
@@ -497,19 +499,19 @@ fn install_layout(
     let union = if ucomplete {
         ushell
     } else {
-        let ualign = facet_alignment(None, payload_size, &union_fields);
+        let ualign = facet_alignment(&ushell, None, payload_size, &union_fields);
         types.set_fields_union_raw(&ushell, union_fields, payload_size, ualign).ok()?
     };
-    layout.union_type = uname;
+    layout.union_type = union.id();
 
     let mut fields = vec![
-        TypeField::new(payload_offset, payload_offset, "payload".to_string(), union),
-        TypeField::new(raw.tag_offset, raw.tag_offset, "tag".to_string(), tag_type),
+        TypeField::new(payload_offset, payload_offset, "payload".to_string(), union.id()),
+        TypeField::new(raw.tag_offset, raw.tag_offset, "tag".to_string(), tag_type.id()),
     ];
     fields.sort_by_key(|f| f.offset);
-    let align = aggregate_alignment(die, size, &fields, &[]);
+    let align = aggregate_alignment(shell, die, size, &fields, &[]);
     let done = types.set_fields_struct_raw(shell, fields, Vec::new(), size, align, 0).ok()?;
-    types.kuna_record_variant_layout(layout);
+    types.kuna_record_variant_layout(&done, layout).ok()?;
     Some(done)
 }
 
@@ -521,11 +523,11 @@ fn install_layout(
 fn seal_shell(
     types: &dyn TypeFactory,
     die: &DieSnap,
-    shell: Rc<Datatype>,
+    shell: TypeRoot,
     size: int4,
     niche: bool,
-) -> Rc<Datatype> {
-    let align = aggregate_alignment(die, size, &[], &[]);
+) -> TypeRoot {
+    let align = aggregate_alignment(&shell, die, size, &[], &[]);
     let sealed = if niche {
         types.set_fields_union_raw(&shell, Vec::new(), size, align)
     } else {
@@ -596,15 +598,17 @@ fn field_name_survives(i: usize, off: int4, width: int4, name: &str, built: &[Bu
 
 /// Whether an already-complete interned struct has exactly `fields`
 /// (offset, name, width), i.e. is the same facet rather than a name collision.
-fn same_layout(t: &Rc<Datatype>, fields: &[TypeField]) -> bool {
+fn same_layout(t: &TypeRoot, fields: &[TypeField]) -> bool {
     if t.num_depend() != fields.len() as int4 {
         return false;
     }
-    fields.iter().enumerate().all(|(i, f)| match t.get_field(i as int4) {
+    let view = t.read();
+    fields.iter().enumerate().all(|(i, f)| match view.get_field(t.id(), i as int4).expect("facet in graph") {
         Some(g) => {
             g.offset == f.offset
                 && g.name == f.name
-                && g.field_type.get_size() == f.field_type.get_size()
+                && view.get(g.field_type).expect("member in graph").get_size()
+                    == view.get(f.field_type).expect("member in graph").get_size()
         }
         None => false,
     })
@@ -627,7 +631,7 @@ fn open_facet(
     fields: Vec<TypeField>,
     size: int4,
     align: int4,
-) -> Option<(Rc<Datatype>, String)> {
+) -> Option<(TypeRoot, String)> {
     for attempt in 0..8 {
         let cand = if attempt == 0 { base.to_string() } else { format!("{base}_{attempt}") };
         let fname =
@@ -662,6 +666,7 @@ fn open_facet(
 #[allow(clippy::too_many_arguments)]
 fn build_facets(
     types: &dyn TypeFactory,
+    owner: &TypeRoot,
     dies: &BTreeMap<usize, DieSnap>,
     raw: &RawVariantPart,
     name: &str,
@@ -694,10 +699,13 @@ fn build_facets(
             }
             let width = fty.get_size();
             let rebased = foff - payload_offset;
-            fields.push(TypeField::new(rebased, rebased, fname.clone(), fty));
+            fields.push(TypeField::new(rebased, rebased, fname.clone(), fty.id()));
             claims.push((fname.clone(), *foff, width));
         }
-        fields.sort_by_key(|f| (f.offset, f.field_type.get_size()));
+        {
+            let view = owner.read();
+            fields.sort_by_key(|f| (f.offset, view.get(f.field_type).expect("member in graph").get_size()));
+        }
         fields.dedup_by_key(|f| f.offset);
         claims.sort_by_key(|c| (c.1, c.2));
         claims.dedup_by_key(|c| c.1);
@@ -724,25 +732,27 @@ fn build_facets(
         // table, which is where a `match` renderer reads them, and there is no
         // payload for a field path to reach anyway.
         let (payload_type, label) = if built[i].fields.is_empty() {
-            (String::new(), String::new())
+            (None, String::new())
         } else {
             let label = label_for(i, &built);
+            let view = owner.read();
             let renamed: Vec<TypeField> = built[i]
                 .fields
                 .iter()
                 .map(|f| {
                     let abs = f.offset + payload_offset;
-                    let width = f.field_type.get_size();
+                    let width = view.get(f.field_type).expect("member in graph").get_size();
                     let fname = if field_name_survives(i, abs, width, &f.name, &built) {
                         f.name.clone()
                     } else {
                         format!("field_0x{abs:x}")
                     };
-                    TypeField::new(f.offset, f.ident, fname, Rc::clone(&f.field_type))
+                    TypeField::new(f.offset, f.ident, fname, f.field_type)
                 })
                 .collect();
-            let falign = facet_alignment(built[i].alignment, payload_size, &renamed);
-            let (facet, fname) = open_facet(
+            drop(view);
+            let falign = facet_alignment(owner, built[i].alignment, payload_size, &renamed);
+            let (facet, _) = open_facet(
                 types,
                 &format!("{name}::{label}"),
                 name,
@@ -754,9 +764,9 @@ fn build_facets(
                 union_fields.len() as int4,
                 0,
                 label.clone(),
-                facet,
+                facet.id(),
             ));
-            (fname, label)
+            (Some(facet.id()), label)
         };
         facets.push(VariantFacet {
             name: built[i].name.clone(),
@@ -779,7 +789,7 @@ fn build_facets(
 /// A name a discriminant type may have: an integer, a boolean, or an enum.
 /// Anything else (a pointer, a float, an aggregate) is not a discriminant this
 /// module will read a `DW_AT_discr_value` against.
-fn is_discriminant_shaped(t: &Rc<Datatype>) -> bool {
+fn is_discriminant_shaped(t: &TypeRoot) -> bool {
     matches!(
         t.get_metatype(),
         type_metatype::TYPE_UINT
@@ -799,31 +809,22 @@ fn open_shell(
     types: &dyn TypeFactory,
     name: &str,
     is_union: bool,
-) -> Option<(Rc<Datatype>, bool)> {
-    let want = if is_union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
-    match types.find_by_name(name) {
-        Ok(Some(t)) if t.get_metatype() == want => {
-            let complete = !t.is_incomplete();
-            Some((t, complete))
-        }
-        Ok(Some(_)) => None,
-        Ok(None) => {
-            let built =
-                if is_union { types.get_type_union(name) } else { types.get_type_struct(name) };
-            built.ok().filter(|t| t.get_metatype() == want).map(|t| (t, false))
-        }
-        Err(_) => None,
-    }
+) -> Option<(TypeRoot, bool)> {
+    let root = if is_union { types.get_type_union(name) } else { types.get_type_struct(name) }
+        .ok()?;
+    let complete = !root.is_incomplete();
+    Some((root, complete))
 }
 
 /// The alignment for a synthesized facet or overlay: the producer's
 /// `DW_AT_alignment` when it stated one, else the widest member's, clamped to a
 /// power of two no wider than the piece itself (`calc_align_size` would otherwise
 /// pad it past the width DWARF gave).
-fn facet_alignment(stated: Option<u64>, size: int4, fields: &[TypeField]) -> int4 {
+fn facet_alignment(owner: &TypeRoot, stated: Option<u64>, size: int4, fields: &[TypeField]) -> int4 {
+    let view = owner.read();
     let derived = fields
         .iter()
-        .map(|f| f.field_type.get_alignment())
+        .map(|f| view.get(f.field_type).expect("member in graph").get_alignment())
         .max()
         .unwrap_or(1)
         .max(1);

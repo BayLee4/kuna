@@ -18,14 +18,12 @@
 //! `op->getTime()` / `op->code()` / `op->numInput()` / `op->getIn()` /
 //! `op->isMarker()` exactly as the C++ does through the `PcodeOp *`.
 
-use std::rc::Rc;
-
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::dtype::{type_metatype, TypeRoot, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::context::OpId;
 use crate::unionresolve::{ResolveEdge, ResolvedUnion};
@@ -40,7 +38,7 @@ impl Funcdata {
 
     /// Build the data-flow `ResolveEdge(unresType, op, slot)`
     /// (C++ `ResolveEdge::ResolveEdge(const Datatype*,const PcodeOp*,int4)`).
-    fn union_edge_op(&self, unres_type: &Datatype, op: OpId, slot: int4) -> ResolveEdge {
+    fn union_edge_op(&self, unres_type: &TypeRoot, op: OpId, slot: int4) -> ResolveEdge {
         ResolveEdge::new_op(unres_type, self.op_time(op), slot)
     }
 
@@ -53,7 +51,7 @@ impl Funcdata {
     /// guard).
     pub fn get_union_field(
         &self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         op: OpId,
         slot: int4,
     ) -> Option<&ResolvedUnion> {
@@ -76,7 +74,7 @@ impl Funcdata {
     /// data-type.
     pub fn get_union_resolution(
         &self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         op: OpId,
         slot: int4,
     ) -> Option<&ResolvedUnion> {
@@ -89,7 +87,7 @@ impl Funcdata {
     /// `Funcdata::getAddressBasedUnionField`, `funcdata.cc:959-968`).
     pub fn get_address_based_union_field(
         &self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         addr: &Address,
         slot: int4,
     ) -> Option<&ResolvedUnion> {
@@ -107,7 +105,7 @@ impl Funcdata {
     /// between `MULTIEQUAL` input slots holding the same Varnode).
     pub fn set_union_field(
         &mut self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         op: OpId,
         slot: int4,
         resolve: ResolvedUnion,
@@ -171,7 +169,7 @@ impl Funcdata {
     /// except where a previous *locked* association exists.
     pub fn set_address_based_union_field(
         &mut self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         addr: &Address,
         slot: int4,
         resolve: ResolvedUnion,
@@ -217,7 +215,7 @@ impl Funcdata {
             };
             let sym = localmap.database().symbol(sym_id);
             let dt = match sym.dtype.as_ref() {
-                Some(d) => Rc::clone(d),
+                Some(d) => d.clone(),
                 None => return Ok(false),
             };
             (dt, sym.get_field_number(), sym.is_addr_based())
@@ -229,7 +227,7 @@ impl Funcdata {
         // sym->isAddrBased(): build a locked resolution keyed on the first-use
         // address + the hash-encoded slot (C++ funcdata_varnode.cc:1661-1666).
         if addr_based {
-            let mut resolve = ResolvedUnion::new_field(Rc::clone(&sym_type), field_number, typegrp.as_ref())?;
+            let mut resolve = ResolvedUnion::new_field(sym_type.clone(), field_number, typegrp.as_ref())?;
             resolve.set_lock(true);
             let slot = crate::dynamic::DynamicHash::get_slot_from_hash(entry.get_hash());
             let first_use = entry.get_first_use_address();
@@ -259,28 +257,28 @@ impl Funcdata {
         };
         // Datatype *dt = vn->getType();  — widen unresType to the pointer / partial
         // wrapper the Varnode actually carries, when it wraps the facet's union.
-        let mut unres_type = Rc::clone(&sym_type);
-        if let Some(dt) = self.vbank().get(vn).map(|v| Rc::clone(v.get_type())) {
+        let mut unres_type = sym_type.clone();
+        if let Some(dt) = self.vbank().get(vn).map(|v| v.get_type().clone()) {
             match dt.get_metatype() {
                 type_metatype::TYPE_PTR => {
-                    if dt.get_ptr_to().map(|p| Rc::ptr_eq(&p, &sym_type)).unwrap_or(false) {
+                    if dt.get_ptr_to().map(|p| p.id() == sym_type.id()).unwrap_or(false) {
                         unres_type = dt;
                     }
                 }
                 type_metatype::TYPE_PARTIALSTRUCT => {
-                    if dt.get_partial_base().map(|p| Rc::ptr_eq(&p, &sym_type)).unwrap_or(false) {
+                    if dt.get_partial_base().map(|p| p.id() == sym_type.id()).unwrap_or(false) {
                         unres_type = dt;
                     }
                 }
                 type_metatype::TYPE_PARTIALUNION => {
-                    if dt.get_partial_base().map(|p| Rc::ptr_eq(&p, &sym_type)).unwrap_or(false) {
+                    if dt.get_partial_base().map(|p| p.id() == sym_type.id()).unwrap_or(false) {
                         unres_type = dt;
                     }
                 }
                 _ => {}
             }
         }
-        let mut resolve = ResolvedUnion::new_field(Rc::clone(&unres_type), field_number, typegrp.as_ref())?;
+        let mut resolve = ResolvedUnion::new_field(unres_type.clone(), field_number, typegrp.as_ref())?;
         resolve.set_lock(true);
         self.set_union_field(&unres_type, op, slot, resolve);
         Ok(true)
@@ -294,10 +292,10 @@ impl Funcdata {
     /// association for the edge.
     pub fn update_union_field(
         &mut self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         op: OpId,
         slot: int4,
-        res_type: Rc<Datatype>,
+        res_type: TypeRoot,
     ) -> bool {
         let edge = self.union_edge_op(unres_type, op, slot);
         if let Some(entry) = self.union_map.get_mut(&edge) {
@@ -315,7 +313,7 @@ impl Funcdata {
     /// converted to a standard pointer to the same base.
     pub fn force_facing_type(
         &mut self,
-        unres_type: Rc<Datatype>,
+        unres_type: TypeRoot,
         field_num: int4,
         op: OpId,
         slot: int4,
@@ -325,7 +323,7 @@ impl Funcdata {
                 kuna_base::error::KunaError::lowlevel("forceFacingType: pointer missing ptrto")
             })?
         } else {
-            Rc::clone(&unres_type)
+            unres_type.clone()
         };
         let unres_type = if unres_type.is_pointer_rel() {
             let typegrp = self.get_arch().types_rc().ok_or_else(|| {
@@ -343,7 +341,7 @@ impl Funcdata {
         let typegrp = self.get_arch().types_rc().ok_or_else(|| {
             kuna_base::error::KunaError::lowlevel("forceFacingType: TypeFactory unavailable")
         })?;
-        let resolve = ResolvedUnion::new_field(Rc::clone(&unres_type), field_num, typegrp.as_ref())?;
+        let resolve = ResolvedUnion::new_field(unres_type.clone(), field_num, typegrp.as_ref())?;
         self.set_union_field(&unres_type, op, slot, resolve);
         Ok(())
     }
@@ -355,7 +353,7 @@ impl Funcdata {
     /// had no associated resolution.
     pub fn inherit_union_field(
         &mut self,
-        unres_type: &Datatype,
+        unres_type: &TypeRoot,
         op: OpId,
         slot: int4,
         old_op: OpId,
@@ -383,7 +381,7 @@ impl Funcdata {
     /// Returns the inherited field number, or -1 if there was nothing to inherit.
     pub fn inherit_union_field_ptr(
         &mut self,
-        unres_ptr: Rc<Datatype>,
+        unres_ptr: TypeRoot,
         op: OpId,
         slot: int4,
         old_op: OpId,
@@ -406,7 +404,7 @@ impl Funcdata {
         let typegrp = self.get_arch().types_rc().ok_or_else(|| {
             kuna_base::error::KunaError::lowlevel("inheritUnionFieldPtr: TypeFactory unavailable")
         })?;
-        let ptrres = ResolvedUnion::new_field(Rc::clone(&unres_ptr), inherited_field, typegrp.as_ref())?;
+        let ptrres = ResolvedUnion::new_field(unres_ptr.clone(), inherited_field, typegrp.as_ref())?;
         self.set_union_field(&unres_ptr, op, slot, ptrres);
         Ok(inherited_field)
     }

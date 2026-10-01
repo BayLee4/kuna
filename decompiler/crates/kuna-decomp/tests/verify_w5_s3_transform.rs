@@ -37,7 +37,7 @@ use kuna_base::space::{
 };
 use kuna_base::types::int4;
 
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl, TypeRoot};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::context::{ArchContext, VarnodeId};
 use kuna_decomp::transform::{
@@ -68,7 +68,14 @@ fn build_manager() -> AddrSpaceManager {
 
 fn build_fd() -> Funcdata {
     let manage = build_manager();
-    let glb = Rc::new(ArchContext::new(manage));
+    let mut arch = ArchContext::new(manage);
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(types);
+    let glb = Rc::new(arch);
     let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
     let addr = Address::new(ram, 0x1000);
     Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
@@ -78,13 +85,14 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 fn mk_vn(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(s, Address::new(ram, off), dt(s))
+    let ct = dt(fd, s);
+    fd.vbank_mut().create(s, Address::new(ram, off), ct)
 }
 
 fn mk_const(fd: &mut Funcdata, val: u64, s: int4) -> VarnodeId {
@@ -328,7 +336,8 @@ fn w5s3_preexisting_guard_full_truth_table() {
 
     // A piece_temp also suppresses (unique-space piece is piece_temp).
     let upiece = {
-        let uvn = fd.vbank_mut().create_unique(8, dt(8));
+        let ct = dt(&fd, 8);
+        let uvn = fd.vbank_mut().create_unique(8, ct);
         tm.new_piece(&fd, uvn, 16, 0)
     };
     assert_eq!(tm.var(upiece).get_type(), tvar_type::piece_temp);

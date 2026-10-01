@@ -37,7 +37,7 @@
 //! | `ActionLateDoNothing` | `"latedonothing"` | `0` | partial (flags realized, surgery STUB) |
 //! | `ActionRedundBranch` | `"redundbranch"` | `0` | partial (splice realized, removeBranch STUB) |
 //! | `ActionDeterminedBranch` | `"determinedbranch"` | `0` | realized (detect + `removeBranch`) |
-//! | `ActionNormalizeSetup` | `"normalizesetup"` | `rule_onceperfunc` | realized `reset`, STUB body (W4 proto) |
+//! | `ActionNormalizeSetup` | `"normalizesetup"` | `rule_onceperfunc` | per-analysis prototype normalization |
 //!
 //! **The boundary** is the next class, [`ActionDeadCode`] (`coreaction.hh:565`,
 //! `name() == "deadcode"`).  Its `apply` body needs `FuncCallSpecs` /
@@ -86,6 +86,7 @@ use kuna_num::opcodes::OpCode;
 
 use crate::action::{ruleflags, Action, ActionBase, ActionContext, ActionGroupList, ApplyResult};
 use crate::funcdata::Funcdata;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 // =============================================================================
 // Setup actions (coreaction.hh:34-86)
@@ -313,6 +314,7 @@ impl Action for ActionConstbase {
             data.op_set_opcode_code(op, OpCode::CPUI_COPY);
             data.op_set_input(op, vnin, 0).expect("ActionConstbase: opSetInput");
             data.op_insert_begin(op, bb);
+            branch_receipt::record_track(data, op, &addr, size, ctx.val);
         }
         0
     }
@@ -993,7 +995,10 @@ impl Action for ActionDeterminedBranch {
                 cond_vn.get_offset()
             };
             let num: kuna_base::types::int4 = if (val != 0) != is_flip { 0 } else { 1 };
-            self.base.count += data.remove_branch(bb, num).map(|_| 1).unwrap_or(0);
+            let receipt = branch_receipt::begin_branch(data, cbranch, num);
+            let removed = data.remove_branch(bb, num);
+            branch_receipt::finish_branch(data, receipt, removed.is_ok());
+            self.base.count += removed.map(|_| 1).unwrap_or(0);
         }
         0
     }
@@ -1034,25 +1039,19 @@ impl Action for ActionNormalizeSetup {
         }
         Some(Box::new(ActionNormalizeSetup { base: self.base.clone() }))
     }
-    /// C++ `ActionNormalizeSetup::reset`: `{ data.setNormalization(true); }`.
-    ///
-    /// Faithful: the C++ override *replaces* `Action::reset` (does not chain to
-    /// it), so the base status/warning latch is intentionally left untouched
-    /// here — only the function's normalization flag is set.
     fn reset(&mut self, data: &mut Funcdata) {
+        self.base.reset_base();
         data.set_normalization(true);
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
-        // C++ coreaction.cc:4801
-        //   FuncProto &fp(data.getFuncProto());
-        //   fp.clearInput();
-        //   fp.setModelLock(false);   // forces model re-evaluation
-        //   fp.setOutputLock(false);
-        //   return 0;
-        // STUB(W4): FuncProto is an empty Default placeholder in substrate/context.rs;
-        // clearInput / setModelLock / setOutputLock are W4 prototype surfaces.
-        // The realized `reset` already flips the function into normalization mode;
-        // the lock-stripping is deferred to the prototype wave (no change count).
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+        // Normalize the analysis-owned copy, never the host's immutable seed.
+        // A not-yet-attached store has no parameters or output locks to clear.
+        let proto = data.get_func_proto_mut();
+        if proto.has_store() {
+            proto.clear_input();
+            proto.set_output_lock(false);
+        }
+        proto.set_model_lock(false);
         0
     }
 }

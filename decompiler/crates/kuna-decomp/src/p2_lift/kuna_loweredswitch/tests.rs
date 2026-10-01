@@ -53,6 +53,10 @@ fn build_fd() -> Funcdata {
 fn build_fd_with_label_signedness(enabled: bool) -> Funcdata {
     let manage = build_manager();
     let mut context = ArchContext::new(manage);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    context.types = Some(Rc::new(types));
     context.lowered_switch_labels = enabled;
     // These fixtures exercise recovery and label signedness over trees whose
     // routing is not always self-consistent; `loweredswitchexact` has its own.

@@ -20,7 +20,7 @@ use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,
 };
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::type_metatype;
 use crate::context::{ArchContext, BlockId};
 
 fn build_manager() -> AddrSpaceManager {
@@ -54,10 +54,6 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 /// Create an op with `inputs` slots and a given opcode at `off`, returning its id.
 fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
     let ram = ram_space(fd);
@@ -86,7 +82,8 @@ fn mk_block(fd: &mut Funcdata) -> BlockId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(4, Address::new(ram, off), dt(4))
+    let dtype = fd.type_base_unknown(4);
+    fd.vbank_mut().create(4, Address::new(ram, off), dtype)
 }
 
 // --- op creation / SeqNum allocation ------------------------------------------
@@ -119,7 +116,51 @@ fn new_op_seq_bumps_uniqid() {
 // --- def-use link integrity ---------------------------------------------------
 
 #[test]
-fn op_set_input_links_descend() {
+fn constant_input_duplication_preserves_float_bits_type_and_locks() {
+    use crate::varnode::varnode_flags;
+
+    for bits in [2.5_f64.to_bits(), (-0.0_f64).to_bits()] {
+        for locks in [0, varnode_flags::typelock | varnode_flags::namelock] {
+            let mut fd = build_fd();
+            let float_type = fd.get_arch().types().unwrap()
+                .get_base(8, type_metatype::TYPE_FLOAT).unwrap();
+            let integer_type = fd.get_arch().types().unwrap()
+                .get_base(8, type_metatype::TYPE_UINT).unwrap();
+            let original = fd.new_constant(8, bits);
+            fd.vn_update_type(original, float_type);
+            fd.vbank_mut().get_mut(original).unwrap().set_flags_pub(locks);
+            let first = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
+            fd.op_set_input(first, original, 0).unwrap();
+
+            // Equal raw bits at an integer use are not a floating value.
+            let integer = fd.new_constant(8, bits);
+            fd.vn_update_type(integer, integer_type);
+            let integer_use = mk_op(&mut fd, 1, 0x1004, OpCode::CPUI_COPY);
+            fd.op_set_input(integer_use, integer, 0).unwrap();
+
+            let cast = mk_op(&mut fd, 1, 0x1008, OpCode::CPUI_CAST);
+            fd.op_set_input(cast, original, 0).unwrap();
+            let duplicate = fd.obank().get(cast).unwrap().get_in(0).unwrap();
+            assert_ne!(duplicate, original);
+            for id in [original, duplicate] {
+                let value = fd.vbank().get(id).unwrap();
+                assert!(value.is_constant());
+                assert_eq!(value.get_offset(), bits);
+                assert_eq!(value.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
+                assert_eq!(value.get_type().get_size(), 8);
+                assert_eq!(value.is_type_lock(), locks != 0);
+                assert_eq!(value.is_name_lock(), locks != 0);
+            }
+            assert_eq!(fd.obank().get(first).unwrap().get_in(0), Some(original));
+            let integer = fd.obank().get(integer_use).unwrap().get_in(0).unwrap();
+            assert_eq!(fd.vbank().get(integer).unwrap().get_type().get_metatype(), type_metatype::TYPE_UINT);
+            assert_eq!(fd.vbank().get(integer).unwrap().get_offset(), bits);
+        }
+    }
+}
+
+#[test]
+fn op_set_input_links_and_unlinks_descend() {
     let mut fd = build_fd();
     let op = mk_op(&mut fd, 2, 0x100, OpCode::CPUI_INT_ADD);
     let v0 = mk_vn(&mut fd, 0x10);
@@ -434,7 +475,8 @@ fn op_flip_in_place_test_less_const_first_normalizes() {
     let op = mk_op(&mut fd, 2, 0x100, OpCode::CPUI_INT_LESS);
     // in0 is a constant -> return 0; otherwise 1.
     let cspace = Rc::clone(fd.get_arch().manage().get_space(0).unwrap());
-    let cvn = fd.vbank_mut().create(4, Address::new(cspace, 5), dt(4));
+    let dtype = fd.type_base_unknown(4);
+    let cvn = fd.vbank_mut().create(4, Address::new(cspace, 5), dtype);
     fd.op_set_input(op, cvn, 0).unwrap();
     let mut fl = Vec::new();
     assert_eq!(fd.op_flip_in_place_test(op, &mut fl, false), 0);
@@ -529,7 +571,7 @@ fn mk_op_flags(
 /// Attach a fresh output Varnode (at `off`, size 4) to an op via op_set_output.
 fn give_out(fd: &mut Funcdata, op: OpId, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.new_varnode(4, &Address::new(ram, off), Some(dt(4)));
+    let vn = fd.new_varnode(4, &Address::new(ram, off), None);
     fd.op_set_output(op, vn).unwrap();
     op_out(fd, op)
 }

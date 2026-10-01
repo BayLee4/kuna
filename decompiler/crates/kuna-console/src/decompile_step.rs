@@ -31,14 +31,15 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
-use kuna_base::error::KunaResult;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4, uintb};
 use kuna_decomp::architecture::Architecture;
 use kuna_decomp::database::DynamicSymbolSpec;
-use kuna_decomp::dtype::Datatype;
-use kuna_decomp::fspec::{ParameterPieces, PrototypePieces};
+use kuna_decomp::dtype::TypeRoot;
+use kuna_decomp::fspec::{FuncProto, ParameterPieces, PrototypePieces};
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::kuna_formatstring::ParkedFormatSite;
+use kuna_decomp::overrides::Override;
 
 /// Every console-only fact a decompile may be seeded with, plus the two facts
 /// both surfaces carry (`mapped_symbols`, `flow_overrides`).
@@ -48,9 +49,9 @@ use kuna_decomp::kuna_formatstring::ParkedFormatSite;
 /// forwarding stays checkable by eye.
 pub struct DecompileSeed<'a> {
     /// `map addr` symbols ++ the function's DWARF stack locals.
-    pub mapped_symbols: &'a [(String, Rc<Datatype>, Address, uint4)],
+    pub mapped_symbols: &'a [(String, TypeRoot, Address, uint4)],
     /// `type varnode %REG(pc)` usepoint-scoped symbols (console only).
-    pub usepoint_symbols: &'a [(String, Rc<Datatype>, Address, uint4, Address, bool)],
+    pub usepoint_symbols: &'a [(String, TypeRoot, Address, uint4, Address, bool)],
     /// `map hash` dynamic symbols (console only).
     pub dynamic_symbols: &'a [DynamicSymbolSpec],
     /// `parse line extern <decl>` prototype for this function (console only).
@@ -65,7 +66,7 @@ pub struct DecompileSeed<'a> {
 impl DecompileSeed<'_> {
     /// A seed carrying only the two facts the whole-binary loop has.
     pub fn plain<'a>(
-        mapped_symbols: &'a [(String, Rc<Datatype>, Address, uint4)],
+        mapped_symbols: &'a [(String, TypeRoot, Address, uint4)],
         flow_overrides: &'a [(Address, uint4)],
     ) -> DecompileSeed<'a> {
         DecompileSeed {
@@ -89,7 +90,28 @@ impl DecompileSeed<'_> {
 /// loop discards it (each function is decompiled once).
 pub struct DecompileStep {
     pub result: KunaResult<Funcdata>,
-    pub discovered: Vec<(Address, PrototypePieces)>,
+    pub discovered: Override,
+}
+
+/// Standalone format analysis temporarily retains an open tail, independently
+/// of host internal-list assignment boundaries and their closed arity.
+fn insert_format_override(
+    arch: &Architecture,
+    overrides: &mut Override,
+    callpoint: Address,
+    mut pieces: PrototypePieces,
+) -> KunaResult<()> {
+    pieces.first_var_arg_slot = pieces.intypes.len() as int4;
+    let model = arch.default_fp().cloned().ok_or_else(|| {
+        KunaError::lowlevel("Format override requires a default prototype model")
+    })?;
+    let mut proto = FuncProto::new();
+    proto.seed_locked_from_pieces(
+        &pieces, model, arch.types().get_type_void()?, arch.types(), arch.manage(),
+    )?;
+    overrides.insert_proto_override(callpoint.clone(), proto);
+    overrides.insert_format_call(callpoint);
+    Ok(())
 }
 
 /// Decompile one function -- the single source of truth for both surfaces.
@@ -119,7 +141,7 @@ pub fn decompile_one(
     entry: Address,
     size: int4,
     seed: &DecompileSeed<'_>,
-    proto_overrides: &[(Address, PrototypePieces)],
+    proto_overrides: &Override,
 ) -> DecompileStep {
     decompile_one_prefollowed(arch, name, entry, size, seed, proto_overrides, None)
 }
@@ -137,9 +159,14 @@ pub fn decompile_one_prefollowed(
     entry: Address,
     size: int4,
     seed: &DecompileSeed<'_>,
-    proto_overrides: &[(Address, PrototypePieces)],
+    proto_overrides: &Override,
     prefollowed: Option<Funcdata>,
 ) -> DecompileStep {
+    // This is the CLI/console full-decompile boundary. The lower-level seeded
+    // drive honors the architecture's selected root for host reduced pipelines.
+    if let Err(error) = arch.allacts.set_current("decompile") {
+        return DecompileStep { result: Err(error), discovered: Override::new() };
+    }
     let formatstring_mode = arch.analysis_formatstring;
     let saved_readonlypropagate = arch.readonlypropagate;
     // Only the LOOP needs the drive to fold the format constant out of read-only
@@ -155,7 +182,9 @@ pub fn decompile_one_prefollowed(
         match arch.format_call_overrides.get(&entry.get_offset()) {
             Some(sites) if entry.get_space().is_some() => sites
                 .iter()
-                .filter(|s| !proto_overrides.iter().any(|(a, _)| a.get_offset() == s.callpoint))
+                .filter(|s| proto_overrides.find_proto_override(
+                    &Address::new(Rc::clone(entry.get_space().expect("checked above")), s.callpoint)
+                ).is_none())
                 .cloned()
                 .collect(),
             _ => Vec::new(),
@@ -163,20 +192,20 @@ pub fn decompile_one_prefollowed(
     } else {
         Vec::new()
     };
-    let first_overrides: Vec<(Address, PrototypePieces)> = if parked.is_empty() {
-        proto_overrides.to_vec()
-    } else {
+    let mut first_overrides = proto_overrides.clone();
+    if !parked.is_empty() {
         let space = entry.get_space().expect("checked above");
-        let mut merged = proto_overrides.to_vec();
-        merged.extend(
-            parked
-                .iter()
-                .map(|s| (Address::new(Rc::clone(space), s.callpoint), s.pieces.clone())),
-        );
-        merged
-    };
-    let proto_overrides: &[(Address, PrototypePieces)] = &first_overrides;
-    arch.format_override_callpoints = parked.iter().map(|s| s.callpoint).collect();
+        for site in &parked {
+            if let Err(err) = insert_format_override(
+                arch, &mut first_overrides,
+                Address::new(Rc::clone(space), site.callpoint), site.pieces.clone(),
+            ) {
+                arch.readonlypropagate = saved_readonlypropagate;
+                return DecompileStep { result: Err(err), discovered: Override::new() };
+            }
+        }
+    }
+    let proto_overrides = &first_overrides;
     // A RET-call chain beginning at the function entry is safe to recognize
     // without an assertion: every link stored its own fall-through before the
     // RETURN, which distinguishes it from the incoming return address and from
@@ -258,34 +287,36 @@ pub fn decompile_one_prefollowed(
         Ok(fd) if !parked.is_empty() => audit_parked_format_sites(arch, fd, &parked),
         _ => Vec::new(),
     };
-    let mut discovered: Vec<(Address, PrototypePieces)> = Vec::new();
+    let mut discovered = Override::new();
     if formatstring_mode.loop_pass() {
         if let Ok(fd) = &result {
             for (callpoint, pieces) in extract_format_string_overrides(arch, fd) {
                 // Only the call-site overrides not already installed (a
                 // hand-typed `override prototype` at the same callpoint wins).
-                if !proto_overrides.iter().any(|(a, _)| a == &callpoint)
-                    && !discovered.iter().any(|(a, _)| a == &callpoint)
+                if proto_overrides.find_proto_override(&callpoint).is_none()
+                    && discovered.find_proto_override(&callpoint).is_none()
                 {
-                    discovered.push((callpoint, pieces));
+                    if let Err(err) = insert_format_override(arch, &mut discovered, callpoint, pieces) {
+                        arch.readonlypropagate = saved_readonlypropagate;
+                        return DecompileStep { result: Err(err), discovered };
+                    }
                 }
             }
             if std::env::var_os("KUNA_FMTSTATIC_DEBUG").is_some() {
-                for (at, _) in &discovered {
+                for (at, _) in discovered.proto_overrides() {
                     eprintln!("fmtloop: site only the loop found {:#x}", at.get_offset());
                 }
             }
         }
     }
-    if !dropped.is_empty() || !discovered.is_empty() {
-        let mut merged: Vec<(Address, PrototypePieces)> = proto_overrides
-            .iter()
-            .filter(|(a, _)| !dropped.contains(&a.get_offset()))
-            .cloned()
-            .collect();
-        merged.extend(discovered.iter().cloned());
-        arch.format_override_callpoints.retain(|at| !dropped.contains(at));
-        arch.format_override_callpoints.extend(discovered.iter().map(|(a, _)| a.get_offset()));
+    if !dropped.is_empty() || discovered.has_proto_overrides() {
+        let mut merged = proto_overrides.clone();
+        if let Some(space) = entry.get_space() {
+            for offset in &dropped {
+                merged.remove_proto_override(&Address::new(Rc::clone(space), *offset));
+            }
+        }
+        merged.merge_proto_overrides(&discovered);
         result = kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
             arch,
             name,
@@ -300,7 +331,6 @@ pub fn decompile_one_prefollowed(
             seed.mapped_params,
         );
     }
-    arch.format_override_callpoints.clear();
     arch.readonlypropagate = saved_readonlypropagate;
     DecompileStep { result, discovered }
 }
@@ -605,7 +635,7 @@ pub(crate) fn extract_format_string_overrides(
         // Collect the callee's recovered *fixed* param types (the analog of
         // Ghidra `namesToParameters.get(callFunctionName)` = the declared params
         // minus the trailing "...").
-        let mut fixed: Vec<Rc<Datatype>> =
+        let mut fixed: Vec<TypeRoot> =
             Vec::with_capacity(num_params as usize);
         let mut ok = true;
         for p in 0..num_params {

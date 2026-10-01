@@ -26,14 +26,13 @@
 //! by-name park is suppressed while the genuine import addresses remain typed.
 
 use std::collections::HashSet;
-use std::rc::Rc;
 
 use object::read::{Object, ObjectSymbol};
 use object::SymbolKind;
 
 use kuna_base::error::KunaResult;
 use kuna_base::types::uint4;
-use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeRoot};
 use kuna_decomp::fspec::PrototypePieces;
 
 use crate::pass::{AnalysisCtx, AnalysisOutput, AnalysisPass, Phase};
@@ -161,13 +160,13 @@ const LIBC: &[(&str, Sig)] = &[
     ("ptrace", Sig { ret: Ty::Long, params: &[Ty::Int, Ty::Int, Ty::VoidPtr, Ty::VoidPtr], vararg: -1 }),
 ];
 
-/// Build the kuna [`Datatype`] for a [`Ty`] using the architecture's type factory.
+/// Build the kuna [`TypeRoot`] for a [`Ty`] using the architecture's type factory.
 fn build_ty(
     t: Ty,
     types: &dyn TypeFactory,
     word_size: uint4,
     layout: kuna_libctypes::Layout,
-) -> KunaResult<Rc<Datatype>> {
+) -> KunaResult<TypeRoot> {
     let ptr = types.get_size_of_pointer();
     match t {
         Ty::Void => types.get_type_void(),

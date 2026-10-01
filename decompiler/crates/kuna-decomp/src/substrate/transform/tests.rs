@@ -23,7 +23,7 @@ use kuna_base::space::{
     addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, IopSpace, UniqueSpace,
 };
 
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::context::{ArchContext, VarnodeId};
 
 // --- test harness -------------------------------------------------------------
@@ -60,14 +60,15 @@ fn ram_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+fn dt(fd: &Funcdata, size: int4) -> TypeRoot {
+    fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
 }
 
 /// A fresh free varnode in ram at `off`, size `s`.
 fn mk_vn(fd: &mut Funcdata, off: u64, s: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(s, Address::new(ram, off), dt(s))
+    let ty = dt(fd, s);
+    fd.vbank_mut().create(s, Address::new(ram, off), ty)
 }
 
 /// A fresh free constant varnode of value `val`, size `s`.
@@ -330,7 +331,8 @@ fn new_piece_byte_aligned_uses_overlapping_storage() {
 fn new_piece_in_unique_space_is_piece_temp() {
     let mut fd = build_fd();
     // A varnode in the unique (internal) space → preserveAddress false → piece_temp.
-    let vn = fd.vbank_mut().create_unique(8, dt(8));
+    let ty = dt(&fd, 8);
+    let vn = fd.vbank_mut().create_unique(8, ty);
     let mut tm = TransformManager::new();
     let r = tm.new_piece(&fd, vn, 16, 0);
     assert_eq!(tm.var(r).get_type(), tvar_type::piece_temp);
@@ -600,7 +602,8 @@ fn apply_constant_iop_round_trips_through_get_op_from_const() {
 fn preserve_address_rules() {
     let mut fd = build_fd();
     let ram_vn = mk_vn(&mut fd, 0x100, 8);
-    let uniq_vn = fd.vbank_mut().create_unique(8, dt(8));
+    let ty = dt(&fd, 8);
+    let uniq_vn = fd.vbank_mut().create_unique(8, ty);
     let tm = TransformManager::new();
     // aligned + non-internal → true.
     assert!(tm.preserve_address(&fd, ram_vn, 16, 0));

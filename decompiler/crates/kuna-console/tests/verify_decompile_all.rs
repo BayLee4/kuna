@@ -96,7 +96,7 @@ fn decompile_all_enumerates_and_decompiles_every_function() {
         &[],
         None,
         &[],
-        &[],
+        &kuna_decomp::overrides::Override::new(),
         &[],
     )
     .expect("main must decompile");
@@ -120,7 +120,7 @@ fn decompile_all_enumerates_and_decompiles_every_function() {
         .expect("authenticate present in enumeration");
     let mapped = prog.dwarf_locals_for(auth_addr.get_offset());
     let fd = decompile_func_full_with_override_dyn(
-        prog.arch_mut(), "authenticate", auth_addr, 0, &mapped, &[], &[], None, &[], &[], &[],
+        prog.arch_mut(), "authenticate", auth_addr, 0, &mapped, &[], &[], None, &[], &kuna_decomp::overrides::Override::new(), &[],
     )
     .expect("authenticate must decompile");
     let auth_vars = extract_variables(prog.arch(), &fd);

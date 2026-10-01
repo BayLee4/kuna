@@ -80,14 +80,13 @@ use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::Datatype;
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::TypeRoot;
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
-/// The stage group every rule in this batch registers against (the C++
-/// `Rule::getGroup()` for these classes is the analysis family; the worked
-/// `DummyConstFold` example uses the same string).  `clone_rule` gates on it.
+/// The primary stage group for most rules in this batch. Cleanup and prototype
+/// recovery rules declare their distinct groups and aliases in [`specs`].
 const RULE_GROUP: &str = "analysis";
 
 // =============================================================================
@@ -281,11 +280,8 @@ impl Rule for RuleUnsigned2Float {
         vec![OpCode::CPUI_FLOAT_INT2FLOAT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleUnsigned2Float))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleUnsigned2Float)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -406,11 +402,8 @@ impl Rule for RuleInt2FloatCollapse {
         vec![OpCode::CPUI_FLOAT_INT2FLOAT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleInt2FloatCollapse))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleInt2FloatCollapse)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -545,11 +538,8 @@ impl Rule for RuleFuncPtrEncoding {
         vec![OpCode::CPUI_CALLIND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleFuncPtrEncoding))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleFuncPtrEncoding)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -822,11 +812,8 @@ impl Rule for RuleThreeWayCompare {
         ]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleThreeWayCompare))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleThreeWayCompare)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1095,11 +1082,8 @@ impl Rule for RulePopcountBoolXor {
         vec![OpCode::CPUI_POPCOUNT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RulePopcountBoolXor))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePopcountBoolXor)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1183,12 +1167,8 @@ impl Rule for RulePiecePathology {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ getGroup() == "protorecovery" (coreaction.cc), not RULE_GROUP/"analysis".
-        if !grouplist.contains("protorecovery") && !grouplist.contains("piecepathology") {
-            return None;
-        }
-        Some(Box::new(RulePiecePathology))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RulePiecePathology)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1237,11 +1217,8 @@ impl Rule for RuleXorSwap {
         vec![OpCode::CPUI_INT_XOR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleXorSwap))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleXorSwap)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1287,11 +1264,8 @@ impl Rule for RuleLzcountShiftBool {
         vec![OpCode::CPUI_LZCOUNT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleLzcountShiftBool))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLzcountShiftBool)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1376,11 +1350,8 @@ impl Rule for RuleFloatSign {
         ]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleFloatSign))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleFloatSign)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1442,12 +1413,8 @@ impl Rule for RuleFloatSignCleanup {
         vec![OpCode::CPUI_INT_AND, OpCode::CPUI_INT_XOR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ getGroup() == "cleanup" (coreaction.cc), not RULE_GROUP/"analysis".
-        if !grouplist.contains("cleanup") && !grouplist.contains("floatsigncleanup") {
-            return None;
-        }
-        Some(Box::new(RuleFloatSignCleanup))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleFloatSignCleanup)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1484,11 +1451,8 @@ impl Rule for RuleOrCompare {
         vec![OpCode::CPUI_INT_OR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(RULE_GROUP) {
-            return None;
-        }
-        Some(Box::new(RuleOrCompare))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOrCompare)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1610,7 +1574,7 @@ impl RuleExpandLoad {
         data: &mut Funcdata,
         old_vn: VarnodeId,
         new_vn: VarnodeId,
-        dt: &Rc<Datatype>,
+        dt: &TypeRoot,
         offset: int4,
     ) {
         let shift = 8 * offset; // Convert to shift amount (bits)
@@ -1624,14 +1588,14 @@ impl RuleExpandLoad {
             let and_off = data.vbank().get(and_c).expect("mac: stale and const").get_offset();
             let new_and_off = and_off << shift;
             let new_and_const = data.new_constant(dt_size, new_and_off);
-            data.vbank_mut().get_mut(new_and_const).expect("mac: stale new and const").update_type(Rc::clone(dt));
+            data.vbank_mut().get_mut(new_and_const).expect("mac: stale new and const").update_type(dt.clone());
             data.op_set_input(and_op, new_vn, 0).expect("mac: opSetInput and 0");
             data.op_set_input(and_op, new_and_const, 1).expect("mac: opSetInput and 1");
             let comp_c = data.obank().get(comp_op).expect("mac: stale comp").get_in(1).expect("mac: comp in1");
             let comp_off = data.vbank().get(comp_c).expect("mac: stale comp const").get_offset();
             let new_comp_off = comp_off << shift;
             let new_comp_const = data.new_constant(dt_size, new_comp_off);
-            data.vbank_mut().get_mut(new_comp_const).expect("mac: stale new comp const").update_type(Rc::clone(dt));
+            data.vbank_mut().get_mut(new_comp_const).expect("mac: stale new comp const").update_type(dt.clone());
             data.op_set_input(comp_op, new_comp_const, 1).expect("mac: opSetInput comp 1");
         }
     }
@@ -1642,12 +1606,8 @@ impl Rule for RuleExpandLoad {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ getGroup() == "cleanup" (coreaction.cc), not RULE_GROUP/"analysis".
-        if !grouplist.contains("cleanup") && !grouplist.contains("expandload") {
-            return None;
-        }
-        Some(Box::new(RuleExpandLoad))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleExpandLoad)
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1658,7 +1618,7 @@ impl Rule for RuleExpandLoad {
         let mut root_ptr = data.obank().get(op).expect("el: stale op").get_in(1).expect("el: load ptr");
         let mut add_op: Option<OpId> = None;
         let mut offset: int4 = 0;
-        let el_type: Rc<Datatype>;
+        let el_type: TypeRoot;
         let root_v = data.vbank().get(root_ptr).expect("el: stale rootPtr");
         if root_v.is_written() {
             let def_op = root_v.get_def().expect("el: written rootPtr has def");
@@ -1681,18 +1641,12 @@ impl Rule for RuleExpandLoad {
                     return 0;
                 }
                 root_ptr = new_root;
-                el_type = Rc::clone(
-                    data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(def_op),
-                );
+                el_type = data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(def_op).clone();
             } else {
-                el_type = Rc::clone(
-                    data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(op),
-                );
+                el_type = data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(op).clone();
             }
         } else {
-            el_type = Rc::clone(
-                data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(op),
-            );
+            el_type = data.vbank().get(root_ptr).expect("el: stale rootPtr").get_type_read_facing(op).clone();
         }
         if el_type.get_metatype() != type_metatype::TYPE_PTR {
             return 0;
@@ -1761,7 +1715,7 @@ impl Rule for RuleExpandLoad {
         }
 
         // Modify the LOAD.
-        let new_out = data.new_unique(el_type.get_size(), Some(Rc::clone(&el_type)));
+        let new_out = data.new_unique(el_type.get_size(), Some(el_type.clone()));
         data.op_set_output(op, new_out).expect("el: opSetOutput newOut");
         if let Some(add) = add_op {
             data.op_set_input(op, root_ptr, 1).expect("el: opSetInput rootPtr");
@@ -1775,7 +1729,7 @@ impl Rule for RuleExpandLoad {
                     .get_base(el_type.get_size(), type_metatype::TYPE_UINT)
                     .expect("el: getBase UINT")
             } else {
-                Rc::clone(&el_type)
+                el_type.clone()
             };
             RuleExpandLoad::modify_and_comparison(data, out_vn, new_out, &dt, lsb_cut);
         } else {
@@ -1802,21 +1756,21 @@ impl Rule for RuleExpandLoad {
 /// carrying the rule's exact C++ `name()` string.
 pub fn specs() -> Vec<RuleSpec> {
     vec![
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleUnsigned2Float) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleInt2FloatCollapse) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleFuncPtrEncoding) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleThreeWayCompare) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RulePopcountBoolXor) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleUnsigned2Float) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleInt2FloatCollapse) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleFuncPtrEncoding) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleThreeWayCompare) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RulePopcountBoolXor) },
         // Registered "protorecovery" (coreaction.cc / universalaction.rs), not RULE_GROUP.
-        RuleSpec { group: "protorecovery", ctor: || Box::new(RulePiecePathology) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleXorSwap) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleLzcountShiftBool) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleFloatSign) },
+        RuleSpec { group: "protorecovery", aliases: &["piecepathology"], ctor: || Box::new(RulePiecePathology) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleXorSwap) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleLzcountShiftBool) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleFloatSign) },
         // Registered "cleanup" (coreaction.cc / universalaction.rs), not RULE_GROUP.
-        RuleSpec { group: "cleanup", ctor: || Box::new(RuleFloatSignCleanup) },
-        RuleSpec { group: RULE_GROUP, ctor: || Box::new(RuleOrCompare) },
+        RuleSpec { group: "cleanup", aliases: &["floatsigncleanup"], ctor: || Box::new(RuleFloatSignCleanup) },
+        RuleSpec { group: RULE_GROUP, aliases: &[], ctor: || Box::new(RuleOrCompare) },
         // Registered "cleanup" (coreaction.cc / universalaction.rs), not RULE_GROUP.
-        RuleSpec { group: "cleanup", ctor: || Box::new(RuleExpandLoad) },
+        RuleSpec { group: "cleanup", aliases: &["expandload"], ctor: || Box::new(RuleExpandLoad) },
     ]
 }
 
@@ -1843,8 +1797,8 @@ mod tests {
     use kuna_base::types::int4;
     use kuna_num::opcodes::OpCode;
 
-    use crate::action::ActionGroupList;
-    use crate::dtype::{type_metatype, Datatype};
+    use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
+    use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeRoot};
     use crate::funcdata::Funcdata;
     use crate::context::{ArchContext, OpId, VarnodeId};
     use crate::varnode::{DefOpInfo, VarnodeBank};
@@ -1884,6 +1838,12 @@ mod tests {
         let manage = build_manager();
         let mut ctx = ArchContext::new(manage);
         ctx.funcptr_align = align;
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        ctx.types = Some(types);
         let glb = Rc::new(ctx);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
@@ -1894,12 +1854,12 @@ mod tests {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
     }
 
-    fn unk(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
+    fn unk(fd: &Funcdata, size: int4) -> TypeRoot {
+        fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_UNKNOWN).unwrap()
     }
 
-    fn float_t(size: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(size, type_metatype::TYPE_FLOAT))
+    fn float_t(fd: &Funcdata, size: int4) -> TypeRoot {
+        fd.get_arch().types().unwrap().get_base(size, type_metatype::TYPE_FLOAT).unwrap()
     }
 
     fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaResult<()> {
@@ -1950,7 +1910,7 @@ mod tests {
     /// A free varnode at (off,size) in ram.
     fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+        fd.new_varnode(size, &Address::new(r, off), Some(unk(fd, size)))
     }
 
     /// A constant varnode of the given size/value.
@@ -1962,7 +1922,7 @@ mod tests {
     /// output id.  Bypasses the `op_set_output` W3 stub via the low-level
     /// `set_def`/`set_output` pair (the W3 verifier fixture pattern), with the
     /// given data-type.
-    fn set_output(fd: &mut Funcdata, op: OpId, off: u64, ct: Rc<Datatype>) -> VarnodeId {
+    fn set_output(fd: &mut Funcdata, op: OpId, off: u64, ct: TypeRoot) -> VarnodeId {
         let r = ram(fd);
         let size = ct.get_size();
         let vn = fd.new_varnode(size, &Address::new(r, off), Some(ct));
@@ -1977,10 +1937,6 @@ mod tests {
     fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
         fd.vbank_mut().add_descend(vn, op).unwrap();
         fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), slot);
-    }
-
-    fn groups() -> ActionGroupList {
-        ActionGroupList::from_names(["analysis"])
     }
 
     fn code(fd: &Funcdata, op: OpId) -> OpCode {
@@ -2005,27 +1961,6 @@ mod tests {
         // INT_XOR: binary | commutative (typeop.cc:1410) — NOT booloutput.
         let x = resolve_typeop(OpCode::CPUI_INT_XOR);
         assert_eq!(x.get_flags(), pcodeop_flags::binary | pcodeop_flags::commutative);
-    }
-
-    #[test]
-    fn specs_lists_twelve_rules_in_order() {
-        let s = specs();
-        assert_eq!(s.len(), 12);
-        // Most specs register against the analysis group; three register against
-        // their own pool (RulePiecePathology -> "protorecovery", RuleFloatSignCleanup
-        // and RuleExpandLoad -> "cleanup"), matching coreaction.cc getGroup(). Each
-        // spec's ctor yields a rule that clones in *its own* group's grouplist and is
-        // filtered out of an empty grouplist.
-        for spec in &s {
-            let r = (spec.ctor)();
-            let yes = ActionGroupList::from_names([spec.group]);
-            assert!(
-                r.clone_rule(&yes).is_some(),
-                "{} should clone in its registration group",
-                spec.group
-            );
-            assert!(r.clone_rule(&ActionGroupList::new()).is_none());
-        }
     }
 
     #[test]
@@ -2081,7 +2016,8 @@ mod tests {
         let op2 = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_XOR);
         wire(&mut fd, a, op2, 0);
         wire(&mut fd, b, op2, 1);
-        let t = set_output(&mut fd, op2, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let t = set_output(&mut fd, op2, 0x30, ct);
         // outer xor:  op = t ^ a
         let op = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_XOR);
         wire(&mut fd, t, op, 0);
@@ -2114,7 +2050,8 @@ mod tests {
         let op2 = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_XOR);
         wire(&mut fd, b, op2, 0);
         wire(&mut fd, a, op2, 1);
-        let t = set_output(&mut fd, op2, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let t = set_output(&mut fd, op2, 0x30, ct);
         // outer xor: op = a ^ t   (i=1 finds the inner xor; othervn = a = vn1)
         let op = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_XOR);
         wire(&mut fd, a, op, 0);
@@ -2161,7 +2098,8 @@ mod tests {
         let op2 = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_XOR);
         wire(&mut fd, a, op2, 0);
         wire(&mut fd, b, op2, 1);
-        let t = set_output(&mut fd, op2, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let t = set_output(&mut fd, op2, 0x30, ct);
         let op = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_XOR);
         wire(&mut fd, t, op, 0);
         wire(&mut fd, a, op, 1);
@@ -2187,7 +2125,8 @@ mod tests {
         let andop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_AND);
         wire(&mut fd, ptr, andop, 0);
         wire(&mut fd, mask, andop, 1);
-        let masked = set_output(&mut fd, andop, 0x20, unk(8));
+        let ct = unk(&fd, 8);
+        let masked = set_output(&mut fd, andop, 0x20, ct);
         let callind = mk_op(&mut fd, bl, 1, 0x104, OpCode::CPUI_CALLIND);
         wire(&mut fd, masked, callind, 0);
         let rc = RuleFuncPtrEncoding.apply_op(callind, &mut fd);
@@ -2249,12 +2188,14 @@ mod tests {
         };
         let pop = mk_op(&mut fd, bl, 1, 0x104, OpCode::CPUI_POPCOUNT);
         wire(&mut fd, x, pop, 0);
-        let popout = set_output(&mut fd, pop, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let popout = set_output(&mut fd, pop, 0x30, ct);
         let one = mk_const(&mut fd, 1, 1);
         let baseop = mk_op(&mut fd, bl, 2, 0x108, OpCode::CPUI_INT_AND);
         wire(&mut fd, popout, baseop, 0);
         wire(&mut fd, one, baseop, 1);
-        let _ = set_output(&mut fd, baseop, 0x40, unk(1));
+        let ct = unk(&fd, 1);
+        let _ = set_output(&mut fd, baseop, 0x40, ct);
         assert_eq!(RulePopcountBoolXor.apply_op(pop, &mut fd), 0);
         assert_eq!(code(&fd, baseop), OpCode::CPUI_INT_AND);
     }
@@ -2270,12 +2211,14 @@ mod tests {
         };
         let pop = mk_op(&mut fd, bl, 1, 0x104, OpCode::CPUI_POPCOUNT);
         wire(&mut fd, x, pop, 0);
-        let popout = set_output(&mut fd, pop, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let popout = set_output(&mut fd, pop, 0x30, ct);
         let three = mk_const(&mut fd, 1, 3);
         let baseop = mk_op(&mut fd, bl, 2, 0x108, OpCode::CPUI_INT_AND);
         wire(&mut fd, popout, baseop, 0);
         wire(&mut fd, three, baseop, 1);
-        let _ = set_output(&mut fd, baseop, 0x40, unk(1));
+        let ct = unk(&fd, 1);
+        let _ = set_output(&mut fd, baseop, 0x40, ct);
         assert_eq!(RulePopcountBoolXor.apply_op(pop, &mut fd), 0);
         assert_eq!(code(&fd, baseop), OpCode::CPUI_INT_AND);
     }
@@ -2392,12 +2335,14 @@ mod tests {
         let orop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_OR);
         wire(&mut fd, v, orop, 0);
         wire(&mut fd, w, orop, 1);
-        let orout = set_output(&mut fd, orop, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let orout = set_output(&mut fd, orop, 0x30, ct);
         let zero = mk_const(&mut fd, 4, 0);
         let eq = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, orout, eq, 0);
         wire(&mut fd, zero, eq, 1);
-        let _ = set_output(&mut fd, eq, 0x40, unk(1));
+        let ct = unk(&fd, 1);
+        let _ = set_output(&mut fd, eq, 0x40, ct);
         assert_eq!(RuleOrCompare.apply_op(orop, &mut fd), 1);
         // The reader became BOOL_AND(eq_V_out, eq_W_out).
         let eq_rec = fd.obank().get(eq).expect("eq survives");
@@ -2433,7 +2378,8 @@ mod tests {
         let orop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_OR);
         wire(&mut fd, v, orop, 0);
         wire(&mut fd, w, orop, 1);
-        let orout = set_output(&mut fd, orop, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let orout = set_output(&mut fd, orop, 0x30, ct);
         // reader is an INT_ADD, not a comparison.
         let add = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_INT_ADD);
         wire(&mut fd, orout, add, 0);
@@ -2458,7 +2404,8 @@ mod tests {
         let orop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_OR);
         wire(&mut fd, v, orop, 0);
         wire(&mut fd, w, orop, 1);
-        let _ = set_output(&mut fd, orop, 0x30, unk(4));
+        let ct = unk(&fd, 4);
+        let _ = set_output(&mut fd, orop, 0x30, ct);
         assert_eq!(RuleOrCompare.apply_op(orop, &mut fd), 0);
     }
 
@@ -2479,12 +2426,12 @@ mod tests {
         let andop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_AND);
         wire(&mut fd, x, andop, 0);
         wire(&mut fd, mask, andop, 1);
-        let _ = set_output(&mut fd, andop, 0x20, unk(4)); // UNKNOWN, not FLOAT
+        let ct = unk(&fd, 4);
+        let _ = set_output(&mut fd, andop, 0x20, ct); // UNKNOWN, not FLOAT
         assert_eq!(RuleFloatSignCleanup.apply_op(andop, &mut fd), 0);
     }
 
-    #[test]
-    fn floatsigncleanup_converts_and_signmask_to_float_abs() {
+    fn cleanup_alias_fixture() -> (Funcdata, OpId, OpId, OpId, OpId) {
         // Float output passes the first guard; `x & 0x7fffffff` clears the float
         // sign bit, so `floatSignManipulation` classifies it as FLOAT_ABS and the
         // rule rewrites the op (input 1 removed, op-code -> FLOAT_ABS).
@@ -2500,14 +2447,74 @@ mod tests {
         let andop = mk_op(&mut fd, bl, 2, 0x100, OpCode::CPUI_INT_AND);
         wire(&mut fd, x, andop, 0);
         wire(&mut fd, mask, andop, 1);
-        let _ = set_output(&mut fd, andop, 0x20, float_t(4)); // FLOAT output
-        assert_eq!(RuleFloatSignCleanup.apply_op(andop, &mut fd), 1);
-        assert_eq!(code(&fd, andop), OpCode::CPUI_FLOAT_ABS); // x & 0x7fff.. -> ABS(x)
-        assert_eq!(
-            fd.obank().get(andop).unwrap().num_input(),
-            1,
-            "the constant mask input is removed"
+        let ct = float_t(&fd, 4);
+        let _ = set_output(&mut fd, andop, 0x20, ct); // FLOAT output
+
+        let types = fd.get_arch().types_impl().unwrap();
+        let word = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
+        let pointer_type = types.get_type_pointer(8, word, 1).unwrap();
+        let pointer = fd.new_varnode(8, &Address::new(ram(&fd), 0x30), Some(pointer_type));
+        let pointer = fd.vbank_mut().set_input(pointer, &mut no_replace()).unwrap();
+        let load = mk_op(&mut fd, bl, 2, 0x104, OpCode::CPUI_LOAD);
+        let space_index = ram(&fd).get_index() as u64;
+        let space = mk_const(&mut fd, 8, space_index);
+        wire(&mut fd, space, load, 0);
+        wire(&mut fd, pointer, load, 1);
+        let ct = unk(&fd, 2);
+        let loaded = set_output(&mut fd, load, 0x40, ct);
+        let masked = mk_op(&mut fd, bl, 2, 0x108, OpCode::CPUI_INT_AND);
+        let mask = mk_const(&mut fd, 2, 0xff);
+        wire(&mut fd, loaded, masked, 0);
+        wire(&mut fd, mask, masked, 1);
+        let ct = unk(&fd, 2);
+        let masked_value = set_output(&mut fd, masked, 0x50, ct);
+        let compare = mk_op(&mut fd, bl, 2, 0x10c, OpCode::CPUI_INT_EQUAL);
+        let expected = mk_const(&mut fd, 2, 7);
+        wire(&mut fd, masked_value, compare, 0);
+        wire(&mut fd, expected, compare, 1);
+        let ct = unk(&fd, 1);
+        set_output(&mut fd, compare, 0x60, ct);
+
+        // A real unrelated rule in the same primary group must not leak into
+        // either alias-only pool.
+        let mult = mk_op(&mut fd, bl, 2, 0x110, OpCode::CPUI_INT_MULT);
+        let minus_one = mk_const(&mut fd, 4, 0xffff_ffff);
+        wire(&mut fd, x, mult, 0);
+        wire(&mut fd, minus_one, mult, 1);
+        let ct = unk(&fd, 4);
+        set_output(&mut fd, mult, 0x70, ct);
+        (fd, andop, load, masked, mult)
+    }
+
+    #[test]
+    fn registered_cleanup_aliases_transform_only_the_selected_rule() {
+        let mut pool = ActionPool::new(0, "cleanup");
+        for spec in specs() {
+            pool.add_spec(&spec, spec.aliases.first().copied().unwrap_or("analysis"));
+        }
+        pool.add_rule(
+            RuleState::new("cleanup", 0, "multnegone"),
+            Box::new(crate::ruleaction_6::RuleMultNegOne::new("cleanup")),
         );
+        for group in ["cleanup", "floatsigncleanup", "expandload", "unrelated"] {
+            let (mut fd, sign, load, masked, mult) = cleanup_alias_fixture();
+            if let Some(mut selected) = pool.clone_filtered(&ActionGroupList::from_names([group])) {
+                assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
+            }
+            let sign_enabled = group == "cleanup" || group == "floatsigncleanup";
+            let load_enabled = group == "cleanup" || group == "expandload";
+            assert_eq!(code(&fd, sign),
+                if sign_enabled { OpCode::CPUI_FLOAT_ABS } else { OpCode::CPUI_INT_AND }, "{group}");
+            assert_eq!(fd.obank().get(sign).unwrap().num_input(), if sign_enabled { 1 } else { 2 });
+            let loaded = fd.obank().get(load).unwrap().get_out().unwrap();
+            assert_eq!(fd.vbank().get(loaded).unwrap().get_size(), if load_enabled { 4 } else { 2 }, "{group}");
+            assert_eq!(fd.obank().get(masked).unwrap().get_in(0), Some(loaded), "{group}");
+            let mask = fd.obank().get(masked).unwrap().get_in(1).unwrap();
+            assert_eq!(fd.vbank().get(mask).unwrap().get_size(), if load_enabled { 4 } else { 2 });
+            assert_eq!(fd.vbank().get(mask).unwrap().get_offset(), 0xff);
+            assert_eq!(code(&fd, mult),
+                if group == "cleanup" { OpCode::CPUI_INT_2COMP } else { OpCode::CPUI_INT_MULT }, "{group}");
+        }
     }
 
     // =====================================================================
@@ -2524,7 +2531,8 @@ mod tests {
             fd.vbank_mut().set_input(v, &mut no_replace()).unwrap()
         };
         wire(&mut fd, src, defop, 0);
-        let out = set_output(&mut fd, defop, 0x20, unk(4));
+        let ct = unk(&fd, 4);
+        let out = set_output(&mut fd, defop, 0x20, ct);
         // zero readers -> None
         assert_eq!(lone_descend(&fd, out), None);
         // one reader -> Some

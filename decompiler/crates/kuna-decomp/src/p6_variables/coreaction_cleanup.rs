@@ -2185,11 +2185,8 @@ fn bind_proto_partial_piece(
 /// `PrintC::pushSymbolScope` (`printc.cc:203`) + `Symbol::getResolutionDepth`
 /// (`database.cc:324`) under the default `MINIMAL_NAMESPACES` strategy.
 ///
-/// The kuna printer renders a HighVariable's bound `kuna_name` string verbatim, so
-/// the namespace qualifier is computed here (where the function's local scope, its
-/// namespace path, and the global Symbol's scope chain are all available) and baked
-/// into the bound name — exactly as the function's own `a::b::assign_vals` display
-/// name is baked in by `parse line`.
+/// The printer applies this to the retained symbol binding at emission time, so
+/// changing namespace strategy does not rename or rebind analysis symbols.
 ///
 /// * `base` is the Symbol's bare name (e.g. `spam`).
 /// * `sym_scope_path` is the Symbol's scope chain, innermost first, GLOBAL excluded
@@ -2200,7 +2197,7 @@ fn bind_proto_partial_piece(
 ///   function's local scope (a parameter/local that shadows the global)?
 ///
 /// Returns the (possibly qualified) name, e.g. `::spam`, `a::spam`, or just `spam`.
-fn kuna_qualify_global_name(
+pub(crate) fn kuna_qualify_global_name(
     base: &str,
     sym_scope_path: &[String],
     func_ns_path: &[String],
@@ -2295,7 +2292,7 @@ fn kuna_qualify_global_name(
 /// ancestry that `Symbol::getResolutionDepth` walks; the function's local scope is a
 /// detached scope in the kuna port, so its namespace ancestry is recovered from the
 /// name the function was loaded under (`lo fu a::b::assign_vals`).
-fn kuna_function_namespace_path(display_name: &str) -> Vec<String> {
+pub(crate) fn kuna_function_namespace_path(display_name: &str) -> Vec<String> {
     let mut parts: Vec<&str> = display_name.split("::").collect();
     parts.pop(); // drop the function's own base name
     parts.into_iter().map(|s| s.to_string()).collect()
@@ -2306,7 +2303,7 @@ fn kuna_function_namespace_path(display_name: &str) -> Vec<String> {
 /// recommended data-type (`None` when the source was reached through a `CPUI_CAST`, a
 /// less-preferred recommendation), `name` is the callee's parameter name.
 struct OpRecommend {
-    ct: Option<std::rc::Rc<crate::dtype::Datatype>>,
+    ct: Option<crate::dtype::TypeRoot>,
     name: String,
 }
 
@@ -2366,7 +2363,7 @@ fn build_func_param_name_recmap(
             if crate::kuna_naming::kuna_is_generated_name(&param_name) {
                 continue;
             }
-            let mut ct: Option<std::rc::Rc<crate::dtype::Datatype>> = param.get_type().cloned();
+            let mut ct: Option<crate::dtype::TypeRoot> = param.get_type().cloned();
 
             let arg_vn = match data.obank().get(op).and_then(|o| o.get_in(j + 1)) {
                 Some(v) => v,
@@ -2448,7 +2445,7 @@ fn build_func_param_name_recmap(
 /// empty-`printNameBase` case).
 fn kuna_default_local_name(
     arch: &crate::context::ArchContext,
-    ct: Option<&crate::dtype::Datatype>,
+    ct: Option<&crate::dtype::TypeRoot>,
     base: &mut int4,
 ) -> String {
     use crate::database::DatabaseArch;
@@ -2597,6 +2594,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
     // address-keyed half is applied per-high inside the walk
     // (`recommended_name_for`).  Both are no-ops without recommendations.
     data.kuna_apply_dynamic_recommendations();
+    data.finalize_execution_input_names();
 
     // C++ `ActionNameVars::apply` (coreaction.cc:3084) calls
     // `lookForFuncParamNames(data,namerec)` AFTER `linkSymbols` but BEFORE the
@@ -2662,6 +2660,30 @@ fn name_local_highs_angr(data: &mut Funcdata) {
             continue;
         }
         seen.insert(high);
+        if let Some(slot) = data.execution_input_slot_for_high(high) {
+            let name = data.get_func_proto().get_param(slot)
+                .expect("execution input slot").get_name().to_string();
+            if let Some(value) = data.high_bank_mut().get_mut(high) {
+                value.set_kuna_name(name);
+            }
+            continue;
+        }
+        if let Some(slot) = data.source_projection_slot_for_high(high) {
+            let source = data.get_scope_local().and_then(|scope| {
+                let id = scope.parameter_symbol_for_slot(slot)?;
+                let symbol = scope.database().symbol(id);
+                Some((id, symbol.get_display_name().to_string(), symbol.dtype.clone()))
+            });
+            if let Some((id, name, dtype)) = source {
+                if let Some(value) = data.high_bank_mut().get_mut(high) {
+                    value.set_kuna_name(name);
+                    value.set_symbol_offset(-1);
+                    value.set_kuna_link_symbol(id);
+                    if let Some(dtype) = dtype { value.set_symbol_type(dtype); }
+                }
+                continue;
+            }
+        }
         // C++ `if (!high->hasName()) continue;` — the gate that admits parameters,
         // mapped/promoted locals, and ordinary named locals while excluding
         // implied/non-coverable and the unaffected-stackpointer high.
@@ -2973,20 +2995,11 @@ fn name_local_highs_angr(data: &mut Funcdata) {
             if let Some((sym_name, sym_off, sym_type, scope_path)) =
                 data.get_arch().name_for_global_varnode_scoped(&v_addr, v_size, &usepoint)
             {
-                // Namespace-qualify the global name for the body render (C++
-                // `PrintC::pushSymbolScope` -> `getResolutionDepth(curscope)`), where
-                // `curscope` is the function's local scope.  A bare global Symbol whose
-                // name collides with a local/parameter gets a `::` prefix; a Symbol in
-                // a namespace gets its `ns::` path.  Non-colliding globals are
-                // unchanged (`scope_path` empty and no local collision -> bare name).
-                let func_ns_path = kuna_function_namespace_path(data.get_display_name());
-                let name_used = |nm: &str| {
-                    data.get_scope_local().map(|lm| lm.local_name_used(nm)).unwrap_or(false)
-                };
-                let qualified =
-                    kuna_qualify_global_name(&sym_name, &scope_path, &func_ns_path, &name_used);
+                // Retain the binding independently of display policy. The printer
+                // chooses minimal/none/all qualification at each document render.
                 if let Some(h) = data.high_bank_mut().get_mut(high) {
-                    h.set_kuna_name(qualified);
+                    h.set_kuna_name(sym_name);
+                    h.set_kuna_symbol_scope(scope_path);
                     h.set_symbol_offset(sym_off);
                     if let Some(t) = sym_type {
                         h.set_symbol_type(t);
@@ -3019,7 +3032,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
                 // (`iVar1`/`uVar1`/...).  Pick the rep's data-type for the prefix
                 // (the same type that renders the declaration, e.g. `int4`).
                 let rep_ty = data.vbank().get(name_rep.unwrap()).map(|v| v.get_type().clone());
-                kuna_default_local_name(data.get_arch(), rep_ty.as_deref(), &mut base)
+                kuna_default_local_name(data.get_arch(), rep_ty.as_ref(), &mut base)
             }
         };
         if let Some(h) = data.high_bank_mut().get_mut(high) {
@@ -3225,7 +3238,12 @@ mod tests {
 
     fn build_fd() -> Funcdata {
         let manage = build_manager();
-        let glb = Rc::new(ArchContext::new(manage));
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let mut arch = ArchContext::new(manage);
+        arch.types = Some(types);
+        let glb = Rc::new(arch);
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()

@@ -38,7 +38,7 @@
 //!
 //! ## The guard here
 //!
-//! [`TypeWalk::Cycle`] is upstream's counter. Termination: every recursive step
+//! [`Guard::Cycle`] is upstream's counter. Termination: every recursive step
 //! is bracketed by [`TypeWalk::enter`]/[`TypeWalk::leave`], an offset already on
 //! the path twice is refused, and the number of distinct offsets in a
 //! compilation unit is finite — so no walk can be infinite. [`MAX_NESTING`] is a
@@ -46,10 +46,11 @@
 //! exhausting the native stack, which a Java port does not have to worry about
 //! and a Rust one does.
 //!
-//! [`TypeWalk::Depth`] is the pre-fix budget, kept so `--option typedepth off`
+//! [`Guard::Depth`] is the pre-fix budget, kept so `--option typedepth off`
 //! reproduces the old mapping exactly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use kuna_decomp::dtype::TypeRoot;
 
 /// Re-entry count at which a DIE offset is refused — upstream's `case 3`.
 const MAX_REENTRY: u32 = 3;
@@ -65,6 +66,9 @@ const MAX_TYPE_DEPTH: u32 = 3;
 
 /// The recursion guard threaded through [`super::build_datatype`].
 ///
+/// `reserved` maps source DIE offsets to roots before recursion, retaining the
+/// nominal identity through completion. `path` supplies the current DIE to the
+/// shared aggregate loaders; `anonymous_names` carries source typedef names.
 /// [`Guard`] is the guard proper; `active` is the (kuna `dwarfstructs`) set of
 /// aggregate names whose field population is on the current path, so a
 /// self-referential member resolves to the interned shell instead of re-entering
@@ -72,6 +76,9 @@ const MAX_TYPE_DEPTH: u32 = 3;
 pub(super) struct TypeWalk {
     guard: Guard,
     active: BTreeSet<String>,
+    reserved: BTreeMap<usize, TypeRoot>,
+    path: Vec<usize>,
+    anonymous_names: BTreeMap<usize, String>,
 }
 
 /// The recursion-guard arms proper.
@@ -97,7 +104,36 @@ impl TypeWalk {
         } else {
             Guard::Depth { depth: 0 }
         };
-        TypeWalk { guard, active: BTreeSet::new() }
+        TypeWalk {
+            guard, active: BTreeSet::new(), reserved: BTreeMap::new(),
+            path: Vec::new(), anonymous_names: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn reserved(&self, off: usize) -> Option<TypeRoot> {
+        self.reserved.get(&off).cloned()
+    }
+
+    pub(super) fn reserve(&mut self, off: usize, root: TypeRoot) {
+        self.reserved.insert(off, root);
+    }
+
+    pub(super) fn forget(&mut self, off: usize) {
+        self.reserved.remove(&off);
+    }
+
+    pub(super) fn reserve_current(&mut self, root: TypeRoot) {
+        if let Some(&off) = self.path.last() {
+            self.reserve(off, root);
+        }
+    }
+
+    pub(super) fn name_anonymous(&mut self, off: usize, name: String) {
+        self.anonymous_names.entry(off).or_insert(name);
+    }
+
+    pub(super) fn anonymous_name(&self, off: usize) -> Option<String> {
+        self.anonymous_names.get(&off).cloned()
     }
 
     /// (kuna `dwarfstructs`) Claim `name` for field population on this path.
@@ -121,6 +157,7 @@ impl TypeWalk {
                     return false;
                 }
                 *depth += 1;
+                self.path.push(off);
                 true
             }
             Guard::Cycle { counts, nesting } => {
@@ -133,6 +170,7 @@ impl TypeWalk {
                 }
                 *seen += 1;
                 *nesting += 1;
+                self.path.push(off);
                 true
             }
         }
@@ -140,6 +178,7 @@ impl TypeWalk {
 
     /// Finish the DIE at `off` (pairs with an [`Self::enter`] that returned true).
     pub(super) fn leave(&mut self, off: usize) {
+        self.path.pop();
         match &mut self.guard {
             Guard::Depth { depth } => *depth = depth.saturating_sub(1),
             Guard::Cycle { counts, nesting } => {
@@ -151,12 +190,9 @@ impl TypeWalk {
         }
     }
 
-    /// Whether the transparent `typedef`/`const`/`volatile`/`restrict` hops are
-    /// collapsed for EVERY caller ([`super::strip_qualifiers`]), not just the C++
-    /// one. Under the cycle guard they no longer need collapsing to survive a
-    /// budget — but collapsing is what carries an anonymous aggregate's typedef
-    /// name onto it, and full-depth resolution reaches many more of those (a
-    /// local `mbstate_t` would otherwise intern as the shared `anon_struct`).
+    /// Whether transparent `const`/`volatile`/`restrict` hops are collapsed for
+    /// every caller, not just C++. Typedefs are reserved nominal graph nodes and
+    /// never collapsed; anonymous aggregate naming is tracked separately.
     pub(super) fn collapse_qualifiers(&self) -> bool {
         matches!(self.guard, Guard::Cycle { .. })
     }

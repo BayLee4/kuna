@@ -2,7 +2,7 @@
 //! datatest runner.
 //!
 //! Ports the three C++ types that execute the 83 datatest files
-//! (`tests/datatests/`, 675 `<stringmatch>` assertions):
+//! (`tests/datatests/`, 674 `<stringmatch>` assertions):
 //!
 //! - [`FunctionTestProperty`] — one `<stringmatch min=.. max=..>` assertion: a
 //!   (possibly multi-line) regular expression run over the lines of decompiler
@@ -574,7 +574,7 @@ impl FunctionTestCollection {
     ///
     /// Faithful to the C++ stream swap: command chatter to a discarded
     /// `midBuffer` (`optr`), bulk `print C` output to `bulkout` (`fileoptr`).
-    /// On a console error (the first stubbed engine command), the
+    /// On an unexpected console error, the
     /// `Error: Did not apply tests in <f>` path runs; on empty bulk output the
     /// `No output for <f>` path runs.  Returns the file-results text.
     pub fn run_tests(&mut self, late_stream: &mut Vec<String>) -> String {
@@ -732,7 +732,8 @@ fn console_dcp_mut(console: &mut IfaceStatus) -> Option<&mut IfaceDecompData> {
 /// C++ `FunctionTestCollection::runTestFiles(const vector<string> &testFiles,
 /// ostream &s)`: run each listed file in turn, accumulate the totals, print the
 /// per-file results and the capped `Failures:` summary, and return the number of
-/// failed assertions (`applied - succeeded`).
+/// failed assertions and file-level failures. Assertion totals exclude files
+/// whose scripts did not complete or produced no output.
 ///
 /// The output text is written to `out` (the Python harness reads it off
 /// **stdout**); the exact grammar — `Success -- `/`FAIL -- `, the
@@ -796,7 +797,7 @@ pub fn run_test_files_with_specs(
             out.push('\n');
         }
     }
-    total_tests_applied - total_tests_succeeded
+    int4::try_from(failures.len()).unwrap_or(int4::MAX)
 }
 
 // ---------------------------------------------------------------------------

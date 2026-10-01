@@ -39,16 +39,14 @@
 //! ([`crate::kuna_libctypes::AGGREGATE_NAMES`]) and only while that option is
 //! on, so `libctypes off` is untouched.
 
-use std::rc::Rc;
-
 use crate::context::{OpId, VarnodeId};
-use crate::dtype::{type_metatype, Datatype};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use kuna_base::types::int4;
 
 /// Does the value call `op` reads in `slot` get used outside the libc
 /// aggregate `ct` points at?
-pub(crate) fn overruns(data: &Funcdata, op: OpId, slot: int4, ct: &Datatype) -> bool {
+pub(crate) fn overruns(data: &Funcdata, op: OpId, slot: int4, ct: &TypeRoot) -> bool {
     if !data.get_arch().libctypes {
         return false;
     }
@@ -59,7 +57,7 @@ pub(crate) fn overruns(data: &Funcdata, op: OpId, slot: int4, ct: &Datatype) -> 
 
 /// Should type propagation refuse to carry `ct` onto `vn`? The same question
 /// [`overruns`] asks at a call, asked of the Varnode the type would land on.
-pub(crate) fn refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
+pub(crate) fn refuses(data: &Funcdata, vn: VarnodeId, ct: &TypeRoot) -> bool {
     if !data.get_arch().libctypes {
         return false;
     }
@@ -68,20 +66,22 @@ pub(crate) fn refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
 }
 
 /// The `void *` the vote falls back to, as wide as the declared pointer.
-pub(crate) fn width_stable_vote(data: &Funcdata, ct: &Datatype) -> Option<Rc<Datatype>> {
+pub(crate) fn width_stable_vote(data: &Funcdata, ct: &TypeRoot) -> Option<TypeRoot> {
     let tlst = data.get_arch().types()?;
     let void = tlst.get_type_void().ok()?;
     let ws = ct.get_word_size().unwrap_or(1);
     tlst.get_type_pointer(ct.get_size(), void, ws).ok()
 }
 
-fn libc_pointee_size(ct: &Datatype) -> Option<i64> {
+fn libc_pointee_size(ct: &TypeRoot) -> Option<i64> {
     if ct.get_metatype() != type_metatype::TYPE_PTR {
         return None;
     }
     let pointee = ct.get_ptr_to()?;
+    let view = pointee.read();
+    let definition = view.get(pointee.id()).ok()?;
     if pointee.get_metatype() != type_metatype::TYPE_STRUCT
-        || !crate::kuna_libctypes::AGGREGATE_NAMES.contains(&pointee.get_name())
+        || !crate::kuna_libctypes::AGGREGATE_NAMES.contains(&definition.get_name())
     {
         return None;
     }

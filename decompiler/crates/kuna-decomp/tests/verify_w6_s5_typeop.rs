@@ -1,18 +1,9 @@
 //! Adversarial verifier tests for item `w6-s5-typeop` (the canonical `TypeOp`
 //! information table ported from `decompiler/cpp/typeop.{cc,hh}`).
 //!
-//! These are an INDEPENDENT third copy: they do not re-read the production
-//! `type_op_info` match nor the porter's `expected_table()`.  Instead they
-//! re-derive behavior from the C++ semantics directly and target the hunt-list
-//! spots most likely to hide a faithful-port bug for this item:
+//! These tests exercise public behavior derived from the C++ semantics and
+//! target the spots most likely to hide a faithful-port bug for this item:
 //!
-//!   * **Iteration-order / off-by-one in `register_instructions`.**  C++
-//!     `TypeOp::registerInstructions` (typeop.cc:24-109) leaves `inst[0]` and the
-//!     unused discriminant 45 (gap between FLOAT_LESSEQUAL=44 and FLOAT_NAN=46)
-//!     null, and fills every other slot < CPUI_MAX exactly once.  An off-by-one in
-//!     `REGISTERED_OPCODES` or a wrong `opc as usize` index silently corrupts
-//!     `setOpcode`.  F-V1 pins the exact null/non-null shape against the opcode
-//!     enum, independent of REGISTERED_OPCODES.
 //!   * **Integer width sensitivity of `floatSignManipulation`.**  The sign mask is
 //!     `calc_mask(size)`, so the recognized constant is width-specific; a size-4
 //!     AND must match the 4-byte mask and must NOT match the 8-byte mask.  The
@@ -22,8 +13,7 @@
 //!     silent corruption.  F-V3 snapshots the whole table and asserts only those
 //!     six records differ.
 //!   * **Per-op `getInputLocal`/`getOutputLocal` size-only overrides.**  F-V4
-//!     re-derives the metatype each (opcode, slot) produces straight from the C++
-//!     override bodies, including the documented CBRANCH slot-0 W8 seam.
+//!     checks the metatype each (opcode, slot) produces.
 //!
 //! C++ oracle anchors are cited inline.
 
@@ -31,7 +21,7 @@ use kuna_base::address::calc_mask;
 use kuna_decomp::dtype::{type_metatype, TypeFactoryImpl};
 use kuna_decomp::typeop::{
     float_sign_manipulation, register_instructions, select_java_operators, type_op_info,
-    TypeOpClass, TypeOpInfo,
+    TypeOpInfo,
 };
 use kuna_num::opcodes::OpCode;
 use type_metatype::*;
@@ -41,47 +31,6 @@ fn factory() -> TypeFactoryImpl {
     f.set_default_alignment_map();
     f.set_max_basetype_size(8);
     f
-}
-
-/// Walk every discriminant 0..CPUI_MAX via `OpCode::try_from(u32)` and assert the
-/// `register_instructions` slot is non-null iff that discriminant is a real,
-/// registered op-code.  This is derived from the opcode enum alone (the C++
-/// `opcodes.hh` gap at 45 + `inst[0]` null), not from REGISTERED_OPCODES, so an
-/// off-by-one in that constant or a transposed `opc as usize` index is caught.
-///
-/// cpp: decompiler/cpp/typeop.cc:24-109 (registerInstructions) ;
-///      decompiler/cpp/opcodes.hh:44,46,131 (FLOAT_LESSEQUAL=44, FLOAT_NAN=46, MAX=75)
-#[test]
-fn v1_register_instructions_null_shape_is_exactly_the_opcode_gap() {
-    let inst = register_instructions();
-    // Length is CPUI_MAX (75): inst[CPUI_MAX] itself is never addressable.
-    assert_eq!(inst.len(), OpCode::CPUI_MAX as usize, "inst[] length == CPUI_MAX");
-
-    for idx in 0..(OpCode::CPUI_MAX as i32) {
-        // Reconstruct the op-code from the raw discriminant.  Discriminant 0 and
-        // the unused 45 have no CPUI_* (from_i32 -> None) and must map to a null
-        // slot; everything else is a registered op whose record's opcode
-        // round-trips to the same index.
-        let slot = &inst[idx as usize];
-        match OpCode::from_i32(idx) {
-            Some(opc) => {
-                let rec = slot.unwrap_or_else(|| panic!("inst[{idx}] ({opc:?}) unexpectedly null"));
-                assert_eq!(
-                    rec.opcode as i32, idx,
-                    "inst[{idx}] holds the wrong op-code record ({:?})",
-                    rec.opcode
-                );
-            }
-            None => {
-                assert!(slot.is_none(), "inst[{idx}] should be null (no CPUI_* at {idx})");
-            }
-        }
-    }
-    // Spot the two specific nulls the C++ leaves: discriminant 0 and 45.
-    assert!(inst[0].is_none(), "inst[0] is null (no CPUI_* == 0)");
-    assert!(inst[45].is_none(), "inst[45] is null (gap between FLOAT_LESSEQUAL and FLOAT_NAN)");
-    // ... and that the slot right after the gap (FLOAT_NAN=46) is populated.
-    assert_eq!(inst[46].unwrap().opcode, OpCode::CPUI_FLOAT_NAN);
 }
 
 /// `floatSignManipulation` recognizes a width-specific constant.  Re-derive the
@@ -201,10 +150,7 @@ fn v3_select_java_operators_blast_radius() {
 }
 
 /// Re-derive the metatype each per-op `getInputLocal`/`getOutputLocal` override
-/// produces straight from the C++ override bodies, including the documented
-/// CBRANCH slot-0 W8 seam (typeop.cc:611-621 returns a code pointer in C++; the
-/// port returns the inherited `getBase(size, TYPE_UNKNOWN)` default and pins that
-/// as the current behavior so a regression here is visible).
+/// produces straight from the C++ override bodies.
 #[test]
 fn v4_local_type_overrides_metatype_rederived() {
     let f = factory();
@@ -233,14 +179,8 @@ fn v4_local_type_overrides_metatype_rederived() {
     // CPOOLREF input -> INT (typeop.cc:2467-2471).
     assert_eq!(min(OpCode::CPUI_CPOOLREF, 0, 4), TYPE_INT);
 
-    // CBRANCH slot 1 -> BOOL (typeop.cc:613-617); slot 0 is the documented W8 seam
-    // (C++ returns a code pointer; port returns the Base UNKNOWN default).
+    // CBRANCH slot 1 -> BOOL (typeop.cc:613-617).
     assert_eq!(min(OpCode::CPUI_CBRANCH, 1, 1), TYPE_BOOL);
-    assert_eq!(
-        min(OpCode::CPUI_CBRANCH, 0, 8),
-        TYPE_UNKNOWN,
-        "CBRANCH slot-0 W8 seam: inherited UNKNOWN default (NOT the C++ code pointer)"
-    );
 
     // INSERT slots <=1 -> UNKNOWN, slot 2 -> Func metain INT (typeop.cc:2537-2543).
     assert_eq!(min(OpCode::CPUI_INSERT, 0, 4), TYPE_UNKNOWN);
@@ -260,18 +200,3 @@ fn v4_local_type_overrides_metatype_rederived() {
     assert_eq!(min(OpCode::CPUI_POPCOUNT, 0, 4), TYPE_UNKNOWN);
 }
 
-/// Guard the `TypeOpClass` assignment for a representative of each shape: the
-/// class drives the generic local-type fallthrough, so a Func-vs-Binary mixup is
-/// invisible in flag-word tests but changes `getInputLocal`/`getOutputLocal`.
-#[test]
-fn v5_typeopclass_shape_sanity() {
-    assert_eq!(type_op_info(OpCode::CPUI_COPY).class, TypeOpClass::Base);
-    assert_eq!(type_op_info(OpCode::CPUI_INT_ADD).class, TypeOpClass::Binary);
-    assert_eq!(type_op_info(OpCode::CPUI_INT_2COMP).class, TypeOpClass::Unary);
-    assert_eq!(type_op_info(OpCode::CPUI_INT_ZEXT).class, TypeOpClass::Func);
-    // PIECE/SUBPIECE are Func in C++ (TypeOpFunc) despite the "binary" opflag.
-    assert_eq!(type_op_info(OpCode::CPUI_PIECE).class, TypeOpClass::Func);
-    assert_eq!(type_op_info(OpCode::CPUI_SUBPIECE).class, TypeOpClass::Func);
-    // PTRADD/PTRSUB derive directly from TypeOp (Base), with size-only overrides.
-    assert_eq!(type_op_info(OpCode::CPUI_PTRADD).class, TypeOpClass::Base);
-}

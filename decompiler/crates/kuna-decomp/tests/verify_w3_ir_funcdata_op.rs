@@ -28,7 +28,7 @@ use kuna_base::types::{int4, uint4};
 use kuna_num::opcodes::OpCode;
 
 use kuna_base::error::KunaResult;
-use kuna_decomp::dtype::{type_metatype, Datatype};
+use kuna_decomp::dtype::type_metatype;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::op::pcodeop_flags;
 use kuna_decomp::context::{ArchContext, BlockId, OpId, TypeOp, VarnodeId};
@@ -69,10 +69,6 @@ fn const_space(fd: &Funcdata) -> Rc<AddrSpace> {
     Rc::clone(fd.get_arch().manage().get_space(0).unwrap())
 }
 
-fn dt(size: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))
-}
-
 fn opcode_flags(opc: OpCode) -> uint4 {
     match opc {
         OpCode::CPUI_BRANCH | OpCode::CPUI_CBRANCH | OpCode::CPUI_BRANCHIND => pcodeop_flags::branch,
@@ -90,13 +86,15 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 
 fn mk_vn(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.vbank_mut().create(4, Address::new(ram, off), dt(4))
+    let dtype = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
+    fd.vbank_mut().create(4, Address::new(ram, off), dtype)
 }
 
 /// A constant varnode (free, in the constant space).
 fn mk_const(fd: &mut Funcdata, val: u64) -> VarnodeId {
     let c = const_space(fd);
-    fd.vbank_mut().create(4, Address::new(c, val), dt(4))
+    let dtype = fd.get_arch().types().unwrap().get_base(4, type_metatype::TYPE_UNKNOWN).unwrap();
+    fd.vbank_mut().create(4, Address::new(c, val), dtype)
 }
 
 fn mk_block(fd: &mut Funcdata) -> BlockId {

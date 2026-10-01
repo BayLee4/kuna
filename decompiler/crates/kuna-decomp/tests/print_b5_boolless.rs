@@ -821,8 +821,9 @@ fn verify_w10_infertypes_uint1_is_real_metatype_not_string() {
             // The metatype is the oracle a string hack cannot fake: the printer
             // renders `uint1` ONLY because this is the interned size-1 UINT core
             // type.  A hardcoded "uint1" string would leave the metatype UNKNOWN.
+            let view = ty.read();
             assert_eq!(
-                ty.get_name(),
+                view.get(ty.id()).expect("retained varnode datatype").get_name(),
                 "uint1",
                 "the size-1 UINT core type must be the interned `uint1`, not an ad-hoc type"
             );

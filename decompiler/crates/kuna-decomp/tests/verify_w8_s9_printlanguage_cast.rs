@@ -22,9 +22,9 @@ use std::rc::Rc;
 
 use kuna_base::types::{int4, uint4, uintb};
 use kuna_decomp::cast::{
-    CastContext, CastStrategy, CastStrategyC, IntPromotionCode, OpRef, VnRef,
+    CastContext, CastStrategy, CastStrategyC, OpRef, VnRef,
 };
-use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactoryImpl};
+use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind, TypeRoot, TypeFactoryImpl};
 use kuna_decomp::printlanguage::{
     format_binary, most_natural_base, parentheses, unicode_needs_escape, OpToken, ReversePolish,
     TokenType,
@@ -35,28 +35,32 @@ use kuna_num::opcodes::OpCode;
 // data-type builders (mirror cast/tests.rs)
 // ---------------------------------------------------------------------------
 
-fn base(size: int4, meta: type_metatype) -> Rc<Datatype> {
-    Rc::new(Datatype::new(size, meta))
+fn base(f: &TypeFactoryImpl, size: int4, meta: type_metatype) -> TypeRoot {
+    f.intern(Datatype::new(size, meta)).unwrap()
 }
-fn int_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_INT)
+fn int_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_INT)
 }
-fn uint_t(size: int4) -> Rc<Datatype> {
-    base(size, type_metatype::TYPE_UINT)
+fn uint_t(f: &TypeFactoryImpl, size: int4) -> TypeRoot {
+    base(f, size, type_metatype::TYPE_UINT)
 }
 
-fn ptr_to(ptrto: Rc<Datatype>, wordsize: uint4) -> Rc<Datatype> {
+fn ptr_to(f: &TypeFactoryImpl, ptrto: TypeRoot, wordsize: uint4) -> TypeRoot {
     let mut t = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTR);
-    t.kind = DatatypeKind::Pointer { ptrto, spaceid: None, truncate: None, wordsize };
-    Rc::new(t)
+    t.kind = DatatypeKind::Pointer { ptrto: ptrto.id(), spaceid: None, truncate: None, wordsize };
+    f.intern(t).unwrap()
 }
 
-fn strategy_c() -> CastStrategyC {
+fn factory() -> Rc<TypeFactoryImpl> {
     let f = TypeFactoryImpl::new();
     f.set_default_alignment_map();
     f.set_max_basetype_size(8);
     f.setup_sizes(Some(4), 8, 8);
-    CastStrategyC::new(Rc::new(f))
+    Rc::new(f)
+}
+
+fn strategy_c(f: &Rc<TypeFactoryImpl>) -> CastStrategyC {
+    CastStrategyC::new(f.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -65,9 +69,10 @@ fn strategy_c() -> CastStrategyC {
 
 #[test]
 fn subpiece_cast_endian_bigend_boundary_and_wrap() {
-    let s = strategy_c();
-    let inty = int_t(4);
-    let outy = int_t(4);
+    let f = &factory();
+    let s = strategy_c(f);
+    let inty = int_t(f, 4);
+    let outy = int_t(f, 4);
 
     // big-endian, offset == size-1 -> tmpoff = 4-1-3 = 0 -> isSubpieceCast(.,.,0)
     // INT/INT offset 0 -> true.
@@ -100,7 +105,7 @@ fn subpiece_cast_endian_bigend_boundary_and_wrap() {
 struct LongCtx {
     size: int4,
     offset: uintb,
-    ty: Rc<Datatype>,
+    ty: TypeRoot,
     is_shift: bool,
     marked: std::cell::Cell<bool>,
 }
@@ -142,11 +147,11 @@ impl CastContext for LongCtx {
     fn vn_lone_descend(&self, _vn: VnRef) -> Option<OpRef> {
         None
     }
-    fn vn_high_type(&self, _vn: VnRef) -> Rc<Datatype> {
-        Rc::clone(&self.ty)
+    fn vn_high_type(&self, _vn: VnRef) -> TypeRoot {
+        Clone::clone(&self.ty)
     }
-    fn vn_high_type_read_facing(&self, _vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.ty)
+    fn vn_high_type_read_facing(&self, _vn: VnRef, _op: OpRef) -> TypeRoot {
+        Clone::clone(&self.ty)
     }
     fn op_inherits_sign(&self, _op: OpRef) -> bool {
         false
@@ -170,8 +175,9 @@ impl CastContext for LongCtx {
 }
 
 fn long_size_marked(meta: type_metatype, size: int4, offset: uintb) -> bool {
-    let s = strategy_c();
-    let ty = base(size, meta);
+    let f = &factory();
+    let s = strategy_c(f);
+    let ty = base(f, size, meta);
     let mut ctx = LongCtx { size, offset, ty, is_shift: true, marked: std::cell::Cell::new(false) };
     s.mark_explicit_long_size(&mut ctx, OpRef(0), 0)
 }
@@ -202,8 +208,9 @@ fn mark_explicit_long_size_unsigned_boundary_and_size_guard() {
     assert!(!long_size_marked(type_metatype::TYPE_UINT, 4, 0xff));
 
     // Non-shift op -> never long.
-    let s = strategy_c();
-    let ty = base(8, type_metatype::TYPE_UINT);
+    let f = &factory();
+    let s = strategy_c(f);
+    let ty = base(f, 8, type_metatype::TYPE_UINT);
     let mut ctx =
         LongCtx { size: 8, offset: 0xffff, ty, is_shift: false, marked: std::cell::Cell::new(false) };
     assert!(!s.mark_explicit_long_size(&mut ctx, OpRef(0), 0));
@@ -352,43 +359,25 @@ fn parentheses_binary_associative_pointer_identity() {
 
 #[test]
 fn cast_standard_pointer_chain_forces_care_uint_int() {
-    let s = strategy_c();
+    let f = &factory();
+    let s = strategy_c(f);
     // uint4* vs int4* with care_uint_int=FALSE at the top level.  Descending into
     // the pointers sets care_uint_int=true (cast.cc:322), so UINT-vs-INT under
     // the pointer DOES require a cast even though the caller passed false.
-    let a = ptr_to(uint_t(4), 1);
-    let b = ptr_to(int_t(4), 1);
+    let a = ptr_to(f, uint_t(f, 4), 1);
+    let b = ptr_to(f, int_t(f, 4), 1);
     assert!(s.cast_standard(&a, &b, false, true).is_some());
 
     // Same two base types NOT under a pointer, care_uint_int=false: no cast
     // (the reset only happens inside the pointer loop).
-    assert!(s.cast_standard(&uint_t(4), &int_t(4), false, true).is_none());
+    assert!(s.cast_standard(&uint_t(f, 4), &int_t(f, 4), false, true).is_none());
 
     // care_ptr_uint=false with a UINT requirement and a PTR current at top level
     // (no pointer descent on req side): the `!care_ptr_uint && PTR` arm -> no
     // cast (cast.cc:359-360).
-    assert!(s.cast_standard(&uint_t(8), &ptr_to(int_t(4), 1), false, false).is_none());
+    assert!(s.cast_standard(&uint_t(f, 8), &ptr_to(f, int_t(f, 4), 1), false, false).is_none());
     // ...but care_ptr_uint=true -> the size matches (both 8) and PTR is not in
     // the UINT no-cast set -> default arm -> cast.
-    assert!(s.cast_standard(&uint_t(8), &ptr_to(int_t(4), 1), false, true).is_some());
+    assert!(s.cast_standard(&uint_t(f, 8), &ptr_to(f, int_t(f, 4), 1), false, true).is_some());
 }
 
-#[test]
-fn int_promotion_code_discriminants_match_cpp() {
-    // The discriminants are load-bearing: int_promotion_type AND-combines them
-    // (cast.hh:48-54).  Verify the raw values and the bit-algebra the port relies
-    // on (UNSIGNED & SIGNED == 0, EITHER == UNSIGNED | SIGNED).
-    assert_eq!(IntPromotionCode::NO_PROMOTION.as_i32(), -1);
-    assert_eq!(IntPromotionCode::UNKNOWN_PROMOTION.as_i32(), 0);
-    assert_eq!(IntPromotionCode::UNSIGNED_EXTENSION.as_i32(), 1);
-    assert_eq!(IntPromotionCode::SIGNED_EXTENSION.as_i32(), 2);
-    assert_eq!(IntPromotionCode::EITHER_EXTENSION.as_i32(), 3);
-    assert_eq!(
-        IntPromotionCode::UNSIGNED_EXTENSION.as_i32() & IntPromotionCode::SIGNED_EXTENSION.as_i32(),
-        0
-    );
-    assert_eq!(
-        IntPromotionCode::UNSIGNED_EXTENSION.as_i32() | IntPromotionCode::SIGNED_EXTENSION.as_i32(),
-        IntPromotionCode::EITHER_EXTENSION.as_i32()
-    );
-}

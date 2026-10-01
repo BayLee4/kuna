@@ -1310,12 +1310,8 @@ pub struct Architecture {
     /// staging — `(name, first-use address, hash)`; see
     /// [`Self::kuna_pending_name_recs`].  Always empty outside ghidra mode.
     pub kuna_pending_dyn_recs: Vec<(String, Address, u64)>,
-    /// (ghidra-mode, Phase 4) The prototype MODEL the host declared for the
-    /// next decompiled function (`<prototype model=…>`), staged the same way.
-    /// The host assigned its committed parameter storage under this
-    /// convention, so re-deriving storage from kuna's default model would
-    /// disagree with the database and make Java's `checkFullCommit` rewrite
-    /// the user's signature on any rename.  `None` outside ghidra mode.
+    /// Explicit calling convention for the next standalone declaration seed.
+    /// Host function prototypes carry their model in address-keyed facts instead.
     pub kuna_pending_proto_model: Option<Rc<crate::fspec::ProtoModel>>,
 
     // --- kuna analysis-pass gates (per-run `--option <id> on|off`) ----------
@@ -1791,12 +1787,6 @@ pub struct Architecture {
     /// overrides.  Empty unless the Listing and `formatstring` are both on.
     pub format_call_overrides:
         std::collections::BTreeMap<u64, Vec<crate::kuna_formatstring::ParkedFormatSite>>,
-    /// (kuna `formatstring`) The call points, among the prototype overrides of
-    /// the drive in progress, whose override a resolved format string produced.
-    /// Set by the console's decompile step around each drive; the flow build
-    /// installs those overrides with an open tail
-    /// ([`crate::p4_calls::kuna_formattail`]).
-    pub format_override_callpoints: std::collections::BTreeSet<u64>,
     /// (kuna `formatstring`) Which variadic arguments the target passes exactly
     /// as named ones, which bounds what a closed printf/scanf override may
     /// declare. A FACT, written once at `load file` from the image's container;
@@ -2513,7 +2503,7 @@ impl Architecture {
             kuna_calleevote: crate::kuna_calleevote::Ledger::default(),
             kuna_pending_name_recs: Vec::new(), // (ghidra Phase 4) staged per drive
             kuna_pending_dyn_recs: Vec::new(),  // (ghidra Phase 4) staged per drive
-            kuna_pending_proto_model: None,     // (ghidra Phase 4) staged per drive
+            kuna_pending_proto_model: None,     // declaration model staged per drive
 
             // Analysis-pass gates: placeholder values -- `Architecture::new` calls
             // `reset_defaults_internal()` below, the SINGLE source of every
@@ -2573,7 +2563,6 @@ impl Architecture {
             analysis_operand_refs: false,
             analysis_formatstring: crate::kuna_formatstring::FormatStringMode::Off,
             format_call_overrides: std::collections::BTreeMap::new(),
-            format_override_callpoints: std::collections::BTreeSet::new(),
             format_vararg_abi: None, // (kuna) a load-time fact; set by the console's `load file`
             analysis_listing: false,
             analysis_fast_funcdisc: false,
@@ -3907,45 +3896,19 @@ impl Architecture {
         ))
     }
 
-    /// Reset options modifiable by the OptionDatabase, including the action
-    /// database (C++ `Architecture::resetDefaults`, `architecture.cc:1463`).
-    ///
-    /// STUB(W5/W8): the C++ also calls `allacts.resetDefaults()` (the
-    /// `ActionDatabase` default-group reset, a W5 surface not yet exposed) and
-    /// resets every `PrintLanguage` in `printlist` (W8).  Only the internal
-    /// option reset runs here; the action/print resets land with their waves.
-    pub fn reset_defaults(&mut self) {
+    /// Reset engine options and derived action roots without discarding program facts.
+    pub fn reset_defaults(&mut self) -> KunaResult<()> {
         self.reset_defaults_internal();
-        // allacts.resetDefaults();                                 -- STUB(W5)
-        // for printlang in printlist: printlang.reset_defaults();  -- STUB(W8)
+        self.allacts.reset_defaults()
     }
 
-    /// (kuna, Phase 3) The ghidra-mode `SetOptions` reset (the upstream
-    /// `ghidra->resetDefaults()` at the top of `SetOptions::rawAction`,
-    /// ghidra_process.cc:435-445): Java DELTA-encodes its option list — only
-    /// values differing from the Java default constants travel — so an option
-    /// previously sent as non-default must revert when the user sets it back
-    /// to default.  Lands every setOptions on the same baseline a fresh
-    /// registerProgram produces (the respawn-replay equivalence Java
-    /// assumes); the caller re-applies the DIV-77 ghidra-mode preset layer on
-    /// top before decoding the list.
-    ///
-    /// Covered: the engine option defaults (`reset_defaults` →
-    /// `reset_defaults_internal`), the printer's context state (integer
-    /// format, comment indent + header/instruction flags, namespace strategy,
-    /// language — a fresh `PrintContext`), and the PrintC-proper option block
-    /// + emitter indent increment
-    /// (`PrintC::reset_wire_option_defaults`: nullprinting, inplaceops,
-    /// conventionprinting, nocastprinting, hideimpliedexts, the brace
-    /// formats, indentincrement).  NOT covered: the action-database
-    /// default-group reset (the shared STUB(W5) of [`Self::reset_defaults`] —
-    /// the `currentaction` option toggles accumulate for the session), and
-    /// `maxlinewidth`/`commentstyle`, which are recorded-no-op printer stubs
-    /// with no state to reset.
-    pub fn reset_wire_defaults(&mut self) {
-        self.reset_defaults();
+    /// Reset a complete host option snapshot. The adapter overlays host-owned
+    /// sparse defaults and its mode before applying the new list in wire order.
+    pub fn reset_wire_defaults(&mut self) -> KunaResult<()> {
+        self.reset_defaults()?;
         self.print.context = crate::printlanguage::PrintContext::new();
         self.print.reset_wire_option_defaults();
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -4035,17 +3998,11 @@ impl Architecture {
         fetch: Rc<dyn crate::remote_provider::RemoteProviderFetch>,
         type_fetch: Option<Rc<dyn crate::dtype::RemoteTypeFetch>>,
     ) {
-        let mut models = std::collections::BTreeMap::new();
-        for (name, model) in &self.proto_models {
-            models.insert(name.clone(), Rc::clone(model));
-        }
         let base = self.symboltab.build_global_query();
         let scope = crate::remote_provider::RemoteScope::new(
             fetch,
             self.translate.manager_rc(),
             self.types_rc(),
-            models,
-            self.defaultfp.clone(),
             base,
         );
         self.remote_scope = Some(Rc::new(scope));
@@ -4063,19 +4020,21 @@ impl Architecture {
         ctx.header_comment() | ctx.instruction_comment()
     }
 
-    /// (kuna, Phase 3) The ghidra-mode flushNative reset, in the upstream order
-    /// (`FlushNative::rawAction`, ghidra_process.cc:262-273): the lazy symbol
-    /// cache (+ its property-map rollback), the non-core data-types, the
-    /// comment database, and the decoded-string cache.  kuna has no live
+    /// (kuna, Phase 3) The ghidra-mode flushNative reset
+    /// (`FlushNative::rawAction`, ghidra_process.cc:262-273): the non-core
+    /// data-types, the lazy symbol cache (+ its property-map rollback), the
+    /// comment database, and the decoded-string cache. Datatype clearing goes
+    /// first so graph refusal leaves the other caches intact. kuna has no live
     /// sub-scopes to delete (namespaces are cached path strings inside the
     /// RemoteScope, cleared with it) and no wired constant pool yet.
-    pub fn flush_remote_caches(&mut self) {
+    pub fn flush_remote_caches(&mut self) -> KunaResult<()> {
+        self.types.clear_noncore()?;
         if let Some(remote) = &self.remote_scope {
             remote.clear();
         }
-        self.types.clear_noncore();
         self.commentdb.clear();
         self.string_manager.borrow_mut().base.clear();
+        Ok(())
     }
 
     /// (kuna, Phase 3) The active fallback naming vocabulary (see
@@ -4321,6 +4280,7 @@ impl Architecture {
         ctx.unknown_byte_is_char =
             self.realtypes && self.print.out_lang() == crate::kuna_lang::OutLang::C;
         ctx.int_promotion = self.print.out_lang().profile().caps.integer_promotion;
+        ctx.execution_callable_c = self.print.out_lang() == crate::kuna_lang::OutLang::C;
         ctx.char_byte = self.char_byte; // (kuna) charbyte
         ctx.cast_arith = self.cast_arith && self.print.out_lang() == crate::kuna_lang::OutLang::C; // (kuna) castarith
         ctx.cast_index = self.cast_index && self.print.out_lang() == crate::kuna_lang::OutLang::C; // (kuna) castindex
@@ -5485,13 +5445,22 @@ impl Architecture {
 
     /// Register a prototype model under its name (C++ `protoModels[name] =`).
     pub fn register_model(&mut self, model: Rc<ProtoModel>) {
+        self.types.register_proto_model(model.clone());
         self.proto_models.insert(model.get_name().to_string(), model);
     }
 
     /// Set the default prototype model (C++ `Architecture::setDefaultModel`,
     /// architecture.cc:222).
     pub fn set_default_model_rc(&mut self, model: Rc<ProtoModel>) {
+        if let Some(previous) = &self.defaultfp {
+            previous.set_print_in_decl(true);
+        }
+        model.set_print_in_decl(false);
+        self.register_model(model.clone());
         self.defaultfp = Some(model);
+        self.types
+            .set_proto_context(self.defaultfp.clone(), self.translate.manager_rc())
+            .expect("architecture retains the same datatype model context");
     }
 
     // -----------------------------------------------------------------------
@@ -5525,7 +5494,7 @@ impl Architecture {
             let store = kuna_base::xml::xml_tree(&xml)?;
             let root = store.get_root().clone();
             let mut decoder = XmlDecode::new_with_root(&manager, &registry, &root, 0);
-            return self.types.decode_core_types(&mut decoder);
+            return self.types.decode_host_core_types(&mut decoder);
         }
         let t = &self.types;
         t.set_core_type("void", 1, TYPE_VOID, false)?;
@@ -5747,6 +5716,7 @@ impl Architecture {
                 // `None` (== the C++ `defaultReturnAddr.space == 0`).
                 self.default_return_addr = self.decode_default_return_addr(&root);
                 if let Ok(model) = self.decode_default_proto(&root) {
+                    model.set_print_in_decl(false);
                     let rc = Rc::new(model);
                     self.register_model(Rc::clone(&rc));
                     self.defaultfp = Some(Rc::clone(&rc));
@@ -5778,6 +5748,7 @@ impl Architecture {
         }
         let mut model = ProtoModel::new(self.manage());
         model.set_name("unknown");
+        model.set_print_in_decl(false);
         // Build empty input/output param lists so `model.output()`/`input()` are
         // present (an empty list characterizes every range as `no_containment`,
         // so proto recovery declines gracefully rather than the model lacking
@@ -6836,7 +6807,7 @@ impl Architecture {
     /// `Architecture::buildAction` -> `allacts.universalAction(this)` +
     /// `resetDefaults()`, architecture.cc:590).  The stack space (if any) is
     /// taken from the engine so the stack-aware passes are scheduled.
-    pub fn build_action(&mut self) {
+    pub fn build_action(&mut self) -> KunaResult<()> {
         let stackspace = self.manage().get_stack_space().cloned();
         let stackspace_index = stackspace.as_ref().map(|s| s.get_index());
         crate::universalaction::install_universal(
@@ -6845,15 +6816,7 @@ impl Architecture {
             stackspace_index,
             Vec::new(),
         );
-        // C++ `Architecture::buildAction` runs `allacts.resetDefaults()`
-        // (coreaction.cc `ActionDatabase::resetDefaults` -> `setCurrent(...)`),
-        // which leaves the "decompile" root as the current action *before* any
-        // function is decompiled.  The merged tree previously deferred the
-        // `setCurrent` to the decompile drive, leaving `getCurrentName()` empty
-        // at rest; that broke the `phase status`/`pipeline list (current)`
-        // readers (kuna_console).  Set it here so the at-rest current name is
-        // "decompile", matching upstream `resetDefaults`.
-        let _ = self.allacts.set_current("decompile");
+        self.allacts.set_current("decompile")
     }
 
     /// Register the p-code OpBehavior table (C++ `Architecture::buildInstructions`,
@@ -7016,8 +6979,11 @@ impl Architecture {
         // factory is standalone, so the link is established once here, right
         // after `defaultfp` is finalized.
         self.types
-            .set_proto_context(self.defaultfp.clone(), self.translate.manager_rc());
-        self.build_action();
+            .set_proto_context(self.defaultfp.clone(), self.translate.manager_rc())?;
+        for model in self.proto_models.values() {
+            self.types.register_proto_model(model.clone());
+        }
+        self.build_action()?;
         self.print.initialize_from_architecture();
         // C++ `symboltab->adjustCaches()` (architecture.cc, end of restoreFromSpec)
         // resizes every scope's per-space `maptable` to `numSpaces()` after the
@@ -7117,16 +7083,10 @@ impl ArchOptionContext for Architecture {
 
     // --- prototype models (C++ defaultfp / evalfp_current) -----------------
     fn set_default_extra_pop(&mut self, expop: int4) {
-        // C++ `glb->defaultfp->setExtraPop(expop)` (+ eval-model spreads).
-        // The registry holds the model behind `Rc`; mutate the shared model
-        // (and keep the registry entry pointing at the same data via the same
-        // `Rc`).  Both `defaultfp` and the registry entry are the one `Rc`.
-        if let Some(fp) = self.defaultfp.as_mut() {
-            Rc::make_mut(fp).set_extra_pop(expop);
-            // Re-publish the (now-distinct) Rc into the registry so getModel
-            // and defaultfp stay the same object (C++ shared-pointer identity).
-            let name = fp.get_name().to_string();
-            self.proto_models.insert(name, Rc::clone(fp));
+        if let Some(fp) = self.defaultfp.as_ref() {
+            let mut updated = ProtoModel::copy_named(fp.get_name(), fp);
+            updated.set_extra_pop(expop);
+            self.set_default_model_rc(Rc::new(updated));
         }
     }
     fn set_function_extra_pop(&mut self, name: &str, _expop: int4) -> KunaResult<()> {
@@ -7141,15 +7101,19 @@ impl ArchOptionContext for Architecture {
         // C++ `glb->setDefaultModel(getModel(p1))`.
         match self.proto_models.get(name).cloned() {
             Some(model) => {
-                self.defaultfp = Some(model);
+                self.set_default_model_rc(model);
                 Ok(())
             }
             None => Err(KunaError::lowlevel(format!("Unknown prototype model :{name}"))),
         }
     }
     fn set_eval_current_model(&mut self, name: &str) -> KunaResult<()> {
-        // C++ `glb->evalfp_current = getModel(p1)`.
-        match self.proto_models.get(name).cloned() {
+        let model = if name == "default" {
+            self.defaultfp.clone()
+        } else {
+            self.proto_models.get(name).cloned()
+        };
+        match model {
             Some(model) => {
                 self.evalfp_current = Some(model);
                 Ok(())
@@ -7196,20 +7160,17 @@ impl ArchOptionContext for Architecture {
     fn set_hide_implied_exts(&mut self, val: bool) {
         self.print.set_hide_implied_exts(val);
     }
-    fn set_max_line_size(&mut self, val: int4) {
-        // C++ throws on a bad range; the Rust setter returns a Result.  The
-        // option apply already validated the parse; ignore the (always-Ok)
-        // no-markup result.
-        let _ = self.print.set_max_line_size(val);
+    fn set_max_line_size(&mut self, val: int4) -> KunaResult<()> {
+        self.print.set_max_line_size(val)
     }
     fn set_indent_increment(&mut self, val: int4) {
         self.print.set_indent_increment(val);
     }
-    fn set_line_comment_indent(&mut self, val: int4) {
-        let _ = self.print.set_line_comment_indent(val);
+    fn set_line_comment_indent(&mut self, val: int4) -> KunaResult<()> {
+        self.print.set_line_comment_indent(val)
     }
-    fn set_comment_style(&mut self, style: &str) {
-        self.print.set_comment_style(style);
+    fn set_comment_style(&mut self, style: &str) -> KunaResult<()> {
+        self.print.set_comment_style(style)
     }
     fn header_comment_flags(&self) -> uint4 {
         self.print.header_comment_flags()
@@ -7223,8 +7184,8 @@ impl ArchOptionContext for Architecture {
     fn set_instruction_comment_flags(&mut self, flags: uint4) {
         self.print.set_instruction_comment_flags(flags);
     }
-    fn set_integer_format(&mut self, fmt: &str) {
-        let _ = self.print.set_integer_format(fmt);
+    fn set_integer_format(&mut self, fmt: &str) -> KunaResult<()> {
+        self.print.set_integer_format(fmt)
     }
     fn set_namespace_strategy(&mut self, strategy: NamespaceStrategy) {
         self.print.set_namespace_strategy(strategy);
@@ -7247,24 +7208,17 @@ impl ArchOptionContext for Architecture {
             None => false,
         }
     }
-    fn clone_action_group(&mut self, from: &str, to: &str) {
-        // C++ `glb->allacts.cloneGroup(p1,p2); setCurrent(p2)`.
-        if self.allacts.clone_group(from, to.to_string()).is_ok() {
-            let _ = self.allacts.set_current(to);
-        }
+    fn clone_action_group(&mut self, from: &str, to: &str) -> KunaResult<()> {
+        self.allacts.clone_group(from, to.to_string())
     }
-    fn set_current_action(&mut self, name: &str) {
-        let _ = self.allacts.set_current(name);
+    fn set_current_action(&mut self, name: &str) -> KunaResult<()> {
+        self.allacts.set_current(name)
     }
     fn current_action_name(&self) -> String {
         self.allacts.get_current_name().to_string()
     }
-    fn toggle_action(&mut self, _group: &str, _sub: &str, _val: bool) {
-        // C++ `glb->allacts.toggleAction(grp,sub,val)`.
-        // STUB(W5): `ActionDatabase::toggleAction` (action.cc:1036) is not yet
-        // ported onto the Rust `ActionDatabase`; the plain `option NAME VALUE`
-        // path (the most-used datatest command) does not reach it — only the
-        // `setaction GROUP SUB on/off` form does.  Recorded as a loss.
+    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) -> KunaResult<()> {
+        self.allacts.toggle_action(group, sub, val)
     }
     fn enable_rule(&mut self, path: &str) -> bool {
         match self.allacts.get_current_mut() {
@@ -7395,28 +7349,28 @@ impl crate::userop::UseropTypeArchitecture for BuiltinTypeArch {
     fn get_default_data_space_word_size(&self) -> int4 {
         self.data_word_size
     }
-    fn get_type_void(&self) -> Rc<crate::dtype::Datatype> {
+    fn get_type_void(&self) -> crate::dtype::TypeRoot {
         self.types.get_type_void().expect("builtin: getTypeVoid")
     }
     fn get_type_pointer(
         &self,
         ptr_size: int4,
-        base: Rc<crate::dtype::Datatype>,
+        base: crate::dtype::TypeRoot,
         word_size: int4,
-    ) -> Rc<crate::dtype::Datatype> {
+    ) -> crate::dtype::TypeRoot {
         self.types
             .get_type_pointer(ptr_size, base, word_size as uint4)
             .expect("builtin: getTypePointer")
     }
-    fn get_base_int(&self, size: int4) -> Rc<crate::dtype::Datatype> {
+    fn get_base_int(&self, size: int4) -> crate::dtype::TypeRoot {
         self.types.get_base(size, type_metatype::TYPE_INT).expect("builtin: getBase(INT)")
     }
-    fn get_type_char(&self) -> Rc<crate::dtype::Datatype> {
+    fn get_type_char(&self) -> crate::dtype::TypeRoot {
         self.types
             .get_type_char(self.types.get_size_of_char())
             .expect("builtin: getTypeChar")
     }
-    fn get_type_wchar(&self) -> Rc<crate::dtype::Datatype> {
+    fn get_type_wchar(&self) -> crate::dtype::TypeRoot {
         self.types
             .get_type_char(self.types.get_size_of_wchar())
             .expect("builtin: getTypeChar(wchar)")

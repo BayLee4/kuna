@@ -10,7 +10,7 @@
 //! no `.sla`, no binary analysis, no dependence on which functions currently
 //! abort.
 //!
-//! The exceptions drive the real engine over a checked-in fixture. A stub cannot
+//! The exceptions drive the real engine over actual binary fixtures. A stub cannot
 //! notice that the console reordered its own prints — the reorder that would
 //! silently return `kuna decompile` to the generic wording — and it cannot
 //! notice that the console's own grammar split a path on a space, because the
@@ -56,15 +56,12 @@ fn stub_decomp_dbg(tag: &str, c_body: &str, transcript: &str, stderr_text: &str)
     let script = format!(
         "#!/bin/sh\n\
          out=\n\
-         saw_load=0\n\
          if [ \"${{KUNA_EXPECT_ARM_ISA+x}}\" = x ] && [ \"$KUNA_ARM_ISA\" != \"$KUNA_EXPECT_ARM_ISA\" ]; then exit 9; fi\n\
          while IFS= read -r line; do\n\
-         \x20 if [ \"${{KUNA_EXPECT_LOAD_LINE+x}}\" = x ] && [ \"$line\" = \"$KUNA_EXPECT_LOAD_LINE\" ]; then saw_load=1; fi\n\
          \x20 case \"$line\" in\n\
          \x20   'openfile write '*) out=${{line#openfile write }} ;;\n\
          \x20 esac\n\
          done\n\
-         if [ \"${{KUNA_EXPECT_LOAD_LINE+x}}\" = x ] && [ \"$saw_load\" != 1 ]; then exit 8; fi\n\
          [ -n \"$out\" ] && cat > \"$out\" <<'KUNA_C_EOF'\n{c_body}\nKUNA_C_EOF\n\
          cat <<'KUNA_OUT_EOF'\n{transcript}\nKUNA_OUT_EOF\n\
          cat >&2 <<'KUNA_ERR_EOF'\n{stderr_text}\nKUNA_ERR_EOF\n\
@@ -172,46 +169,127 @@ fn arm_isa_override_reaches_single_function_engine() {
 }
 
 #[test]
-fn raw_image_flags_reach_single_function_engine_with_quoted_path() {
+fn raw_image_text_cli_preserves_mapping_selection_and_isa() {
     let raw = common::scratch_file("raw single image", "bin");
-    std::fs::write(&raw, [0x07, 0x20, 0x70, 0x47]).unwrap();
-    let stub = stub_decomp_dbg(
-        "raw_input",
-        "unsigned int sub_4000(void)\n{\n  return 7;\n}",
-        "[decomp]> decompile\nDecompiling sub_4000\nDecompilation complete\n[decomp]> print C",
-        "",
-    );
-    let expected = format!(
-        "load raw ARM:LE:32:v4t:default 0x4000 0x4001 \"{}\"",
-        raw.display()
-    );
-    let out = Command::new(env!("CARGO_BIN_EXE_kuna"))
-        .env("KUNA_EXPECT_ARM_ISA", "thumb")
-        .env("KUNA_EXPECT_LOAD_LINE", expected)
-        .args([
+    // Two independent Thumb functions: movs r0,#7; bx lr at the base, and
+    // movs r0,#9; bx lr at base+4. Selecting the base cannot satisfy the
+    // non-base case merely because it also produces valid C.
+    std::fs::write(&raw, [0x07, 0x20, 0x70, 0x47, 0x09, 0x20, 0x70, 0x47]).unwrap();
+    let raw = raw.canonicalize().unwrap();
+    let alias = common::scratch_file("raw alias", "bin");
+    std::os::unix::fs::symlink(&raw, &alias).unwrap();
+    let sp = specs();
+    let arm = "ARM:LE:32:v4t:default";
+    let run = |path: &Path, base: &str, selector: &str, target: &str, isa: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+        // Use the real text route and normal engine resolution, including the
+        // existing KUNA_DECOMP_DBG override. No canned console transcript.
+        cmd.args([
             "decompile",
-            raw.to_str().unwrap(),
-            "0x4001",
+            path.to_str().unwrap(),
+            selector,
             "--raw-image",
             "--target",
-            "ARM:LE:32:v4t:default",
+            target,
             "--base",
-            "0x4000",
-            "--isa",
-            "thumb",
-            "--decomp-dbg",
-            stub.to_str().unwrap(),
-        ])
-        .output()
-        .expect("run kuna decompile over raw input");
-    let _ = std::fs::remove_file(&stub);
+            base,
+            "--sleighpath",
+            &sp,
+        ]);
+        if let Some(isa) = isa {
+            cmd.args(["--isa", isa]);
+        }
+        cmd.output().expect("run real text kuna decompile over raw input")
+    };
+
+    let base = run(&raw, "0x4000", "0x4001", arm, Some("thumb"));
+    let stderr = String::from_utf8_lossy(&base.stderr);
+    if !Path::new(&sp).join("Ghidra/Processors/ARM/data/languages/ARM8_le.sla").exists()
+        && is_specs_skip(&stderr)
+    {
+        let _ = std::fs::remove_file(&alias);
+        let _ = std::fs::remove_file(&raw);
+        eprintln!("skipping: specs-less environment: {stderr}");
+        return;
+    }
+    let direct = run(&raw, "0x4000", "0x4005", arm, Some("thumb"));
+    let linked = run(&alias, "0x4000", "0x4005", arm, Some("thumb"));
+    let rebased = run(&alias, "0x8000", "0x8005", arm, Some("thumb"));
+    let failures = [
+        (
+            run(&raw, "0x8000", "0x4005", arm, Some("thumb")),
+            "raw entry 0x4005 is outside mapped range 0x8000..0x8008",
+        ),
+        (
+            run(&raw, "0x4000", "0x4008", arm, Some("thumb")),
+            "raw entry 0x4008 is outside mapped range 0x4000..0x4008",
+        ),
+        (
+            run(&raw, "0x4000", "0x4004", arm, None),
+            "raw ARM32 input requires --isa arm or --isa thumb",
+        ),
+        (
+            run(&raw, "0x4000", "0x4005", arm, None),
+            "raw ARM32 input requires --isa arm or --isa thumb",
+        ),
+    ];
+    let incompatible = run(&raw, "0x4000", "0x4004", "x86:LE:64:default:gcc", Some("thumb"));
+    let wrong_isa = run(&raw, "0x4000", "0x4005", arm, Some("arm"));
+    let _ = std::fs::remove_file(&alias);
     let _ = std::fs::remove_file(&raw);
+
+    // Ignore type spelling and whitespace, but require both the normalized
+    // entry identity and its complete computation, not just some C output.
+    let compact = |out: &std::process::Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    for (label, out, function) in [
+        ("base", &base, "sub_4000(void){return7;}"),
+        ("non-base", &direct, "sub_4004(void){return9;}"),
+        ("symlink", &linked, "sub_4004(void){return9;}"),
+        ("rebased symlink", &rebased, "sub_8004(void){return9;}"),
+    ] {
+        assert!(
+            out.status.success(),
+            "{label} failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            compact(out).contains(function),
+            "{label} selected the wrong identity or computation:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    for (out, reason) in failures {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{reason} must fail, got:\n{stderr}");
+        assert!(stderr.contains(reason), "expected {reason:?}, got:\n{stderr}");
+    }
+    let stderr = String::from_utf8_lossy(&incompatible.stderr);
+    // The successful ARM runs above establish their prerequisite; only this
+    // independent target can still legitimately lack a compiled specification.
+    if !Path::new(&sp).join("Ghidra/Processors/x86/data/languages/x86-64.sla").exists()
+        && is_specs_skip(&stderr)
+    {
+        eprintln!("skipping incompatible-target case: no x86-64 .sla: {stderr}");
+    } else {
+        assert!(!incompatible.status.success(), "Thumb on x86 must fail:\n{stderr}");
+        assert!(
+            stderr.contains("--isa thumb requires a 32-bit ARM SLEIGH target"),
+            "expected an incompatible ISA/target diagnostic, got:\n{stderr}"
+        );
+    }
+    // ARM decoding need not fail universally, but must not masquerade as the
+    // Thumb function. This catches an ignored ISA even if the decoder emits C.
     assert!(
-        out.status.success(),
-        "raw load command did not reach decomp_dbg: {}",
-        String::from_utf8_lossy(&out.stderr)
+        !compact(&wrong_isa).contains("sub_4004(void){return9;}"),
+        "--isa arm unexpectedly recovered the Thumb identity and computation:\n{}",
+        String::from_utf8_lossy(&wrong_isa.stdout)
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("return 7;"));
 }
 
 /// An empty `print C` keeps the pre-existing "no C output" error (that path is

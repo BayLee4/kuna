@@ -30,7 +30,7 @@ use kuna_base::address::{calc_mask, sign_extend};
 use kuna_base::types::{int4, intb, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
+use crate::action::{Rule, RuleSpec};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, TypeOp, VarnodeId};
 
@@ -63,11 +63,8 @@ impl Rule for RuleOvLessSimplify {
     }
 
     /// C++ `RuleOvLessSimplify::clone(grouplist)`.
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleOvLessSimplify { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleOvLessSimplify { enabled: self.enabled, group: self.group.clone() })
     }
 
     /// C++ `RuleOvLessSimplify::applyOp` (`kuna_ovlesssimplify.cc:48`) —
@@ -198,6 +195,7 @@ impl Rule for RuleOvLessSimplify {
 pub fn specs() -> Vec<RuleSpec> {
     vec![RuleSpec {
         group: "analysis",
+        aliases: &[],
         // Shipped default: `option ovlesssimplify on` (architecture.cc resets
         // ov_less_simplify = true; kuna DIV-2 default-on, GH-7190).
         ctor: || Box::new(RuleOvLessSimplify::with_group(true, "analysis")),

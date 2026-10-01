@@ -50,11 +50,12 @@ use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
 
-use crate::action::{ActionGroupList, Rule, RuleSpec};
-use crate::dtype::{type_metatype, Datatype};
+use crate::action::{Rule, RuleSpec};
+use crate::dtype::{type_metatype, TypeRoot};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
 use crate::varnode::DefOpInfo;
+use crate::p4_calls::kuna_branchreachability as branch_receipt;
 
 // =============================================================================
 // Shared local shims (W3/W6 stubs — see module docs)
@@ -73,11 +74,10 @@ fn set_opcode(data: &mut Funcdata, op: OpId, opc: OpCode) {
     data.op_set_opcode(op, crate::typeop::type_op_for(opc));
 }
 
-/// The unknown-base [`Datatype`] of size `s` (C++ `glb->types->getBase(s,
-/// TYPE_UNKNOWN)`).  STUB(W6): the `TypeFactory` is W6; the skeleton is built
-/// directly, exactly as the funcdata_varnode factories do.
-fn type_base_unknown(s: int4) -> Rc<Datatype> {
-    Rc::new(Datatype::new(s, type_metatype::TYPE_UNKNOWN))
+/// The factory-owned unknown type of size `s` (C++ `glb->types->getBase`).
+fn type_base_unknown(data: &Funcdata, s: int4) -> TypeRoot {
+    data.get_arch().types().expect("type factory")
+        .get_base(s, type_metatype::TYPE_UNKNOWN).expect("unknown type")
 }
 
 /// `data.newUniqueOut(s, op)` (C++ `funcdata_varnode.cc:131`): allocate a fresh
@@ -91,7 +91,7 @@ fn type_base_unknown(s: int4) -> Rc<Datatype> {
 fn new_unique_out(data: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
     let seqnum = data.obank().get(op).expect("new_unique_out: stale op").get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum };
-    let ct = type_base_unknown(s);
+    let ct = type_base_unknown(data, s);
     let vn = data
         .vbank_mut()
         .create_def_unique(s, ct, def, &mut |_, _, _| Ok(()))
@@ -124,7 +124,7 @@ fn new_unique_out(data: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
 fn new_varnode_out(data: &mut Funcdata, s: int4, m: Address, op: OpId) -> VarnodeId {
     let seqnum = data.obank().get(op).expect("new_varnode_out: stale op").get_seq_num().clone();
     let def = DefOpInfo { id: op, seqnum };
-    let ct = type_base_unknown(s);
+    let ct = type_base_unknown(data, s);
     let vn = data
         .vbank_mut()
         .create_def(s, m, ct, def, &mut |_, _, _| Ok(()))
@@ -371,14 +371,8 @@ impl Rule for RuleLoadVarnode {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone` gates on `grouplist.contains(getGroup())`; RuleLoadVarnode
-        // is registered with group "stackvars" (coreaction.cc:5939), not
-        // "analysis".
-        if !grouplist.contains("stackvars") {
-            return None;
-        }
-        Some(Box::new(RuleLoadVarnode::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleLoadVarnode::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -389,6 +383,7 @@ impl Rule for RuleLoadVarnode {
         let size = size_of(data, out_vn(data, op));
         let offoff = kuna_base::space::AddrSpace::address_to_byte(offoff, baseoff.get_word_size());
         let newvn = data.new_varnode_space_off(size, Rc::clone(&baseoff), offoff);
+        let receipt = branch_receipt::begin_load(data, op, newvn);
         data.op_set_input(op, newvn, 0).expect("RuleLoadVarnode: opSetInput");
         data.op_remove_input(op, 1);
         set_opcode(data, op, OpCode::CPUI_COPY);
@@ -419,6 +414,7 @@ impl Rule for RuleLoadVarnode {
                 }
             }
         }
+        branch_receipt::finish(data, receipt);
         1
     }
 }
@@ -449,14 +445,8 @@ impl Rule for RuleStoreVarnode {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // C++ `clone` gates on `grouplist.contains(getGroup())`; RuleStoreVarnode
-        // is registered with group "stackvars" (coreaction.cc:5940), not
-        // "analysis".
-        if !grouplist.contains("stackvars") {
-            return None;
-        }
-        Some(Box::new(RuleStoreVarnode::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleStoreVarnode::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -511,11 +501,8 @@ impl Rule for RuleSubExtComm {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleSubExtComm::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubExtComm::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -671,11 +658,8 @@ impl Rule for RuleSubCommute {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleSubCommute::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubCommute::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -909,11 +893,8 @@ impl Rule for RuleConcatCommute {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleConcatCommute::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConcatCommute::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1014,11 +995,8 @@ impl Rule for RuleConcatZext {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleConcatZext::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConcatZext::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1081,11 +1059,8 @@ impl Rule for RuleZextCommute {
         vec![OpCode::CPUI_INT_RIGHT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleZextCommute::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleZextCommute::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1145,11 +1120,8 @@ impl Rule for RuleZextShiftZext {
         vec![OpCode::CPUI_INT_ZEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleZextShiftZext::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleZextShiftZext::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1235,11 +1207,8 @@ impl Rule for RuleShiftAnd {
         vec![OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_MULT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleShiftAnd::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShiftAnd::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1332,11 +1301,8 @@ impl Rule for RuleConcatZero {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleConcatZero::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConcatZero::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1390,11 +1356,8 @@ impl Rule for RuleConcatLeftShift {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleConcatLeftShift::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleConcatLeftShift::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1478,11 +1441,8 @@ impl Rule for RuleSubZext {
         vec![OpCode::CPUI_INT_ZEXT]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleSubZext::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubZext::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1611,11 +1571,8 @@ impl Rule for RuleSubCancel {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleSubCancel::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSubCancel::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1714,11 +1671,8 @@ impl Rule for RuleShiftSub {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleShiftSub::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleShiftSub::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1783,11 +1737,8 @@ impl Rule for RuleHumptyDumpty {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleHumptyDumpty::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleHumptyDumpty::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1868,11 +1819,8 @@ impl Rule for RuleDumptyHump {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleDumptyHump::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleDumptyHump::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1947,11 +1895,8 @@ impl Rule for RuleHumptyOr {
         vec![OpCode::CPUI_INT_OR]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleHumptyOr::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleHumptyOr::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2070,11 +2015,8 @@ impl Rule for RuleSwitchSingle {
         vec![OpCode::CPUI_BRANCHIND]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleSwitchSingle::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleSwitchSingle::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2127,11 +2069,8 @@ impl Rule for RuleCondNegate {
         vec![OpCode::CPUI_CBRANCH]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains("analysis") {
-            return None;
-        }
-        Some(Box::new(RuleCondNegate::new()))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleCondNegate::new())
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -2171,25 +2110,25 @@ pub fn specs() -> Vec<RuleSpec> {
     vec![
         // RuleLoadVarnode / RuleStoreVarnode register under "stackvars"
         // (coreaction.cc:5939-5940, actprop2), not "analysis".
-        RuleSpec { group: "stackvars", ctor: || Box::new(RuleLoadVarnode::new()) },
-        RuleSpec { group: "stackvars", ctor: || Box::new(RuleStoreVarnode::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSubExtComm::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSubCommute::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleConcatCommute::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleConcatZext::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleZextCommute::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleZextShiftZext::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleShiftAnd::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleConcatZero::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleConcatLeftShift::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSubZext::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSubCancel::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleShiftSub::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleHumptyDumpty::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleDumptyHump::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleHumptyOr::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleSwitchSingle::new()) },
-        RuleSpec { group: "analysis", ctor: || Box::new(RuleCondNegate::new()) },
+        RuleSpec { group: "stackvars", aliases: &[], ctor: || Box::new(RuleLoadVarnode::new()) },
+        RuleSpec { group: "stackvars", aliases: &[], ctor: || Box::new(RuleStoreVarnode::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSubExtComm::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSubCommute::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleConcatCommute::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleConcatZext::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleZextCommute::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleZextShiftZext::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleShiftAnd::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleConcatZero::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleConcatLeftShift::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSubZext::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSubCancel::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleShiftSub::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleHumptyDumpty::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleDumptyHump::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleHumptyOr::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleSwitchSingle::new()) },
+        RuleSpec { group: "analysis", aliases: &[], ctor: || Box::new(RuleCondNegate::new()) },
     ]
 }
 

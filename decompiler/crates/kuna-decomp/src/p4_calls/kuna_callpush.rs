@@ -42,7 +42,7 @@
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::action::{ActionGroupList, Rule};
+use crate::action::Rule;
 use crate::context::{OpId, VarnodeId};
 use crate::funcdata::Funcdata;
 use crate::ruleaction_4::RuleLoadVarnode;
@@ -70,11 +70,8 @@ impl Rule for RuleCallPush {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        if !grouplist.contains(&self.group) {
-            return None;
-        }
-        Some(Box::new(RuleCallPush { enabled: self.enabled, group: self.group.clone() }))
+    fn clone_rule(&self) -> Box<dyn Rule> {
+        Box::new(RuleCallPush { enabled: self.enabled, group: self.group.clone() })
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
