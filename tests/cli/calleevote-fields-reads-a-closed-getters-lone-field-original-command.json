@@ -1,0 +1,40 @@
+{
+  "schema": "re-probe/1",
+  "kind": "cli",
+  "cmd": [
+    "{{KUNA}}",
+    "decompile-all",
+    "{{BIN}}"
+  ],
+  "cwd": "{{WORK}}",
+  "env": {
+    "SLEIGHHOME": "{{SPECS}}"
+  },
+  "stdin": null,
+  "timeout_s": 120,
+  "repeat": 1,
+  "target": {
+    "binary_rel": "decompiler/crates/kuna-analysis/tests/fixtures/calleevote_x86_64",
+    "binary_sha256": "87748df9fd521469bdb5a5bbd4ae3946ea8781c775fdea0b1c186d535bfd7648",
+    "binary_size": 16176,
+    "binary_source": "in-repo",
+    "in_repo_path": "decompiler/crates/kuna-analysis/tests/fixtures/calleevote_x86_64",
+    "selector": "peek_used",
+    "selector_kind": "name"
+  },
+  "expect": {
+    "exit_code": {
+      "eq": 0
+    },
+    "stdout_matches": [
+      "long peek_used\\(([A-Za-z_]\\w*) \\*(\\w+)\\)\\s*\\{\\s*(?://[^\\r\\n]*\\n\\s*)*return \\2->field_0x8 \\* 3;[\\s\\S]*long report\\(\\1 \\*\\w+\\)",
+      "\\bsame\\(char \\*\\w+,char \\*\\w+\\)",
+      "(?:unsigned )?long get_cap\\([A-Za-z_]\\w* \\*(\\w+)\\)\\s*\\{\\s*(?://[^\\r\\n]*\\n\\s*)*return \\1->field_0x18;",
+      "\\bby_used\\(void \\*\\w+,void \\*\\w+\\)"
+    ],
+    "stdout_absent": [
+      "\\b\\w+\\[4\\] = '"
+    ]
+  },
+  "notes": "Original default command, without callbacktype override: peek_used/report share a record, same takes strings, get_cap reads offset24 as a field, and by_used keeps two void pointers. Its unchanged comparator is executed at O0/O2 in decompile_all_cli.rs."
+}

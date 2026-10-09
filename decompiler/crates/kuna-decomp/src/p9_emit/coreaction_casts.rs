@@ -2169,6 +2169,79 @@ mod verify_w10_merge_casts_r2 {
         }
     }
 
+    #[test]
+    fn closed_variadic_override_cast_preserves_abi_and_concrete_argument_types() {
+        use crate::dtype::type_class;
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel, PrototypePieces};
+        use crate::fspec::ParamEntry;
+        let (mut fd, strat, ram) = build();
+        let types = fd.get_arch().types().unwrap();
+        let void = types.get_type_void().unwrap();
+        let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let uint8 = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
+        let mut model = ProtoModel::new(fd.get_arch().manage());
+        model.build_param_list("standard").unwrap();
+        for (input, offset) in [(true, 0x80), (false, 0x10)] {
+            let entry = ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
+                ram.clone(), offset, 4, 1, 0, 0, true, false, &[],
+                fd.get_arch().manage()).unwrap();
+            let list = if input { model.input_mut() } else { model.output_mut() };
+            list.push_entry(entry);
+            list.finish_decode();
+        }
+        let model = Rc::new(model);
+        let factory = fd.get_arch().types_impl().unwrap();
+        factory.set_proto_context(fd.get_arch().manage.clone());
+        factory.set_proto_models(Some(model.clone()), Default::default());
+        let declaration = factory.get_type_code_proto(&PrototypePieces {
+            outtype: Some(int4.clone()), intypes: vec![int4.clone()],
+            innames: vec!["arg".to_owned()], first_var_arg_slot: 1,
+            ..Default::default()
+        }).unwrap();
+        let target_type = types.get_type_pointer(8, declaration.clone(), 1).unwrap();
+        let target = fd.new_unique(8, Some(target_type.clone()));
+        let mut proto = FuncProto::new();
+        proto.set_internal(model, void);
+        proto.set_override(true);
+        for slot in 0..3 {
+            proto.set_param(slot, "arg", &ParameterPieces {
+                addr: Address::new(ram.clone(), 0x80 + slot as u64 * 8),
+                type_: Some(int4.clone()), flags: parameter_pieces_flags::TYPELOCK,
+            });
+        }
+        proto.set_output(&ParameterPieces {
+            addr: Address::new(ram.clone(), 0x10), type_: Some(int4),
+            flags: parameter_pieces_flags::TYPELOCK,
+        });
+        let op = fd.new_op(4, Address::new(ram, 0x2000));
+        fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_CALLIND, crate::op::pcodeop_flags::call, "CALLIND"));
+        fd.op_set_input(op, target, 0).unwrap();
+        for slot in 1..4 {
+            let argument = fd.new_unique(8, Some(uint8.clone()));
+            fd.op_set_input(op, argument, slot).unwrap();
+        }
+        let mut specs = FuncCallSpecs::new(op, Address::new_invalid());
+        specs.proto_mut().copy(&proto);
+        fd.push_call_specs(specs);
+        let callable = get_input_cast(&mut fd, &strat, op, 0)
+            .unwrap_or_else(|| fd.vn_high_type_read_facing(target, op));
+        let code = callable.get_ptr_to().unwrap();
+        let signature = code.get_code_prototype().unwrap();
+        assert!(signature.is_dotdotdot());
+        assert_eq!(signature.num_params(), 1);
+        assert_eq!(signature.get_param(0).unwrap().get_type().unwrap().get_size(), 4);
+        let variadic_argument = get_input_cast(&mut fd, &strat, op, 2).unwrap();
+        assert_eq!(variadic_argument.get_metatype(), type_metatype::TYPE_INT);
+        assert_eq!(variadic_argument.get_size(), 4);
+        let original = fd.get_call_specs(fd.get_call_specs_index(op).unwrap());
+        assert_eq!(original.proto().num_params(), 3);
+        assert!(!original.proto().is_dotdotdot());
+        assert_eq!(original.format_arity(), None);
+        assert!(declaration.get_code_prototype().unwrap().is_dotdotdot());
+        assert_eq!(declaration.get_code_prototype().unwrap().num_params(), 1);
+        assert!(Rc::ptr_eq(&fd.vn_high_type_read_facing(target, op), &target_type));
+    }
+
     // -- AT1 (B1) -- INT_SLESS over a uint4-typed operand MUST route to the
     //    inputTypeLocal body with the (true,true) tail, NOT the EQUAL body.
     //    Faithful (typeop.cc:1025-1033): reqtype = inputTypeLocal(slot) (a SIGNED

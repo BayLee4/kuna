@@ -6533,6 +6533,83 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
+    mod config_ir_regressions {
+        use super::{SubvariableFlow, OpCode, build_fd, calc_mask, mk_input, mk_op, mk_reg, wire_in, wire_out};
+        #[test]
+        fn subvariable_loop_phi_preserves_input_and_backedge_order() {
+            let mut fd = build_fd();
+            let root = fd.bblocks_root_pub();
+            let entry = fd.bblocks_mut().new_block_basic(root);
+            let block = fd.bblocks_mut().new_block_basic(root);
+            fd.bblocks_mut().add_edge(entry, block);
+            fd.bblocks_mut().add_edge(block, block);
+            fd.bblocks_mut().set_start_block(root, entry);
+            let input = mk_input(&mut fd, 0x40, 8);
+            fd.vbank_mut().get_mut(input).unwrap().set_consume(0xffff_ffff);
+            let phi = mk_op(&mut fd, 0x1000, 2, OpCode::CPUI_MULTIEQUAL);
+            let wide = mk_reg(&mut fd, 0x80, 8);
+            let wide = wire_out(&mut fd, phi, wide);
+            fd.vbank_mut().get_mut(wide).unwrap().set_consume(0xffff_ffff);
+            wire_in(&mut fd, phi, input, 0);
+            wire_in(&mut fd, phi, wide, 1);
+            fd.op_insert_begin(phi, block);
+            let pull = mk_op(&mut fd, 0x1004, 2, OpCode::CPUI_SUBPIECE);
+            let zero = fd.new_constant(4, 0);
+            wire_in(&mut fd, pull, wide, 0);
+            wire_in(&mut fd, pull, zero, 1);
+            let out = mk_reg(&mut fd, 0xc0, 4);
+            wire_out(&mut fd, pull, out);
+            fd.op_insert_end(pull, block);
+            let mut flow = SubvariableFlow::new(&mut fd, wide, 0xffff_ffff, true, false, false).unwrap();
+            assert!(flow.do_trace(&mut fd).unwrap());
+            flow.do_replacement(&mut fd).unwrap();
+            let narrow = fd.obank().get(pull).unwrap().get_in(0).unwrap();
+            assert_eq!(fd.vbank().get(narrow).unwrap().get_size(), 4);
+            let replacement = fd.vbank().get(narrow).unwrap().get_def().unwrap();
+            let narrowed_phi = fd.obank().get(replacement).unwrap();
+            assert_eq!(narrowed_phi.code(), OpCode::CPUI_MULTIEQUAL);
+            assert_eq!(narrowed_phi.get_in(1), Some(narrow));
+            let first = fd.vbank().get(narrowed_phi.get_in(0).unwrap()).unwrap();
+            assert!(first.is_input());
+            assert_eq!(first.get_size(), 4);
+            assert_eq!(first.get_offset(), 0x40);
+            assert_eq!(fd.obank().get(phi).unwrap().get_in(1), Some(wide));
+        }
+
+        #[test]
+        fn subvariable_shift_count_preserves_unknown_high_bits() {
+                for code in [OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT] {
+                    for known_zero_high in [false, true] {
+                        let mut fd = build_fd();
+                        let count = mk_input(&mut fd, 0x40, 8);
+                        let mask = calc_mask(4);
+                        let input = fd.vbank_mut().get_mut(count).unwrap();
+                        input.set_consume(calc_mask(8));
+                        input.set_nz_mask(if known_zero_high { mask } else { calc_mask(8) });
+                        let projection = mk_op(&mut fd, 0x100, 2, OpCode::CPUI_SUBPIECE);
+                        let zero = fd.new_constant(4, 0);
+                        wire_in(&mut fd, projection, count, 0);
+                        wire_in(&mut fd, projection, zero, 1);
+                        let slice = mk_reg(&mut fd, 0x40, 4);
+                        wire_out(&mut fd, projection, slice);
+                        let shift = mk_op(&mut fd, 0x104, 2, code);
+                        let value = fd.new_constant(8, 1);
+                        wire_in(&mut fd, shift, value, 0);
+                        wire_in(&mut fd, shift, count, 1);
+                        let output = mk_reg(&mut fd, 0x48, 8);
+                        wire_out(&mut fd, shift, output);
+                        let mut flow = SubvariableFlow::new(&mut fd, count, mask, false, false, false).unwrap();
+                        let traced = flow.do_trace(&mut fd).unwrap();
+                        assert_eq!(traced, known_zero_high, "{code:?}");
+                        if traced { flow.do_replacement(&mut fd).unwrap(); }
+                        let actual = fd.obank().get(shift).unwrap().get_in(1).unwrap();
+                        assert_eq!(fd.vbank().get(actual).unwrap().get_size(), if known_zero_high { 4 } else { 8 }, "{code:?}");
+                        if !known_zero_high { assert_eq!(actual, count, "unknown high shift-count bits must remain observable"); }
+                    }
+                }
+            }
+    }
+
     use kuna_base::address::Address;
     use kuna_base::space::{
         addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, FspecSpace,

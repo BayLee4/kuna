@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
+pub mod c_behavior;
 pub mod process;
+pub mod raw_calls;
 
 use std::path::PathBuf;
 use std::process::Command;

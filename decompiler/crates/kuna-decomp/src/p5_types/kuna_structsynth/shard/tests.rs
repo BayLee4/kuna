@@ -26,6 +26,35 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
+#[test]
+fn retirement_preserves_held_source_names_and_readable_old_revisions() {
+    let f = factory();
+    let fs = fields(&f, &[(0, Ty::CharPtr), (8, Ty::Long)]);
+    let authoritative = f.get_type_struct("struct_0").unwrap();
+    let authoritative = f.set_fields_struct_raw(
+        &authoritative, fs.clone(), Vec::new(), 16, 1, 0,
+    ).unwrap();
+    let held_revision = ledger::mint(&f, "struct_1", fs.clone(), 16, &[]).unwrap();
+    let held = held_names(&f);
+    let retired = ledger::mint(&f, "struct_2", fs.clone(), 16, &[]).unwrap();
+    let retired_pointer = f.get_type_pointer(8, Rc::clone(&retired), 1).unwrap();
+    let late = f.get_type_struct("struct_3").unwrap();
+    let late = f.set_fields_struct_raw(&late, fs.clone(), Vec::new(), 16, 1, 0).unwrap();
+    forget_minted(&f, &held).unwrap();
+    assert_eq!(f.find_by_name("struct_0").unwrap().unwrap().get_id(), authoritative.get_id());
+    assert_eq!(f.find_by_name("struct_1").unwrap().unwrap().get_size(), held_revision.get_size());
+    assert_eq!(f.find_by_name("struct_3").unwrap().unwrap().get_id(), late.get_id(),
+        "an authored definition installed after the load boundary is not transient inference");
+    assert_eq!(ledger::layout_of(&retired_pointer.get_ptr_to().unwrap()), ledger::layout_of(&retired));
+    assert!(f.find_by_name("struct_2").unwrap().is_none());
+    let mut wider = fs;
+    wider.push(TypeField::new(2, 16, "extra", f.get_base(8, type_metatype::TYPE_INT).unwrap()));
+    let replacement = ledger::mint(&f, "struct_2", wider, 24, &[]).unwrap();
+    assert_eq!(replacement.get_size(), 24);
+    assert_eq!(retired.get_size(), 16);
+    assert_eq!(retired_pointer.get_ptr_to().unwrap().get_size(), 16);
+}
+
 #[derive(Clone, Copy)]
 enum Ty {
     CharPtr,

@@ -8,6 +8,11 @@
 
 use super::*;
 use crate::action::Rule;
+use crate::action::{Action, ActionContext, ActionGroupList, ActionPool, RuleState};
+use crate::context::{ArchContext, BlockId, OpId, VarnodeId};
+use crate::funcdata::Funcdata;
+use kuna_base::address::Address;
+use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace};
 
 // =============================================================================
 // BitRange: extraction/placement matrix
@@ -383,6 +388,157 @@ fn myfoo_byte0_struct() -> Rc<Datatype> {
     s.flags |= flags::has_bitfields;
     s.kind = DatatypeKind::Struct { field: vec![], bitfield };
     Rc::new(s)
+}
+
+fn rule_fixture() -> (Funcdata, BlockId) {
+    let mut manager = AddrSpaceManager::new();
+    manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+    manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+    manager.insert_space(Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 2,
+        addrspace_flags::hasphysical, 1, 1,
+    ))).unwrap();
+    let mut arch = ArchContext::new(manager);
+    let types = crate::dtype::TypeFactoryImpl::new();
+    types.setup_sizes(Some(8), 8, 8);
+    types.set_core_type("undefined", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+    types.cache_core_types().unwrap();
+    arch.types = Some(Rc::new(types));
+    let arch = Rc::new(arch);
+    let ram = arch.manage().get_space_by_name("ram").unwrap().clone();
+    let mut fd = Funcdata::new("bitfields", "bitfields", arch,
+        Address::new(ram, 0x1000), 0x10000000, 0x40).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    (fd, block)
+}
+
+fn fixture_op(fd: &mut Funcdata, block: BlockId, code: OpCode, inputs: &[VarnodeId], size: i32) -> OpId {
+    let ram = fd.get_arch().manage().get_space_by_name("ram").unwrap().clone();
+    let op = fd.new_op(inputs.len() as i32, Address::new(ram, 0x1000));
+    fd.op_set_opcode_code(op, code);
+    for (slot, &input) in inputs.iter().enumerate() {
+        fd.op_set_input(op, input, slot as i32).unwrap();
+    }
+    if size != 0 { fd.new_unique_out(size, op).unwrap(); }
+    fd.op_insert_end(op, block);
+    op
+}
+
+fn fixture_out(fd: &Funcdata, op: OpId) -> VarnodeId {
+    fd.obank().get(op).unwrap().get_out().unwrap()
+}
+
+fn fixture_input(fd: &mut Funcdata, size: i32, offset: u64, ty: Option<Rc<Datatype>>) -> VarnodeId {
+    let ram = fd.get_arch().manage().get_space_by_name("ram").unwrap().clone();
+    let input = fd.new_varnode(size, &Address::new(ram, offset), ty);
+    fd.set_input_varnode(input).unwrap()
+}
+
+#[test]
+fn all_bitfield_rules_require_registered_group_for_real_rewrites() {
+    for (index, name) in ["bitfield_store", "bitfield_out", "bitfield_load", "bitfield_in", "pull_absorb", "insert_absorb"].into_iter().enumerate() {
+        let mut pool = ActionPool::new(0, "bitfields");
+        pool.add_rule(RuleState::new("bitfields", 0, name), (specs()[index].ctor)());
+        for enabled in [false, true] {
+            let (mut fd, block) = rule_fixture();
+            let mut groups = ActionGroupList::new();
+            groups.insert("base");
+            if enabled { groups.insert("bitfields"); }
+            let field_type = myfoo_byte0_struct();
+            let value = fd.new_constant(1, 0x55);
+            let mask = fd.new_constant(1, 7);
+            let pos = fd.new_constant(4, 0);
+            let width = fd.new_constant(4, 3);
+            let input = fixture_input(&mut fd, 1, 0x2000, None);
+            let (observe, before, after, changed_input) = match index {
+                0 | 2 => {
+                    use crate::dtype::TypeFactory;
+                    let pointer_type = fd.get_arch().types_impl().unwrap().get_type_pointer(8, field_type, 1).unwrap();
+                    let pointer = fixture_input(&mut fd, 8, 0x2100, Some(pointer_type));
+                    let space = fd.new_constant(8, 2);
+                    if index == 0 {
+                        let store = fixture_op(&mut fd, block, OpCode::CPUI_STORE, &[space, pointer, value], 0);
+                        (store, OpCode::CPUI_STORE, OpCode::CPUI_STORE, None)
+                    } else {
+                        let load = fixture_op(&mut fd, block, OpCode::CPUI_LOAD, &[space, pointer], 1);
+                        let loaded = fixture_out(&fd, load);
+                        let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[loaded, mask], 1);
+                        (and, OpCode::CPUI_INT_AND, OpCode::CPUI_ZPULL, None)
+                    }
+                }
+                1 => {
+                    let copy = fixture_op(&mut fd, block, OpCode::CPUI_COPY, &[value], 1);
+                    let out = fixture_out(&fd, copy);
+                    let vn = fd.vbank_mut().get_mut(out).unwrap();
+                    vn.update_type(field_type);
+                    vn.mark_mapped_addr_tied();
+                    (copy, OpCode::CPUI_COPY, OpCode::CPUI_INSERT, None)
+                }
+                3 => {
+                    fd.vbank_mut().get_mut(input).unwrap().update_type(field_type);
+                    let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[input, mask], 1);
+                    (and, OpCode::CPUI_INT_AND, OpCode::CPUI_ZPULL, None)
+                }
+                4 => {
+                    let pull = fixture_op(&mut fd, block, OpCode::CPUI_SPULL, &[input, pos, width], 1);
+                    let pulled = fixture_out(&fd, pull);
+                    let ext = fixture_op(&mut fd, block, OpCode::CPUI_INT_SEXT, &[pulled], 4);
+                    (ext, OpCode::CPUI_INT_SEXT, OpCode::CPUI_SPULL, None)
+                }
+                5 => {
+                    let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[input, mask], 1);
+                    let masked = fixture_out(&fd, and);
+                    let insert = fixture_op(&mut fd, block, OpCode::CPUI_INSERT, &[value, masked, pos, width], 1);
+                    (insert, OpCode::CPUI_INSERT, OpCode::CPUI_INSERT, Some((masked, input)))
+                }
+                _ => unreachable!(),
+            };
+            let mut filtered = pool.clone_filtered(&groups);
+            if let Some(action) = filtered.as_mut() {
+                action.reset(&mut fd);
+                action.perform(&mut fd, &mut ActionContext::new());
+            }
+            if !enabled {
+                assert!(filtered.is_none(), "{name}");
+                assert_eq!(fd.obank().get(observe).unwrap().code(), before, "{name}");
+            } else if index == 0 {
+                let written = fd.obank().get(observe).unwrap().get_in(2).unwrap();
+                let definition = fd.vbank().get(written).unwrap().get_def().unwrap();
+                assert_eq!(fd.obank().get(definition).unwrap().code(), OpCode::CPUI_INSERT, "{name}");
+            } else if index == 2 || index == 3 {
+                assert!(fd.bb_ops(block).iter().any(|&op| fd.obank().get(op).unwrap().code() == after), "{name}");
+            } else {
+                assert_eq!(fd.obank().get(observe).unwrap().code(), after, "{name}");
+            }
+            if let Some((old, new)) = changed_input {
+                assert_eq!(fd.obank().get(observe).unwrap().get_in(1), Some(if enabled { new } else { old }), "{name}");
+            }
+        }
+    }
+}
+
+#[test]
+fn schedule_registration_controls_unconditional_analysis_clone() {
+    for enabled in [false, true] {
+        let (mut fd, block) = rule_fixture();
+        let input = fixture_input(&mut fd, 4, 0x2000, None);
+        let xor = fixture_op(&mut fd, block, OpCode::CPUI_INT_XOR, &[input, input], 4);
+        let mut pool = ActionPool::new(0, "analysis");
+        pool.add_rule(RuleState::new("registered", 0, "identity"), Box::new(crate::ruleaction_2::RuleTrivialArith));
+        let mut groups = ActionGroupList::new();
+        groups.insert("base");
+        if enabled { groups.insert("registered"); }
+        let mut filtered = pool.clone_filtered(&groups);
+        if let Some(action) = filtered.as_mut() { action.perform(&mut fd, &mut ActionContext::new()); }
+        assert_eq!(filtered.is_some(), enabled);
+        assert_eq!(fd.obank().get(xor).unwrap().code(), if enabled { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_XOR });
+        if enabled {
+            let zero = fd.obank().get(xor).unwrap().get_in(0).unwrap();
+            assert!(fd.vbank().get(zero).unwrap().is_constant());
+            assert_eq!(fd.vbank().get(zero).unwrap().get_offset(), 0);
+        }
+    }
 }
 
 #[test]

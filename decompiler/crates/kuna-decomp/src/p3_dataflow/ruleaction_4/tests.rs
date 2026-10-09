@@ -22,6 +22,49 @@ use kuna_base::space::{
 use crate::dtype::{type_metatype, Datatype};
 use crate::context::{ArchContext, BlockId};
 
+mod config_ir_regressions {
+    use super::{OpCode, RuleSubExtComm, build_fd, mk_block, mk_def, mk_op, mk_vn};
+    use crate::action::Rule;
+    #[test]
+    fn subextcomm_crossing_slice_retains_extension_and_partial_mask() {
+        for extension in [OpCode::CPUI_INT_ZEXT, OpCode::CPUI_INT_SEXT] {
+            let mut fd = build_fd();
+            let bl = mk_block(&mut fd);
+            let input = mk_vn(&mut fd, 4, 0x40);
+            let (_, wide) = mk_def(&mut fd, bl, extension, 8, 0x100, &[input]);
+            let crossing = mk_op(&mut fd, 2, 0x104, OpCode::CPUI_SUBPIECE);
+            let offset = fd.new_constant(4, 2);
+            fd.op_set_input(crossing, wide, 0).unwrap();
+            fd.op_set_input(crossing, offset, 1).unwrap();
+            fd.new_unique_out(4, crossing).unwrap();
+            fd.op_insert_end(crossing, bl);
+            assert_eq!(RuleSubExtComm::new().apply_op(crossing, &mut fd), 1);
+            let operation = fd.obank().get(crossing).unwrap();
+            assert_eq!(operation.code(), extension, "crossing an input boundary cannot cancel extension bits");
+            assert_eq!(operation.num_input(), 1);
+            let narrowed = operation.get_in(0).unwrap();
+            let value = fd.vbank().get(narrowed).unwrap();
+            assert_eq!(value.get_size(), 2);
+            let extract = fd.obank().get(value.get_def().unwrap()).unwrap();
+            assert_eq!(extract.code(), OpCode::CPUI_SUBPIECE);
+            assert_eq!(extract.get_in(0), Some(input));
+            assert_eq!(fd.vbank().get(extract.get_in(1).unwrap()).unwrap().get_offset(), 2);
+
+            let mask = fd.new_constant(8, 0xffff_fffe);
+            let (_, masked) = mk_def(&mut fd, bl, OpCode::CPUI_INT_AND, 8, 0x108, &[wide, mask]);
+            let cut = mk_op(&mut fd, 2, 0x10c, OpCode::CPUI_SUBPIECE);
+            let zero = fd.new_constant(4, 0);
+            fd.op_set_input(cut, masked, 0).unwrap();
+            fd.op_set_input(cut, zero, 1).unwrap();
+            fd.new_unique_out(4, cut).unwrap();
+            fd.op_insert_end(cut, bl);
+            assert_eq!(RuleSubExtComm::new().apply_op(cut, &mut fd), 0);
+            assert_eq!(fd.obank().get(cut).unwrap().code(), OpCode::CPUI_SUBPIECE);
+            assert_eq!(fd.obank().get(cut).unwrap().get_in(0), Some(masked), "partly zero mask must not be bypassed");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures (mirroring funcdata_op/tests.rs)
 // ---------------------------------------------------------------------------

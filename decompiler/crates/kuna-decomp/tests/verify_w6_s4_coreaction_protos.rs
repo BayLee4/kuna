@@ -15,13 +15,9 @@
 //! call-spec-gated bodies (`qlst` absent) stay inert.  The hunt list therefore
 //! concentrates on:
 //!
-//!   - **Change-signal totality.** Every `apply` MUST leave `count == 0` and
-//!     return `0`.  A STUB that spuriously bumps `count` would falsely signal a
-//!     change to the `rule_repeatapply` fixpoint driver (silent infinite-loop /
-//!     extra-pass corruption).  The most fragile case is `ActionExtraPopSetup`
-//!     with a **non-null** stack space (`Some(idx)`): it falls *through* the one
-//!     realized control-path (the `stackspace == 0` early return) into the
-//!     deferred per-call insertion, which must still be inert.
+//!   - **Change signals.** `apply` returns zero; `ActionPrototypeTypes` alone
+//!     increments `count` on this model-less, RETURN-less fixture.
+//!     ExtraPopSetup covers both no space and a space without a spacebase.
 //!   - **`clone_filtered` totality + type/flags fidelity.** C++ `clone(grouplist)`
 //!     returns null out-of-group and a same-class, same-name/group/flags object
 //!     in-group.  A copy-paste slip (cloning the wrong type, or dropping the
@@ -81,9 +77,7 @@ fn build_fd() -> Funcdata {
 }
 
 /// Every owned action, each constructed in a fixed group.  `ExtraPopSetup` is
-/// listed twice on purpose: once with a NULL stack space (`None`, the realized
-/// early-return) and once with a NON-null stack space (`Some`, which falls
-/// through into the deferred per-call seam).
+/// listed twice: no stack space and a RAM space without a spacebase.
 fn all_actions(g: &str) -> Vec<Box<dyn Action>> {
     vec![
         ActionPrototypeTypes::boxed(g),
@@ -263,12 +257,8 @@ fn proto_actions_flags_match_cpp_constructors() {
     );
 }
 
-/// HUNT: the one realized vs deferred boundary in `ExtraPopSetup::apply`.
-/// C++: `if (stackspace == (AddrSpace *)0) return 0;`.  Both the null path
-/// (realized early-return) and the non-null path (fall-through to the deferred
-/// per-call insertion) are inert TODAY; this documents the boundary so the
-/// future W8 wiring that makes `Some(idx)` actually insert INT_ADD/INDIRECT ops
-/// will trip this test and force a re-verify.
+/// No stack space and a space without a spacebase retain zero change signals
+/// across repeated applications; neither case asserts an IR mutation contract.
 #[test]
 fn extrapop_null_and_nonnull_both_inert_for_now() {
     let mut data = build_fd();

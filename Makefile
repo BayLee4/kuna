@@ -17,7 +17,7 @@ PYTHON  ?= python3
 # (inside target/, which is gitignored, so a failed run leaves no repo litter).
 GHIDRA_SIM_LOG := $(ENGINE)/target/ghidra-sim.log
 
-.PHONY: all binaries specs test test-stages test-cli test-tools test-ghidra rust rust-test lint clean check-spec version observatory coverage
+.PHONY: all binaries specs test test-stages test-cli test-tools test-ghidra test-ghidra-live rust rust-test lint clean check-spec version observatory coverage
 
 all: binaries specs
 
@@ -70,7 +70,8 @@ test-ghidra:
 	@bash -c 'set -o pipefail; cd $(ENGINE) && \
 	  cargo test --$(PROFILE) -p kuna-ghidra -- --include-ignored --nocapture \
 	    2>&1 | tee $(GHIDRA_SIM_LOG)'
-	@grep -qE 'test (ghidra_sim_e2e::)?ghidra_sim_sort_grep_breadth \.\.\. ok' $(GHIDRA_SIM_LOG) || { \
+	@grep -qE '^test (ghidra_sim_e2e::)?ghidra_sim_sort_grep_breadth \.\.\.' $(GHIDRA_SIM_LOG) && \
+	  ! grep -qE '^test (ghidra_sim_e2e::)?ghidra_sim_sort_grep_breadth \.\.\..*ignored' $(GHIDRA_SIM_LOG) || { \
 	  echo "ERROR: the sort/grep breadth test did not RUN (needs --include-ignored) -- false green"; \
 	  exit 1; \
 	}
@@ -79,6 +80,9 @@ test-ghidra:
 # exactly one chapter, and (strict) every settable option is mentioned.
 check-spec:
 	python3 tools/check_spec.py
+
+test-ghidra-live:
+	$(PYTHON) tests/ghidra/run.py
 
 # The RE-friction loop's regression corpus: every gap it closes leaves the acceptance probe
 # that proved the fix in tests/cli/ (docs/re-pipeline.md sec.3). Without a runner they are

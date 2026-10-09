@@ -151,3 +151,43 @@ fn the_complete_definition_wins_one_record_per_name() {
     let only_fwd = dedup_by_name(&[Rc::clone(&other)]);
     assert_eq!(only_fwd.len(), 1);
 }
+
+#[test]
+fn callback_only_dependencies_include_inputs_and_recursive_results() {
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
+    use crate::fspec::{FuncProto, ParameterPieces};
+
+    let types = TypeFactoryImpl::new();
+    types.setup_sizes(Some(4), 8, 8);
+    types.set_max_basetype_size(8);
+    let integer = core(4, type_metatype::TYPE_INT, "int4");
+    let input = struct_of("Argument", 4, &[(0, "value", integer)]);
+    let result = types.get_type_struct("Result").unwrap();
+    let mut proto = FuncProto::new();
+    proto.attach_internal_store(core(0, type_metatype::TYPE_VOID, "void"));
+    proto.set_output(&ParameterPieces {
+        type_: Some(Rc::clone(&result)),
+        ..Default::default()
+    });
+    proto.store_set_input(0, "argument", &ParameterPieces {
+        type_: Some(input),
+        ..Default::default()
+    });
+    let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+    code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+    let callback = ptr_to(Rc::new(code));
+    let completed = types.set_fields_struct_raw(
+        &result,
+        vec![TypeField::new(0, 0, "next", Rc::clone(&callback))],
+        vec![], 8, 8, 0,
+    ).unwrap();
+    let holder = struct_of("Holder", 8, &[(0, "callback", callback)]);
+    let definitions = walk(&[holder]);
+    assert_eq!(definitions.last().map(String::as_str), Some("Holder"));
+    assert_eq!(definitions.len(), 3);
+    assert_eq!(
+        definitions.iter().map(String::as_str).collect::<HashSet<_>>(),
+        HashSet::from(["Argument", "Result", "Holder"]),
+    );
+    assert_eq!(completed.get_size(), 8);
+}

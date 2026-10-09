@@ -723,6 +723,96 @@ mod tests {
     use std::collections::BTreeSet;
     use std::rc::Rc;
 
+    #[test]
+    fn hashed_wire_local_resolves_at_hash_anchor_across_cast() {
+        use crate::dtype::{type_metatype, TypeFactoryImpl};
+        use crate::dynamic::DynamicHash;
+        use crate::remote_provider::{ELEM_HASH, ELEM_MAPSYM};
+        use kuna_base::address::RangeList;
+        use kuna_base::marshal::{ATTRIB_TYPE, ATTRIB_VAL};
+        let mut manager = build_manager();
+        let register = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 5,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+            "stack", 6, 8, &register, 1, true, false,
+        ))).unwrap();
+        let mut context = ArchContext::new(manager);
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("undefined", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        context.types = Some(Rc::new(types));
+        let glb = Rc::new(context);
+        let memory = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+        let mut fd = Funcdata::new("hash_anchor", "hash_anchor", glb,
+            Address::new(Rc::clone(&memory), 0x1000), 0x10000000, 0x40).unwrap();
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+        fd.bblocks_mut().set_start_block(root, block);
+        let dtype = fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_UINT).unwrap();
+        let emit = |fd: &mut Funcdata, opcode, pc, offset, inputs: &[VarnodeId]| {
+            let op = new_op(fd, inputs.len() as int4, opcode, pc);
+            for (slot, input) in inputs.iter().enumerate() { fd.op_set_input(op, *input, slot as int4).unwrap(); }
+            let output = fd.new_varnode(8, &Address::new(Rc::clone(&memory), offset), Some(dtype.clone()));
+            fd.op_set_output(op, output).unwrap();
+            fd.op_insert_end(op, block);
+            output
+        };
+        let ca = fd.new_constant(8, 0x11);
+        let a = emit(&mut fd, OpCode::CPUI_COPY, 0x1010, 0x100, &[ca]);
+        let cb = fd.new_constant(8, 0x22);
+        let b = emit(&mut fd, OpCode::CPUI_COPY, 0x1014, 0x108, &[cb]);
+        let sum = emit(&mut fd, OpCode::CPUI_INT_ADD, 0x1018, 0x110, &[a, b]);
+        let cast = emit(&mut fd, OpCode::CPUI_CAST, 0x101c, 0x130, &[sum]);
+        emit(&mut fd, OpCode::CPUI_COPY, 0x1020, 0x118, &[cast]);
+        fd.structure_reset();
+        fd.set_high_level();
+        let high = fd.vbank().get(cast).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("cast_local");
+        let covering_type = fd.get_arch().types().unwrap().get_base(16, type_metatype::TYPE_UNKNOWN).unwrap();
+        fd.get_scope_local_mut().unwrap().add_symbol("covering_local", covering_type,
+            &Address::new(Rc::clone(&memory), 0x130), &Address::new_invalid()).unwrap();
+        let (expected_hash, anchor) = crate::dynamic::dynamic_unique_hash(cast, 8, &mut fd).unwrap();
+        assert_ne!(anchor, Address::new(Rc::clone(&memory), 0x101c));
+        assert_eq!(DynamicHash::new().find_varnode(&mut fd, &anchor, expected_hash), Some(cast));
+        fd.kuna_link_high_symbols();
+        let mut bytes = Vec::new();
+        fd.get_scope_local().unwrap().encode_with_storage(&fd.kuna_wire_symbols,
+            &Default::default(), &mut PackedEncode::new(&mut bytes)).unwrap();
+        fn collect_dynamic(dec: &mut PackedDecode, found: &mut Vec<(u64, Address)>) {
+            while dec.peek_element().unwrap() != 0 {
+                let eid = dec.open_element().unwrap();
+                if eid == ELEM_MAPSYM.get_id() {
+                    if dec.read_string_id(&ATTRIB_TYPE).ok().as_deref() == Some(b"dynamic") {
+                        dec.skip_element().unwrap();
+                        let hid = dec.open_element_id(&ELEM_HASH).unwrap();
+                        let hash = dec.read_unsigned_integer_id(&ATTRIB_VAL).unwrap();
+                        dec.close_element(hid).unwrap();
+                        let mut ranges = RangeList::default();
+                        ranges.decode(dec).unwrap();
+                        found.push((hash, ranges.get_first_range().unwrap().get_first_addr()));
+                    }
+                    dec.close_element_skipping(eid).unwrap();
+                } else {
+                    while dec.get_next_attribute_id().unwrap() != 0 {}
+                    collect_dynamic(dec, found);
+                    dec.close_element(eid).unwrap();
+                }
+            }
+        }
+        let mut decoder = PackedDecode::new(fd.get_arch().manage());
+        decoder.ingest_stream(&bytes).unwrap();
+        let mut entries = Vec::new();
+        collect_dynamic(&mut decoder, &mut entries);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(DynamicHash::new().find_varnode(&mut fd, &entries[0].1, entries[0].0), Some(cast),
+            "actual host hash/range replay must resolve cast_local, not the CAST definition PC");
+    }
+
     use kuna_base::address::{Address, ATTRIB_UNIQ, ELEM_RANGELIST, ELEM_SEQNUM};
     use kuna_base::marshal::{Decoder, PackedDecode, PackedEncode};
     use kuna_base::space::{

@@ -50,6 +50,210 @@ fn specs() -> Vec<String> {
         .unwrap_or_else(|_| repo_root().join("specs").to_string_lossy().into_owned())]
 }
 
+fn source_state_program(fixture: &RawFixture, entries: &[u64]) -> kuna_console::engine::ConsoleProgram {
+    let mut program = bootstrap_from_raw(fixture.0.to_str().unwrap(),
+        "x86:LE:64:default:gcc", 0x1000, entries, None, &specs())
+        .expect("real x86 fixture and built specification");
+    program.commit_pending_analysis().unwrap();
+    program
+}
+
+#[test]
+fn physical_source_console_edits_replay_without_resurrecting_old_slots() {
+    use kuna_console::ifacedecomp::{register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
+    use kuna_console::ifaceterm::ConsoleCommands;
+    let fixture = RawFixture::new("physical-source-edits", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
+    let cases: &[(&[&str], [(&str, i32, u64); 2])] = &[
+        (&["rename value renamed", "decompile", "retype other int1 changed", "decompile"],
+            [("renamed", 1, 0x38), ("changed", 1, 0x30)]),
+        (&["rename other sibling", "map param subject::0 [register,0x8,2] uint2 fresh",
+            "rename fresh newest", "decompile"],
+            [("newest", 2, 0x08), ("sibling", 1, 0x30)]),
+        (&["rename value old_rename", "parse line extern uint4 subject(uint2 fresh, uint1 other);",
+            "rename fresh newest", "decompile"],
+            [("newest", 2, 0x38), ("other", 1, 0x30)]),
+        (&["retype other uint2 changed", "decompile"],
+            [("value", 1, 0x38), ("other", 1, 0x30)]),
+    ];
+    for &(commands, expected) in cases {
+        let program = source_state_program(&fixture, &[0x1000]);
+        let mut script: Vec<String> = [
+            "map function [ram,0x1000] subject", "load function subject",
+            "parse line extern uint4 subject(uint1 value,uint1 other);", "decompile",
+        ].into_iter().map(str::to_owned).collect();
+        script.extend(commands.iter().map(|command| command.to_string()));
+        let executed_commands = script.clone();
+        let mut status = ConsoleCommands::into_status(script);
+        register_decomp_commands(&mut status);
+        status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+            .downcast_mut::<IfaceDecompData>().unwrap().conf = Some(program);
+        for command in executed_commands {
+            let result = status.run_command();
+            if command == "retype other uint2 changed" {
+                assert!(result.unwrap_err().is_execution(),
+                    "a mapped non-address-tied register symbol cannot change width");
+            } else {
+                result.unwrap_or_else(|error| panic!("{command}: {error}"));
+            }
+        }
+        let transcript = status.optr.clone();
+        let data = status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+            .downcast_mut::<IfaceDecompData>().unwrap();
+        let fd = data.fd.as_ref().unwrap_or_else(|| panic!("{transcript}"));
+        let scope = fd.get_scope_local().expect("source symbols remain available after replay");
+        let mut encoded_scope = Vec::new();
+        scope.encode(&mut kuna_base::marshal::XmlEncode::new(&mut encoded_scope)).unwrap();
+        let mut documents = kuna_base::xml::DocumentStorage::new();
+        let document = documents.parse_document(&encoded_scope).unwrap();
+        fn parameter_roster(element: &kuna_base::xml::Element, roster: &mut Vec<(u16, String)>) {
+            if element.get_name() == "symbol" && element.get_attribute_value("cat").unwrap() == b"0" {
+                let index = std::str::from_utf8(element.get_attribute_value("index").unwrap()).unwrap();
+                let ordinal = u16::from_str_radix(index.strip_prefix("0x").unwrap(), 16).unwrap();
+                let name = std::str::from_utf8(element.get_attribute_value("name").unwrap())
+                    .unwrap().to_owned();
+                roster.push((ordinal, name));
+            }
+            for child in element.get_children() {
+                parameter_roster(child, roster);
+            }
+        }
+        let mut roster = Vec::new();
+        parameter_roster(document.get_root(), &mut roster);
+        roster.sort();
+        assert_eq!(roster, expected.iter().enumerate()
+            .map(|(ordinal, &(name, _, _))| (ordinal as u16, name.to_owned())).collect::<Vec<_>>(),
+            "complete authored parameter roster must survive replay: {transcript}");
+        for (ordinal, &(name, size, offset)) in expected.iter().enumerate() {
+            let symbols = scope.query_by_name(name);
+            assert_eq!(symbols.len(), 1, "authored source name must have one live symbol: {transcript}");
+            let symbol = symbols[0];
+            assert_eq!(scope.symbol_category(symbol), kuna_decomp::database::symbol_category::FUNCTION_PARAMETER);
+            assert_eq!(scope.database().symbol(symbol).get_category_index(), ordinal as u16);
+            assert_eq!(scope.database().symbol(symbol).dtype.as_ref().unwrap().get_size(), size);
+            let meta = if name == "changed" {
+                kuna_decomp::dtype::type_metatype::TYPE_INT
+            } else {
+                kuna_decomp::dtype::type_metatype::TYPE_UINT
+            };
+            assert_eq!(scope.database().symbol(symbol).dtype.as_ref().unwrap().get_metatype(), meta);
+            assert!(scope.symbol_storage(symbol).iter().any(|(address, width)|
+                address.get_space().unwrap().get_name() == "register"
+                    && address.get_offset() == offset && *width == size),
+                "source storage is independent of execution inputs: {name}/{offset:#x}");
+        }
+        fn original_input(
+            fd: &kuna_decomp::funcdata::Funcdata,
+            id: kuna_decomp::context::VarnodeId,
+            offset: u64,
+            size: i32,
+        ) -> bool {
+            use kuna_num::opcodes::OpCode;
+            let input = fd.vbank().get(id).unwrap();
+            let address = input.get_addr();
+            if input.get_size() != size
+                || address.get_space().unwrap().get_name() != "register"
+                || address.get_offset() != offset
+            {
+                return false;
+            }
+            if input.is_input() {
+                return true;
+            }
+            let Some(definition) = input.get_def().and_then(|id| fd.obank().get(id)) else {
+                return false;
+            };
+            if definition.is_dead() || definition.code() != OpCode::CPUI_PIECE {
+                return false;
+            }
+            let high = definition.get_in(0).unwrap();
+            let low = definition.get_in(1).unwrap();
+            let low_size = fd.vbank().get(low).unwrap().get_size();
+            low_size > 0 && low_size < size
+                && original_input(fd, low, offset, low_size)
+                && original_input(fd, high, offset + low_size as u64, size - low_size)
+        }
+        // Independent input pieces may reconstruct EDI/ESI; source formals
+        // and an ECX mapping cannot replace their live four-byte provenance.
+        for offset in [0x38, 0x30] {
+            assert!(fd.obank().iter_all().any(|(_, id)| {
+                let op = fd.obank().get(id).unwrap();
+                !op.is_dead()
+                    && op.code() == kuna_num::opcodes::OpCode::CPUI_INT_ADD
+                    && op.get_addr().get_offset() == 0x1002
+                    && (0..op.num_input()).filter_map(|slot| op.get_in(slot))
+                        .any(|id| original_input(fd, id, offset, 4))
+            }), "original four-byte machine input provenance at {offset:#x} must survive source replay");
+        }
+        let c = kuna_decomp::decompile_drive::print_c(data.conf.as_mut().unwrap().arch_mut(), fd);
+        for &(name, _, _) in &expected {
+            assert!(c.contains(name), "source-authored name missing from readable C:\n{c}");
+        }
+        assert!(!c.contains("old_rename"), "obsolete source edit resurrected:\n{c}");
+    }
+}
+
+#[test]
+fn physical_source_assertion_batch_keeps_carriers_read_only_until_replay() {
+    let fixture = RawFixture::new("physical-source-batch", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
+    let mut program = source_state_program(&fixture, &[0x1000]);
+    let entry = program.find_entry_at(0x1000).unwrap();
+    let function = entry.name.clone();
+    program.set_assertions(vec![
+        Directive { raw: "source prototype".into(), body: Body::Prototype {
+            func: function.clone(), decl: format!("uint4 {function}(uint1 value,uint1 other)"),
+        }},
+        Directive { raw: "source rename".into(), body: Body::Name {
+            func: Some(function), symbol: "value".into(), newname: "renamed".into(),
+        }},
+    ]);
+    assertions::apply_program_scoped(&mut program);
+    let results = decompile_targets(&mut program, vec![entry], false, false, false);
+    let result = &results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let formals: Vec<_> = result.variables.iter().filter(|variable| variable.is_param)
+        .map(|variable| (variable.name.as_str(), variable.size)).collect();
+    assert_eq!(formals, [("renamed", 1), ("other", 1)]);
+    let c = result.code.as_ref().unwrap();
+    assert!(c.contains("renamed") && c.contains("other"), "{c}");
+}
+
+
+
+
+#[test]
+fn observable_link_register_state_is_not_return_target_bookkeeping() {
+    let mut image = vec![0u8; 0x24];
+    image[..8].copy_from_slice(&[0xe0, 0x03, 0x1e, 0xaa, 0xc0, 0x03, 0x5f, 0xd6]);
+    image[0x20..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);
+    let fixture = RawFixture::new("link-register-entry-state", &image);
+    let mut program = bootstrap_from_raw(fixture.0.to_str().unwrap(),
+        "AARCH64:LE:64:v8A:default", 0x1000, &[0x1000, 0x1020], None, &specs())
+        .expect("actual AArch64 fixture and built specification");
+    program.commit_pending_analysis().unwrap();
+    let escape = program.find_entry_at(0x1000).unwrap();
+    let plain = program.find_entry_at(0x1020).unwrap();
+    program.set_assertions(vec![
+        Directive { raw: "observable return".into(), body: Body::Prototype {
+            func: escape.name.clone(), decl: format!("unsigned long long {}(void)", escape.name),
+        }},
+        Directive { raw: "control-only return".into(), body: Body::Prototype {
+            func: plain.name.clone(), decl: format!("void {}(void)", plain.name),
+        }},
+    ]);
+    assertions::apply_program_scoped(&mut program);
+    assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
+    let ordinary = decompile_targets(&mut program, vec![escape, plain.clone()], false, false, false);
+    for result in &ordinary {
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.variables.iter().all(|variable| !variable.is_param),
+            "control or observable entry X30 is not an invented source formal");
+        assert!(result.code.as_deref().unwrap().contains("return"), "ordinary return body remains readable");
+    }
+    let plain_export = kuna_console::project::decompile_export_targets(&mut program, vec![plain]);
+    assert!(plain_export[0].error.is_none(), "plain RET export must remain supported");
+    assert!(plain_export[0].code.as_deref().unwrap().contains("return"), "plain void return must remain readable");
+}
+
 fn run_console(script: &str, isa: Option<&str>) -> std::process::Output {
     let roots = specs();
     let mut command = Command::new(env!("CARGO_BIN_EXE_decomp_dbg"));

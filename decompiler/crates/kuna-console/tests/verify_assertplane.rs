@@ -48,6 +48,87 @@ fn directive(spec: &str, body: Body) -> Directive {
     Directive { raw: spec.to_string(), body }
 }
 
+#[test]
+fn parsed_callee_cleanup_is_committed_for_own_entries_only_when_enabled() {
+    use std::rc::Rc;
+    use kuna_base::address::Address;
+    use kuna_base::xml::DocumentStorage;
+    use kuna_console::engine::bootstrap_program;
+    use kuna_console::grammar::{parse_c, DataOrg};
+    use kuna_decomp::fspec::EXTRAPOP_UNKNOWN;
+    let mut documents = DocumentStorage::new();
+    let image = documents.parse_document(br#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#)
+        .unwrap().get_root().clone();
+    let mut program = bootstrap_program(image, "x86:LE:32:default:windows",
+        &[repo_root().join("specs").to_str().unwrap().to_owned()]).unwrap();
+    for enabled in [true, false] {
+        program.arch_mut().set_kuna_option("calleeprotostack", if enabled { "on" } else { "off" }).unwrap();
+        let arch = program.arch();
+        let (addr_size, word_size) = arch.data_org();
+        let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+        for (declaration, model, cleanup, first_stack) in [
+            ("extern int __stdcall pop_std(int value);", "__stdcall", 8, true),
+            ("extern int __fastcall pop_fast(int value);", "__fastcall", 4, false),
+            ("extern int __fastcall pop_fast_stack(int a, int b, int c);", "__fastcall", 8, false),
+            ("extern int __cdecl pop_cdecl(int a, int b, int c);", "__cdecl", 4, true),
+        ] {
+            let mut parsed = None;
+            parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
+                parsed = Some((pieces, name.to_owned())); Ok(())
+            }).unwrap();
+            let (pieces, selected) = parsed.unwrap();
+            assert_eq!(selected, model);
+            let model = arch.get_model(&selected).unwrap().clone();
+            let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
+            let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
+            fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
+            let proto = fd.get_func_proto();
+            assert!(Rc::ptr_eq(proto.model(), &model));
+            assert_eq!(proto.get_extra_pop(), if enabled || selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN });
+            assert_eq!(proto.get_param(0).unwrap().get_address().get_space().unwrap().get_name() == "stack", first_stack);
+        }
+    }
+}
+
+#[test]
+fn parsed_indirect_result_keeps_logical_origins_without_inventing_input_only_results() {
+    use kuna_base::address::Address;
+    use kuna_base::xml::DocumentStorage;
+    use kuna_console::engine::bootstrap_program;
+    use kuna_console::grammar::{parse_c, DataOrg};
+    let mut documents = DocumentStorage::new();
+    let image = documents.parse_document(br#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#)
+        .unwrap().get_root().clone();
+    let mut program = bootstrap_program(image, "x86:LE:32:default:windows",
+        &[repo_root().join("specs").to_str().unwrap().to_owned()]).unwrap();
+    let arch = program.arch();
+    let (addr_size, word_size) = arch.data_org();
+    let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+    parse_c("typedef struct SourceBig { unsigned long long a; unsigned long long b; unsigned long long c; } SourceBig;",
+        arch.types(), DataOrg { addr_size, word_size }, &models, |_, _| unreachable!()).unwrap();
+    for declaration in ["extern SourceBig __cdecl source_big(int tag);", "extern SourceBig __cdecl source_big_var(int tag, ...);"] {
+        let arch = program.arch();
+        let mut parsed = None;
+        parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
+            parsed = Some((pieces, name.to_owned())); Ok(())
+        }).unwrap();
+        let (pieces, selected) = parsed.unwrap();
+        assert_eq!(pieces.outtype.as_ref().unwrap().get_size(), 24);
+        assert_eq!(pieces.intypes.len(), 1);
+        let model = arch.get_model(&selected).unwrap().clone();
+        let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
+        let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
+        fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
+        assert!(fd.get_func_proto().get_param(0).unwrap().is_hidden_return());
+        assert_eq!(fd.get_func_proto().is_dotdotdot(), pieces.first_var_arg_slot >= 0);
+        let mut input_only = pieces.clone();
+        input_only.outtype = None;
+        fd.apply_locked_prototype_with_model(&input_only, Some(model)).unwrap();
+        assert!(fd.get_func_proto().is_input_locked());
+        assert!(!fd.get_func_proto().is_output_locked(), "input-only edit must not invent an authored result lock");
+    }
+}
+
 /// Decompile `authenticate` under `directives`, returning `(C, report)`.
 fn decompile_with(directives: Vec<Directive>) -> (String, Vec<Outcome>) {
     let mut prog = load();
@@ -441,6 +522,60 @@ fn output_only_prototype_pieces_do_not_abort_the_drive() {
         &[],
     );
     assert!(step.result.is_ok(), "an output-only prototype aborted the drive");
+}
+
+#[test]
+fn output_only_prototype_pieces_preserve_output_authority_without_input_lock() {
+    use kuna_decomp::fspec::{parameter_pieces_flags, ParameterPieces, PrototypePieces};
+    let mut prog = load();
+    let entry = prog
+        .resolve_entry(&EntrySelector::Name(TARGET.to_string()))
+        .expect("fauxware has an `authenticate`");
+    let int4 = prog
+        .arch()
+        .types()
+        .get_base(4, kuna_decomp::dtype::type_metatype::TYPE_INT)
+        .expect("int4");
+    let rax = prog
+        .arch()
+        .manage()
+        .get_space_by_name("register")
+        .map(|s| kuna_base::address::Address::new(std::rc::Rc::clone(s), 0))
+        .expect("x86-64 has a register space");
+    let pieces = PrototypePieces {
+        name: TARGET.to_string(),
+        first_var_arg_slot: -1,
+        output_storage: Some(ParameterPieces {
+            addr: rax,
+            type_: Some(int4),
+            flags: parameter_pieces_flags::TYPELOCK,
+        }),
+        ..Default::default()
+    };
+    let addr = entry.addr.clone();
+    let step = kuna_console::decompile_step::decompile_one(
+        prog.arch_mut(),
+        TARGET,
+        addr,
+        0,
+        &kuna_console::decompile_step::DecompileSeed {
+            mapped_symbols: &[],
+            usepoint_symbols: &[],
+            dynamic_symbols: &[],
+            pending_proto: Some(&pieces),
+            flow_overrides: &[],
+            mapped_params: &[],
+        },
+        &[],
+    );
+    let fd = step.result.expect("an output-only prototype aborted the drive");
+    let prototype = fd.get_func_proto();
+    assert!(prototype.is_output_locked());
+    assert!(!prototype.is_input_locked(), "output authority does not invent locked source inputs");
+    let output = prototype.get_output();
+    assert_eq!(output.get_size(), 4);
+    assert_eq!(output.get_type().unwrap().get_metatype(), kuna_decomp::dtype::type_metatype::TYPE_INT);
+    assert_eq!(output.get_address(), pieces.output_storage.as_ref().unwrap().addr);
 }
 
 /// The declarations kuna PRINTS are declarations kuna ACCEPTS

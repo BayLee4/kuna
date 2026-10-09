@@ -6,12 +6,16 @@
 //! (which drives `parentheses`), the negate cross-links, the keyword constants,
 //! the byte-for-byte integer / float / char token strings, the generic
 //! name builders, and the opcode→token dispatch — plus the `resetDefaultsPrintC`
-//! defaults including the kuna `arraynotation` default-on.  The RPN/`Emit`
-//! driver bodies are the W9 stub (see the module docs) and are not testable
-//! until `prettyprint` lands.
+//! defaults including the kuna `arraynotation` default-on.
+//! RPN, document markup and generated declaration consumers are covered below.
 
 use super::*;
 use crate::printlanguage::{parentheses, ReversePolish};
+
+mod support;
+mod expressions;
+mod documents;
+mod type_definitions;
 
 #[test]
 fn case_labels_without_ops_keep_their_numeric_value() {

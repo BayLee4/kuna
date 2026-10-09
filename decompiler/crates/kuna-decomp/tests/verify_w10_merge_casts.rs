@@ -189,6 +189,9 @@ fn w10_is_op_identical_descends_pointer_chain() {
         !is_op_identical(&pp_int, &pp_float),
         "int4** vs float4** are NOT op-identical (different leaf)"
     );
+    let separate_int = ptr(ptr(base(4, type_metatype::TYPE_INT)));
+    assert!(!is_op_identical(&pp_int, &separate_int),
+        "structurally equal leaves from distinct owners are not op-identical");
 }
 
 /// Typedef stripping: a typedef of `int4` is op-identical to the underlying

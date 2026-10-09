@@ -650,6 +650,122 @@ fn scope_local_add_symbol_maps_a_named_local() {
 }
 
 #[test]
+fn address_tied_type_seed_remains_available_but_requires_containing_storage() {
+    let mut scope = scope_local();
+    let types = factory();
+    let space = Rc::clone(scope.get_space_id());
+    let storage = Address::new(Rc::clone(&space), 0x10);
+    let dtype = base(4, type_metatype::TYPE_INT);
+    let local = scope.add_symbol("local", dtype.clone(), &storage, &Address::new_invalid()).unwrap();
+    scope.set_attribute(local, crate::varnode::varnode_flags::typelock);
+    for usepoint in [Address::new_invalid(), Address::new(Rc::clone(&space), 0x2000)] {
+        assert_eq!(scope.build_localtype_seed_at(&storage, 4, &usepoint, &types).unwrap()
+            .compare(&dtype, 8).unwrap(), 0);
+        assert!(scope.build_localtype_seed_at(&storage, 8, &usepoint, &types).is_none());
+        let partial = Address::new(Rc::clone(&space), 0x12);
+        assert!(scope.build_localtype_seed_at(&partial, 4, &usepoint, &types).is_none());
+    }
+}
+
+#[test]
+fn owned_stack_parameter_keeps_whole_function_mapping() {
+    use crate::varnode::varnode_flags as vf;
+    let mut scope = scope_local();
+    let types = factory();
+    let stack = Rc::clone(scope.get_space_id());
+    let mut window = RangeList::new();
+    window.insert_range(Rc::clone(&stack), 0x10, 0x3f);
+    scope.reset_local_window(&RangeList::new(), &window, true);
+    let storage = Address::new(Rc::clone(&stack), 0x20);
+    let input = Address::new(Rc::clone(&stack), 0xfff);
+    let later = Address::new(stack, 0x1020);
+    let dtype = base(4, type_metatype::TYPE_INT);
+    let symbol = scope.add_param_symbol(0, "memory_input", dtype.clone(), &storage, &input)
+        .unwrap().unwrap();
+    scope.set_attribute(symbol, vf::typelock | vf::namelock);
+    for usepoint in [&input, &later] {
+        assert_eq!(scope.query_container_for_link(&storage, usepoint).unwrap().symbol, symbol);
+        assert_eq!(scope.build_localtype_seed_at(&storage, 4, usepoint, &types).unwrap()
+            .compare(&dtype, 8).unwrap(), 0);
+        assert_eq!(scope.query_properties(&storage, 4, usepoint) & (vf::mapped | vf::addrtied), vf::mapped | vf::addrtied);
+    }
+}
+
+#[test]
+fn joined_parameter_fields_are_scoped_to_input_not_register_reuse() {
+    use crate::dtype::{DatatypeKind, TypeField};
+    use crate::varnode::varnode_flags as vf;
+    use kuna_base::space::{AddrSpaceManager, ConstantSpace, JoinSpace, VarnodeStorage};
+    for mixed_stack in [false, true] {
+        let mut scope = scope_local();
+        let types = factory();
+        let register = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 2,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        let code = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 3,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        let stack = Rc::clone(scope.get_space_id());
+        let mut window = RangeList::new();
+        window.insert_range(Rc::clone(&stack), 0, 0xff);
+        scope.reset_local_window(&RangeList::new(), &window, true);
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.insert_space(Rc::clone(&code)).unwrap();
+        manager.insert_space(Rc::clone(&stack)).unwrap();
+        manager.insert_space(Rc::new(JoinSpace::new(5, false))).unwrap();
+        let low = Address::new(Rc::clone(&register), 0x10);
+        let high = Address::new(if mixed_stack { stack } else { register }, 0x20);
+        let pieces = [high.clone(), low.clone()].map(|addr| VarnodeStorage {
+            space: addr.get_space().cloned(), offset: addr.get_offset(), size: 4,
+        });
+        let joined = manager.find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+        let input = Address::new(Rc::clone(&code), 0xfff);
+        let later = Address::new(code, 0x1020);
+        let integer = base(4, type_metatype::TYPE_INT);
+        let float = base(4, type_metatype::TYPE_FLOAT);
+        let mut draft = Datatype::new_with_align(8, 4, type_metatype::TYPE_STRUCT);
+        draft.kind = DatatypeKind::Struct {
+            field: vec![
+                TypeField::new(17, 0, "count", integer.clone()),
+                TypeField::new(29, 4, "value", float.clone()),
+            ],
+            bitfield: vec![],
+        };
+        let pair = Rc::new(draft);
+        let symbol = scope.add_param_symbol(0, "incoming", pair.clone(), &joined, &input).unwrap().unwrap();
+        scope.set_attribute(symbol, vf::typelock | vf::namelock);
+        assert_eq!(scope.build_localtype_seed_at(&joined, 8, &input, &types).unwrap()
+            .compare(&pair, 8).unwrap(), 0);
+        assert!(scope.build_localtype_seed_at(&joined, 8, &later, &types).is_none());
+        for (addr, offset, dtype) in [(&low, 0, &integer), (&high, 4, &float)] {
+            let entry = scope.query_container_for_link(addr, &input).unwrap();
+            assert_eq!(entry.symbol, symbol);
+            assert_eq!(entry.display_name, "incoming");
+            assert_eq!(entry.sym_off, offset);
+            assert_eq!(scope.build_localtype_seed_at(addr, 4, &input, &types).unwrap()
+                .compare(dtype, 8).unwrap(), 0);
+            assert!(scope.query_container_for_link(addr, &later).is_none());
+            assert!(scope.build_localtype_seed_at(addr, 4, &later, &types).is_none());
+        }
+        assert_eq!(scope.query_properties(&low, 4, &later) & (vf::mapped | vf::addrtied), 0);
+        if mixed_stack {
+            assert_eq!(scope.query_properties(&high, 4, &later) & (vf::mapped | vf::addrtied), vf::mapped | vf::addrtied);
+        }
+        let replacement = scope.add_symbol("delta", float.clone(), &low, &later).unwrap();
+        scope.set_attribute(replacement, vf::typelock | vf::namelock);
+        assert_eq!(scope.query_container_for_link(&low, &later).unwrap().symbol, replacement);
+        assert_eq!(scope.build_localtype_seed_at(&low, 4, &later, &types).unwrap()
+            .compare(&float, 8).unwrap(), 0);
+        assert_eq!(scope.build_localtype_seed_at(&low, 4, &input, &types).unwrap()
+            .compare(&integer, 8).unwrap(), 0);
+    }
+}
+
+#[test]
 fn scope_local_query_properties_marks_mapped_range_addrtied() {
     use crate::varnode::varnode_flags;
     // C++ `Scope::queryProperties` (database.cc:1268): a storage range covered by

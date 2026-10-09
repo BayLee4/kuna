@@ -19,6 +19,111 @@ use kuna_num::opcodes::OpCode;
 use super::*;
 use crate::context::{ArchContext, TypeOp};
 
+mod config_ir_regressions {
+    use super::{ActionContext, ActionDatabase, ActionPool, ArchContext, Address, Funcdata, OpCode, Rc, RuleState, TypeOp, build_default_groups, build_manager};
+    use crate::architecture::Architecture;
+    use crate::options::{OptionDatabase, ELEM_CURRENTACTION, ELEM_SETACTION};
+    use kuna_sleigh::globalcontext::ContextInternal;
+    use kuna_sleigh::loadimage::LoadImage;
+    use kuna_sleigh::sleigh::Sleigh;
+
+    struct ConfigDummyImage;
+    impl LoadImage for ConfigDummyImage {
+        fn get_file_name(&self) -> &str { "config-test" }
+        fn load_fill(&mut self, _: &mut [u8], _: &Address) -> kuna_base::error::KunaResult<()> {
+            Err(kuna_base::error::KunaError::data_unavail("no image"))
+        }
+        fn get_arch_type(&self) -> Vec<u8> { Vec::new() }
+        fn adjust_vma(&mut self, _: i64) {}
+    }
+
+    fn mask_architecture() -> Architecture {
+        let mut arch = Architecture::new("config", Sleigh::new(Box::new(ConfigDummyImage), Box::new(ContextInternal::new())));
+        let mut pool = ActionPool::new(0, "maskpool");
+        pool.add_rule(RuleState::new("analysis", 0, "ormask"), Box::new(crate::ruleaction_1::RuleOrMask::new("analysis")));
+        arch.allacts.set_universal(Box::new(pool));
+        build_default_groups(&mut arch.allacts);
+        arch.allacts.set_current("decompile").unwrap();
+        arch
+    }
+
+    fn run_mask_root(db: &mut ActionDatabase, transforms: bool) {
+        let mut context = ArchContext::new(build_manager());
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        context.types = Some(Rc::new(types));
+        let glb = Rc::new(context);
+        let pc = Address::new(Rc::clone(glb.manage().get_space_by_name("ram").unwrap()), 0x1000);
+        let mut fd = Funcdata::new("mask", "mask", glb, pc.clone(), 0x10000000, 0x40).unwrap();
+        let op = fd.obank_mut().create_at(2, pc);
+        fd.obank_mut().mark_alive(op);
+        fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_INT_OR, 0, "INT_OR"));
+        let left = fd.new_constant(4, 0x1234);
+        let mask = fd.new_constant(4, 0xffff_ffff);
+        fd.op_set_input(op, left, 0).unwrap();
+        fd.op_set_input(op, mask, 1).unwrap();
+        fd.new_unique_out(4, op).unwrap();
+        let root = db.get_current_mut().expect("selected executable");
+        root.reset(&mut fd);
+        root.perform(&mut fd, &mut ActionContext::new());
+        let result = fd.obank().get(op).unwrap();
+        assert_eq!(result.code(), if transforms { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_OR });
+        assert_eq!(result.num_input(), if transforms { 1 } else { 2 });
+        if transforms {
+            assert_eq!(fd.vbank().get(result.get_in(0).unwrap()).unwrap().get_offset(), 0xffff_ffff);
+        }
+    }
+
+    #[test]
+    fn cached_root_options_transform_and_reset_removes_custom_roots() {
+        let mut arch = mask_architecture();
+        let options = OptionDatabase::new();
+        run_mask_root(&mut arch.allacts, true);
+        for enabled in [false, true, false] {
+            options.set(&mut arch, ELEM_CURRENTACTION.get_id(), "decompile", "analysis", if enabled { "on" } else { "off" }).unwrap();
+            assert_eq!(arch.allacts.get_current_name(), "decompile");
+            run_mask_root(&mut arch.allacts, enabled);
+        }
+        options.set(&mut arch, ELEM_SETACTION.get_id(), "decompile", "custom", "").unwrap();
+        run_mask_root(&mut arch.allacts, false);
+        arch.reset_defaults();
+        assert_eq!(arch.allacts.get_current_name(), "decompile");
+        assert!(arch.allacts.get_group("custom").is_err());
+        run_mask_root(&mut arch.allacts, true);
+    }
+
+    #[test]
+    fn failed_root_selection_preserves_executable_and_recovers() {
+        let mut arch = mask_architecture();
+        run_mask_root(&mut arch.allacts, true);
+        assert!(arch.allacts.set_current("missing").is_err());
+        run_mask_root(&mut arch.allacts, true);
+        arch.allacts.set_current("firstpass").unwrap();
+        run_mask_root(&mut arch.allacts, false);
+        arch.allacts.set_current("decompile").unwrap();
+        run_mask_root(&mut arch.allacts, true);
+    }
+
+    #[test]
+    fn explicit_currentaction_selects_requested_root_and_reset_default_schedule() {
+        let mut arch = mask_architecture();
+        let options = OptionDatabase::new();
+        arch.allacts.clone_group("decompile", "inactive").unwrap();
+        arch.allacts.set_current("inactive").unwrap();
+        run_mask_root(&mut arch.allacts, true);
+        arch.allacts.set_current("firstpass").unwrap();
+        run_mask_root(&mut arch.allacts, false);
+        options.set(&mut arch, ELEM_CURRENTACTION.get_id(), "inactive", "analysis", "off").unwrap();
+        run_mask_root(&mut arch.allacts, false);
+        options.set(&mut arch, ELEM_CURRENTACTION.get_id(), "inactive", "analysis", "on").unwrap();
+        run_mask_root(&mut arch.allacts, true);
+        arch.reset_defaults();
+        assert_eq!(arch.allacts.get_current_name(), "decompile");
+        run_mask_root(&mut arch.allacts, true);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Harness: a Funcdata with hand-built ops
 // -----------------------------------------------------------------------------

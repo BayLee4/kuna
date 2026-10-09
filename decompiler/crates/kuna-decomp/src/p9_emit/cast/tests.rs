@@ -367,6 +367,19 @@ fn cast_code_generic_no_cast() {
     let a = code_noproto();
     let b = code_noproto();
     assert!(s.cast_standard(&a, &b, false, false).is_none());
+
+    // A declared callable versus generic code reaches the null-prototype arm.
+    let mut proto = crate::fspec::FuncProto::new();
+    proto.attach_internal_store(void_t());
+    proto.set_output(&crate::fspec::ParameterPieces {
+        type_: Some(int_t(4)),
+        ..Default::default()
+    });
+    let mut declared = Datatype::new(1, type_metatype::TYPE_CODE);
+    declared.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+    let declared = Rc::new(declared);
+    assert!(s.cast_standard(&a, &declared, false, false).is_none());
+    assert!(s.cast_standard(&declared, &a, false, false).is_none());
 }
 
 // -- mark_explicit_unsigned (cast.cc:38-71) ---------------------------------

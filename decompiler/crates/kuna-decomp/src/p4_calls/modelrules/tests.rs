@@ -312,6 +312,8 @@ fn filter_homogeneous_float_aggregate() {
     let flt = dt_float(4);
     let s = dt_struct(8, 4, &[(0, Rc::clone(&flt)), (4, Rc::clone(&flt))]);
     assert!(f.filter(&s));
+    let different = dt_struct(16, 8, &[(0, dt_float(4)), (8, dt_float(8))]);
+    assert!(!f.filter(&different));
     // struct of int+float -> not homogeneous.
     let mixed = dt_struct(8, 4, &[(0, dt_int(4)), (4, dt_float(4))]);
     assert!(!f.filter(&mixed));

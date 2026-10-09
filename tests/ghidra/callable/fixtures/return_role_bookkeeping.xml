@@ -1,0 +1,31 @@
+<binaryimage arch="RISCV:LE:64:default:gcc">
+<!-- Actual RV64 instruction encodings, lifted through the real language.
+     The gcc model declares ra as returnaddress.
+     Each final 0x8082 is the compressed return: its real Sleigh lowering is
+     RETURN[ra], unlike the uncompressed return's low-bit masking operation.
+     This isolates COPY-use safety, not tagged-return arithmetic or reverse
+     candidate enumeration (the compressed RETURN names ra directly).
+
+     return_copy: mv t1,ra; mv ra,t1; c.ret
+     partial_read: sw ra,0(a3); c.ret
+     narrowed_target: sext.w t1,ra; mv ra,t1; c.ret
+     output_escape: mv a0,ra; c.ret
+     implicit_parent: mv t1,ra; mv a2,ra; jal ra,consume_a2;
+                      mv ra,t1; c.ret
+     consume_a2: sd a2,0(a3); li a0,0; c.ret
+     The JAL at 0x1408 targets the actual body at 0x1500. Adjacent a2 and a3
+     input reads may be coalesced: tests require byte containment, not a
+     particular range packaging. No source declarations alter machine facts. -->
+<bytechunk space="ram" offset="0x1000" readonly="true">13830000930003008280</bytechunk>
+<bytechunk space="ram" offset="0x1100" readonly="true">23a016008280</bytechunk>
+<bytechunk space="ram" offset="0x1200" readonly="true">1b830000930003008280</bytechunk>
+<bytechunk space="ram" offset="0x1300" readonly="true">138500008280</bytechunk>
+<bytechunk space="ram" offset="0x1400" readonly="true">1383000013860000ef00800f930003008280</bytechunk>
+<bytechunk space="ram" offset="0x1500" readonly="true">23b0c600130500008280</bytechunk>
+<symbol space="ram" offset="0x1000" name="return_copy"/>
+<symbol space="ram" offset="0x1100" name="partial_read"/>
+<symbol space="ram" offset="0x1200" name="narrowed_target"/>
+<symbol space="ram" offset="0x1300" name="output_escape"/>
+<symbol space="ram" offset="0x1400" name="implicit_parent"/>
+<symbol space="ram" offset="0x1500" name="consume_a2"/>
+</binaryimage>

@@ -385,4 +385,73 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn completed_callable_types_preserve_nested_parameter_and_return_declarators() {
+        use std::rc::Rc;
+        use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl, TypeField};
+        use crate::fspec::{FuncProto, ParameterPieces};
+        use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(8), 8, 8);
+        types.set_core_type("int", 4, type_metatype::TYPE_INT, false).unwrap();
+        types.set_core_type("void", 1, type_metatype::TYPE_VOID, false).unwrap();
+        types.cache_core_types().unwrap();
+        let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let callable = |output: Rc<Datatype>, inputs: Vec<Rc<Datatype>>, variadic: bool, closed: bool| {
+            let mut proto = FuncProto::new();
+            proto.attach_internal_store(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            proto.set_output(&ParameterPieces { type_: Some(output), ..Default::default() });
+            for (i, ty) in inputs.into_iter().enumerate() {
+                proto.store_set_input(i as i32, "", &ParameterPieces {
+                    type_: Some(ty), ..Default::default()
+                });
+            }
+            proto.set_input_lock(closed);
+            proto.set_dotdotdot(variadic);
+            let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+            code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+            types.get_type_pointer(8, Rc::new(code), 1).unwrap()
+        };
+        let declaration = |ty: &Rc<Datatype>| {
+            let (front, back) = super::C_SPELLER.declarator(&SpellCtx::OFF, ty);
+            format!("{front}x{back}")
+        };
+        let callback = callable(Rc::clone(&integer), vec![Rc::clone(&integer)], false, true);
+        assert_eq!(
+            super::C_SPELLER.type_name(&SpellCtx::OFF, &callback.get_ptr_to().unwrap()),
+            ("int".to_string(), "(int)".to_string()),
+        );
+        let nested = callable(
+            types.get_type_pointer(8, Rc::clone(&integer), 1).unwrap(),
+            vec![Rc::clone(&integer), callback], true, true,
+        );
+        assert_eq!(declaration(&nested), "int *(*x)(int,int (*)(int),...)");
+        let unlocked = callable(Rc::clone(&integer), vec![], false, false);
+        assert_eq!(declaration(&unlocked), "int (*x)(void)");
+        let fixed_variadic = callable(Rc::clone(&integer), vec![Rc::clone(&integer)], true, true);
+        assert_eq!(declaration(&fixed_variadic), "int (*x)(int,...)");
+        let array = types.get_type_array(3, Rc::clone(&integer)).unwrap();
+        let nested_return = callable(types.get_type_pointer(8, array, 1).unwrap(), vec![], false, true);
+        assert_eq!(declaration(&nested_return), "int (*(*x)(void))[3]");
+
+        let node = types.get_type_struct("Node").unwrap();
+        let callback = callable(Rc::clone(&node), vec![Rc::clone(&node)], false, true);
+        let completed = types.set_fields_struct_raw(
+            &node, vec![TypeField::new(0, 0, "next", Rc::clone(&callback))],
+            vec![], 8, 8, 0,
+        ).unwrap();
+        assert_eq!(declaration(&callback), "Node (*x)(Node)");
+        assert_eq!(
+            crate::kuna_structdefs::definition_text(&completed, SpellCtx::OFF),
+            "struct Node {\n    Node (*next)(Node);\n};\n",
+        );
+        let input = types.get_typedef(&node, "Input", 0x1234, 0).unwrap();
+        let nested = callable(Rc::clone(&input), vec![Rc::clone(&node)], false, true);
+        let outer = callable(node, vec![input, nested], false, true);
+        assert_eq!(declaration(&outer), "Node (*x)(Input,Input (*)(Node))");
+        let alias = types.get_typedef(&outer, "Transform", 0x5678, 0).unwrap();
+        assert_eq!(super::C_SPELLER.type_name(&SpellCtx::OFF, &alias), ("Transform".into(), "".into()));
+    }
 }

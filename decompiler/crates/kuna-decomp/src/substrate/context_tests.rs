@@ -8,6 +8,48 @@ use crate::dtype::{type_metatype, Datatype, DatatypeKind};
 
 use super::{GlobalEntry, GlobalQuery, IndirectSlotType};
 
+mod config_ir_regressions {
+    use super::{Address, Datatype, IndirectSlotType, Rc, addr, code_noproto, query, space, type_metatype, typed_entry};
+    use crate::dtype::TypeFactoryImpl;
+    use kuna_base::space::AddrSpaceManager;
+
+    fn config_context() -> crate::context::ArchContext {
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(kuna_base::space::ConstantSpace::new())).unwrap();
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let mut model = crate::fspec::ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        let mut context = crate::context::ArchContext::new(manager);
+        context.defaultfp = Some(Rc::new(model));
+        context.types = Some(Rc::new(types));
+        context
+    }
+
+    #[test]
+    fn data_slot_shadow_preserves_independent_import_flow_and_name() {
+        let memory = space(3);
+        let at = addr(&memory, 0x100);
+        let mut imported = typed_entry(&memory, 0x100, 8, "known_exit", code_noproto(), true);
+        imported.func_no_return = true;
+        imported.func_inject_id = 17;
+        let data = typed_entry(&memory, 0x100, 8, "declared_data", Rc::new(Datatype::new(8, type_metatype::TYPE_INT)), false);
+        let mut context = config_context();
+        context.peimportcall = true;
+        context.global_query = Some(Rc::new(query(vec![imported, data])));
+        assert!(matches!(context.query_indirect_slot_type(&at, 8, &Address::new_invalid()), Some(IndirectSlotType::Untyped)));
+        let (name, entry, prototype) = context.query_function(&at).expect("independent import flow metadata");
+        assert_eq!(name, "known_exit");
+        assert_eq!(entry, at);
+        assert_eq!(prototype.num_params(), 0);
+        assert!(!prototype.is_input_locked());
+        assert!(prototype.is_no_return());
+        assert!(prototype.is_inline());
+        assert_eq!(prototype.get_inject_id(), 17);
+    }
+}
+
 fn space(index: i32) -> Rc<AddrSpace> {
     Rc::new(AddrSpace::new(
         spacetype::IPTR_PROCESSOR,

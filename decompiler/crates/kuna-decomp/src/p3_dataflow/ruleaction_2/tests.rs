@@ -18,6 +18,149 @@ use crate::dtype::{type_metatype, Datatype};
 use crate::context::{ArchContext, BlockId};
 use crate::varnode::DefOpInfo;
 
+fn apply_selected_rule(name: &str, fd: &mut Funcdata) -> int4 {
+    use crate::action::{Action, ActionContext, ActionPool, RuleState};
+    let rule: Box<dyn Rule> = match name {
+        "andcommute" => Box::new(RuleAndCommute),
+        "andcompare" => Box::new(RuleAndCompare),
+        "andpiece" => Box::new(RuleAndPiece),
+        "bitundistribute" => Box::new(RuleBitUndistribute),
+        "leftright" => Box::new(RuleLeftRight),
+        "shiftcompare" => Box::new(RuleShiftCompare),
+        _ => panic!("unknown test rule"),
+    };
+    let mut pool = ActionPool::new(0, "selected-rule");
+    pool.add_rule(RuleState::new("analysis", 0, name), rule);
+    let bl = mk_block(fd);
+    let v = mk_reg(fd, 0xff00, 4);
+    let (_, excluded) = mk_written(fd, bl, 0xff10, 4, OpCode::CPUI_INT_XOR, &[v, v]);
+    assert!(pool.clone_filtered(&ActionGroupList::from_names(["unrelated"])).is_none());
+    let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).unwrap();
+    selected.apply(fd, &mut ActionContext::new());
+    assert_eq!(code_of(fd, excluded), OpCode::CPUI_INT_XOR);
+    assert_eq!(in_of(fd, excluded, 0), Some(v));
+    assert_eq!(in_of(fd, excluded, 1), Some(v));
+    selected.base().count
+}
+
+#[test]
+fn andcommute_selected_rule_moves_mask_before_left_shift() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 4);
+    let sa = mk_const(&mut fd, 4, 8);
+    let (shifted, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let mask = mk_const(&mut fd, 4, 0xff00);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[shifted, mask]);
+    assert_eq!(apply_selected_rule("andcommute", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LEFT);
+    let and = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    let unshift = fd.vbank().get(in_of(&fd, and, 1).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, unshift), OpCode::CPUI_INT_RIGHT);
+    for (operation, slot, value) in [(op, 1, 8), (unshift, 0, 0xff00), (unshift, 1, 8)] {
+        let constant = fd.vbank().get(in_of(&fd, operation, slot).unwrap()).unwrap();
+        assert!(constant.is_constant());
+        assert_eq!(constant.get_offset(), value);
+    }
+}
+
+#[test]
+fn andcompare_selected_rule_moves_mask_to_unextended_input() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 2);
+    let (extended, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_ZEXT, &[v]);
+    let mask = mk_const(&mut fd, 4, 0xff);
+    let (masked, _) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[extended, mask]);
+    let zero = mk_const(&mut fd, 4, 0);
+    let (_, op) = mk_written(&mut fd, bl, 0x30, 1, OpCode::CPUI_INT_EQUAL, &[masked, zero]);
+    assert_eq!(apply_selected_rule("andcompare", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
+    let narrowed = in_of(&fd, op, 0).unwrap();
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_size(), 2);
+    let and = fd.vbank().get(narrowed).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, and, 1).unwrap()), 0xff);
+    let zero = in_of(&fd, op, 1).unwrap();
+    assert_eq!(const_val(&fd, zero), 0);
+    assert_eq!(fd.vbank().get(zero).unwrap().get_size(), 2);
+}
+
+#[test]
+fn andpiece_selected_rule_discards_masked_high_piece() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let hi = mk_reg(&mut fd, 0x100, 2);
+    let lo = mk_reg(&mut fd, 0x104, 2);
+    let (piece, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_PIECE, &[hi, lo]);
+    let mask = mk_const(&mut fd, 4, 0xffff);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[piece, mask]);
+    assert_eq!(apply_selected_rule("andpiece", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
+    assert_eq!(const_val(&fd, in_of(&fd, op, 1).unwrap()), 0xffff);
+    let ext = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, ext), OpCode::CPUI_INT_ZEXT);
+    assert_eq!(in_of(&fd, ext, 0), Some(lo));
+}
+
+#[test]
+fn bitundistribute_selected_rule_factors_shared_arithmetic_shift() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let a = mk_reg(&mut fd, 0x100, 4);
+    let b = mk_reg(&mut fd, 0x104, 4);
+    let sa = mk_const(&mut fd, 4, 3);
+    let (left, _) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_SRIGHT, &[a, sa]);
+    let (right, _) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[b, sa]);
+    let (_, op) = mk_written(&mut fd, bl, 0x30, 4, OpCode::CPUI_INT_OR, &[left, right]);
+    assert_eq!(apply_selected_rule("bitundistribute", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SRIGHT);
+    assert_eq!(const_val(&fd, in_of(&fd, op, 1).unwrap()), 3);
+    let or = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, or), OpCode::CPUI_INT_OR);
+    assert_eq!(in_of(&fd, or, 0), Some(a));
+    assert_eq!(in_of(&fd, or, 1), Some(b));
+}
+
+#[test]
+fn leftright_selected_rule_replaces_paired_shifts_with_sign_extension() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 4);
+    let sa = mk_const(&mut fd, 4, 16);
+    let (shifted, left) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[shifted, sa]);
+    assert_eq!(apply_selected_rule("leftright", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SEXT);
+    assert_eq!(code_of(&fd, left), OpCode::CPUI_SUBPIECE);
+    assert_eq!(in_of(&fd, left, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, left, 1).unwrap()), 0);
+    let narrowed = in_of(&fd, op, 0).unwrap();
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_size(), 2);
+    assert_eq!(fd.vbank().get(narrowed).unwrap().get_def(), Some(left));
+}
+
+#[test]
+fn shiftcompare_selected_rule_preserves_information_loss_mask() {
+    let mut fd = build_fd();
+    let bl = mk_block(&mut fd);
+    let v = mk_reg(&mut fd, 0x100, 1);
+    let sa = mk_const(&mut fd, 1, 4);
+    let (shifted, _) = mk_written(&mut fd, bl, 0x10, 1, OpCode::CPUI_INT_LEFT, &[v, sa]);
+    let constant = mk_const(&mut fd, 1, 0x30);
+    let (_, op) = mk_written(&mut fd, bl, 0x20, 1, OpCode::CPUI_INT_EQUAL, &[shifted, constant]);
+    assert_eq!(apply_selected_rule("shiftcompare", &mut fd), 1);
+    assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
+    assert_eq!(const_val(&fd, in_of(&fd, op, 1).unwrap()), 3);
+    let and = fd.vbank().get(in_of(&fd, op, 0).unwrap()).unwrap().get_def().unwrap();
+    assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_AND);
+    assert_eq!(in_of(&fd, and, 0), Some(v));
+    assert_eq!(const_val(&fd, in_of(&fd, and, 1).unwrap()), 0x0f);
+}
+
 // -----------------------------------------------------------------------------
 // Fixture
 // -----------------------------------------------------------------------------

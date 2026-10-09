@@ -4354,6 +4354,34 @@ impl CloneBlockOps {
 mod tests {
     use std::rc::Rc;
 
+    mod config_ir_regressions {
+        use super::{Funcdata, OpCode, TypeOp, addr, build_fd, pcodeop_flags, ramspace};
+        #[test]
+        fn jumptable_recoverable_pipeline_failure_does_not_publish_trial() {
+            use crate::flow::VisitedMap;
+            use crate::jumptable::RecoveryMode;
+            use kuna_base::error::KunaError;
+            let mut fd = build_fd();
+            let pc = addr(&ramspace(&fd), 0x1000);
+            let op = fd.obank_mut().create_at(1, pc);
+            fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_BRANCHIND, pcodeop_flags::branch, "BRANCHIND"));
+            let target = fd.new_constant(8, 0x2000);
+            fd.op_set_input(op, target, 0).unwrap();
+            let mut visits = 0;
+            let mut pipeline = |_: &mut Funcdata, _: &VisitedMap| {
+                visits += 1;
+                Err(KunaError::lowlevel("unrecoverable switch expression"))
+            };
+            let mut shared = None;
+            let result = fd.recover_jump_table_flow(op, false, &VisitedMap::new(), &mut pipeline, &mut shared);
+            assert!(matches!(result, Err(RecoveryMode::FailNormal)));
+            assert_eq!(visits, 1, "the real partial pipeline must be reached");
+            assert_eq!(fd.num_jump_tables(), 0);
+            assert!(shared.is_none());
+            assert!(fd.obank().get(op).is_some(), "caller flow remains available after recoverable failure");
+        }
+    }
+
     use kuna_base::address::Address;
     use kuna_base::space::{
         addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace,

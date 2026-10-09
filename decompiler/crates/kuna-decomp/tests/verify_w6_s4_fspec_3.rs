@@ -425,3 +425,378 @@ fn fspec3_check_input_join_reaches_funcproto() {
     assert_eq!(r_his, fc.check_input_join(1, true, 4, 4));
     assert_eq!(r_los, fc.check_input_join(1, false, 4, 4));
 }
+
+#[test]
+fn fspec3_force_set_locked_register_reuses_committed_operand() {
+    let mut fd = fcs_fd();
+    let reg = fcs_reg(&fd);
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALL);
+    let dest = fd.new_constant(8, 0x2000);
+    let regvn = fd.new_varnode(4, &addr(&reg, 0), None);
+    fd.op_set_input(call, dest, 0).unwrap();
+    fd.op_set_input(call, regvn, 1).unwrap();
+    let model = Rc::new(std_model(fd.get_arch().manage()));
+    let voidt = Rc::new(Datatype::new(1, type_metatype::TYPE_VOID));
+    let mut fc = FuncCallSpecs::new(call, Address::default());
+    fc.proto_mut().set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    fc.get_active_input().register_trial(&addr(&reg, 0), 4);
+    fc.get_active_input().get_trial_mut(0).set_slot(1);
+    let mut restricted = FuncProto::new();
+    restricted.set_internal(model, voidt);
+    restricted.set_param(0, "a", &ParameterPieces {
+        addr: addr(&reg, 0),
+        type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))),
+        flags: kuna_decomp::fspec::parameter_pieces_flags::TYPELOCK,
+    });
+    restricted.set_input_lock(true);
+    let mut log = kuna_decomp::kuna_restartlog::RestartLog::new();
+    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+    assert!(!fd.has_restart_pending());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(dest));
+    assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(regvn));
+    assert!(fc.proto().is_input_locked());
+    let site = fd.obank().get(call).unwrap().get_addr();
+    let pinned = fd.get_override().find_proto_override(site).unwrap().prototype()
+        .expect("force_set must retain the recovered full prototype");
+    assert_eq!(pinned.get_param(0).unwrap().get_address(), addr(&reg, 0));
+    assert_eq!(pinned.get_param(0).unwrap().get_size(), 4);
+}
+
+#[test]
+fn site_authority_keeps_input_and_output_locks_independent_across_edits() {
+    use kuna_decomp::fspec::parameter_pieces_flags as pf;
+    let mut fd = fcs_fd();
+    let reg = fcs_reg(&fd);
+    let model = Rc::new(std_model(fd.get_arch().manage()));
+    let voidt = Rc::new(Datatype::new(1, type_metatype::TYPE_VOID));
+    let mut callee = FuncProto::new();
+    callee.set_internal(Rc::clone(&model), Rc::clone(&voidt));
+    callee.set_param(0, "authored", &ParameterPieces {
+        addr: addr(&reg, 0),
+        type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))),
+        flags: pf::TYPELOCK | pf::NAMELOCK,
+    });
+    callee.set_input_lock(true);
+    callee.set_output_lock(false);
+    let mut sites = Vec::new();
+    for offset in [0x1010, 0x1020] {
+        let call = fcs_new_op(&mut fd, 2, offset, OpCode::CPUI_CALL);
+        let dest = fd.new_constant(8, 0x2000);
+        let value = fd.new_varnode(4, &addr(&reg, 0), None);
+        fd.op_set_input(call, dest, 0).unwrap();
+        fd.op_set_input(call, value, 1).unwrap();
+        let mut fc = FuncCallSpecs::new(call, addr(&fcs_ram(&fd), 0x2000));
+        fc.proto_mut().set_internal(Rc::clone(&model), Rc::clone(&voidt));
+        fc.get_active_input().register_trial(&addr(&reg, 0), 4);
+        fc.get_active_input().get_trial_mut(0).set_slot(1);
+        sites.push(fc);
+    }
+    let mut log = kuna_decomp::kuna_restartlog::RestartLog::new();
+    sites[0].force_set(&mut fd, &callee, &mut log).unwrap();
+    assert!(sites[0].proto().is_input_locked());
+    assert!(!sites[0].proto().is_output_locked());
+    assert!(!sites[1].proto().is_input_locked());
+    let mut edited = FuncProto::new();
+    edited.copy(&callee);
+    edited.set_param(0, "renamed", &ParameterPieces {
+        addr: addr(&reg, 0),
+        type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_UINT))),
+        flags: pf::TYPELOCK | pf::NAMELOCK,
+    });
+    sites[0].force_set(&mut fd, &edited, &mut log).unwrap();
+    let site = fd.obank().get(sites[0].get_op()).unwrap().get_addr();
+    let pinned = fd.get_override().find_proto_override(site).unwrap().prototype()
+        .expect("edited callsite override must retain the recovered full prototype");
+    assert_eq!(pinned.get_param(0).unwrap().get_name(), "renamed");
+    assert_eq!(pinned.get_param(0).unwrap().get_type().unwrap().get_metatype(), type_metatype::TYPE_UINT);
+    assert_eq!(callee.get_param(0).unwrap().get_name(), "authored");
+    assert!(callee.is_input_locked());
+    assert!(!callee.is_output_locked());
+    assert!(!sites[1].proto().is_input_locked());
+}
+
+fn input_transfer_fixture(big_endian: bool, trial_size: int4, operand_size: int4)
+    -> (Funcdata, FuncCallSpecs, Address, VarnodeId)
+{
+    let mut manager = fcs_manager();
+    let register = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "physical", big_endian, 8, 1, 5, 0, 1, 1,
+    ));
+    manager.insert_space(register.clone()).unwrap();
+    manager.insert_space(Rc::new(kuna_base::space::JoinSpace::new(6, big_endian))).unwrap();
+    manager.insert_space(Rc::new(kuna_base::space::FspecSpace::new(7))).unwrap();
+    let arch = Rc::new(ArchContext::new(manager));
+    let ram = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
+    let mut fd = Funcdata::new("caller", "caller", arch, addr(&ram, 0x1000), 0x10000000, 0x40).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let copy = fcs_new_op(&mut fd, 1, 0x1008, OpCode::CPUI_COPY);
+    let value = fd.new_constant(operand_size, 0x123456789abcdef0);
+    fd.op_set_input(copy, value, 0).unwrap();
+    let source = fd.new_unique_out(operand_size, copy).unwrap();
+    fd.op_insert_end(copy, block);
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALLIND);
+    let target = fd.new_constant(8, 0x2000);
+    fd.op_set_input(call, target, 0).unwrap();
+    fd.op_set_input(call, source, 1).unwrap();
+    fd.op_insert_end(call, block);
+    let mut fc = fcs_with_std_model(fd.get_arch().manage(), call);
+    let physical = addr(&register, 0x38);
+    fc.get_active_input().register_trial(&physical, trial_size);
+    (fd, fc, physical, source)
+}
+
+fn set_transfer_parameter(proto: &mut FuncProto, slot: int4, storage: &Address, size: int4) {
+    proto.set_param(slot, "bytes", &ParameterPieces {
+        addr: storage.clone(),
+        type_: Some(Rc::new(Datatype::new(size, type_metatype::TYPE_UINT))),
+        flags: kuna_decomp::fspec::parameter_pieces_flags::TYPELOCK,
+    });
+}
+
+fn transfer_value(fd: &Funcdata, id: VarnodeId) -> u64 {
+    let vn = fd.vbank().get(id).unwrap();
+    let value = if vn.is_constant() { vn.get_offset() } else {
+        let op = fd.obank().get(vn.get_def().unwrap()).unwrap();
+        let first = transfer_value(fd, op.get_in(0).unwrap());
+        match op.code() {
+            OpCode::CPUI_COPY => first,
+            OpCode::CPUI_SUBPIECE => first >> (8 * transfer_value(fd, op.get_in(1).unwrap())),
+            OpCode::CPUI_INT_ADD => first.wrapping_add(transfer_value(fd, op.get_in(1).unwrap())),
+            code => panic!("unexpected argument expression {code:?}"),
+        }
+    };
+    if vn.get_size() >= 8 { value } else { value & ((1u64 << (8 * vn.get_size())) - 1) }
+}
+
+#[test]
+fn locked_input_slices_preserve_physical_bytes_through_late_commit() {
+    for big_endian in [false, true] {
+        for force in [false, true] {
+            for (offset, size, trial_size, operand_size, little, big) in [
+                (0, 4, 8, 8, 0x9abcdef0, 0x12345678),
+                (4, 4, 8, 8, 0x12345678, 0x9abcdef0),
+                (2, 2, 8, 8, 0x9abc, 0x5678),
+                (0, 8, 8, 8, 0x123456789abcdef0, 0x123456789abcdef0),
+                (0, 2, 4, 8, 0xdef0, 0x9abc),
+            ] {
+                let (mut fd, mut fc, physical, original) = input_transfer_fixture(big_endian, trial_size, operand_size);
+                let mut restricted = FuncProto::new();
+                restricted.copy(fc.proto());
+                let storage = &physical + offset;
+                set_transfer_parameter(&mut restricted, 0, &storage, size);
+                restricted.set_input_lock(true);
+                let mut log = kuna_decomp::kuna_restartlog::RestartLog::new();
+                if force { fc.force_set(&mut fd, &restricted, &mut log).unwrap(); }
+                else {
+                    let target = addr(&fcs_ram(&fd), 0x2000);
+                    fc.deindirect(&mut fd, target, "selected_bytes", &restricted, false, false, &mut log).unwrap();
+                }
+                assert!(!fd.has_restart_pending());
+                let selected = fd.obank().get(fc.get_op()).unwrap().get_in(1).unwrap();
+                assert_eq!(transfer_value(&fd, selected), if big_endian { big } else { little });
+                assert_eq!(fd.vbank().get(selected).unwrap().get_size(), size);
+                if size == operand_size { assert_eq!(selected, original); }
+                assert_eq!(fc.proto().get_param(0).unwrap().get_address(), storage);
+                if force {
+                    let site = fd.obank().get(fc.get_op()).unwrap().get_addr();
+                    let pinned = fd.get_override().find_proto_override(site).unwrap().prototype()
+                        .expect("committed slice override must retain source storage");
+                    assert_eq!(pinned.get_param(0).unwrap().get_address(), storage);
+                    let mut other = FuncProto::new();
+                    other.copy(&restricted);
+                    set_transfer_parameter(&mut other, 0, &physical, 1);
+                    fc.force_set(&mut fd, &other, &mut log).unwrap();
+                    assert_eq!(fd.obank().get(fc.get_op()).unwrap().get_in(1), Some(selected));
+                    assert_eq!(fc.proto().get_param(0).unwrap().get_address(), storage);
+                    assert_eq!(fc.proto().get_param(0).unwrap().get_size(), size);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn locked_inputs_select_distinct_parts_of_one_trial_and_nonlow_join_piece() {
+    for joined in [false, true] {
+        let (mut fd, mut fc, physical, _) = input_transfer_fixture(false, 8, 8);
+        let (low, high) = if joined {
+            let low = &physical + 0x40i64;
+            let high = &physical - 0x20i64;
+            let pieces = [high.clone(), low.clone()].map(|a| kuna_base::space::VarnodeStorage {
+                space: a.get_space().cloned(), offset: a.get_offset(), size: 4,
+            });
+            let join = fd.get_arch().manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+            fc.get_active_input().clear();
+            fc.get_active_input().register_trial(&join, 8);
+            (low, high)
+        } else { (physical.clone(), &physical + 4i64) };
+        let mut restricted = FuncProto::new();
+        restricted.copy(fc.proto());
+        set_transfer_parameter(&mut restricted, 0, &high, 4);
+        set_transfer_parameter(&mut restricted, 1, &low, 4);
+        restricted.set_input_lock(true);
+        fc.force_set(&mut fd, &restricted, &mut kuna_decomp::kuna_restartlog::RestartLog::new()).unwrap();
+        assert!(!fd.has_restart_pending());
+        let call = fd.obank().get(fc.get_op()).unwrap();
+        assert_eq!(transfer_value(&fd, call.get_in(1).unwrap()), 0x12345678);
+        assert_eq!(transfer_value(&fd, call.get_in(2).unwrap()), 0x9abcdef0);
+        assert_eq!(fc.proto().get_param(0).unwrap().get_address(), high);
+        assert_eq!(fc.proto().get_param(1).unwrap().get_address(), low);
+    }
+}
+
+#[test]
+fn unavailable_locked_input_transfer_preserves_operands_and_persists_restart() {
+    for reason in ["narrower", "space", "straddle", "join_straddle", "stripped", "missing", "destination", "stack"] {
+        let operand_size = if reason == "narrower" { 4 } else { 8 };
+        let (mut fd, mut fc, physical, original) = input_transfer_fixture(false, 8, operand_size);
+        let call = fc.get_op();
+        let parameter = match reason {
+            "space" => addr(&fcs_ram(&fd), physical.get_offset()),
+            "straddle" => &physical + 7i64,
+            "join_straddle" => {
+                let pieces = [physical.clone(), &physical + 0x40i64].map(|a| kuna_base::space::VarnodeStorage {
+                    space: a.get_space().cloned(), offset: a.get_offset(), size: 4,
+                });
+                let join = fd.get_arch().manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+                fc.get_active_input().clear();
+                fc.get_active_input().register_trial(&join, 8);
+                &physical + 3i64
+            }
+            "stack" => addr(&fcs_stack(&fd), 0x28),
+            _ => physical,
+        };
+        if reason == "stripped" { fc.get_active_input().get_trial_mut(0).mark_no_use(); }
+        if reason == "missing" { fd.op_unset_input(call, 1); }
+        if reason == "destination" { fd.op_unset_input(call, 0); }
+        let destination = fd.obank().get(call).unwrap().get_in(0);
+        let argument = fd.obank().get(call).unwrap().get_in(1);
+        let mut restricted = FuncProto::new();
+        restricted.copy(fc.proto());
+        set_transfer_parameter(&mut restricted, 0, &parameter, 2);
+        restricted.set_input_lock(true);
+        fc.force_set(&mut fd, &restricted, &mut kuna_decomp::kuna_restartlog::RestartLog::new()).unwrap();
+        assert!(fd.has_restart_pending(), "{reason}");
+        assert_eq!(fd.obank().get(call).unwrap().get_in(0), destination);
+        assert_eq!(fd.obank().get(call).unwrap().get_in(1), argument);
+        assert_eq!(fd.vbank().get(original).unwrap().get_size(), operand_size);
+        assert_eq!(fc.proto().num_params(), 0, "failed staging must not partially replace the prototype");
+        let site = fd.obank().get(call).unwrap().get_addr();
+        let pinned = fd.get_override().find_proto_override(site).unwrap().prototype()
+            .expect("failed staging must preserve the requested prototype for restart");
+        assert!(pinned.is_input_locked());
+        assert_eq!(pinned.get_param(0).unwrap().get_address(), parameter);
+        assert_eq!(pinned.get_param(0).unwrap().get_size(), 2);
+    }
+}
+
+#[test]
+fn func_call_specs_unmodeled_locked_input_without_trial_requires_restart() {
+    let mut fd = fcs_fd();
+    let call = fcs_new_op(&mut fd, 1, 0x1010, OpCode::CPUI_CALLIND);
+    let target = fd.new_constant(8, 0x2000);
+    fd.op_set_input(call, target, 0).unwrap();
+    let mut fc = FuncCallSpecs::new(call, Address::default());
+    let mut restricted = FuncProto::new();
+    restricted.set_internal(Rc::new(std_model(fd.get_arch().manage())),
+        Rc::new(Datatype::new(1, type_metatype::TYPE_VOID)));
+    set_transfer_parameter(&mut restricted, 0, &addr(&fcs_reg(&fd), 0x10), 4);
+    restricted.set_input_lock(true);
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    assert!(!fc.late_restriction(&fd, &restricted, &mut inputs, &mut outputs).unwrap());
+    assert!(!fc.proto().has_model());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
+    let mut log = kuna_decomp::kuna_restartlog::RestartLog::new();
+    fc.force_set(&mut fd, &restricted, &mut log).unwrap();
+    assert!(fd.has_restart_pending());
+    assert!(!log.is_empty_for(&fd));
+    assert!(!fc.proto().has_model());
+    assert!(fc.proto().is_input_locked());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
+    let site = fd.obank().get(call).unwrap().get_addr();
+    let pinned = fd.get_override().find_proto_override(site).unwrap().prototype()
+        .expect("unmodeled call restart must retain the requested source prototype");
+    assert_eq!(pinned.num_params(), 1);
+    assert_eq!(pinned.get_param(0).unwrap().get_address(), restricted.get_param(0).unwrap().get_address());
+}
+
+#[test]
+fn finalized_repeated_arguments_preserve_occurrences_and_physical_storage() {
+    let mut fd = fcs_fd();
+    let reg = fcs_reg(&fd);
+    let call = fcs_new_op(&mut fd, 4, 0x1010, OpCode::CPUI_CALL);
+    let target = fd.new_constant(8, 0x2000);
+    let shared = fd.new_varnode(4, &addr(&reg, 0x100), None);
+    let shared = fd.set_input_varnode(shared).unwrap();
+    let raw = fd.new_constant(4, 0x55);
+    fd.op_set_all_input(call, &[target, shared, raw, shared]).unwrap();
+    let mut fc = fcs_with_std_model(fd.get_arch().manage(), call);
+    fc.init_active_input();
+    for (index, storage) in [0x10, 0x18, 0x20].into_iter().enumerate() {
+        fc.get_active_input().register_trial(&addr(&reg, storage), 4);
+        if index != 1 {
+            fc.get_active_input().get_trial_mut(index as i32).mark_used();
+        }
+    }
+    fd.push_call_specs(fc);
+    let mut fc = fd.replace_call_specs(0);
+    kuna_decomp::funcdata_callsite::build_input_from_trials(&mut fc, &mut fd);
+    fc.clear_active_input();
+    fd.restore_call_specs_at(0, fc);
+    let fc = fd.get_call_specs(0);
+    let op = fd.obank().get(call).unwrap();
+    assert_eq!(op.num_input(), 3);
+    assert_eq!(op.get_in(0), Some(target));
+    assert_eq!(op.get_in(1), Some(shared));
+    assert_eq!(op.get_in(2), Some(shared));
+    assert!(!fc.is_input_active());
+    assert_eq!(fc.active_input().get_num_trials(), 2);
+    for (index, (slot, storage)) in [(1, 0x10), (2, 0x20)].into_iter().enumerate() {
+        let trial = fc.active_input().get_trial(index as i32);
+        assert_eq!(trial.get_slot(), slot);
+        assert_eq!(trial.get_address(), &addr(&reg, storage));
+    }
+    assert_eq!(fc.final_input_storage(), &[(addr(&reg, 0x10), 4), (addr(&reg, 0x20), 4)]);
+}
+
+#[test]
+fn narrowing_joined_call_output_restarts_without_invalid_extensions() {
+    let (mut fd, mut fc, physical, old_input) = input_transfer_fixture(false, 8, 8);
+    let call = fc.get_op();
+    let low = &physical + 0x40i64;
+    let high = &physical - 0x20i64;
+    let pieces = [high.clone(), low.clone()].map(|a| kuna_base::space::VarnodeStorage {
+        space: a.get_space().cloned(), offset: a.get_offset(), size: 8,
+    });
+    let join = fd.get_arch().manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr();
+    let old_output = fcs_out(&mut fd, call, join.get_space().unwrap().clone(), join.get_offset(), 16);
+    let mut restricted = FuncProto::new();
+    restricted.copy(fc.proto());
+    restricted.set_output(&ParameterPieces {
+        addr: low.clone(),
+        type_: Some(Rc::new(Datatype::new(8, type_metatype::TYPE_INT))),
+        flags: 0,
+    });
+    restricted.set_output_lock(true);
+    set_transfer_parameter(&mut restricted, 0, &(&physical + 4i64), 4);
+    restricted.set_input_lock(true);
+    let mut inputs = Vec::new();
+    let mut outputs = Vec::new();
+    assert!(!fc.late_restriction(&fd, &restricted, &mut inputs, &mut outputs).unwrap());
+    assert_eq!(outputs, vec![old_output]);
+    fc.force_set(&mut fd, &restricted, &mut kuna_decomp::kuna_restartlog::RestartLog::new()).unwrap();
+    assert!(fd.has_restart_pending());
+    assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(old_input));
+    assert_eq!(fd.vbank().get(old_input).unwrap().get_size(), 8);
+    assert_eq!(fd.obank().get(call).unwrap().get_out(), Some(old_output));
+    assert_eq!(fd.vbank().get(old_output).unwrap().get_size(), 16);
+    assert_eq!(fd.vbank().get(old_output).unwrap().get_addr(), &join);
+    let pinned = fd.get_override().find_proto_override(fd.obank().get(call).unwrap().get_addr())
+        .unwrap().prototype().expect("output narrowing restart must retain the requested prototype");
+    assert!(pinned.is_output_locked());
+    assert_eq!(pinned.get_output().get_address(), low);
+    assert_eq!(pinned.get_output().get_size(), 8);
+}
+

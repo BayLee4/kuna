@@ -2,6 +2,55 @@
 
 use super::*;
 
+mod config_ir_regressions {
+    use super::{AddrSpaceManager, Decoder, ELEM_MAXINSTRUCTION, IdRegistry, OptionDatabase, RecordingContext, XmlDecode, register_option_elements};
+    #[test]
+    fn strict_decode_rejects_known_errors_without_applying_later_entries() {
+        for invalid in [
+            "<maxinstruction>-1</maxinstruction>",
+            "<maxinstruction><future>1</future></maxinstruction>",
+            "<maxinstruction><param1>1</param1><param1>2</param1></maxinstruction>",
+            "<setlanguage>java-language</setlanguage>",
+        ] {
+            let xml = format!("<optionslist><maxinstruction>777</maxinstruction>{invalid}\
+                <jumptablemax>512</jumptablemax></optionslist>");
+            let manager = AddrSpaceManager::new();
+            let mut registry = IdRegistry::with_base_ids();
+            register_option_elements(&mut registry);
+            let mut decoder = XmlDecode::new(&manager, &registry);
+            decoder.ingest_stream(xml.as_bytes()).unwrap();
+            let mut context = RecordingContext::default();
+            assert!(OptionDatabase::new().decode(&mut decoder, &mut context).is_err(), "{invalid}");
+            assert_eq!(context.max_instructions, 777);
+            assert_eq!(context.max_jumptable_size, 0);
+            OptionDatabase::new().set(&mut context, ELEM_MAXINSTRUCTION.get_id(), "23", "", "").unwrap();
+            assert_eq!(context.max_instructions, 23);
+        }
+    }
+
+    #[test]
+    fn lenient_decode_reports_known_application_errors_and_continues() {
+        for invalid in [
+            "<maxinstruction>-1</maxinstruction>",
+            "<setlanguage>java-language</setlanguage>",
+        ] {
+            let xml = format!("<optionslist><maxinstruction>777</maxinstruction>{invalid}\
+                <jumptablemax>512</jumptablemax></optionslist>");
+            let manager = AddrSpaceManager::new();
+            let mut registry = IdRegistry::with_base_ids();
+            register_option_elements(&mut registry);
+            let mut decoder = XmlDecode::new(&manager, &registry);
+            decoder.ingest_stream(xml.as_bytes()).unwrap();
+            let mut context = RecordingContext::default();
+            let warnings = OptionDatabase::new().decode_lenient(&mut decoder, &mut context).unwrap();
+            assert_eq!(warnings.len(), 1, "{invalid}: {warnings:?}");
+            assert!(warnings[0].starts_with("Warning"), "{warnings:?}");
+            assert_eq!(context.max_instructions, 777);
+            assert_eq!(context.max_jumptable_size, 512);
+        }
+    }
+}
+
 use kuna_base::marshal::{IdRegistry, XmlDecode};
 use kuna_base::space::AddrSpaceManager;
 

@@ -294,3 +294,29 @@ fn resolved_union_update_pointer_identity_semantics() {
     assert!(!res.update(&op_field0), "locked + differing fieldNum -> rejected");
     let _ = int_b;
 }
+
+#[test]
+fn resolved_union_update_nominal_type_and_lock_semantics() {
+    use kuna_decomp::dtype::TypeFactory;
+    let factory = TypeFactoryImpl::new();
+    factory.set_default_alignment_map();
+    factory.set_max_basetype_size(16);
+    let integer = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let first = factory.get_typedef(&integer, "first_int", 0, 0).unwrap();
+    let second = factory.get_typedef(&integer, "second_int", 0, 0).unwrap();
+    let union_t = make_union(4, &[(0, Rc::clone(&integer))]);
+    let mut result = ResolvedUnion::new(Rc::clone(&union_t));
+    let mut candidate = ResolvedUnion::new(Rc::clone(&union_t));
+    candidate.set_resolve(Rc::clone(&first));
+    assert!(result.update(&candidate));
+    assert_eq!(result.get_datatype().get_name(), "first_int");
+    assert!(!result.update(&candidate));
+    candidate.set_resolve(second);
+    assert!(result.update(&candidate));
+    assert_eq!(result.get_datatype().get_name(), "second_int");
+    result.set_lock(true);
+    let field = ResolvedUnion::new_field(union_t, 0, &factory).unwrap();
+    assert!(!result.update(&field));
+    assert_eq!(result.get_field_num(), -1);
+    assert_eq!(result.get_datatype().get_name(), "second_int");
+}

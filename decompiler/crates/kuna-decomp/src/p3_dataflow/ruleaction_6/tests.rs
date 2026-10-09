@@ -32,6 +32,33 @@ use crate::dtype::{type_metatype, Datatype};
 use crate::context::{ArchContext, OpId, TypeOp, VarnodeId};
 use crate::varnode::{varnode_flags, DefOpInfo, VarnodeBank};
 
+mod config_ir_regressions {
+    use super::{OpCode, RuleMultNegOne, build_fd, give_output, mk_const, mk_op, set_in};
+    use crate::action::{Action, ActionPool, ActionContext, ActionGroupList, RuleState};
+
+    #[test]
+    fn registered_group_controls_multnegone_transform() {
+        let mut fd = build_fd();
+        let op = mk_op(&mut fd, 2, 0x100, OpCode::CPUI_INT_MULT);
+        let x = mk_const(&mut fd, 4, 7);
+        let minus_one = mk_const(&mut fd, 4, 0xffff_ffff);
+        set_in(&mut fd, op, x, 0);
+        set_in(&mut fd, op, minus_one, 1);
+        give_output(&mut fd, op, 0x20, 4);
+        let mut pool = ActionPool::new(0, "cleanup");
+        pool.add_rule(
+            RuleState::new("registered", 0, "multnegone"),
+            Box::new(RuleMultNegOne::new("registered")),
+        );
+        assert!(pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).is_none());
+        let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["registered"])).unwrap();
+        assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
+        assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_2COMP);
+        assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(x));
+        assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
+    }
+}
+
 // -----------------------------------------------------------------------------
 // fixtures
 // -----------------------------------------------------------------------------

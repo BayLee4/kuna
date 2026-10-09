@@ -8926,6 +8926,405 @@ mod tests {
         }
     }
 
+    fn decode_regression_type(
+        f: &TypeFactoryImpl,
+        manager: &kuna_base::space::AddrSpaceManager,
+        text: &str,
+    ) -> KunaResult<Rc<Datatype>> {
+        let mut registry = kuna_base::marshal::IdRegistry::with_base_ids();
+        register_type_wire_ids(&mut registry);
+        crate::infra::remote_provider::register_remote_provider_ids(&mut registry);
+        registry.register_element(&crate::prettyprint::ids::ELEM_BITFIELD);
+        registry.register_element(&kuna_base::marshal::ElementId::new("param", 166));
+        let document = kuna_base::xml::xml_tree(text.as_bytes())?;
+        let root = document.get_root().clone();
+        let mut decoder = kuna_base::marshal::XmlDecode::new_with_root(manager, &registry, &root, 0);
+        f.decode_type(&mut decoder)
+    }
+
+    fn encoded_regression_type_identity(
+        value: &Datatype,
+        manager: &kuna_base::space::AddrSpaceManager,
+    ) -> (u32, Option<u64>, Option<i64>) {
+        use kuna_base::marshal::*;
+        let mut bytes = Vec::new();
+        value.encode_ref(&mut PackedEncode::new(&mut bytes)).unwrap();
+        let mut decoder = PackedDecode::new(manager);
+        decoder.ingest_stream(&bytes).unwrap();
+        let element = decoder.open_element().unwrap();
+        let (mut source_id, mut size) = (None, None);
+        loop {
+            let attribute = decoder.get_next_attribute_id().unwrap();
+            if attribute == 0 { break; }
+            if attribute == ATTRIB_ID.get_id() {
+                source_id = Some(decoder.read_unsigned_integer().unwrap());
+            } else if attribute == ATTRIB_SIZE.get_id() {
+                size = Some(decoder.read_signed_integer().unwrap());
+            }
+        }
+        (element, source_id, size)
+    }
+
+
+    #[test]
+    fn by_value_forward_alias_and_array_cycles_reject_then_retry_valid_fields() {
+        let f = factory();
+        let node = f.kuna_declare_record("Cycle", false).unwrap();
+        let alias = f.get_typedef(&node, "CycleAlias", 0, 0).unwrap();
+        let array = f.get_type_array(2, Rc::clone(&alias)).unwrap();
+        for field in [Rc::clone(&node), alias, array] {
+            assert!(f.assign_raw_fields_struct(
+                &node, vec![TypeField::new(0, -1, "cycle", field)], vec![],
+            ).is_err());
+            assert!(f.find_by_name("Cycle").unwrap().unwrap().is_incomplete());
+        }
+        let value = f.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let complete = f.assign_raw_fields_struct(
+            &node, vec![TypeField::new(0, -1, "value", value)], vec![],
+        ).unwrap();
+        assert!(!complete.is_incomplete());
+        assert_eq!((complete.get_size(), complete.get_field(0).unwrap().offset), (4, 0));
+    }
+
+    #[test]
+    fn sized_opaque_source_stays_incomplete_until_its_fields_arrive() {
+        let f = factory();
+        let manager = kuna_base::space::AddrSpaceManager::new();
+        let shell = decode_regression_type(&f, &manager,
+            r#"<type name="Opaque" id="301" size="8" alignment="8" metatype="struct" incomplete="true"/>"#).unwrap();
+        assert_eq!((shell.get_size(), shell.get_alignment()), (8, 8));
+        assert!(shell.is_incomplete(), "known extent is not a completed definition");
+        let pointer = f.get_type_pointer(8, Rc::clone(&shell), 1).unwrap();
+        let alias = f.get_typedef(&shell, "OpaqueAlias", 302, 0).unwrap();
+        let alias_pointer = f.get_type_pointer(8, alias, 1).unwrap();
+        assert!(pointer.get_ptr_to().unwrap().is_incomplete());
+        let complete = decode_regression_type(&f, &manager,
+            r#"<type name="Opaque" id="301" size="8" alignment="8" metatype="struct"><field name="value" offset="0"><type name="" metatype="int" size="4"/></field></type>"#).unwrap();
+        assert!(!complete.is_incomplete());
+        for seen in [pointer.get_ptr_to().unwrap(), alias_pointer.get_ptr_to().unwrap()] {
+            assert!(!seen.is_incomplete());
+            assert_eq!((seen.get_size(), seen.get_alignment()), (8, 8));
+            assert_eq!(seen.get_field(0).unwrap().name, "value");
+        }
+    }
+
+    #[test]
+    fn same_spelled_source_records_and_aliases_keep_nominal_identity() {
+        let f = factory();
+        let m = kuna_base::space::AddrSpaceManager::new();
+        let record = |id| format!(
+            r#"<type name="Source" id="{id}" metatype="struct" size="4" alignment="4"><field name="value" id="71" offset="0"><type name="" metatype="int" size="4"/></field></type>"#
+        );
+        let a = decode_regression_type(&f, &m, &record(101)).unwrap();
+        let b = decode_regression_type(&f, &m, &record(102)).unwrap();
+        let aa = f.get_typedef(&a, "Alias", 201, 0).unwrap();
+        let ab = f.get_typedef(&b, "Alias", 202, 0).unwrap();
+        assert_eq!(a.get_name(), b.get_name());
+        assert_eq!(a.get_size(), b.get_size());
+        assert_ne!(a.get_id(), b.get_id());
+        for (base, alias) in [(&a, &aa), (&b, &ab)] {
+            assert_eq!(alias.get_typedef().unwrap().get_id(), base.get_id());
+            let pointer = f.get_type_pointer(8, Rc::clone(alias), 1).unwrap();
+            let seen = pointer.get_ptr_to().unwrap();
+            assert_eq!(seen.get_id(), alias.get_id());
+            assert_eq!(seen.get_field(0).unwrap().name, "value");
+        }
+        let pa = f.get_type_pointer(8, a, 1).unwrap();
+        let pb = f.get_type_pointer(8, b, 1).unwrap();
+        let ab = pa.compare_dependency(&pb).unwrap();
+        assert_ne!(ab, 0);
+        assert_eq!(ab, -pb.compare_dependency(&pa).unwrap());
+    }
+
+    #[test]
+    fn explicit_host_alias_keeps_supplied_identity_and_original_layout() {
+        let f = factory();
+        let shell = f.get_type_struct("Node").unwrap();
+        let node = f.set_fields_struct_raw(&shell, vec![], vec![], 8, 8, 0).unwrap();
+        let explicit = f.get_typedef(&node, "Node", 0x1a2b, 0).unwrap();
+        assert_eq!(explicit.get_id(), 0x1a2b);
+        assert_ne!(explicit.get_id(), node.get_id());
+        assert_eq!((explicit.get_name(), explicit.get_size()), ("Node", 8));
+        assert_eq!(explicit.get_typedef().unwrap().get_id(), node.get_id());
+    }
+
+    #[test]
+    fn core_alias_and_opaque_union_pointer_metadata_survive_flush() {
+        let f = factory();
+        f.set_core_type("SourceWord", 4, type_metatype::TYPE_UINT, false).unwrap();
+        f.cache_core_types().unwrap();
+        let core = f.find_by_name("SourceWord").unwrap().unwrap();
+        let alias = f.get_typedef(&core, "WordAlias", 902, 0).unwrap();
+        let opaque = f.kuna_declare_record("OpaqueUnion", true).unwrap();
+        let union_alias = f.get_typedef(&opaque, "UnionAlias", 303, 0).unwrap();
+        let direct = f.get_type_pointer(8, Rc::clone(&opaque), 1).unwrap();
+        let through_alias = f.get_type_pointer(8, union_alias, 1).unwrap();
+        let outer = f.get_type_pointer(8, Rc::clone(&direct), 1).unwrap();
+        assert!(!outer.needs_resolution());
+        assert_eq!(outer.get_sub_meta(), sub_metatype::SUB_PTR);
+        for pointer in [&direct, &through_alias] {
+            assert!(pointer.needs_resolution());
+            assert_eq!(pointer.get_sub_meta(), sub_metatype::SUB_PTR_STRUCT);
+            assert_eq!(pointer.get_ptr_to().unwrap().get_metatype(), type_metatype::TYPE_UNION);
+        }
+        f.clear_noncore();
+        assert!(f.find_by_name("SourceWord").unwrap().unwrap().is_core_type());
+        assert_eq!((alias.get_name(), alias.get_size(), alias.get_metatype()),
+            ("WordAlias", 4, type_metatype::TYPE_UINT));
+        assert_eq!(alias.get_typedef().unwrap().get_id(), core.get_id());
+        assert!(through_alias.get_ptr_to().unwrap().is_incomplete());
+    }
+
+    #[test]
+    fn source_format_edits_preserve_layout_alias_targets_and_pointer_bank() {
+        let f = factory();
+        let mut base = f.get_base_named(4, type_metatype::TYPE_UINT, "SourceWord").unwrap();
+        let alias = f.get_typedef(&base, "SourceWordAlias", 301, 0).unwrap();
+        let m = space_with_index(7);
+        let pointer = f.get_type_pointer_with_space(Rc::clone(&alias), Rc::clone(&m), "").unwrap();
+        for format in 1..=5 {
+            let updated = f.set_display_format(&base, format).unwrap();
+            assert_eq!(updated.get_display_format(), format);
+            assert_eq!((updated.get_id(), updated.get_size(), updated.get_alignment()),
+                (base.get_id(), base.get_size(), base.get_alignment()));
+            assert_eq!(updated.get_metatype(), type_metatype::TYPE_UINT);
+            assert_eq!(alias.get_typedef().unwrap().get_id(), base.get_id());
+            assert_eq!(pointer.get_pointer_space().unwrap().get_index(), 7);
+            assert_eq!(pointer.get_ptr_to().unwrap().get_id(), alias.get_id());
+            assert_eq!(f.find_by_name("SourceWord").unwrap().unwrap().get_display_format(), format);
+            base = updated;
+        }
+    }
+
+    #[test]
+    fn wire_pointer_banks_remain_distinct_through_interning_and_encoding() {
+        use kuna_base::marshal::{Decoder, PackedDecode, PackedEncode};
+        use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
+        let mut manager = AddrSpaceManager::new();
+        for (index, bank) in [(1, "INTMEM"), (2, "SFR")] {
+            manager.insert_space(Rc::new(AddrSpace::new(
+                spacetype::IPTR_PROCESSOR, bank, false, 1, 1, index, 0, 0, 0,
+            ))).unwrap();
+        }
+        let f = factory();
+        f.setup_sizes(Some(1), 1, 1);
+        let byte = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
+        let a = f.get_type_pointer_with_space(Rc::clone(&byte),
+            Rc::clone(manager.get_space_by_name("INTMEM").unwrap()), "").unwrap();
+        let b = f.get_type_pointer_with_space(byte,
+            Rc::clone(manager.get_space_by_name("SFR").unwrap()), "").unwrap();
+        assert_ne!(a.compare_dependency(&b).unwrap(), 0);
+        for (pointer, bank) in [(a, "INTMEM"), (b, "SFR")] {
+            let alias = f.get_typedef(&pointer, &format!("{bank}Alias"), 0, 0).unwrap();
+            let resized = f.resize_pointer(alias, 2).unwrap();
+            assert_eq!(resized.get_pointer_space().unwrap().get_name(), bank);
+            let mut bytes = Vec::new();
+            pointer.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+            let fresh = factory();
+            let mut decoder = PackedDecode::new(&manager);
+            decoder.ingest_stream(&bytes).unwrap();
+            let decoded = fresh.decode_type(&mut decoder).unwrap();
+            assert_eq!(decoded.get_pointer_space().unwrap().get_name(), bank);
+            assert_eq!((decoded.get_size(), decoded.get_word_size()), (1, Some(1)));
+        }
+        assert!(decode_regression_type(&f, &manager,
+            r#"<type name="" metatype="ptr" size="1" space="missing"><type name="" size="1" metatype="uint"/></type>"#).is_err());
+    }
+
+    #[test]
+    fn original_wire_pointer_banks_keep_relative_and_nonrelative_source_declarations() {
+        use kuna_base::marshal::{PackedDecode, PackedEncode};
+        use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager, ConstantSpace};
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        for (index, bank) in [(1, "INTMEM"), (2, "SFR")] {
+            manager.insert_space(Rc::new(AddrSpace::new(
+                spacetype::IPTR_PROCESSOR, bank, true, 1, 1, index, 0, 0, 0,
+            ))).unwrap();
+        }
+        let f = factory();
+        let decode = |bank: &str, relative: bool| {
+            let extra = if relative {
+                r#"<type name="" size="4" metatype="array" arraysize="4"><type name="" size="1" metatype="uint"/></type><off>1</off>"#
+            } else { "" };
+            let wire = format!(
+                r#"<type name="" size="1" metatype="{}" space="{bank}"><type name="" size="1" metatype="uint"/>{extra}</type>"#,
+                if relative { "ptrrel" } else { "ptr" },
+            );
+            decode_regression_type(&f, &manager, &wire)
+        };
+        for relative in [false, true] {
+            let ram = decode("INTMEM", relative).unwrap();
+            let sfr = decode("SFR", relative).unwrap();
+            assert_ne!(ram.compare(&sfr, 10).unwrap(), 0);
+            assert_ne!(ram.compare_dependency(&sfr).unwrap(), 0);
+            for (pointer, bank) in [(ram, "INTMEM"), (sfr, "SFR")] {
+                assert_eq!(pointer.get_pointer_space().unwrap().get_name(), bank);
+                assert_eq!((pointer.get_size(), pointer.get_word_size()), (1, Some(1)));
+                let mut bytes = Vec::new();
+                pointer.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+                let fresh = factory();
+                let mut decoder = PackedDecode::new(&manager);
+                decoder.ingest_stream(&bytes).unwrap();
+                let restored = fresh.decode_type(&mut decoder).unwrap();
+                assert_eq!(restored.get_pointer_space().unwrap().get_name(), bank);
+                assert_eq!(restored.is_pointer_rel(), relative);
+            }
+        }
+        assert!(decode("missing", false).is_err());
+    }
+
+    #[test]
+    fn qualified_pointer_derivations_keep_the_address_bank() {
+        use kuna_base::space::{spacetype, AddrSpace};
+        let f = factory();
+        f.setup_sizes(Some(1), 1, 1);
+        f.set_core_type("undefined", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+        f.cache_core_types().unwrap();
+        f.size_of_pointer.set(1);
+        f.size_of_alt_pointer.set(2);
+        let bank = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "SFR", false, 1, 1, 2, 0, 0, 0));
+        let byte = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
+        let pointer = f.get_type_pointer_with_space(Rc::clone(&byte), Rc::clone(&bank), "").unwrap();
+        let alias = f.get_typedef(&pointer, "Port", 0x1234, 0).unwrap();
+        let wide = f.resize_pointer(alias, 2).unwrap();
+        let DatatypeKind::Pointer { truncate: Some(truncated), .. } = &wide.kind else {
+            panic!("alternate pointer must retain its narrow form");
+        };
+        let truncated = Rc::clone(truncated);
+        let array = f.get_type_array(4, Rc::clone(&byte)).unwrap();
+        let record = f.get_type_struct("Ports").unwrap();
+        let record = f.set_fields_struct_raw(&record,
+            vec![TypeField::new(0, 0, "ports", Rc::clone(&array))], vec![], 4, 1, 0).unwrap();
+        let record_pointer = f.get_type_pointer_with_space(record, Rc::clone(&bank), "").unwrap();
+        let field = f.down_chain(&record_pointer, 0, false).unwrap().0.unwrap();
+        let array_pointer = f.get_type_pointer_with_space(array, Rc::clone(&bank), "").unwrap();
+        let element = f.down_chain(&array_pointer, 2, false).unwrap().0.unwrap();
+        let enumeration = f.get_type_enum_sized("Flags", 4, type_metatype::TYPE_UINT).unwrap();
+        let enumeration = f.set_enum_values(&enumeration, std::collections::BTreeMap::from([
+            (1, "ONE".to_string()), (2, "TWO".to_string()),
+        ])).unwrap();
+        let enum_pointer = f.get_type_pointer_with_space(enumeration, bank, "").unwrap();
+        let enum_byte = f.down_chain(&enum_pointer, 0, false).unwrap().0.unwrap();
+        let relative = f.get_type_pointer_rel(record_pointer, byte, 1).unwrap();
+        let stripped = relative.get_stripped().unwrap();
+        let parent = f.down_chain(&relative, -1, false).unwrap().0.unwrap();
+        for derived in [wide, truncated, field, element, enum_byte, relative, stripped, parent] {
+            assert_eq!(derived.get_pointer_space().unwrap().get_name(), "SFR");
+        }
+    }
+
+
+    #[test]
+    fn failed_named_definition_can_be_removed_and_retried_without_stale_lookup() {
+        let f = factory();
+        let shell = f.get_type_struct("Retry").unwrap();
+        let alias = f.get_typedef(&shell, "RetryAlias", 302, 0).unwrap();
+        let fields = vec![TypeField::new(0, 0, "cycle", alias)];
+        assert!(f.assign_raw_fields_struct(&shell, fields, vec![]).is_err());
+        f.destroy_type(&shell).unwrap();
+        assert!(f.find_by_name("Retry").unwrap().is_none());
+        let retry = f.get_type_struct("Retry").unwrap();
+        let value = f.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let completed = f.assign_raw_fields_struct(
+            &retry, vec![TypeField::new(0, 0, "value", value)], vec![],
+        ).unwrap();
+        let found = f.find_by_name("Retry").unwrap().unwrap();
+        assert_eq!((found.get_size(), found.is_incomplete()), (4, false));
+        assert_eq!(found.get_field(0).unwrap().name, "value");
+        assert_eq!(completed.get_id(), found.get_id());
+    }
+
+
+    #[test]
+    fn original_callback_wire_identity_keeps_source_id_and_instance_extent() {
+        let f = factory();
+        let manager = Rc::new(kuna_base::space::AddrSpaceManager::new());
+        f.set_proto_context(Rc::clone(&manager));
+        f.set_proto_models(Some(Rc::new(crate::fspec::ProtoModel::new(&manager))), Default::default());
+        let callback = |size, explicit| format!(
+            r#"<type name="Callback" id="0x600000000000000" size="{size}" metatype="code"{}><prototype><returnsym><addr/><void/></returnsym></prototype></type>"#,
+            if explicit { r#" varlength="true""# } else { "" },
+        );
+        let identity = |value: &Rc<Datatype>| encoded_regression_type_identity(value, &manager);
+        let implicit = decode_regression_type(&f, &manager, &callback(1, false)).unwrap();
+        let explicit = decode_regression_type(&f, &manager, &callback(1, true)).unwrap();
+        let callable_identity = (ELEM_TYPEREF.get_id(), Some(0x600000000000000), Some(1));
+        assert_eq!(identity(&implicit), callable_identity);
+        assert_eq!(identity(&explicit), callable_identity);
+        let reference = decode_regression_type(&f, &manager,
+            r#"<typeref name="Callback" id="0x600000000000000" size="1"/>"#).unwrap();
+        assert_eq!(identity(&reference), callable_identity);
+        assert!(decode_regression_type(&f, &manager,
+            r#"<typeref name="Callback" id="0x600000000000000"/>"#).is_err());
+        let fixed = decode_regression_type(&f, &manager,
+            r#"<type name="Callback" id="0x600000000000000" size="1" metatype="code"/>"#).unwrap();
+        assert_eq!(identity(&fixed), (ELEM_TYPEREF.get_id(), Some(0x600000000000000), None));
+        let fixed_reference = decode_regression_type(&f, &manager,
+            r#"<typeref name="Callback" id="0x600000000000000"/>"#).unwrap();
+        assert_eq!(identity(&fixed_reference), identity(&fixed));
+        let anonymous = decode_regression_type(&f, &manager,
+            r#"<type name="" size="1" metatype="code"><prototype><returnsym><addr/><void/></returnsym></prototype></type>"#).unwrap();
+        assert_eq!(identity(&anonymous), (crate::prettyprint::ids::ELEM_TYPE.get_id(), None, Some(1)));
+    }
+
+
+    #[test]
+    fn source_edit_flush_refreshes_nested_layouts_without_mutating_old_values() {
+        let f = factory();
+        let m = kuna_base::space::AddrSpaceManager::new();
+        let source = |field, meta| format!(
+            r#"<type name="Source" id="701" size="8" alignment="4" metatype="struct"><field name="low" offset="0"><type name="" size="4" metatype="uint"/></field><field name="{field}" offset="4"><type name="" size="4" metatype="{meta}"/></field></type>"#
+        );
+        let old = decode_regression_type(&f, &m, &source("high", "uint")).unwrap();
+        let old_alias = f.get_typedef(&old, "AuthoredAlias", 702, 0).unwrap();
+        let old_pointer = f.get_type_pointer(8, Rc::clone(&old_alias), 1).unwrap();
+        let old_array = f.get_type_array(2, Rc::clone(&old)).unwrap();
+        let relative = f.get_type_pointer_rel_full(
+            8, Rc::clone(&old), f.get_base(1, type_metatype::TYPE_UINT).unwrap(), 1, 1, "",
+        ).unwrap();
+        f.clear_noncore();
+        let new = decode_regression_type(&f, &m, &source("upper", "int")).unwrap();
+        let new_alias = f.get_typedef(&new, "AuthoredAlias", 702, 0).unwrap();
+        let new_relative = f.get_type_pointer_rel_full(
+            8, Rc::clone(&new), f.get_base(1, type_metatype::TYPE_UINT).unwrap(), 1, 1, "",
+        ).unwrap();
+        assert_eq!(old.get_id(), new.get_id());
+        assert_eq!((new.get_size(), new.get_alignment()), (8, 4));
+        assert_eq!(new_alias.get_field(1).unwrap().name, "upper");
+        assert_eq!(new_alias.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_INT);
+        assert_eq!(new_relative.get_rel_parent().unwrap().get_field(1).unwrap().name, "upper");
+        assert_eq!(new_relative.get_ptr_to().unwrap().get_size(), relative.get_ptr_to().unwrap().get_size());
+        for retained in [old, old_alias, old_pointer.get_ptr_to().unwrap(),
+            old_array.get_array_base().unwrap(), relative.get_rel_parent().unwrap()] {
+            assert_eq!(retained.get_field(1).unwrap().name, "high");
+            assert_eq!(retained.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_UINT);
+        }
+    }
+
+
+    #[test]
+    fn configured_factory_preserves_scalar_limit_and_unknown_array_extent() {
+        for maximum in [10, 16] {
+            let f = TypeFactoryImpl::new();
+            f.set_default_alignment_map();
+            f.set_max_basetype_size(maximum);
+            f.set_core_type("undefined", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+            f.cache_core_types().unwrap();
+            for size in [4, maximum] {
+                let integer = f.get_base(size, type_metatype::TYPE_INT).unwrap();
+                assert_eq!((integer.get_metatype(), integer.get_size()), (type_metatype::TYPE_INT, size));
+            }
+            let oversized = f.get_base(maximum + 1, type_metatype::TYPE_INT).unwrap();
+            assert_eq!((oversized.get_metatype(), oversized.get_size()), (type_metatype::TYPE_ARRAY, maximum + 1));
+            assert_eq!(oversized.num_elements(), Some(maximum + 1));
+            let element = oversized.get_array_base().unwrap();
+            assert_eq!((element.get_metatype(), element.get_size()), (type_metatype::TYPE_UNKNOWN, 1));
+            let unknown = f.get_base(1, type_metatype::TYPE_UNKNOWN).unwrap();
+            assert_eq!(element.compare_dependency(&unknown).unwrap(), 0);
+        }
+    }
+
     #[test]
     fn bitfield_triple_compare_orders_least_to_most_significant() {
         // Little-endian: smaller byte offset is less significant; within a byte,

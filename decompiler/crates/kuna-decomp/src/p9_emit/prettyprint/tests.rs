@@ -11,6 +11,132 @@ use std::rc::Rc;
 
 use kuna_base::space::ConstantSpace;
 
+mod stock_markup {
+    use super::*;
+    use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl, TypeField};
+    use kuna_base::marshal::{Decoder, PackedDecode};
+    use kuna_base::space::AddrSpaceManager;
+
+    fn wire_types(bytes: &[u8]) -> Vec<(String, Option<u64>)> {
+        let manager = AddrSpaceManager::new();
+        let mut decoder = PackedDecode::new(&manager);
+        decoder.ingest_stream(bytes).unwrap();
+        let root = decoder.open_element().unwrap();
+        let mut types = Vec::new();
+        while decoder.peek_element().unwrap() != 0 {
+            let element = decoder.open_element().unwrap();
+            if element == ids::ELEM_TYPE.get_id() {
+                let mut name = String::new();
+                let mut id = None;
+                loop {
+                    let attribute = decoder.get_next_attribute_id().unwrap();
+                    if attribute == 0 {
+                        break;
+                    }
+                    if attribute == ids::ATTRIB_CONTENT.get_id() {
+                        name = String::from_utf8(decoder.read_string().unwrap()).unwrap();
+                    } else if attribute == ids::ATTRIB_ID.get_id() {
+                        id = Some(decoder.read_unsigned_integer().unwrap());
+                    }
+                }
+                types.push((name, id));
+            }
+            decoder.close_element_skipping(element).unwrap();
+        }
+        decoder.close_element(root).unwrap();
+        types
+    }
+
+    #[test]
+    fn queue_wrap_replaces_type_bindings_and_syntax_slots() {
+        let mut pp = EmitPrettyPrint::new();
+        pp.set_max_line_size(20).unwrap();
+        pp.set_markup(true);
+        let document = pp.begin_document();
+        let mut expected = Vec::new();
+        for index in 0..180 {
+            match index % 3 {
+                0 => {
+                    let id = 700 + index;
+                    pp.tag_type("NodeAlias", SyntaxHighlight::TypeColor,
+                        &MarkupRef { type_id: Some(id), ..MarkupRef::none() });
+                    expected.push(("NodeAlias".into(), Some(id)));
+                }
+                1 => {
+                    pp.tag_type("int", SyntaxHighlight::TypeColor, &MarkupRef::none());
+                    expected.push(("int".into(), None));
+                }
+                _ => pp.print("*[2]", SyntaxHighlight::NoColor),
+            }
+            pp.spaces(1, 0);
+        }
+        pp.end_document(document);
+        pp.flush().unwrap();
+        let LowLevel::Markup(emitter) = pp.lowlevel_mut() else { unreachable!() };
+        assert_eq!(wire_types(&emitter.take_output()), expected);
+    }
+
+    #[test]
+    fn wrapped_markup_capture_tracks_committed_lines_and_host_field_byte_offset() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let node = types.get_type_struct("Node").unwrap();
+        let field = TypeField::new(73, 8, "next_member",
+            types.get_base(4, type_metatype::TYPE_INT).unwrap());
+        let node = types.set_fields_struct_raw(&node, vec![field.clone()], vec![],
+            16, 4, 0).unwrap();
+        let id = node.get_unsized_id().unwrap();
+        for (width, expected_line) in [(20, 2), (100, 1)] {
+            let mut pp = EmitPrettyPrint::new();
+            pp.set_max_line_size(width).unwrap();
+            pp.set_markup(true);
+            let LowLevel::Markup(emitter) = pp.lowlevel_mut() else { unreachable!() };
+            emitter.set_capture_tokens(true);
+            let document = pp.begin_document();
+            pp.tag_line();
+            pp.tag_variable("long_variable", SyntaxHighlight::VarColor,
+                &MarkupRef { opref: Some(17), varref: Some(9), ..MarkupRef::none() });
+            pp.spaces(1, 0);
+            pp.tag_op("+", SyntaxHighlight::NoColor, &MarkupRef::op(Some(17)));
+            pp.spaces(1, 0);
+            pp.tag_field(&field.name, SyntaxHighlight::NoColor, field.offset,
+                &MarkupRef { type_name: Some(node.get_name().into()),
+                    type_id: Some(id), opref: Some(17),
+                    ..MarkupRef::none() });
+            pp.end_document(document);
+            pp.flush().unwrap();
+            let LowLevel::Markup(emitter) = pp.lowlevel_mut() else { unreachable!() };
+            let tokens = emitter.take_tokens();
+            let member = tokens.iter().find(|token| token.kind == TokenKind::Field).unwrap();
+            assert_eq!((member.line, member.opref, member.text.as_str()),
+                (expected_line, Some(17), "next_member"));
+            assert!(emitter.take_provenance().associations.iter().any(|entry|
+                entry.line_number == expected_line && entry.opref == Some(17)));
+            let bytes = emitter.take_output();
+            let manager = AddrSpaceManager::new();
+            let mut decoder = PackedDecode::new(&manager);
+            decoder.ingest_stream(&bytes).unwrap();
+            let root = decoder.open_element().unwrap();
+            let mut metadata = None;
+            while decoder.peek_element().unwrap() != 0 {
+                let element = decoder.open_element().unwrap();
+                if element == ids::ELEM_FIELD.get_id() {
+                    metadata = Some((
+                        decoder.read_string_id(&ids::ATTRIB_NAME).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_ID).unwrap(),
+                        decoder.read_signed_integer_id(&ids::ATTRIB_OFF).unwrap(),
+                        decoder.read_unsigned_integer_id(&ids::ATTRIB_OPREF).unwrap(),
+                    ));
+                }
+                decoder.close_element_skipping(element).unwrap();
+            }
+            decoder.close_element(root).unwrap();
+            assert_eq!(metadata, Some((b"Node".to_vec(), id, 8, 17)));
+        }
+    }
+}
+
 /// Drive a no-markup [`EmitPrettyPrint`] at a given width and return the text.
 fn run(maxline: int4, build: impl FnOnce(&mut EmitPrettyPrint)) -> String {
     let mut pp = EmitPrettyPrint::new();
@@ -432,6 +558,20 @@ mod engine {
         // No end_document: the begin token's size stays negative.
         let err = pp.try_flush().unwrap_err();
         assert!(err.is_lowlevel());
+    }
+
+    #[test]
+    fn queue_error_is_reported_and_document_can_restart() {
+        let mut pp = EmitPrettyPrint::new();
+        pp.try_begin_document().unwrap();
+        assert!(pp.try_flush().unwrap_err().is_lowlevel());
+        // Reset the failed token queue separately from the bound output sink.
+        pp.clear_pretty();
+        let LowLevel::NoMarkup(emitter) = pp.lowlevel_mut() else { unreachable!() };
+        emitter.set_output_stream();
+        case_a(&mut pp);
+        pp.flush().unwrap();
+        assert_eq!(pp.output(), "a = b;");
     }
 
     #[test]

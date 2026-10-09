@@ -1,0 +1,41 @@
+{
+  "schema": "re-probe/1",
+  "kind": "cli",
+  "cmd": [
+    "{{KUNA}}",
+    "decompile-all",
+    "{{BIN}}",
+    "--option",
+    "calleevote",
+    "off"
+  ],
+  "cwd": "{{WORK}}",
+  "env": {
+    "SLEIGHHOME": "{{SPECS}}"
+  },
+  "stdin": null,
+  "timeout_s": 120,
+  "repeat": 1,
+  "target": {
+    "binary_rel": "decompiler/crates/kuna-analysis/tests/fixtures/calleevote_x86_64",
+    "binary_sha256": "87748df9fd521469bdb5a5bbd4ae3946ea8781c775fdea0b1c186d535bfd7648",
+    "binary_size": 16176,
+    "binary_source": "in-repo",
+    "in_repo_path": "decompiler/crates/kuna-analysis/tests/fixtures/calleevote_x86_64",
+    "selector": "peek_used",
+    "selector_kind": "name"
+  },
+  "expect": {
+    "exit_code": {
+      "eq": 0
+    },
+    "stdout_matches": [
+      "long peek_used\\(void \\*\\w+\\)",
+      "long report\\((?!void\\b|char\\b|long\\b|int\\b)[A-Za-z_]\\w* \\*\\w+\\)",
+      "\\bsame\\(long \\w+,long \\w+\\)",
+      "(?:unsigned )?long get_cap\\(void \\*\\w+\\)",
+      "\\bby_used\\(void \\*\\w+,void \\*\\w+\\)"
+    ]
+  },
+  "notes": "Original calleevote-off command, without callbacktype override: report remains a record, peek_used/get_cap stay void pointers, same retains two machine-width scalars, and by_used retains two void pointers. Its source comparator ABI/values are executed at O0/O2."
+}

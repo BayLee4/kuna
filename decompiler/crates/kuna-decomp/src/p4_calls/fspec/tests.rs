@@ -818,6 +818,164 @@ fn manager_with_default_data_space() -> (AddrSpaceManager, Rc<AddrSpace>) {
     (m, reg)
 }
 
+fn source_boundary_model(mgr: &AddrSpaceManager, reg: &Rc<AddrSpace>,
+    hidden: Option<AssignActionResponse>) -> (ProtoModel, Rc<AddrSpace>)
+{
+    use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+    let mut model = ProtoModel::new(mgr);
+    model.build_param_list("standard").unwrap();
+    let stack = stack_space();
+    let input = model.input_mut();
+    if hidden.is_some() {
+        input.push_entry(ParamEntry::seed(0, type_class::TYPECLASS_HIDDENRET,
+            Rc::clone(reg), 0x80, 8, 1, 0, 0, true, false, &[], mgr).unwrap());
+    }
+    let base_group = i32::from(hidden.is_some());
+    for index in 0..4 {
+        let entry = excl_entry(base_group + index, reg, 0x10 + index as u64 * 0x10,
+            8, input.get_entry(), mgr);
+        input.push_entry(entry);
+    }
+    let entry = stack_entry(base_group + 4, &stack, 0, 0x100, 8, input.get_entry(), mgr);
+    input.push_entry(entry);
+    input.finish_decode();
+    let mut registry = IdRegistry::with_base_ids();
+    crate::modelrules::register_ids(&mut registry);
+    let mut decoder = XmlDecode::new(mgr, &registry);
+    decoder.ingest_stream(br#"<rule><datatype name="any"/><varargs first="0" last="2147483647"/><goto_stack/></rule>"#).unwrap();
+    input.push_model_rule(crate::modelrules::ModelRule::decode(&mut decoder, input).unwrap());
+    let output = model.output_mut();
+    output.push_entry(excl_entry(0, reg, 0x90, 8, &[], mgr));
+    output.finish_decode();
+    if let Some(ret_code) = hidden {
+        output.push_model_rule(crate::modelrules::ModelRule::from_components(
+            crate::modelrules::DatatypeFilter::SizeRestricted(crate::modelrules::SizeRestriction::new(9, 0)),
+            crate::modelrules::AssignAction::HiddenReturnAssign { ret_code }));
+    }
+    (model, stack)
+}
+
+fn source_boundary_pieces(first: int4) -> PrototypePieces {
+    use crate::dtype::{DatatypeKind, TypeField};
+    let mut big = Datatype::new_with_align(24, 8, type_metatype::TYPE_STRUCT);
+    let word = Rc::new(Datatype::new_with_align(8, 8, type_metatype::TYPE_INT));
+    big.kind = DatatypeKind::Struct {
+        field: (0..3).map(|index| TypeField::new(index, index * 8, format!("word{index}"), word.clone())).collect(),
+        bitfield: Vec::new(),
+    };
+    PrototypePieces {
+        name: "source_boundary".into(),
+        outtype: Some(Rc::new(big)),
+        intypes: vec![word, int4_type(), Rc::new(Datatype::new_with_align(8, 8, type_metatype::TYPE_FLOAT))],
+        innames: vec!["first".into(), "second".into(), "tail".into()],
+        first_var_arg_slot: first,
+        output_storage: None,
+        input_storage: Vec::new(),
+    }
+}
+
+#[test]
+fn supplied_effective_boundary_lowers_big_result_before_varargs_rules() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = crate::dtype::TypeFactoryImpl::new();
+    tf.setup_sizes(Some(4), 8, 8);
+    for strategy in [None, Some(AssignActionResponse::hiddenret_specialreg), Some(AssignActionResponse::hiddenret_specialreg_void)] {
+        let (model, stack) = source_boundary_model(&mgr, &reg, strategy);
+        let proto = source_boundary_pieces(1);
+        let mut assigned = Vec::new();
+        model.assign_parameter_storage(&proto, &mut assigned, false, &tf, &mgr).unwrap();
+        assert_eq!(proto.first_var_arg_slot, 1, "source boundary excludes hidden ABI result input");
+        assert_eq!(assigned.len(), 5);
+        assert_eq!(assigned[0].flags, parameter_pieces_flags::INDIRECTSTORAGE);
+        assert_eq!(assigned[1].flags, parameter_pieces_flags::HIDDENRETPARM);
+        assert_eq!(assigned[1].type_.as_ref().unwrap().get_ptr_to().unwrap()
+            .compare(proto.outtype.as_ref().unwrap(), 8).unwrap(), 0);
+        assert_eq!(assigned[1].addr, addr(&reg, if strategy.is_some() { 0x80 } else { 0x10 }));
+        assert_eq!(assigned[2].addr, addr(&reg, if strategy.is_some() { 0x10 } else { 0x20 }));
+        assert_eq!(assigned[3].addr, addr(&stack, 0));
+        assert_eq!(assigned[4].addr, addr(&stack, 8));
+        for (piece, declared) in assigned[2..].iter().zip(&proto.intypes) {
+            assert_eq!(piece.type_.as_ref().unwrap().compare(declared, 8).unwrap(), 0);
+            assert_eq!(piece.flags, 0);
+        }
+        if strategy == Some(AssignActionResponse::hiddenret_specialreg_void) {
+            assert_eq!(assigned[0].type_.as_ref().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+        } else { assert_eq!(assigned[0].addr, addr(&reg, 0x90)); }
+    }
+}
+
+#[test]
+fn supplied_declared_boundary_and_safe_sentinels_keep_fixed_inputs_in_registers() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = crate::dtype::TypeFactoryImpl::new();
+    tf.setup_sizes(Some(4), 8, 8);
+    let (model, stack) = source_boundary_model(&mgr, &reg, None);
+    for (first, tail_on_stack) in [(2, true), (-1, false), (99, false)] {
+        let proto = source_boundary_pieces(first);
+        let mut assigned = Vec::new();
+        model.assign_parameter_storage(&proto, &mut assigned, false, &tf, &mgr).unwrap();
+        assert_eq!(assigned.len(), 5);
+        assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+        assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+        assert_eq!(assigned[3].addr, addr(&reg, 0x30));
+        assert_eq!(assigned[4].addr, if tail_on_stack { addr(&stack, 0) } else { addr(&reg, 0x40) });
+    }
+}
+
+#[test]
+fn supplied_effective_boundary_survives_this_before_hidden_result_markup_swap() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = crate::dtype::TypeFactoryImpl::new();
+    tf.setup_sizes(Some(4), 8, 8);
+    let (mut model, stack) = source_boundary_model(&mgr, &reg, None);
+    model.set_name("__thiscall");
+    model.input_mut().thisbeforeret = true;
+    let mut proto = source_boundary_pieces(1);
+    let this_type = tf.get_type_pointer(8, int4_type(), 1).unwrap();
+    proto.intypes[0] = this_type.clone();
+    let mut assigned = Vec::new();
+    model.assign_parameter_storage(&proto, &mut assigned, false, &tf, &mgr).unwrap();
+    assert_eq!(assigned.len(), 5);
+    assert_eq!(assigned[1].type_.as_ref().unwrap().compare(&this_type, 8).unwrap(), 0);
+    assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+    assert_eq!(assigned[1].flags, parameter_pieces_flags::ISTHIS);
+    assert_eq!(assigned[2].type_.as_ref().unwrap().get_ptr_to().unwrap()
+        .compare(proto.outtype.as_ref().unwrap(), 8).unwrap(), 0);
+    assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+    assert_eq!(assigned[2].flags, parameter_pieces_flags::HIDDENRETPARM);
+    assert_eq!(assigned[3].addr, addr(&stack, 0));
+    assert_eq!(assigned[4].addr, addr(&stack, 8));
+}
+
+#[test]
+fn supplied_explicit_pointer_and_indirect_byvalue_do_not_shift_boundary() {
+    let (mgr, reg) = manager_with_default_data_space();
+    let tf = crate::dtype::TypeFactoryImpl::new();
+    tf.setup_sizes(Some(4), 8, 8);
+    let (mut model, stack) = source_boundary_model(&mgr, &reg, None);
+    model.input_mut().push_pointermax_rule(8);
+    let mut proto = source_boundary_pieces(2);
+    let big = proto.outtype.take().unwrap();
+    let pointer = tf.get_type_pointer(8, big.clone(), 1).unwrap();
+    proto.outtype = Some(pointer.clone());
+    proto.intypes[0] = pointer.clone();
+    proto.intypes[1] = big.clone();
+    let mut assigned = Vec::new();
+    model.assign_parameter_storage(&proto, &mut assigned, false, &tf, &mgr).unwrap();
+    assert_eq!(proto.first_var_arg_slot, 2);
+    assert_eq!(assigned.len(), 4);
+    assert_eq!(assigned[0].type_.as_ref().unwrap().compare(&pointer, 8).unwrap(), 0);
+    assert_eq!(assigned[0].addr, addr(&reg, 0x90));
+    assert_eq!(assigned[1].type_.as_ref().unwrap().compare(&pointer, 8).unwrap(), 0);
+    assert_eq!(assigned[1].addr, addr(&reg, 0x10));
+    assert_eq!(assigned[1].flags, 0);
+    assert_eq!(assigned[2].type_.as_ref().unwrap().get_ptr_to().unwrap().compare(&big, 8).unwrap(), 0);
+    assert_eq!(assigned[2].addr, addr(&reg, 0x20));
+    assert_eq!(assigned[2].flags, parameter_pieces_flags::INDIRECTSTORAGE);
+    assert_eq!(assigned[3].addr, addr(&stack, 0));
+    assert_eq!(assigned[3].type_.as_ref().unwrap().compare(&proto.intypes[2], 8).unwrap(), 0);
+}
+
 /// A `ParamListStandardOut` whose lone 8-byte register entry cannot hold a
 /// 24-byte return value (but CAN hold the 8-byte hidden pointer), so `assignMap`
 /// falls through to the hidden-return path.
@@ -1674,6 +1832,57 @@ fn func_call_specs_state_toggles_and_set_funcdata() {
     assert_eq!(fc.get_name(), "callee");
     assert_eq!(*fc.get_entry_address(), entry);
     assert!(fc.set_funcdata(entry, "callee2").is_err());
+}
+
+#[test]
+fn locked_stack_input_fallback_loads_requested_storage() {
+    use kuna_base::space::{ConstantSpace, SpacebaseSpace, UniqueSpace};
+    let mut manager = AddrSpaceManager::new();
+    manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+    manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+    let ram = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 2, 0, 1, 1));
+    manager.insert_space(ram.clone()).unwrap();
+    let stack = Rc::new(SpacebaseSpace::new("stack", 3, 8, &ram, 1, true, false));
+    manager.insert_space(stack.clone()).unwrap();
+    manager.set_default_code_space(2).unwrap();
+    let mut fd = Funcdata::new("caller", "caller", Rc::new(ArchContext::new(manager)),
+        addr(&ram, 0x1000), 0x10000000, 0x40).unwrap();
+    let root = fd.bblocks_root_pub();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALLIND);
+    let destination = fd.new_constant(8, 0x2000);
+    fd.op_set_input(call, destination, 0).unwrap();
+    fd.op_insert_end(call, block);
+    let placeholder = fcs_new_op(&mut fd, 2, 0x100c, OpCode::CPUI_LOAD);
+    let space = fd.new_varnode_space(&ram);
+    let stack_pointer = fd.new_constant(8, 0x1000);
+    fd.op_set_input(placeholder, space, 0).unwrap();
+    fd.op_set_input(placeholder, stack_pointer, 1).unwrap();
+    let temporary = fd.new_unique_out(8, placeholder).unwrap();
+    fd.vbank_mut().get_mut(temporary).unwrap().set_spacebase_placeholder();
+    fd.op_insert_before(placeholder, call);
+    fd.op_set_input(call, temporary, 1).unwrap();
+    let mut fc = fcs_with_std_model(fd.get_arch().manage(), call);
+    fc.set_stack_placeholder_slot(1);
+    let mut restricted = FuncProto::new();
+    restricted.copy(fc.proto());
+    let storage = addr(&stack, 0x28);
+    restricted.set_param(0, "stack_value", &ParameterPieces {
+        addr: storage.clone(), type_: Some(int4_type()), flags: parameter_pieces_flags::TYPELOCK,
+    });
+    restricted.set_input_lock(true);
+    fc.force_set(&mut fd, &restricted, &mut RestartLog::new()).unwrap();
+    assert!(!fd.has_restart_pending());
+    let argument = fd.obank().get(call).unwrap().get_in(1).unwrap();
+    let vn = fd.vbank().get(argument).unwrap();
+    assert_eq!(vn.get_size(), 4);
+    let load = fd.obank().get(vn.get_def().unwrap()).unwrap();
+    assert_eq!(load.code(), OpCode::CPUI_LOAD);
+    let addition = fd.obank().get(fd.vbank().get(load.get_in(1).unwrap()).unwrap().get_def().unwrap()).unwrap();
+    assert_eq!(addition.code(), OpCode::CPUI_INT_ADD);
+    assert_eq!(fd.vbank().get(addition.get_in(0).unwrap()).unwrap().get_offset(), 0x1000);
+    assert_eq!(fd.vbank().get(addition.get_in(1).unwrap()).unwrap().get_offset(), 0x28);
+    assert_eq!(fc.proto().get_param(0).unwrap().get_address(), storage);
 }
 
 #[test]

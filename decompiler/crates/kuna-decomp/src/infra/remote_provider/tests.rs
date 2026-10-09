@@ -455,6 +455,39 @@ fn decode_captured_main(
     }
 }
 
+fn decode_function_xml(
+    m: &Rc<AddrSpaceManager>,
+    types: &TypeFactoryImpl,
+    text: &str,
+) -> Box<RemoteSymbolRecord> {
+    let registry = source_fixture_registry();
+
+    let store = kuna_base::xml::xml_tree(text.as_bytes()).unwrap();
+    let root = store.get_root().clone();
+    let mut dec = XmlDecode::new_with_root(m, &registry, &root, 0);
+    match decode_mapped_answer(&mut dec, types).unwrap() {
+        RemoteMapAnswer::Symbol(rec) => rec,
+        _ => panic!("expected a symbol"),
+    }
+}
+
+fn source_fixture_registry() -> IdRegistry {
+    let mut registry = IdRegistry::with_base_ids();
+    register_remote_provider_ids(&mut registry);
+    crate::dtype::register_type_wire_ids(&mut registry);
+    for element in [
+        crate::funcdata_encode::ELEM_FUNCTION, crate::prettyprint::ids::ELEM_TYPE,
+        crate::fspec::ELEM_KILLEDBYCALL, crate::fspec::ELEM_UNAFFECTED,
+        kuna_base::marshal::ElementId::new("param", 166),
+        kuna_base::marshal::ElementId::new("override", 223),
+        kuna_base::marshal::ElementId::new("protooverride", 224),
+    ] {
+        registry.register_element(&element);
+    }
+    registry.register_attribute(&crate::jumptable::ATTRIB_LABEL);
+    registry
+}
+
 /// Decode the vendored REAL Java answer (XML form; the packed wire form
 /// differs only in the marshaling layer behind `dyn Decoder`).
 #[test]
@@ -523,6 +556,651 @@ fn captured_java_locked_params_materialize_with_pieces_locks() {
             piece.flags
         );
     }
+}
+
+fn source_types_with_core() -> Rc<TypeFactoryImpl> {
+    let types = types_with_core();
+    types.set_max_basetype_size(8);
+    types
+}
+
+fn source_manager_with_registers() -> Rc<AddrSpaceManager> {
+    let mut manager = Rc::try_unwrap(manager_with_registers())
+        .unwrap_or_else(|_| unreachable!("fresh fixture manager has one owner"));
+    manager.insert_space(Rc::new(kuna_base::space::ConstantSpace::new())).unwrap();
+    manager.insert_space(Rc::new(kuna_base::space::UniqueSpace::new(3, 0, false))).unwrap();
+    manager.set_default_code_space(1).unwrap();
+    manager.set_default_data_space(1).unwrap();
+    Rc::new(manager)
+}
+
+fn source_fact_scope(m: &Rc<AddrSpaceManager>, types: Rc<TypeFactoryImpl>) -> Rc<RemoteScope> {
+    let mut model = ProtoModel::new(m);
+    model.build_param_list("standard").unwrap();
+    model.set_name("__stdcall");
+    let register = Rc::clone(m.get_space_by_name("register").unwrap());
+    for (slot, offset) in [0x38, 0x30, 0x10, 0x08].into_iter().enumerate() {
+        let entry = crate::fspec::ParamEntry::seed(
+            slot as i32, crate::dtype::type_class::TYPECLASS_GENERAL,
+            Rc::clone(&register), offset, 8, 1, 0, 0, true, false,
+            model.input().get_entry(), m,
+        ).unwrap();
+        model.input_mut().push_entry(entry);
+    }
+    model.input_mut().finish_decode();
+    model.output_mut().push_entry(crate::fspec::ParamEntry::seed(
+        0, crate::dtype::type_class::TYPECLASS_GENERAL,
+        register, 0, 8, 1, 0, 0, true, false, &[], m,
+    ).unwrap());
+    model.output_mut().finish_decode();
+    let model = Rc::new(model);
+    types.set_proto_context(Rc::clone(m));
+    types.set_proto_models(Some(Rc::clone(&model)),
+        std::collections::BTreeMap::from([("__stdcall".to_string(), Rc::clone(&model))]));
+    let mut owned = kuna_base::address::RangeList::default();
+    owned.insert_range(ram(m), 0, u64::MAX >> 8);
+    Rc::new(RemoteScope::new(
+        Rc::new(MockFetch::default()), Rc::clone(m), types,
+        std::collections::BTreeMap::from([("__stdcall".to_string(), model.clone())]),
+        Some(model), GlobalQuery::new(Vec::new(), owned, PartMap::default()),
+    ))
+}
+
+#[test]
+fn same_signature_entries_keep_independent_storage_and_analysis_copies() {
+    for reverse in [false, true] {
+        let m = source_manager_with_registers();
+        let types = source_types_with_core();
+        let scope = source_fact_scope(&m, Rc::clone(&types));
+        let custom = |entry, input, output| CAPTURED_MAIN_MAPSYM
+            .replace("0x101900", entry)
+            .replace("modellock=\"true\"", "modellock=\"true\" custom=\"true\"")
+            .replace("offset=\"0x38\"", input)
+            .replace("offset=\"0x0\" size=\"4\"", output);
+        let mut records = vec![
+            (CAPTURED_MAIN_MAPSYM.to_string(), 0x101900, 0x38, 0, false),
+            (custom("0x101a00", "offset=\"0x90\"", "offset=\"0x10\" size=\"4\""), 0x101a00, 0x90, 0x10, true),
+            (custom("0x101b00", "offset=\"0x98\"", "offset=\"0x08\" size=\"4\""), 0x101b00, 0x98, 0x08, true),
+        ];
+        if reverse { records.reverse(); }
+        for (xml, ..) in &records {
+            scope.materialize(*decode_function_xml(&m, &types, xml));
+        }
+        let mut ctx = crate::context::ArchContext::new_shared(Rc::clone(&m));
+        ctx.remote_scope = Some(Rc::clone(&scope));
+        ctx.types = Some(Rc::clone(&types));
+        ctx.defaultfp = scope.resolve_model("__stdcall");
+        for (_, entry, input, output, custom) in &records {
+            let entry = Address::new(ram(&m), *entry);
+            let direct = ctx.query_callee_proto(&entry).expect("declared callee");
+            let (_, _, deindirect) = ctx.query_function(&entry).unwrap();
+            let indirect = match ctx.query_indirect_slot_type(&entry, 8, &entry).unwrap() {
+                crate::context::IndirectSlotType::Prototype(proto) => proto,
+                crate::context::IndirectSlotType::FunctionCode => {
+                    let pieces = ctx.callee_proto_pieces(&entry).expect("exact function source");
+                    assert_eq!(pieces.innames[0], "argc");
+                    ctx.query_callee_proto(&entry).unwrap()
+                }
+                crate::context::IndirectSlotType::Untyped => panic!("authoritative function slot"),
+            };
+            for proto in [direct, deindirect, indirect] {
+                let param = proto.get_param(0).unwrap();
+                assert_eq!(param.get_name(), "argc");
+                assert_eq!(param.get_address().get_offset(), *input);
+                assert_eq!(param.get_address().get_space().unwrap().get_name(), "register");
+                assert_eq!(param.get_size(), 4);
+                assert_eq!(proto.get_output().get_address().get_offset(), *output);
+                assert_eq!(proto.get_output().get_size(), 4);
+                assert_eq!(proto.has_custom_storage(), *custom);
+                assert!(param.is_type_locked() && param.is_name_locked());
+                assert!(proto.is_output_locked());
+                let mut analysis = crate::fspec::FuncProto::new();
+                analysis.copy(&proto);
+                analysis.set_param(0, "recovered", &crate::fspec::ParameterPieces {
+                    addr: Address::new(Rc::clone(m.get_space_by_name("register").unwrap()), 0xa0),
+                    type_: param.get_type().cloned(), flags: 0,
+                });
+                analysis.set_output_lock(false);
+                let fresh = ctx.query_callee_proto(&entry).unwrap();
+                assert_eq!(fresh.get_param(0).unwrap().get_name(), "argc");
+                assert_eq!(fresh.get_param(0).unwrap().get_address().get_offset(), *input);
+                assert!(fresh.is_output_locked());
+            }
+            for wrong_width in [4, 16] {
+                assert!(matches!(ctx.query_indirect_slot_type(&entry, wrong_width, &entry),
+                    Some(crate::context::IndirectSlotType::Untyped)));
+            }
+        }
+        let old = scope.function_at(&Address::new(ram(&m), 0x101900)).unwrap();
+        scope.clear();
+        scope.materialize(*decode_function_xml(&m, &types,
+            &custom("0x101900", "offset=\"0x90\"", "offset=\"0x10\" size=\"4\"")));
+        let fresh = ctx.query_callee_proto(&Address::new(ram(&m), 0x101900)).unwrap();
+        assert_eq!(fresh.get_param(0).unwrap().get_address().get_offset(), 0x90);
+        assert_eq!(old.param_storage[0].2.addr.get_offset(), 0x38);
+    }
+}
+
+#[test]
+fn source_parameter_name_and_type_locks_materialize_independently() {
+    for type_lock in [false, true] {
+        for name_lock in [false, true] {
+            let m = source_manager_with_registers();
+            let types = source_types_with_core();
+            let scope = source_fact_scope(&m, Rc::clone(&types));
+            let xml = CAPTURED_MAIN_MAPSYM
+                .replace("typelock=\"true\"", &format!("typelock=\"{type_lock}\""))
+                .replace("namelock=\"true\"", &format!("namelock=\"{name_lock}\""));
+            scope.materialize(*decode_function_xml(&m, &types, &xml));
+            let facts = scope.function_at(&Address::new(ram(&m), 0x101900)).unwrap();
+            assert_eq!(facts.param_storage.len(), 2, "supplied storage survives unlocked source");
+            for (slot, name, offset) in [(0, "argc", 0x38), (1, "argv", 0x30)] {
+                let (actual_slot, actual_name, piece) = &facts.param_storage[slot];
+                assert_eq!((*actual_slot, actual_name.as_str()), (slot as i32, name));
+                assert_eq!(piece.addr.get_offset(), offset);
+                assert_eq!(piece.flags & crate::fspec::parameter_pieces_flags::TYPELOCK != 0, type_lock);
+                assert_eq!(piece.flags & crate::fspec::parameter_pieces_flags::NAMELOCK != 0, name_lock);
+            }
+        }
+    }
+}
+
+#[test]
+fn host_input_and_output_locks_remain_independent_at_callee_consumers() {
+    for void_result in [false, true] {
+    for input_lock in [false, true] {
+        for output_lock in [false, true] {
+            let m = source_manager_with_registers();
+            let types = source_types_with_core();
+            let scope = source_fact_scope(&m, Rc::clone(&types));
+            let xml = CAPTURED_MAIN_MAPSYM
+                .replace("modellock=\"true\"", "modellock=\"false\" custom=\"true\"")
+                .replace("typelock=\"true\"", &format!("typelock=\"{input_lock}\""))
+                .replace(&format!("<returnsym typelock=\"{input_lock}\">"),
+                    &format!("<returnsym typelock=\"{output_lock}\">"))
+                .replace("namelock=\"true\"", "namelock=\"false\"");
+            let mut rec = decode_function_xml(&m, &types, &xml);
+            if void_result {
+                let source = rec.func.as_mut().unwrap().proto.as_mut().unwrap();
+                source.out_type = Some(types.get_type_void().unwrap());
+                source.out_storage = Address::new_invalid();
+            }
+            let source = rec.func.as_ref().unwrap().proto.as_ref().unwrap();
+            assert_eq!(source.is_input_locked(), input_lock);
+            assert_eq!(source.out_lock, output_lock);
+            scope.materialize(*rec);
+            let mut ctx = crate::context::ArchContext::new_shared(Rc::clone(&m));
+            ctx.types = Some(Rc::clone(&types));
+            ctx.defaultfp = scope.resolve_model("__stdcall");
+            ctx.remote_scope = Some(scope);
+            let (_, _, proto) = ctx.query_function(&Address::new(ram(&m), 0x101900)).unwrap();
+            assert_eq!(proto.is_input_locked(), input_lock);
+            assert_eq!(proto.is_output_locked(), output_lock);
+            assert_eq!(proto.is_model_locked(), input_lock || output_lock);
+            assert!(!proto.get_param(0).unwrap().is_name_locked());
+            if void_result {
+                assert!(proto.get_output().get_address().is_invalid());
+                assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+            } else {
+                assert_eq!(proto.get_output().get_size(), 4);
+                assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_INT);
+                assert_eq!(proto.get_output().get_address().get_offset(), 0);
+            }
+            assert_eq!(proto.get_param(0).unwrap().get_address().get_offset(), 0x38);
+        }
+    }
+    }
+}
+
+#[test]
+fn same_signature_effects_and_locks_do_not_alias_or_mutate_cached_seed() {
+    for reverse in [false, true] {
+        let m = source_manager_with_registers();
+        let types = source_types_with_core();
+        let scope = source_fact_scope(&m, Rc::clone(&types));
+        let locked = CAPTURED_MAIN_MAPSYM.replace("</prototype>",
+            "<killedbycall><addr space=\"register\" offset=\"0x90\" size=\"4\"/></killedbycall></prototype>");
+        let unlocked = CAPTURED_MAIN_MAPSYM
+            .replace("0x101900", "0x101a00")
+            .replace("typelock=\"true\"", "typelock=\"false\"")
+            .replace("namelock=\"true\"", "namelock=\"false\"")
+            .replace("modellock=\"true\"", "modellock=\"false\" inline=\"true\"")
+            .replace("</prototype>",
+                "<unaffected><addr space=\"register\" offset=\"0x90\" size=\"4\"/></unaffected></prototype>");
+        let mut documents = vec![locked, unlocked];
+        if reverse { documents.reverse(); }
+        for xml in documents { scope.materialize(*decode_function_xml(&m, &types, &xml)); }
+        let mut ctx = crate::context::ArchContext::new_shared(Rc::clone(&m));
+        ctx.types = Some(Rc::clone(&types));
+        ctx.defaultfp = scope.resolve_model("__stdcall");
+        ctx.remote_scope = Some(scope);
+        let effect_addr = Address::new(Rc::clone(m.get_space_by_name("register").unwrap()), 0x90);
+        for (entry, locked, effect) in [
+            (0x101900, true, crate::fspec::effect_type::KILLEDBYCALL),
+            (0x101a00, false, crate::fspec::effect_type::UNAFFECTED),
+        ] {
+            let entry = Address::new(ram(&m), entry);
+            let (_, _, canonical) = ctx.query_function(&entry).unwrap();
+            assert_eq!(canonical.has_effect(&effect_addr, 4), effect);
+            assert_eq!(canonical.is_input_locked(), locked);
+            assert_eq!(canonical.is_output_locked(), locked);
+            assert_eq!(canonical.is_inline(), !locked);
+            let mut analysis = crate::fspec::FuncProto::new();
+            analysis.copy(&canonical);
+            analysis.set_output_lock(!locked);
+            analysis.set_inline(locked);
+            let (_, _, fresh) = ctx.query_function(&entry).unwrap();
+            assert_eq!(fresh.is_output_locked(), locked);
+            assert_eq!(fresh.is_inline(), !locked);
+            assert_eq!(fresh.has_effect(&effect_addr, 4), effect);
+        }
+    }
+}
+
+#[test]
+fn internal_custom_storage_keeps_void_hidden_this_and_indirect_roles() {
+    for void_result in [false, true] {
+        let m = source_manager_with_registers();
+        let types = source_types_with_core();
+        let result = if void_result { "<void/>" } else {
+            r#"<type name="SiteResult" metatype="struct" size="16"><field name="left" offset="0"><type name="" metatype="int" size="8"/></field><field name="right" offset="8"><type name="" metatype="int" size="8"/></field></type>"#
+        };
+        let result_storage = if void_result { "<addr/>" } else {
+            r#"<addr space="register" offset="0x70" size="16"/>"#
+        };
+        let xml = format!(
+            r#"<doc><mapsym><function name="custom" id="123" size="1"><addr space="ram" offset="0x101900"/>
+            <prototype model="__stdcall" custom="true" modellock="true" extrapop="8">
+              <returnsym typelock="false">{result_storage}{result}</returnsym>
+              <internallist first="2">
+                <param name="return_storage" typelock="true" namelock="false" hiddenretparm="true"><addr space="register" offset="0x80" size="8"/><type name="" metatype="ptr" size="8"><type name="" metatype="int" size="4"/></type></param>
+                <param name="self" typelock="true" namelock="true" thisptr="true" indirectstorage="true"><addr space="register" offset="0x98" size="8"/><type name="" metatype="ptr" size="8"><type name="" metatype="int" size="4"/></type></param>
+              </internallist>
+            </prototype></function><addr space="ram" offset="0x101900" size="1"/><rangelist/></mapsym></doc>"#
+        );
+        let rec = decode_function_xml(&m, &types, &xml);
+        let proto = rec.func.as_ref().unwrap().proto.as_ref().unwrap();
+        assert_eq!(proto.params.len(), 2, "internal inputs must not be discarded");
+        assert_eq!(proto.params[0].name, "return_storage");
+        assert!(proto.params[0].hidden);
+        assert_eq!(proto.params[0].storage.get_offset(), 0x80);
+        assert_eq!(proto.params[1].name, "self");
+        assert_eq!(proto.params[1].storage.get_offset(), 0x98);
+        assert!(!proto.dotdotdot, "first boundary is not an open-arity declaration");
+        assert!(!proto.out_lock);
+        assert_eq!(proto.out_storage.is_invalid(), void_result);
+        assert_eq!(proto.out_type.as_ref().unwrap().get_metatype(),
+            if void_result { type_metatype::TYPE_VOID } else { type_metatype::TYPE_STRUCT });
+        let scope = source_fact_scope(&m, Rc::clone(&types));
+        scope.materialize(*rec);
+        let facts = scope.function_at(&Address::new(ram(&m), 0x101900)).unwrap();
+        let hidden = &facts.param_storage[0].2;
+        assert_ne!(hidden.flags & crate::fspec::parameter_pieces_flags::HIDDENRETPARM, 0);
+        let this = &facts.param_storage[1].2;
+        assert_ne!(this.flags & crate::fspec::parameter_pieces_flags::ISTHIS, 0);
+        assert_ne!(this.flags & crate::fspec::parameter_pieces_flags::INDIRECTSTORAGE, 0);
+    }
+}
+
+const CLOSED_AGGREGATE_OVERRIDE: &str = r#"<override><protooverride>
+  <addr space="ram" offset="0x101920"/>
+  <prototype extrapop="8" model="__stdcall">
+    <returnsym typelock="true"><addr/>
+      <type name="SiteResult" metatype="struct" size="16">
+        <field name="left" offset="0"><type name="" metatype="int" size="8"/></field>
+        <field name="right" offset="8"><type name="" metatype="int" size="8"/></field>
+      </type>
+    </returnsym>
+    <internallist first="2">
+      <param name="rethidden" typelock="true" namelock="true"><addr/>
+        <type name="" metatype="int" size="4"/>
+      </param>
+      <param name="self" typelock="true" namelock="false"><addr/>
+        <type name="SitePayload" metatype="struct" size="16">
+          <field name="head" offset="0"><type name="" metatype="int" size="8"/></field>
+          <field name="tail" offset="8"><type name="" metatype="int" size="8"/></field>
+        </type>
+      </param>
+    </internallist>
+  </prototype>
+</protooverride></override>"#;
+
+#[test]
+fn caller_override_source_reaches_only_its_callsite_and_survives_analysis_reset() {
+    for custom in [false, true] {
+    let m = source_manager_with_registers();
+    let types = source_types_with_core();
+    let scope = source_fact_scope(&m, Rc::clone(&types));
+    let custom_override = r#"<override><protooverride><addr space="ram" offset="0x101920"/>
+      <prototype extrapop="8" model="__stdcall" custom="true">
+        <returnsym typelock="false"><addr space="register" offset="0x10" size="4"/><type name="" metatype="int" size="4"/></returnsym>
+        <internallist><param name="custom_arg" typelock="true" namelock="false"><addr space="register" offset="0x90" size="4"/><type name="" metatype="int" size="4"/></param></internallist>
+      </prototype></protooverride></override>"#;
+    let declaration = if custom { custom_override } else { CLOSED_AGGREGATE_OVERRIDE };
+    let xml = CAPTURED_MAIN_MAPSYM.replace("</function>", &format!("{declaration}</function>"));
+    scope.materialize(*decode_function_xml(&m, &types, &xml));
+    scope.materialize(*decode_function_xml(&m, &types, &CAPTURED_MAIN_MAPSYM.replace("0x101900", "0x101a00")));
+    let mut ctx = crate::context::ArchContext::new_shared(Rc::clone(&m));
+    ctx.remote_scope = Some(Rc::clone(&scope));
+    ctx.types = Some(Rc::clone(&types));
+    ctx.defaultfp = scope.resolve_model("__stdcall");
+    let ctx = Rc::new(ctx);
+    let fresh = |entry| crate::funcdata::Funcdata::new(
+        "caller", "caller", Rc::clone(&ctx), Address::new(ram(&m), entry), 0x10000000, 0,
+    ).unwrap();
+    let site = Address::new(ram(&m), 0x101920);
+    let mut caller = fresh(0x101900);
+    caller.clear();
+    let source = caller.get_override().find_proto_override(&site).expect("host callsite declaration");
+    let proto = source.prototype().expect("materialized override");
+    assert_eq!(proto.get_model_name(), "__stdcall");
+    assert!(proto.is_input_locked());
+    assert_eq!(proto.is_output_locked(), !custom);
+    assert_eq!(proto.has_custom_storage(), custom);
+    if custom {
+        assert_eq!(proto.num_params(), 1);
+        let input = proto.get_param(0).unwrap();
+        assert_eq!(input.get_name(), "custom_arg");
+        assert_eq!(input.get_address().get_offset(), 0x90);
+        assert!(input.is_type_locked() && !input.is_name_locked());
+        assert_eq!(proto.get_output().get_address().get_offset(), 0x10);
+        assert_eq!(proto.get_output().get_size(), 4);
+    } else {
+        assert_eq!(proto.num_params(), 3);
+        assert!(proto.get_param(0).unwrap().is_hidden_return());
+        assert_eq!(proto.get_param(1).unwrap().get_name(), "rethidden");
+        assert!(!proto.get_param(1).unwrap().is_hidden_return());
+        let result = proto.get_output().get_type().unwrap().get_ptr_to().unwrap();
+        assert_eq!((result.get_name(), result.get_size()), ("SiteResult", 16));
+    }
+    assert!(!proto.is_dotdotdot());
+    assert!(caller.get_override().find_proto_override(&Address::new(ram(&m), 0x101924)).is_none());
+    assert!(fresh(0x101a00).get_override().find_proto_override(&site).is_none());
+    caller.get_override_mut().clear();
+    assert!(caller.get_override().find_proto_override(&site).is_none());
+    assert!(fresh(0x101900).get_override().find_proto_override(&site).is_some());
+    scope.clear();
+    scope.materialize(*decode_captured_main(&m, &types));
+    assert!(fresh(0x101900).get_override().find_proto_override(&site).is_none());
+    }
+}
+
+#[test]
+fn closed_internal_source_arguments_preserve_storage_names_and_arity_boundary() {
+    for open in [false, true] {
+        let m = source_manager_with_registers();
+        let types = source_types_with_core();
+        let text = format!(
+            r#"<prototype model="__stdcall" extrapop="8" dotdotdot="{open}" custom="true">
+              <returnsym typelock="true"><addr space="register" offset="0" size="4"/><type name="" metatype="int" size="4"/></returnsym>
+              <internallist first="1">
+                <param name="format" typelock="true" namelock="true"><addr space="register" offset="0x90" size="8"/><type name="" metatype="ptr" size="8"><type name="char" metatype="int" size="1" char="true"/></type></param>
+                <param name="count" typelock="true" namelock="false"><addr space="register" offset="0x30" size="4"/><type name="" metatype="int" size="4"/></param>
+                <param name="wide" typelock="true" namelock="true"><addr space="register" offset="0x98" size="8"/><type name="" metatype="int" size="8"/></param>
+              </internallist>
+            </prototype>"#
+        );
+        let registry = source_fixture_registry();
+        let store = kuna_base::xml::xml_tree(text.as_bytes()).unwrap();
+        let root = store.get_root().clone();
+        let mut decoder = XmlDecode::new_with_root(&m, &registry, &root, 0);
+        let proto = decode_prototype(&mut decoder, &types).unwrap();
+        assert_eq!(proto.dotdotdot, open, "first=1 alone must not reopen recovered arity");
+        assert!(proto.out_lock);
+        assert_eq!(proto.params.len(), 3);
+        for (param, name, offset, size) in [
+            (&proto.params[0], "format", 0x90, 8),
+            (&proto.params[1], "count", 0x30, 4),
+            (&proto.params[2], "wide", 0x98, 8),
+        ] {
+            assert_eq!(param.name, name);
+            assert_eq!(param.storage.get_offset(), offset);
+            assert_eq!(param.dtype.as_ref().unwrap().get_size(), size);
+            assert!(param.typelock);
+        }
+        assert_eq!(proto.to_pieces("site").intypes.len(), 3);
+    }
+}
+
+#[test]
+fn committed_and_unlocked_aggregate_source_keeps_exact_types_storage_and_roles() {
+    for (input_lock, output_lock, unknown) in [
+        (true, true, false), (false, true, false), (true, false, false), (true, true, true),
+    ] {
+        let m = source_manager_with_registers();
+        let types = source_types_with_core();
+        let value = if unknown { r#"<type name="" metatype="unknown" size="4"/>"# }
+            else { r#"<type name="" metatype="int" size="4"/>"# };
+        let xml = format!(
+            r#"<doc><mapsym><function name="aggregate" id="123" size="1"><addr space="ram" offset="0x101900"/>
+              <prototype model="__stdcall" custom="true" extrapop="8">
+                <returnsym typelock="{output_lock}"><addr space="register" offset="0x70" size="16"/>
+                  <type name="SiteResult" metatype="struct" size="16"><field name="left" offset="0"><type name="" metatype="int" size="8"/></field><field name="right" offset="8"><type name="" metatype="int" size="8"/></field></type>
+                </returnsym>
+                <internallist first="2">
+                  <param name="rethidden" typelock="{input_lock}" namelock="true"><addr space="register" offset="0x90" size="4"/>{value}</param>
+                  <param name="self" typelock="true" namelock="false" thisptr="true"><addr space="register" offset="0x98" size="16"/>
+                    <def name="SitePayloadAlias" id="601"><type name="SitePayload" id="602" metatype="struct" size="16"><field name="head" offset="0"><type name="" metatype="int" size="8"/></field><field name="tail" offset="8"><type name="" metatype="int" size="8"/></field></type></def>
+                  </param>
+                </internallist>
+              </prototype>
+            </function><addr space="ram" offset="0x101900" size="1"/><rangelist/></mapsym></doc>"#
+        );
+        let rec = decode_function_xml(&m, &types, &xml);
+        let source = rec.func.as_ref().unwrap().proto.as_ref().unwrap();
+        assert!(source.custom);
+        assert_eq!(source.out_lock, output_lock);
+        assert_eq!(source.out_storage.get_offset(), 0x70);
+        let result = source.out_type.as_ref().unwrap();
+        assert_eq!((result.get_name(), result.get_size()), ("SiteResult", 16));
+        assert_eq!(result.get_field(1).unwrap().name, "right");
+        assert_eq!(source.params.len(), 2, "committed result storage must not invent hidden input");
+        let fixed = &source.params[0];
+        assert_eq!(fixed.name, "rethidden");
+        assert!(!fixed.hidden, "names do not declare automatic roles");
+        assert_eq!(fixed.typelock, input_lock);
+        assert_eq!(fixed.storage.get_offset(), 0x90);
+        assert_eq!(fixed.dtype.as_ref().unwrap().get_metatype(),
+            if unknown { type_metatype::TYPE_UNKNOWN } else { type_metatype::TYPE_INT });
+        let aggregate = &source.params[1];
+        let alias = aggregate.dtype.as_ref().unwrap();
+        assert_eq!((alias.get_name(), alias.get_size()), ("SitePayloadAlias", 16));
+        assert_eq!(alias.get_typedef().unwrap().get_name(), "SitePayload");
+        assert_eq!(alias.get_field(1).unwrap().name, "tail");
+        assert_eq!(aggregate.storage.get_offset(), 0x98);
+        let pieces = source.to_pieces("aggregate");
+        assert_eq!(pieces.intypes.len(), 2);
+        assert_eq!(pieces.input_storage[1].1.addr.get_offset(), 0x98);
+        assert_eq!(pieces.output_storage.as_ref().unwrap().addr.get_offset(), 0x70);
+    }
+}
+
+#[test]
+fn special_void_result_preserves_locked_hidden_return_and_supplied_inputs() {
+    use crate::dtype::TypeField;
+    use crate::fspec::{ParamEntry, PrototypePieces};
+    let m = source_manager_with_registers();
+    let types = source_types_with_core();
+    let registers = Rc::clone(m.get_space_by_name("register").unwrap());
+    let mut model = ProtoModel::new(&m);
+    model.build_param_list("standard").unwrap();
+    model.set_name("site_registers");
+    model.input_mut().push_entry(ParamEntry::seed(
+        0, crate::dtype::type_class::TYPECLASS_HIDDENRET, Rc::clone(&registers),
+        0x80, 8, 1, 0, 0, true, false, &[], &m,
+    ).unwrap());
+    for (slot, offset) in [0x38, 0x30, 0x10, 0x08].into_iter().enumerate() {
+        let entry = ParamEntry::seed(
+            slot as i32 + 1, crate::dtype::type_class::TYPECLASS_GENERAL, Rc::clone(&registers),
+            offset, 8, 1, 0, 0, true, false, model.input().get_entry(), &m,
+        ).unwrap();
+        model.input_mut().push_entry(entry);
+    }
+    model.input_mut().finish_decode();
+    let mut registry = IdRegistry::with_base_ids();
+    crate::modelrules::register_ids(&mut registry);
+    let mut decoder = XmlDecode::new(&m, &registry);
+    decoder.ingest_stream(br#"<rule><datatype name="struct"/><varargs first="0"/><convert_to_ptr/></rule>"#).unwrap();
+    let rule = crate::modelrules::ModelRule::decode(&mut decoder, model.input()).unwrap();
+    model.input_mut().push_model_rule(rule);
+    model.output_mut().push_entry(ParamEntry::seed(
+        0, crate::dtype::type_class::TYPECLASS_GENERAL, registers,
+        0, 8, 1, 0, 0, true, false, &[], &m,
+    ).unwrap());
+    model.output_mut().finish_decode();
+    model.output_mut().push_model_rule(crate::modelrules::ModelRule::from_components(
+        crate::modelrules::DatatypeFilter::SizeRestricted(crate::modelrules::SizeRestriction::new(9, 0)),
+        crate::modelrules::AssignAction::HiddenReturnAssign {
+            ret_code: crate::fspec::AssignActionResponse::hiddenret_specialreg_void,
+        },
+    ));
+    let word = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+    let result = types.get_type_struct("SiteResult").unwrap();
+    let result = types.set_fields_struct_raw(&result, vec![
+        TypeField::new(0, 0, "left", Rc::clone(&word)),
+        TypeField::new(1, 8, "right", word),
+    ], vec![], 16, 8, 0).unwrap();
+    let pieces = PrototypePieces {
+        outtype: Some(Rc::clone(&result)),
+        intypes: vec![types.get_base(4, type_metatype::TYPE_INT).unwrap(), result],
+        innames: vec!["rethidden".to_string(), "self".to_string()],
+        first_var_arg_slot: 1, ..Default::default()
+    };
+    types.set_proto_context(Rc::clone(&m));
+    let callable = types.get_type_code_proto_model(&pieces, Rc::new(model)).unwrap();
+    let proto = callable.get_code_prototype().unwrap();
+    assert!(proto.get_output().get_address().is_invalid());
+    assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+    assert!(proto.is_output_locked() && proto.get_output().is_indirect_storage());
+    assert!(proto.is_input_locked(), "hidden result must not unlock the complete input list");
+    assert_eq!(proto.num_params(), 3);
+    for (slot, offset) in [(0, 0x80), (1, 0x38), (2, 0x30)] {
+        let param = proto.get_param(slot).unwrap();
+        assert!(param.is_type_locked());
+        assert_eq!(param.get_address().get_offset(), offset);
+    }
+    assert!(proto.get_param(0).unwrap().is_hidden_return());
+    assert!(!proto.get_param(1).unwrap().is_hidden_return());
+    assert_eq!(proto.get_param(1).unwrap().get_name(), "rethidden");
+    assert!(proto.get_param(2).unwrap().is_indirect_storage());
+    let mut bytes = Vec::new();
+    proto.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+    let mut decoder = PackedDecode::new(&m);
+    decoder.ingest_stream(&bytes).unwrap();
+    let replay = decode_prototype(&mut decoder, &types).unwrap();
+    assert_eq!(replay.out_type.as_ref().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+    assert!(replay.out_lock);
+    assert_eq!(replay.params.len(), 3);
+    assert!(replay.params[0].hidden);
+    assert_eq!(replay.params[0].storage.get_offset(), 0x80);
+    assert_eq!(replay.params[1].name, "rethidden");
+    assert_eq!(replay.params[2].storage.get_offset(), 0x30);
+}
+
+
+#[test]
+fn host_names_override_equal_extent_defaults_without_hiding_unmapped_defaults() {
+    let m = manager();
+    let types = source_types_with_core();
+    let defaults = scope_over(&m, Rc::clone(&types), MockFetch::default());
+    let record = |name: &str, offset: u64, id: u64| decode_function_xml(&m, &types, &format!(
+        r#"<doc><mapsym><symbol name="{name}" id="{id}" typelock="true" namelock="true" cat="-1"><type name="" metatype="uint" size="1"/></symbol><addr space="ram" offset="{offset}" size="1"/><rangelist/></mapsym></doc>"#
+    ));
+    defaults.materialize(*record("P2", 0xa0, 0x100));
+    defaults.materialize(*record("HIE", 0xa1, 0x101));
+    let scope = RemoteScope::new(
+        Rc::new(MockFetch::default()), Rc::clone(&m), Rc::clone(&types),
+        std::collections::BTreeMap::new(), None, defaults.snapshot().as_ref().clone(),
+    );
+    let address = Address::new(ram(&m), 0xa0);
+    let neighbor = Address::new(ram(&m), 0xa1);
+    let name = |query: &GlobalQuery, address: &Address|
+        query.name_for_varnode(address, 1, &Address::new_invalid()).unwrap().0;
+    assert_eq!(name(&scope.query_snapshot(&address), &address), "P2");
+    scope.materialize(*record("motor_control", 0xa0, 0x200));
+    assert_eq!(name(&scope.query_snapshot(&address), &address), "motor_control");
+    assert_eq!(name(&scope.query_snapshot(&neighbor), &neighbor), "HIE");
+    scope.clear();
+    assert_eq!(name(&scope.query_snapshot(&address), &address), "P2");
+    scope.materialize(*record("renamed_control", 0xa0, 0x201));
+    assert_eq!(name(&scope.query_snapshot(&address), &address), "renamed_control");
+}
+
+#[test]
+fn host_default_declarations_retain_scope_model_storage_and_locks() {
+    let m = source_manager_with_registers();
+    let types = source_types_with_core();
+    let scope = source_fact_scope(&m, Rc::clone(&types));
+    let original_xml = CAPTURED_MAIN_MAPSYM.replace("__stdcall", "default");
+    scope.materialize(*decode_function_xml(&m, &types, &original_xml));
+    let mut ctx = crate::context::ArchContext::new_shared(Rc::clone(&m));
+    ctx.remote_scope = Some(Rc::clone(&scope));
+    let entry = Address::new(ram(&m), 0x101900);
+    let original = ctx.query_callee_proto(&entry).unwrap();
+    let original_name = original.get_model_name().to_string();
+    scope.materialize(*decode_function_xml(&m, &types, &original_xml.replace("0x101900", "0x101a00")));
+    let next = ctx.query_callee_proto(&Address::new(ram(&m), 0x101a00)).unwrap();
+    let retained = ctx.query_callee_proto(&entry).unwrap();
+    for proto in [&original, &next, &retained] {
+        assert_eq!(proto.get_model_name(), original_name);
+        assert!(Rc::ptr_eq(proto.model(), original.model()));
+        assert_eq!(proto.get_param(0).unwrap().get_address().get_offset(), 0x38);
+        assert_eq!(proto.get_output().get_address().get_offset(), 0);
+        assert!(proto.is_input_locked());
+        assert!(proto.is_output_locked());
+    }
+    // EC-0194's live default-publication clause is unrepresented: Architecture's
+    // defaultprototype updates its TypeFactory, not this RemoteScope's defaultfp.
+}
+
+#[test]
+fn parameter_symbol_metadata_survives_exact_storage_reuse_without_promoting_overlap() {
+    let m = source_manager_with_registers();
+    let types = source_types_with_core();
+    let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let address = Address::new(Rc::clone(m.get_space_by_name("register").unwrap()), 0x90);
+    let usepoint = Address::new(ram(&m), 0x100f);
+    for typelock in [false, true] {
+        for namelock in [false, true] {
+            let mut local = crate::varmap::ScopeLocal::new(
+                0x1234, ram(&m), "committed", m.num_spaces(),
+            ).unwrap();
+            let sid = local.add_symbol("committed", Rc::clone(&int4), &address, &usepoint).unwrap();
+            let attrs = if typelock { varnode_flags::typelock } else { 0 }
+                | if namelock { varnode_flags::namelock } else { 0 };
+            local.set_attribute(sid, attrs);
+            local.add_param_symbol(0, "recovered", Rc::clone(&int4), &address, &usepoint).unwrap();
+            let mut bytes = Vec::new();
+            local.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+            let mut decoder = PackedDecode::new(&m);
+            decoder.ingest_stream(&bytes).unwrap();
+            let mut params = Vec::new();
+            let mut locked = false;
+            let mut locals = Vec::new();
+            decode_localdb_params(&mut decoder, &types, &mut params, &mut locked, &mut locals).unwrap();
+            assert_eq!(params.len(), 1);
+            assert!(locals.is_empty());
+            assert_eq!(params[0].name, "committed");
+            assert_eq!(params[0].storage, address);
+            assert_eq!(params[0].typelock, typelock);
+        }
+    }
+    let mut local = crate::varmap::ScopeLocal::new(0x1235, ram(&m), "overlap", m.num_spaces()).unwrap();
+    local.add_symbol("wide_local", types.get_base(8, type_metatype::TYPE_UINT).unwrap(),
+        &address, &usepoint).unwrap();
+    local.add_param_symbol(0, "arg", int4, &address, &usepoint).unwrap();
+    let mut bytes = Vec::new();
+    local.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+    let mut decoder = PackedDecode::new(&m);
+    decoder.ingest_stream(&bytes).unwrap();
+    let mut params = Vec::new();
+    let mut locked = false;
+    let mut locals = Vec::new();
+    decode_localdb_params(&mut decoder, &types, &mut params, &mut locked, &mut locals).unwrap();
+    assert!(params.is_empty());
+    assert_eq!(locals.len(), 1);
+    assert_eq!(locals[0].name, "wide_local");
+    assert_eq!(locals[0].dtype.get_size(), 8);
 }
 
 // ---------------------------------------------------------------------------

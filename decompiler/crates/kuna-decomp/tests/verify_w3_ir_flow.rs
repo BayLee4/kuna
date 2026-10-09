@@ -51,6 +51,127 @@ use kuna_sleigh::loadimage_xml::{register_loadimage_xml_ids, LoadImageXml};
 use kuna_sleigh::sleigh::Sleigh;
 use kuna_sleigh::translate::Translate;
 
+mod config_ir_regressions {
+    use super::{Address, ArchContext, FlowEnvironment, FlowInfo, Funcdata, OpCode, Rc, Translate, TypeOp, build_manager, make_op, pcodeop_flags, ram_space, set_coderef_in, type_metatype, typeop_for};
+    fn config_flow_fd() -> Funcdata {
+        let mut context = ArchContext::new(build_manager());
+        let factory = kuna_decomp::dtype::TypeFactoryImpl::new();
+        factory.set_default_alignment_map();
+        factory.set_max_basetype_size(8);
+        context.types = Some(Rc::new(factory));
+        let context = Rc::new(context);
+        let entry = Address::new(Rc::clone(context.manage().get_space_by_name("ram").unwrap()), 0x1000);
+        Funcdata::new("flow", "flow", context, entry, 0x10000000, 0x40).unwrap()
+    }
+
+    #[test]
+    fn callsite_prototype_precedes_noninline_callee_but_not_instruction_flow_override() {
+        use kuna_decomp::fspec::{parameter_pieces_flags, FuncProto, ParameterPieces, ProtoModel, PrototypePieces};
+        use kuna_decomp::overrides::flow_type;
+
+        struct NoReturnCallee;
+        impl FlowEnvironment for NoReturnCallee {
+            fn translate(&self) -> &dyn Translate {
+                panic!("pure IR flow does not lift");
+            }
+            fn resolve_typeop(&self, opcode: OpCode) -> TypeOp {
+                typeop_for(opcode)
+            }
+            fn query_call(&self, _: &Address) -> Option<String> {
+                Some("global_noreturn".into())
+            }
+            fn query_call_no_return(&self, _: &Address) -> bool {
+                true
+            }
+        }
+
+        // direct; untyped indirect; indirect resolved on a prior pass.
+        for route in 0..3 {
+            for explicit_return in [false, true] {
+                let mut fd = config_flow_fd();
+                let ram = ram_space(&fd);
+                let site = Address::new(Rc::clone(&ram), 0x1000);
+                let target = Address::new(Rc::clone(&ram), 0x2000);
+                let mut model = ProtoModel::new(fd.get_arch().manage());
+                model.build_param_list("standard").unwrap();
+                model.set_name("site_model");
+                let mut proto = FuncProto::new();
+                let types = fd.get_arch().types().unwrap();
+                proto.set_internal(
+                    Rc::new(model), types.get_type_void().unwrap(),
+                );
+                let input = ParameterPieces {
+                    addr: Address::new(Rc::clone(&ram), 0x90),
+                    type_: Some(types.get_base(4, type_metatype::TYPE_INT).unwrap()),
+                    flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK
+                        | parameter_pieces_flags::CUSTOM_STORAGE,
+                };
+                let output = ParameterPieces {
+                    addr: Address::new(Rc::clone(&ram), 0x10),
+                    type_: Some(types.get_base(8, type_metatype::TYPE_INT).unwrap()),
+                    flags: 0,
+                };
+                proto.set_pieces(&PrototypePieces {
+                    outtype: Some(types.get_type_void().unwrap()),
+                    innames: vec!["site_argument".into()],
+                    first_var_arg_slot: -1,
+                    input_storage: vec![(0, input)],
+                    output_storage: Some(output),
+                    ..Default::default()
+                }, None, types, fd.get_arch().manage()).unwrap();
+                proto.set_output_lock(false);
+                fd.get_override_mut().insert_proto_override(site.clone(), Box::new(proto));
+                if route == 2 {
+                    fd.get_override_mut().insert_indirect_override(site.clone(), target);
+                }
+                let call = make_op(
+                    &mut fd,
+                    if route == 0 { OpCode::CPUI_CALL } else { OpCode::CPUI_CALLIND },
+                    0x1000, 1,
+                );
+                set_coderef_in(&mut fd, call, 0x2000);
+                fd.obank_mut().get_mut(call).unwrap().set_flag(pcodeop_flags::startmark);
+                if explicit_return {
+                    fd.get_override_mut().insert_flow_override(site.clone(), flow_type::CALL_RETURN);
+                    fd.override_flow(&site, flow_type::CALL_RETURN).unwrap();
+                }
+                let env = NoReturnCallee;
+                let mut flow = FlowInfo::new(fd, &env);
+                let mut startbasic = true;
+                let mut fallthrough = false;
+                flow.xref_for_test(call, &mut startbasic, &mut fallthrough).unwrap();
+                assert_eq!(fallthrough, !explicit_return, "route {route}");
+                let fc = flow.data.get_call_specs(flow.data.get_call_specs_index(call).unwrap());
+                assert_eq!(fc.proto().get_model_name(), "site_model");
+                assert!(fc.proto().is_override());
+                assert!(!fc.proto().is_no_return());
+                assert_eq!(fc.proto().num_params(), 1);
+                let arg = fc.proto().get_param(0).unwrap();
+                assert_eq!(arg.get_name(), "site_argument");
+                assert_eq!(arg.get_address().get_offset(), 0x90);
+                assert_eq!(arg.get_size(), 4);
+                assert!(arg.is_type_locked() && arg.is_name_locked());
+                assert_eq!(fc.proto().get_output().get_address().get_offset(), 0x10);
+                assert_eq!(fc.proto().get_output().get_size(), 8);
+                assert!(!fc.proto().is_output_locked());
+                assert_eq!(flow.data.obank().get(call).unwrap().code(),
+                    if route == 1 { OpCode::CPUI_CALLIND } else { OpCode::CPUI_CALL });
+            }
+        }
+
+        // A site without an override retains ordinary global noreturn behavior.
+        let mut fd = config_flow_fd();
+        let call = make_op(&mut fd, OpCode::CPUI_CALL, 0x1000, 1);
+        set_coderef_in(&mut fd, call, 0x2000);
+        let env = NoReturnCallee;
+        let mut flow = FlowInfo::new(fd, &env);
+        let mut startbasic = true;
+        let mut fallthrough = true;
+        flow.xref_for_test(call, &mut startbasic, &mut fallthrough).unwrap();
+        assert!(!fallthrough);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The op-code → TypeOp table (the W6 `glb->inst` boundary, for the test environment)
 // ---------------------------------------------------------------------------

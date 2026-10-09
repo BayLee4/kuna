@@ -116,6 +116,23 @@ fn pointers_and_arrays_are_pure_prefixes() {
 }
 
 #[test]
+fn nested_types_retain_nominal_leaf_not_pointer_or_array_name() {
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
+
+    let types = TypeFactoryImpl::new();
+    types.setup_sizes(Some(4), 8, 8);
+    types.set_max_basetype_size(8);
+    let node = types.get_type_struct("Node").unwrap();
+    let alias = types.get_typedef(&node, "NodeAlias", 0x1234, 0).unwrap();
+    let root = ptr_to(array_of(ptr_to(alias.clone()), 2));
+    let (front, back) = RUST_SPELLER.declarator(&ctx(), &root);
+    assert_eq!((front.as_str(), back.as_str()), ("*mut [*mut NodeAlias; 2]", ""));
+    assert_eq!(alias.get_typedef().unwrap().get_name(), "Node");
+    assert_eq!(alias.get_unsized_id().unwrap(), 0x1234);
+    assert_eq!(spell(&base(3, type_metatype::TYPE_UNKNOWN)), "[u8; 3]");
+}
+
+#[test]
 fn void_is_the_unit_type() {
     assert_eq!(spell(&base(0, type_metatype::TYPE_VOID)), "()");
     assert_eq!(spell(&ptr_to(base(0, type_metatype::TYPE_VOID))), "*mut ()");

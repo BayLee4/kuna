@@ -1234,6 +1234,8 @@ mod tests {
     use super::*;
     use kuna_decomp::dtype::TypeFactoryImpl;
 
+    mod declaration_regressions;
+
     /// A configured [`TypeFactory`] for the mapper unit tests (the dtype-test
     /// recipe: default alignment map, max base size 8, 64-bit sizes, core-type
     /// cache so `get_type_void`/`get_type_char`/`get_type_pointer` resolve).

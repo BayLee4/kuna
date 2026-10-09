@@ -31,6 +31,90 @@ use crate::varnode::DefOpInfo;
 
 use super::{ActionConditionalExe, ConditionalExecution, MultiPredicate, RuleOrPredicate};
 
+mod config_ir_regressions {
+    use super::{Action, ActionGroupList, OpCode, RuleOrPredicate, build_fd, mk_const, mk_input, mk_out, new_bb, new_op, pcodeop_flags, place, set_cover, set_start, wire_read};
+    use crate::action::{ActionContext, ActionPool, RuleState};
+
+    #[test]
+    fn orpredicate_registered_pool_rewrites_single_form() {
+        let mut fd = build_fd();
+        let condb = new_bb(&mut fd);
+        let zero_bl = new_bb(&mut fd);
+        let other_bl = new_bb(&mut fd);
+        let join = new_bb(&mut fd);
+        for (bl, s) in [(condb, 0x1000), (zero_bl, 0x2000), (other_bl, 0x3000), (join, 0x4000)] {
+            set_cover(&mut fd, bl, s);
+        }
+        // condBlock: out0=false=>other_bl, out1=true=>zero_bl.  (val2==0) is true on
+        // the FALSE path here, so zeroPathIsTrue must be false for checkSingle to fire.
+        fd.bblocks_mut().add_edge(condb, zero_bl); // slot 0 (false) => zero set
+        fd.bblocks_mut().add_edge(condb, other_bl); // slot 1 (true)
+        fd.bblocks_mut().add_edge(zero_bl, join);
+        fd.bblocks_mut().add_edge(other_bl, join);
+        set_start(&mut fd, condb);
+
+        // val2 (the `other` input to the OR) and val1 (the non-zero MULTIEQUAL side).
+        let val2 = mk_input(&mut fd, 0x10, 4);
+        let val1 = mk_input(&mut fd, 0x18, 4);
+        // cond = INT_EQUAL(val2, #0) in condBlock.
+        let k = mk_const(&mut fd, 0, 4);
+        let eq = new_op(&mut fd, 2, 0x1000, OpCode::CPUI_INT_EQUAL);
+        let c = mk_out(&mut fd, eq, 0x80, 1);
+        wire_read(&mut fd, eq, val2, 0);
+        wire_read(&mut fd, eq, k, 1);
+        place(&mut fd, eq, condb);
+        let cb = new_op(&mut fd, 2, 0x1001, OpCode::CPUI_CBRANCH);
+        let tgt = mk_input(&mut fd, 0x100, 8);
+        wire_read(&mut fd, cb, tgt, 0);
+        wire_read(&mut fd, cb, c, 1);
+        place(&mut fd, cb, condb);
+
+        // zero set: tmp_zero = COPY(#0) in zero_bl (join slot 0).
+        let zero = mk_const(&mut fd, 0, 4);
+        let cp0 = new_op(&mut fd, 1, 0x2000, OpCode::CPUI_COPY);
+        let tmp0 = mk_out(&mut fd, cp0, 0x70, 4);
+        wire_read(&mut fd, cp0, zero, 0);
+        place(&mut fd, cp0, zero_bl);
+
+        // tmp1 = MULTIEQUAL(tmp0 [zero, slot 0], val1 [other path, slot 1]).
+        let me = new_op(&mut fd, 2, 0x4000, OpCode::CPUI_MULTIEQUAL);
+        fd.obank_mut().get_mut(me).unwrap().set_flag(pcodeop_flags::marker);
+        let tmp1 = mk_out(&mut fd, me, 0x88, 4);
+        wire_read(&mut fd, me, tmp0, 0);
+        wire_read(&mut fd, me, val1, 1);
+        place(&mut fd, me, join);
+
+        // result = tmp1 | val2  (the INT_OR rule target).
+        let or = new_op(&mut fd, 2, 0x4001, OpCode::CPUI_INT_OR);
+        let _o = mk_out(&mut fd, or, 0x90, 4);
+        wire_read(&mut fd, or, tmp1, 0); // branch0 = MULTIEQUAL form
+        wire_read(&mut fd, or, val2, 1); // branch1 not a predicate (val2 plain) => checkSingle path
+        place(&mut fd, or, join);
+
+        fd.structure_reset();
+
+        let mut pool = ActionPool::new(0, "predicate-pool");
+        pool.add_rule(
+            RuleState::new("condexe", 0, "orpredicate"),
+            Box::new(RuleOrPredicate::new("condexe")),
+        );
+        assert!(pool.clone_filtered(&ActionGroupList::from_names(["unrelated"])).is_none());
+        assert_eq!(fd.obank().get(or).unwrap().code(), OpCode::CPUI_INT_OR);
+        let mut selected = pool
+            .clone_filtered(&ActionGroupList::from_names(["condexe"]))
+            .unwrap();
+        selected.reset(&mut fd);
+        let mut ctx = ActionContext::new();
+        assert_eq!(selected.perform(&mut fd, &mut ctx), 1);
+        let rewritten = fd.obank().get(or).unwrap();
+        assert_eq!(rewritten.code(), OpCode::CPUI_COPY);
+        assert_eq!(rewritten.num_input(), 1);
+        assert_eq!(rewritten.get_in(0), Some(tmp1));
+        assert_eq!(fd.obank().get(me).unwrap().get_in(0), Some(val2));
+        assert_eq!(fd.obank().get(me).unwrap().get_in(1), Some(val1));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Fixture
 // -----------------------------------------------------------------------------

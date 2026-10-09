@@ -17,6 +17,75 @@ use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, 
 
 use super::*;
 
+mod config_ir_regressions {
+    use super::{AddrSpaceManager, Override, Rc, manager, ram};
+    use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+    use crate::fspec::{FuncProto, ParameterPieces, ProtoModel, PrototypePieces, parameter_pieces_flags};
+
+    fn prototype(m: &AddrSpaceManager, input: u64, output: u64) -> FuncProto {
+        let mut model = ProtoModel::new(m);
+        model.build_param_list("standard").unwrap();
+        model.set_name("custom_call_model");
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(8), 8, 8);
+        types.set_max_basetype_size(8);
+        let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let mut proto = FuncProto::new();
+        proto.set_internal(Rc::new(model), types.get_type_void().unwrap());
+        let input_piece = ParameterPieces {
+            addr: ram(m, input), type_: Some(int4.clone()),
+            flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::CUSTOM_STORAGE,
+        };
+        proto.set_pieces(&PrototypePieces {
+            outtype: Some(types.get_type_void().unwrap()),
+            innames: vec!["argument".into()],
+            first_var_arg_slot: -1,
+            input_storage: vec![(0, input_piece.clone())],
+            output_storage: Some(ParameterPieces {
+                addr: ram(m, output), type_: Some(int4), flags: 0,
+            }),
+            ..Default::default()
+        }, None, &types, m).unwrap();
+        proto.set_param(0, "argument", &input_piece);
+        proto.set_output_lock(false);
+        proto
+    }
+
+    #[test]
+    fn proto_override_replacement_is_callsite_local_and_preserves_exact_signature() {
+        let m = manager();
+        let mut ov = Override::new();
+        ov.insert_proto_override(ram(&m, 0x40), Box::new(prototype(&m, 0x90, 0x10)));
+        ov.insert_proto_override(ram(&m, 0x80), Box::new(prototype(&m, 0x98, 0x08)));
+        let mut original_caller = Override::new();
+        original_caller.insert_proto_override(ram(&m, 0x40), Box::new(prototype(&m, 0x90, 0x10)));
+        ov.insert_proto_override(ram(&m, 0x40), Box::new(prototype(&m, 0xa0, 0x18)));
+        for (store, site, input, output) in [
+            (&ov, 0x40, 0xa0, 0x18),
+            (&ov, 0x80, 0x98, 0x08),
+            (&original_caller, 0x40, 0x90, 0x10),
+        ] {
+            let proto = store.find_proto_override(&ram(&m, site)).unwrap().prototype().unwrap();
+            assert!(proto.is_override());
+            assert_eq!(proto.get_model_name(), "custom_call_model");
+            assert!(proto.has_custom_storage());
+            assert_eq!(proto.num_params(), 1);
+            let param = proto.get_param(0).unwrap();
+            assert_eq!(param.get_address(), ram(&m, input));
+            assert_eq!(param.get_size(), 4);
+            assert!(param.is_type_locked());
+            assert!(!param.is_name_locked());
+            assert_eq!(proto.get_output().get_address(), ram(&m, output));
+            assert_eq!(proto.get_output().get_size(), 4);
+            assert!(!proto.is_output_locked());
+        }
+        assert!(ov.find_proto_override(&ram(&m, 0x44)).is_none());
+        ov.clear();
+        assert!(ov.find_proto_override(&ram(&m, 0x40)).is_none());
+        assert!(original_caller.find_proto_override(&ram(&m, 0x40)).is_some());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Test fixtures
 // ---------------------------------------------------------------------------

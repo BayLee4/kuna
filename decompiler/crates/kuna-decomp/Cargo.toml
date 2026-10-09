@@ -17,6 +17,7 @@ smallvec.workspace = true
 slotmap.workspace = true
 
 [dev-dependencies]
+kuna-harness = { path = "../kuna-harness" }
 # Verifier-only: the datatest <stringmatch> engine (item w10-structure-printbody).
 regex = { workspace = true }
 serde = { version = "1", features = ["derive"] }

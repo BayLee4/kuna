@@ -29,7 +29,9 @@
 //!   `run_test_files`) with the `<stringmatch>` min/max + multi-line matching and
 //!   the `Success -- `/`FAIL -- `/`Total tests applied = N` stdout grammar.
 
+pub mod c_behavior;
 pub mod corpus;
+pub mod dwarf_fixture;
 pub mod liftdiff;
 pub mod testfunction;
 pub mod unittest;

@@ -7,6 +7,8 @@
 mod common;
 
 use common::process;
+use common::scratch_file;
+use kuna_harness::c_behavior;
 
 #[cfg(unix)]
 #[path = "common/compiler_probe_tests.rs"]
@@ -2627,6 +2629,52 @@ fn printed_functions(stdout: &str, names: &[&str]) -> String {
         bodies.push('\n');
     }
     format!("{}{bodies}", defs.concat())
+}
+
+#[test]
+fn original_calleevote_commands_preserve_the_source_comparator_abi_and_values() {
+    let binary = repo_root()
+        .join("decompiler/crates/kuna-analysis/tests/fixtures/calleevote_x86_64");
+    let sleigh = specs();
+    for option in [None, Some("off"), Some("types")] {
+        let mut arguments = vec!["decompile-all", binary.to_str().unwrap()];
+        if let Some(value) = option {
+            arguments.extend(["--option", "calleevote", value]);
+        }
+        let (output, diagnostics, success) = run_kuna_env(&arguments, &[("SLEIGHHOME", &sleigh)]);
+        assert!(success, "{diagnostics}");
+        let comparator = printed_functions(&output, &["by_used"]);
+        c_behavior::assert_c_behavior(
+            &scratch_file("original-calleevote-comparator", "c"),
+            r#"#include <limits.h>
+#include <stddef.h>
+#include <stdbool.h>
+struct table { int n; long used; long buckets; long cap; };
+_Static_assert(sizeof(long) == 8 && offsetof(struct table, used) == 8, "fixture data model");
+static int source_comparator(const void *left, const void *right) {
+    return ((const struct table *)left)->used < ((const struct table *)right)->used;
+}
+"#,
+            &comparator,
+            r#"int main(void) {
+    int (*consumer)(void *, void *) = by_used;
+    const long values[] = {LONG_MIN, -42, -1, 0, 1, 42, LONG_MAX};
+    for (unsigned left = 0; left < sizeof(values)/sizeof(values[0]); ++left) {
+        for (unsigned right = 0; right < sizeof(values)/sizeof(values[0]); ++right) {
+            struct table a = {17, values[left], 91, 113};
+            struct table b = {23, values[right], 127, 149};
+            int expected = source_comparator(&a, &b);
+            int actual = consumer(&a, &b);
+            if (actual != expected || (actual != 0 && actual != 1)) return 1;
+            if (a.n != 17 || a.used != values[left] || a.buckets != 91 || a.cap != 113 ||
+                b.n != 23 || b.used != values[right] || b.buckets != 127 || b.cap != 149) return 2;
+        }
+    }
+    return 0;
+}
+"#,
+        );
+    }
 }
 
 /// On MIPS o32 `h(int, float)` takes its float in a general register, and each
@@ -9942,4 +9990,312 @@ fn a_float_result_held_as_bits_round_trips() {
             "{cc}: the printed C computes something else:\n{printed}"
         );
     }
+}
+
+fn scratch_dir(stem: &str) -> PathBuf {
+    let dir = common::scratch_file(stem, "dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn have_c_compiler() -> bool {
+    process::optional_output(Command::new("cc").arg("--version")).is_some()
+}
+
+fn compile_project(dir: &std::path::Path, project: &std::path::Path, stem: &str, driver: &str) {
+    let source = dir.join("consumer.c");
+    std::fs::write(&source, driver).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let executable = dir.join(format!("consumer{opt}"));
+        let built = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
+                "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(project).arg(project.join(format!("{stem}.c")))
+            .arg(&source).arg("-o").arg(&executable).output().expect("compile original providers");
+        assert!(built.status.success(), "{opt}: {}", String::from_utf8_lossy(&built.stderr));
+        let ran = process::required_output(&mut Command::new(&executable));
+        assert!(ran.status.success(), "{opt}: {}", String::from_utf8_lossy(&ran.stderr));
+    }
+}
+#[test]
+fn branch_selected_entry_values_survive_the_cli_raw_image_pipeline() {
+    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
+    let dir = scratch_dir("branch_selected_entry_values_survive_the_cli_raw_image_pipeline");
+    std::fs::create_dir_all(&dir).unwrap();
+    let binary = dir.join("branch_copy");
+    let project = dir.join("project");
+    std::fs::write(&binary, [0x85,0xd2,0x74,5,0x48,0x89,0xf0,0xeb,3,0x48,0x89,0xf8,0xc3]).unwrap();
+    let sp = specs();
+    let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
+        .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap(),
+            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
+            "--addr", "0x1000", "--define-function", "0x1000-0x100d=subject", "--assert-strict", "--assert",
+            "prototype subject unsigned long long subject(unsigned long long first,unsigned long long second,unsigned int which)"])
+        .output().expect("export branch entry-value effects");
+    let stderr = String::from_utf8_lossy(&export.stderr);
+    assert!(export.status.success(), "a branch selecting declared inputs must be representable: {stderr}");
+    let driver = dir.join("consumer.c");
+    std::fs::write(&driver, r#"#include "branch_copy.h"
+#include <stdint.h>
+#include <stdio.h>
+int main(void) {
+    const uint64_t pairs[][2] = {{0,7}, {7,0},
+        {UINT64_C(0x123456789abcdef0),UINT64_C(0x76543210fedcba98)}};
+    const unsigned flags[] = {0,1,UINT32_MAX};
+    for (unsigned i=0; i<3; ++i) for (unsigned j=0; j<3; ++j) {
+        uint64_t want = pairs[i][flags[j] != 0];
+        uint64_t got = subject(pairs[i][0],pairs[i][1],flags[j]);
+        if (got != want) {
+            fprintf(stderr,"pair=%u flag=%u got=%llx want=%llx\n",i,flags[j],
+                (unsigned long long)got,(unsigned long long)want);
+            return 1;
+        }
+    }
+    return 0;
+}
+"#).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let exe = dir.join(format!("consumer{opt}"));
+        let build = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(&project).arg(project.join("branch_copy.c"))
+            .arg(&driver).arg("-o").arg(&exe).output().expect("compile branch entry-value effects");
+        assert!(build.status.success(), "{opt}: {}", String::from_utf8_lossy(&build.stderr));
+        let run = Command::new(&exe).output().expect("run branch entry-value effects");
+        assert!(run.status.success(), "{opt}: unchanged C discarded a branch's incoming value: {}", String::from_utf8_lossy(&run.stderr));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn callback_callee_saved_effects_cannot_be_folded_into_the_wrong_result() {
+    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
+    let dir = scratch_dir("callback_callee_saved_effects_cannot_be_folded_into_the_wrong_result");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sp = specs();
+    {
+        let name = "restored";
+        let binary = dir.join(name);
+        let project = dir.join(format!("{name}-project"));
+            let dispatch = [0x48,0x8d,0x35,0xf9,1,0,0,0xbf,85,0,0,0,0xe8,0xef,0,0,0,0xc3];
+        let caller = [0x53,0xbb,42,0,0,0,0xff,0xd6,0x89,0xd8,0x5b,0xc3];
+        let target: &[u8] = &[0x53,0xbb,7,0,0,0,0xb8,3,0,0,0,0x5b,0xc3];
+        let mut image = vec![0u8; 0x220];
+        image[..dispatch.len()].copy_from_slice(&dispatch);
+        image[0x100..0x100+caller.len()].copy_from_slice(&caller);
+        image[0x200..0x200+target.len()].copy_from_slice(target);
+        std::fs::write(&binary, image).unwrap();
+        let target_definition = format!("0x1200-0x{:x}=target", 0x1200 + target.len());
+        let common = [
+            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
+            "--addr", "0x1000", "--addr", "0x1100", "--addr", "0x1200",
+            "--define-function", "0x1000-0x1012=dispatch", "--define-function", "0x1100-0x110c=caller",
+            "--define-function", &target_definition, "--assert-strict",
+            "--assert", "typedef typedef int (*Callback)(unsigned char);",
+            "--assert", "prototype dispatch int dispatch(void)",
+            "--assert", "prototype caller int caller(unsigned char value,Callback callback)",
+            "--assert", "prototype target int target(unsigned char value)",
+        ];
+        let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
+            .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap()])
+            .args(common).output().expect("export callback effects");
+        let stderr = String::from_utf8_lossy(&export.stderr);
+        assert!(export.status.success(), "a real save/restore must remain representable: {stderr}");
+        let expected = 42;
+        let driver = dir.join(format!("{name}-consumer.c"));
+        std::fs::write(&driver, format!(
+            "#include \"{name}.h\"\n#include <stdio.h>\nint main(void) {{ int got=dispatch(); if(got!={expected}) {{ fprintf(stderr,\"got=%d expected={expected}\\n\",got); return 1; }} return 0; }}\n"
+        )).unwrap();
+        for opt in ["-O0", "-O2"] {
+            let exe = dir.join(format!("{name}{opt}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+                .arg("-I").arg(&project).arg(project.join(format!("{name}.c")))
+                .arg(&driver).arg("-o").arg(&exe).output().expect("compile callback effects");
+            assert!(build.status.success(), "{name} {opt}: {}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run callback effects");
+            assert!(run.status.success(), "{name} {opt}: unchanged C differs from the machine: {}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn joined_return_project_compiles_with_scalar_piece_helpers() {
+    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
+    let dir = scratch_dir("joined_return_project_compiles_with_scalar_piece_helpers");
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("join_return");
+    std::fs::write(&image, [0x8b, 0x44, 0x24, 0x04, 0x8b, 0x54, 0x24, 0x08, 0xc3]).unwrap();
+    let project = dir.join("project");
+    let sp = specs();
+    let (_, stderr, ok) = run_kuna(&[
+        "decompile-project", image.to_str().unwrap(), "-o", project.to_str().unwrap(),
+        "--raw-image", "--target", "x86:LE:32:default:gcc", "--base", "0x1000",
+        "--sleighpath", &sp, "--addr", "0x1000", "--define-function", "0x1000-0x1009=subject",
+        "--assert-strict", "--assert",
+        "prototype subject unsigned long long __cdecl subject(unsigned int low,unsigned int high)",
+    ]);
+    assert!(ok, "joined return export failed: {stderr}");
+    let consumer = dir.join("consumer.c");
+    std::fs::write(&consumer, r#"#include "join_return.h"
+int main(void) {
+    /* Exact EDX:EAX instruction results, including the signed high-bit boundary. */
+    if (subject(0, 7) != 0x0000000700000000ULL) return 1;
+    if (subject(7, 0) != 7ULL) return 2;
+    if (subject(0x12345678U, 0x76543210U) != 0x7654321012345678ULL) return 3;
+    if (subject(0xffffffffU, 0x80000000U) != 0x80000000ffffffffULL) return 4;
+    return 0;
+}
+"#).unwrap();
+    for opt in ["-O0", "-O2"] {
+        let executable = dir.join(format!("consumer{opt}"));
+        let built = Command::new("cc")
+            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
+                "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
+            .arg("-I").arg(&project).arg(project.join("join_return.c"))
+            .arg(&consumer).arg("-o").arg(&executable).output().expect("spawn cc");
+        assert!(built.status.success(), "unchanged JOIN export failed to compile {opt}:\n{}",
+            String::from_utf8_lossy(&built.stderr));
+        let ran = Command::new(&executable).output().expect("run joined return consumer");
+        assert!(ran.status.success(), "JOIN return differs from EDX:EAX {opt}:\n{}",
+            String::from_utf8_lossy(&ran.stderr));
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn signed_byte_table_loads_ignore_the_consumers_plain_char_mode() {
+    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
+    let dir = scratch_dir("signed_byte_table_loads_ignore_the_consumers_plain_char_mode");
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("signed_table");
+    let mut bytes = vec![0u8; 0x108];
+    let code = [0x83,0xe7,0x07,0x48,0x8d,0x05,0xf6,0,0,0,0x0f,0xbe,0x04,0x07,0xc3];
+    bytes[..code.len()].copy_from_slice(&code);
+    bytes[0x100..].copy_from_slice(&[129,4,225,99,0,127,255,42]);
+    std::fs::write(&image, bytes).unwrap();
+    let sp = specs();
+    let (printed, stderr, ok) = run_kuna(&[
+        "decompile-all", image.to_str().unwrap(), "--raw-image", "--target", "x86:LE:64:default:gcc",
+        "--base", "0x1000", "--addr", "0x1000", "--define-function", "0x1000-0x100f=table_value",
+        "--sleighpath", &sp, "--assert-strict",
+        "--assert", "prototype table_value int table_value(unsigned int index)",
+        "--assert", "data 0x1100 char identity_table[8]",
+    ]);
+    assert!(ok, "signed table decompilation failed: {stderr}");
+    assert!(printed.contains("identity_table"), "the machine load lost its named global dependency:\n{printed}");
+    let source = dir.join("consumer.c");
+    std::fs::write(&source, format!(r#"#include <stdint.h>
+#include <stdio.h>
+typedef signed char sbyte, schar;
+typedef unsigned char byte, uchar;
+typedef unsigned int uint;
+const char identity_table[8] = {{(char)129,4,(char)225,99,0,127,(char)255,42}};
+{printed}
+int main(void) {{
+    const int expected[8] = {{-127,4,-31,99,0,127,-1,42}};
+    for (unsigned index=0; index<8; ++index) {{
+        int actual=table_value(index);
+        if (actual!=expected[index]) {{
+            fprintf(stderr,"table_value(%u)=%d expected=%d\n",index,actual,expected[index]);
+            return 1;
+        }}
+    }}
+    return 0;
+}}
+"#)).unwrap();
+    for opt in ["-O0", "-O2"] {
+        for char_mode in ["-fsigned-char", "-funsigned-char"] {
+            let exe = dir.join(format!("consumer{opt}{char_mode}"));
+            let build = Command::new("cc")
+                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=implicit-function-declaration", opt, char_mode])
+                .arg(&source).arg("-o").arg(&exe).output().expect("spawn cc");
+            assert!(build.status.success(), "{opt} {char_mode}: unchanged signed table C did not compile:\n{}\n{printed}", String::from_utf8_lossy(&build.stderr));
+            let run = Command::new(&exe).output().expect("run signed table consumer");
+            assert!(run.status.success(), "{opt} {char_mode}: MOVSBL changed meaning:\n{}\n{printed}", String::from_utf8_lossy(&run.stderr));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn assert_parameter(document: &str, function: &str, index: u64, name: &str, size: u64) {
+    let json: serde_json::Value = serde_json::from_str(document).expect("CLI JSON");
+    let row = json["functions"].as_array().unwrap().iter()
+        .find(|r| r["name"] == function).expect("selected function");
+    let param = row["variables"].as_array().unwrap().iter()
+        .find(|v| v["kind"] == "arg" && v["arg_index"] == index).expect("source parameter");
+    assert_eq!(param["name"], name, "source-authored parameter name");
+    assert_eq!(param["size"], size, "source formal must not become its wider machine carrier");
+}
+
+#[test]
+fn narrow_declared_inputs_preserve_live_physical_bits() {
+    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
+    let dir = scratch_dir("physical-input");
+    let sp = specs();
+    let cases: &[(&str, &[u8], &str, &str, u32)] = &[
+        ("movzx_byte", &[0x40,0x0f,0xb6,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned char value)", "(uint8_t)raw == 85", 255),
+        ("movzx_short", &[0x0f,0xb7,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
+         "unsigned int subject(unsigned short value)", "(uint16_t)raw == 85", 65535),
+        ("movsx_edi_clears_upper", &[0x40,0x0f,0xbe,0xff,0x48,0x89,0xf8,0x48,0xc1,0xe8,0x20,0xc3],
+         "unsigned long long subject(signed char value)", "0", 255),
+    ];
+    for &(name, code, declaration, expected, limit) in cases {
+        let image = dir.join(name);
+        let project = dir.join(format!("{name}-project"));
+        let mut bytes = vec![0u8; 0x240];
+        bytes[..code.len()].copy_from_slice(code);
+        let mut carrier = Vec::new();
+        let call_pc = 0x1200i64 + carrier.len() as i64;
+        carrier.push(0xe8);
+        carrier.extend_from_slice(&i32::try_from(0x1000 - call_pc - 5).unwrap().to_le_bytes());
+        carrier.push(0xc3);
+        bytes[0x200..0x200 + carrier.len()].copy_from_slice(&carrier);
+        std::fs::write(&image, bytes).unwrap();
+        let end = 0x1000 + code.len();
+        let definition = format!("0x1000-0x{end:x}=subject");
+        let carrier_definition = format!("0x1200-0x{:x}=carry", 0x1200 + carrier.len());
+        let prototype = format!("prototype subject {declaration}");
+        let carrier_proto = "prototype carry unsigned long long carry(unsigned long long raw)";
+        let args = vec![
+            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000",
+            "--addr", "0x1000", "--addr", "0x1200", "--define-function", &definition,
+            "--define-function", &carrier_definition, "--sleighpath", &sp,
+            "--assert-strict", "--assert", &prototype, "--assert", carrier_proto,
+        ];
+        let mut metadata_args = vec!["decompile-all", image.to_str().unwrap(), "--json"];
+        metadata_args.extend_from_slice(&args);
+        let (document, error, ok) = run_kuna(&metadata_args);
+        assert!(ok, "{name}: readable source result failed: {error}");
+        let source_size = if declaration.contains("short") { 2 } else { 1 };
+        assert_parameter(&document, "subject", 0, "value", source_size);
+        let mut export_args = vec!["decompile-project", image.to_str().unwrap(), "-o", project.to_str().unwrap()];
+        export_args.extend_from_slice(&args);
+        let (_, error, ok) = run_kuna(&export_args);
+        assert!(ok, "{name}: genuine wide caller export failed: {error}");
+        let driver = format!(r#"#include <stdint.h>
+#include <stdio.h>
+#include "{name}.h"
+static uint64_t reference(uint64_t raw) {{
+    (void)raw; return {expected};
+}}
+int main(void) {{
+    const uint64_t upper[] = {{0, UINT64_C(0x10000), UINT64_C(0x1234567800000000), UINT64_C(0xffffffff00000000)}};
+    for (unsigned p=0; p<4; ++p)
+        for (uint32_t bits=0; bits<={limit}U; ++bits) {{
+            uint64_t raw=upper[p]|bits;
+            uint64_t want=reference(raw), got=carry(raw);
+            if (got!=want) {{
+                fprintf(stderr,"raw=%llx got=%llx want=%llx\n",(unsigned long long)raw,
+                    (unsigned long long)got,(unsigned long long)want); return 1;
+            }}
+        }}
+    return 0;
+}}
+"#);
+        compile_project(&dir, &project, name, &driver);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
 }

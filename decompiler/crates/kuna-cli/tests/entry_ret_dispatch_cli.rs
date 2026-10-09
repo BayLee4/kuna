@@ -3,6 +3,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+use common::{c_behavior, raw_calls, scratch_file};
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../..")
@@ -54,6 +57,9 @@ fn entry_dispatch_recovers_every_call_and_continuation() {
         !code.contains("return;"),
         "entry dispatch stayed an empty return:\n{code}"
     );
+    c_behavior::assert_three_call_chain(
+        &scratch_file("entry-dispatch", "c"), &code, "entry_dispatch",
+    );
 }
 
 #[test]
@@ -78,6 +84,9 @@ fn incoming_return_address_is_not_a_dispatch_target() {
         code.contains("return;"),
         "incoming return address became a call:\n{code}"
     );
+    assert!(raw_calls::indirect_targets(&decompile_with(
+        "incoming_return_ret", &["--raw"],
+    )).is_empty());
     assert!(
         !code.contains("(*"),
         "incoming return address became a call:\n{code}"
@@ -117,6 +126,10 @@ fn unrelated_computed_returns_are_not_calls() {
                 "{function} recovered unrelated {call}:\n{code}"
             );
         }
+        let mut raw_extra = extra.to_vec();
+        raw_extra.push("--raw");
+        assert!(raw_calls::indirect_targets(&decompile_with(function, &raw_extra)).is_empty(),
+            "{function}: a computed return acquired an indirect call");
     }
 
     let code = decompile("unrelated_fallthrough_store_ret");
@@ -128,6 +141,9 @@ fn unrelated_computed_returns_are_not_calls() {
         !code.contains("(*"),
         "unrelated store made the incoming return address callable:\n{code}"
     );
+    assert!(raw_calls::indirect_targets(&decompile_with(
+        "unrelated_fallthrough_store_ret", &["--raw"],
+    )).is_empty());
 }
 
 #[test]
@@ -137,6 +153,9 @@ fn option_off_restores_the_first_ret_termination() {
     for call in CALLS {
         assert!(!code.contains(call), "option off still derived {call}:\n{code}");
     }
+    assert!(raw_calls::indirect_targets(&decompile_with(
+        "entry_dispatch", &["--option", "entryretdispatch", "off", "--raw"],
+    )).is_empty());
 }
 
 #[test]
@@ -146,4 +165,7 @@ fn explicit_return_cleanly_vetoes_the_automatic_call() {
     for call in CALLS {
         assert!(!code.contains(call), "explicit return was overridden by {call}:\n{code}");
     }
+    assert!(raw_calls::indirect_targets(&decompile_with(
+        "entry_dispatch", &["--assert", "flow 0x804900b return", "--raw"],
+    )).is_empty());
 }

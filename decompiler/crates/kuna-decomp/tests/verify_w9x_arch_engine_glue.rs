@@ -41,6 +41,175 @@ use kuna_sleigh::loadimage::LoadImage;
 use kuna_sleigh::loadimage_xml::register_loadimage_xml_ids;
 use kuna_sleigh::translate::register_translate_ids;
 
+mod config_ir_regressions {
+    use super::{Address, AddrSpaceManager, Architecture, DataTest, DummyImg, LanguageDatabase, Rc, XmlArchitecture, XmlArchitectureCapability, build_registry, decompile_func, parse_datatest, repo_root};
+    fn seeded_bootstrap(dt: &DataTest) -> Result<XmlArchitecture, String> {
+        let root = repo_root();
+        let registry = build_registry();
+        let capability = XmlArchitectureCapability::new();
+        let mut arch = capability.build_architecture("datatest", "");
+        arch.build_loader(Rc::clone(&dt.binaryimage)).map_err(|e| format!("build_loader: {e}"))?;
+        let mut db = LanguageDatabase::new();
+        db.scan_for_sleigh_directories(root.join("specs").to_str().unwrap());
+        db.get_descriptions(&registry).map_err(|e| format!("collect ldefs: {e}"))?;
+        arch.sleigh_mut().set_archid(&dt.arch_id);
+        arch.sleigh_mut()
+            .resolve_architecture(&db, &dt.arch_id)
+            .map_err(|e| format!("resolve_architecture: {e}"))?;
+        if arch.sleigh().language_index() < 0 {
+            return Err("language index unresolved".to_string());
+        }
+        let specs = arch.sleigh().build_spec_file(&db).map_err(|e| format!("build_spec_file: {e}"))?;
+        let resolved_sla = specs.slafile.ok_or("build_spec_file resolved no .sla")?;
+        let sla = std::fs::read(&resolved_sla).map_err(|e| format!("read sla: {e}"))?;
+        arch.sleigh_mut()
+            .build_translator(Box::new(DummyImg), &sla)
+            .map_err(|e| format!("build_translator: {e}"))?;
+        let base = arch.sleigh_mut().base_mut().ok_or("no Architecture base after build_translator")?;
+        base.set_pspec_xml(std::fs::read(&specs.processorfile).map_err(|e| format!("read pspec: {e}"))?);
+        base.set_cspec_xml(std::fs::read(&specs.compilerfile).map_err(|e| format!("read cspec: {e}"))?);
+        base.translate_mut().as_sleigh_mut().ok_or("standalone Sleigh engine")?
+            .install_register_lookup().map_err(|e| format!("install_register_lookup: {e}"))?;
+        base.init_post_engine().map_err(|e| format!("init_post_engine: {e}"))?;
+        let manager_ptr: *const AddrSpaceManager = arch.sleigh().base().unwrap().manage();
+        // SAFETY: same shape as the gate / corpus_bootstrap — manager outlives open().
+        arch.open_image(unsafe { &*manager_ptr }, &registry).map_err(|e| format!("open_image: {e}"))?;
+        let img = arch.take_loader().ok_or("loader vanished after open")?;
+        arch.sleigh_mut().base_mut().unwrap().set_loader(Box::new(img));
+        Ok(arch)
+    }
+
+    use kuna_decomp::action::{ruleflags, Action, ActionBase, ActionContext, ActionGroupList, ActionRestartGroup};
+    use kuna_decomp::funcdata::Funcdata;
+    use std::cell::Cell;
+
+    struct RestartProbe {
+        base: ActionBase,
+        visits: Rc<Cell<u32>>,
+    }
+
+    struct PanicProbe(ActionBase);
+    impl Action for PanicProbe {
+        fn base(&self) -> &ActionBase { &self.0 }
+        fn base_mut(&mut self) -> &mut ActionBase { &mut self.0 }
+        fn clone_filtered(&self, groups: &ActionGroupList) -> Option<Box<dyn Action>> {
+            groups.contains("panic_probe").then(|| Box::new(Self(
+                ActionBase::new(0, "panic_probe", "panic_probe"),
+            )) as Box<dyn Action>)
+        }
+        fn apply(&mut self, _: &mut Funcdata, _: &mut ActionContext) -> i32 {
+            panic!("injected reduced-pipeline unwind")
+        }
+    }
+
+    impl Action for RestartProbe {
+        fn base(&self) -> &ActionBase { &self.base }
+        fn base_mut(&mut self) -> &mut ActionBase { &mut self.base }
+        fn clone_filtered(&self, groups: &ActionGroupList) -> Option<Box<dyn Action>> {
+            groups.contains("restart_probe").then(|| Box::new(Self {
+                base: ActionBase::new(0, "restart_probe", "restart_probe"),
+                visits: self.visits.clone(),
+            }) as Box<dyn Action>)
+        }
+        fn apply(&mut self, fd: &mut Funcdata, _: &mut ActionContext) -> i32 {
+            let visits = self.visits.get();
+            self.visits.set(visits + 1);
+            if visits == 0 { fd.set_restart_pending(true); }
+            0
+        }
+    }
+
+    fn selected_root_fixture() -> (XmlArchitecture, String, Address) {
+        let dt = parse_datatest("switchind").expect("checked-in switch fixture");
+        let mut xarch = seeded_bootstrap(&dt).expect("usable compiled spec is required");
+        let arch = xarch.sleigh_mut().base_mut().unwrap();
+        let symbol = dt.symbols.first().expect("switch fixture entry");
+        let entry = Address::new(arch.manage().get_space_by_name(&symbol.space).unwrap().clone(), symbol.offset);
+        (xarch, symbol.name.clone(), entry)
+    }
+
+    fn install_selected_root(arch: &mut Architecture) -> Rc<Cell<u32>> {
+        arch.allacts.set_current("firstpass").unwrap();
+        let firstpass = arch.allacts.get_current().unwrap()
+            .clone_filtered(arch.allacts.get_group("firstpass").unwrap()).unwrap();
+        let visits = Rc::new(Cell::new(0));
+        let mut root = ActionRestartGroup::new(ruleflags::rule_onceperfunc, "universal", 8);
+        root.add_action(firstpass);
+        root.add_action(Box::new(RestartProbe {
+            base: ActionBase::new(0, "restart_probe", "restart_probe"), visits: visits.clone(),
+        }));
+        root.add_action(Box::new(PanicProbe(ActionBase::new(0, "panic_probe", "panic_probe"))));
+        arch.allacts.set_universal(Box::new(root));
+        arch.allacts.set_group("seeded_firstpass", ["base", "restart_probe"]);
+        arch.allacts.set_group("panic_probe", ["panic_probe"]);
+        arch.allacts.set_current("seeded_firstpass").unwrap();
+        visits
+    }
+
+    #[test]
+    fn selected_reduced_root_preserves_explicit_entry_and_local_seeds_across_reflow() {
+        use kuna_decomp::dtype::type_metatype;
+        use kuna_decomp::fspec::{ParameterPieces, PrototypePieces};
+        use kuna_decomp::varnode::varnode_flags;
+        let (mut xarch, name, entry) = selected_root_fixture();
+        let arch = xarch.sleigh_mut().base_mut().unwrap();
+        let visits = install_selected_root(arch);
+        let declared_type = arch.types().get_base(4, type_metatype::TYPE_INT).unwrap();
+        let stack = arch.manage().get_stack_space().expect("compiler stack space").clone();
+        let output_addr = Address::new(stack.clone(), 0x20);
+        let explicit = PrototypePieces {
+            name: name.clone(), outtype: Some(declared_type.clone()), first_var_arg_slot: -1,
+            output_storage: Some(ParameterPieces { addr: output_addr.clone(), type_: Some(declared_type.clone()), flags: 0 }),
+            ..Default::default()
+        };
+        let local_addr = Address::new(stack.clone(), stack.get_highest() - 0x1f);
+        let local_flags = varnode_flags::typelock | varnode_flags::namelock;
+        let mapped = [("committed_local".to_string(), declared_type.clone(), local_addr.clone(), local_flags)];
+        let fd = kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
+            arch, &name, entry, 0, &mapped, &[], &[], Some(&explicit), &[], &[], &[],
+        ).expect("selected seeded firstpass drive");
+        assert_eq!(visits.get(), 2, "one real cross-flow restart must run");
+        assert!(!fd.is_high_on(), "selected firstpass excludes high-variable pipeline");
+        assert!(!fd.is_type_recovery_on());
+        assert_eq!(fd.get_func_proto().get_output_type().expect("declared entry output type")
+            .compare_dependency(&declared_type).unwrap(), 0);
+        assert!(fd.get_func_proto().is_output_locked());
+        assert_eq!(fd.get_func_proto().get_output().get_address(), output_addr);
+        assert!(fd.mapped_symbol_specs().iter().any(|(name, ty, addr, flags)| {
+            name == "committed_local" && ty.compare_dependency(&declared_type).unwrap() == 0
+                && addr == &local_addr && flags & local_flags == local_flags
+        }));
+        assert_eq!(explicit.outtype.as_ref().expect("source output type")
+            .compare_dependency(&declared_type).unwrap(), 0);
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+    }
+
+    #[test]
+    fn temporary_roots_restore_custom_selection_after_success_error_and_deadline() {
+        use kuna_decomp::decompile_drive::run_named_pipeline_variant;
+        let (mut xarch, name, entry) = selected_root_fixture();
+        let arch = xarch.sleigh_mut().base_mut().unwrap();
+        let visits = install_selected_root(arch);
+        let fd = run_named_pipeline_variant(arch, &name, entry.clone(), 0, "firstpass").expect("temporary firstpass");
+        assert!(!fd.is_high_on());
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+        assert!(run_named_pipeline_variant(arch, &name, entry.clone(), 0, "missing_root").is_err());
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+        assert!(run_named_pipeline_variant(arch, &name, entry.clone(), 0, "panic_probe").is_err());
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+        arch.kuna_fn_budget = Some(std::time::Duration::ZERO);
+        assert!(decompile_func(arch, &name, entry.clone(), 0).is_err(), "expired drive cannot publish partial IR");
+        assert!(arch.kuna_fn_deadline.is_none(), "deadline must not leak to next request");
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+        assert_eq!(visits.get(), 0, "expired actions must not run");
+        arch.kuna_fn_budget = None;
+        let fd = decompile_func(arch, &name, entry, 0).unwrap();
+        assert_eq!(visits.get(), 2);
+        assert!(!fd.is_high_on());
+        assert_eq!(arch.allacts.get_current_name(), "seeded_firstpass");
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
 }

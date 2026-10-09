@@ -1200,3 +1200,98 @@ fn an_unselected_address_that_starts_no_function_is_still_rejected() {
         "the rejection did not name the address:\n{stdout}"
     );
 }
+
+#[test]
+fn raw_image_text_cli_preserves_mapping_selection_and_isa() {
+    let raw = common::scratch_file("raw \"single\" image", "bin");
+    std::fs::write(&raw, [0x07, 0x20, 0x70, 0x47, 0x09, 0x20, 0x70, 0x47]).unwrap();
+    let raw = raw.canonicalize().unwrap();
+    let alias = common::scratch_file("raw alias", "bin");
+    std::os::unix::fs::symlink(&raw, &alias).unwrap();
+    let sp = specs();
+    let arm = "ARM:LE:32:v4t:default";
+    let run = |path: &Path, base: &str, selector: &str, target: &str, isa: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_kuna"));
+                cmd.args([
+            "decompile",
+            path.to_str().unwrap(),
+            selector,
+            "--raw-image",
+            "--target",
+            target,
+            "--base",
+            base,
+            "--sleighpath",
+            &sp,
+        ]);
+        if let Some(isa) = isa {
+            cmd.args(["--isa", isa]);
+        }
+        cmd.output().expect("run real text kuna decompile over raw input")
+    };
+
+    let base = run(&raw, "0x4000", "0x4001", arm, Some("thumb"));
+    let direct = run(&raw, "0x4000", "0x4005", arm, Some("thumb"));
+    let linked = run(&alias, "0x4000", "0x4005", arm, Some("thumb"));
+    let rebased = run(&alias, "0x8000", "0x8005", arm, Some("thumb"));
+    let failures = [
+        (
+            run(&raw, "0x8000", "0x4005", arm, Some("thumb")),
+            "raw entry 0x4005 is outside mapped range 0x8000..0x8008",
+        ),
+        (
+            run(&raw, "0x4000", "0x4008", arm, Some("thumb")),
+            "raw entry 0x4008 is outside mapped range 0x4000..0x4008",
+        ),
+        (
+            run(&raw, "0x4000", "0x4004", arm, None),
+            "raw ARM32 input requires --isa arm or --isa thumb",
+        ),
+    ];
+    let incompatible = run(&raw, "0x4000", "0x4004", "x86:LE:64:default:gcc", Some("thumb"));
+    let wrong_isa = run(&raw, "0x4000", "0x4005", arm, Some("arm"));
+    let _ = std::fs::remove_file(&alias);
+    let _ = std::fs::remove_file(&raw);
+
+    let compact = |out: &std::process::Output| {
+        String::from_utf8_lossy(&out.stdout)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect::<String>()
+    };
+    for (label, out, function) in [
+        ("base", &base, "sub_4000(void){return7;}"),
+        ("non-base", &direct, "sub_4004(void){return9;}"),
+        ("symlink", &linked, "sub_4004(void){return9;}"),
+        ("rebased symlink", &rebased, "sub_8004(void){return9;}"),
+    ] {
+        assert!(
+            out.status.success(),
+            "{label} failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            compact(out).contains(function),
+            "{label} selected the wrong identity or computation:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    for (out, reason) in failures {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{reason} must fail, got:\n{stderr}");
+        let expected = if reason.contains("outside mapped range") { "outside mapped range" } else { "requires --isa" };
+        assert!(stderr.contains(expected), "expected {expected:?}, got:\n{stderr}");
+    }
+    let stderr = String::from_utf8_lossy(&incompatible.stderr);
+        assert!(!incompatible.status.success(), "Thumb on x86 must fail:\n{stderr}");
+        assert!(
+            stderr.contains("--isa thumb requires a 32-bit ARM SLEIGH target"),
+            "expected an incompatible ISA/target diagnostic, got:\n{stderr}"
+        );
+    assert!(
+        !compact(&wrong_isa).contains("sub_4004(void){return9;}"),
+        "--isa arm unexpectedly recovered the Thumb identity and computation:\n{}",
+        String::from_utf8_lossy(&wrong_isa.stdout)
+    );
+}

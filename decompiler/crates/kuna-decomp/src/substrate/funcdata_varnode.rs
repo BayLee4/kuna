@@ -3227,6 +3227,40 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
+    #[test]
+    fn call_double_use_tracks_sparse_trials_across_a_placeholder() {
+        use crate::fspec::{FuncCallSpecs, ParamTrial};
+        for same_storage in [false, true] {
+            let mut fd = build_fd();
+            let root = fd.bblocks_root_pub();
+            let first_block = fd.bblocks_mut().new_block_basic(root);
+            let second_block = fd.bblocks_mut().new_block_basic(root);
+            let first = append_test_op(&mut fd, first_block, 0x1010, OpCode::CPUI_CALL,
+                crate::op::pcodeop_flags::call);
+            let second = append_test_op(&mut fd, second_block, 0x1020, OpCode::CPUI_CALL,
+                crate::op::pcodeop_flags::call);
+            let shared = make_input(&mut fd, 0x100, 4);
+            let target = fd.new_constant(8, 0x2000);
+            let filler = fd.new_constant(4, 0);
+            fd.op_set_all_input(first, &[target, shared]).unwrap();
+            fd.op_set_all_input(second, &[target, filler, filler, shared]).unwrap();
+            let entry = Address::new(ram(&fd), 0x2000);
+            let storage = Address::new(ram(&fd), 0x38);
+            let other = Address::new(ram(&fd), if same_storage { 0x38 } else { 0x40 });
+            let mut first_spec = FuncCallSpecs::new(first, entry.clone());
+            first_spec.get_active_input().register_trial(&storage, 4);
+            fd.push_call_specs(first_spec);
+            let mut second_spec = FuncCallSpecs::new(second, entry);
+            second_spec.get_active_input().register_trial(&Address::new(ram(&fd), 0x30), 4);
+            second_spec.get_active_input().set_placeholder_slot();
+            second_spec.get_active_input().register_trial(&other, 4);
+            fd.push_call_specs(second_spec);
+            let trial = ParamTrial::new(storage, 4, 1);
+            assert_eq!(fd.only_op_use(shared, first, &trial, 0), same_storage,
+                "the same SSA value is a sibling argument only at the same actual trial storage");
+        }
+    }
+
     use kuna_base::address::Address;
     use kuna_base::space::{
         addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, FspecSpace,

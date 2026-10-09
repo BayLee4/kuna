@@ -1548,4 +1548,54 @@ mod tests {
         bad.error = Some("budget exceeded".into());
         assert!(index_line(1, &bad, 0, 0).contains("\"error\":\"budget exceeded\""));
     }
+
+    #[test]
+    fn announced_blocks_remain_immutable_for_an_open_reader() {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = Layout {
+            binary_path: dir.path().join("input"),
+            path_label: "input".into(),
+            file_name: "input".into(),
+            out_dir: dir.path().to_path_buf(),
+        };
+        let run = StreamRun::new(layout.out_dir.clone(), ReadmeFacts::default(), 1);
+        let mut writer = ProjectWriter::create(&layout, String::new()).unwrap();
+        let first = result(0x1000, Vec::new());
+        let block = render_c(std::slice::from_ref(&first));
+        writer.append(first, &run).unwrap();
+        let announced = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        let record: serde_json::Value = serde_json::from_str(announced.trim()).unwrap();
+        let offset = record["c_offset"].as_u64().unwrap();
+        let len = usize::try_from(record["c_len"].as_u64().unwrap()).unwrap();
+        let mut reader = File::open(dir.path().join("input.c")).unwrap();
+        reader.seek(SeekFrom::Start(offset)).unwrap();
+        let mut original = vec![0; len];
+        reader.read_exact(&mut original).unwrap();
+        assert_eq!(original, block.as_bytes());
+
+        writer.append(result(0x2000, Vec::new()), &run).unwrap();
+        let mut failed = result(0x3000, Vec::new());
+        failed.code = None;
+        failed.error = Some("producer failed".into());
+        writer.append(failed, &run).unwrap();
+        writer.write_header(Some("typedef unsigned int SourceWord;\n")).unwrap();
+        drop(writer);
+        reader.seek(SeekFrom::Start(offset)).unwrap();
+        let mut final_block = vec![0; len];
+        reader.read_exact(&mut final_block).unwrap();
+        assert_eq!(final_block, original, "an open reader's announced span changed");
+        let final_c = std::fs::read(dir.path().join("input.c")).unwrap();
+        let start = usize::try_from(offset).unwrap();
+        assert_eq!(&final_c[start..start + len], original);
+        let final_index = std::fs::read_to_string(dir.path().join(INDEX_FILE)).unwrap();
+        assert!(final_index.starts_with(&announced), "announced index lines were rewritten");
+        let records: Vec<serde_json::Value> = final_index.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1]["c_offset"].as_u64(), Some(offset + len as u64));
+        assert_eq!(records[1]["seq"].as_u64(), Some(1));
+        assert_eq!(records[2]["error"], "producer failed");
+    }
 }

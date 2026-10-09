@@ -683,6 +683,25 @@ pub fn superseded_names(types: &dyn TypeFactory) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn authoritative_same_shape_is_not_an_inferred_ledger_entry() {
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let word = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let fields = vec![TypeField::new(0, 0, "field_0x0", word)];
+        let authority = types.get_type_struct("struct_0").unwrap();
+        let authority = types.set_fields_struct_raw(
+            &authority, fields.clone(), Vec::new(), 8, 1, 0,
+        ).unwrap();
+        let inferred = lookup_or_mint(
+            &types, fields, 8, &[], &[], crate::kuna_structmerge::StructMergeMode::Off,
+        ).unwrap();
+        assert_ne!(inferred.get_name(), authority.get_name(), "authored same shape must remain authored");
+        assert_eq!(layout_of(&inferred), layout_of(&authority));
+        assert_eq!(types.find_by_name("struct_0").unwrap().unwrap().get_id(), authority.get_id());
+    }
+
     /// A claimed scalar field.
     fn f(offset: int4, width: int4, meta: type_metatype) -> FieldKey {
         FieldKey { offset, width, ty: format!("{meta:?}:{width}:"), pointer: false, opaque: false }

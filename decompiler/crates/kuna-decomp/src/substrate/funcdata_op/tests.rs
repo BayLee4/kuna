@@ -23,6 +23,59 @@ use kuna_base::space::{
 use crate::dtype::{type_metatype, Datatype};
 use crate::context::{ArchContext, BlockId};
 
+mod config_ir_regressions {
+    use super::{Address, ArchContext, Funcdata, OpCode, Rc, build_manager, mk_op, type_metatype};
+    #[test]
+    fn constant_input_duplication_preserves_float_bits_type_and_locks() {
+        use crate::varnode::varnode_flags;
+
+        for bits in [2.5_f64.to_bits(), (-0.0_f64).to_bits()] {
+            for locks in [0, varnode_flags::typelock | varnode_flags::namelock] {
+                let mut context = ArchContext::new(build_manager());
+                let factory = crate::dtype::TypeFactoryImpl::new();
+                factory.set_default_alignment_map();
+                factory.set_max_basetype_size(8);
+                context.types = Some(Rc::new(factory));
+                let context = Rc::new(context);
+                let entry = Address::new(Rc::clone(context.manage().get_space_by_name("ram").unwrap()), 0x1000);
+                let mut fd = Funcdata::new("float", "float", context, entry, 0x10000000, 0x40).unwrap();
+                let float_type = fd.get_arch().types().unwrap()
+                    .get_base(8, type_metatype::TYPE_FLOAT).unwrap();
+                let integer_type = fd.get_arch().types().unwrap()
+                    .get_base(8, type_metatype::TYPE_UINT).unwrap();
+                let original = fd.new_constant(8, bits);
+                fd.vn_update_type(original, float_type);
+                fd.vbank_mut().get_mut(original).unwrap().set_flags_pub(locks);
+                let first = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
+                fd.op_set_input(first, original, 0).unwrap();
+
+                // Equal raw bits at an integer use are not a floating value.
+                let integer = fd.new_constant(8, bits);
+                fd.vn_update_type(integer, integer_type);
+                let integer_use = mk_op(&mut fd, 1, 0x1004, OpCode::CPUI_COPY);
+                fd.op_set_input(integer_use, integer, 0).unwrap();
+
+                let cast = mk_op(&mut fd, 1, 0x1008, OpCode::CPUI_CAST);
+                fd.op_set_input(cast, original, 0).unwrap();
+                let duplicate = fd.obank().get(cast).unwrap().get_in(0).unwrap();
+                for id in [original, duplicate] {
+                    let value = fd.vbank().get(id).unwrap();
+                    assert!(value.is_constant());
+                    assert_eq!(value.get_offset(), bits);
+                    assert_eq!(value.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
+                    assert_eq!(value.get_type().get_size(), 8);
+                    assert_eq!(value.is_type_lock(), locks != 0);
+                    assert_eq!(value.is_name_lock(), locks != 0);
+                }
+                assert_eq!(fd.obank().get(first).unwrap().get_in(0), Some(original));
+                let integer = fd.obank().get(integer_use).unwrap().get_in(0).unwrap();
+                assert_eq!(fd.vbank().get(integer).unwrap().get_type().get_metatype(), type_metatype::TYPE_UINT);
+                assert_eq!(fd.vbank().get(integer).unwrap().get_offset(), bits);
+            }
+        }
+    }
+}
+
 fn build_manager() -> AddrSpaceManager {
     let mut m = AddrSpaceManager::new();
     m.insert_space(Rc::new(ConstantSpace::new())).unwrap();

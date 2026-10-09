@@ -24,6 +24,7 @@ object.workspace = true
 
 [dev-dependencies]
 object = { workspace = true, features = ["write"] }
+kuna-harness = { path = "../kuna-harness" }
 # The register<->global over-merge render gate (`tests/verify_global_regmerge.rs`)
 # asserts, via a word-boundary regex, that no raw register / `Unique<hex>` leaks.
 regex.workspace = true
@@ -39,7 +40,7 @@ path = "src/bin/decomp_dbg.rs"
 
 # `decomp_test_dbg` lives in the `kuna-harness` crate: the test runner drives the
 # datatest harness (`kuna_harness::testfunction`), and `kuna-harness` depends on
-# `kuna-console` (not the reverse), so the binary that needs both is produced
+# `kuna-console` as a normal dependency (not the reverse), so the binary that needs both is produced
 # there.  It still builds to `target/<profile>/decomp_test_dbg` (the path the
 # Python `kuna/run_tests.py` resolves), unchanged.
 

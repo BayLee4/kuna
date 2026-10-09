@@ -148,16 +148,8 @@ fn w7_s37_merge_actions_exact_schedule_and_groups() {
     assert_eq!(casts, vec!["setcasts"], "ActionSetCasts is the sole casts-group leaf");
 }
 
-/// (c) Stub totality: EVERY stubbed `apply` is a pure no-op that leaves
-/// `count == 0` and returns 0 — and stays that way across repeated application
-/// (the C++ `rule_onceperfunc` bodies are change-signalled by `count`, and a
-/// stub that "accidentally" mutated would show up as a non-zero count or a
-/// changed Funcdata).  This is checked on a non-empty Funcdata (the high layer
-/// turned on first) to make sure the stub bodies do not read uninitialised
-/// state into a panic and do not piggy-back on the realized assignhigh.
-///
-/// The realized `ActionAssignHigh` is checked separately for its idempotence
-/// and for signalling NO change (C++ `return 0` with no `count += 1`).
+/// Cleanup actions on this empty high-enabled function must remain stable
+/// across repeated application, without a spurious change signal.
 #[test]
 fn w7_s37_stub_bodies_are_total_noops_under_repetition() {
     let mut fd = build_fd();
@@ -174,8 +166,6 @@ fn w7_s37_stub_bodies_are_total_noops_under_repetition() {
     assert_eq!(assign.base().count, 0);
     assert!(fd.is_high_on());
 
-    // The 13 stubbed leaves: apply each five times; every call returns 0 and the
-    // accumulated count stays 0 (no hidden mutation, no spurious change-signal).
     let mut stubs: Vec<Box<dyn Action>> = vec![
         ActionMergeRequired::boxed("merge"),
         ActionMarkExplicit::boxed("merge"),
