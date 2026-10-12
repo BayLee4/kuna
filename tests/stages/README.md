@@ -262,3 +262,7 @@ branch tables, including case bodies that share a saved-frame epilogue, with
 real indirect function-pointer call are controls. `kuna-cli/tests/arm_conditional_switch.rs`
 compiles the untouched emitted bodies with GCC and Clang at `-O0` and `-O2`
 with undefined-behavior checks and exercises every case and signed boundaries.
+
+- `kuna-sparc-double-abs.xml`, `kuna-sparc64-double-abs.xml`: binary64 absolute value from a high-word `fabss`, without a numeric high-word cast.
+
+- `kuna-sparc-double-sign.xml`, `kuna-sparc64-double-sign.xml`: binary64 negation from a high-word `fnegs`, without a numeric high-word cast.
