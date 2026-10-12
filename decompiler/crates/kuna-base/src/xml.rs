@@ -2066,7 +2066,7 @@ mod tests {
         // clears is not returned (GH-847)
         // and kuna-signed-float-trunc{,64} / signed float conversions remain signed
         // before assignments to unsigned merged variables
-        assert_eq!(count, 502, "corpus file count drifted");
+        assert_eq!(count, 503, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
