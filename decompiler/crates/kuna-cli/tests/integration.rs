@@ -9,6 +9,8 @@ mod argument_errors_cli;
 
 #[path = "conditional_register_lifetimes.rs"]
 mod conditional_register_lifetimes;
+#[path = "arm_conditional_switch.rs"]
+mod arm_conditional_switch;
 
 #[path = "arm_float_arguments.rs"]
 mod arm_float_arguments;
