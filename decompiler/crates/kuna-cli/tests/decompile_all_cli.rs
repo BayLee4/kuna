@@ -1150,6 +1150,124 @@ fn watchdog_stops_heritage_guard_placement() {
     assert!(elapsed < Duration::from_secs(10), "the 1 s watchdog took {elapsed:?} to stop big");
 }
 
+/// `--max-fn-memory` stops `big` in `tests/hang-repro/escaped_locals` once its
+/// process passes the limit, records that as `big`'s error, and the batch goes
+/// on to decompile `after`: in process, through a worker pool, and on the
+/// `kuna decompile` text surface, whose engine runs in `decomp_dbg`.
+#[test]
+fn memory_limit_stops_one_function_and_the_batch_continues() {
+    let bin = repo_root().join("tests/hang-repro/escaped_locals");
+    let bin = bin.to_str().unwrap();
+    let sp = specs();
+    let error = "per-function memory limit exceeded (300 MiB)";
+    for jobs in ["1", "2"] {
+        let (stdout, stderr, ok) = run_kuna_with_timeout(
+            &[
+                "decompile-all", bin, "--json", "--max-fn-seconds", "0", "--max-fn-memory", "300",
+                "--jobs", jobs, "--sleighpath", &sp,
+            ],
+            Duration::from_secs(300),
+        )
+        .expect("decompile-all did not terminate within the 300s outer bound");
+        assert!(ok, "--jobs {jobs}: {stderr}");
+        let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let row = |name: &str| {
+            doc["functions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("--jobs {jobs}: no {name} record:\n{stdout}"))
+                .clone()
+        };
+        assert_eq!(row("big")["error"], error, "--jobs {jobs}");
+        assert_eq!(row("after")["error"], serde_json::Value::Null, "--jobs {jobs}");
+        assert!(
+            row("after")["code"].as_str().unwrap().contains("return a0 * 3 + 1;"),
+            "--jobs {jobs}: {stdout}"
+        );
+    }
+    let (_, stderr, ok) = run_kuna_with_timeout(
+        &["decompile", bin, "big", "--max-fn-memory", "300", "--sleighpath", &sp],
+        Duration::from_secs(300),
+    )
+    .expect("decompile did not terminate within the 300s outer bound");
+    assert!(!ok && stderr.contains(error), "{stderr}");
+}
+
+/// A limit below what the process already holds after its load does not stop
+/// ordinary functions: none of them adds 64 MiB, so a long batch's creep cannot
+/// fail them. A limit nothing reaches changes nothing either, and the value is
+/// MiB, not a size with a unit.
+#[test]
+fn ordinary_functions_never_trip_the_memory_limit() {
+    let bin = fauxware();
+    let sp = specs();
+    let base = ["decompile-all", bin.as_str(), "--json", "--max-fn-seconds", "0", "--sleighpath", &sp];
+    let (plain, stderr, ok) = run_kuna(&base);
+    assert!(ok, "{stderr}");
+    for limit in ["1", "65536"] {
+        let limited: Vec<&str> = base.iter().copied().chain(["--max-fn-memory", limit]).collect();
+        let (with_limit, stderr, ok) = run_kuna(&limited);
+        assert!(ok, "{stderr}");
+        assert_eq!(plain, with_limit, "--max-fn-memory {limit}");
+    }
+    let unit: Vec<&str> = base.iter().copied().chain(["--max-fn-memory", "6G"]).collect();
+    let (_, stderr, ok) = run_kuna(&unit);
+    assert!(!ok && stderr.contains("invalid --max-fn-memory value \"6G\""), "{stderr}");
+}
+
+/// Without `--max-fn-memory`, a serial run under a capped cgroup takes the cap
+/// less max(512 MiB, 10%): 512 MiB under a faked 1 GiB cap, also on the `kuna
+/// decompile` text surface. A `--jobs 2` pool takes no default, and an explicit
+/// value wins.
+#[test]
+fn the_memory_limit_defaults_to_a_share_of_the_cgroup_cap() {
+    let Some(own) = std::fs::read_to_string("/proc/self/cgroup")
+        .ok()
+        .and_then(|m| m.lines().find_map(|l| l.strip_prefix("0::").map(str::to_string)))
+    else {
+        return;
+    };
+    let root = tempfile::tempdir().unwrap();
+    let leaf = root.path().join(own.trim_start_matches('/'));
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::write(leaf.join("memory.max"), "1073741824\n").unwrap();
+    let env = [("KUNA_CGROUP_ROOT", root.path().to_str().unwrap())];
+    let bin = repo_root().join("tests/hang-repro/escaped_locals");
+    let bin = bin.to_str().unwrap();
+    let sp = specs();
+    for (extra, mib) in [
+        (&[][..], 512),
+        (&["--max-fn-memory", "300"][..], 300),
+        (&["--jobs", "2", "--max-fn-seconds", "1"][..], 0),
+    ] {
+        let mut args = vec!["decompile-all", bin, "--json", "--sleighpath", &sp];
+        if !extra.contains(&"--max-fn-seconds") {
+            args.extend_from_slice(&["--max-fn-seconds", "0"]);
+        }
+        args.extend_from_slice(extra);
+        let (stdout, stderr, ok) = run_kuna_env_with_timeout(&args, &env, Duration::from_secs(300))
+            .expect("decompile-all did not terminate within the 300s outer bound");
+        assert!(ok, "{extra:?}: {stderr}");
+        if mib == 0 {
+            assert!(!stdout.contains("memory limit exceeded"), "{extra:?}: a pool has no default:\n{stdout}");
+            assert!(stdout.contains("per-function decompile budget exceeded (1 s)"), "{extra:?}:\n{stdout}");
+        } else {
+            let error = format!("per-function memory limit exceeded ({mib} MiB)");
+            assert!(stdout.contains(&error), "{extra:?}: expected {error}:\n{stdout}");
+        }
+        assert!(stdout.contains("return a0 * 3 + 1;"), "{extra:?}: after must decompile:\n{stdout}");
+    }
+    let (_, stderr, ok) = run_kuna_env_with_timeout(
+        &["decompile", bin, "big", "--sleighpath", &sp],
+        &env,
+        Duration::from_secs(300),
+    )
+    .expect("decompile did not terminate within the 300s outer bound");
+    assert!(!ok && stderr.contains("per-function memory limit exceeded (512 MiB)"), "{stderr}");
+}
+
 /// The past-pathological function of the stripped-ELF hang repro now
 /// CONVERGES: `sub_1bd04` @ 0x1bd04 used to spin forever (100% CPU, no output)
 /// in a condconst↔lowered-switch-repair fixpoint tug-of-war

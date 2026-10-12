@@ -121,6 +121,7 @@ the directories it looked in.
 | `KUNA_DECODE_SELFCHECK` | `1` runs both walks, compares them field by field and returns the serial result; `abort` panics on a difference. Keeps the runtime's panic report, as `KUNA_DECODE_STATS` does. |
 | `KUNA_DECODE_STATS` | `1` prints one line of lane/interval/round/crossing/decode counts and the walk, merge and lane-memory figures. It also keeps the runtime's panic report for a lane fault, which the fallback otherwise silences. |
 | `KUNA_DECODE_FAULT` | Test-only: `<n>` panics lane `n` once, `spawn:<n>` makes lane `n`'s spawn fail — the two fallback paths. |
+| `KUNA_CGROUP_ROOT` | Test-only: the directory read in place of `/sys/fs/cgroup` when the `--max-fn-memory` default looks for a cgroup memory cap. |
 | `KUNA_JOBS_FAULT` | Test-only, comma-separated: `panic:<addr>` / `panic-once:<addr>` / `stall:<addr>` make a `--jobs` worker panic (the first time only) or wedge as it starts the target at that byte address (`*` for every target), `spawn:<n>` refuses every worker spawn after the first `n`, and `load-abort:<n>` makes the first `n` worker loads of the run abort as a refused allocation does (`*` for every one) — the pool's re-run paths. `stall` only ends when `--max-fn-seconds` is non-zero. |
 
 An override wins over both layouts, and one pointing at nothing is reported as
@@ -183,6 +184,10 @@ Drives `decomp_dbg` as a subprocess and captures `print C` via `openfile write`,
 interactive prompts never pollute the output. `--option NAME VALUE` (repeatable) and
 `--kassert "<args>"` flip phase-model sub-phase assertions per run; `--mode
 auto|reliable|aggressive|fast` applies an option preset (`docs/modes.md`).
+`--max-fn-memory MiB` stops the decompile once `decomp_dbg` holds more than MiB
+resident and the function has added 64 MiB (see *Per-function memory limit*
+under `decompile-all`, including its cgroup default) and reports `per-function
+memory limit exceeded` instead of being killed.
 
 An option **name** is checked before anything is loaded, on every surface that takes
 `--option`, and an unrecognized one exits 2 rather than running as if it had not been
@@ -319,7 +324,7 @@ kuna decompile ./crackme.exe main --option errortoomanyinstructions on
 Both options are upstream `OptionDatabase` names rather than phase-model ones, so
 they are reachable through `--option` on every surface but do not appear in `kuna
 catalog`. `--max-fn-seconds` (see `decompile-all` below) is the wall-clock half of
-the same budget.
+the same budget, and `--max-fn-memory` the memory half.
 
 The jump-table ceiling is the other budget a giant function hits: a switch whose
 range check admits more than `jumptablemax` cases (1024 by default) is not
@@ -1677,6 +1682,39 @@ Behaviors specific to `decompile-all`:
   settable — zero output change for a function whose drive completes before
   expiry; the console / `decomp_dbg` parity path never arms it.
 
+- **Per-function memory limit** — `--max-fn-memory MiB` (`0` disables) on
+  `decompile-all`, `decompile-project`, `decompile-graph` and `kuna decompile`.
+  A function is stopped once the process decompiling it holds more than MiB
+  resident AND the function itself has added at least 64 MiB since it began;
+  it is cut off at the same cooperative probes as the watchdog and recorded as
+  its `error` (`"per-function memory limit exceeded (N MiB)"`), and the batch
+  continues. The 64 MiB floor is what keeps a long batch's creep (results it
+  holds, heap the allocator kept) from stopping an ordinary function, so the
+  process can end up to that much over the limit before a function is
+  blamed. The resident set is read when each function starts and then at most
+  every 50 ms while it runs. A function that starts within a tenth of the limit
+  first hands free heap pages back to the system (glibc `malloc_trim`) and
+  measures again, and a stopped function hands its own back before the next
+  one starts.
+
+  The limit is per process: the serial run, each `--jobs N` worker, and the
+  `decomp_dbg` child of `kuna decompile`. Under a container memory cap with
+  `--jobs N`, N workers and the parent share the cap, so an explicit value
+  that keeps them all inside it is roughly (cap minus a few hundred MiB) /
+  (N + 1); every worker gets the value given. A serial run (`--jobs 1`) and
+  `kuna decompile` take a **default** when the flag is absent and the process
+  runs under a finite cgroup v2 `memory.max` (the smallest one on the path to
+  the root, as `systemd-run --scope -p MemoryMax=6G` sets): the cap less
+  max(512 MiB, 10%). A 6 GiB cap gives 5,529 MiB. A `--jobs N` pool, and any
+  run outside a capped cgroup, has no default: a fixed share per worker would
+  stop functions the container could have held while the other workers were
+  small. An explicit value, `0` included, always wins. A function the limit never stops is unchanged.
+  It reads `/proc/self/status`, so on a platform without it a non-zero value
+  is refused and there is no default. A function the limit stops usually has an
+  alternative that keeps some output: `--max-size N` leaves functions over N
+  bytes out of the run, and `--option maxinstruction N` truncates their flow
+  (see *The instruction budget*).
+
 - **`--jobs N|auto` — the worker pool, and the decode lanes.** The per-function
   loop is ~96% of a whole-binary run's wall clock and the engine is
   single-threaded, so `--jobs N` spreads it over `N` copies of the `kuna` binary.
@@ -2764,8 +2802,8 @@ The project-export face of the same in-process core
 `kuna_console::project` module — the decompile loop + artifact builders also behind the
 web UI's Download-Binary-Source zip and `kuna_wasm project`). Identical
 load-once/decompile-many path and flags —
-`--functions`/`--addr`/`--max-fn-seconds`/`--mode`/`--option`/`--isa`/`--slice`/
-`--target`/`--sleighpath`/`--jobs`/`--stream`; no `--json`. Omitted mode is the same
+`--functions`/`--addr`/`--max-fn-seconds`/`--max-fn-memory`/`--mode`/`--option`/
+`--isa`/`--slice`/`--target`/`--sleighpath`/`--jobs`/`--stream`; no `--json`. Omitted mode is the same
 size-based `auto` policy as the other file front-ends. In particular, a project input
 at least 2 MiB automatically suppresses the exhaustive Listing consumers, prologue
 scan, and AIF gap walk through the `fast` preset, while substituting rooted direct-call
@@ -3102,7 +3140,7 @@ One document holding every discovered function — its recovered signature,
 parameters, C body and assembly — plus the call edges between them
 (`decompiler/crates/kuna-cli/src/decompile_graph.rs`). The same in-process
 load-once path and the same flags as `decompile-project`
-(`--functions`/`--addr`/`--max-fn-seconds`/`--mode`/`--define-function`/
+(`--functions`/`--addr`/`--max-fn-seconds`/`--max-fn-memory`/`--mode`/`--define-function`/
 `--option`/`--slice`/`--target`/`--sleighpath`/`--jobs`; no `--json`, the document
 always is), plus `-o/--output FILE` and `--label TEXT`, which is copied verbatim into
 `binary.label` for a consumer that wants to stamp the document with its own
