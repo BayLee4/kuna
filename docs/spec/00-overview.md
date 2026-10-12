@@ -2239,6 +2239,36 @@ external-symbol note rather than `not mapped in this input` — and folds the
 ARM/Thumb mode bit out of the address, so the declaration lands where every later
 resolution of it looks.
 
+(kuna) **A by-address selection inside another function is said to be one.**
+Pointing `--addr` at an address is how an entry discovery missed gets
+decompiled at all, so a selection that starts no inventory entry is decompiled
+from where it points rather than refused or moved. The same command at an
+address inside a function discovery did find printed a `sub_<addr>` body that is
+a fragment of its neighbour, with nothing to say so, and such fragments were
+cited as function entries (issue #1039). The fragment's `sub_<addr>` name
+selects the same address, so the question is asked of the address a selection
+RESOLVES to, whatever its spelling — a name, a numeric address with or without
+the Thumb mode bit, an object's section coordinate: the canonical entry
+immediately below it whose inventory size — the address-contiguous clip `kuna
+functions` reports, or a declared extent — reaches past it
+(`decompiler/crates/kuna-console/src/engine.rs (ConsoleProgram::entries_containing)`,
+which enumerates the inventory once for a whole batch of targets). An address
+that is itself an entry, or that no extent covers, has no answer. `kuna
+decompile` asks the console with `function containing <selector>` before
+installing the selection's symbol and reads the answer off the transcript; the
+in-process surfaces (`decompile --json`, `decompile-all`, `decompile-project`)
+ask about the targets their selection already resolved and deduplicated
+(`decompiler/crates/kuna-cli/src/interior.rs (selections)`), and an unfiltered
+run, which selects inventory entries only, asks nothing. `decompile-graph` does
+not ask: it keeps only executable inventory entries, so it never decompiles an
+interior target. Each prints
+one `note:` per record on stderr naming the containing function and the offset,
+and the JSON record of such a target carries it as `interior_to`. The key exists only
+there, so `kuna decompile --json` of an entry stays byte-identical to its
+`decompile-all` record, and the exit status and the C are unchanged. A
+`--define-function` at the address registers an entry there before the
+question is asked, which is how a caller says the fragment is meant.
+
 (kuna) **The C the assertion plane accepts is the C it prints.** Six directives
 carry a C declaration, and every one of them goes through the console's
 C-declaration grammar (`decompiler/crates/kuna-console/src/grammar.rs (CParse)`),

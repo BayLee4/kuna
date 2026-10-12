@@ -336,6 +336,33 @@ kuna decompile ./state_machine.exe 0x14000c0b0 --addr \
 which functions would hit either budget before anything is decompiled; see `limits`
 below.
 
+**An address inside another function is decompiled as asked, and said to be
+one.** `--addr` declares that a function starts where it points — that is how an
+entry discovery missed is reached at all — so it is never refused or moved. But
+an address inside a function discovery *did* find decompiles to a plausible
+`sub_<addr>` that is only a fragment of its neighbour, so stderr names the
+function whose inventory extent (the `size` `kuna functions --json` reports)
+holds it, and the offset:
+
+```bash
+kuna decompile ./kuna_repro.exe 0x140001040 --addr
+#   int sub_140001040(int a0) { return a0 * 0xb + -4; }
+#   note: 0x140001040 is interior to sub_140001030 (0x140001030+0x10), not an entry
+#         kuna discovered; decompiled from 0x140001040 as asked (--define-function
+#         0x140001040 declares a function there)
+```
+
+Select the containing function by its name or entry address to decompile it
+whole; if a function really starts there, `--define-function <addr>` makes it an
+entry and the note goes away. The exit status is unchanged. It is the address
+the selection resolves to that is checked, so the fragment's own name (`kuna
+decompile ./kuna_repro.exe sub_140001040`), a Thumb address carrying its mode bit
+and an object's `.text+0xOFF` answer the same way, and so do `decompile-all` and
+`decompile-project` for each target selected by `--addr` or `--functions` — one
+note per record. With `--json` the record of such a
+target carries it as `interior_to`: `{name,address,address_hex,offset}`. No other
+record has the key, so every other document is byte-for-byte what it was.
+
 **`--define-function <start[-end][=name] | @file>`** (repeatable) tells kuna where a
 function starts and ends. Every boundary kuna knows is otherwise *derived* —
 discovery finds the entries, and the extent is the address-contiguous clip to the
@@ -1452,7 +1479,9 @@ stack_offset,size,line_numbers,addresses}],types:[{name,definition,size}]}]}` (`
 object shaped like the `--summary` one over the listed functions, and the key is absent
 otherwise, so the plain listing never pays for the walk).
 `object_location` is `null` for linked images and undefined imports; for a relocatable
-definition it is `{section_index,section,offset,offset_hex}`. `count` is what the
+definition it is `{section_index,section,offset,offset_hex}`. A record selected (`--addr` or `--functions`)
+inside another function's extent also carries `interior_to` (see `kuna decompile`
+above): `{name,address,address_hex,offset}` of the function that holds it. `count` is what the
 `functions` array holds. `kuna functions --json` also carries `total`, the count
 before any triage narrowing; `decompile-all --json` carries `total` only when a
 triage flag actually narrowed it, so an unfiltered whole-binary document — the one

@@ -1439,6 +1439,47 @@ impl IfaceCommandAction for IfcKunaFunctionSymbol {
     }
 }
 
+/// `function containing <selector>`: name the inventory entry whose extent
+/// holds the function `selector` resolves to, when that is not itself an
+/// entry, so `kuna decompile` can say it is decompiling from inside another
+/// function. Silent otherwise: a selector that does not resolve is the `load`
+/// command's to report.
+pub struct IfcKunaFunctionContaining;
+
+impl IfaceCommandAction for IfcKunaFunctionContaining {
+    fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
+        s.skip_ws();
+        let token =
+            kuna_decomp::kuna_symbolnamebound::bound_scope_path(&s.read_token(), "::").into_owned();
+        let dcp = dcp_mut(status)?;
+        let prog = dcp
+            .conf
+            .as_mut()
+            .ok_or_else(|| IfaceError::execution("No load image present"))?;
+        let selector = match crate::engine::EntrySelector::parse(&token) {
+            crate::engine::EntrySelector::Numeric(display) => match prog.input_code_offset(display) {
+                Ok(vma) => crate::engine::EntrySelector::Numeric(vma),
+                Err(_) => return Ok(()),
+            },
+            selector => selector,
+        };
+        let Some(vma) = prog.selection_address(&selector) else { return Ok(()) };
+        let Some(Some(owner)) = prog.entries_containing(&[vma]).pop() else { return Ok(()) };
+        let at = prog.output_code_offset(vma);
+        let entry = prog.output_code_offset(owner.addr.get_offset());
+        status.out(&format!(
+            "{at:#x} is interior to {} at {entry:#x} (+{:#x})\n",
+            owner.name,
+            at - entry
+        ));
+        Ok(())
+    }
+
+    fn module(&self) -> String {
+        DECOMPILE_MODULE.to_string()
+    }
+}
+
 /// (kuna) `map prototype <func> <C declaration>`: bind a declared signature to
 /// the function NAMED by `<func>`.
 ///
@@ -1520,6 +1561,7 @@ pub fn register_kuna_commands(status: &mut IfaceStatus) {
     // exposes as `--define-function`.
     status.register_com(Box::new(IfcKunaFunctionBounds), &["function", "bounds"]);
     status.register_com(Box::new(IfcKunaFunctionSymbol), &["function", "symbol"]);
+    status.register_com(Box::new(IfcKunaFunctionContaining), &["function", "containing"]);
     // (kuna) Not a C++ command either: `parse line extern` binds a prototype by
     // the name in the declaration, which is the wrong key for an override that
     // exists because the function has no name worth keeping.
