@@ -2048,6 +2048,8 @@ mod tests {
         // walk gives
         // and kuna-ucomiss-unordered / an x86 float compare flag read by
         // seta/setae/setbe/setb keeps its unordered case
+        // and kuna-conditional-register / an unused guarded path does not emit
+        // a transfer from a call-clobbered register
         // and kuna-thunkentry / the target of a jmp thunk is a function entry
         // and kuna-armwalkmode / a bl target keeps A32 after a blx to Thumb
         // and kuna-sparc-zeropair / a SPARC int's return 0 is not the second
@@ -2062,7 +2064,7 @@ mod tests {
         // clears is not returned (GH-847)
         // and kuna-signed-float-trunc{,64} / signed float conversions remain signed
         // before assignments to unsigned merged variables
-        assert_eq!(count, 496, "corpus file count drifted");
+        assert_eq!(count, 497, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
