@@ -2052,6 +2052,7 @@ mod tests {
         // a transfer from a call-clobbered register
         // and kuna-arm-conditional-switch / a guarded A32 PC table retains its
         // bounded case bodies after positive-domain narrowing
+        // and kuna-arm-constant-shift / a signed fixed ARM LSL is defined in C
         // and kuna-thunkentry / the target of a jmp thunk is a function entry
         // and kuna-armwalkmode / a bl target keeps A32 after a blx to Thumb
         // and kuna-sparc-zeropair / a SPARC int's return 0 is not the second
@@ -2069,7 +2070,7 @@ mod tests {
         // and kuna-globalarrayanchor{,-a64} / a negative element bias keeps the mapped array base
         // and kuna-switchguardreload / kuna-switchunrolledsense: a guarded
         // relative table is not read past its guard (GH-1028)
-        assert_eq!(count, 510, "corpus file count drifted");
+        assert_eq!(count, 511, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors

@@ -11,6 +11,8 @@ mod argument_errors_cli;
 mod conditional_register_lifetimes;
 #[path = "arm_conditional_switch.rs"]
 mod arm_conditional_switch;
+#[path = "arm_constant_shift.rs"]
+mod arm_constant_shift;
 
 #[path = "arm_float_arguments.rs"]
 mod arm_float_arguments;

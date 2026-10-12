@@ -498,11 +498,16 @@ mod tests {
         /// available frame region as an array, but a pointer parameter does not
         /// establish the source array's exact length. Keep that representation
         /// choice per-run rather than enabling it in a preset.
+        ///
+        /// `armconstshift` makes signed ARM constant shifts defined C at the
+        /// cost of a cast pair on every sign-bit test (`x << 0x18 < 0`), which
+        /// firmware uses for nearly every register flag check.
         const EXCLUDED_ON_PURPOSE: &[&str] =
             &["v850indirectbranch", "dwarf_lines", "ifuncfpret",
               "aifcorroborate", "linuxsyscall", "nulterminator", "msvcstrappend",
               "structdefs", "indirectonly", "protoorder", "bejoin", "armframes",
-              "mixedtailret", "varargsharedfloat", "callarrayextent"];
+              "mixedtailret", "varargsharedfloat", "callarrayextent",
+              "armconstshift"];
 
         /// Default-off options that predate this test and are **not** in the preset,
         /// i.e. are currently unreachable on the default path. Each is a genuine open
