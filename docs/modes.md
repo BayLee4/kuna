@@ -77,7 +77,10 @@ build failure. The options it enables:
   `switchguardbound` (speed-costly),
   `unrolledguard` (speed-costly), `stackalias`, `sparcstructret`,
   `globalarrayanchor` (retain mapped array bases in negatively biased element indices),
-  `regionedgeorder`, `returndup`, `orchain`, `iteexpr`, `ctypes`,
+  `regionedgeorder`, `returndup`, `orchain`, `iteexpr`,
+  `devectorize` (a proven vectorized integer reduction re-rolled into its scalar
+  loop; off by default only because the rewrite hides the stride and the
+  duplicated body), `ctypes`,
   `calltargettype` (an indirect call's target takes the function-pointer type
   the call states, so the call compiles as C),
   `cortexmpriv` (DIV-99 - fold the Cortex-M `isCurrentModePrivileged()` guard;

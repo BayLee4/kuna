@@ -2067,7 +2067,7 @@ mod tests {
         // and kuna-signed-float-trunc{,64} / signed float conversions remain signed
         // before assignments to unsigned merged variables
         // and kuna-globalarrayanchor{,-a64} / a negative element bias keeps the mapped array base
-        assert_eq!(count, 505, "corpus file count drifted");
+        assert_eq!(count, 508, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors

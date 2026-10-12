@@ -38,13 +38,13 @@ fn surface_count_is_120() {
 }
 
 #[test]
-fn settable_count_is_287() {
-    assert_eq!(kuna_num_settables(), 287);
-    assert_eq!(SETTABLE_TABLE.len(), 287);
+fn settable_count_is_289() {
+    assert_eq!(kuna_num_settables(), 289);
+    assert_eq!(SETTABLE_TABLE.len(), 289);
 }
 
 #[test]
-fn tier_counts_are_100_core_111_transform_76_analysis() {
+fn tier_counts_are_101_core_112_transform_76_analysis() {
     let mut core = 0;
     let mut transform = 0;
     let mut analysis = 0;
@@ -56,7 +56,7 @@ fn tier_counts_are_100_core_111_transform_76_analysis() {
             other => panic!("invalid tier {other:?} on {}", s.option),
         }
     }
-    assert_eq!((core, transform, analysis), (100, 111, 76));
+    assert_eq!((core, transform, analysis), (101, 112, 76));
 }
 
 #[test]
@@ -797,7 +797,8 @@ fn option_values_live_value_present_for_110() {
     // 121 -> 122: +1 for `callerreads` (live_field = caller_reads).
     // 122 -> 123: +1 for `callarrayextent` (live_field = call_array_extent).
     // 123 -> 124: +1 for `globalarrayanchor` (live_field = global_array_anchor).
-    assert_eq!(with_live, 124);
+    // 124 -> 126: +2 for `wideslice` and `devectorize`.
+    assert_eq!(with_live, 126);
 }
 
 #[test]
@@ -993,7 +994,8 @@ fn emit_catalog_json_static_form_brackets_and_commas() {
     // +1 for `zerocallregs`; its P4 row sits mid-table beside `zerofillreturn`.
     // +1 for `callerreads`.
     // +1 for `bytearrayc`; its P9 row sits mid-table.
-    assert_eq!(json.matches("},\n").count(), 286);
+    // +2 for `wideslice` and `devectorize`.
+    assert_eq!(json.matches("},\n").count(), 288);
 }
 
 #[test]
