@@ -2066,7 +2066,8 @@ mod tests {
         // clears is not returned (GH-847)
         // and kuna-signed-float-trunc{,64} / signed float conversions remain signed
         // before assignments to unsigned merged variables
-        assert_eq!(count, 503, "corpus file count drifted");
+        // and kuna-globalarrayanchor{,-a64} / a negative element bias keeps the mapped array base
+        assert_eq!(count, 505, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors

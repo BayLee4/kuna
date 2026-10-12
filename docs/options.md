@@ -419,6 +419,8 @@ Three tiers:
 | a helper's stack output array is shorter than the helper writes | [`callarrayextent`](#callarrayextent) |
 | a post-call stack read is emitted as an independent uninitialized scalar | [`callarrayextent`](#callarrayextent) |
 | a stack array passed to a helper loses aliases with neighboring frame slots | [`callarrayextent`](#callarrayextent) |
+| negative index displacement hides a declared global array | [`globalarrayanchor`](#globalarrayanchor) |
+| indexed stores use an address immediately before an array | [`globalarrayanchor`](#globalarrayanchor) |
 | puts/printf arguments untyped so string literals render as bare constants or dat_ addresses | [`libproto`](#libproto) |
 | imports carry no signatures and call arguments stay untyped | [`libproto`](#libproto) |
 | a caller's parameter is unsigned long where it is only ever passed to a libc function that takes a char */int | [`libcsigs`](#libcsigs) |
@@ -2018,6 +2020,14 @@ The control surface: each of these can make output worse on the wrong source sha
 - **When to flip:** A helper writes through a stack pointer, but the caller declares a short array followed by independent uninitialized scalars for the helper's output, or splits adjacent input and output storage used by one call. Opt in only when the frame region is intended to be shared storage: caller-defined neighboring values are excluded, but a pointer prototype still does not establish the exact array length. Explicit local types remain authoritative.
 - **Where / provenance:** P6/stack-frame-layout · kuna · feature · kuna-callarrayextent
 - **Example:** `option callarrayextent on`
+
+### `globalarrayanchor` -- on | off, default `off`
+
+- **Symptoms:** negative index displacement hides a declared global array; indexed stores use an address immediately before an array.
+- **What it does:** Keep an exact mapped global array base visible when a scaled memory index carries a negative element displacement.
+- **When to flip:** Enable when an indexed access is rendered with a literal address before the declared array or with a synthetic symbol instead of its declared array.
+- **Where / provenance:** P3/simplification-quiescence · kuna · opt-in-tool · mapped-array-negative-index-bias
+- **Example:** `option globalarrayanchor on`
 
 ## Analysis & loader passes
 
