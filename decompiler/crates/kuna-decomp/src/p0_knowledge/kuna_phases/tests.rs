@@ -38,13 +38,13 @@ fn surface_count_is_120() {
 }
 
 #[test]
-fn settable_count_is_286() {
-    assert_eq!(kuna_num_settables(), 286);
-    assert_eq!(SETTABLE_TABLE.len(), 286);
+fn settable_count_is_287() {
+    assert_eq!(kuna_num_settables(), 287);
+    assert_eq!(SETTABLE_TABLE.len(), 287);
 }
 
 #[test]
-fn tier_counts_are_99_core_111_transform_76_analysis() {
+fn tier_counts_are_100_core_111_transform_76_analysis() {
     let mut core = 0;
     let mut transform = 0;
     let mut analysis = 0;
@@ -56,7 +56,7 @@ fn tier_counts_are_99_core_111_transform_76_analysis() {
             other => panic!("invalid tier {other:?} on {}", s.option),
         }
     }
-    assert_eq!((core, transform, analysis), (99, 111, 76));
+    assert_eq!((core, transform, analysis), (100, 111, 76));
 }
 
 #[test]
@@ -624,6 +624,7 @@ fn option_values_live_value_present_for_110() {
                             // `Architecture::syscall_regs`.
                             | "syscallregs"
                             | "arraycoverwidth"
+                            | "bytearrayc"
                             | "emptystrconst"
                             // (kuna) `structdefs` is a PrintC option like
                             // `arraycoverwidth`/`emptystrconst` above: its live
@@ -991,7 +992,8 @@ fn emit_catalog_json_static_form_brackets_and_commas() {
     // +1 for `thunkentry`; its P1 row sits mid-table beside `unmappedentry`.
     // +1 for `zerocallregs`; its P4 row sits mid-table beside `zerofillreturn`.
     // +1 for `callerreads`.
-    assert_eq!(json.matches("},\n").count(), 285);
+    // +1 for `bytearrayc`; its P9 row sits mid-table.
+    assert_eq!(json.matches("},\n").count(), 286);
 }
 
 #[test]

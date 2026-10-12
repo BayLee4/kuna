@@ -164,6 +164,8 @@ mod local_name_batch;
 
 #[path = "loop_cursor_initializer.rs"]
 mod loop_cursor_initializer;
+#[path = "mapped_array_c.rs"]
+mod mapped_array_c;
 
 #[path = "mapped_decode_failure.rs"]
 mod mapped_decode_failure;

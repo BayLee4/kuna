@@ -1,7 +1,7 @@
 {
   "data_footer": [
-    2602,
-    2602
+    2606,
+    2606
   ],
   "passing": [
     "data:64-bit logical shift retains unsigned destination",
@@ -82,6 +82,8 @@
     "data:ARRAYSUBFIELD #5: the reported reproducer writes the low half of the 16-byte return container at its real width",
     "data:ARRAYSUBFIELD #6: and the high half likewise",
     "data:ARRAYSUBFIELD #7: honest about what is NOT fixed: the whole-container shift is upstream-faithful and still not valid C",
+    "data:ARRAYSUBFIELD #8: opt-in C reads preserve the low eight bytes",
+    "data:ARRAYSUBFIELD #9: opt-in C reads preserve the high eight bytes",
     "data:Address-only local #1: both passes declare the four-byte object",
     "data:Address-only local #2: the saved pointer reaches that object",
     "data:Address-only local #3: the address width is never the object width",
@@ -852,7 +854,9 @@
     "data:KUNA-CATALOG #12: scalar ARM inputs are a default-off opt-in",
     "data:KUNA-CATALOG #13: validated ARM frames are default-off",
     "data:KUNA-CATALOG #14: validated ARM frames are explicitly enabled",
-    "data:KUNA-CATALOG #15: 286 registry rows plus four individual queries",
+    "data:KUNA-CATALOG #15: 287 registry rows plus six individual queries",
+    "data:KUNA-CATALOG #16: standard C byte-array rendering is explicitly opt-in",
+    "data:KUNA-CATALOG #17: standard C byte-array rendering exposes its live state",
     "data:KUNA-CATALOG #1: compareform documented with its post-DIV-2 default and P3 address",
     "data:KUNA-CATALOG #2: arraynotation documented as default-on, P9 pointer-notation",
     "data:KUNA-CATALOG #3: returnpair flagged destructive-as-default so an agent keeps it opt-in",
