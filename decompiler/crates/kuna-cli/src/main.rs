@@ -224,7 +224,9 @@ fn usage_test() {
          test) or tests/stages (the kuna-owned issue cases, = make test-stages).\n\
          --baseline F compares against a recorded result; --save-baseline F re-records\n\
          one.  Re-recording docs/baseline.json to absorb a regression is never\n\
-         sanctioned -- see docs/agents.md."
+         sanctioned -- see docs/agents.md.\n\
+         --json emits {{unit_footer,data_footer,passing,returncode,failures}}, plus\n\
+         parity with --baseline."
     );
 }
 
@@ -284,7 +286,7 @@ fn cmd_catalog(argv: &[String]) -> Result<i32, String> {
     Ok(if check {
         catalog::cmd_check(pinned_by)
     } else if json {
-        catalog::cmd_json(option.as_deref(), pinned_by)
+        catalog::cmd_json(option.as_deref(), tier.as_deref(), pinned_by)
     } else if markdown {
         catalog::cmd_markdown(option.as_deref())
     } else {
@@ -301,11 +303,16 @@ fn usage_catalog() {
          flips on every decompiling surface.  Each row carries its phase, tier, values,\n\
          default, the symptoms it addresses and when to flip it.\n\
          \n\
-         --json is the machine-readable form an agent selects options from.\n\
+         --json is the machine-readable form an agent selects options from: an\n\
+         ARRAY, one object per option, [{{option,values,default,phase,subphase,tier,\n\
+         summary,use_when,symptoms,..}}] (one element with --option NAME).  It and\n\
+         `kuna docs --json` are the two array-rooted documents; every other --json\n\
+         is an object.\n\
          --markdown regenerates docs/options.md (tier-grouped, symptom-indexed).\n\
          --check cross-checks the catalog against the engine's registered option\n\
          names and exits nonzero on drift; this is the CI gate.\n\
-         --option NAME reports one row; --tier keeps one tier.\n\
+         --option NAME reports one row; --tier keeps one tier, in the table and\n\
+         in --json.\n\
          \n\
          Upstream OptionDatabase names (maxinstruction, errortoomanyinstructions, ..)\n\
          are reachable through --option but are NOT catalog rows, so they do not\n\
@@ -325,7 +332,10 @@ fn cmd_modes(argv: &[String]) -> i32 {
         match a.as_str() {
             "--json" => json = true,
             "-h" | "--help" => {
-                eprintln!("usage: kuna modes [--json]");
+                eprintln!(
+                    "usage: kuna modes [--json]\n\n\
+                     --json emits {{modes:[{{name,summary,automatic,overrides}}]}}."
+                );
                 return 0;
             }
             s if s.starts_with("--") => {
