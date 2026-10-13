@@ -75,7 +75,7 @@ build failure. The options it enables:
 
 - **transform tier**: `switchmodbound`, `constselectjump`,
   `switchguardbound` (speed-costly),
-  `unrolledguard` (speed-costly), `stackalias`, `sparcstructret`,
+  `unrolledguard` (speed-costly), `sparcstructret`,
   `globalarrayanchor` (retain mapped array bases in negatively biased element indices),
   `regionedgeorder`, `returndup`, `orchain`, `iteexpr`,
   `devectorize` (a proven vectorized integer reduction re-rolled into its scalar
@@ -283,3 +283,7 @@ options that net-help, which then become candidate default-on flips. The omitted
 with input size and is therefore not a stable benchmark baseline.
 Use `fast` for latency-sensitive bulk export and compare its function inventory
 and output against `reliable` before adopting the coverage tradeoff.
+
+`stackalias` and `stackviews` require an explicit per-function choice. Physical
+frame-write preservation can change object layout and declaration types; neither
+recovery policy is promoted by `aggressive` while that integration is incomplete.
