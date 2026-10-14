@@ -845,6 +845,17 @@ pub struct Architecture {
     /// (kuna) Read a declared callee's stack contract off its locked prototype
     /// (`calleeprotostack`).  See [`crate::p4_calls::kuna_calleeprotostack`].
     pub callee_proto_stack: bool,
+    /// (kuna) Size an MSVC `__cdecl` import's by-value class argument at the
+    /// call site (option `msvcbyval`).  See [`crate::p4_calls::kuna_msvcbyval`].
+    pub msvc_byval: bool,
+    /// (kuna `msvcbyval`) The MSVC declarations with one by-value class of
+    /// unstated size, by entry `(space index, offset)`; filled by the analysis
+    /// commit while `msvcsig` applies.
+    pub msvc_byval_decls: Rc<crate::p4_calls::kuna_msvcbyval::ByvalDecls>,
+    /// (kuna `msvcbyval`) The entries an MSVC name declares as building the
+    /// object at an address they are handed (a constructor, or a function
+    /// returning a class by value).
+    pub msvc_builders: Rc<crate::p4_calls::kuna_msvcbyval::Builders>,
     /// (kuna) Drop a trailing register argument a previous call's clobber put
     /// there (option `argclobber`).  See [`crate::p4_calls::kuna_argclobber`].
     pub arg_clobber: bool,
@@ -2752,6 +2763,9 @@ impl Architecture {
             callee_pop_slot: true,
             callee_pop_frame: true,
             callee_proto_stack: true,
+            msvc_byval: true,
+            msvc_byval_decls: Rc::new(Default::default()),
+            msvc_builders: Rc::new(Default::default()),
             arg_clobber: true, // (kuna) option argclobber; reset_defaults sets the shipped default
             arm_float_args: false, // (kuna) option armfloatargs
             arm_float_return: false, // (kuna) option armfloatreturn
@@ -3097,6 +3111,7 @@ impl Architecture {
         self.callee_pop = true; // (kuna) default-on (0/675 ablation): an unknown extrapop is read off the caller's push run instead of guessed as "pops nothing" (0/675 ablation)
         self.callee_pop_slot = true; // (kuna) default-on (0/675 ablation): the calleepop guess follows a slot pushed in front of one call and popped by a later one
         self.callee_pop_frame = true; // (kuna) default-on (0/675 ablation): a fixed-frame caller's `sub esp,n` after an imported call reads as the callee popping n
+        self.msvc_byval = true; // (kuna) default-on (0/675 ablation): an MSVC __cdecl import's by-value class is sized from the caller's cleanup
         self.callee_dead_arg = true; // (kuna) default-on (DIV-KUNA_DEADARG_DIV): 0/675 datatests, subtractive only
         self.hidden_ret_arg = true; // (kuna) default-on (0/675 ablation): a hidden-return register trial the callee never takes, or a null-page constant, is no argument
         self.callee_read_arg = true; // (kuna) default-on: a register argument the caller also tests is kept when the callee's own body reads it (0/675 ablation)
@@ -3887,6 +3902,9 @@ impl Architecture {
         ctx.callee_pop_slot = self.callee_pop_slot; // calleepopslot
         ctx.callee_pop_frame = self.callee_pop_frame; // calleepopframe
         ctx.callee_proto_stack = self.callee_proto_stack; // calleeprotostack
+        ctx.msvc_byval = self.msvc_byval; // msvcbyval
+        ctx.msvc_byval_decls = Rc::clone(&self.msvc_byval_decls);
+        ctx.msvc_builders = Rc::clone(&self.msvc_builders);
         ctx.arg_clobber = self.arg_clobber; // argclobber
         ctx.pass_through = self.pass_through; // passthrough
         ctx.mixed_tail_ret = self.mixed_tail_ret; // mixedtailret
