@@ -435,6 +435,11 @@ pub struct Funcdata {
         (int4, kuna_base::types::uintb),
         std::rc::Rc<crate::kuna_rustabi::CalleeReturnWrites>,
     >,
+    /// (kuna `bejoin evidence`) The model's output pair, the wide-return
+    /// verdicts of this function and its callees, and the callees a call asked
+    /// about without one. Seeded by the driver
+    /// ([`crate::kuna_bejoin::seed_wide_returns`]).
+    kuna_wide: Option<crate::kuna_bejoin::WideView>,
     /// (kuna `calleedeadarg`) Per direct-call-target evidence about the registers
     /// the callee is *proven* never to read before writing, keyed by
     /// `(space index, entry offset)`.  Seeded by the driver after the flow build
@@ -741,6 +746,7 @@ impl Funcdata {
             kuna_wrapped_wire_storage: std::collections::BTreeMap::new(),
             kuna_wire_symbol_for_high: std::collections::BTreeMap::new(),
             kuna_callee_ret_writes: std::collections::HashMap::new(),
+            kuna_wide: None,
             kuna_callee_entry_dead: std::collections::HashMap::new(),
             kuna_hiddenret_vetoed: std::collections::HashSet::new(),
             kuna_own_entry_dead: None,
@@ -988,6 +994,18 @@ impl Funcdata {
 
     pub fn set_kuna_name_snapshot(&mut self, snapshot: Vec<(String, crate::kuna_stablenames::Keys)>) {
         self.kuna_name_snapshot = snapshot;
+    }
+
+    /// (kuna `bejoin evidence`) Hold the wide-return verdicts the driver took
+    /// for this function and its callees.
+    pub fn kuna_set_wide(&mut self, wide: crate::kuna_bejoin::WideView) {
+        self.kuna_wide = Some(wide);
+    }
+
+    /// (kuna `bejoin evidence`) The wide-return verdicts and the model's pair,
+    /// when the driver took them.
+    pub fn kuna_wide(&self) -> Option<&crate::kuna_bejoin::WideView> {
+        self.kuna_wide.as_ref()
     }
 
     /// (kuna `rustabi`) Record what a probe of `entry`'s body proved about the
