@@ -1661,6 +1661,22 @@ moves.
   This is required on PE, where the IAT slot and its `FF 25` veneer are separate
   `FunctionSymbol`s with the same name and a direct call reads the veneer's
   prototype by entry address.
+  ELF relocatable objects also contribute the loader's proven external code targets,
+  including undefined `STT_NOTYPE` symbols reached by call relocations. Their
+  synthetic target addresses receive the same signature as ordinary imports;
+  data-only relocations and undefined symbols without code relocation evidence
+  or a function symbol kind do not qualify. A same-spelled
+  definition still suppresses ambiguous name-only parking. The `libcsigs` and
+  `libctypes` passes use this same import evidence.
+  The extension adds no option of its own: it is more evidence for the same
+  passes, so `libproto`, `libcsigs` and `libctypes` off together decompile a
+  relocatable object exactly as before. Code imports
+  the loader cannot establish, including untyped x86 `PC32` direct calls and
+  `GOTPCRELX` indirect calls, remain outside this additional evidence stream.
+  LOSS: typing one callee can move an untyped neighbour's argument inference
+  (stale i386 `-O0` outgoing stack slots, the AArch64 `x8` result register), and
+  in an i386 PIC object, whose `GOTOFF` addresses the loader leaves unresolved,
+  a `char *` parameter renders such a garbage address as a string literal.
 - **(kuna) Measured libc signatures** (`libcsigs`,
   `decompiler/crates/kuna-analysis/src/analyzers/protos/kuna_libcsigs.rs (LibcSigsPass)`):
   the second, larger half of the same table, closing most of the LOSS above. Which
