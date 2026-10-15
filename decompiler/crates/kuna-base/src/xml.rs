@@ -2090,7 +2090,8 @@ mod tests {
         // and kuna-register-pair-call-args / overwritten register-pair argument slots
         // and kuna-rettriangle / a one-block if keeps one return
         // and kuna-narrow-register-inputs / mixed-width reads do not span known inputs
-        assert_eq!(count, 550, "corpus file count drifted");
+        // and kuna-indirect-value-arguments / declared aggregate value arguments
+        assert_eq!(count, 551, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors

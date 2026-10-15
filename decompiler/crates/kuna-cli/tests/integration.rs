@@ -424,6 +424,8 @@ mod call_outparam_snapshot;
 mod global_load_call_order;
 #[path = "integer_float_rounding.rs"]
 mod integer_float_rounding;
+#[path = "indirect_value_arguments.rs"]
+mod indirect_value_arguments;
 
 #[path = "multireg_call_inputs.rs"]
 mod multireg_call_inputs;
