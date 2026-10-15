@@ -4607,10 +4607,15 @@ and slice the boundary pages at their search positions. Growing the walk allocat
 bounded chunks without copying a whole-image buffer. Every record retains its
 flow targets, assembly and lazy p-code fields. Exact, range and interior queries
 still borrow the original record in address order. The index key remains
-independent of mutable instruction addresses. Replacing an address reuses its row;
-ARM frame-preserving rebuilds clone the records and index before extending them. Serial and parallel
-walks use the same store. This changes allocation and lookup layout, not the
-instruction partition or the facts any consumer receives.
+independent of mutable instruction addresses. Replacing an address reuses its row.
+Rebuilds that preserve ARM frames copy the paged address index but share immutable
+record chunks. A shared chunk is copied only when a write reaches it through
+`get_mut` or replacement, or when the walk appends into a shared partial tail
+(`decompiler/crates/kuna-analysis/src/listing/kuna_insnstore.rs
+(InstructionChunk::clone)`). The copy retains full chunk capacity and leaves the
+prior Listing independent. Serial and parallel walks use the same store. This
+changes allocation and lookup layout, not the instruction partition or the facts
+any consumer receives.
 
 The optional lazy p-code list is an owned boxed vector, so an instruction with
 no retained p-code reserves a pointer-sized slot rather than a vector header
