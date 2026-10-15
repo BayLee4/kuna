@@ -2091,7 +2091,8 @@ mod tests {
         // and kuna-rettriangle / a one-block if keeps one return
         // and kuna-narrow-register-inputs / mixed-width reads do not span known inputs
         // and kuna-indirect-value-arguments / declared aggregate value arguments
-        assert_eq!(count, 551, "corpus file count drifted");
+        // and guarded/preloaded local read controls on SPARC and x86
+        assert_eq!(count, 555, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors
