@@ -2092,7 +2092,8 @@ mod tests {
         // and kuna-narrow-register-inputs / mixed-width reads do not span known inputs
         // and kuna-indirect-value-arguments / declared aggregate value arguments
         // and guarded/preloaded local read controls on SPARC and x86
-        assert_eq!(count, 555, "corpus file count drifted");
+        // and kuna-global-aggregate-store / kuna-global-array-member-store
+        assert_eq!(count, 557, "corpus file count drifted");
     }
 
     /// ~20 representative SLEIGH spec files across varied processors

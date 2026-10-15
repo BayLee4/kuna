@@ -430,6 +430,9 @@ mod guarded_local_read;
 #[path = "indirect_value_arguments.rs"]
 mod indirect_value_arguments;
 
+#[path = "global_aggregate_store.rs"]
+mod global_aggregate_store;
+
 #[path = "multireg_call_inputs.rs"]
 mod multireg_call_inputs;
 
