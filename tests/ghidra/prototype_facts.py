@@ -121,7 +121,8 @@ def parameter_markup(result):
                    and node.getHighSymbol(high).getId() == parameter.getId() for node in variables), str(parameter.getName())
 
 
-def execute_export(program, results, driver, *, output, stem, input_text=None):
+def execute_export(program, results, driver, *, output, stem, input_text=None, functions=(),
+                   direct_call=None):
     """Execute unmodified stock CppExporter output and genuine selected providers."""
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
     from ghidra.program.model.address import AddressSet
@@ -138,6 +139,7 @@ def execute_export(program, results, driver, *, output, stem, input_text=None):
     interface.setOptions(options)
     try:
         assert interface.openProgram(program), str(interface.getLastMessage())
+        pending.extend(interface.decompileFunction(function, 60, monitor) for function in functions)
         while pending:
             result = pending.pop()
             assert result.decompileCompleted(), str(result.getErrorMessage())
@@ -171,7 +173,8 @@ def execute_export(program, results, driver, *, output, stem, input_text=None):
         observations = {}
         try:
             default_stdcall = str(program.getCompilerSpec().getDefaultCallingConvention().getName()) == "__stdcall"
-            execute_i386_publication(observations, directory, header_path, body_path, driver_path, default_stdcall)
+            execute_i386_publication(observations, directory, header_path, body_path, driver_path,
+                                     default_stdcall, direct_call=direct_call)
         finally:
             (directory / "execution.json").write_text(json.dumps(observations, indent=2) + "\n")
         return ""
@@ -371,10 +374,7 @@ def main():
                     result_storage = call_op.getOutput()
                     assert result_storage is not None and result_storage.getSize() == 4, row
                     assert result_storage.getAddress() == fn.getProgram().getRegister(output_register).getAddress(), row
-            if callable_unit and core == "stock":
-                row["c_executed"] = False
-                row["execution_scope"] = "Paired source/metadata control; no duplicate stock executable consumer"
-            elif callable_unit:
+            if callable_unit:
                 row["stdout"] = execute_export(fn.getProgram(), [result], driver,
                                                 output=output, stem=f"{label}-{core}")
                 row["c_executed"] = True
@@ -390,6 +390,10 @@ def main():
 
     def call(site, target):
         return b"\xe8" + struct.pack("<i", target - site - 5)
+
+    def caller_driver(name, expected):
+        return (f"int main(void) {{ int result = {name}(); "
+                f"return result != {expected} || calls != 1 || argument != 5; }}\n")
 
     try:
         for core in ("stock", "kuna"):
@@ -434,7 +438,14 @@ def main():
                                 name: bool(java_field(FunctionPrototype, name).get(decoded))
                                 for name in expected
                             }
-                            assert row["result_locks"] == expected, row
+                            normalized = dict(expected)
+                            normalized["modellock"] = bool(
+                                expected["modellock"] or expected["voidinputlock"]
+                                or expected["outputlock"]
+                                or (parameters and parameters[0][4])
+                            )
+                            row["expected_result_locks"] = normalized
+                            assert row["result_locks"] == normalized, row
                             if expected["voidinputlock"]:
                                 assert decoded.getNumParams() == 0, row
                             if expected["outputlock"]:
@@ -451,6 +462,7 @@ def main():
                                 if type_locked:
                                     assert parameter.getDataType().isEquivalent(dtype), row
                                     assert parameter.getStorage() == storage, row
+                            assert source_facts(fn)[0] == expected, row
                             assert str(fn.getSignature()) == before, row
                             row["passed"] = True
                         except Exception:
@@ -534,6 +546,15 @@ def main():
                             observe(ifc, caller, kind, core, "",
                                     f"int main(void) {{ return {name}() != {expected}; }}\n",
                                     (0x2000, 5, outgoing), callable_unit=True)
+                            preamble = ("static int calls, argument;\n"
+                                        f"int {target_name}(int value) {{ ++calls; argument = value; "
+                                        f"return value + {expected - 5}; }}\n")
+                            observe(ifc, caller, kind + "_caller_occurrences", core, preamble,
+                                    caller_driver(name, expected), (0x2000, 5, outgoing))
+                        if kind == "both":
+                            observe(ifc, target, "current_custom", core, "",
+                                    f"int main(void) {{ return {target_name}(-9) != 0 || "
+                                    f"{target_name}(5) != 14; }}\n", current_contract=True)
         with program("callee_isolation") as (value, api):
             with transaction(value):
                 ordinary = function(value, api, 0x3000, bytes.fromhex("8d4701c3"), "ordinary_target")
@@ -603,6 +624,9 @@ def main():
                         bytes.fromhex("41ba0500000041bb07000000") + call(0x100c, 0x2000)
                         + bytes.fromhex("89d0c3"), "edited_caller")
                     signature(caller, empty=True)
+                    live_named = function(value, api, 0x3000,
+                                          bytes.fromhex("8d4709c3"), "live_named")
+                    signature(live_named, "EDI", "EAX")
                 with interface(value, core) as ifc:
                     for index, (register, instruction, argument) in enumerate([
                         ("R10D", "4489d2", 5), ("R11D", "4489da", 7), ("R10D", "4489d2", 5),
@@ -622,12 +646,14 @@ def main():
                     for lifecycle in ("rename_retype", "unlock", "reset", "reopen"):
                         if lifecycle == "rename_retype":
                             with transaction(value):
-                                target.getParameter(0).setName("unsigned_value", user)
-                                target.getParameter(0).setDataType(UnsignedIntegerDataType.dataType, user)
+                                for fn in (target, live_named):
+                                    fn.getParameter(0).setName("unsigned_value", user)
+                                    fn.getParameter(0).setDataType(UnsignedIntegerDataType.dataType, user)
                             ifc.flushCache()
                         elif lifecycle == "unlock":
                             with transaction(value):
-                                target.setSignatureSource(SourceType.DEFAULT)
+                                for fn in (target, live_named):
+                                    fn.setSignatureSource(SourceType.DEFAULT)
                             ifc.flushCache()
                         elif lifecycle == "reset":
                             ifc.resetDecompiler()
@@ -637,17 +663,71 @@ def main():
                         row = {"case": "source_edit_" + lifecycle, "core": core}
                         rows.append(row)
                         try:
-                            expected, _, _ = source_facts(target)
+                            before = str(target.getSignature())
+                            expected, parameters, _ = source_facts(target)
+                            assert len(parameters) == 1, row
+                            name, _, storage, name_locked, type_locked = parameters[0]
+                            assert name == "unsigned_value" and name_locked, row
+                            assert bool(type_locked) == (lifecycle == "rename_retype"), row
                             result = selected_results(ifc, [target], monitor)[0]
-                            parameter_markup(result)
-                            decoded = result.getHighFunction().getFunctionPrototype().getParam(0)
-                            assert str(decoded.getName()) == "unsigned_value", row
-                            assert decoded.isNameLocked(), row
-                            assert bool(decoded.isTypeLocked()) == (lifecycle == "rename_retype"), row
+                            high = result.getHighFunction()
+                            prototype = high.getFunctionPrototype()
+                            matches = [prototype.getParam(index)
+                                       for index in range(prototype.getNumParams())
+                                       if prototype.getParam(index).getStorage() == storage]
+                            for vn in high.locRange():
+                                if not vn.isInput() or not any(
+                                        vn.getAddress() == entry.getAddress()
+                                        and vn.getSize() == entry.getSize()
+                                        for entry in storage.getVarnodes()):
+                                    continue
+                                variable = vn.getHigh()
+                                assert variable is not None and variable.getSymbol() is not None, row
+                                matches.append(variable.getSymbol())
+                            matches = list({int(symbol.getId()): symbol for symbol in matches}.values())
                             if lifecycle == "rename_retype":
-                                assert decoded.getDataType().isEquivalent(UnsignedIntegerDataType.dataType), row
+                                parameter_markup(result)
+                                assert prototype.getNumParams() == 1 and matches, row
+                            for decoded in matches:
+                                assert str(decoded.getName()) == "unsigned_value", row
+                                assert bool(decoded.isNameLocked()) == name_locked, row
+                                assert bool(decoded.isTypeLocked()) == type_locked, row
+                                if lifecycle == "rename_retype":
+                                    assert decoded.getDataType().isEquivalent(UnsignedIntegerDataType.dataType), row
+                            assert source_facts(target)[:2] == (expected, parameters), row
+                            assert str(target.getSignature()) == before, row
                             assert str(target.getParameter(0).getName()) == "unsigned_value", row
                             row["source_locks"] = expected
+                            row["matching_live_symbols"] = [
+                                {"id": int(symbol.getId()), "name": str(symbol.getName()),
+                                 "storage": str(symbol.getStorage())} for symbol in matches
+                            ]
+                            row["name_contract"] = "Preserve authored source and matching live High names; unlocked custom storage need not survive as a formal"
+                            row["passed"] = True
+                        except Exception:
+                            row["passed"] = False
+                            row["failure"] = traceback.format_exc()
+                        row = {"case": "live_source_name_" + lifecycle, "core": core}
+                        rows.append(row)
+                        try:
+                            before = str(live_named.getSignature())
+                            _, parameters, _ = source_facts(live_named)
+                            assert len(parameters) == 1, row
+                            name, _, storage, name_locked, type_locked = parameters[0]
+                            result = selected_results(ifc, [live_named], monitor)[0]
+                            parameter_markup(result)
+                            prototype = result.getHighFunction().getFunctionPrototype()
+                            matches = [prototype.getParam(index)
+                                       for index in range(prototype.getNumParams())
+                                       if prototype.getParam(index).getStorage() == storage]
+                            assert len(matches) == 1, row
+                            decoded = matches[0]
+                            assert str(decoded.getName()) == name == "unsigned_value", row
+                            assert decoded.isNameLocked() and name_locked, row
+                            assert bool(decoded.isTypeLocked()) == bool(type_locked), row
+                            if lifecycle == "rename_retype":
+                                assert decoded.getDataType().isEquivalent(UnsignedIntegerDataType.dataType), row
+                            assert str(live_named.getSignature()) == before, row
                             row["passed"] = True
                         except Exception:
                             row["passed"] = False

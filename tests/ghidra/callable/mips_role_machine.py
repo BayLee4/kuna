@@ -3,7 +3,7 @@
 import argparse,hashlib,json,traceback
 from pathlib import Path
 from whole_calls_workers import ElfMachine
-p=argparse.ArgumentParser();p.add_argument('--construction',type=Path,required=True);p.add_argument('--out',type=Path,required=True);p.add_argument('--scope',choices=['roles','inherited','private'],default='roles');a=p.parse_args();a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False);construction=json.loads(a.construction.read_text());r={'completed':False,'cases':[],'selected_scope':a.scope,'scope':'Original linked MIPS32 machine bodies, genuine direct calls and mutable function-pointer slots. No callee substitution, register injection between instructions, ABI clearing, or source-formal GP arguments.','partial_write_scope':'Genuine lone LWR gp,3(base) merges a new low byte with old dirty upper24bits. Raw pcode has full GP output and explicit old-GP read, NOT a byte-sized subregister output. No LWL pair or context shortcut.'}
+p=argparse.ArgumentParser();p.add_argument('--construction',type=Path,required=True);p.add_argument('--out',type=Path,required=True);p.add_argument('--scope',choices=['roles','inherited','private','natural'],default='roles');a=p.parse_args();a.out=a.out.resolve();a.out.mkdir(parents=True,exist_ok=False);construction=json.loads(a.construction.read_text());r={'completed':False,'cases':[],'selected_scope':a.scope,'scope':'Original linked MIPS32 machine bodies, genuine direct calls and mutable function-pointer slots. No callee substitution, register injection between instructions, ABI clearing, or source-formal GP arguments.','partial_write_scope':'Genuine lone LWR gp,3(base) merges a new low byte with old dirty upper24bits. Raw pcode has full GP output and explicit old-GP read, NOT a byte-sized subregister output. No LWL pair or context shortcut.'}
 try:
  from jpype import JArray,JByte
  # Imports below require the genuine ElfMachine startup first.
@@ -31,6 +31,8 @@ try:
      for entry in ['direct_gp_parent','direct_gp_read_parent']:assert api.disassemble(m.address(symbols[entry]))
     if a.scope=='private':
      for entry in ['private_gp_spill','private_gp_reload','private_gp_escape']:assert api.disassemble(m.address(symbols[entry]))
+    if a.scope=='natural':
+     for entry in ['dirty_gp','direct_gp_parent','dirty_gp_natural','direct_gp_natural_parent']:assert api.disassemble(m.address(symbols[entry]))
    finally:program.endTransaction(tx,True)
    load=program.getListing().getInstructionAt(m.address(symbols['consume_gp']));assert any(op.getOpcode()==PcodeOp.LOAD for op in load.getPcode())
    merge=program.getListing().getInstructionAt(m.address(symbols['partial_merge']))
@@ -39,6 +41,7 @@ try:
    selected=['caller_dirty','caller_full','caller_partial','caller_removed']if image['readonly_value']==0 else['caller_removed']
    if a.scope=='inherited':selected=['direct_gp_parent','direct_gp_read_parent']
    if a.scope=='private':selected=['private_gp_spill','private_gp_reload','private_gp_escape']
+   if a.scope=='natural':selected=['dirty_gp','direct_gp_parent','dirty_gp_natural','direct_gp_natural_parent']
    for entry in selected:
     emulator=PcodeEmulator(program.getLanguage());EmulatorUtilities.loadProgram(emulator,program);thread=emulator.newThread();state=thread.getState()
     preserved=[('s0',0x12121212),('s1',0x23232323),('s2',0x34343434),('s3',0x45454545),('s4',0x56565656),('s5',0x67676767),('s6',0x78787878),('s7',0x89898989),('s8',0x98989898)]
@@ -66,6 +69,25 @@ try:
      row['parent_actual_raw_pcode']=[str(op)for op in original_ops]
      row['parent_own_GP_writes']=0;row['parent_own_GP_reads']=len(gp_reads)
      wanted=11 if entry=='direct_gp_parent'else 77
+     final_gp=symbols['alternate_value']
+    elif a.scope=='natural':
+     parent=entry.startswith('direct_')
+     target='dirty_gp_natural'if 'natural'in entry else'dirty_gp'
+     assert [call['callee']for call in row['calls']]==([target]if parent else[])
+     if parent:assert row['calls'][0]['GP']==0x41414141
+     end=symbols['consume_gp']if entry=='dirty_gp'else symbols[entry+'_end']
+     instructions=[instruction for instruction in program.getListing().getInstructions(m.address(symbols[entry]),True)if int(instruction.getAddress().getOffset())<end]
+     original_ops=[op for instruction in instructions for op in instruction.getPcode()]
+     calls=[op for op in original_ops if op.getOpcode()==PcodeOp.CALL]
+     assert len(calls)==int(parent)
+     if parent:
+      assert int(calls[0].getInput(0).getOffset())==symbols[target]
+      assert not any(op.getOutput()is not None and op.getOutput().isRegister()and op.getOutput().getOffset()==gp.getAddress().getOffset()for op in original_ops)
+      assert not any(vn.isRegister()and vn.getOffset()==gp.getAddress().getOffset()for op in original_ops for vn in op.getInputs())
+     row['original_instruction_pcode']=[{'address':int(instruction.getAddress().getOffset()),'instruction':str(instruction),'pcode':[str(op)for op in instruction.getPcode()]}for instruction in instructions]
+     row['actual_V0']=register_value('v0');assert row['actual_V0']==(11 if parent else 0)
+     row['native_execution_contract']='Not inspected: raw completeness/execution=None must be observed by actual Kuna engine, not inferred from these machine values.'
+     wanted=11 if parent else None
      final_gp=symbols['alternate_value']
     elif a.scope=='private':
      assert not row['calls']

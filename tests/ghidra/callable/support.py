@@ -64,17 +64,42 @@ def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def require_provider_body(path, name):
-    """Require the selected real provider definition in unchanged exporter output."""
+def record_unrepresented_admission(row, result, case, requirements, outcome='refusal'):
+    """Retain a mandatory admission clause without certifying ordinary project output."""
+    row.setdefault('unrepresented_admission', []).append({
+        'status': 'prerequisite-unrepresented',
+        'case': case,
+        'requirement_ids': requirements,
+        'required_outcome': outcome,
+        'observed_ordinary_export': result,
+        'missing_owner': 'Current decompile-project has no explicit executable-admission consumer.',
+    })
+
+
+def _provider_body(path, name):
     body = Path(path).read_text()
     tokens = re.sub(
         r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
         ' ', body, flags=re.DOTALL,
     )
-    assert re.search(r'\b' + re.escape(name) + r'\s*\([^;{}]*\)\s*\{', tokens), (name, path, body)
+    for match in re.finditer(r'\b' + re.escape(name) + r'\s*\([^;{}]*\)\s*\{', tokens):
+        start = match.start()
+        if tokens.count('{', 0, start) == tokens.count('}', 0, start):
+            return match
+    return None
 
 
-def execute_i386_publication(row, directory, header, body, driver, default_stdcall):
+def require_provider_body(path, name):
+    """Require the selected real provider definition in unchanged exporter output."""
+    assert _provider_body(path, name), (name, path, Path(path).read_text())
+
+
+def require_absent_provider_body(path, name):
+    """Require an unselected provider to remain outside a partial export."""
+    assert not _provider_body(path, name), (name, path, Path(path).read_text())
+
+
+def execute_i386_publication(row, directory, header, body, driver, default_stdcall, *, direct_call=None):
     """Compile untouched publication bytes and execute their actual i386 ABI."""
     from whole_calls_workers import ElfMachine
     from java.math import BigInteger
@@ -111,26 +136,37 @@ def execute_i386_publication(row, directory, header, body, driver, default_stdca
         machine = ElfMachine(image, case)
         try:
             assert str(machine.program.getLanguageID()) == 'x86:LE:32:default'
-            symbols = list(machine.program.getSymbolTable().getSymbols('main'))
+            function = 'main' if direct_call is None else direct_call['function']
+            symbols = list(machine.program.getSymbolTable().getSymbols(function))
             assert len(symbols) == 1, symbols
             emulator = machine.EmulatorHelper(machine.program)
             try:
                 preserved = [('EBP', 0x11223344), ('EBX', 42), ('ESI', 0x12345678), ('EDI', 0x23456789)]
-                for register, value in [('ESP', 0x7fdc), *preserved]:
+                initial_esp = 0x7fdc if direct_call is None else direct_call['initial_esp']
+                inputs = [] if direct_call is None else direct_call['registers']
+                if isinstance(inputs, dict):
+                    inputs = list(inputs.items())
+                incoming = dict([('ESP', initial_esp), *preserved, *inputs])
+                for register, value in incoming.items():
                     emulator.writeRegister(register, BigInteger(str(value)))
-                emulator.writeMemory(machine.address(0x7fdc), JArray(JByte)((0x7ff0).to_bytes(4, 'little')))
+                emulator.writeMemory(machine.address(initial_esp), JArray(JByte)((0x7ff0).to_bytes(4, 'little')))
                 emulator.setBreakpoint(machine.address(0x7ff0))
                 assert emulator.run(symbols[0].getAddress(), None, machine.monitor), str(emulator.getLastError())
                 assert emulator.getExecutionAddress() == machine.address(0x7ff0)
                 actual = int(str(emulator.readRegister('EAX'))) & 0xffffffff
-                assert actual == 0, actual
-                assert int(str(emulator.readRegister('ESP'))) == 0x7fe0
-                for register, value in preserved:
+                expected = 0 if direct_call is None else direct_call['expected_result']
+                final_esp = 0x7fe0 if direct_call is None else direct_call['expected_final_esp']
+                assert actual == expected, (function, actual, expected)
+                assert int(str(emulator.readRegister('ESP'))) == final_esp
+                for register, _ in preserved:
+                    value = incoming[register]
                     assert int(str(emulator.readRegister(register))) == value
                 row.setdefault('execution', []).append({
                     'optimization': optimization, 'target': 'i386-unknown-linux-gnu',
                     'default': 'stdcall (-mrtd)' if default_stdcall else 'cdecl',
-                    'actual_main_EAX': actual, 'final_ESP': 0x7fe0, 'binary_sha256': sha256(image)})
+                    'function': function, 'register_inputs': dict(inputs),
+                    'actual_EAX': actual, 'initial_ESP': initial_esp,
+                    'final_ESP': final_esp, 'binary_sha256': sha256(image)})
             finally:
                 emulator.dispose()
         finally:

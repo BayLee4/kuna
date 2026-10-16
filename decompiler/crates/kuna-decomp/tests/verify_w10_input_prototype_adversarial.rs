@@ -44,8 +44,9 @@ fn datatests_dir() -> PathBuf {
 }
 
 fn rust_test_bin() -> PathBuf {
-    // This crate's own workspace target dir (the branch build under test).
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/decomp_test_dbg")
+    std::env::var_os("KUNA_DECOMP_TEST_RUST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/decomp_test_dbg"))
 }
 
 fn cpp_oracle_bin() -> PathBuf {

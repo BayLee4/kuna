@@ -121,7 +121,7 @@ fn small_struct_return_loses_its_phantom_sret() {
         on.contains("P8 ret_struct(uint4 x)") && !on.contains("rethidden"),
         "an 8-byte struct return should be a register return, got:\n{on}"
     );
-    assert!(on.contains("* 7") && on.contains("+ 1"), "source layout must retain both computations:\n{on}");
+    assert!(on.contains("* 7") && on.contains("+ 1"), "return computation changed:\n{on}");
 }
 
 /// A 24-byte return really IS an sret — the fix must not delete a hidden return

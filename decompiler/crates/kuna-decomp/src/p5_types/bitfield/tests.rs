@@ -525,10 +525,10 @@ fn schedule_registration_controls_unconditional_analysis_clone() {
         let input = fixture_input(&mut fd, 4, 0x2000, None);
         let xor = fixture_op(&mut fd, block, OpCode::CPUI_INT_XOR, &[input, input], 4);
         let mut pool = ActionPool::new(0, "analysis");
-        pool.add_rule(RuleState::new("registered", 0, "identity"), Box::new(crate::ruleaction_2::RuleTrivialArith));
+        pool.add_rule(RuleState::new("analysis", 0, "identity"), Box::new(crate::ruleaction_2::RuleTrivialArith));
         let mut groups = ActionGroupList::new();
         groups.insert("base");
-        if enabled { groups.insert("registered"); }
+        if enabled { groups.insert("analysis"); }
         let mut filtered = pool.clone_filtered(&groups);
         if let Some(action) = filtered.as_mut() { action.perform(&mut fd, &mut ActionContext::new()); }
         assert_eq!(filtered.is_some(), enabled);

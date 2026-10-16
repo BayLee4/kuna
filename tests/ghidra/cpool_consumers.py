@@ -23,7 +23,7 @@ def main():
                               "stdout": produced.stdout, "stderr": produced.stderr}
         assert produced.returncode == 0, report["producer"]
         pyghidra = start_ghidra()
-        from jpype import JArray, JLong
+        from jpype import JArray, JByte, JLong
         from java.util import ArrayList
         from ghidra.app.decompiler import DecompInterface, DecompileOptions
         from ghidra.program.model.data import Pointer
@@ -104,6 +104,22 @@ def main():
                 else:
                     assert returned.isEquivalent(source), (returned, source)
 
+            array_instruction = next(instruction for instruction in
+                program.getListing().getInstructions(targets["array"].getBody(), True)
+                if str(instruction.getMnemonicString()) == "anewarray")
+            instruction_address = array_instruction.getAddress()
+            original_instruction = bytes((int(value) & 255) for value in array_instruction.getBytes())
+            assert len(original_instruction) == 3 and original_instruction[0] == 0xbd
+
+            def replace_array_reference(data):
+                tx = program.startTransaction("Explicit malformed/restore JVM constant-pool source reference")
+                try:
+                    program.getListing().clearCodeUnits(instruction_address, instruction_address.add(2), False)
+                    program.getMemory().setBytes(instruction_address, JArray(JByte)(data))
+                    assert api.disassemble(instruction_address)
+                finally:
+                    program.endTransaction(tx, True)
+
             for core, executable in (("stock", None), ("kuna", KUNA_GHIDRA)):
                 with selected_core(executable):
                     interface = DecompInterface()
@@ -145,6 +161,39 @@ def main():
                             except Exception:
                                 row["passed"] = False
                                 row["failure"] = traceback.format_exc()
+                        row = {"core": core, "function": "array", "case": "malformed_constant_pool_record_recovery",
+                               "producer": "original analyzed anewarray with reserved invalid pool index zero"}
+                        report["rows"].append(row)
+                        try:
+                            try:
+                                replace_array_reference(bytes([0xbd, 0, 0]))
+                                interface.flushCache()
+                                result = interface.decompileFunction(targets["array"], 60, monitor)
+                                row["error"] = str(result.getErrorMessage())
+                                assert not result.decompileCompleted(), row
+                                assert result.getHighFunction() is None and result.getDecompiledFunction() is None, row
+                                assert result.getCCodeMarkup() is None, row
+                                assert not result.isTimedOut() and not result.isCancelled(), row
+                                row["failed_without_fabricated_products"] = True
+                            except Exception:
+                                row["negative_failure"] = traceback.format_exc()
+                            finally:
+                                replace_array_reference(original_instruction)
+                                interface.flushCache()
+                            recovered = interface.decompileFunction(targets["array"], 60, monitor)
+                            assert recovered.decompileCompleted(), str(recovered.getErrorMessage())
+                            assert recovered.getHighFunction() is not None and recovered.getCCodeMarkup() is not None
+                            recovered_code = str(recovered.getDecompiledFunction().getC())
+                            assert re.search(r"\bnew\s+(?:java\.lang\.)?Object\s*\[", recovered_code), recovered_code
+                            assert_return_constraints(
+                                recovered.getHighFunction().getFunctionPrototype().getReturnType(),
+                                targets["array"].getReturnType())
+                            assert str(targets["array"].getSignature()) == source_before["array"]
+                            row["valid_followup"] = True
+                            row["passed"] = "negative_failure" not in row
+                        except Exception:
+                            row["passed"] = False
+                            row["failure"] = traceback.format_exc()
                     finally:
                         interface.dispose()
         report["completed"] = True

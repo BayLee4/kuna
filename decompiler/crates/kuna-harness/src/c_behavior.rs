@@ -3,14 +3,15 @@
 use std::path::Path;
 use std::process::Command;
 
-pub fn assert_c_behavior(source: &Path, preamble: &str, body: &str, driver: &str) {
+pub fn assert_c_behavior(source: &Path, preamble: &str, body: &str, driver: &str, warnings: &[&str]) {
     let executable = source.with_extension("exe");
     std::fs::write(&source, format!("{preamble}\n{body}\n{driver}\n"))
         .expect("write emitted-C witness");
     let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
     for optimization in ["-O0", "-O2"] {
         let built = Command::new(&compiler)
-            .args(["-std=c11", optimization, "-Wall", "-Werror"])
+            .args(["-std=c11", optimization])
+            .args(warnings)
             .arg(&source)
             .arg("-o")
             .arg(&executable)

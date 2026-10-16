@@ -65,7 +65,7 @@ def main():
                 assert interface.openProgram(program), str(interface.getLastMessage())
                 native = native_field.get(process_field.get(interface))
                 pid = int(native.pid())
-                for limit in (100, 1, 100):
+                for limit in (100, 1, 100, 1, 100):
                     options.setMaxInstructions(limit)
                     assert interface.setOptions(options), str(interface.getLastMessage())
                     result = interface.decompileFunction(function, 30, monitor)
@@ -77,18 +77,22 @@ def main():
                         "completed": bool(result.decompileCompleted()),
                         "error": str(result.getErrorMessage()),
                         "highfunction": result.getHighFunction() is not None,
+                        "markup": result.getCCodeMarkup() is not None,
+                        "timed_out": bool(result.isTimedOut()),
+                        "cancelled": bool(result.isCancelled()),
                         "c": str(decompiled.getC()) if decompiled is not None else None,
                     }
                     rows[core].append(row)
                     assert row["pid"] == pid and current_native.isAlive(), row
                     if limit == 1:
                         assert not row["completed"] and not row["highfunction"] and row["c"] is None, row
+                        assert not row["markup"] and not row["timed_out"] and not row["cancelled"], row
                         assert re.search(r"exceed.*maximum.*instructions", row["error"], re.I), row
                         assert "Decoding error" not in row["error"], row
                     else:
                         assert row["completed"] and row["highfunction"] and row["error"] == "", row
                         assert re.search(r"return\s+\w+\s*\+\s*7\s*;", row["c"] or ""), row
-                print(f"PASS {core}: success/failure/recovery, unchanged native PID {pid}")
+                print(f"PASS {core}: success/failure/recovery twice, unchanged native PID {pid}")
             finally:
                 interface.dispose()
     finally:

@@ -141,6 +141,7 @@ fn narrow_signed_switch_labels_round_trip_through_c_and_rust() {
     std::fs::write(&rust_source, format!("{RUST_HARNESS}\n{rust}")).unwrap();
     let compile = Command::new("rustc")
         .args(["--crate-name", "narrow_switch_labels", "--edition", "2021", "-O"])
+        .args(["-C", "link-arg=-no-pie"])
         .arg(&rust_source)
         .arg("-C")
         .arg(format!("link-arg={}", native.display()))

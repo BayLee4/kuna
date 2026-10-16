@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import traceback
-from support import require_provider_body, start_ghidra
+from support import require_provider_body, require_absent_provider_body, start_ghidra
 
 BASE = 0x1000
 
@@ -121,6 +121,7 @@ def main():
         try:
             for which, target in [(0, 0x1040), (1, 0x1060)]:
                 assert machine.call(0x1000, which) == target
+                assert machine.call(0x1000, which) == target
             assert machine.call(0x1100) == 0
             assert machine.call(0x1120) == 1
             assert machine.call(0x1160) == 0
@@ -166,19 +167,24 @@ def main():
             'carry_invoke': [('bits', 8), ('callback', 8)],
             'carry_ambient': [('bits', 8)], 'carry_bool': [('bits', 8)],
         }
-        actual_source = {}
-        for function in metadata['functions']:
-            assert function.get('error') is None, function
-            name = function['name']
-            if name not in expected_source:
-                continue
-            params = sorted((v for v in function['variables'] if v['kind'] == 'arg'), key=lambda v:v['arg_index'])
-            assert [v['arg_index'] for v in params] == list(range(len(expected_source[name]))), function
-            actual = [(v['name'], v['size']) for v in params]
-            assert actual == expected_source[name], (name, actual, expected_source[name])
-            actual_source[name] = actual
-        assert actual_source == expected_source, actual_source
-        report['source_metadata'] = actual_source
+        try:
+            assert len(metadata['functions']) == len(expected_source), metadata
+            assert {function['name'] for function in metadata['functions']} == set(expected_source), metadata
+            actual_source = {}
+            for function in metadata['functions']:
+                assert function.get('error') is None, function
+                name = function['name']
+                if name not in expected_source:
+                    continue
+                params = sorted((v for v in function['variables'] if v['kind'] == 'arg'), key=lambda v:v['arg_index'])
+                assert [v['arg_index'] for v in params] == list(range(len(expected_source[name]))), function
+                actual = [(v['name'], v['size']) for v in params]
+                assert actual == expected_source[name], (name, actual, expected_source[name])
+                actual_source[name] = actual
+            assert actual_source == expected_source, actual_source
+            report['source_metadata'] = actual_source
+        except Exception:
+            report['source_metadata_failure'] = traceback.format_exc()
         emitted_c = project/'whole_calls.c'
         emitted_h = project/'whole_calls.h'
         for name in expected_source:
@@ -190,6 +196,11 @@ def main():
             ' if (choose(0)!=choose(0) || choose(1)!=choose(1) || choose(0)==choose(1)) return 11;\n'
             ' if (direct_dirty()!=0 || direct_clean()!=1) return 12;\n'
             ' if (ambient_dirty()!=0 || ambient_clean()!=1) return 15;\n'
+            ' if (bool_byte(0)!=0 || bool_byte(1)!=0) return 19;\n'
+            ' for(unsigned low=0;low<256;++low) { Flags value=(Flags)low; int want=low==85;\n'
+            '  if(byte_target(value)!=want || word_target(value)!=want) return 18;\n'
+            '  for(unsigned which=0;which<2;++which) if(dispatch(value,which)!=want || invoke(value,choose(which))!=want) return 20;\n'
+            ' }\n'
             ' const uint64_t upper[]={0,UINT64_C(0x10000),UINT64_C(0x1234567800000000)};\n'
             ' unsigned checked=0;\n'
             ' for(unsigned p=0;p<3;++p) for(unsigned low=0;low<256;++low) for(unsigned which=0;which<2;++which) {\n'
@@ -200,11 +211,21 @@ def main():
             '  int got=carry_dispatch(raw,which); int via_pointer=carry_invoke(raw,choose(which));\n'
             '  if(got!=want || via_pointer!=want) { fprintf(stderr,"raw=%llx target=%u got=%d indirect=%d want=%d\\n",(unsigned long long)raw,which,got,via_pointer,want); return 13; }\n'
             '  ++checked;\n }\n printf("checked=%u direct-calls=passed pointer-identity=passed\\n",checked); return 0;\n}\n')
+        report['consumer_failures'] = []
         for opt in ('O0','O2'):
             for char_mode in ('-fsigned-char', '-funsigned-char'):
-                exe = args.out/('consumer-'+opt+char_mode)
-                invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration','-'+opt,char_mode,'-I',project,emitted_c,driver,'-o',exe])
-                invoke([exe])
+                try:
+                    exe = args.out/('consumer-'+opt+char_mode)
+                    invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration','-'+opt,char_mode,'-I',project,emitted_c,driver,'-o',exe])
+                    invoke([exe])
+                except BaseException:
+                    report['consumer_failures'].append({'optimization': opt, 'char_mode': char_mode,
+                                                       'failure': traceback.format_exc()})
+        assert not report['consumer_failures'], report['consumer_failures']
+        report['behavioral_checks_completed'] = True
+    except BaseException:
+        report['failure'] = traceback.format_exc()
+    try:
         native_image = bytearray(0x180)
         native_entries = [
             ('forward', 0x1000, rel(0xe8, 0x1000, 0x1100) + bytes([0xc3]), 'int forward(Callback callback)'),
@@ -232,16 +253,20 @@ def main():
         native_metadata_command = [args.cli, 'decompile-all', native_binary, '--json', *native_common]
         native_metadata = json.loads(invoke(native_metadata_command)['stdout'])
         native_forward = next(function for function in native_metadata['functions'] if function['name'] == 'forward')
-        assert native_forward.get('error') is None, native_forward
+        assert len(native_metadata['functions']) == 1 and native_forward.get('error') is None and native_forward.get('code'), native_forward
         native_params = [(value['name'], value['size']) for value in native_forward['variables'] if value['kind'] == 'arg']
         assert native_params == [('callback', 8)], native_forward
+        exported = invoke([args.cli, 'decompile-project', native_binary, '-o', args.out/'native-project',
+                           *native_common])
+        native_body = args.out/'native-project'/(native_binary.name+'.c')
+        require_provider_body(native_body, 'forward')
+        for name, _, _, _ in native_entries[1:]:
+            require_absent_provider_body(native_body, name)
         report['native_boundary'] = {'original_machine_byte_target':1, 'original_machine_word_target':0,
-                                     'source_callback_parameter_size':8}
-        report['behavioral_checks_completed'] = True
-        report['completed'] = True
+                                     'source_callback_parameter_size':8, 'project_status':exported['status']}
+        report['completed'] = not any(key in report for key in ('failure', 'source_metadata_failure'))
     except BaseException:
-        report['failure'] = traceback.format_exc()
-        raise
+        report['native_boundary_failure'] = traceback.format_exc()
     finally:
         (args.out/'report.json').write_text(json.dumps(report, indent=2)+'\n')
         print(json.dumps(report, indent=2))

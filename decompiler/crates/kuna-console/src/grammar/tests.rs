@@ -1615,7 +1615,10 @@ fn same_tag_typedef_and_early_pointer_keep_completed_source_layout() {
     let before = parse_type("struct Node *", &f, org()).unwrap().0;
     parse("struct Node { struct Node *next; int4 value; };");
     let node = f.find_by_name("Node").unwrap().unwrap();
-    assert_eq!((implicit.get_id(), implicit.get_size()), (node.get_id(), 8));
+    assert_eq!(implicit.get_id(), node.get_id());
+    let resolved_implicit = f.get_type_pointer(org().addr_size, implicit, org().word_size)
+        .unwrap().get_ptr_to().unwrap();
+    assert_eq!((resolved_implicit.get_id(), resolved_implicit.get_size()), (node.get_id(), 8));
     let after = parse_type("struct Node *", &f, org()).unwrap().0;
     for pointer in [&before, &after] {
         let seen = pointer.get_ptr_to().unwrap();
@@ -1930,52 +1933,108 @@ fn callback_void_is_closed_and_default_changes_are_future_only() {
     ]));
     let new = parse_type("int4 (*cb)(void)", &f, org()).unwrap().0.get_ptr_to().unwrap();
     for (code, expected) in [(&old, "__cdecl"), (&new, "__fastcall")] {
-        assert_eq!(code.get_code_prototype().unwrap().get_model_name(), expected);
+        let prototype = code.get_code_prototype().unwrap();
+        assert_eq!(prototype.get_model_name(), expected);
+        assert_eq!(prototype.num_params(), 0);
+        assert!(prototype.is_input_locked());
+        assert!(!prototype.is_dotdotdot());
     }
     assert_eq!(explicit.get_code_prototype().unwrap().get_model_name(), "__cdecl");
     assert_eq!(callback_pieces(&explicit).intypes.len(), 1);
 }
 
 #[test]
-fn recursive_callback_keeps_nominal_byvalue_identity_in_both_query_orders() {
-    for query_before_layout in [false, true] {
+fn typedef_void_parameter_is_closed_and_function_alias_parameters_decay() {
+    let f = factory_with_model_resources(&[], true);
+    for declaration in ["typedef void NoValue;", "typedef int4 Callback(int4);"] {
+        super::parse_c(declaration, &f, org(), &[], |_, _| unreachable!()).unwrap();
+    }
+    let empty = parse_protopieces("extern int4 closed(NoValue);", &f, org()).unwrap();
+    assert_eq!(empty.intypes.len(), 0);
+    assert_eq!(empty.first_var_arg_slot, -1);
+    let callable = parse_type("int4 (*callback)(NoValue)", &f, org()).unwrap().0.get_ptr_to().unwrap();
+    let prototype = callable.get_code_prototype().unwrap();
+    assert_eq!(prototype.num_params(), 0);
+    assert!(prototype.is_input_locked());
+    assert!(!prototype.is_dotdotdot());
+
+    let alias = f.find_by_name("Callback").unwrap().unwrap();
+    let pieces = parse_protopieces("extern int4 invoke(Callback callback,int4 value);", &f, org()).unwrap();
+    assert_eq!(pieces.innames, ["callback", "value"]);
+    assert_eq!(pieces.intypes.len(), 2);
+    assert_eq!(pieces.intypes[0].get_metatype(), meta::TYPE_PTR);
+    assert_eq!(pieces.intypes[0].get_size(), org().addr_size);
+    let target = pieces.intypes[0].get_ptr_to().unwrap();
+    assert_eq!(target.get_id(), alias.get_id());
+    let callback = target.get_code_prototype().unwrap();
+    assert_eq!(callback.num_params(), 1);
+    assert_eq!(callback.get_output_type().unwrap().get_name(), "int4");
+    assert_eq!(callback.get_param(0).unwrap().get_type().unwrap().get_name(), "int4");
+    assert_eq!(pieces.intypes[1].get_name(), "int4");
+}
+
+#[test]
+fn recursive_callback_declaration_preserves_source_signature_after_completion() {
+    use kuna_decomp::kuna_langc::C_SPELLER;
+    use kuna_decomp::kuna_langtypes::{SpellCtx, TypeSpeller};
+    for observe_before_layout in [false, true] {
         let f = factory_with_model_resources(&[], true);
-        let declare = |source| super::parse_c(source, &f, org(), &[], |_, _| unreachable!()).unwrap();
+        let organization = org();
+        let declare = |source| super::parse_c(source, &f, organization, &[], |_, _| unreachable!()).unwrap();
         declare("struct Node;");
         declare("typedef struct Node (*Fn)(struct Node);");
-        let node = f.find_by_name("Node").unwrap().unwrap();
+        let held_node = f.find_by_name("Node").unwrap().unwrap();
         let callback = f.find_by_name("Fn").unwrap().unwrap();
         let code = callback.get_ptr_to().unwrap();
-        if query_before_layout {
-            let pieces = callback_pieces(&code);
-            assert!(pieces.outtype.unwrap().is_incomplete());
-            assert!(pieces.intypes[0].is_incomplete());
+        if observe_before_layout {
+            let _ = callback_pieces(&code);
         }
         declare("struct Node { float8 d; Fn next; };");
-        let pieces = callback_pieces(&code);
-        let output = pieces.outtype.unwrap();
-        assert_eq!(output.get_name(), "Node");
-        assert!(!output.is_incomplete());
-        assert_eq!(output.get_size(), 16);
-        assert_eq!(output.get_field(0).unwrap().name, "d");
-        assert_eq!(output.get_field(0).unwrap().offset, 0);
-        assert_eq!(output.get_field(1).unwrap().name, "next");
-        assert_eq!(output.get_field(1).unwrap().offset, 8);
-        assert_eq!(output.get_field(1).unwrap().field_type.get_name(), "Fn");
-        assert_eq!(pieces.intypes.len(), 1);
-        assert_eq!(pieces.intypes[0].get_size(), node.get_size());
-        assert_eq!(pieces.intypes[0].get_field(1).unwrap().name, "next");
-        assert_eq!(node.get_field(1).unwrap().field_type.get_name(), callback.get_name());
-        assert_eq!(f.find_by_name("Node").unwrap().unwrap().get_size(), 16);
+        let node = f.find_by_name("Node").unwrap().unwrap();
+        assert_eq!(node.get_id(), held_node.get_id());
+        assert_eq!(node.get_name(), "Node");
+        assert!(!node.is_incomplete());
+        assert_eq!(node.get_size(), 16);
+        assert_eq!(node.get_field(0).unwrap().name, "d");
+        assert_eq!(node.get_field(0).unwrap().offset, 0);
+        let next = node.get_field(1).unwrap();
+        assert_eq!(next.name, "next");
+        assert_eq!(next.offset, 8);
+        assert_eq!(next.field_type.get_name(), "Fn");
+        assert_eq!(next.field_type.get_id(), callback.get_id());
+        let (front, back) = C_SPELLER.declarator(&SpellCtx::OFF, &code);
+        let emitted = parse_protopieces(&format!("{front} emitted{back};"), &f, organization).unwrap();
+        let result = emitted.outtype.unwrap();
+        assert_eq!(result.get_metatype(), meta::TYPE_STRUCT);
+        assert_eq!(result.get_id(), node.get_id());
+        assert_eq!(emitted.intypes.len(), 1);
+        assert_eq!(emitted.intypes[0].get_id(), node.get_id());
+        assert_eq!(emitted.intypes[0].get_metatype(), meta::TYPE_STRUCT);
+        for source_type in [&result, &emitted.intypes[0]] {
+            assert_eq!(source_type.get_name(), "Node");
+            assert!(!source_type.is_incomplete());
+            assert_eq!(source_type.get_size(), 16);
+            let first = source_type.get_field(0).unwrap();
+            assert_eq!(first.name, "d");
+            assert_eq!(first.offset, 0);
+            let next = source_type.get_field(1).unwrap();
+            assert_eq!(next.name, "next");
+            assert_eq!(next.offset, 8);
+            assert_eq!(next.field_type.get_name(), "Fn");
+            assert_eq!(next.field_type.get_id(), callback.get_id());
+        }
     }
 }
 
 #[test]
 fn typedef_forward_tag_supports_recursive_callback_and_distinct_aliases() {
-    for query_before_layout in [false, true] {
+    use kuna_decomp::kuna_langc::C_SPELLER;
+    use kuna_decomp::kuna_langtypes::{SpellCtx, TypeSpeller};
+    for observe_before_layout in [false, true] {
         let f = factory_with_model_resources(&[], true);
         f.set_size_of_double(8);
-        let declare = |source| super::parse_c(source, &f, org(), &[], |_, _| unreachable!()).unwrap();
+        let organization = org();
+        let declare = |source| super::parse_c(source, &f, organization, &[], |_, _| unreachable!()).unwrap();
         declare("typedef struct Node Node;");
         let node = f.find_by_name("Node").unwrap().unwrap();
         assert!(node.is_incomplete());
@@ -1984,20 +2043,59 @@ fn typedef_forward_tag_supports_recursive_callback_and_distinct_aliases() {
         let alias = f.find_by_name("OtherNode").unwrap().unwrap();
         assert_eq!(alias.get_name(), "OtherNode");
         assert_eq!(alias.get_typedef().unwrap().get_name(), "Node");
+        assert_ne!(alias.get_id(), node.get_id());
         let callback = f.find_by_name("Fn").unwrap().unwrap();
         let code = callback.get_ptr_to().unwrap();
-        if query_before_layout {
-            assert!(callback_pieces(&code).intypes[0].is_incomplete());
+        if observe_before_layout {
+            let _ = callback_pieces(&code);
         }
         declare("struct Node { double d; Fn next; };");
-        let pieces = callback_pieces(&code);
-        assert_eq!(pieces.outtype.unwrap().get_size(), 16);
-        assert_eq!(pieces.intypes[0].get_size(), 16);
-        assert_eq!(pieces.intypes[0].get_field(1).unwrap().field_type.get_name(), "Fn");
-        assert_eq!(node.get_size(), 16);
-        assert_eq!(alias.get_size(), 16);
-        assert_eq!(alias.get_typedef().unwrap().get_size(), 16);
+        let completed = f.find_by_name("Node").unwrap().unwrap();
+        assert_eq!(completed.get_id(), node.get_id());
+        assert_eq!(completed.get_size(), 16);
+        assert_eq!(completed.get_field(0).unwrap().name, "d");
+        assert_eq!(completed.get_field(0).unwrap().offset, 0);
+        let next = completed.get_field(1).unwrap();
+        assert_eq!(next.name, "next");
+        assert_eq!(next.offset, 8);
+        assert_eq!(next.field_type.get_id(), callback.get_id());
+        let resolved_alias = f.get_type_pointer(organization.addr_size, alias.clone(), organization.word_size)
+            .unwrap().get_ptr_to().unwrap();
+        assert_eq!(resolved_alias.get_id(), alias.get_id());
+        assert_eq!(resolved_alias.get_size(), 16);
+        let alias_base = resolved_alias.get_typedef().unwrap();
+        assert_eq!(alias_base.get_id(), node.get_id());
+        assert_eq!(alias_base.get_size(), 16);
+        assert_eq!(alias_base.get_field(0).unwrap().name, "d");
+        assert_eq!(alias_base.get_field(0).unwrap().offset, 0);
+        let alias_next = alias_base.get_field(1).unwrap();
+        assert_eq!(alias_next.name, "next");
+        assert_eq!(alias_next.offset, 8);
+        assert_eq!(alias_next.field_type.get_id(), callback.get_id());
         assert_eq!(alias.get_name(), "OtherNode");
         assert_eq!(node.get_name(), "Node");
+        let (front, back) = C_SPELLER.type_name(&SpellCtx::OFF, &alias);
+        assert_eq!(parse_type(&format!("{front} alias_value{back}"), &f, organization).unwrap().0.get_id(), alias.get_id());
+        let (front, back) = C_SPELLER.declarator(&SpellCtx::OFF, &code);
+        let emitted = parse_protopieces(&format!("{front} emitted{back};"), &f, organization).unwrap();
+        let result = emitted.outtype.unwrap();
+        assert_eq!(result.get_id(), node.get_id());
+        assert_eq!(result.get_metatype(), meta::TYPE_STRUCT);
+        assert_eq!(emitted.intypes.len(), 1);
+        assert_eq!(emitted.intypes[0].get_id(), node.get_id());
+        assert_eq!(emitted.intypes[0].get_metatype(), meta::TYPE_STRUCT);
+        for source_type in [&result, &emitted.intypes[0]] {
+            assert_eq!(source_type.get_name(), "Node");
+            assert!(!source_type.is_incomplete());
+            assert_eq!(source_type.get_size(), 16);
+            let first = source_type.get_field(0).unwrap();
+            assert_eq!(first.name, "d");
+            assert_eq!(first.offset, 0);
+            let next = source_type.get_field(1).unwrap();
+            assert_eq!(next.name, "next");
+            assert_eq!(next.offset, 8);
+            assert_eq!(next.field_type.get_name(), "Fn");
+            assert_eq!(next.field_type.get_id(), callback.get_id());
+        }
     }
 }

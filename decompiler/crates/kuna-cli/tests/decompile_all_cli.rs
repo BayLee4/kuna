@@ -2673,6 +2673,7 @@ static int source_comparator(const void *left, const void *right) {
     return 0;
 }
 "#,
+            &["-Wall", "-Werror"],
         );
     }
 }

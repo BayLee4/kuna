@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import traceback
@@ -14,7 +15,8 @@ from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, export_program, start_
 output = Path(os.environ["KUNA_SMOKE_OUT"]).resolve()
 output.mkdir(parents=True, exist_ok=True)
 executable = Path(KUNA_GHIDRA).resolve()
-report = {"passed": False, "scope": "actual union, partial aggregate and bitfield-alias source-edit public C/High/markup/export consumers", "native": str(executable)}
+report = {"passed": False, "scope": "actual Node, union, partial aggregate and bitfield-alias public C/High/markup/export consumers; fresh source edits across flush/reset/reopen and genuine packed source fixtures", "native": str(executable)}
+values = [0, 85, 0x10055, -7, 0x7fffffff, -0x80000000]
 machine = None
 field = None
 original = None
@@ -26,8 +28,8 @@ def save():
 
 def mutation_matrix():
     """Consume actual host child edits through fresh public results and export."""
-    from java.io import ByteArrayOutputStream, StringWriter
-    from ghidra.program.model.data import (CategoryPath, DataTypeWriter, TypedefDataType, UnionDataType,
+    from java.io import ByteArrayOutputStream
+    from ghidra.program.model.data import (CategoryPath, TypedefDataType, UnionDataType,
                                          UnsignedIntegerDataType, UnsignedLongLongDataType)
     from ghidra.program.model.pcode import PackedEncode, XmlEncode
 
@@ -40,8 +42,9 @@ def mutation_matrix():
         manager = program.getDataTypeManager()
         api = FlatProgramAPI(program, fixture.monitor)
         interface = DecompInterface()
+        retained = []
         row = {"case": kind, "epochs": [{"epoch": epoch, "status": "unexecuted"}
-               for epoch in ("initial", "edited_flush")]}
+               for epoch in ("initial", "edited_flush", "reset", "reopen")]}
         rows.append(row)
         directory = output / kind
         directory.mkdir(exist_ok=True)
@@ -96,7 +99,7 @@ def mutation_matrix():
                                (("word", word), ("record", record), ("source", source))}
 
             row["source_epochs"] = []
-            for epoch in ("initial", "edited_flush"):
+            for epoch in ("initial", "edited_flush", "reset", "reopen"):
                 if epoch == "edited_flush":
                     edit_source(True)
                 identities = PcodeDataTypeManager(program, IllegalCharCppTransformer())
@@ -108,6 +111,14 @@ def mutation_matrix():
                     packed = ByteArrayOutputStream()
                     identities.encodeType(PackedEncode(packed), ty, ty.getLength())
                     (directory / (epoch + "-" + name + ".packed")).write_bytes(
+                        bytes((int(value) & 255) for value in packed.toByteArray()))
+                for name, ty in (("record", record), ("aggregate", aggregate)):
+                    wire = XmlEncode()
+                    identities.encodeCompositePlaceholder(wire, ty)
+                    (directory / (epoch + "-" + name + "-placeholder.xml")).write_text(str(wire))
+                    packed = ByteArrayOutputStream()
+                    identities.encodeCompositePlaceholder(PackedEncode(packed), ty)
+                    (directory / (epoch + "-" + name + "-placeholder.packed")).write_bytes(
                         bytes((int(value) & 255) for value in packed.toByteArray()))
                 row["source_epochs"].append({"epoch": epoch, "committed_source_ids": ids,
                                              "revision": int(program.getModificationNumber()),
@@ -136,23 +147,47 @@ def mutation_matrix():
             options.setBitfieldAccess(True)
             interface.setOptions(options)
             assert interface.openProgram(program), str(interface.getLastMessage())
-            for epoch in ("initial", "edited_flush"):
+            for epoch in ("initial", "edited_flush", "reset", "reopen"):
                 observed = next(phase for phase in row["epochs"] if phase["epoch"] == epoch)
                 observed["status"] = "running"
                 if epoch == "edited_flush":
                     edit_source(True)
                     interface.flushCache()
+                elif epoch == "reset":
+                    interface.resetDecompiler()
+                elif epoch == "reopen":
+                    interface.closeProgram()
+                    assert interface.openProgram(program), str(interface.getLastMessage())
                 result = interface.decompileFunction(function, 120, fixture.monitor)
                 assert result.decompileCompleted(), str(result.getErrorMessage())
                 assert result.getCCodeMarkup() is not None
+                retained.append((str(result.getDecompiledFunction().getC()), result))
                 identities = PcodeDataTypeManager(program, IllegalCharCppTransformer())
                 actual = result.getHighFunction().getFunctionPrototype().getParam(0).getDataType()
                 referent = actual if kind == "partial" else actual.getDataType()
                 assert int(manager.getID(referent)) == ids["source"]
+                assert referent.isEquivalent(source)
+                expected_field = "high" if epoch == "initial" else "upper"
+                if kind != "bitfield_alias":
+                    assert str(record.getComponentAt(4).getFieldName()) == expected_field
+                assert word.getDataType().isSigned() == (epoch != "initial")
                 header_path = directory / (epoch + ".h")
                 body_path = directory / (epoch + ".c")
                 driver_path = directory / (epoch + "-driver.c")
                 assert export_program(program, body_path, options=options)
+                header_text = header_path.read_text()
+                assert "WordAlias" in header_text and "SourceAlias" in header_text
+                word_declarations = re.findall(r'(?m)^typedef[^\n;]*\bWordAlias\s*;', header_text)
+                assert len(word_declarations) == 1, word_declarations
+                if epoch == "initial":
+                    initial_word_declaration = word_declarations[0]
+                else:
+                    assert word_declarations[0] != initial_word_declaration, "Same-ID signedness edit lost from fresh H"
+                if kind != "bitfield_alias":
+                    assert expected_field in header_text
+                    assert ("upper" if epoch == "initial" else "high") not in header_text
+                if kind == "union":
+                    assert ("whole" if epoch == "initial" else "signed_whole") in header_text
                 include = f'#include "{header_path.name}"\n'
                 expression = "read_value(value)" if kind == "partial" else "read_value(&value)"
                 expected = "((unsigned)(raw >> 3) & 255)" if kind == "bitfield_alias" else "(unsigned)(raw >> 32)"
@@ -179,6 +214,11 @@ int main(void) {{
                     ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
                     assert ran.returncode == 0, (kind, epoch, optimization, ran.stderr)
                     observed["execution"].append(optimization)
+                # Retained Java results must remain readable after native reset.
+                for old_c, old in retained:
+                    assert old.getHighFunction() is not None
+                    assert str(old.getDecompiledFunction().getC()) == old_c
+                    assert old.getCCodeMarkup() is not None
                 observed["status"] = "passed"
                 save()
             row["passed"] = True
@@ -199,10 +239,12 @@ int main(void) {{
 try:
     start_ghidra()
     from jpype import JArray, JByte
+    from java.io import File
     from java.math import BigInteger
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
+    from ghidra.app.util.exporter import CppExporter
     from ghidra.program.flatapi import FlatProgramAPI
-    from ghidra.program.model.data import DataTypeConflictHandler, FunctionDefinitionDataType, IntegerDataType, ParameterDefinition, ParameterDefinitionImpl, PointerDataType, StructureDataType
+    from ghidra.program.model.data import ArrayDataType, DataTypeConflictHandler, FunctionDefinitionDataType, IntegerDataType, LongLongDataType, ParameterDefinition, ParameterDefinitionImpl, PointerDataType, StructureDataType, VoidDataType
     from ghidra.program.model.listing import Function, ParameterImpl, ReturnParameterImpl, Variable
     from ghidra.program.model.pcode import PcodeDataTypeManager
     from ghidra.program.model.symbol import IllegalCharCppTransformer, SourceType
@@ -212,6 +254,156 @@ try:
     original = field.get(None)
     field.set(None, str(executable))
     mutation_matrix()
+    # mov rax,[rdi]; mov eax,[rax]; ret: exactly load the int addressed by node.p.
+    code = bytes.fromhex("488b078b00c3")
+    machine = Machine(code, [("load_node", 0x1000, code, "int load_node(Node *node)")])
+    program = machine.program
+    manager = program.getDataTypeManager()
+    api = FlatProgramAPI(program, machine.monitor)
+    convention = str(program.getCompilerSpec().getDefaultCallingConvention().getName())
+    transaction = program.startTransaction("Actual source Node with inline structural descendants")
+    try:
+        callback = FunctionDefinitionDataType("NestedCallback", manager)
+        callback.setCallingConvention(convention)
+        callback.setReturnType(IntegerDataType.dataType)
+        callback.setArguments(JArray(ParameterDefinition)([ParameterDefinitionImpl("value", IntegerDataType.dataType, None)]))
+        node = StructureDataType("Node", 40, manager)
+        node.replaceAtOffset(0, PointerDataType(IntegerDataType.dataType, manager), 8, "p", None)
+        node.replaceAtOffset(8, ArrayDataType(IntegerDataType.dataType, 3, 4, manager), 12, "values", None)
+        node.replaceAtOffset(24, PointerDataType(callback, manager), 8, "callback", None)
+        node.replaceAtOffset(32, PointerDataType(VoidDataType.dataType, manager), 8, "opaque", None)
+        node = manager.resolve(node, DataTypeConflictHandler.DEFAULT_HANDLER)
+        callback = node.getComponentAt(24).getDataType().getDataType()
+        assert int(callback.getReturnType().getLength()) == 4
+        function = api.createFunction(machine.address(0x1000), "load_node")
+        assert function is not None
+        function.updateFunction(convention, ReturnParameterImpl(IntegerDataType.dataType, program), Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, False, SourceType.USER_DEFINED, JArray(Variable)([ParameterImpl("node", PointerDataType(node, manager), program)]))
+    finally:
+        program.endTransaction(transaction, True)
+
+    machine_rows = []
+    report["machine"] = machine_rows
+    for value in values:
+        emulator = machine.EmulatorHelper(program)
+        try:
+            emulator.writeMemory(machine.address(0x7100), JArray(JByte)((0x7200).to_bytes(8, "little") + bytes(32)))
+            emulator.writeMemory(machine.address(0x7200), JArray(JByte)((value & 0xffffffff).to_bytes(4, "little")))
+            # SysV x86-64 entry: return address occupies eight bytes, RSP%16==8.
+            emulator.writeMemory(machine.address(0x7fd8), JArray(JByte)((0x7ff0).to_bytes(8, "little")))
+            emulator.writeRegister("RDI", BigInteger(str(0x7100)))
+            emulator.writeRegister("RSP", BigInteger(str(0x7fd8)))
+            emulator.setBreakpoint(machine.address(0x7ff0))
+            assert emulator.run(machine.address(0x1000), None, machine.monitor), str(emulator.getLastError())
+            actual = int(str(emulator.readRegister("RAX"))) & 0xffffffff
+            assert actual == (value & 0xffffffff), (value, actual)
+            assert emulator.getExecutionAddress() == machine.address(0x7ff0)
+            assert int(str(emulator.readRegister("RSP"))) == 0x7fe0
+            machine_rows.append({"input": value, "actual_u32": actual, "entry_rsp": 0x7fd8, "final_rsp": 0x7fe0})
+        finally:
+            emulator.dispose()
+    save()
+
+    options = DecompileOptions()
+    interface = DecompInterface()
+    try:
+        interface.setOptions(options)
+        assert interface.openProgram(program), str(interface.getLastMessage())
+        result = interface.decompileFunction(function, 120, machine.monitor)
+        assert result.decompileCompleted(), str(result.getErrorMessage())
+        assert result.getHighFunction() is not None and result.getCCodeMarkup() is not None
+        parameter = result.getHighFunction().getFunctionPrototype().getParam(0)
+        assert parameter.getDataType().getDataType().isEquivalent(node)
+        old_result = result
+        old_code = str(result.getDecompiledFunction().getC())
+    finally:
+        interface.dispose()
+
+    exporter = CppExporter(options, True, True, True, True, False, "")
+    assert exporter.export(File(str(output / "node.c")), program, None, ConsoleTaskMonitor()), "Actual structural publication rejected"
+    driver = output / "driver.c"
+    driver_body = '''int main(void) {
+    const int values[] = {0, 85, 0x10055, -7, 0x7fffffff, (-0x7fffffff - 1)};
+    Node node = {0};
+    for (unsigned int i = 0; i < sizeof(values)/sizeof(values[0]); ++i) {
+        int value = values[i];
+        node.p = &value;
+        if (load_node(&node) != value) return 1;
+    }
+    return 0;
+}
+'''
+    driver.write_text('#include "node.h"\n'
+        '_Static_assert(_Generic(((Node *)0)->callback, int (*)(int): 1, default: 0), '
+        '"Original callback is int(int)");\n' + driver_body)
+    executions = []
+    report["execution"] = executions
+    for optimization in ("-O0", "-O2"):
+        binary = output / ("node" + optimization)
+        command = [os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", optimization, str(output / "node.c"), str(driver), "-o", str(binary)]
+        built = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        row = {"optimization": optimization, "command": command, "compile_exit": built.returncode, "stdout": built.stdout, "stderr": built.stderr}
+        executions.append(row)
+        save()
+        assert built.returncode == 0, row
+        ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
+        row.update({"execution_exit": ran.returncode, "execution_stdout": ran.stdout, "execution_stderr": ran.stderr})
+        save()
+        assert ran.returncode == 0, row
+
+    original_revision = int(program.getModificationNumber())
+    original_signature = str(function.getSignature())
+    transaction = program.startTransaction("Edit the actual nested callback child, retaining previous result")
+    try:
+        callback.setReturnType(LongLongDataType.dataType)
+        assert int(node.getComponentAt(24).getDataType().getDataType().getReturnType().getLength()) == 8
+    finally:
+        program.endTransaction(transaction, True)
+    assert int(program.getModificationNumber()) != original_revision
+    assert str(function.getSignature()) == original_signature
+    interface = DecompInterface()
+    try:
+        assert interface.openProgram(program), str(interface.getLastMessage())
+        report["node_source_epochs"] = []
+        for epoch in ("edited_flush", "reset", "reopen"):
+            if epoch == "edited_flush":
+                interface.flushCache()
+            elif epoch == "reset":
+                interface.resetDecompiler()
+            else:
+                interface.closeProgram()
+                assert interface.openProgram(program), str(interface.getLastMessage())
+            revision = int(program.getModificationNumber())
+            fresh = interface.decompileFunction(function, 120, machine.monitor)
+            assert fresh.decompileCompleted(), str(fresh.getErrorMessage())
+            decoded_node = fresh.getHighFunction().getFunctionPrototype().getParam(0).getDataType().getDataType()
+            assert decoded_node.getComponentAt(24).getDataType().getDataType().getReturnType().getLength() == 8
+            assert fresh.getCCodeMarkup() is not None
+            assert old_result.getHighFunction() is not None
+            assert str(old_result.getDecompiledFunction().getC()) == old_code
+            assert old_result.getCCodeMarkup() is not None
+            destination = output / ("node-" + epoch + ".c")
+            assert export_program(program, destination, options=options)
+            header = destination.with_suffix(".h")
+            assert header.read_text() != (output / "node.h").read_text(), "Nested callback edit lost from fresh source declarations"
+            edited_driver = output / ("node-" + epoch + "-driver.c")
+            edited_driver.write_text('#include "' + header.name + '"\n'
+                '_Static_assert(_Generic(((Node *)0)->callback, longlong (*)(int): 1, default: 0), '
+                '"Edited callback is longlong(int)");\n' + driver_body)
+            for optimization in ("-O0", "-O2"):
+                binary = output / ("node-" + epoch + optimization)
+                built = subprocess.run([os.environ.get("CC", "cc"), "-std=c11", "-Wall",
+                    "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration",
+                    optimization, str(destination), str(edited_driver), "-o", str(binary)],
+                    capture_output=True, text=True, timeout=120)
+                assert built.returncode == 0, built.stderr
+                ran = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30)
+                assert ran.returncode == 0, ran.stderr
+            assert int(program.getModificationNumber()) == revision
+            assert str(function.getSignature()) == original_signature
+            report["node_source_epochs"].append({"epoch": epoch, "callback_return_size": 8,
+                                                 "old_result_readable": True, "source_unchanged": True})
+    finally:
+        interface.dispose()
     report["passed"] = all(row.get("passed") for row in report["mutations"])
     assert report["passed"], "Mutation consumers failed; source snapshots remain available"
 except BaseException:

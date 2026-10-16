@@ -42,7 +42,28 @@ try:
     for register,value in preserved:assert int(str(e.readRegister(register)))==value,(entry,register)
     r['cases'].append({'entry':entry,'selector':selector,'tag':tag,'actual_target':target,'actual_target_address':symbols[target],'call_SP':call_sp,'hidden_X8':hidden,'hidden_footprint':[hidden,hidden+24],'saved_registers_start':call_sp+32,'actual_result_fields':fields,'scalar_result':result,'final_SP':0x7fe0,'preserved_X19_X29_checked':True})
    finally:e.dispose()
-
+ r['control_negatives']=[]
+ for entry,tag,stop in [('wrong_return',5,0x7fd0),('mixed_return',0,0),('mixed_return',1,0x7ff0),('observed_link',5,0x7ff0),('overwritten_link',-20,0x7ff0)]:
+  tx=m.program.startTransaction('decode actual return-control boundary')
+  try:
+   assert api.disassemble(m.address(symbols[entry]))
+   assert api.disassemble(m.address(symbols[entry+'_target']))
+  finally:m.program.endTransaction(tx,True)
+  instructions=[instruction for instruction in m.program.getListing().getInstructions(m.address(symbols[entry]),True)if int(instruction.getAddress().getOffset())<symbols[entry+'_end']]
+  calls=[instruction for instruction in instructions if any(op.getOpcode()==PcodeOp.CALLIND for op in instruction.getPcode())]
+  assert len(calls)==1
+  continuation=int(calls[0].getAddress().getOffset())+int(calls[0].getLength())
+  e=m.EmulatorHelper(m.program)
+  try:
+   for register,value in [('sp',0x7fe0),('x30',0x7ff0),('x0',tag&0xffffffff),('x19',0x7fd0)]:e.writeRegister(register,BigInteger(str(value)))
+   e.setBreakpoint(m.address(stop));assert e.run(m.address(symbols[entry]),None,m.monitor),str(e.getLastError())
+   assert e.getExecutionAddress()==m.address(stop)
+   result=int(str(e.readRegister('x0')))&mask
+   if entry=='observed_link':assert result==(tag+continuation)&mask
+   if entry=='overwritten_link':assert result==((tag&0xffffffff)+tag+3)&mask and result!=(2*tag+3)&mask
+   if entry=='mixed_return'and tag==1:assert result==5
+   r['control_negatives'].append({'entry':entry,'tag':tag,'actual_stop':stop,'actual_result':result,'call_continuation':continuation})
+  finally:e.dispose()
  r['completed']=True
 except BaseException:r['failure']=traceback.format_exc()
 finally:m.close();(a.out/'report.json').write_text(json.dumps(r,indent=2)+'\n');print(json.dumps({'completed':r['completed'],'cases':len(r['cases']),'failure':r.get('failure')}))

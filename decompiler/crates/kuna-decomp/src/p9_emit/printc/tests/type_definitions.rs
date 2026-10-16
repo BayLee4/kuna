@@ -7,17 +7,29 @@ mod decompile_project_type_render {
     use super::*;
     use crate::dtype::flags;
     use crate::printc::{
-        render_type_definitions,
+        compose_type_body, render_type_definitions,
         RealTypeCtx,
     };
     fn named(types: &TypeFactoryImpl, size: i32, m: type_metatype, nm: &str) -> Rc<Datatype> {
         types.get_base_named(size, m, nm).unwrap()
     }
 
+    fn ptr_to(types: &TypeFactoryImpl, ptrto: Rc<Datatype>) -> Rc<Datatype> {
+        types.get_type_pointer(8, ptrto, 1).unwrap()
+    }
 
+    fn array_of(types: &TypeFactoryImpl, arrayof: Rc<Datatype>, n: i32) -> Rc<Datatype> {
+        types.get_type_array(n, arrayof).unwrap()
+    }
 
     /// A complete named struct with the given (offset, name, type) fields and
     /// total size.
+    fn struct_of(types: &TypeFactoryImpl, nm: &str, size: i32, fields: &[(i32, &str, Rc<Datatype>)]) -> Rc<Datatype> {
+        let shell = types.get_type_struct(nm).unwrap();
+        types.set_fields_struct_raw(&shell, fields.iter().enumerate()
+            .map(|(i, (off, fnm, ft))| TypeField::new(i as i32, *off, *fnm, ft.clone()))
+            .collect(), vec![], size, 8, 0).unwrap()
+    }
 
     fn make_enum(types: &TypeFactoryImpl, nm: &str, size: i32, m: type_metatype, entries: &[(u64, &str)]) -> Rc<Datatype> {
         let shell = types.get_type_enum_sized(nm, size, if m == type_metatype::TYPE_INT {
@@ -31,6 +43,67 @@ mod decompile_project_type_render {
 
 
     #[test]
+    fn composite_declarations_preserve_layout_and_member_storage() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let i4 = named(&types, 4, type_metatype::TYPE_INT, "int4");
+        let ch = named(&types, 1, type_metatype::TYPE_INT, "char");
+        let s = struct_of(&types, "mystruct", 40, &[
+            (0, "a", i4.clone()),
+            (8, "p", ptr_to(&types, ch)),
+            (16, "arr", array_of(&types, i4.clone(), 4)),
+        ]);
+        let f8 = named(&types, 8, type_metatype::TYPE_FLOAT, "float8");
+        let shell = types.get_type_union("myunion").unwrap();
+        let u = types.set_fields_union_raw(&shell, vec![
+            TypeField::new(0, 0, "as_int", i4.clone()),
+            TypeField::new(1, 0, "as_float", f8.clone()),
+        ], 8, 8).unwrap();
+        let source = format!(
+            "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\
+             typedef int32_t int4; typedef double float8; typedef uint8_t undefined1;\n{}{}\n{}",
+            compose_type_body(&s, "mystruct", RealTypeCtx::OFF),
+            compose_type_body(&u, "myunion", RealTypeCtx::OFF),
+            r#"
+_Static_assert(sizeof(struct mystruct) == 40, "struct extent");
+_Static_assert(offsetof(struct mystruct, a) == 0, "scalar offset");
+_Static_assert(offsetof(struct mystruct, p) == 8, "pointer offset");
+_Static_assert(offsetof(struct mystruct, arr) == 16, "array offset");
+_Static_assert(sizeof(((struct mystruct *)0)->arr) == 16, "array extent");
+_Static_assert(sizeof(union myunion) == 8, "union extent");
+_Static_assert(offsetof(union myunion, as_int) == 0, "integer union offset");
+_Static_assert(offsetof(union myunion, as_float) == 0, "float union offset");
+int main(void) {
+    struct mystruct s;
+    unsigned char expected[40];
+    memset(&s, 0xa5, sizeof(s));
+    memset(expected, 0xa5, sizeof(expected));
+    int4 a = -739, values[4] = { 219, -415, 831, -991 };
+    char text[] = "layout", *pointer = text;
+    s.a = a; s.p = pointer;
+    for (unsigned i = 0; i < 4; ++i) s.arr[i] = values[i];
+    memcpy(expected, &a, sizeof(a));
+    memcpy(expected + 8, &pointer, sizeof(pointer));
+    memcpy(expected + 16, values, sizeof(values));
+    if (memcmp(&s, expected, sizeof(s)) || s.p[2] != 'y' || s.arr[1] != -415) return 1;
+    union myunion u;
+    memset(&u, 0, sizeof(u));
+    u.as_int = a;
+    int4 integer;
+    memcpy(&integer, &u, sizeof(integer));
+    if (integer != a) return 2;
+    u.as_float = -17.25;
+    double floating;
+    memcpy(&floating, &u, sizeof(floating));
+    return floating != -17.25;
+}
+"#,
+        );
+        super::assert_c_source(&source, "composite-layout");
+    }
+
+    #[test]
     fn generated_enum_width_sign_and_complements_are_consumed_without_repair() {
         let types = TypeFactoryImpl::new();
         types.setup_sizes(Some(4), 8, 8);
@@ -39,10 +112,11 @@ mod decompile_project_type_render {
             for signed in [false, true] {
                 let meta = if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
                 let name = format!("Flags{}{}", size * 8, if signed { "s" } else { "u" });
-                let ty = make_enum(&types, &name, size, meta, &[(1, "ONE"), (2, "TWO")]);
+                let wide = if size == 8 { 0x8000_0000 } else { 4 };
+                let ty = make_enum(&types, &name, size, meta, &[(1, "ONE"), (2, "TWO"), (wide, "WIDE")]);
                 let declarations = render_type_definitions(&[ty.clone()], RealTypeCtx::OFF);
                 let mut checks = String::new();
-                for flag in [1, 3] {
+                for flag in [1, 3, wide] {
                     let value = kuna_base::address::calc_mask(size) ^ flag;
                     let mut print = PrintC::new();
                     print.set_output_stream();
@@ -115,12 +189,16 @@ mod decompile_project_type_render {
                 let name = format!("Flags{bits}{}", if signed { "s" } else { "u" });
                 let one = format!("{name}_ONE");
                 let two = format!("{name}_TWO");
-                let scalar = format!("{}{bits}", if signed { "i" } else { "u" });
-                source.push_str(&format!("const {one}: {scalar} = 1;\nconst {two}: {scalar} = 2;\n"));
+                let wide = format!("{name}_WIDE");
+                let wide_value = if size == 8 { 0x8000_0000 } else { 4 };
+                let scalar = format!("{}{bits}", if signed { 'i' } else { 'u' });
+                source.push_str(&format!(
+                    "const {one}: {scalar} = 1;\nconst {two}: {scalar} = 2;\nconst {wide}: {scalar} = {wide_value};\n"
+                ));
                 let ty = make_enum(&types, &name, size,
                     if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT },
-                    &[(1, &one), (2, &two)]);
-                for flag in [1, 3] {
+                    &[(1, &one), (2, &two), (wide_value, &wide)]);
+                for flag in [1, 3, wide_value] {
                     let value = kuna_base::address::calc_mask(size) ^ flag;
                     let mut print = execution_printer(&arch, true);
                     print.push_enum_constant_ir(&ty, value, OpId::default(), VarnodeId::default());

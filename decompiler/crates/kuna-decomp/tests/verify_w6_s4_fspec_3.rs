@@ -427,6 +427,55 @@ fn fspec3_check_input_join_reaches_funcproto() {
 }
 
 #[test]
+fn spacebase_abort_preserves_trailing_raw_operand() {
+    use kuna_base::space::{SpacebaseSpace, VarnodeStorage};
+    let mut manager = fcs_manager();
+    let ram = Rc::clone(manager.get_space_by_name("ram").unwrap());
+    let reg = Rc::clone(manager.get_space_by_name("register").unwrap());
+    let stack = Rc::new(SpacebaseSpace::new("raw_stack", 5, 8, &ram, 1, false, false));
+    manager.add_spacebase_pointer(&stack, &VarnodeStorage {
+        space: Some(Rc::clone(&reg)), offset: 0x20, size: 8,
+    }, 8, true).unwrap();
+    manager.insert_space(Rc::clone(&stack)).unwrap();
+    let mut fd = Funcdata::new("caller", "caller", Rc::new(ArchContext::new(manager)),
+        Address::new(ram, 0x1000), 0x10000000, 0x40).unwrap();
+    let call = fcs_new_op(&mut fd, 2, 0x1010, OpCode::CPUI_CALL);
+    let dest = fd.new_constant(8, 0x2000);
+    let argument = fd.new_varnode(4, &addr(&reg, 0x38), None);
+    fd.op_set_input(call, dest, 0).unwrap();
+    fd.op_set_input(call, argument, 1).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    fd.op_insert_end(call, block);
+    let mut fc = fcs_with_std_model(fd.get_arch().manage(), call);
+    let mut restricted = FuncProto::new();
+    restricted.copy(fc.proto());
+    restricted.set_param(0, "value", &ParameterPieces {
+        addr: addr(&reg, 0x38),
+        type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))),
+        flags: kuna_decomp::fspec::parameter_pieces_flags::TYPELOCK,
+    });
+    restricted.set_input_lock(true);
+    fc.proto_mut().copy(&restricted);
+    fc.get_active_input().register_trial(&addr(&reg, 0x38), 4);
+    fc.get_active_input().get_trial_mut(0).set_slot(1);
+    fc.create_placeholder(&mut fd, &stack).unwrap();
+    let placeholder = fd.obank().get(call).unwrap().get_in(2).unwrap();
+    assert!(fd.vbank().get(placeholder).unwrap().is_spacebase_placeholder());
+    let raw = fd.new_varnode(4, &addr(&reg, 0x18), None);
+    fd.op_insert_input(call, raw, 3).unwrap();
+    fc.abort_spacebase_relative(&mut fd);
+    assert_eq!(fd.obank().get(call).unwrap().get_in(2), Some(raw));
+    assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
+    assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(dest));
+    assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(argument));
+    assert_eq!(fd.vbank().get(raw).unwrap().get_addr(), &addr(&reg, 0x18));
+    assert_eq!(fd.vbank().get(raw).unwrap().get_size(), 4);
+    assert_eq!(fc.proto().num_params(), 1);
+    assert_eq!(fc.proto().get_param(0).unwrap().get_name(), "value");
+}
+
+#[test]
 fn fspec3_force_set_locked_register_reuses_committed_operand() {
     let mut fd = fcs_fd();
     let reg = fcs_reg(&fd);

@@ -102,6 +102,7 @@ for name,binary,language in targets:
       finally:emulator.dispose()
    if args.phase in ['all','host']:
     from ghidra.program.model.pcode import PcodeOp
+    from prototype_facts import C_TYPES
     helper_out=out/'helper-object';helper_out.mkdir()
     helper_object=args.query_helpers/(name+'.o');helper_machine=ElfMachine(helper_object,helper_out)
     row['query_helper_object_sha256']=hashlib.sha256(helper_object.read_bytes()).hexdigest()
@@ -143,9 +144,10 @@ for name,binary,language in targets:
     row['orders']=[]
     for order,first in [('callable_first','callable_root'),('record_first','record_root')]:
      if args.order!='all'and args.order!=order:continue
-     order_out=out/order;order_out.mkdir();ordered={'order':order,'first_native_query_function':first,'completed':False,'decompilations':[],'commands':[]};row['orders'].append(ordered)
+     order_out=out/order;order_out.mkdir();ordered={'order':order,'first_native_query_function':first,'completed':False,'decompilations':[],'commands':[],'failures':[]};row['orders'].append(ordered)
      core=ExitStack();core.enter_context(selected_core(args.ghidra_exe));ifc=DecompInterface();options=DecompileOptions();options.setNamespaceStrategy(DecompileOptions.NamespaceStrategy.Never);ifc.setOptions(options)
      before=snapshot(functions);ordered['source_before']=before
+     documents=[]
      try:
       assert ifc.openProgram(program),str(ifc.getLastMessage())
       for fn_name in [first,'transform','drive']:
@@ -167,9 +169,12 @@ for name,binary,language in targets:
         if isinstance(token,ClangFieldToken):
          dtype=token.getDataType();observed['fields'].append({'text':str(token.getText()),'offset':int(token.getOffset()),'id':None if dtype is None else int(manager.getID(dtype))})
         for i in range(token.numChildren()):visit(token.Child(i))
-       visit(result.getCCodeMarkup())
-       for token in observed['fields']:
-        if token['text']in ['d','next']:assert token['id']==row['nominal_node_id']and token['offset']==(0 if token['text']=='d'else 8),token
+       try:
+        visit(result.getCCodeMarkup())
+        for token in observed['fields']:
+         if token['text']in ['d','next']:assert token['id']==row['nominal_node_id']and token['offset']==(0 if token['text']=='d'else 8),token
+       except Exception:
+        ordered['failures'].append({'stage':'field-token','function':fn_name,'failure':traceback.format_exc()})
        if fn_name=='drive':
         calls=[op for op in hf.getPcodeOps()if op.getOpcode()==PcodeOp.CALLIND]
         assert len(calls)==1 and calls[0].getOutput()is not None
@@ -179,6 +184,17 @@ for name,binary,language in targets:
         assert len(target_proto.getArguments())==1 and target_proto.getArguments()[0].getDataType().isEquivalent(node)and target_proto.getReturnType().isEquivalent(node)
         observed['actual_indirect_call']={'op':str(calls[0]),'target_type':str(target_type),'inputs':[{'varnode':str(calls[0].getInput(i)),'size':int(calls[0].getInput(i).getSize())}for i in range(calls[0].getNumInputs())],'output':str(calls[0].getOutput()),'output_size':int(calls[0].getOutput().getSize()),'logical_Node_to_Node_verified':True}
         assert calls[0].getNumInputs()==2 and calls[0].getInput(1).getSize()==16 and calls[0].getOutput().getSize()==16,observed['actual_indirect_call']
+       if fn_name in ['transform','drive']:documents.append(observed['c'])
+      fragment=order_out/'fragment-consumer.c'
+      fragment.write_text(C_TYPES+'typedef struct Node Node;typedef Node Fn(Node);struct Node{double d;Fn *next;};\n'+'\n'.join(documents)+'\nint main(void){for(int i=-20;i<=20;++i){Node n={(double)i/4,transform};Node r=transform(n);if(r.d!=n.d+1||r.next!=transform)return 1;if(drive(n,transform)!=n.d+1)return 2;}return 0;}\n')
+      for opt in ['-O0','-O2']:
+       try:
+        executable=order_out/('fragment-consumer'+opt)
+        for command in [[tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,str(fragment),'-o',str(executable)],[str(executable)]]:
+         p=subprocess.run(command,capture_output=True,text=True,timeout=120);receipt={'command':command,'status':p.returncode,'stdout':p.stdout,'stderr':p.stderr};ordered['commands'].append(receipt);assert p.returncode==0,receipt
+       except Exception:
+        ordered['failures'].append({'stage':'fragment-C'+opt,'failure':traceback.format_exc()})
+      ordered['original_fragment_C_O0_O2']=not any(f['stage'].startswith('fragment-C')for f in ordered['failures'])
       exported=export_program(program,order_out/'unit.c',machine.monitor,options=options)
       ordered['stock_exported']=exported
       assert exported,ordered
@@ -191,14 +207,18 @@ for name,binary,language in targets:
       ifc.dispose();core.close()
       ordered['source_after']=snapshot(functions)
       assert ordered['source_after']==before,'Export must preserve source signatures/storage'
-     assert any(token['text']=='d'for d in ordered['decompilations']if d['name']in ['transform','drive']for token in d['fields']),ordered
+     try:
+      assert any(token['text']=='d'for d in ordered['decompilations']if d['name']in ['transform','drive']for token in d['fields']),ordered
+     except Exception:
+      ordered['failures'].append({'stage':'field-presence','failure':traceback.format_exc()})
      source=order_out/'consumer.c';source.write_text('#include "unit.h"\nint main(void){for(int i=-20;i<=20;++i){Node n={(double)i/4,transform};Node r=transform(n);if(r.d!=n.d+1||r.next!=transform)return 1;if(drive(n,transform)!=n.d+1)return 2;}return 0;}\n')
      ordered['emitted_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()for p in [order_out/'unit.c',order_out/'unit.h']}
      for opt in ['-O0','-O2']:
       exe=order_out/('consumer'+opt)
       for command in [[tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,str(order_out/'unit.c'),str(source),'-o',str(exe)],[str(exe)]]:
        p=subprocess.run(command,capture_output=True,text=True,timeout=120);record={'command':command,'status':p.returncode,'stdout':p.stdout,'stderr':p.stderr};ordered['commands'].append(record);assert p.returncode==0,record
-     ordered['completed']=True
+     ordered['unchanged_export_C_O0_O2']=True
+     ordered['completed']=not ordered['failures']
      (order_out/'report.json').write_text(json.dumps(ordered,indent=2)+'\n')
     row['unchanged_c_passed']=all(o['completed']for o in row['orders'])
    row['completed']=all(o['completed']for o in row['orders'])if args.phase in ['all','host']else True
@@ -218,7 +238,7 @@ if args.phase in ['all','cli']:
    meta=invoke([args.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
    metadata=json.loads(meta['stdout']);(out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==2
    assert {f['name'].lstrip('_')for f in metadata['functions']}=={'transform','drive'},metadata
-   assert all(f.get('error')is None for f in metadata['functions']),metadata
+   assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
    project=out/'project';export=invoke([args.cli,'decompile-project',binary,'-o',project,*common]);assert export['status']==0,export
    driver=out/'consumer.c';driver.write_text('#include "production-smoke.h"\nint main(void){for(int i=-20;i<=20;++i){Node n={(double)i/4,_transform};Node r=_transform(n);if(r.d!=n.d+1||r.next!=_transform)return 1;if(_drive(n,_transform)!=n.d+1)return 2;}return 0;}\n')
    row['emitted_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()for p in [project/'production-smoke.c',project/'production-smoke.h']}

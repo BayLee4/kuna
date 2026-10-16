@@ -6578,36 +6578,100 @@ mod tests {
 
         #[test]
         fn subvariable_shift_count_preserves_unknown_high_bits() {
-                for code in [OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT] {
-                    for known_zero_high in [false, true] {
-                        let mut fd = build_fd();
-                        let count = mk_input(&mut fd, 0x40, 8);
-                        let mask = calc_mask(4);
-                        let input = fd.vbank_mut().get_mut(count).unwrap();
-                        input.set_consume(calc_mask(8));
-                        input.set_nz_mask(if known_zero_high { mask } else { calc_mask(8) });
-                        let projection = mk_op(&mut fd, 0x100, 2, OpCode::CPUI_SUBPIECE);
-                        let zero = fd.new_constant(4, 0);
-                        wire_in(&mut fd, projection, count, 0);
-                        wire_in(&mut fd, projection, zero, 1);
-                        let slice = mk_reg(&mut fd, 0x40, 4);
-                        wire_out(&mut fd, projection, slice);
-                        let shift = mk_op(&mut fd, 0x104, 2, code);
-                        let value = fd.new_constant(8, 1);
-                        wire_in(&mut fd, shift, value, 0);
-                        wire_in(&mut fd, shift, count, 1);
-                        let output = mk_reg(&mut fd, 0x48, 8);
-                        wire_out(&mut fd, shift, output);
-                        let mut flow = SubvariableFlow::new(&mut fd, count, mask, false, false, false).unwrap();
-                        let traced = flow.do_trace(&mut fd).unwrap();
-                        assert_eq!(traced, known_zero_high, "{code:?}");
-                        if traced { flow.do_replacement(&mut fd).unwrap(); }
-                        let actual = fd.obank().get(shift).unwrap().get_in(1).unwrap();
-                        assert_eq!(fd.vbank().get(actual).unwrap().get_size(), if known_zero_high { 4 } else { 8 }, "{code:?}");
-                        if !known_zero_high { assert_eq!(actual, count, "unknown high shift-count bits must remain observable"); }
+            use std::rc::Rc;
+            use kuna_base::address::Address;
+            use kuna_num::float::FloatFormat;
+            use kuna_num::opbehavior::{register_instructions, FloatFormatProvider};
+            use crate::action::Rule;
+            use crate::context::ArchContext;
+            use crate::funcdata::Funcdata;
+            use crate::kuna_emulatefunction::EmulateFunction;
+            use super::{build_manager, RuleSubvarSubpiece};
+
+            struct NoFormats;
+            impl FloatFormatProvider for NoFormats {
+                fn get_float_format(&self, _size: i32) -> Option<&FloatFormat> {
+                    None
+                }
+            }
+
+            for code in [OpCode::CPUI_INT_LEFT, OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT] {
+                for known_zero_high in [false, true] {
+                    let mut glb = ArchContext::new(build_manager());
+                    let provider: Rc<dyn FloatFormatProvider> = Rc::new(NoFormats);
+                    register_instructions(&mut glb.opbehaviors, &provider);
+                    let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+                    let mut fd = Funcdata::new(
+                        "func", "func", Rc::new(glb), Address::new(ram, 0x1000),
+                        0x10000000, 0x40,
+                    ).unwrap();
+                    let root = fd.bblocks_root_pub();
+                    let block = fd.bblocks_mut().new_block_basic(root);
+                    fd.bblocks_mut().set_start_block(root, block);
+                    let input = mk_input(&mut fd, 0x40, 8);
+                    fd.vbank_mut().get_mut(input).unwrap()
+                        .set_nz_mask(if known_zero_high { calc_mask(4) } else { calc_mask(8) });
+                    let count = input;
+                    fd.vbank_mut().get_mut(count).unwrap()
+                        .set_consume(if known_zero_high { calc_mask(4) } else { calc_mask(8) });
+                    let projection = mk_op(&mut fd, 0x100, 2, OpCode::CPUI_SUBPIECE);
+                    let zero = fd.new_constant(4, 0);
+                    wire_in(&mut fd, projection, count, 0);
+                    wire_in(&mut fd, projection, zero, 1);
+                    let slice = mk_reg(&mut fd, 0x60, 4);
+                    let slice = wire_out(&mut fd, projection, slice);
+                    fd.op_insert_end(projection, block);
+                    let shift = mk_op(&mut fd, 0x104, 2, code);
+                    let value = fd.new_constant(8, 1);
+                    wire_in(&mut fd, shift, value, 0);
+                    wire_in(&mut fd, shift, count, 1);
+                    let output = mk_reg(&mut fd, 0x68, 8);
+                    let output = wire_out(&mut fd, shift, output);
+                    fd.op_insert_end(shift, block);
+                    let ret = mk_op(&mut fd, 0x108, 3, OpCode::CPUI_RETURN);
+                    let destination = fd.new_constant(8, 0);
+                    wire_in(&mut fd, ret, destination, 0);
+                    wire_in(&mut fd, ret, output, 1);
+                    wire_in(&mut fd, ret, slice, 2);
+                    fd.op_insert_end(ret, block);
+
+                    let mut counts = vec![0, 1, 31, 32, 63, 64, 65, 0xffff_ffff];
+                    if !known_zero_high {
+                        counts.extend([0x1_0000_0000, 0x1_0000_0001]);
+                    }
+                    let observe = |fd: &Funcdata, count_value| {
+                        let mut emul = EmulateFunction::new(fd);
+                        let live = fd.obank().get(shift).unwrap().get_in(1).unwrap();
+                        let live_input = fd.vbank().get(live).unwrap();
+                        assert!(live_input.is_input());
+                        assert_eq!(live_input.get_addr(), &Address::new(
+                            Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap()), 0x40,
+                        ));
+                        emul.seed_varnode_value(live, count_value);
+                        let ret = fd.obank().get(ret).unwrap();
+                        [
+                            emul.evaluate_held(ret.get_in(1).unwrap(), 32).unwrap(),
+                            emul.evaluate_held(ret.get_in(2).unwrap(), 32).unwrap(),
+                        ]
+                    };
+                    let before: Vec<_> = counts.iter().map(|&n| observe(&fd, n)).collect();
+                    if !known_zero_high {
+                        assert_eq!(before[0][1], before[8][1], "{code:?}: equal low bits");
+                        assert_ne!(before[0][0], before[8][0], "{code:?}: high bits affect shift");
+                    }
+                    let changed = RuleSubvarSubpiece::new("subvar").apply_op(projection, &mut fd);
+                    assert_eq!(changed, i32::from(known_zero_high), "{code:?}");
+                    let actual = fd.obank().get(shift).unwrap().get_in(1).unwrap();
+                    assert_eq!(fd.vbank().get(actual).unwrap().get_size(), if known_zero_high { 4 } else { 8 });
+                    if !known_zero_high {
+                        assert_eq!(actual, count, "unknown high shift-count bits must remain observable");
+                    }
+                    for (&n, expected) in counts.iter().zip(before) {
+                        assert_eq!(observe(&fd, n), expected, "{code:?}, known_zero_high={known_zero_high}, count={n:#x}");
                     }
                 }
             }
+        }
     }
 
     use kuna_base::address::Address;

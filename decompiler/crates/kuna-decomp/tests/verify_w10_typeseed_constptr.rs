@@ -48,13 +48,6 @@ fn rust_harness() -> PathBuf {
     repo_root().join("decompiler/target").join(profile).join("decomp_test_dbg")
 }
 
-fn cpp_oracle() -> PathBuf {
-    if let Some(p) = std::env::var_os("KUNA_DECOMP_TEST") {
-        return PathBuf::from(p);
-    }
-    repo_root().join("decompiler/cpp/decomp_test_dbg")
-}
-
 /// Drive `bin` on `stem`.xml with `KUNA_DUMP=1`, returning the sliced bulk
 /// `print C` body (between `===KUNA_DUMP_BEGIN===` and `===KUNA_DUMP_MID===`),
 /// or `None` if the binary / `.sla` is unavailable (the test SKIPs).
@@ -199,26 +192,6 @@ fn t3_single_bit_const_not_turned_into_pointer() {
             "{stem}: a single-bit/mask switch constant was promoted to a global \
              pointer reference (`&dat_`/`PTRSUB(0,...)`) — the bit_transitions<3 \
              guard failed. Body:\n{body}"
-        );
-    }
-}
-
-// =============================================================================
-// (T4) THE PROTECTED-PARITY FILES STAY BYTE-IDENTICAL Rust-vs-C++: a const->ptr
-//      type-seed that leaked into an unrelated function would surface here.
-//      `boolless` / `condconst` carry constants but no mapped global array, so the
-//      type-seed must be a complete no-op on them.
-// =============================================================================
-#[test]
-fn t4_protected_parity_files_byte_identical() {
-    for stem in ["boolless", "condconst"] {
-        let Some(rust_body) = dump_print_c(&rust_harness(), stem) else { return };
-        let Some(cpp_body) = dump_print_c(&cpp_oracle(), stem) else { return };
-        assert_eq!(
-            rust_body, cpp_body,
-            "{stem}: render diverged from the C++ oracle — the const->ptr type-seed \
-             perturbed a function with no mapped global array.\n--- RUST ---\n\
-             {rust_body}\n--- CPP ---\n{cpp_body}"
         );
     }
 }

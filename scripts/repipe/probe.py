@@ -26,18 +26,20 @@ Three rules the rest of the pipeline depends on:
   is not the binary the probe was written against -- because that is "unrunnable", not "not
   reproducible", and the two must never be confused.
 
-Resource accounting uses ``/usr/bin/time -v``, not ``resource.getrusage(RUSAGE_CHILDREN)``.
-The getrusage route is wrong for exactly the number these probes care about: ``ru_maxrss`` under
+Resource accounting uses GNU ``/usr/bin/time -v`` or a fresh ``wait4`` supervisor on Darwin,
+not ``resource.getrusage(RUSAGE_CHILDREN)``. The getrusage route is wrong: ``ru_maxrss`` under
 RUSAGE_CHILDREN is a **high-water mark over every child this process has ever reaped**, not an
 additive counter, so a before/after subtraction yields 0 for any run smaller than an earlier one
 -- and probes run in a ``repeat`` loop by construction, next to a captain that has already reaped
-cargo. ``/usr/bin/time -v -o FILE`` measures one child in isolation and writes its report to FILE
-instead of into the probe's captured stderr; its ``Exit status:`` / ``Command terminated by
-signal`` lines are parsed back so a killed child reports ``-SIGNAL`` the way ``subprocess`` would
-(time(1) itself would report 128+N). Wall time comes from ``time.monotonic()`` around the whole
-spawn, not from time(1)'s centisecond field, which is too coarse for a sub-100 ms kuna call. When
-``/usr/bin/time`` is absent, ``max_rss_kb`` is None and ``rusage_source`` says so, rather than a
-silently wrong getrusage delta.
+cargo. Both backends measure one child in isolation and write their reports to a separate file.
+Darwin's native ``time -l -o FILE`` still writes abnormal-termination warnings into child stderr
+and cannot distinguish SIGKILL from a numeric exit, so the stdlib supervisor reaps the exact
+child PID instead. Its own RSS is not measured, and Darwin's RSS bytes are converted to KiB.
+Signals are reported as ``-SIGNAL``, not numeric ``128+SIGNAL`` exits.
+Wall time comes from ``time.monotonic()`` around the whole
+spawn, not from time(1)'s centisecond field, which is too coarse for a sub-100 ms kuna call.
+Outside Darwin, when ``/usr/bin/time`` is absent, ``max_rss_kb`` is None and ``rusage_source``
+says so, rather than a silently wrong getrusage delta.
 
 Substitution happens on ``cmd``, ``cwd`` and ``env`` only (never on ``stdin``), and the probe_id
 is derived from the *unsubstituted* cmd so the same probe keeps its identity in every work dir.
@@ -547,22 +549,36 @@ def _parse_time_report(path):
     return out
 
 
-def _kill_group(proc):
+def _measurement_source():
+    if sys.platform == "darwin":
+        return "wait4"
+    if os.path.exists(TIME_BIN) and os.access(TIME_BIN, os.X_OK):
+        return "/usr/bin/time -v"
+    return "unavailable"
+
+
+def _parse_wait4_report(path):
     try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        proc.kill()
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"error": "wait4 measurement report unavailable"}
+
+
+def _kill_group(proc):
+    """Finish the entire session group, even if its supervisor exits before descendants."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
         return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sig)
-        except OSError:
-            return
-        try:
-            proc.wait(timeout=TERM_GRACE_S)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        proc.wait(timeout=TERM_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 # --- what a probe is allowed to execute ------------------------------------
@@ -657,7 +673,7 @@ def check_executable(argv, env=None):
     return None
 
 
-def _exec_once(index, argv, cwd, env, stdin_data, timeout_s, use_time):
+def _exec_once(index, argv, cwd, env, stdin_data, timeout_s, measurement):
     """One execution. Never raises: an exec failure or a timeout is recorded, not thrown."""
     rec = {"index": index, "exit_code": None, "signal": None, "stdout": "", "stderr": "",
            "stdout_bytes": 0, "stderr_bytes": 0, "wall_ms": 0.0, "max_rss_kb": None,
@@ -676,10 +692,22 @@ def _exec_once(index, argv, cwd, env, stdin_data, timeout_s, use_time):
 
     report_path = None
     wrapped = argv
-    if use_time:
+    if measurement != "unavailable":
         fd, report_path = tempfile.mkstemp(prefix="repipe-rusage-", suffix=".txt")
-        os.close(fd)
-        wrapped = [TIME_BIN, "-v", "-o", report_path, "--"] + argv
+        if measurement == "wait4":
+            try:
+                with os.fdopen(fd, "w") as report:
+                    json.dump({"environment": env,
+                               "error": "wait4 measurement report unavailable"}, report)
+            except OSError as exc:
+                os.unlink(report_path)
+                rec["error"] = "measurement setup failed: %s" % exc
+                return rec
+            helper = os.path.join(os.path.dirname(os.path.abspath(__file__)), "measurement.py")
+            wrapped = [sys.executable, "-I", "-S", helper, report_path, resolved] + argv
+        else:
+            os.close(fd)
+            wrapped = [TIME_BIN, "-v", "-o", report_path, "--"] + argv
 
     payload = stdin_data.encode() if isinstance(stdin_data, str) else None
     t0 = time.monotonic()
@@ -715,13 +743,18 @@ def _exec_once(index, argv, cwd, env, stdin_data, timeout_s, use_time):
     rec["stdout_truncated"] = rec["stdout_bytes"] > CAPTURE_MAX_BYTES
     rec["stderr_truncated"] = rec["stderr_bytes"] > CAPTURE_MAX_BYTES
 
-    report = _parse_time_report(report_path) if report_path else None
+    if measurement == "wait4":
+        report = _parse_wait4_report(report_path)
+    else:
+        report = _parse_time_report(report_path) if report_path else None
     if report_path:
         try:
             os.unlink(report_path)
         except OSError:
             pass
-    if report and report["exit_code"] is not None:
+    if measurement == "wait4" and report.get("error"):
+        rec["error"] = report["error"]
+    elif report and report["exit_code"] is not None:
         rec["exit_code"] = report["exit_code"]
         rec["signal"] = report["signal"]
         rec["max_rss_kb"] = report["max_rss_kb"]
@@ -733,7 +766,8 @@ def _exec_once(index, argv, cwd, env, stdin_data, timeout_s, use_time):
         if report:
             rec["max_rss_kb"] = report["max_rss_kb"]
     if rec["timed_out"]:
-        rec["error"] = "timed out after %ss" % timeout_s
+        rec["error"] = "timed out after %ss%s" % (
+            timeout_s, "; " + rec["error"] if rec["error"] else "")
     return rec
 
 
@@ -825,7 +859,7 @@ def run(probe, ctx=None, timeout=None):
         env.update(env_extra)
         tmo = int(timeout) if timeout is not None else int(p["timeout_s"])
         reps = int(p.get("repeat") or 1)
-        use_time = os.path.exists(TIME_BIN) and os.access(TIME_BIN, os.X_OK)
+        measurement = _measurement_source()
         obs = {
             "schema": "re-observation/1",
             "probe_id": p["probe_id"],
@@ -835,13 +869,13 @@ def run(probe, ctx=None, timeout=None):
             "env_extra": env_extra,
             "repeat": reps,
             "timeout_s": tmo,
-            "rusage_source": "/usr/bin/time -v" if use_time else "unavailable",
+            "rusage_source": measurement,
             "started_at": time.time(),
             "baselines": ctx.get("baselines") or {},
             "runs": [],
         }
         for i in range(reps):
-            obs["runs"].append(_exec_once(i, argv, cwd, env, p.get("stdin"), tmo, use_time))
+            obs["runs"].append(_exec_once(i, argv, cwd, env, p.get("stdin"), tmo, measurement))
         obs["duration_s"] = time.time() - obs["started_at"]
         return obs
     finally:

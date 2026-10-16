@@ -2,7 +2,7 @@
 
 #![allow(dead_code)] // Each integration test uses only part of this shared helper.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use kuna_base::xml::DocumentStorage;
@@ -19,7 +19,9 @@ pub const C_TYPES: &str = "#include <stdint.h>\n#include <stdbool.h>\n#include <
     typedef uint8_t uint1; typedef uint16_t uint2; typedef uint32_t uint4; typedef uint64_t uint8;\n\
     typedef int8_t int1; typedef int16_t int2; typedef int32_t int4; typedef int64_t int8;\n";
 
-pub use kuna_harness::c_behavior::assert_c_behavior;
+pub fn assert_c_behavior(source: &Path, preamble: &str, body: &str, driver: &str) {
+    kuna_harness::c_behavior::assert_c_behavior(source, preamble, body, driver, &["-Wall", "-Werror"]);
+}
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -78,6 +80,10 @@ impl Corpus {
             .unwrap_or_else(|| repo_root().join("specs"));
         let program = bootstrap_from_root(&root_element, &[specs.to_string_lossy().into_owned()])
             .unwrap_or_else(|e| panic!("{stem}: production bootstrap failed: {e}"));
+        Self::from_program(stem, program, commands)
+    }
+
+    pub fn from_program(stem: &str, program: ConsoleProgram, commands: Vec<String>) -> Self {
         let mut status = IfaceTerm::into_status("> ", b"");
         register_decomp_commands(&mut status);
         register_console_commands(&mut status);

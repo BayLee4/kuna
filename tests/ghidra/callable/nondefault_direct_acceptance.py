@@ -9,7 +9,7 @@ import hashlib
 import json
 
 from pathlib import Path
-from support import execute_i386_publication, require_provider_body
+from support import execute_i386_publication, require_provider_body, require_absent_provider_body
 import re
 import subprocess
 import sys
@@ -67,22 +67,37 @@ def cli():
   for suffix in ['std','fast']:
    caller='caller_'+suffix;target='target_'+suffix;directory=a.out/(suffix+('-on'if printing else'-off'));directory.mkdir()
    row={'model':'__stdcall'if suffix=='std'else'__fastcall','printing':printing,'completed':False};r['cases'].append(row)
-   try:
-    common=['--target','x86:LE:32:default:windows','--language','c','--option','defaultprototype','__cdecl','--option','conventionprinting','on'if printing else'off',*assertions]
-    selected=[caller,target]
-    result=invoke(row,[a.native,'decompile-all',a.binary,'--json','--functions',','.join(selected),*common]);assert result['status']==0,result
-    metadata=json.loads(result['stdout']);(directory/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
-    functions=metadata['functions'];assert {f['name']for f in functions}==set(selected)
-    assert all(f.get('error')is None for f in functions),metadata
-    project=directory/'project';export=invoke(row,[a.native,'decompile-project',a.binary,'-o',project,'--functions',','.join(selected),*common])
-    assert export['status']==0,export
-    header=project/(a.binary.name+'.h');body=project/(a.binary.name+'.c')
-    for name in selected:require_provider_body(body,name)
-    check_print(row,header,body,selected,printing)
-    execute_emitted(row,directory,header,body,selected,False)
-    row['behavioral_checks_completed']=True
-    row['completed']=True
-   except BaseException:row['failure']=traceback.format_exc()
+   common=['--target','x86:LE:32:default:windows','--language','c','--option','defaultprototype','__cdecl','--option','conventionprinting','on'if printing else'off',*assertions]
+   row['failures']=[]
+   for missing in [True,False]:
+    label='missing'if missing else'full';stage='metadata'
+    try:
+     selected=[caller]if missing else[caller,target]
+     result=invoke(row,[a.native,'decompile-all',a.binary,'--json','--functions',','.join(selected),*common]);assert result['status']==0,result
+     metadata=json.loads(result['stdout']);(directory/(label+'-metadata.json')).write_text(json.dumps(metadata,indent=2)+'\n')
+     functions=metadata['functions'];assert len(functions)==len(selected) and {f['name']for f in functions}==set(selected),metadata
+     assert all(f.get('error')is None and f.get('code')for f in functions),metadata
+     stage='export'
+     project=directory/label;export=invoke(row,[a.native,'decompile-project',a.binary,'-o',project,'--functions',','.join(selected),*common])
+     if missing:
+      stage='partial-selection'
+      assert export['status']==0,export
+      assert target not in {f['name']for f in functions},metadata
+      require_provider_body(project/(a.binary.name+'.c'),caller)
+      require_absent_provider_body(project/(a.binary.name+'.c'),target)
+      row['partial_export']={'selected_body':caller,'omitted':target,'status':export['status']}
+     else:
+      assert export['status']==0,export
+      stage='providers'
+      header=project/(a.binary.name+'.h');body=project/(a.binary.name+'.c')
+      for name in selected:require_provider_body(body,name)
+      stage='convention-printing'
+      check_print(row,header,body,selected,printing)
+      stage='unchanged-i386-consumer'
+      execute_emitted(row,directory,header,body,selected,False)
+    except BaseException:
+     failure=traceback.format_exc();row['failures'].append({'phase':label,'stage':stage,'failure':failure});row.setdefault('failure',failure)
+   row['completed']=not row['failures']
    save()
 
 def cli_nested():
@@ -125,8 +140,8 @@ def cli_nested():
    common=['--target','x86:LE:32:default:windows','--functions',','.join(names),'--language','c','--option','structdefs','on','--option','defaultprototype','__cdecl','--option','conventionprinting','on'if printing else'off',*assertions]
    result=invoke(row,[a.native,'decompile-all',a.binary,'--json',*common]);assert result['status']==0,result
    metadata=json.loads(result['stdout']);(directory/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
-   assert {f['name']for f in metadata['functions']}==set(names)
-   assert all(f.get('error')is None for f in metadata['functions']),metadata
+   assert len(metadata['functions'])==len(names) and {f['name']for f in metadata['functions']}==set(names)
+   assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
    project=directory/'project';result=invoke(row,[a.native,'decompile-project',a.binary,'-o',project,*common]);assert result['status']==0,result
    header=project/(a.binary.name+'.h');body=project/(a.binary.name+'.c')
    for name in names:require_provider_body(body,name)

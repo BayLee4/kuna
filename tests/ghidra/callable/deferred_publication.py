@@ -2,7 +2,7 @@
 """Real deferred provider publication + unchanged emitted C, no helper-body fixes."""
 import argparse,hashlib,json,re,struct,subprocess,traceback
 from pathlib import Path
-from support import tool, require_provider_body
+from support import tool, require_provider_body, require_absent_provider_body
 from whole_calls_workers import elf_symbols
 p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True);p.add_argument('--binary',type=Path,required=True);p.add_argument('--cli',type=Path,required=True);p.add_argument('--sha256',required=True);p.add_argument('--slot-address',type=lambda value:int(value,0),required=True);p.add_argument('--mode',choices=['all','serial','stream','jobs2'],default='all');p.add_argument('--case',choices=['all','scalar_formal_control','scalar_only','returned_callback_control','returned_scalar_callback','deferred_scalar_cycle'],default='all');a=p.parse_args();a.out.mkdir(parents=True,exist_ok=False);repo=Path(__file__).resolve().parents[3];r={'completed':False,'selected_mode':a.mode,'selected_case':a.case,'cli_sha256':hashlib.sha256(a.cli.read_bytes()).hexdigest(),'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'cases':[]};assert r['cli_sha256']==a.sha256;symbols=elf_symbols(a.binary)
 declarations=['typedef typedef int (*Fn)(int);','typedef typedef Fn (*Chooser)(void);','data '+hex(a.slot_address)+' Fn scalar_slot']
@@ -74,23 +74,36 @@ cases=[
 ]
 for mode in ['serial','stream','jobs2']:
  if a.mode!='all'and a.mode!=mode:continue
- for label,names,provider,body in cases:
+ for label,names,omitted,body in cases:
   if a.case!='all'and a.case!=label:continue
   out=a.out/(mode+'-'+label);out.mkdir();row={'mode':mode,'case':label,'completed':False,'commands':[],'source_type_provenance':'Existing accepted v4 genuine DWARF, no assertions or manual type replacement'if mode!='serial'else'Accepted serial source assertions over same genuine fixture','binary_sha256':r['binary_sha256']};r['cases'].append(row)
   def invoke(command):
    command=list(map(str,command));q=subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=240);v={'command':command,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr};row['commands'].append(v);return v
-  try:
-   jobs=['--jobs','2']if mode=='jobs2'else[];stream=['--stream']if mode=='stream'else[]
-   for suffix in ['full']:
-    chosen=names;common=['--functions',','.join(chosen),'--language','c','--option','structdefs','on',*jobs,*(assertions if mode=='serial'else[])]
-    result=invoke([a.cli,'decompile-all',a.binary,'--json',*common]);assert result['status']==0,result;metadata=json.loads(result['stdout']);(out/(suffix+'-metadata.json')).write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==len(chosen)
+  jobs=['--jobs','2']if mode=='jobs2'else[];stream=['--stream']if mode=='stream'else[]
+  row['failures']=[]
+  for missing in ([True,False]if omitted else[False]):
+   suffix='omitted'if missing else'full';stage='metadata'
+   try:
+    chosen=[name for name in names if not missing or name!=omitted];common=['--functions',','.join(chosen),'--language','c','--option','structdefs','on',*jobs,*(assertions if mode=='serial'else[])]
+    result=invoke([a.cli,'decompile-all',a.binary,'--json',*common]);assert result['status']==0,result;metadata=json.loads(result['stdout']);(out/(suffix+'-metadata.json')).write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==len(chosen) and {f['name']for f in metadata['functions']}==set(chosen),metadata
     row.setdefault('actual_source_variables',{})[suffix]={f['name']:[{'name':v['name'],'type':v['type'],'size':v['size'],'arg_index':v['arg_index']}for v in f['variables']if v['kind']=='arg']for f in metadata['functions']}
-    assert all(f.get('error')is None for f in metadata['functions']),metadata
+    assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
+    stage='export'
     project=out/(suffix+'-project');export=invoke([a.cli,'decompile-project',a.binary,'-o',project,*common,*stream])
+    if missing:
+     stage='partial-selection'
+     assert export['status']==0,export
+     assert all(f['address']!=symbols[omitted]for f in metadata['functions']),metadata
+     for name in chosen:require_provider_body(project/(a.binary.name+'.c'),name)
+     require_absent_provider_body(project/(a.binary.name+'.c'),omitted)
+     row['partial_export']={'selected_bodies':chosen,'omitted':omitted,'status':export['status']};continue
     assert export['status']==0,export
+    stage='providers'
     for name in names:
      require_provider_body(project/(a.binary.name+'.c'),name)
-    if provider:row['deferred_provider_owner']={'function':provider,'address':symbols[provider]}
+    if omitted:
+     owner=next(f for f in metadata['functions']if f['name']==omitted);assert owner['address']==symbols[omitted],owner
+     row['deferred_provider_owner']={'function':omitted,'address':owner['address']}
     if label=='scalar_formal_control':
      body='for(int x=-2;x<=31;++x){if(scalar_entry(x)!=2*x+9)return 1;if(scalar_root(actual_leaf,x)!=2*x+9)return 2;}'
     stem=a.binary.name;driver=out/'consumer.c';driver.write_text('#include "'+stem+'.h"\nint main(void){'+body+'return 0;}\n')
@@ -103,11 +116,15 @@ for mode in ['serial','stream','jobs2']:
      data=out/'fixture-data.c';data.write_text('#include "'+stem+'.h"\nFn '+('volatile 'if actual_volatile else'')+'scalar_slot=actual_leaf;\n');data_sources.append(data)
     row['emitted_sha256']={path.name:hashlib.sha256(path.read_bytes()).hexdigest()for path in [project/(stem+'.c'),project/(stem+'.h')]}
     for opt in ['-O0','-O2']:
-     exe=out/('consumer'+opt);built=invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/(stem+'.c'),driver,*data_sources,'-o',exe]);assert built['status']==0,built;ran=invoke([exe]);assert ran['status']==0,ran
+     stage='compile'+opt
+     exe=out/('consumer'+opt);built=invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/(stem+'.c'),driver,*data_sources,'-o',exe]);assert built['status']==0,built
+     stage='execute'+opt
+     ran=invoke([exe]);assert ran['status']==0,ran
     row['unchanged_C_passed']=True
-   row['behavioral_checks_completed']=True
-   row['completed']=True
-  except BaseException:row['failure']=traceback.format_exc()
-  finally:(out/'report.json').write_text(json.dumps(row,indent=2)+'\n');print(json.dumps({'mode':mode,'case':label,'completed':row['completed'],'failure':row.get('failure')}),flush=True)
+   except BaseException:
+    failure=traceback.format_exc();row['failures'].append({'phase':suffix,'stage':stage,'failure':failure});row.setdefault('failure',failure)
+  row['behavioral_checks_completed']=not row['failures']
+  row['completed']=not row['failures']
+  (out/'report.json').write_text(json.dumps(row,indent=2)+'\n');print(json.dumps({'mode':mode,'case':label,'completed':row['completed'],'failures':row['failures']}),flush=True)
 r['completed']=all(row['completed']for row in r['cases']);(a.out/'report.json').write_text(json.dumps(r,indent=2)+'\n')
 if not r['completed']:raise SystemExit(1)

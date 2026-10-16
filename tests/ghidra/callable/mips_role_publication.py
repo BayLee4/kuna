@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import traceback
 
-from support import tool, require_provider_body
+from support import tool, require_provider_body, require_absent_provider_body
 
 p = argparse.ArgumentParser()
 p.add_argument('--cli', type=Path, required=True)
@@ -15,10 +15,12 @@ p.add_argument('--sha256', required=True)
 p.add_argument('--binary', type=Path, required=True)
 p.add_argument('--binary-sha256', required=True)
 p.add_argument('--out', type=Path, required=True)
-p.add_argument('--subjects', help='Comma-separated subset; default is all three public consumers')
+p.add_argument('--subjects', help='Comma-separated subset; default is all eight v4 cases')
 a = p.parse_args()
 cases = [('dirty_gp', [], True), ('private_gp_spill', [], True),
-         ('direct_gp_parent', ['dirty_gp'], True)]
+         ('direct_gp_parent', ['dirty_gp'], True), ('direct_gp_read_parent', ['dirty_gp'], False),
+         ('private_gp_reload', [], False), ('private_gp_escape', [], False),
+         ('dirty_gp_natural', [], True), ('direct_gp_natural_parent', ['dirty_gp_natural'], True)]
 selected = a.subjects.split(',') if a.subjects is not None else [case[0] for case in cases]
 unknown = set(selected) - {case[0] for case in cases}
 if unknown:
@@ -30,7 +32,7 @@ a.out.mkdir(parents=True, exist_ok=False)
 sha = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
 report = {'completed': False, 'cli_sha256': sha(a.cli), 'binary_sha256': sha(a.binary), 'cases': [],
           'selected_subjects': selected,
-          'boundary': 'Three genuine machine scopes are separate from export execution. Raw/final GP effects are checked by verify_mips_internal_roles, not inferred from publication. Negative private-role observations remain genuine machine and Engine guards, not project-refusal probes.'}
+          'boundary': 'Four genuine machine scopes are separate from export execution. Raw/final GP effects are checked by verify_mips_internal_roles, not inferred from publication. Negative private-role observations remain genuine machine and Engine guards, not project-refusal probes.'}
 assert report['cli_sha256'] == a.sha256
 assert report['binary_sha256'] == a.binary_sha256
 assertion_names = set(selected)
@@ -40,7 +42,8 @@ for subject, providers, _ in cases:
 assertions = ['--assert-strict']
 assertion_count = 0
 for declaration in ['void dirty_gp(void)', 'int direct_gp_parent(void)', 'int direct_gp_read_parent(void)',
-                    'int private_gp_spill(void)']:
+                    'int private_gp_spill(void)', 'int private_gp_reload(void)', 'void private_gp_escape(void)',
+                    'void dirty_gp_natural(void)', 'int direct_gp_natural_parent(void)']:
     name = declaration.split('(')[0].split()[-1]
     if name in assertion_names:
         assertions += ['--assert', 'prototype ' + name + ' ' + declaration]
@@ -62,50 +65,82 @@ for subject, providers, positive in cases:
         row['commands'].append(result)
         return result
 
-    try:
-        names = [subject] + providers
-        label = 'full'
-        common = ['--functions', ','.join(names), '--language', 'c', '--option', 'structdefs', 'on', *assertions]
-        result = invoke([a.cli, 'decompile-all', a.binary, '--json', *common])
-        assert result['status'] == 0, result
-        metadata = json.loads(result['stdout'])
-        (directory / (label + '-metadata.json')).write_text(json.dumps(metadata, indent=2) + '\n')
-        source_assertions = [item for item in metadata.get('assertions', [])
-                             if item.get('directive', '').startswith('prototype ')]
-        assert len(source_assertions) == assertion_count and all(item.get('status') == 'applied'
-                                                                 for item in source_assertions), metadata.get('assertions')
-        functions = metadata['functions']
-        assert {f['name'] for f in functions} == set(names), metadata
-        subject_function = next(f for f in functions if f['name'] == subject)
-        assert subject_function.get('error') is None, subject_function
-        project = directory / label
-        result = invoke([a.cli, 'decompile-project', a.binary, '-o', project, *common])
-        assert result['status'] == 0, result
-        stem = a.binary.name
-        header = project / (stem + '.h')
-        body = project / (stem + '.c')
-        for name in names:
-            require_provider_body(body, name)
-        row['emitted_sha256'] = {path.name: sha(path) for path in [header, body]}
-        check = subject + '(); return 0;' if subject == 'dirty_gp' else 'return ' + subject + '() != 11;'
-        consumer = directory / 'consumer.c'
-        consumer.write_text('#include "' + stem + '.h"\nint main(void) { ' + check + ' }\n')
-        for optimization in ['-O0', '-O2']:
-            executable = directory / ('consumer' + optimization)
-            result = invoke([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror=uninitialized',
-                             '-Werror=incompatible-pointer-types', '-Werror=implicit-function-declaration',
-                             optimization, '-I', project, body, consumer, '-o', executable])
+    row['failures'] = []
+    for omit in ([True, False] if positive and providers else [False]):
+        label = 'omitted' if omit else 'full'
+        stage = 'metadata'
+        try:
+            names = [subject] + ([] if omit else providers)
+            common = ['--functions', ','.join(names), '--language', 'c', '--option', 'structdefs', 'on', *assertions]
+            result = invoke([a.cli, 'decompile-all', a.binary, '--json', *common])
             assert result['status'] == 0, result
-            result = invoke([executable])
+            metadata = json.loads(result['stdout'])
+            (directory / (label + '-metadata.json')).write_text(json.dumps(metadata, indent=2) + '\n')
+            source_assertions = [item for item in metadata.get('assertions', [])
+                                 if item.get('directive', '').startswith('prototype ')]
+            assert len(source_assertions) == assertion_count and all(item.get('status') == 'applied'
+                                                                     for item in source_assertions), metadata.get('assertions')
+            functions = metadata['functions']
+            assert len(functions) == len(names) and {f['name'] for f in functions} == set(names), metadata
+            subject_function = next(f for f in functions if f['name'] == subject)
+            assert subject_function.get('error') is None and subject_function.get('code'), subject_function
+            stage = 'export'
+            project = directory / label
+            result = invoke([a.cli, 'decompile-project', a.binary, '-o', project, *common])
+            row[label + '_project_status'] = result['status']
+            if not positive:
+                row['negative_boundary'] = {
+                    'whole_export_refused': result['status'] != 0,
+                    'diagnostic': result['stderr'],
+                    'proof_test': ('actual_direct_child_role_cannot_hide_a_later_implicit_gp_read'
+                                   if subject == 'direct_gp_read_parent' else
+                                   'actual_private_spill_proof_rejects_reload_and_pointer_escape'),
+                }
+                continue
+            assert all(f.get('error') is None and f.get('code') for f in functions), metadata
+            if omit:
+                stage = 'partial-selection'
+                assert result['status'] == 0, result
+                assert not set(providers) & {f['name'] for f in functions}, metadata
+                body = project / (a.binary.name + '.c')
+                require_provider_body(body, subject)
+                for provider in providers:
+                    require_absent_provider_body(body, provider)
+                row['partial_export'] = {'selected_body': subject, 'omitted': providers,
+                                         'status': result['status']}
+                continue
             assert result['status'] == 0, result
-        row['unchanged_C_passed'] = True
-        row['behavioral_checks_completed'] = True
-        row['completed'] = True
-    except BaseException:
-        row['failure'] = traceback.format_exc()
-    finally:
-        (directory / 'report.json').write_text(json.dumps(row, indent=2) + '\n')
-        print(json.dumps({'subject': subject, 'completed': row['completed'], 'failure': row.get('failure')}), flush=True)
+            stage = 'providers'
+            for name in names:
+                require_provider_body(project / (a.binary.name + '.c'), name)
+            if providers:
+                row['actual_child_providers'] = [f for f in functions if f['name'] in providers]
+            stem = a.binary.name
+            header = project / (stem + '.h')
+            body = project / (stem + '.c')
+            row['emitted_sha256'] = {path.name: sha(path) for path in [header, body]}
+            check = subject + '(); return 0;' if subject in {'dirty_gp', 'dirty_gp_natural'} else 'return ' + subject + '() != 11;'
+            consumer = directory / 'consumer.c'
+            consumer.write_text('#include "' + stem + '.h"\nint main(void) { ' + check + ' }\n')
+            for optimization in ['-O0', '-O2']:
+                stage = 'compile' + optimization
+                executable = directory / ('consumer' + optimization)
+                result = invoke([compiler, '-std=c11', '-Wall', '-Wextra', '-Werror=uninitialized',
+                                 '-Werror=incompatible-pointer-types', '-Werror=implicit-function-declaration',
+                                 optimization, '-I', project, body, consumer, '-o', executable])
+                assert result['status'] == 0, result
+                stage = 'execute' + optimization
+                result = invoke([executable])
+                assert result['status'] == 0, result
+            row['unchanged_C_passed'] = True
+        except BaseException:
+            failure = traceback.format_exc()
+            row['failures'].append({'phase': label, 'stage': stage, 'failure': failure})
+            row.setdefault('failure', failure)
+    row['behavioral_checks_completed'] = not row['failures']
+    row['completed'] = not row['failures']
+    (directory / 'report.json').write_text(json.dumps(row, indent=2) + '\n')
+    print(json.dumps({'subject': subject, 'completed': row['completed'], 'failures': row['failures']}), flush=True)
 report['completed'] = all(row['completed'] for row in report['cases'])
 (a.out / 'report.json').write_text(json.dumps(report, indent=2) + '\n')
 if not report['completed']:

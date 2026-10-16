@@ -361,8 +361,14 @@ The driver distinguishes an empty selection from a retryable disk brake or
 claim race. Pauses retry on the next scheduler tick; only an empty selection
 with no active workers reports a drained backlog. Selector, reaper and claim
 errors preserve their diagnostics, stop new dispatch, and return exit 2 after
-waiting for in-flight workers. Driver tests use temporary state and replace
-worker, Git and GitHub commands; an error-exit test also runs the real selector.
+waiting for in-flight workers. PID tracking supports macOS's Bash 3 as well as
+newer Bash; worker completion refreshes capacity in the scheduler itself.
+Repeated graceful-stop signals still wait for in-flight workers to finish.
+The disk brake uses portable `df -Pk` and floors available space to whole GiB:
+1.5 GiB does not satisfy `PIPELINE_MIN_FREE_GB=2`. An unavailable space reading
+pauses dispatch rather than implying sufficient space. Driver tests use
+temporary state and replace worker, Git and GitHub commands; an error-exit
+test also runs the real selector.
 
 Pipeline and repipe text writers share `scripts/atomic.py`. Each write uses its
 own sibling file, publishes it only after a successful close, and removes it on

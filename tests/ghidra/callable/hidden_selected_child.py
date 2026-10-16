@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Real selected child pointer-result/load chain and unchanged provider C."""
+"""Original hidden parent boundary and selected child pointer-result provider C."""
 import argparse,hashlib,json,re,subprocess,traceback
 from pathlib import Path
-from support import ROOT, host, require_provider_body, tool
+from support import ROOT, host, require_provider_body, require_absent_provider_body, tool
 from whole_calls_workers import ElfMachine,elf_symbols
 p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True);p.add_argument('--binary',type=Path,required=True);p.add_argument('--cli',type=Path);p.add_argument('--sha256');p.add_argument('--phase',choices=['machine','all'],default='all');a=p.parse_args();a.out.mkdir(parents=True,exist_ok=False);repo=ROOT;r={'completed':False,'phase':a.phase,'scope':'Actual selected child pointer return, load, and public provider consumer','machine':[],'commands':[],'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest()}
 if a.phase=='all':r['cli_sha256']=hashlib.sha256(a.cli.read_bytes()).hexdigest();assert r['cli_sha256']==a.sha256
@@ -11,10 +11,10 @@ try:
  try:
   from java.math import BigInteger
   data_symbols={str(s.getName()):int(s.getAddress().getOffset())for s in m.program.getSymbolTable().getAllSymbols(True)}
-  for entry in ['selected_child']:
+  for entry in ['hidden_selected_child','selected_child']:
    e=m.EmulatorHelper(m.program)
    try:
-    for register,value in [('X0',0x76543210),('X19',42),('X29',0x1122334455667788),('X30',0x7ff0),('sp',0x7fe0)]:e.writeRegister(register,BigInteger(str(value)))
+    for register,value in [('X0',symbols['make_big_zero']if entry=='hidden_selected_child'else 0x76543210),('X19',42),('X29',0x1122334455667788),('X30',0x7ff0),('sp',0x7fe0)]:e.writeRegister(register,BigInteger(str(value)))
     e.setBreakpoint(m.address(0x7ff0));assert e.run(m.address(symbols[entry]),None,m.monitor),str(e.getLastError());got=int(str(e.readRegister('X0')));assert got==13
     assert int(str(e.readRegister('sp')))==0x7fe0 and int(str(e.readRegister('X19')))==42 and int(str(e.readRegister('X29')))==0x1122334455667788
     r['machine'].append({'entry':entry,'result':got,'final_SP':0x7fe0,'final_X19':42,'final_X29':0x1122334455667788})
@@ -79,15 +79,32 @@ try:
     finally:interface.dispose()
  finally:m.close()
  if a.phase=='all':
-  declarations=['typedef typedef unsigned long long *(*PtrFn)(void);','prototype selected_child unsigned long long selected_child(void)','prototype native_pointer unsigned long long *native_pointer(void)','data '+hex(data_symbols['pointer_slot'])+' PtrFn pointer_slot','data '+hex(data_symbols['pointer_value'])+' unsigned long long pointer_value']
-  command=[str(a.cli),'decompile-all',str(a.binary),'--functions','selected_child','--json','--language','c','--option','structdefs','on','--assert-strict']
+  declarations=['typedef typedef struct Big24 { unsigned long long a; unsigned long long b; unsigned long long c; } Big24;','typedef typedef Big24 (*Big0Fn)(void);','prototype hidden_selected_child unsigned long long hidden_selected_child(Big0Fn callback)','prototype make_big_zero Big24 make_big_zero(void)','typedef typedef unsigned long long *(*PtrFn)(void);','prototype selected_child unsigned long long selected_child(void)','prototype native_pointer unsigned long long *native_pointer(void)','data '+hex(data_symbols['pointer_slot'])+' PtrFn pointer_slot','data '+hex(data_symbols['pointer_value'])+' unsigned long long pointer_value']
+  command=[str(a.cli),'decompile-all',str(a.binary),'--functions','hidden_selected_child,selected_child','--json','--language','c','--option','structdefs','on','--assert-strict']
   for d in declarations:command+=['--assert',d]
-  q=subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=240);r['commands'].append({'command':command,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr});assert q.returncode==0;meta=json.loads(q.stdout);(a.out/'metadata.json').write_text(json.dumps(meta,indent=2)+'\n');functions={f['name']:f for f in meta['functions']};assert set(functions)=={'selected_child'}
-  child=functions['selected_child']
+  q=subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=240);r['commands'].append({'command':command,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr});assert q.returncode==0;meta=json.loads(q.stdout);(a.out/'metadata.json').write_text(json.dumps(meta,indent=2)+'\n');functions={f['name']:f for f in meta['functions']};assert len(meta['functions'])==2 and set(functions)=={'hidden_selected_child','selected_child'}
+  parent=functions['hidden_selected_child'];child=functions['selected_child']
   for f in functions.values():
    assert f.get('error')is None,f
    assert re.search(r'\breturn\b',f['code']),f
+  assert re.search(r'\bselected_child\s*\(',parent['code']),parent
+  assert re.search(r'\bcallback\b[^;\n]*\(',parent['code']),parent
   assert re.search(r'\b(?:native_pointer|pointer_slot)\b',child['code']),child
+  parent_command=[str(a.cli),'decompile-project',str(a.binary),'-o',str(a.out/'parent-project'),*command[3:]]
+  parent_command.remove('--json')
+  exported=subprocess.run(parent_command,cwd=repo,capture_output=True,text=True,timeout=240)
+  observation={'command':parent_command,'status':exported.returncode,'stdout':exported.stdout,'stderr':exported.stderr}
+  r['commands'].append(observation)
+  parent_failure=None
+  try:
+   assert observation['status']==0,observation
+   parent_body=a.out/'parent-project'/(a.binary.name+'.c')
+   for provider in ('hidden_selected_child','selected_child'):require_provider_body(parent_body,provider)
+   for provider in ('native_pointer','make_big_zero'):require_absent_provider_body(parent_body,provider)
+   r['parent_selection_retained']=True
+  except Exception:
+   parent_failure=traceback.format_exc()
+   r['parent_selection_failure']=parent_failure
   child_common=['--functions','selected_child,native_pointer','--language','c','--option','structdefs','on','--assert-strict']
   for declaration in declarations:child_common+=['--assert',declaration]
   child_project=a.out/'child-project'
@@ -109,6 +126,7 @@ try:
    invoke([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',optimization,'-I',child_project,body,data,driver,'-o',executable])
    invoke([executable])
   r['unchanged_selected_child_provider_execution']=True
+  if parent_failure:raise AssertionError(parent_failure)
  r['behavioral_checks_completed']=True
  r['completed']=True
 except BaseException:r['failure']=traceback.format_exc()

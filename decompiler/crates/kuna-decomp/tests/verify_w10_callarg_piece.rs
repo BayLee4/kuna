@@ -30,11 +30,11 @@
 //!
 //! These drive the *real* gate path: the committed Rust `decomp_test_dbg`
 //! harness on `concat.xml` / `longdouble.xml` whose `<script>` runs
-//! `parse line extern` + `lo fu` + `decompile` + `print C`, then compares the
-//! bulk `print C` against the C++ oracle on the same datatest.  Each assertion is
-//! keyed to generic structure geometry (field-write FORM, no struct/field/
-//! function name as the discriminator) so it cannot be met by a special-cased
-//! decode.  All tests SKIP (not fail) when a binary or `.sla` is unavailable,
+//! `parse line extern` + `lo fu` + `decompile` + `print C`.  Assertions preserve
+//! the authored types, gathered field values, and ordering around the call,
+//! without constraining storage comments or whole-function formatting.  The
+//! different aggregate layouts exercise recovery beyond a single name/shape.
+//! All tests SKIP (not fail) when a binary or `.sla` is unavailable,
 //! honoring the same pattern as `verify_w10_input_prototype_adversarial.rs`.
 
 use std::path::PathBuf;
@@ -57,13 +57,9 @@ fn datatests_dir() -> PathBuf {
 }
 
 fn rust_test_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/decomp_test_dbg")
-}
-
-fn cpp_oracle_bin() -> PathBuf {
-    std::env::var_os("KUNA_DECOMP_TEST")
+    std::env::var_os("KUNA_DECOMP_TEST_RUST")
         .map(PathBuf::from)
-        .unwrap_or_else(|| repo_root().join("decompiler/cpp/decomp_test_dbg"))
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/decomp_test_dbg"))
 }
 
 /// Drive a `decomp_test_dbg` binary on one datatest with `KUNA_DUMP=1` and
@@ -158,18 +154,25 @@ fn at1_by_value_struct_arg_renders_field_writes_not_inline_concat() {
         "the two struct fields are not rendered as separate writes; got:\n{body}"
     );
 
-    // If the oracle is available, the statement content must match it exactly
-    // (the gather is faithful, not an approximation of the field text); compare
-    // with the variable-storage `// <reg>` comment stripped (the orthogonal
-    // variable-comment plane).
-    if let Some(cpp) = dump_print_c(&cpp_oracle_bin(), "concat") {
-        if let Some(cpp_body) = function_block(&cpp, "concatregparam") {
-            assert_eq!(
-                strip_line_comments(body),
-                strip_line_comments(cpp_body),
-                "concatregparam statement content diverges from the C++ oracle"
-            );
-        }
+    assert!(
+        regex::Regex::new(
+            r"^\s*void\s+concatregparam\s*\(\s*int4\s+regp1\s*,\s*int4\s+regp2\s*\)"
+        ).unwrap().is_match(body),
+        "the caller must retain its void result and two int4 inputs:\n{body}"
+    );
+    let decl = regex::Regex::new(r"(?m)^\s*foo\s+v1\s*;").unwrap()
+        .find(body)
+        .unwrap_or_else(|| panic!("missing gathered foo local:\n{body}"))
+        .start();
+    let call = body.find("structparam(v1)").unwrap();
+    // Either independent field order is valid, but both values must reach the call.
+    for field in ["v1.A = regp1;", "v1.B = regp2;"] {
+        let write = body.find(field).unwrap();
+        assert!(
+            decl < write && write < call,
+            "the gathered local must be declared and initialized before the call; \
+             field `{field}`:\n{body}"
+        );
     }
 }
 
@@ -213,35 +216,38 @@ fn at2_generic_struct_arg_split_no_name_keying() {
         );
     }
 
-    // Oracle parity on the STATEMENT content (the field-writes + the call): the
-    // only residual gap is the declaration-line trailing `// <storage>` comment
-    // (`fooshort v1;` vs `fooshort v1; // tmp`), a pre-existing variable-comment
-    // plane divergence orthogonal to the call-arg gather.  Compare with trailing
-    // `//` comments stripped so the load-bearing statements are checked exactly.
-    if let Some(cpp) = dump_print_c(&cpp_oracle_bin(), "concat") {
-        if let Some(cpp_body) = function_block(&cpp, "replaceshort") {
-            assert_eq!(
-                strip_line_comments(body),
-                strip_line_comments(cpp_body),
-                "replaceshort statement content diverges from the C++ oracle"
-            );
-        }
+    assert!(
+        regex::Regex::new(
+            r"^\s*void\s+replaceshort\s*\(\s*int2\s+replace1\s*,\s*int2\s+replace2\s*\)"
+        ).unwrap().is_match(body),
+        "the caller must retain its void result and two int2 inputs:\n{body}"
+    );
+    let decl = regex::Regex::new(r"(?m)^\s*fooshort\s+v1\s*;").unwrap()
+        .find(body)
+        .unwrap_or_else(|| panic!("missing gathered fooshort local:\n{body}"))
+        .start();
+    let call = body.find("structshort(v1)").unwrap();
+    for field in [
+        "v1.b = replace1;",
+        "v1.a = globshort.a;",
+        "v1.c = globshort.c;",
+        "v1.d = globshort.d;",
+    ] {
+        let write = body.find(field).unwrap();
+        assert!(
+            decl < write && write < call,
+            "the gathered local must be declared and initialized before the call; \
+             field `{field}`:\n{body}"
+        );
     }
-}
-
-/// Drop the trailing `// ...` comment from every line (the variable-storage
-/// annotation plane), keeping the statement content for an exact comparison.
-fn strip_line_comments(block: &str) -> String {
-    block
-        .lines()
-        .map(|l| match l.find("//") {
-            Some(i) => l[..i].trim_end(),
-            None => l.trim_end(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+    let before = body.find("globshort.b = replace1;")
+        .unwrap_or_else(|| panic!("missing pre-call global update:\n{body}"));
+    let after = body.find("globshort.d = replace2;")
+        .unwrap_or_else(|| panic!("missing post-call global update:\n{body}"));
+    assert!(
+        before < call && call < after,
+        "the call must observe the b update but precede the d update:\n{body}"
+    );
 }
 
 /// AT3 — the split is DRIVEN BY THE CALLEE PROTO, not a same-function default.

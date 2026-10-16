@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Actual FunctionGraph and BSim consumers on identical stock/Kuna ProgramDB inputs."""
 from collections import Counter
+import hashlib
 import json
 import os
 from pathlib import Path
 import traceback
 
 from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra
+from error_recovery import field
 
 
 def main():
@@ -20,18 +22,21 @@ def main():
         from java.io import File
         from java.lang import Object, StringBuffer
         from java.util import IdentityHashMap
-        from ghidra.app.decompiler import DecompInterface, DecompileOptions
+        from ghidra.app.decompiler import DecompInterface, DecompileOptions, DecompileProcess
         from ghidra.app.decompiler.signature import VarnodeSignature, BlockSignature
         from ghidra.program.database import ProgramDB
         from ghidra.program.flatapi import FlatProgramAPI
         from ghidra.program.model.data import IntegerDataType
         from ghidra.program.model.lang import LanguageID, CompilerSpecID
         from ghidra.program.model.listing import Function, ParameterImpl, ReturnParameterImpl, Variable
-        from ghidra.program.model.pcode import BlockGraph, BlockCopy, PcodeBlock
+        from ghidra.program.model.pcode import AttributeId, ElementId, BlockGraph, BlockCopy, PcodeBlock
         from ghidra.program.model.symbol import SourceType
         from ghidra.program.util import DefaultLanguageService
         from ghidra.util.task import ConsoleTaskMonitor
-        from generic.lsh.vector import WeightedLSHCosineVectorFactory
+        from generic.lsh.vector import WeightedLSHCosineVectorFactory, VectorCompare
+        from java.util import Date
+        from ghidra.features.bsim.query import FunctionDatabase
+        from ghidra.features.bsim.query.description import DescriptionManager, DatabaseInformation
         from ghidra.xml import XmlPullParserFactory
         owner = Object()
         monitor = ConsoleTaskMonitor()
@@ -50,6 +55,11 @@ def main():
                 JArray(Variable)([ParameterImpl("value", IntegerDataType.dataType, program)]))
         finally:
             program.endTransaction(tx, True)
+        before = str(function.getSignature())
+        process_field = field(DecompInterface, "decompProcess")
+        native_field = field(DecompileProcess, "nativeProcess")
+        encoding_field = field(DecompInterface, "baseEncodingSet")
+        desired_settings_field = field(DecompInterface, "sigSettings")
         weights = Path(os.environ.get("KUNA_BSIM_WEIGHTS", Path(os.environ["GHIDRA_INSTALL_DIR"]) /
                        "Ghidra/Features/BSim/data/lshweights_64.xml"))
         if not weights.is_file():
@@ -68,17 +78,45 @@ def main():
                 try:
                     assert interface.setOptions(DecompileOptions())
                     assert interface.openProgram(program), str(interface.getLastMessage())
+                    native = native_field.get(process_field.get(interface))
+                    initial_pid = int(native.pid())
                     def check(name, invoke):
                         row = {"core": core, "case": name}
                         report["rows"].append(row)
                         try:
                             row["value"] = invoke()
+                            current = native_field.get(process_field.get(interface))
+                            row["pid"] = int(current.pid())
+                            assert row["pid"] == initial_pid and current.isAlive(), row
                             row["passed"] = True
                         except Exception:
                             row["passed"] = False
                             row["failure"] = traceback.format_exc()
                         row["last_message"] = str(interface.getLastMessage())
                         (output / "native_features.json").write_text(json.dumps(report, indent=2) + "\n")
+                    def ordinary():
+                        result = interface.decompileFunction(function, 30, monitor)
+                        assert result.decompileCompleted(), str(result.getErrorMessage())
+                        assert result.getHighFunction() is not None and result.getCCodeMarkup() is not None
+                        code = str(result.getDecompiledFunction().getC())
+                        assert "add_three" in code and "value" in code and "3" in code
+                        assert str(function.getSignature()) == before
+                        return {"c": code, "source_unchanged": True}
+                    def native_settings():
+                        decoder = encoding_field.get(interface).mainResponse
+                        process_field.get(interface).sendCommand("getSignatureSettings", decoder)
+                        outer = decoder.openElement(ElementId.ELEM_SIGSETTINGS)
+                        values = {}
+                        for name, element in (("major", ElementId.ELEM_MAJOR),
+                                              ("minor", ElementId.ELEM_MINOR),
+                                              ("settings", ElementId.ELEM_SETTINGS)):
+                            inner = decoder.openElement(element)
+                            values[name] = int(decoder.readUnsignedInteger(AttributeId.ATTRIB_CONTENT)
+                                               if name == "settings" else
+                                               decoder.readSignedInteger(AttributeId.ATTRIB_CONTENT))
+                            decoder.closeElement(inner)
+                        decoder.closeElement(outer)
+                        return values
                     def structure():
                         graph = BlockGraph()
                         refs = [Object() for _ in range(4)]
@@ -131,9 +169,17 @@ def main():
                                 "objects_addresses_branch_polarity_and_join_preserved": True}
                     def settings():
                         assert interface.setSignatureSettings(73), str(interface.getLastMessage())
-                        version = [int(interface.getMajorVersion()), int(interface.getMinorVersion())]
-                        assert version[0] > 0 and int(interface.getSignatureSettings()) == 73
-                        return {"version": version, "settings": 73}
+                        actual = native_settings()
+                        version = [actual["major"], actual["minor"]]
+                        assert version[0] > 0 and actual["settings"] == 73, actual
+                        assert [int(interface.getMajorVersion()), int(interface.getMinorVersion())] == version
+                        assert int(interface.getSignatureSettings()) == 73
+                        if core == "stock":
+                            stock["version"] = version
+                        else:
+                            assert version == stock["version"], (version, stock)
+                        return {"version": version, "native_settings": actual["settings"],
+                                "java_desired_settings": int(desired_settings_field.get(interface))}
                     def signatures():
                         raw = interface.generateSignatures(function, True, 30, monitor)
                         assert raw is not None, str(interface.getLastMessage())
@@ -176,19 +222,58 @@ def main():
                             stock["features"] = Counter(features)
                         else:
                             assert Counter(features) == stock["features"], (features, stock)
-                        vector = factory.buildVector(JArray(JInt)(sorted(features)))
-                        assert vector.getEntries(), "Kuna/stock raw features did not yield a consumable BSim vector"
-                        return {"hashes": features, "debug": origins,
-                                "vector_entries": len(vector.getEntries()),
-                                "vector_settings": int(factory.getSettings())}
+                        unsigned = [value & 0xffffffff for value in features]
+                        assert unsigned == sorted(unsigned), features
+                        vector = factory.buildVector(JArray(JInt)(features))
+                        histogram = {int(entry.getHash()): int(entry.getTF()) for entry in vector.getEntries()}
+                        assert histogram == dict(Counter(features)), histogram
+                        sql = str(vector.saveSQL())
+                        restored = factory.restoreVectorFromSql(sql)
+                        assert str(restored.saveSQL()) == sql
+                        assert abs(float(vector.compare(restored, VectorCompare())) - 1.0) < 1e-12
+                        if core == "stock":
+                            stock["sql"] = sql
+                        else:
+                            persisted_stock = factory.restoreVectorFromSql(stock["sql"])
+                            assert abs(float(vector.compare(persisted_stock, VectorCompare())) - 1.0) < 1e-12
+                            assert abs(float(persisted_stock.compare(vector, VectorCompare())) - 1.0) < 1e-12
+                        actual = native_settings()
+                        manager = DescriptionManager()
+                        manager.setVersion(actual["major"], actual["minor"])
+                        manager.setSettings(actual["settings"])
+                        code = JArray(JByte)(6)
+                        assert program.getMemory().getBytes(address(0x1000), code) == 6
+                        digest = hashlib.md5(bytes((int(value) & 255) for value in code)).hexdigest()
+                        executable_record = manager.newExecutableRecord(digest, str(program.getName()),
+                            "gcc", str(program.getLanguageID()), Date(0), None, None, None)
+                        description = manager.newFunctionDescription(str(function.getName()), 0x1000, executable_record)
+                        manager.attachSignature(description, manager.newSignature(restored, 1))
+                        info = DatabaseInformation()
+                        info.major, info.minor = stock["version"]
+                        info.settings = int(factory.getSettings())
+                        FunctionDatabase.checkSettingsForQuery(manager, info)
+                        assert not FunctionDatabase.checkSettingsForInsert(manager, info)
+                        return {"hashes": features, "debug": origins, "database_sql": sql,
+                                "database_settings": int(factory.getSettings()), "multiplicity_preserved": True,
+                                "selected_native_metadata_query_insert_compatible": True}
+                    check("ordinary_before", ordinary)
                     check("structureGraph", structure)
                     check("get_set_signature_settings", settings)
                     check("generate_debug_signatures_and_vector", signatures)
                     def invalid_settings():
+                        actual_before = native_settings()
                         assert not interface.setSignatureSettings(0)
+                        desired = int(desired_settings_field.get(interface))
+                        actual_rejected = native_settings()
+                        assert desired == 0 and actual_rejected == actual_before, (desired, actual_rejected, actual_before)
                         assert interface.setSignatureSettings(73)
-                        return {"invalid_zero_rejected": True, "valid_73_recovered": True}
+                        repaired = native_settings()
+                        assert repaired["settings"] == 73, repaired
+                        return {"invalid_zero_rejected": True, "rejected_java_desired_settings": desired,
+                                "native_after_rejection": actual_rejected,
+                                "native_after_repair": repaired, "valid_73_recovered": True}
                     check("invalid_settings_recovery", invalid_settings)
+                    check("ordinary_after", ordinary)
                 finally:
                     interface.dispose()
         report["completed"] = True

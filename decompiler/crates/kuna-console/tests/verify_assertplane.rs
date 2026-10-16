@@ -25,6 +25,9 @@ use kuna_console::assertions::{self, Body, Directive, Outcome};
 use kuna_console::engine::{bootstrap_from_file, bootstrap_from_object, ConsoleProgram, EntrySelector};
 use kuna_console::project::decompile_targets;
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 const TARGET: &str = "authenticate";
 
 fn repo_root() -> PathBuf {
@@ -49,29 +52,83 @@ fn directive(spec: &str, body: Body) -> Directive {
 }
 
 #[test]
-fn parsed_callee_cleanup_is_committed_for_own_entries_only_when_enabled() {
+fn mapped_callee_output_preserves_authored_inputs_in_caller_queries() {
+    use kuna_base::address::Address;
+    use kuna_decomp::decompile_drive::build_and_follow_flow;
+    use kuna_decomp::dtype::type_metatype;
+
+    let mut corpus = corpus::Corpus::from_xml("mapped-callee-output", r#"<decompilertest>
+      <binaryimage arch="x86:LE:64:default:gcc">
+        <bytechunk space="ram" offset="0x1000" readonly="true">e8fbf0ffffc3</bytechunk>
+        <bytechunk space="ram" offset="0x100" readonly="true">c3</bytechunk>
+        <symbol space="ram" offset="0x1000" name="caller"/>
+        <symbol space="ram" offset="0x100" name="callee"/>
+      </binaryimage><script><com>quit</com></script>
+    </decompilertest>"#);
+    corpus.command("parse line extern int4 callee(int4 argument);").unwrap();
+    corpus.command("map return callee::r0x210 float8").unwrap();
+    let arch = corpus.data().conf.as_mut().unwrap().arch_mut();
+    let memory = arch.manage().get_default_code_space().unwrap().clone();
+    let entry = Address::new(memory.clone(), 0x100);
+    let output = Address::new(memory.clone(), 0x210);
+    let caller = build_and_follow_flow(arch, "caller", Address::new(memory, 0x1000), 0).unwrap();
+    let context = caller.get_arch();
+    for prototype in [
+        context.query_callee_proto(&entry).unwrap(),
+        context.query_function(&entry).unwrap().2,
+    ] {
+        assert!(prototype.is_output_locked());
+        assert!(prototype.is_input_locked());
+        assert_eq!(prototype.num_params(), 1);
+        let parameter = prototype.get_param(0).unwrap();
+        assert_eq!(parameter.get_name(), "argument");
+        assert_eq!(parameter.get_type().unwrap().get_metatype(), type_metatype::TYPE_INT);
+        assert_eq!(parameter.get_size(), 4);
+        let result = prototype.get_output_type().unwrap();
+        assert_eq!((result.get_metatype(), result.get_size()), (type_metatype::TYPE_FLOAT, 8));
+        assert_eq!(prototype.get_output().get_address(), output);
+    }
+}
+
+/// Parsed callees already carry a model during flow; defaultparams must still
+/// materialize their working cleanup before extrapopsetup consumes it.
+#[test]
+fn parsed_callee_cleanup_is_consumed_by_direct_callers_only_when_enabled() {
     use std::rc::Rc;
     use kuna_base::address::Address;
     use kuna_base::xml::DocumentStorage;
     use kuna_console::engine::bootstrap_program;
     use kuna_console::grammar::{parse_c, DataOrg};
+    use kuna_decomp::action::ActionContext;
+    use kuna_decomp::coreaction_protos::{ActionDefaultParams, ActionExtraPopSetup};
+    use kuna_decomp::decompile_drive::build_and_follow_flow;
     use kuna_decomp::fspec::EXTRAPOP_UNKNOWN;
-    let mut documents = DocumentStorage::new();
-    let image = documents.parse_document(br#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#)
-        .unwrap().get_root().clone();
-    let mut program = bootstrap_program(image, "x86:LE:32:default:windows",
-        &[repo_root().join("specs").to_str().unwrap().to_owned()]).unwrap();
+    let mut observed = Vec::new();
+    let mut expected = Vec::new();
     for enabled in [true, false] {
-        program.arch_mut().set_kuna_option("calleeprotostack", if enabled { "on" } else { "off" }).unwrap();
-        let arch = program.arch();
-        let (addr_size, word_size) = arch.data_org();
-        let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
-        for (declaration, model, cleanup, first_stack) in [
-            ("extern int __stdcall pop_std(int value);", "__stdcall", 8, true),
-            ("extern int __fastcall pop_fast(int value);", "__fastcall", 4, false),
-            ("extern int __fastcall pop_fast_stack(int a, int b, int c);", "__fastcall", 8, false),
-            ("extern int __cdecl pop_cdecl(int a, int b, int c);", "__cdecl", 4, true),
+        for (declaration, model, cleanup, first_stack, caller, second_caller, callee) in [
+            ("extern int __stdcall pop_std(int value);", "__stdcall", 8, true,
+                "68df9b57136a2ae8f40f00008b04245ac3",
+                "68df9b57136a2ae8f40e00008b04245ac3", "31c0c20400"),
+            ("extern int __fastcall pop_fast(int value);", "__fastcall", 4, false,
+                "68df9b5713b92a000000e8f10f00008b04245ac3",
+                "68df9b5713b92a000000e8f10e00008b04245ac3", "31c0c3"),
+            ("extern int __fastcall pop_fast_stack(int a, int b, int c);", "__fastcall", 8, false,
+                "68df9b57136a33b922000000ba11000000e8ea0f00008b04245ac3",
+                "68df9b57136a33b922000000ba11000000e8ea0e00008b04245ac3", "31c0c20400"),
+            ("extern int __cdecl pop_cdecl(int a, int b, int c);", "__cdecl", 4, true,
+                "68df9b57136a336a226a11e8f00f000083c40c8b04245ac3",
+                "68df9b57136a336a226a11e8f00e000083c40c8b04245ac3", "31c0c3"),
         ] {
+            let mut documents = DocumentStorage::new();
+            let xml = format!(r#"<binaryimage arch="x86:LE:32:default:windows"><bytechunk space="ram" offset="0x1000">{caller}</bytechunk><bytechunk space="ram" offset="0x1100">{second_caller}</bytechunk><bytechunk space="ram" offset="0x2000">{callee}</bytechunk></binaryimage>"#);
+            let image = documents.parse_document(xml.as_bytes()).unwrap().get_root().clone();
+            let mut program = bootstrap_program(image, "x86:LE:32:default:windows",
+                &[repo_root().join("specs").to_str().unwrap().to_owned()]).unwrap();
+            program.arch_mut().set_kuna_option("calleeprotostack", if enabled { "on" } else { "off" }).unwrap();
+            let arch = program.arch();
+            let (addr_size, word_size) = arch.data_org();
+            let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
             let mut parsed = None;
             parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
                 parsed = Some((pieces, name.to_owned())); Ok(())
@@ -79,19 +136,75 @@ fn parsed_callee_cleanup_is_committed_for_own_entries_only_when_enabled() {
             let (pieces, selected) = parsed.unwrap();
             assert_eq!(selected, model);
             let model = arch.get_model(&selected).unwrap().clone();
-            let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
-            let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
+            let code = arch.manage().get_default_code_space().unwrap().clone();
+            let entry = Address::new(code.clone(), 0x2000);
+            let mut fd = arch.new_funcdata(&pieces.name, entry.clone(), 0).unwrap();
             fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
             let proto = fd.get_func_proto();
             assert!(Rc::ptr_eq(proto.model(), &model));
-            assert_eq!(proto.get_extra_pop(), if enabled || selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN });
+            let source_cleanup = if selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN };
+            assert_eq!(proto.get_extra_pop(), source_cleanup);
             assert_eq!(proto.get_param(0).unwrap().get_address().get_space().unwrap().get_name() == "stack", first_stack);
+
+            program.declare_function(entry.clone(), Some(&pieces.name), 0).unwrap();
+            program.set_assertions(vec![directive(declaration, Body::Prototype {
+                func: pieces.name.clone(),
+                decl: declaration.strip_prefix("extern ").unwrap().to_owned(),
+            })]);
+            assertions::apply_program_scoped(&mut program);
+            assert_eq!(program.assertion_outcomes()[0].status, "applied");
+            let mut context = ActionContext::new();
+            let mut source_seed = None;
+            for (name, offset) in [("caller", 0x1000), ("second_caller", 0x1100)] {
+                let mut caller_fd = build_and_follow_flow(program.arch_mut(), name,
+                    Address::new(code.clone(), offset), 0).unwrap();
+                assert_eq!(caller_fd.num_calls(), 1);
+                let source = caller_fd.get_arch().query_callee_proto(&entry).unwrap();
+                if let Some(previous) = &source_seed {
+                    assert!(Rc::ptr_eq(previous, &source));
+                } else {
+                    source_seed = Some(source.clone());
+                }
+                assert!(Rc::ptr_eq(source.model(), &model));
+                assert_eq!(source.get_extra_pop(), source_cleanup);
+                assert_eq!(source.get_param(0).unwrap().get_address(),
+                    fd.get_func_proto().get_param(0).unwrap().get_address());
+                let call = caller_fd.get_call_specs(0);
+                assert_eq!(call.get_entry_address(), &entry);
+                assert!(call.proto().has_model(), "flow must copy the parsed model before actions");
+                assert!(Rc::ptr_eq(call.proto().model(), &model));
+                assert!(call.proto().is_input_locked());
+                assert_eq!(call.proto().get_param(0).unwrap().get_address(),
+                    source.get_param(0).unwrap().get_address());
+                ActionDefaultParams::boxed("base").apply(&mut caller_fd, &mut context);
+                let stack = program.arch().manage().get_space_by_name("stack").unwrap().get_index();
+                ActionExtraPopSetup::boxed("base", Some(stack)).apply(&mut caller_fd, &mut context);
+                let call = caller_fd.get_call_specs(0);
+                observed.push((enabled, pieces.name.clone(), name,
+                    call.get_extra_pop(), call.get_effective_extra_pop()));
+                let working_cleanup = if enabled || selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN };
+                expected.push((enabled, pieces.name.clone(), name, working_cleanup, working_cleanup));
+                let cached = caller_fd.get_arch().query_callee_proto(&entry).unwrap();
+                assert!(Rc::ptr_eq(&source, &cached));
+                assert_eq!(cached.get_extra_pop(), source_cleanup);
+                assert!(Rc::ptr_eq(cached.model(), &model));
+                assert_eq!(cached.get_param(0).unwrap().get_address(),
+                    fd.get_func_proto().get_param(0).unwrap().get_address());
+                let pending = program.pending_prototype(&pieces.name).unwrap();
+                assert_eq!(pending.name, pieces.name);
+                assert_eq!(pending.intypes.len(), pieces.intypes.len());
+                assert!(Rc::ptr_eq(pending.outtype.as_ref().unwrap(), pieces.outtype.as_ref().unwrap()));
+                for (cached, parsed) in pending.intypes.iter().zip(&pieces.intypes) {
+                    assert!(Rc::ptr_eq(cached, parsed));
+                }
+            }
         }
     }
+    assert_eq!(observed, expected, "working cleanup must reach the real caller stack-adjustment owner without changing the source declaration");
 }
 
 #[test]
-fn parsed_indirect_result_keeps_logical_origins_without_inventing_input_only_results() {
+fn parsed_large_result_and_input_only_edit_preserve_independent_locks() {
     use kuna_base::address::Address;
     use kuna_base::xml::DocumentStorage;
     use kuna_console::engine::bootstrap_program;
@@ -562,6 +675,7 @@ fn output_only_prototype_pieces_preserve_output_authority_without_input_lock() {
             mapped_symbols: &[],
             usepoint_symbols: &[],
             dynamic_symbols: &[],
+            object_assertions: &[],
             pending_proto: Some(&pieces),
             flow_overrides: &[],
             mapped_params: &[],

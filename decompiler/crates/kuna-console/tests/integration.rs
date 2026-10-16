@@ -1,6 +1,15 @@
 // Shared integration-test executable. Process-sensitive tests stay separate.
 mod common;
 
+#[path = "deadcode_b4.rs"]
+mod deadcode_b4;
+
+#[path = "decompile_e2e.rs"]
+mod decompile_e2e;
+
+#[path = "funcdata_encode_e2e.rs"]
+mod funcdata_encode_e2e;
+
 #[path = "setup_commands.rs"]
 mod setup_commands;
 
@@ -151,6 +160,9 @@ mod verify_fdeinterior;
 #[path = "verify_fid_build.rs"]
 mod verify_fid_build;
 
+#[path = "verify_float_literals.rs"]
+mod verify_float_literals;
+
 #[path = "verify_floatglobals.rs"]
 mod verify_floatglobals;
 
@@ -241,6 +253,9 @@ mod verify_midstring_literals;
 #[path = "verify_mips16_isa.rs"]
 mod verify_mips16_isa;
 
+#[path = "verify_mips_internal_roles.rs"]
+mod verify_mips_internal_roles;
+
 #[path = "verify_mips_plt.rs"]
 mod verify_mips_plt;
 
@@ -258,6 +273,9 @@ mod verify_multiformat_passes;
 
 #[path = "verify_multiformat_sourcelang.rs"]
 mod verify_multiformat_sourcelang;
+
+#[path = "verify_nested_callable_binding.rs"]
+mod verify_nested_callable_binding;
 
 #[path = "verify_noreturn_demangle.rs"]
 mod verify_noreturn_demangle;
@@ -333,6 +351,9 @@ mod verify_relocrebase;
 
 #[path = "verify_retcallchain.rs"]
 mod verify_retcallchain;
+
+#[path = "verify_return_role_bookkeeping.rs"]
+mod verify_return_role_bookkeeping;
 
 #[path = "verify_return_uncomputed.rs"]
 mod verify_return_uncomputed;

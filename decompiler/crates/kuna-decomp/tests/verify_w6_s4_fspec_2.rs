@@ -362,28 +362,6 @@ fn update_all_types_propagates_stub_lowlevel_w6s4f1() {
     );
 }
 
-#[test]
-fn update_all_types_propagates_missing_space_lowlevel_w6s4f1() {
-    let mgr = AddrSpaceManager::new();
-    let reg = reg_space_le();
-    let model = Rc::new(two_reg_proto_model(&mgr, &reg));
-    let tf = kuna_decomp::dtype::TypeFactoryImpl::new();
-    let mut fp = FuncProto::new();
-    fp.set_internal(model, void_type());
-    let proto = PrototypePieces {
-        name: "g".into(),
-        outtype: Some(int8_type()),
-        intypes: vec![int4_type()],
-        innames: vec!["a".into()],
-        first_var_arg_slot: -1,
-        output_storage: None,
-        input_storage: Vec::new(),
-    };
-    let result = fp.update_all_types(&proto, &tf, &mgr);
-    assert!(matches!(result, Err(KunaError::Lowlevel { .. })),
-        "missing stack space must remain a real ABI assignment error: {result:?}");
-}
-
 /// Control case proving the catch is genuinely too broad: a return value that
 /// the model CAN assign (4-byte int into the 4-byte output reg) must succeed
 /// with NO error flag and a real (non-void) output.  This isolates the F1

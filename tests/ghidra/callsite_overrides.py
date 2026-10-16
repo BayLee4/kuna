@@ -77,7 +77,7 @@ def run(output, report):
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.address import AddressSet
     from ghidra.program.model.data import (
-        CharDataType, DataTypeConflictHandler, DoubleDataType, FunctionDefinitionDataType,
+        CharDataType, DataTypeConflictHandler, DoubleDataType, FloatDataType, FunctionDefinitionDataType,
         IntegerDataType, LongLongDataType, ParameterDefinition, ParameterDefinitionImpl,
         PointerDataType, ShortDataType, StructureDataType, UnsignedLongLongDataType, VoidDataType,
     )
@@ -176,7 +176,19 @@ def run(output, report):
             ParameterDefinitionImpl(f"arg{i}", dtype, None) for i, dtype in enumerate(types)
         ]))
         definition.setVarArgs(varargs)
+        namespace = HighFunction.findOverrideSpace(fn)
+        prior = [] if namespace is None else [
+            (symbol, HighFunctionDBUtil.readOverride(symbol))
+            for symbol in fn.getProgram().getSymbolTable().getSymbols(namespace)
+            if symbol.getAddress() == address(fn.getProgram(), site)
+            and HighFunctionDBUtil.readOverride(symbol) is not None
+        ]
+        assert len(prior) <= 1, "expected at most one override to replace"
+        if prior:
+            prior[0][0].delete()
         HighFunctionDBUtil.writeOverride(fn, address(fn.getProgram(), site), definition)
+        if prior:
+            prior[0][1].cleanupUnusedOverride()
 
     def remove_override(fn, site):
         namespace = HighFunction.findOverrideSpace(fn)
@@ -206,7 +218,7 @@ def run(output, report):
 
     def observe(ifc, fn, label, core, expected, preamble, driver, opcode=None,
                 returns=None, committed_parameters=False,
-                physical_input_size=None, input_text=None, callable_unit=False):
+                physical_input_size=None, input_text=None, callable_unit=False, functions=()):
         row = {"case": label, "core": core}
         rows.append(row)
         result = None
@@ -261,13 +273,10 @@ def run(output, report):
                     if constant is not None:
                         assert constant_value(vn) == constant, row
             row["ir_passed"] = True
-            if callable_unit and core == "stock":
-                row["c_executed"] = False
-                row["execution_scope"] = "Paired source/metadata control; no duplicate stock executable consumer"
-            elif callable_unit:
+            if callable_unit:
                 row["stdout"] = execute_export(fn.getProgram(), [result], driver,
                                                 output=output, stem=f"{label}-{core}",
-                                                input_text=input_text)
+                                                input_text=input_text, functions=functions)
                 row["c_executed"] = True
             else:
                 row["stdout"] = execute_c(row["c"], PREAMBLE + preamble, driver, input_text=input_text)
@@ -363,12 +372,23 @@ def run(output, report):
                                 "int main(void) { return direct_caller() != 50; }\n",
                                 callable_unit=True)
                         rows[-1]["machine_result"] = native
+                        if core == "stock":
+                            preamble = ("static int calls;\nint direct_target(int x" + (", int y" if two else "")
+                                        + ") { ++calls; " + ("(void)y; " if two else "") + "return x * 10; }\n")
+                            observe(ifc, caller, "direct_occurrences_" + phase, core, [(0x100a, args)],
+                                    preamble,
+                                    "int main(void) { return direct_caller() != 50 || calls != 1; }\n")
                         native = machine_return(value, 0x1100)
                         assert native == 70, native
                         observe(ifc, other, "other_" + phase, core, [(0x110a, [(4, integer, 7)])],
                                 "", "int main(void) { return other_caller() != 70; }\n",
                                 callable_unit=True)
                         rows[-1]["machine_result"] = native
+                        if core == "stock":
+                            observe(ifc, other, "other_occurrences_" + phase, core,
+                                    [(0x110a, [(4, integer, 7)])],
+                                    "static int calls; int direct_target(int x) { ++calls; return x * 10; }\n",
+                                    "int main(void) { return other_caller() != 70 || calls != 1; }\n")
                         assert fingerprint(target) == unchanged, "site override changed the global callee"
 
         # Preserve the original two-register body as a separate physical-state
@@ -576,6 +596,12 @@ def run(output, report):
                             [(site, [(4, integer, 5)])],
                             "", "int main(void) { return resolved_caller() != 5; }\n",
                             opcode=PcodeOp.CALL, callable_unit=True)
+                    if core == "stock":
+                        observe(ifc, caller, "resolved_indirect_occurrences", core,
+                                [(site, [(4, integer, 5)])],
+                                "static int calls; int resolved_target(int value) { ++calls; return value; }\n",
+                                "int main(void) { return resolved_caller() != 5 || calls != 1; }\n",
+                                opcode=PcodeOp.CALL)
                 assert fingerprint(target) == unchanged
 
         native_apple = platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
@@ -745,6 +771,11 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                             "", "int main(void) { return fast_caller() != 11; }\n",
                             callable_unit=True)
                     rows[-1]["machine_result"] = native
+                    if core == "stock":
+                        observe(ifc, caller, "nondefault_fastcall_occurrences", core,
+                                [(site, [(4, integer, 5), (4, integer, 6)])],
+                                "static int calls; int fast_target(int a, int b) { ++calls; return a + b; }\n",
+                                "int main(void) { return fast_caller() != 11 || calls != 1; }\n")
                 assert (fingerprint(target), fingerprint(caller)) == unchanged, \
                     "independent convention recovery changed source authority"
 
@@ -834,7 +865,7 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                                          "int main(void) { return typed_fast_caller(typed_fast_target) != 11; }\n",
                                          opcode=PcodeOp.CALLIND, committed_parameters=True,
                                          returns={0x100e: short if phase == "override_result" else integer},
-                                         callable_unit=True)
+                                         callable_unit=True, functions=(target,))
                         assert (fingerprint(target), fingerprint(caller)) == unchanged
 
         with program("inferred_fastcall_wrong_cleanup", bits=32) as (value, api):
@@ -854,6 +885,13 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                     assert high is not None and result.getCCodeMarkup() is not None
                     row["stack_cleanup"] = int(high.getFunctionPrototype().getExtraPop())
                     assert row["stack_cleanup"] == 12, row
+                    execute_export(value, [result], "int main(void) { return 0; }\n",
+                                   output=output, stem="wrong-cleanup-kuna",
+                                   direct_call={"function": "wrong_cleanup",
+                                                "registers": {"ECX": 5, "EDX": 6},
+                                                "initial_esp": 0x7fe0,
+                                                "expected_result": 11,
+                                                "expected_final_esp": 0x7fec})
                 assert fingerprint(target) == unchanged, "Cleanup verification changed source authority"
                 row["passed"] = True
             except Exception:
@@ -967,6 +1005,46 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                 assert target.hasNoReturn()
 
         for core in ("stock", "kuna"):
+            with program("unmarked_trap_boundary") as (value, api):
+                with transaction(value):
+                    trap = function(value, api, 0x1000, bytes.fromhex("cc"), "unmarked_trap")
+                    signature(trap, [])
+                instruction = value.getListing().getInstructionAt(address(value, 0x1000))
+                raw = list(instruction.getPcode(True))
+                raw_opcodes = [int(op.getOpcode()) for op in raw]
+                assert instruction.getFlowOverride() == FlowOverride.NONE
+                assert PcodeOp.CALLOTHER in raw_opcodes and PcodeOp.CALLIND in raw_opcodes
+                returns = [op for op in raw if op.getOpcode() == PcodeOp.RETURN]
+                assert len(returns) == 1 and returns[0].getInput(0).isConstant()
+                assert int(returns[0].getInput(0).getOffset()) == 0
+                unchanged = fingerprint(trap)
+                row = {"case": "unmarked_trap_boundary", "core": core,
+                       "raw_opcodes": raw_opcodes, "flow_override": "NONE",
+                       "c_executed": False,
+                       "evidence_scope": "Actual INT3 diagnostic origin; kernel interrupt context is not supplied"}
+                rows.append(row)
+                try:
+                    with interface(value, core) as ifc:
+                        result = ifc.decompileFunction(trap, 60, monitor)
+                        row["completed"] = bool(result.decompileCompleted())
+                        row["error"] = str(result.getErrorMessage())
+                        assert row["completed"], row
+                        high = result.getHighFunction()
+                        emitted = result.getDecompiledFunction()
+                        assert high is not None and emitted is not None, row
+                        row["high_opcodes"] = [int(op.getOpcode()) for op in high.getPcodeOps()]
+                        assert PcodeOp.CALLOTHER in row["high_opcodes"], row
+                        assert PcodeOp.CALLIND in row["high_opcodes"], row
+                        row["c"] = str(emitted.getC())
+                        (output / f"unmarked_trap_boundary-{core}.c").write_text(row["c"])
+                        assert fingerprint(trap) == unchanged
+                        assert instruction.getFlowOverride() == FlowOverride.NONE
+                        row["passed"] = True
+                except Exception:
+                    row["passed"] = False
+                    row["failure"] = traceback.format_exc()
+
+        for core in ("stock", "kuna"):
             with program("shared_callback") as (value, api):
                 pointer = PointerDataType(integer, value.getDataTypeManager())
                 with transaction(value):
@@ -1004,6 +1082,74 @@ int main(void) {
                             preamble, driver, opcode=PcodeOp.CALLIND,
                             returns={0x1011: integer, 0x101e: pointer}, committed_parameters=True)
                 assert fingerprint(caller) == unchanged, "site casts changed the callback declaration"
+
+        for name, text, first, second in [
+            ("printf", "%d %lld", 65, 0x1122334455667788),
+            ("scanf", "%d %hd", 0x4000, 0x5000),
+        ]:
+            with program("analyzed_" + name) as (value, api):
+                charptr = PointerDataType(CharDataType.dataType, value.getDataTypeManager())
+                with transaction(value):
+                    target = external_function(value, 0x2000, name)
+                    signature(target, [("format", charptr)], varargs=True)
+                    memory(value, api, 0x3000, text.encode() + b"\0", "format_data", False)
+                    api.createAsciiString(address(value, 0x3000))
+                    api.createLabel(address(value, 0x3000), "format_text", True)
+                    memory(value, api, 0x4000, bytes(8), "destination_one", False)
+                    memory(value, api, 0x5000, bytes(8), "destination_two", False)
+                    api.createLabel(address(value, 0x4000), "destination_one", True)
+                    api.createLabel(address(value, 0x5000), "destination_two", True)
+                    prefix = b"\xbf" + struct.pack("<I", 0x3000) + b"\x48\xbe" + struct.pack("<Q", first)
+                    prefix += b"\x48\xba" + struct.pack("<Q", second) + bytes.fromhex("b96300000031c0")
+                    site = 0x1000 + len(prefix)
+                    caller = function(value, api, 0x1000, prefix + call(site) + b"\xc3", "call_" + name)
+                    signature(caller, [])
+                unchanged = fingerprint(target)
+                field.set(None, None)
+                with transaction(value):
+                    log = MessageLog()
+                    assert FormatStringAnalyzer().added(value, caller.getBody(), monitor, log), str(log)
+                assert HighFunctionDBUtil.getFirstVarArg(value, address(value, site)) == 1
+                namespace = HighFunction.findOverrideSpace(caller)
+                definitions = [HighFunctionDBUtil.readOverride(s) for s in value.getSymbolTable().getSymbols(namespace)]
+                definitions = [d.getDataType() for d in definitions if d is not None]
+                assert len(definitions) == 1 and not definitions[0].hasVarArgs()
+                expected_types = ([charptr, integer, wide] if name == "printf" else
+                                  [charptr, PointerDataType(integer, value.getDataTypeManager()),
+                                   PointerDataType(short, value.getDataTypeManager())])
+                assert len(definitions[0].getArguments()) == 3
+                assert all(p.getDataType().isEquivalent(t) for p, t in zip(definitions[0].getArguments(), expected_types))
+                arguments = [(8, charptr, 0x3000),
+                             (4 if name == "printf" else 8, expected_types[1], first),
+                             (8, expected_types[2], second)]
+                preamble = f'#include <stdio.h>\nchar format_text[] = "{text}";\n'
+                input_text = None
+                if name == "printf":
+                    expected_stdout = "65 1234605616436508552"
+                    driver = f"int main(void) {{ return call_printf() != {len(expected_stdout)}; }}\n"
+                else:
+                    preamble += ("union { int value; unsigned char bytes[8]; } destination_one;\n"
+                                 "union { short value; unsigned char bytes[8]; } destination_two;\n")
+                    expected_stdout = ""
+                    input_text = "65 -7!"
+                    driver = r"""
+int main(void) {
+    if (call_scanf() != 2 || destination_one.value != 65 || destination_two.value != -7) return 1;
+    return fgetc(stdin) != '!' || fgetc(stdin) != EOF;
+}
+"""
+                with interface(value, "stock") as ifc:
+                    capture = output / f"analyzer_{name}-stock.xml"
+                    ifc.enableDebug(File(str(capture)))
+                    observe(ifc, caller, "analyzer_" + name, "stock", [(site, arguments)],
+                            preamble, driver, input_text=input_text)
+                    if rows[-1].get("c_executed"):
+                        assert rows[-1]["stdout"] == expected_stdout, rows[-1]
+                    records = captured_overrides(capture)
+                    assert records and all(record == {"first": 1, "inputs": 3, "open": False}
+                                           for record in records), records
+                    rows[-1]["wire"] = records
+                assert fingerprint(target) == unchanged, "analyzer override changed the global callee"
 
         host = platform.system()
         assert host in ("Darwin", "Linux"), f"genuine native-library fixture requires Darwin or Linux, got {host}"
@@ -1238,29 +1384,79 @@ int main(void) {
                     assert (fingerprint(target), fingerprint(external), fingerprint(caller), import_receipt()) == unchanged, \
                         "analyzer/publication changed the imported source declaration or provenance"
                     row["passed"] = True
-                    # Each negative changes the actual imported program, not the
-                    # emitted C or a synthetic proof. Roll back before the next.
-                    negative = {"case": f"analyzer_{name}_source_edit", "core": "kuna", "passed": False}
-                    rows.append(negative)
-                    tx = value.startTransaction("native imported source edit")
-                    try:
-                        external.setReturnType(wide, user)
-                        with interface(value, "kuna") as ifc:
-                            changed = ifc.decompileFunction(caller, 60, monitor)
-                            assert changed.decompileCompleted(), str(changed.getErrorMessage())
-                            assert changed.getHighFunction() is not None and changed.getCCodeMarkup() is not None
-                            negative["c"] = str(changed.getDecompiledFunction().getC())
-                            negative["source"] = fingerprint(external)
-                            negative["import"] = import_receipt()
-                            assert external.getReturnType().isEquivalent(wide)
-                            calls = [op for op in changed.getHighFunction().getPcodeOps()
-                                     if op.getOpcode() == PcodeOp.CALL]
-                            assert len(calls) == 1
-                            assert calls[0].getOutput() is not None and calls[0].getOutput().getSize() == 8
-                        negative["passed"] = True
-                    finally:
-                        value.endTransaction(tx, False)
-                    print(f"PASS kuna: {negative['case']}", flush=True)
+                    bindings = []
+                    for reference in value.getReferenceManager().getReferencesTo(target.getEntryPoint()):
+                        data = value.getListing().getDataAt(reference.getFromAddress())
+                        if (reference.getReferenceType().isData()
+                                and reference.getSource() in (SourceType.DEFAULT, SourceType.IMPORTED)
+                                and data is not None and data.getLength() == ptrsize
+                                and data.getValue() == target.getEntryPoint()):
+                            bindings.append(data.getAddress())
+                    assert bindings, ("actual loader pointer binding missing", receipt)
+                    receipt["pointer_slots"] = [str(slot) for slot in bindings]
+                    for mutation in ("source", "slot", "mapped_body", "thunk_target"):
+                        negative = {"case": f"analyzer_{name}_{mutation}_edit", "core": "kuna",
+                                    "passed": False,
+                                    "evidence_scope": "Actual edited import/source/raw acquisition; "
+                                                      "ordinary CppExporter has no retained-publication submission"}
+                        rows.append(negative)
+                        tx = value.startTransaction("native imported source edit")
+                        try:
+                            if mutation == "source":
+                                external.setReturnType(wide, user)
+                            elif mutation == "slot":
+                                for slot in bindings:
+                                    value.getMemory().setBytes(slot, JArray(JByte)(b"\0" * ptrsize))
+                            elif mutation == "thunk_target":
+                                alternate_names = (("_scanf", "scanf", "__isoc99_scanf") if name == "printf"
+                                                   else ("_printf", "printf"))
+                                alternatives = [location.getFunction() for location in
+                                                value.getExternalManager().getExternalLocations(receipt["library"])
+                                                if str(location.getLabel()) in alternate_names]
+                                assert len(alternatives) == 1 and alternatives[0] is not None
+                                target.setThunkedFunction(alternatives[0])
+                            else:
+                                start = target.getEntryPoint()
+                                first = value.getListing().getInstructionAt(start)
+                                assert first is not None
+                                value.getListing().clearCodeUnits(start, first.getMaxAddress(), False)
+                                replacement = bytes.fromhex("c0035fd6") if host == "Darwin" else b"\xc3"
+                                value.getMemory().setBytes(start, JArray(JByte)(replacement))
+                                assert FlatProgramAPI(value, monitor).disassemble(start)
+                            with interface(value, "kuna") as ifc:
+                                changed = ifc.decompileFunction(caller, 60, monitor)
+                                assert changed.decompileCompleted(), str(changed.getErrorMessage())
+                                assert changed.getHighFunction() is not None and changed.getCCodeMarkup() is not None
+                                negative["c"] = str(changed.getDecompiledFunction().getC())
+                                negative["source"] = fingerprint(external)
+                                negative["import"] = import_receipt()
+                                if mutation == "source":
+                                    assert external.getReturnType().isEquivalent(wide)
+                                    namespace = HighFunction.findOverrideSpace(caller)
+                                    site_records = [HighFunctionDBUtil.readOverride(symbol)
+                                                    for symbol in value.getSymbolTable().getSymbols(namespace)]
+                                    site_records = [record for record in site_records
+                                                    if record is not None and record.getAddress() == instruction.getAddress()]
+                                    assert len(site_records) == 1
+                                    site_return = site_records[0].getDataType().getReturnType()
+                                    assert site_return.isEquivalent(integer)
+                                    negative["site_return"] = str(site_return)
+                                    calls = [op for op in changed.getHighFunction().getPcodeOps()
+                                             if op.getOpcode() == PcodeOp.CALL]
+                                    assert len(calls) == 1
+                                    assert calls[0].getOutput() is not None
+                                    assert calls[0].getOutput().getSize() == site_return.getLength()
+                                elif mutation == "slot":
+                                    assert all(value.getMemory().getLong(slot) == 0 for slot in bindings)
+                                elif mutation == "thunk_target":
+                                    assert target.getThunkedFunction(True) == alternatives[0]
+                                else:
+                                    raw = value.getListing().getInstructionAt(target.getEntryPoint()).getPcode()
+                                    assert any(op.getOpcode() == PcodeOp.RETURN for op in raw)
+                            negative["passed"] = True
+                        finally:
+                            value.endTransaction(tx, False)
+                        print(f"PASS kuna: {negative['case']}", flush=True)
 
         for core in ("stock", "kuna"):
             with program("variadic_indirect") as (value, api):
@@ -1320,12 +1516,40 @@ static int (*volatile runtime_callback)(int, ...);
                 preamble = "typedef int variadic_callback(int, ...);\ntypedef int code(int, ...);\n" + witness
                 driver = ("int main(void) { runtime_callback = variadic_impl; "
                           "return invoke_variadic(runtime_callback) != 42 || calls != 1; }\n")
-                consumer = witness if core == "kuna" else ""
+                consumer = witness
                 args = [(4, integer, 1), (4, integer, 7), (8, double, 0x4004000000000000)]
                 unchanged = fingerprint(target)
                 with interface(value, core) as ifc:
                     observe(ifc, caller, "variadic_computed_call", core, [(site, args)], preamble,
                             consumer + driver, opcode=PcodeOp.CALLIND, callable_unit=True)
+                    if core == "kuna":
+                        negative = {"case": "variadic_unpromoted_tail", "core": core, "passed": False}
+                        rows.append(negative)
+                        tx = value.startTransaction("unpromoted native variadic tail")
+                        try:
+                            remove_override(caller, site)
+                            override(caller, site, [integer, ShortDataType.dataType, FloatDataType.dataType])
+                            ifc.flushCache()
+                            changed = ifc.decompileFunction(caller, 60, monitor)
+                            assert changed.decompileCompleted(), str(changed.getErrorMessage())
+                            assert changed.getHighFunction() is not None and changed.getCCodeMarkup() is not None
+                            namespace = HighFunction.findOverrideSpace(caller)
+                            records = [HighFunctionDBUtil.readOverride(symbol)
+                                       for symbol in value.getSymbolTable().getSymbols(namespace)]
+                            records = [record for record in records if record is not None]
+                            assert len(records) == 1
+                            types = [argument.getDataType() for argument in records[0].getDataType().getArguments()]
+                            assert types[1].isEquivalent(ShortDataType.dataType)
+                            assert types[2].isEquivalent(FloatDataType.dataType)
+                            negative["c"] = str(changed.getDecompiledFunction().getC())
+                            negative["stdout"] = execute_c(negative["c"], PREAMBLE + preamble, driver)
+                            negative["c_executed"] = True
+                            negative["passed"] = True
+                        except Exception:
+                            negative["failure"] = traceback.format_exc()
+                        finally:
+                            value.endTransaction(tx, False)
+                            ifc.flushCache()
                     capture = output / f"variadic_opaque_call-{core}.xml"
                     ifc.enableDebug(File(str(capture)))
                     observe(ifc, opaque_caller, "variadic_opaque_call", core, [(opaque_site, args)], preamble,

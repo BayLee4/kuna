@@ -1,6 +1,6 @@
 //! Dead-code elimination must preserve the observable byte returned by boolless.
 
-mod common;
+use crate::common;
 #[path = "common/corpus.rs"]
 mod corpus;
 

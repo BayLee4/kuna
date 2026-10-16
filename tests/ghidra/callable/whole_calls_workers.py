@@ -7,7 +7,7 @@ import struct
 import subprocess
 import traceback
 from whole_calls import Machine
-from support import require_provider_body, start_ghidra
+from support import require_provider_body, require_absent_provider_body, start_ghidra
 
 
 def elf_symbols(binary):
@@ -56,6 +56,7 @@ def main():
     parser.add_argument('--binary', type=Path, required=True)
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--mode', choices=('serial', 'jobs2', 'stream'), default='jobs2')
+    parser.add_argument('--exclude-dispatch', action='store_true')
     parser.add_argument('--machine-only', action='store_true')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=False)
@@ -63,6 +64,7 @@ def main():
               'mode': args.mode,
               'cli_sha256': hashlib.sha256(args.cli.read_bytes()).hexdigest(),
               'elf_sha256': hashlib.sha256(args.binary.read_bytes()).hexdigest(),
+              'dispatch_excluded': args.exclude_dispatch,
               'commands': [], 'completed': False}
     def invoke(command, expect=0):
         result = subprocess.run(list(map(str, command)), cwd='/tmp', capture_output=True, text=True, timeout=240)
@@ -79,6 +81,7 @@ def main():
         cases = 0
         try:
             for which, name in [(0,'byte_target'),(1,'word_target')]:
+                assert machine.call(symbols['choose'], which) == symbols[name]
                 assert machine.call(symbols['choose'], which) == symbols[name]
             for name, want in [('direct_dirty',0),('direct_clean',1),('ambient_dirty',0),('ambient_clean',1)]:
                 assert machine.call(symbols[name]) == want
@@ -104,9 +107,14 @@ def main():
         report['machine']={'dispatch_cases':cases,'invoke_cases':cases,'ambient_cases':768,'wide_ambient_cases':768,'bool_cases':768,'pointer_identity':True,'native_byte':1,'native_word':0}
         if args.machine_only:
             report['machine_only'] = True
+            (args.out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
+            print(json.dumps(report,indent=2))
             return
         names=['choose','byte_target','word_target','invoke','dispatch','direct_dirty','direct_clean','ambient','ambient_dirty','ambient_clean','bool_byte','wide_ambient',
                'carry_dispatch','carry_invoke','carry_ambient','carry_bool']
+        if args.exclude_dispatch:
+            names.remove('dispatch')
+            names.remove('carry_dispatch')
         jobs = ['--jobs', '2'] if args.mode == 'jobs2' else []
         common=['--functions',','.join(names),*jobs,'--language','c']
         export_mode = ['--stream'] if args.mode == 'stream' else []
@@ -117,24 +125,42 @@ def main():
         expected={'choose':[('which',4)],'byte_target':[('value',1)],'word_target':[('value',1)],'invoke':[('value',1),('callback',8)],'dispatch':[('value',1),('which',4)],'direct_dirty':[],'direct_clean':[],'ambient':[],'ambient_dirty':[],'ambient_clean':[],'bool_byte':[('value',1)],'wide_ambient':[('bits',8)]}
         expected.update({'carry_dispatch':[('bits',8),('which',4)],'carry_invoke':[('bits',8),('callback',8)],
                          'carry_ambient':[('bits',8)],'carry_bool':[('bits',8)]})
-        actual={}
-        for function in metadata['functions']:
-            assert function.get('error') is None, function
-            params=sorted((v for v in function['variables'] if v['kind']=='arg'),key=lambda v:v['arg_index'])
-            assert [v['arg_index'] for v in params] == list(range(len(params))), function
-            actual[function['name']]=[(v['name'],v['size']) for v in params]
-        assert actual==expected, (actual,expected)
-        report['source_metadata']=actual
+        if args.exclude_dispatch:
+            del expected['dispatch']
+            del expected['carry_dispatch']
+        try:
+            assert len(metadata['functions']) == len(expected), metadata
+            assert {function['name'] for function in metadata['functions']} == set(expected), metadata
+            actual={}
+            for function in metadata['functions']:
+                assert function.get('error') is None, function
+                params=sorted((v for v in function['variables'] if v['kind']=='arg'),key=lambda v:v['arg_index'])
+                assert [v['arg_index'] for v in params] == list(range(len(params))), function
+                actual[function['name']]=[(v['name'],v['size']) for v in params]
+            assert actual==expected, (actual,expected)
+            report['source_metadata']=actual
+        except Exception:
+            report['source_metadata_failure']=traceback.format_exc()
         stem=args.binary.name
         emitted_c=project/(stem+'.c'); emitted_h=project/(stem+'.h')
         for name in expected:
             require_provider_body(emitted_c, name)
         report['emitted_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in (emitted_c,emitted_h)}
         driver=args.out/'consumer.c'
-        dispatch_check='if(carry_dispatch(raw,which)!=want) return 14;'
+        dispatch_check='' if args.exclude_dispatch else 'if(carry_dispatch(raw,which)!=want) return 14;'
+        narrow_dispatch='' if args.exclude_dispatch else 'if(dispatch(value,which)!=want)return 20;'
         driver.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "'+stem+'.h"\n'+'''int main(void) {
  if(choose(0)!=choose(0)||choose(1)!=choose(1)||choose(0)==choose(1))return 11;
  if(direct_dirty()!=0||direct_clean()!=1||ambient_dirty()!=0||ambient_clean()!=1)return 12;
+ if(bool_byte(0)!=0||bool_byte(1)!=0)return 19;
+ for(unsigned low=0;low<256;++low){
+  Flags value=(Flags)low;int want=low==85;
+  if(byte_target(value)!=want||word_target(value)!=want)return 18;
+  for(unsigned which=0;which<2;++which){
+   if(invoke(value,choose(which))!=want)return 21;
+'''+narrow_dispatch+'''
+  }
+ }
  const uint64_t upper[]={0,UINT64_C(0x10000),UINT64_C(0x1234567800000000)};
  unsigned checked=0;
  for(unsigned p=0;p<3;++p)for(unsigned low=0;low<256;++low){
@@ -150,20 +176,38 @@ def main():
  printf("checked=%u\\n",checked);return 0;
 }
 ''')
+        report['consumer_failures']=[]
         for opt in ('-O0','-O2'):
             for char_mode in ('-fsigned-char', '-funsigned-char'):
-                exe=args.out/('consumer'+opt+char_mode)
-                invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,char_mode,'-I',project,emitted_c,driver,'-o',exe])
-                invoke([exe])
-        native_common=['--functions','forward',*jobs,'--language','c']
-        native=json.loads(invoke([args.cli,'decompile-all',args.binary,'--json',*native_common])['stdout'])['functions'][0]
-        assert native.get('error') is None, native
-        assert [(v['name'],v['size']) for v in native['variables'] if v['kind']=='arg']==[('callback',8)],native
+                try:
+                    exe=args.out/('consumer'+opt+char_mode)
+                    invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,char_mode,'-I',project,emitted_c,driver,'-o',exe])
+                    invoke([exe])
+                except BaseException:
+                    report['consumer_failures'].append({'optimization':opt,'char_mode':char_mode,
+                                                       'failure':traceback.format_exc()})
+        assert not report['consumer_failures'],report['consumer_failures']
         report['behavioral_checks_completed']=True
-        report['completed']=True
     except BaseException:
         report['failure']=traceback.format_exc()
-        raise
+    try:
+        jobs = ['--jobs', '2'] if args.mode == 'jobs2' else []
+        export_mode = ['--stream'] if args.mode == 'stream' else []
+        native_common=['--functions','forward',*jobs,'--language','c']
+        native=json.loads(invoke([args.cli,'decompile-all',args.binary,'--json',*native_common])['stdout'])['functions'][0]
+        assert native.get('error') is None and native.get('code'), native
+        assert [(v['name'],v['size']) for v in native['variables'] if v['kind']=='arg']==[('callback',8)],native
+        exported=invoke([args.cli,'decompile-project',args.binary,'-o',args.out/'native-project',
+                         *native_common,*export_mode])
+        native_body=args.out/'native-project'/(args.binary.name+'.c')
+        require_provider_body(native_body,'forward')
+        for name in symbols:
+            if name!='forward':
+                require_absent_provider_body(native_body,name)
+        report['native_boundary']={'project_status':exported['status']}
+        report['completed']=not any(key in report for key in ('failure','source_metadata_failure'))
+    except BaseException:
+        report['native_boundary_failure']=traceback.format_exc()
     finally:
         (args.out/'report.json').write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2))

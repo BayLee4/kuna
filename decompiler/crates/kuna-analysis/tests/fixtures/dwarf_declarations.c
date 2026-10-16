@@ -9,6 +9,7 @@ typedef void (*NoReturn)(void) __attribute__((noreturn));
 typedef struct Node Node;
 struct Node { Node *next; void (*visit)(Node *); };
 typedef enum Mode { Seven = 7, Negative = -1 } Mode;
+typedef struct { unsigned char op; unsigned short val; } code;
 struct Forward;
 typedef struct Forward ForwardAlias;
 volatile int object_volatile;
@@ -39,6 +40,11 @@ signed char signed_identity(signed char value) { return value; }
 char plain_identity(char value) { return value; }
 Node *node_identity(Node *value) { return value; }
 Mode mode_identity(Mode value) { return value; }
+int walk_source_codes(code *base, int n) {
+    int total = 0;
+    while (n-- > 0) { total += base->val; ++base; }
+    return total;
+}
 int consume_forward(ForwardAlias *value, int count) { return value ? count : 0; }
 int read_object_twice(void) { return object_volatile + object_volatile; }
 int read_pointer_twice(void) { return *pointer_volatile + *pointer_volatile; }

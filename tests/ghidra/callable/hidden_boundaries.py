@@ -6,7 +6,7 @@ from support import ROOT, tool, require_provider_body
 from whole_calls_workers import ElfMachine,elf_symbols
 p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True);p.add_argument('--binary',type=Path,required=True);p.add_argument('--cli',type=Path,required=True);p.add_argument('--sha256',required=True);a=p.parse_args();a.out.mkdir(parents=True,exist_ok=False)
 repo=ROOT;r={'completed':False,'binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'cli_sha256':hashlib.sha256(a.cli.read_bytes()).hexdigest(),'cases':[]};assert r['cli_sha256']==a.sha256
-cases=[('hidden_local','make_big','BigFn',True),('hidden_overlap','make_big','BigFn',False),('hidden_below_sp','make_big','BigFn',False),('hidden_live_alias','make_big','BigFn',False),('hidden_explicit_alias','make_big_explicit','AliasFn',False)]
+cases=[('hidden_local','make_big','BigFn',True),('hidden_overlap','make_big','BigFn',False),('hidden_below_sp','make_big','BigFn',False),('hidden_live_alias','make_big','BigFn',False),('hidden_explicit_alias','make_big_explicit','AliasFn',False),('hidden_raw_child','make_big','BigFn',False),('explicit_pointer','write_big','WriterFn',False)]
 symbols=elf_symbols(a.binary);m=ElfMachine(a.binary,a.out)
 try:
  from java.math import BigInteger
@@ -27,10 +27,10 @@ try:
       assert int(str(e.readRegister('sp')))==0x7fe0 and int(str(e.readRegister('X29')))==0x1122334455667788
       row['machine'].append({'entry':entry,'tag':tag,'result':value,'final_X19':x19,'final_SP':0x7fe0})
      finally:e.dispose()
-   declarations=['typedef typedef struct Big24 { unsigned long long a; unsigned long long b; unsigned long long c; } Big24;','typedef typedef Big24 (*BigFn)(int);','typedef typedef Big24 (*AliasFn)(int,Big24 *);','prototype '+subject+' unsigned long long '+subject+'('+callback+' callback,int tag)','prototype make_big Big24 make_big(int tag)','prototype make_big_explicit Big24 make_big_explicit(int tag,Big24 *alias)']
+   declarations=['typedef typedef struct Big24 { unsigned long long a; unsigned long long b; unsigned long long c; } Big24;','typedef typedef Big24 (*BigFn)(int);','typedef typedef Big24 (*AliasFn)(int,Big24 *);','typedef typedef void (*WriterFn)(Big24 *,int);','prototype '+subject+' unsigned long long '+subject+'('+callback+' callback,int tag)','prototype make_big Big24 make_big(int tag)','prototype make_big_explicit Big24 make_big_explicit(int tag,Big24 *alias)','prototype write_big void write_big(Big24 *out,int tag)','prototype raw_child unsigned long long raw_child(void)']
    command=[str(a.cli),'decompile-all',str(a.binary),'--functions',subject,'--json','--language','c','--option','structdefs','on','--assert-strict']
    for declaration in declarations:command+=['--assert',declaration]
-   q=subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=240);row['command']={'command':command,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr};assert q.returncode==0,row['command'];metadata=json.loads(q.stdout);(out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==1;f=metadata['functions'][0];assert f.get('error')is None,f
+   q=subprocess.run(command,cwd=repo,capture_output=True,text=True,timeout=240);row['command']={'command':command,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr};assert q.returncode==0,row['command'];metadata=json.loads(q.stdout);(out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==1 and {f['name']for f in metadata['functions']}=={subject};f=metadata['functions'][0];assert f.get('error')is None and f.get('code'),f
    if positive:
     # Consume the actual emitted provider, not a handwritten Big24 callback.
     common=['--functions',subject+','+callee,'--language','c','--option','structdefs','on','--assert-strict']
@@ -42,8 +42,8 @@ try:
      return result.stdout
     full=json.loads(invoke([a.cli,'decompile-all',a.binary,'--json',*common]))
     (out/'provider-metadata.json').write_text(json.dumps(full,indent=2)+'\n')
-    assert {f['name']for f in full['functions']}=={subject,callee},full
-    assert all(f.get('error')is None for f in full['functions']),full
+    assert len(full['functions'])==2 and {f['name']for f in full['functions']}=={subject,callee},full
+    assert all(f.get('error')is None and f.get('code')for f in full['functions']),full
     project=out/'project';invoke([a.cli,'decompile-project',a.binary,'-o',project,*common])
     for name in (subject,callee):require_provider_body(project/(a.binary.name+'.c'),name)
     stem=a.binary.name;driver=out/'consumer.c'

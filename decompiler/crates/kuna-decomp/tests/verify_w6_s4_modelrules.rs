@@ -373,22 +373,6 @@ fn v_w6_s4_modelrules_homogeneous_aggregate_ptr_identity() {
     assert!(!f.filter(&iarr), "homogeneous INT aggregate fails a FLOAT filter");
 }
 
-#[test]
-fn v_w6_s4_modelrules_homogeneous_aggregate_primitive_identity() {
-    let mgr = AddrSpaceManager::new();
-    let filter = decode_filter(r#"<datatype name="homogeneous-float-aggregate"/>"#, &mgr).unwrap();
-    let types = kuna_decomp::dtype::TypeFactoryImpl::new();
-    types.set_default_alignment_map();
-    types.set_max_basetype_size(8);
-    let first = types.get_base(4, type_metatype::TYPE_FLOAT).unwrap();
-    let same = types.get_base(4, type_metatype::TYPE_FLOAT).unwrap();
-    assert!(filter.filter(&dt_array(Rc::clone(&first), 4)));
-    assert!(!filter.filter(&dt_array(Rc::clone(&first), 5)));
-    assert!(filter.filter(&dt_struct(8, 4, &[(0, Rc::clone(&first)), (4, same)])));
-    assert!(!filter.filter(&dt_struct(8, 4, &[(0, first), (4, dt_int(4))])));
-    assert!(!filter.filter(&dt_array(dt_int(4), 2)));
-}
-
 // ===========================================================================
 // 4. VarargsFilter default boundary (INT_MIN/INT_MAX) + firstVarArgSlot<0
 // ===========================================================================

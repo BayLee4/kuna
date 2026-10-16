@@ -3,7 +3,7 @@
 //! token consumers; it deliberately does not implement HighFunction's other
 //! documents (symbols, prototypes, high variables, or jump tables).
 
-mod common;
+use crate::common;
 #[path = "common/corpus.rs"]
 mod corpus;
 

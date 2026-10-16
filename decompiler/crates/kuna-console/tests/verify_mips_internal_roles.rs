@@ -78,6 +78,22 @@ fn original_loaded_calls_distinguish_dirty_full_and_partial_internal_role_defini
 
 #[test]
 #[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
+fn natural_child_preserves_raw_gp_write_and_return_reads() {
+    let mut program = program(0);
+    let gp = program.arch().get_register_varnode(b"gp").unwrap();
+    let ra = program.arch().get_register_varnode(b"ra").unwrap();
+    let gp_address = Address::new(gp.space.unwrap(), gp.offset);
+    let ra_address = Address::new(ra.space.unwrap(), ra.offset);
+    let at = entry(&program, "dirty_gp_natural");
+    let fd = build_and_follow_flow(program.arch_mut(), "dirty_gp_natural", at, 0).unwrap();
+    assert!(register_access(&fd, &gp_address, 4).1 > 0);
+    assert!(register_access(&fd, &ra_address, 4).0 > 0);
+    assert_eq!(opcode_count(&fd, OpCode::CPUI_STORE), 0);
+    assert_eq!(opcode_count(&fd, OpCode::CPUI_RETURN), 1);
+}
+
+#[test]
+#[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
 fn actual_private_spill_reload_and_escape_keep_raw_effects_and_source_formals() {
     for (name, declaration, stores, loads, expected_global) in [
         ("private_gp_spill", "extern int private_gp_spill(void);", 1, 0, None),
@@ -107,7 +123,7 @@ fn actual_private_spill_reload_and_escape_keep_raw_effects_and_source_formals() 
 
 #[test]
 #[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
-fn actual_direct_child_role_cannot_hide_a_later_implicit_gp_read() {
+fn actual_direct_child_preserves_a_later_implicit_raw_gp_read() {
     let mut program = program(0);
     let gp = program.arch().get_register_varnode(b"gp").unwrap();
     let address = Address::new(gp.space.unwrap(), gp.offset);

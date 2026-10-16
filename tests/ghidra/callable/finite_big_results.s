@@ -65,4 +65,47 @@ make_big_b:
 .global make_big_b_end
 make_big_b_end:
 
+.macro NEGATIVE_CALLER name,target
+CALLER_BEGIN \name
+ adrp x16,\target
+ add x16,x16,:lo12:\target
+CALLER_END \name
+.endm
 
+.macro RESULT_BODY name
+.global \name
+.type \name,%function
+\name:
+ sxtw x10,w0
+ mov x11,#7
+ stp x10,x11,[x8]
+ add x10,x10,#3
+ str x10,[x8,#16]
+.endm
+
+NEGATIVE_CALLER wrong_return,wrong_return_target
+NEGATIVE_CALLER mixed_return,mixed_return_target
+NEGATIVE_CALLER observed_link,observed_link_target
+NEGATIVE_CALLER overwritten_link,overwritten_link_target
+
+RESULT_BODY wrong_return_target
+ ret x19
+.size wrong_return_target,.-wrong_return_target
+
+RESULT_BODY mixed_return_target
+ cbz w0,.Lbad_return
+ ret
+.Lbad_return:
+ mov x9,xzr
+ ret x9
+.size mixed_return_target,.-mixed_return_target
+
+RESULT_BODY observed_link_target
+ str x30,[x8,#16]
+ ret
+.size observed_link_target,.-observed_link_target
+
+RESULT_BODY overwritten_link_target
+ add x30,x30,#4
+ ret
+.size overwritten_link_target,.-overwritten_link_target

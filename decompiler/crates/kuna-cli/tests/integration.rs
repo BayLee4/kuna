@@ -92,6 +92,9 @@ mod castnarrow_round_trip;
 #[path = "strlenscan_round_trip.rs"]
 mod strlenscan_round_trip;
 
+#[path = "catalog_consumer.rs"]
+mod catalog_consumer;
+
 #[path = "coff_strings.rs"]
 mod coff_strings;
 

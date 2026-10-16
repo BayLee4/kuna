@@ -21,14 +21,15 @@ def main():
         ('private_frame_aliases', ['--case', case])
         for case in ('branch_alias', 'partial_saved_pointer', 'partial_pointer_write',
                      'callee_partial_pointer_write', 'passed_frame', 'callback_frame',
-                     'delayed_frame_escape')
+                     'delayed_frame_escape', 'disjoint_store')
     ]
     cases += [('aggregate_frame_escape', [])]
     cases += [('restoration_edges', ['--case', case])
               for case in ('saved_slot', 'branch_copy', 'custom_rbx', 'join_return')]
     cases += [('preserved_register_effect', ['--scenario', case])
               for case in ('clobbered', 'restored')]
-    cases += [(name, []) for name in ('native_bool_boundary', 'mixed_flow_return')]
+    cases += [(name, []) for name in ('native_bool_boundary', 'finite_variadic_boundaries',
+                                     'callback_effects', 'mixed_flow_return')]
     report = {'completed': False, 'cases': []}
     for script, options in cases:
         name = script + ('-' + options[-1] if options else '')

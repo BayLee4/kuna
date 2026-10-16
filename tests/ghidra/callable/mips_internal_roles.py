@@ -36,7 +36,8 @@ def main():
         def raw_proofs():
             environment = dict(os.environ, KUNA_MIPS_ROLE_FIXTURES=str(construction.parent))
             command = [tool("cargo"), "test", "--release", "-p", "kuna-console",
-                       "--test", "verify_mips_internal_roles", "--", "--include-ignored", "--nocapture"]
+                       "--test", "integration", "verify_mips_internal_roles::",
+                       "--", "--include-ignored", "--nocapture"]
             result = subprocess.run(command, cwd=ROOT / "decompiler", env=environment,
                                     capture_output=True, text=True, timeout=1800)
             observation = {"command": command, "status": result.returncode,
@@ -46,7 +47,7 @@ def main():
                 raise RuntimeError(f"actual raw/final MIPS matrix failed: {directory / 'raw-proof-command.json'}")
 
         attempt("actual_raw_and_final_proofs", raw_proofs)
-        for scope in ("roles", "inherited", "private"):
+        for scope in ("roles", "inherited", "private", "natural"):
             attempt("machine_" + scope, lambda scope=scope: run_script(
                 "mips_role_machine.py", "--construction", construction,
                 "--scope", scope, "--out", directory / ("machine-" + scope)))

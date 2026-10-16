@@ -1,5 +1,5 @@
 //! Completed source callback declarations keep their ABI after the default changes.
-mod common;
+use crate::common;
 use std::rc::Rc;
 use kuna_console::engine::ConsoleProgram;
 use kuna_console::ifacedecomp::{register_console_commands, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
@@ -75,6 +75,11 @@ fn completed_nested_roots_keep_identity_and_abi_after_default_switch() {
     verify(p, &returned, "__fastcall", true, false);
     run(&mut status, after.len());
     let p = program(&mut status);
+    for (name, held) in [("Old", &old), ("Nested", &nested), ("Explicit", &explicit)] {
+        let current = code(p, name);
+        assert_eq!(current.get_id(), held.get_id(), "{name}: source nominal identity changed");
+        assert!(Rc::ptr_eq(&current, held), "{name}: default change replaced a completed callable");
+    }
     for (name, model, variadic, stack) in [
         ("Old", "__stdcall", false, true), ("Nested", "__stdcall", false, true),
         ("Explicit", "__fastcall", true, false), ("Future", "__fastcall", false, false),

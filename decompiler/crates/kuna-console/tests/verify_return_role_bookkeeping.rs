@@ -70,8 +70,22 @@ fn low_bytes_from_register(
 }
 
 #[test]
-fn observable_partial_reads_narrowed_targets_and_result_escape_are_not_bookkeeping() {
-    for (name, offset, width) in [("partial_read", 0x1100, 8), ("narrowed_target", 0x1200, 4)] {
+fn full_width_return_copy_preserves_raw_control_reads() {
+    let mut program = program();
+    let ra = program.arch().get_register_varnode(b"ra").unwrap();
+    let address = Address::new(ra.space.unwrap(), ra.offset);
+    let fd = body(&mut program, "return_copy", 0x1000);
+    assert!(read_widths(&fd, &address).contains(&(ra.size as i32)));
+    assert!(has_opcode(&fd, OpCode::CPUI_RETURN));
+    assert!(!has_opcode(&fd, OpCode::CPUI_STORE));
+    assert!(!has_opcode(&fd, OpCode::CPUI_CALL) && !has_opcode(&fd, OpCode::CPUI_CALLIND));
+}
+
+#[test]
+fn observable_partial_reads_narrowed_targets_and_result_escape_preserve_raw_provenance() {
+    for (name, offset, width) in [
+        ("partial_read", 0x1100, 8), ("narrowed_target", 0x1200, 4), ("output_escape", 0x1300, 8),
+    ] {
         let mut program = program();
         let ra = program.arch().get_register_varnode(b"ra").unwrap();
         let address = Address::new(ra.space.unwrap(), ra.offset);
@@ -138,11 +152,34 @@ fn observable_partial_reads_narrowed_targets_and_result_escape_are_not_bookkeepi
                     })
             }), "compressed return consumes the sign-extended RV64 target");
         }
+        if name == "output_escape" {
+            let output = program.arch().get_register_varnode(b"a0").unwrap();
+            let output_address = Address::new(output.space.unwrap(), output.offset);
+            assert!(fd.obank().iter_all().any(|(_, id)| {
+                let op = fd.obank().get(id).unwrap();
+                op.get_out().is_some_and(|id| {
+                    let vn = fd.vbank().get(id).unwrap();
+                    vn.get_addr() == &output_address
+                })
+            }), "the link-register value is an observable result, not solely a control target");
+            assert!(fd.obank().iter_all().any(|(_, id)| {
+                let op = fd.obank().get(id).unwrap();
+                op.code() == OpCode::CPUI_COPY
+                    && op.get_in(0).is_some_and(|id| {
+                        let source = fd.vbank().get(id).unwrap();
+                        source.get_addr() == &address && source.get_size() == ra.size as i32
+                    })
+                    && op.get_out().is_some_and(|id| {
+                        let result = fd.vbank().get(id).unwrap();
+                        result.get_addr() == &output_address && result.get_size() == output.size as i32
+                    })
+            }), "the actual result-register definition must consume the link-register value");
+        }
     }
 }
 
 #[test]
-fn implicit_actual_callee_read_prevents_a_return_address_argument_from_being_hidden() {
+fn implicit_actual_callee_read_preserves_the_return_address_argument_raw_provenance() {
     let mut program = program();
     let argument = program.arch().get_register_varnode(b"a2").unwrap();
     let ra = program.arch().get_register_varnode(b"ra").unwrap();
@@ -185,6 +222,47 @@ fn mips_tagged_returns_keep_control_bits_separate_from_observable_values() {
         assert!(read_widths(&fd, &address).contains(&4), "{name}");
         assert!(has_opcode(&fd, OpCode::CPUI_RETURN));
         assert_eq!(has_opcode(&fd, OpCode::CPUI_STORE), stores, "{name}");
-        if data_mask { assert!(has_opcode(&fd, OpCode::CPUI_INT_AND), "{name}"); }
+        if data_mask {
+            let destination = program.arch().get_register_varnode(
+                if name == "result_tag" { b"v0" } else { b"t0" }).unwrap();
+            let destination_address = Address::new(destination.space.unwrap(), destination.offset);
+            let mask = fd.obank().iter_all().find_map(|(_, id)| {
+                let op = fd.obank().get(id).unwrap();
+                (op.code() == OpCode::CPUI_INT_AND
+                    && op.get_addr().get_offset() == offset
+                    && op.get_in(0).is_some_and(|id| {
+                        let source = fd.vbank().get(id).unwrap();
+                        source.get_addr() == &address && source.get_size() == 4
+                    })
+                    && op.get_in(1).is_some_and(|id| {
+                        let bits = fd.vbank().get(id).unwrap();
+                        bits.is_constant() && bits.get_offset() == 1
+                    })
+                    && op.get_out().is_some_and(|id| {
+                        let result = fd.vbank().get(id).unwrap();
+                        result.get_addr() == &destination_address && result.get_size() == 4
+                    })).then_some(op)
+            }).expect("observable tag mask must define V0/T0, not the JR control temporary");
+            if name == "result_tag" {
+                assert!(program.arch().default_fp().unwrap()
+                    .possible_output_param(&destination_address, 4));
+            } else {
+                let store = fd.obank().iter_all().find_map(|(_, id)| {
+                    let op = fd.obank().get(id).unwrap();
+                    (op.code() == OpCode::CPUI_STORE && op.get_addr().get_offset() == offset + 4
+                        && op.get_in(2).is_some_and(|id| {
+                            let value = fd.vbank().get(id).unwrap();
+                            value.get_addr() == &destination_address && value.get_size() == 4
+                        })).then_some(op)
+                }).expect("observable STORE must consume the tag result in T0");
+                assert!(mask.get_time() < store.get_time());
+                assert!(!fd.obank().iter_all().any(|(_, id)| {
+                    let op = fd.obank().get(id).unwrap();
+                    op.get_time() > mask.get_time() && op.get_time() < store.get_time()
+                        && op.get_out().is_some_and(|id|
+                            fd.vbank().get(id).unwrap().get_addr() == &destination_address)
+                }), "no intervening definition may replace the stored tag value");
+            }
+        }
     }
 }

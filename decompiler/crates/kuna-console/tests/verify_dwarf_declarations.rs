@@ -9,6 +9,28 @@ use kuna_decomp::fspec::PrototypePieces;
 use kuna_decomp::varnode::varnode_flags;
 use kuna_harness::dwarf_fixture as producer;
 
+fn callable_child(name: &str) -> bool {
+    const CHILD: &str = "KUNA_CONSOLE_DWARF_DECLARATION_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        assert!(kuna_decomp::kuna_calltargettype::dwarf_function_types());
+        return true;
+    }
+    let output = Command::new(std::env::current_exe().expect("current declaration test executable"))
+        .args(["--exact", name, "--nocapture", "--include-ignored"])
+        .env(CHILD, name)
+        .env(kuna_decomp::kuna_calltargettype::CALLTARGETTYPE_ENV, "on")
+        .output()
+        .expect("isolated declaration test child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.contains("running 1 test") && output.status.success(),
+        "{name} child must execute its original source assertions: {:?}\n{stdout}\n{stderr}",
+        output.status);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    false
+}
+
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../kuna-analysis/tests/fixtures")
 }
@@ -32,6 +54,74 @@ fn pieces<'a>(program: &'a ConsoleProgram, name: &str) -> &'a PrototypePieces {
         .unwrap_or_else(|| panic!("missing genuine function {name}"));
     program.arch().symboltab.function_proto_pieces_across_scopes(address)
         .unwrap_or_else(|| panic!("known source declaration was discarded: {name}"))
+}
+
+fn require_declared_noreturn(path: &Path, callback: &str) {
+    use std::collections::{BTreeMap, BTreeSet};
+    let dumper = std::env::var_os("KUNA_DWARF_DUMP").unwrap_or_else(|| "llvm-dwarfdump".into());
+    let output = Command::new(&dumper).arg("--debug-info").arg(path).output()
+        .expect("noreturn producer prerequisite requires llvm-dwarfdump or KUNA_DWARF_DUMP");
+    assert!(output.status.success(), "DWARF fact dumper {dumper:?} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr));
+    let text = String::from_utf8(output.stdout).expect("DWARF fact dump must be UTF-8");
+    let mut dies = BTreeMap::<u64, (&str, Vec<&str>)>::new();
+    let mut current = None;
+    for line in text.lines().map(str::trim) {
+        if let Some((offset, tag)) = line.split_once(':') {
+            if let Some(hex) = offset.strip_prefix("0x") {
+                let offset = u64::from_str_radix(hex, 16).expect("DWARF DIE offset");
+                dies.insert(offset, (tag.trim(), Vec::new()));
+                current = Some(offset);
+                continue;
+            }
+        }
+        if line.starts_with("DW_AT_") {
+            if let Some(offset) = current {
+                dies.get_mut(&offset).unwrap().1.push(line);
+            }
+        }
+    }
+    let authored_name = format!("(\"{callback}\")");
+    let mut offset = *dies.iter().find(|(_, (tag, attributes))| {
+        *tag == "DW_TAG_typedef" && attributes.iter().any(|attribute| {
+            attribute.starts_with("DW_AT_name") && attribute.ends_with(&authored_name)
+        })
+    }).expect("producer omitted authored callback typedef").0;
+    let gnu_c = dies.range(..=offset).rev()
+        .find(|(_, (tag, _))| *tag == "DW_TAG_compile_unit")
+        .is_some_and(|(_, (_, attributes))| {
+            attributes.iter().any(|attribute| attribute.starts_with("DW_AT_producer")
+                && attribute.contains("(\"GNU C"))
+                && attributes.iter().any(|attribute| attribute.starts_with("DW_AT_language")
+                    && ["(DW_LANG_C)", "(DW_LANG_C89)", "(DW_LANG_C99)", "(DW_LANG_C11)"]
+                        .iter().any(|language| attribute.ends_with(language)))
+        });
+    let mut function_volatile = false;
+    let mut seen = BTreeSet::new();
+    loop {
+        assert!(seen.insert(offset), "producer callback DIE chain cycles");
+        let (tag, attributes) = dies.get(&offset).expect("producer callback reference is absent");
+        if *tag == "DW_TAG_subroutine_type" {
+            let declared = attributes.iter().any(|attribute| {
+                attribute.starts_with("DW_AT_noreturn") && attribute.ends_with("(true)")
+            }) || (gnu_c && function_volatile);
+            assert!(declared, "producer-missing: actual {callback} subroutine DIE {offset:#x} supplies neither a true DW_AT_noreturn nor GNU C volatile-function no-return; no importer verdict");
+            return;
+        }
+        assert!(matches!(*tag, "DW_TAG_typedef" | "DW_TAG_pointer_type" |
+            "DW_TAG_const_type" | "DW_TAG_volatile_type" | "DW_TAG_restrict_type"),
+            "producer callback chain reached unexpected {tag}");
+        if *tag == "DW_TAG_pointer_type" {
+            function_volatile = false;
+        } else if *tag == "DW_TAG_volatile_type" {
+            function_volatile = true;
+        }
+        let reference = attributes.iter().find(|attribute| attribute.starts_with("DW_AT_type"))
+            .expect("producer callback DIE has no type reference");
+        let hex = reference.split_once("(0x").expect("DWARF type reference offset").1
+            .split(|character: char| !character.is_ascii_hexdigit()).next().unwrap();
+        offset = u64::from_str_radix(hex, 16).expect("DWARF callback type offset");
+    }
 }
 
 fn emitted(program: ConsoleProgram, name: &str) -> String {
@@ -76,6 +166,7 @@ fn execute_c(directory: &Path, body: &str, source: &Path, name: &str, driver: &s
 
 #[test]
 fn dwarf_c_open_closed_fixed_and_variadic_source_facts_stay_distinct() {
+    if !callable_child("dwarf_c_open_closed_fixed_and_variadic_source_facts_stay_distinct") { return; }
     for standard in ["c89", "c11"] {
         let fixture = producer::compile_dwarf(&fixtures().join("dwarf_callback_prototyped.c"), standard, &[]);
         let program = boot(&fixture.path);
@@ -102,6 +193,7 @@ macro_rules! callback_execution {
     ($test:ident, $name:literal, $driver:literal) => {
         #[test]
         fn $test() {
+            if !callable_child(stringify!($test)) { return; }
             for standard in ["c89", "c11"] {
                 let source = fixtures().join("dwarf_callback_prototyped.c");
                 let fixture = producer::compile_dwarf(&source, standard, &[]);
@@ -118,6 +210,7 @@ callback_execution!(variadic_callback_preserves_tail_at_o0_o2, "invoke_variadic"
 
 #[test]
 fn cpp_absent_prototyped_is_closed_and_declared_conventions_survive() {
+    if !callable_child("cpp_absent_prototyped_is_closed_and_declared_conventions_survive") { return; }
     let fixture = producer::compile_dwarf(&fixtures().join("dwarf_callback_conventions.cpp"), "c++11", &["--target=i686-w64-windows-gnu"]);
     let program = boot(&fixture.path);
     for (name, model, count) in [("invoke_empty", None, 0), ("invoke_stdcall", Some("__stdcall"), 1), ("invoke_fastcall", Some("__fastcall"), 1), ("invoke_thiscall", Some("__thiscall"), 2)] {
@@ -133,6 +226,7 @@ fn cpp_absent_prototyped_is_closed_and_declared_conventions_survive() {
 
 #[test]
 fn supplied_callback_order_and_alias_survive_loader() {
+    if !callable_child("supplied_callback_order_and_alias_survive_loader") { return; }
     let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
     let program = boot(&fixture.path);
     let source = pieces(&program, "invoke_flags");
@@ -145,6 +239,18 @@ fn supplied_callback_order_and_alias_survive_loader() {
         let ty = proto.get_param(index).unwrap().get_type().unwrap();
         assert_eq!((ty.get_size(), ty.get_metatype(), ty.get_name()), (1, meta, name));
     }
+}
+
+#[test]
+#[ignore = "producer-dependent: requires callback no-return encoded in actual DWARF"]
+fn supplied_noreturn_callback_effect_survives_loader() {
+    if !callable_child("supplied_noreturn_callback_effect_survives_loader") { return; }
+    let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
+    require_declared_noreturn(&fixture.path, "NoReturn");
+    let program = boot(&fixture.path);
+    let source = pieces(&program, "invoke_noreturn");
+    let code = source.intypes[0].get_ptr_to().unwrap();
+    assert!(code.get_code_prototype().expect("declared noreturn callback").is_no_return());
 }
 
 #[test]
@@ -193,6 +299,7 @@ int main(void) {
 
 #[test]
 fn recursive_callback_and_alias_use_completed_layout() {
+    if !callable_child("recursive_callback_and_alias_use_completed_layout") { return; }
     let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
     let program = boot(&fixture.path);
     let source = pieces(&program, "node_identity");
@@ -202,6 +309,7 @@ fn recursive_callback_and_alias_use_completed_layout() {
     assert!(!node.is_incomplete());
     let next = node.get_field(0).unwrap();
     let retained = next.field_type.get_ptr_to().unwrap();
+    assert_eq!((retained.get_id(), retained.get_name()), (node.get_id(), node.get_name()));
     assert_eq!(retained.get_size(), node.get_size());
     assert_eq!(retained.get_field(0).unwrap().name, "next");
     let code = node.get_field(1).unwrap().field_type.get_ptr_to().unwrap();
@@ -209,12 +317,27 @@ fn recursive_callback_and_alias_use_completed_layout() {
     assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
     assert_eq!(proto.num_params(), 1);
     let parameter = proto.get_param(0).unwrap().get_type().unwrap().get_ptr_to().unwrap();
+    assert_eq!((parameter.get_id(), parameter.get_name()), (node.get_id(), node.get_name()));
     assert_eq!(parameter.get_size(), node.get_size());
     assert_eq!(parameter.get_field(1).unwrap().name, "visit");
+    let (field_pointer, offset, _, _) = program.arch().types_impl()
+        .down_chain(&next.field_type, 8, false).unwrap();
+    let field_pointer = field_pointer.expect("held next pointer must resolve the visit field");
+    assert_eq!(offset, 0);
+    let field = field_pointer.get_ptr_to().unwrap();
+    assert_eq!(field.get_metatype(), type_metatype::TYPE_PTR);
+    let resolved_code = field.get_ptr_to().unwrap();
+    assert_eq!(resolved_code.get_metatype(), type_metatype::TYPE_CODE);
+    let resolved = resolved_code.get_code_prototype().unwrap();
+    assert_eq!(resolved.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+    assert_eq!(resolved.num_params(), 1);
+    let resolved_node = resolved.get_param(0).unwrap().get_type().unwrap().get_ptr_to().unwrap();
+    assert_eq!(resolved_node.get_id(), node.get_id());
 }
 
 #[test]
 fn typed_globals_keep_callback_array_extent_and_top_level_volatility() {
+    if !callable_child("typed_globals_keep_callback_array_extent_and_top_level_volatility") { return; }
     let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
     let program = boot(&fixture.path);
     let database = &program.arch().symboltab;

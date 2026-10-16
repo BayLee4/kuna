@@ -193,7 +193,7 @@ fn physical_source_console_edits_replay_without_resurrecting_old_slots() {
 }
 
 #[test]
-fn physical_source_assertion_batch_keeps_carriers_read_only_until_replay() {
+fn physical_source_assertion_batch_replays_the_authored_parameter_roster() {
     let fixture = RawFixture::new("physical-source-batch", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
     let mut program = source_state_program(&fixture, &[0x1000]);
     let entry = program.find_entry_at(0x1000).unwrap();
@@ -221,7 +221,7 @@ fn physical_source_assertion_batch_keeps_carriers_read_only_until_replay() {
 
 
 #[test]
-fn observable_link_register_state_is_not_return_target_bookkeeping() {
+fn link_register_bodies_preserve_declared_zero_arity_and_plain_return_export() {
     let mut image = vec![0u8; 0x24];
     image[..8].copy_from_slice(&[0xe0, 0x03, 0x1e, 0xaa, 0xc0, 0x03, 0x5f, 0xd6]);
     image[0x20..].copy_from_slice(&[0xc0, 0x03, 0x5f, 0xd6]);

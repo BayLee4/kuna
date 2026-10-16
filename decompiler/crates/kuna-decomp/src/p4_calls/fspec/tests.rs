@@ -871,6 +871,7 @@ fn source_boundary_pieces(first: int4) -> PrototypePieces {
         first_var_arg_slot: first,
         output_storage: None,
         input_storage: Vec::new(),
+        kuna_library_names: None,
     }
 }
 

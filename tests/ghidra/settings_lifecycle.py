@@ -51,9 +51,9 @@ def run(output, report):
         ParameterDefinition, ParameterDefinitionImpl, Pointer, PointerDataType, ShortDataType,
         StructureDataType, UnsignedIntegerDataType, UnsignedLongLongDataType, VoidDataType,
     )
-    from ghidra.program.model.lang import CompilerSpecID, LanguageID
+    from ghidra.program.model.lang import CompilerSpecID, DecompilerLanguage, LanguageID
     from ghidra.program.model.listing import CodeUnit, Function, ParameterImpl, ReturnParameterImpl, Variable
-    from ghidra.program.model.pcode import HighFunction, HighFunctionDBUtil, PcodeOp
+    from ghidra.program.model.pcode import AttributeId, ElementId, HighFunction, HighFunctionDBUtil, PcodeOp
     from ghidra.program.model.symbol import SourceType
     from ghidra.program.util import DefaultLanguageService
     from ghidra.util.task import ConsoleTaskMonitor
@@ -62,6 +62,8 @@ def run(output, report):
     original = exepath.get(None)
     process_field = field(DecompInterface, "decompProcess")
     native_field = field(DecompileProcess, "nativeProcess")
+    encoding_field = field(DecompInterface, "baseEncodingSet")
+    response_field = field(DecompInterface, "stringResponse")
     monitor = ConsoleTaskMonitor()
     user = SourceType.USER_DEFINED
     integer = IntegerDataType.dataType
@@ -125,6 +127,18 @@ def run(output, report):
                 tuple((str(p.getName()), str(p.getDataType()), str(p.getVariableStorage()))
                       for p in fn.getParameters()), bool(fn.hasVarArgs()), bool(fn.hasNoReturn()),
                 bool(fn.hasCustomVariableStorage()), str(fn.getCallingConventionName()))
+
+    def native_language(ifc, language):
+        encoder = encoding_field.get(ifc).mainQuery
+        encoder.clear()
+        encoder.openElement(ElementId.ELEM_OPTIONSLIST)
+        encoder.openElement(ElementId.ELEM_SETLANGUAGE)
+        encoder.writeString(AttributeId.ATTRIB_CONTENT, language)
+        encoder.closeElement(ElementId.ELEM_SETLANGUAGE)
+        encoder.closeElement(ElementId.ELEM_OPTIONSLIST)
+        response = response_field.get(ifc)
+        process_field.get(ifc).sendCommand1Param("setOptions", encoder, response)
+        return str(response)
 
     def observe(ifc, fn, core, label, check, preamble=None, driver=None):
         row = {"core": core, "case": label, "pid": pid(ifc)}
@@ -485,10 +499,9 @@ def run(output, report):
                     assert pid(ifc) != before
                     observe(ifc, arithmetic, core, "style_reset_replays_cached_root", firstpass_arithmetic)
 
-                    for style, modes in (("decompile", (False, True)),
-                                         ("paramid", (True,)), ("firstpass", (False,))):
+                    for style in ("decompile", "normalize", "paramid", "firstpass", "register", "decompile"):
                         assert ifc.setSimplificationStyle(style), style
-                        for measures in modes:
+                        for measures in (False, True):
                             tree = not measures
                             ccode = not measures
                             assert ifc.toggleSyntaxTree(tree)
@@ -513,7 +526,6 @@ def run(output, report):
                                         assert info.getInput(0).getVarnode().getSize() == 4, row
                                         assert info.getOutput(0).getVarnode().getSize() == 4, row
                             observe(ifc, arithmetic, core, f"envelope_{style}_{int(measures)}_{len(rows)}", envelope)
-                    assert ifc.setSimplificationStyle("decompile")
                     assert ifc.toggleParamMeasures(False)
                     assert ifc.toggleSyntaxTree(False)
                     assert ifc.toggleCCode(True)
@@ -531,6 +543,41 @@ def run(output, report):
                     assert not ifc.setSimplificationStyle("future_missing_root"), "unknown root accepted"
                     assert ifc.setSimplificationStyle("decompile"), str(ifc.getLastMessage())
                     observe(ifc, arithmetic, core, "known_error_recovery", full_arithmetic,
+                            driver="int main(void) { return plus_seven(35)!=42; }\n")
+                    language_pid = pid(ifc)
+                    assert native_language(ifc, "future_missing_language") == "f", \
+                        "unknown renderer silently accepted"
+                    assert native_language(ifc, "c-language") == "t"
+                    assert ifc.setOptions(DecompileOptions()), str(ifc.getLastMessage())
+                    assert pid(ifc) == language_pid, "renderer rejection replaced the native process"
+                    observe(ifc, arithmetic, core, "unsupported_renderer_recovery", full_arithmetic,
+                            driver="int main(void) { return plus_seven(35)!=42; }\n")
+                    if core == "kuna":
+                        java_options = DecompileOptions()
+                        java_options.setDisplayLanguage(DecompilerLanguage.JAVA_LANGUAGE)
+                        assert not ifc.setOptions(java_options), "unsupported Java renderer silently accepted"
+                        assert ifc.setOptions(DecompileOptions()), str(ifc.getLastMessage())
+                        assert pid(ifc) == language_pid, "renderer rejection replaced the native process"
+                        observe(ifc, arithmetic, core, "unsupported_java_renderer_recovery", full_arithmetic,
+                                driver="int main(void) { return plus_seven(35)!=42; }\n")
+                    def c_parameter_markup(result, ops, row):
+                        assert re.search(r"\bplus_seven\s*\(", row["c"]), row
+                        assert any(op.getOpcode() == PcodeOp.INT_ADD for op in ops), row
+                        expected_symbol = result.getHighFunction().getFunctionPrototype().getParam(0)
+                        bindings = set()
+                        def visit(node):
+                            if isinstance(node, ClangVariableToken) and str(node.getText()) == "value":
+                                vn = node.getVarnode()
+                                if vn is not None:
+                                    high = vn.getHigh()
+                                    assert high is not None and high.getSymbol() is not None, row
+                                    bindings.add((int(high.getSymbol().getId()), int(vn.getSize())))
+                            for index in range(node.numChildren()):
+                                visit(node.Child(index))
+                        visit(result.getCCodeMarkup())
+                        assert bindings == {(int(expected_symbol.getId()), 4)}, row
+                        row["c_parameter_bindings"] = sorted(bindings)
+                    observe(ifc, arithmetic, core, "c_markup_real_java", c_parameter_markup,
                             driver="int main(void) { return plus_seven(35)!=42; }\n")
                     from java.io import File
                     from ghidra.app.emulator import EmulatorHelper

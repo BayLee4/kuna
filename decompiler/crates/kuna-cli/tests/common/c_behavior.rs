@@ -26,5 +26,5 @@ int main(void) {{
 }}
 "#
     );
-    kuna_harness::c_behavior::assert_c_behavior(source, preamble, body, &driver);
+    kuna_harness::c_behavior::assert_c_behavior(source, preamble, body, &driver, &["-Wall", "-Werror"]);
 }

@@ -3,8 +3,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-mod common;
-use common::{c_behavior, raw_calls, scratch_file};
+use crate::common::{c_behavior, raw_calls, scratch_file};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

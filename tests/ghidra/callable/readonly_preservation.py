@@ -2,15 +2,15 @@
 """Authentic readonly branch preservation, provider ownership and unchanged C.
 
 No mandatory arguments. The shared runner supplies KUNA_SMOKE_OUT/KUNA_CLI and
-Ghidra prerequisites. Positive exports execute unchanged providers; negative controls inspect original
-machine effects and memory permissions without an executable-admission claim.
+Ghidra prerequisites. The supported readonly positive executes unchanged providers;
+machine-negative controls remain separate from ordinary project export.
 """
 import json
 import os
 import subprocess
 import traceback
 
-from support import HERE, ROOT, cli, output, sha256, tool, require_provider_body
+from support import HERE, ROOT, cli, output, sha256, tool, require_provider_body, require_absent_provider_body
 from whole_calls_workers import ElfMachine, elf_symbols
 
 
@@ -78,6 +78,24 @@ def common(functions, readonly):
             "--assert", "prototype outer unsigned long long outer(void)"]
 
 
+def omitted_provider(row, kuna, binary, directory):
+    metadata = checked(row, [kuna, "decompile-all", binary, "--json", *common("outer", "on")])
+    data = json.loads(metadata["stdout"])
+    assert len(data["functions"]) == 1 and data["functions"][0]["name"] == "outer", data
+    function = data["functions"][0]
+    assert function.get("error") is None and "subject(" in function["code"], function
+    exported = invoke(row, [kuna, "decompile-project", binary, "-o", directory / "omitted-project",
+                           *common("outer", "on")])
+    assert exported["status"] == 0, exported
+    body = directory / "omitted-project" / (binary.name + ".c")
+    require_provider_body(body, "outer")
+    require_absent_provider_body(body, "subject")
+    row["omitted_provider"] = {
+        "selected_body": "outer", "omitted": "subject",
+        "project_status": exported["status"],
+    }
+
+
 def main():
     directory = output("readonly-preservation")
     kuna = cli()
@@ -101,11 +119,12 @@ def main():
             checked(row, [tool("llvm-readelf"), "-l", "-S", "-s", binary])
             row["machine"] = machine_case(binary, directory / (name + "-machine"), value, mutable)
 
-        for name, readonly in (("readonly_zero", "on"),):
+        for name, readonly, admit in (("readonly_zero", "on", True), ("readonly_one", "on", False),
+                                     ("mutable_zero", "on", False), ("readonly_zero", "off", False)):
             case = directory / (name + "-" + readonly)
             case.mkdir()
             binary = fixtures / (name + ".elf")
-            row = {"name": name, "readonly": readonly,
+            row = {"name": name, "readonly": readonly, "unchanged_C_required": admit,
                    "binary_sha256": sha256(binary), "completed": False}
             report["cases"].append(row)
             try:
@@ -113,7 +132,7 @@ def main():
                 metadata = checked(row, [kuna, "decompile-all", binary, "--json", *args])
                 data = json.loads(metadata["stdout"])
                 (case / "metadata.json").write_text(json.dumps(data, indent=2) + "\n")
-                assert {function["name"] for function in data["functions"]} == {"subject", "outer"}
+                assert len(data["functions"]) == 2 and {function["name"] for function in data["functions"]} == {"subject", "outer"}
                 assert all(function.get("error") is None and function.get("code") for function in data["functions"]), data
                 assertions = [item for item in data.get("assertions", [])
                               if item.get("directive", "").startswith("prototype ")]
@@ -124,18 +143,30 @@ def main():
                 stem = binary.name
                 for provider in ("subject", "outer"):
                     require_provider_body(project / (stem + ".c"), provider)
+                if not admit:
+                    row["completed"] = True
+                    continue
+                try:
+                    omitted_provider(row, kuna, binary, case)
+                except Exception:
+                    row["partial_selection_failure"] = traceback.format_exc()
                 consumer = case / "consumer.c"
                 consumer.write_text('#include "' + stem + '.h"\nint main(void) { return subject()!=11 || outer()!=42; }\n')
                 row["emitted_sha256"] = {path.name: sha256(path) for path in (project / (stem + ".c"), project / (stem + ".h"))}
+                row["consumer_failures"] = []
                 for optimization in ("-O0", "-O2"):
-                    executable = case / ("consumer" + optimization)
-                    checked(row, [native_cc, "-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
-                                  "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration",
-                                  optimization, "-I", project, project / (stem + ".c"), consumer, "-o", executable])
-                    checked(row, [executable])
-                row["unchanged_C_passed"] = True
+                    try:
+                        executable = case / ("consumer" + optimization)
+                        checked(row, [native_cc, "-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
+                                      "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration",
+                                      optimization, "-I", project, project / (stem + ".c"), consumer, "-o", executable])
+                        checked(row, [executable])
+                    except Exception:
+                        row["consumer_failures"].append({"optimization": optimization,
+                                                        "failure": traceback.format_exc()})
+                row["unchanged_C_passed"] = not row["consumer_failures"]
                 row["behavioral_checks_completed"] = True
-                row["completed"] = True
+                row["completed"] = row["unchanged_C_passed"] and "partial_selection_failure" not in row
             except Exception:
                 row["failure"] = traceback.format_exc()
             finally:

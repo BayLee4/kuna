@@ -4,6 +4,7 @@ import json
 import traceback
 
 from support import emulate, execute, host, output, publish, sha256, start_ghidra
+from datatype_consumers import observe_project_source
 from whole_calls import Machine
 
 
@@ -74,6 +75,16 @@ def consume(out, row, kind):
             execute(out, row, 'int main(void){const unsigned long long values[]={0,0x123456789abcdef0ULL,0xfedcba9876543210ULL,~0ULL};'
                     'for(unsigned i=0;i<4;++i){if(target(values[i])!=values[i])return 1;'
                     'if(direct(values[i])!=values[i])return 2;if(indirect(values[i])!=values[i])return 3;}return 0;}\n')
+        else:
+            assertions = []
+            for name, _, _, _ in entries:
+                assertions.extend([
+                    f'prototype {name} unsigned long long {name}(unsigned long long value)',
+                    f'param {name}::0 %RDI unsigned long long value',
+                    f'return {name}::' + ('[stack,0x10,8]' if name == 'target' else '%RAX') +
+                    ' unsigned long long',
+                ])
+            observe_project_source(out, row, image, entries, assertions)
     finally:
         machine.close()
 

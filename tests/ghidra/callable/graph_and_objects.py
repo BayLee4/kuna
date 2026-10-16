@@ -54,6 +54,10 @@ def main():
         'hidden_selected_child.py', '--binary', hidden / 'hidden.elf', '--cli', cli(),
         '--sha256', sha256(cli()), '--out', root / 'selected-child-record'))
 
+    case('original-apple-hidden-result-machine-and-provider', lambda: run_script(
+        'hidden_result_apple.py', '--cli', cli(),
+        '--out', root / 'original-apple-hidden-result'))
+
     def named_phase(phase):
         binary = named / 'named.elf'
         symbols = subprocess.run([tool('llvm-nm'), '--defined-only', str(binary)],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Original-machine and unchanged emitted-C proof for restoration boundaries."""
+"""Original restoration controls; ambient-EBX executable lowering is conditional."""
 import argparse
 import hashlib
 import json
@@ -16,7 +16,8 @@ args = parser.parse_args()
 args.cli = (args.cli or default_cli()).resolve(); args.out = (args.out or output("restoration_edges")/"run").resolve()
 args.out.mkdir(parents=True, exist_ok=False)
 base = ROOT
-report = {'cli_sha256': hashlib.sha256(args.cli.read_bytes()).hexdigest(), 'completed': False, 'cases': []}
+report = {'scope': 'Original machine/source/project controls; branch/custom/JOIN C is mandatory, ambient-EBX C is investigation-only.',
+          'cli_sha256': hashlib.sha256(args.cli.read_bytes()).hexdigest(), 'completed': False, 'cases': []}
 
 start_ghidra()
 from jpype import JArray, JByte
@@ -41,7 +42,7 @@ cases = [
  {'name':'branch_copy','bits':64,'code':'85d274054889f0eb034889f8c3','prototype':'unsigned long long subject(unsigned long long first,unsigned long long second,unsigned int which)',
   'types':[('first',wide),('second',wide),('which',uint)],'result':wide,'extra':[], 'expected_params':[('first',8),('second',8),('which',4)],
   'machine':[({'RDI':a,'RSI':b,'EDX':c},b if c else a) for a,b in [(0,7),(7,0),(0x123456789abcdef0,0x76543210fedcba98)] for c in [0,1,0xffffffff]],
-  'driver':None},
+  'driver':'const uint64_t pairs[][2]={{0,7},{7,0},{UINT64_C(0x123456789abcdef0),UINT64_C(0x76543210fedcba98)}}; const unsigned flags[]={0,1,UINT32_MAX}; for(unsigned i=0;i<3;++i) for(unsigned j=0;j<3;++j) if(subject(pairs[i][0],pairs[i][1],flags[j])!=pairs[i][flags[j]!=0]) return 2;'},
  {'name':'custom_rbx','bits':64,'code':'4889fbc3','prototype':'unsigned long long subject(unsigned long long value)',
   'types':[('value',wide)],'result':wide,'extra':['return subject::%RBX unsigned long long'], 'expected_params':[('value',8)],
   'machine':[({'RDI':v},v) for v in [0,7,0x123456789abcdef0,0x76543210fedcba98]],
@@ -118,11 +119,12 @@ def generated_saved_slot(row, out, project, invoke):
     from java.math import BigInteger
     header, body = project/'saved_slot.h', project/'saved_slot.c'
     row['emitted_sha256'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in (header, body)}
-    for opt in ('-O0', '-O2'):
+    def consume(opt):
         obj, binary = out/('saved'+opt+'.o'), out/('saved'+opt+'.elf')
         built = invoke([tool('clang'),'--target=i386-unknown-linux-gnu','-std=c11',
                         '-ffreestanding','-fno-builtin','-fno-stack-protector','-fno-pic',
-                        '-fno-pie','-Werror=uninitialized',opt,'-I',project,
+                        '-fno-pie','-Wall','-Wextra','-Werror=uninitialized',
+                        '-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,
                         '-c',body,'-o',obj])
         assert built['status']==0,built
         linked = invoke([tool('ld.lld'),'-m','elf_i386','--image-base=0','-Ttext=0x1000',
@@ -148,6 +150,13 @@ def generated_saved_slot(row, out, project, invoke):
                     row.setdefault('generated_machine',[]).append({'optimization':opt,'incoming_EBX':value,'result':actual})
                 finally:emulator.dispose()
         finally:machine.close()
+    failures=[]
+    for opt in ('-O0','-O2'):
+        try:
+            consume(opt)
+        except Exception:
+            failures.append({'optimization':opt,'failure':traceback.format_exc()})
+    assert not failures,failures
 
 for case in cases:
     if args.case!='all' and case['name']!=args.case: continue
@@ -160,9 +169,6 @@ for case in cases:
         return record
     try:
         original_machine(case,row)
-        if case['name']=='branch_copy':
-            row['completed']=True
-            continue
         code=bytes.fromhex(case['code']);image=bytearray(0x105 if 'child'in case else len(code));image[:len(code)]=code
         if 'child'in case:image[0x100:]=bytes.fromhex(case['child'])
         binary=out/case['name'];binary.write_bytes(image)
@@ -171,6 +177,7 @@ for case in cases:
         for extra in case['extra']:common+=['--assert',extra]
         meta=invoke([args.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
         metadata=json.loads(meta['stdout']);(out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
+        assert len(metadata['functions'])==(2 if 'child'in case else 1),metadata
         assert {f['name']for f in metadata['functions']}==({'subject','child'}if 'child'in case else{'subject'}),metadata
         subject=next(f for f in metadata['functions'] if f['name']=='subject')
         assert subject.get('error') is None and subject.get('code'),subject
@@ -182,18 +189,28 @@ for case in cases:
         for provider in ({'subject','child'}if 'child'in case else{'subject'}):
             require_provider_body(project/(case['name']+'.c'),provider)
         if case['name']=='saved_slot':
-            generated_saved_slot(row,out,project,invoke)
+            row['executable_extension_contract']='EX12/EXT03 investigation-only ambient EBX lowering'
+            try:
+                generated_saved_slot(row,out,project,invoke)
+                row['unchanged_c_executed']=True
+            except Exception:
+                row['executable_extension_failure']=traceback.format_exc()
         else:
             driver=out/'consumer.c';driver.write_text('#include "'+case['name']+'.h"\n#include <stdint.h>\nint main(void){'+case['driver']+'return 0;}\n')
             if case['bits']==32:
                 execute_i386_publication(row,out,project/(case['name']+'.h'),project/(case['name']+'.c'),driver,False)
             else:
                 row['emitted_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in [project/(case['name']+'.c'),project/(case['name']+'.h')]}
+                failures=[]
                 for opt in ['-O0','-O2']:
-                    exe=out/('consumer'+opt)
-                    built=invoke([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/(case['name']+'.c'),driver,'-o',exe]);assert built['status']==0,built
-                    ran=invoke([exe]);assert ran['status']==0,ran
-        row['unchanged_c_executed']=True
+                    try:
+                        exe=out/('consumer'+opt)
+                        built=invoke([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/(case['name']+'.c'),driver,'-o',exe]);assert built['status']==0,built
+                        ran=invoke([exe]);assert ran['status']==0,ran
+                    except Exception:
+                        failures.append({'optimization':opt,'failure':traceback.format_exc()})
+                assert not failures,failures
+            row['unchanged_c_executed']=True
         row['behavioral_checks_completed']=True
         row['completed']=True
     except BaseException:

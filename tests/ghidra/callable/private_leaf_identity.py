@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from support import ROOT, tool, require_provider_body
+from support import ROOT, tool, require_provider_body, require_absent_provider_body
 import subprocess
 import traceback
 from whole_calls_workers import ElfMachine,elf_symbols
@@ -43,17 +43,25 @@ for mode in ['serial','stream','jobs2']:
   command=list(map(str,command));p=subprocess.run(command,cwd='/tmp',capture_output=True,text=True,timeout=240)
   value={'command':command,'status':p.returncode,'stdout':p.stdout,'stderr':p.stderr};row['commands'].append(value);return value
  failures=[]
- for label in ['complete']:
+ for label in ['complete','omitted']:
   try:
-   common=['--functions','dispatch,subject',*jobs,'--language','c']
+   names=['dispatch','subject']if label=='complete'else['dispatch']
+   common=['--functions',','.join(names),*jobs,'--language','c']
    meta=invoke([args.cli,'decompile-all',args.binary,'--json',*common]);assert meta['status']==0,meta
    metadata=json.loads(meta['stdout']);(out/(label+'-metadata.json')).write_text(json.dumps(metadata,indent=2)+'\n')
-   assert {f['name']for f in metadata['functions']}=={'dispatch','subject'},metadata
-   assert all(f.get('error')is None for f in metadata['functions']),metadata
+   assert len(metadata['functions'])==len(names) and {f['name']for f in metadata['functions']}==set(names),metadata
+   assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
    for f in metadata['functions']:
     parameters=sorted((v for v in f['variables']if v['kind']=='arg'),key=lambda v:v['arg_index'])
     assert [(p['name'],p['size'],p['arg_index'])for p in parameters]==[('slot',8,0)],parameters
    project=out/(label+'-project');export=invoke([args.cli,'decompile-project',args.binary,'-o',project,*common,*stream])
+   if label=='omitted':
+    assert export['status']==0,export
+    assert all(f['address']!=symbols['subject']for f in metadata['functions']),metadata
+    require_provider_body(project/(args.binary.name+'.c'),'dispatch')
+    require_absent_provider_body(project/(args.binary.name+'.c'),'subject')
+    row['partial_export']={'selected_body':'dispatch','omitted':'subject','status':export['status']}
+    continue
    assert export['status']==0,export
    for name in ('dispatch','subject'):
     require_provider_body(project/(args.binary.name+'.c'),name)

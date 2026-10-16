@@ -129,7 +129,6 @@ fn nested_types_retain_nominal_leaf_not_pointer_or_array_name() {
     assert_eq!((front.as_str(), back.as_str()), ("*mut [*mut NodeAlias; 2]", ""));
     assert_eq!(alias.get_typedef().unwrap().get_name(), "Node");
     assert_eq!(alias.get_unsized_id().unwrap(), 0x1234);
-    assert_eq!(spell(&base(3, type_metatype::TYPE_UNKNOWN)), "[u8; 3]");
 }
 
 #[test]

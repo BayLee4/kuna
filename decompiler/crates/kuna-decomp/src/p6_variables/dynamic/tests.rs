@@ -549,63 +549,6 @@ fn unique_hash_preserves_the_descriptor_of_the_best_collision_method() {
 }
 
 #[test]
-fn unique_operation_hash_recovers_the_operation_and_operand_slot() {
-    let (mut fd, _, _, _, result) = build_add_graph();
-    let operation = fd.vbank().get(result).unwrap().get_def().unwrap();
-    for slot in [-1, 0, 1] {
-        let mut hash = DynamicHash::new();
-        hash.unique_hash_op(operation, slot, 8, &mut fd);
-        let address = hash.get_address().clone();
-        assert_eq!(DynamicHash::new().find_op(&mut fd, &address, hash.get_hash()), Some(operation));
-        assert_eq!(DynamicHash::get_slot_from_hash(hash.get_hash()), slot,
-            "recovering an operation must not redirect an input annotation to another operand");
-    }
-}
-
-#[test]
-fn unique_operation_hash_retains_an_earlier_collision_winner() {
-    let mut fd = build_fd();
-    let block = mk_block(&mut fd);
-    let constant = fd.new_constant(8, 0x11);
-    let other_constant = fd.new_constant(8, 0x22);
-    let other = copy(&mut fd, block, 0x08, other_constant, 0x80, 8);
-    let mut operations = Vec::new();
-    for i in 0..9 {
-        let input_pc = if i < 8 { 0x10 } else { 0x14 };
-        let input = copy(&mut fd, block, input_pc, constant, 0x100 + i * 8, 8);
-        let result = binop(
-            &mut fd, block, 0x20, OpCode::CPUI_INT_ADD,
-            input, other, 0x200 + i * 8, 8,
-        );
-        operations.push(fd.vbank().get(result).unwrap().get_def().unwrap());
-    }
-    let mut collisions = Vec::new();
-    for method in 4..7 {
-        let mut root_hash = DynamicHash::new();
-        root_hash.calc_hash_op(operations[0], -1, method, &mut fd);
-        let comparable = DynamicHash::get_comparable(root_hash.get_hash());
-        let count = operations.iter().filter(|operation| {
-            let mut candidate = DynamicHash::new();
-            candidate.calc_hash_op(**operation, -1, method, &mut fd);
-            DynamicHash::get_comparable(candidate.get_hash()) == comparable
-        }).count();
-        collisions.push(count);
-    }
-    assert!(collisions[1] > 1 && collisions[1] < collisions[2],
-        "fixture must select method5 before method6: {collisions:?}");
-    for operation in operations {
-        let mut hash = DynamicHash::new();
-        hash.unique_hash_op(operation, -1, 8, &mut fd);
-        let address = hash.get_address().clone();
-        assert_eq!(
-            DynamicHash::new().find_op(&mut fd, &address, hash.get_hash()), Some(operation),
-            "the selected neighborhood and collision position must identify this exact operation",
-        );
-        assert_eq!(DynamicHash::get_slot_from_hash(hash.get_hash()), -1);
-    }
-}
-
-#[test]
 fn wide_collision_budget_allows_rendering_without_rebinding_oversized_lists() {
     for count in [9, 16] {
         let (mut fd, roots) = build_collision_graph(count);

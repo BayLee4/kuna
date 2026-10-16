@@ -49,6 +49,8 @@ class Case:
     def ctype(self):
         if self.kind.endswith("enum"):
             return "Flags"
+        if self.kind == "char":
+            return "char"
         return {1: ("signed char", "unsigned char"),
                 2: ("short", "unsigned short"),
                 4: ("int", "unsigned int")}[self.width][not self.signed]
@@ -101,10 +103,17 @@ class Case:
         values = [f"{name}={enum_literal(value)}" for name, value in self.enum_values.items()]
         return "typedef enum __attribute__((packed)) Flags {" + ",".join(values) + "} Flags;\n"
 
+    def assertion(self):
+        values = [f"{name}={hex(value) if value >= 0 else value}" for name, value in self.enum_values.items()]
+        return "typedef typedef enum Flags {" + ",".join(values) + "} Flags;"
+
     def type_assertions(self):
         assertions = f'_Static_assert(sizeof({self.ctype})=={self.width}, "producer width");\n'
-        relation = "<" if self.signed else ">"
-        assertions += f'_Static_assert(({self.ctype})-1 {relation} 0, "producer signedness");\n'
+        if self.kind != "char":
+            relation = "<" if self.signed else ">"
+            assertions += f'_Static_assert(({self.ctype})-1 {relation} 0, "producer signedness");\n'
+        else:
+            assertions += '_Static_assert(CHAR_MIN<0, "x86 gcc char is signed");\n'
         return assertions
 
     def source(self):
@@ -143,7 +152,7 @@ def cases():
     result = [Case(kind, width, signed) for width in (1, 2, 4)
               for kind, signed in (("unsigned", False), ("signed", True),
                                    ("unsigned_enum", False), ("signed_enum", True))]
-    return result + [Case("signed_enum", 8, True)]
+    return result + [Case("char", 1, True), Case("signed_enum", 8, True)]
 
 
 def enum_literal(value):
@@ -181,8 +190,9 @@ def execute_consumer(directory, case, emitted, label, warnings_as_errors=True):
     source.write_text(ALIASES + case.definitions() + emitted + case.driver())
     results = []
     for optimization in (0, 2):
-        # Explicit signed/unsigned types must survive either host plain-char mode.
-        for char_mode in ("signed", "unsigned"):
+        # Plain char follows the producer ABI. Explicitly signed/unsigned types
+        # (including unsigned char) must survive either host plain-char mode.
+        for char_mode in (("signed",) if case.kind == "char" else ("signed", "unsigned")):
             suffix = f"{label}-O{optimization}-{char_mode}-char"
             binary = directory / suffix
             build = command(directory / f"{suffix}-build.json", [
@@ -204,22 +214,62 @@ def check_source(directory, case):
     return execute_consumer(directory, case, bodies, "source-control")
 
 
-def run_cli(directory, case, row):
+def cli_default_enum(directory, row):
+    """Require the x86 gcc compiler specification's four-byte enum layout."""
     cli = Path(os.environ.get("KUNA_CLI", ROOT / "decompiler/target/release/kuna")).resolve()
-    row["producer"] = "cli-dwarf"
+    raw = directory / "default-width.bin"
+    machine = instructions(8, 0)
+    raw.write_bytes(machine)
+    result = command(directory / "default-width-cli.json", [
+        cli, "decompile", raw, "0x1000", "--json", "--raw-image", "--target",
+        "x86:LE:64:default:gcc", "--base", "0x1000", "--define-function",
+        f"0x1000-0x{0x1000 + len(machine):x}=default_width", "--assert-strict",
+        "--assert", Case("unsigned_enum", 4, False).assertion(),
+        "--assert", "prototype default_width int default_width(Flags value)",
+    ])
+    payload = json.loads(result["stdout"])
+    assert payload.get("error") is None, payload
+    function, = payload["functions"]
+    assert function.get("error") is None, function
+    assert all(item["status"] == "applied" for item in payload["assertions"]), payload
+    parameter, = [v for v in function["variables"] if v.get("kind") == "arg" and v.get("arg_index") == 0]
+    assert parameter["size"] == 4, parameter
+    row["default_enum_probe"] = {"parameter": parameter, "assertions": payload["assertions"]}
+    row["effective_case"] = "unsigned_enum4"
+    row["native_enum_model"] = "x86 gcc int and enum width is four bytes"
+    return Case("unsigned_enum", 4, False)
+
+
+def run_cli(directory, case, row, assertion_enum=False):
+    cli = Path(os.environ.get("KUNA_CLI", ROOT / "decompiler/target/release/kuna")).resolve()
+    row["producer"] = "cli-assertions" if not case.kind.endswith("enum") or assertion_enum else "cli-dwarf"
     bodies = []
     row["functions"] = []
-    source = directory / "producer.c"
-    source.write_text(case.source())
-    object_file = directory / "producer.o"
-    # Preserve the authentic narrow loads; do not replace the compiler producer.
-    row["producer_build"] = command(directory / "producer-build.json", [
-        *shlex.split(os.environ.get("KUNA_MATRIX_CROSS_CC", "clang")),
-        "-target", "x86_64-linux-gnu", "-g", "-O0", "-c", source, "-o", object_file,
-    ])
+    object_file = None
+    if row["producer"] == "cli-dwarf":
+        source = directory / "producer.c"
+        source.write_text(case.source())
+        object_file = directory / "producer.o"
+        # O0 retains explicit narrow loads instead of the unrelated narrow-ABI
+        # extension recovery path exercised by optimized EDI comparisons.
+        row["producer_build"] = command(directory / "producer-build.json", [
+            *shlex.split(os.environ.get("KUNA_MATRIX_CROSS_CC", "clang")),
+            "-target", "x86_64-linux-gnu", "-g", "-O0", "-c", source, "-o", object_file,
+        ])
     for index, target in enumerate(case.targets):
         name = f"boundary_{index}"
-        args = [cli, "decompile", object_file, name, "--json"]
+        if object_file is not None:
+            args = [cli, "decompile", object_file, name, "--json"]
+        else:
+            machine = instructions(case.width, target)
+            raw = directory / f"{name}.bin"
+            raw.write_bytes(machine)
+            args = [cli, "decompile", raw, "0x1000", "--json", "--raw-image", "--target",
+                    "x86:LE:64:default:gcc", "--base", "0x1000", "--define-function",
+                    f"0x1000-0x{0x1000 + len(machine):x}={name}", "--assert-strict"]
+            if assertion_enum:
+                args += ["--assert", case.assertion()]
+            args += ["--assert", f"prototype {name} int {name}({case.ctype} value)"]
         result = command(directory / f"{name}-cli.json", args)
         payload = json.loads(result["stdout"])
         assert payload.get("error") is None, payload
@@ -227,6 +277,8 @@ def run_cli(directory, case, row):
         assert function.get("error") is None, function
         parameter, = [v for v in function["variables"] if v.get("kind") == "arg" and v.get("arg_index") == 0]
         assert parameter["size"] == case.width, parameter
+        if object_file is None:
+            assert all(a["status"] == "applied" for a in payload["assertions"]), payload["assertions"]
         row["functions"].append({"target_bits": target, "parameter": parameter, "assertions": payload["assertions"]})
         bodies.append(function["code"])
     emitted = "\n\n".join(bodies) + "\n"
@@ -242,7 +294,7 @@ def run_ghidra(directory, case, row, stock=False):
     from ghidra.program.database import ProgramDB
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.data import (
-        CategoryPath, EnumDataType, SignedCharDataType, UnsignedCharDataType,
+        CategoryPath, EnumDataType, CharDataType, SignedCharDataType, UnsignedCharDataType,
         ShortDataType, UnsignedShortDataType, IntegerDataType, UnsignedIntegerDataType,
         DataTypeConflictHandler,
     )
@@ -272,6 +324,8 @@ def run_ghidra(directory, case, row, stock=False):
                     dtype.add(name, value)
                 dtype = manager.resolve(dtype, DataTypeConflictHandler.DEFAULT_HANDLER)
                 assert bool(dtype.isSigned()) == case.signed, str(dtype)
+            elif case.kind == "char":
+                dtype = CharDataType.dataType
             else:
                 dtype = {(1, True): SignedCharDataType, (1, False): UnsignedCharDataType,
                          (2, True): ShortDataType, (2, False): UnsignedShortDataType,
@@ -335,7 +389,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--producer", choices=("both", "cli", "ghidra"), default="both")
     parser.add_argument("--case", action="append", help="select a case, e.g. unsigned1 or signed_enum2")
-    parser.add_argument("--surface", action="append", choices=("cli", "ghidra", "stock"),
+    parser.add_argument("--surface", action="append", choices=("cli", "cli-default-enum", "ghidra", "stock"),
                         help="select a producer surface within the case filter")
     parser.add_argument("--stock", action="store_true", help="record stock comparisons without making parity an oracle")
     args = parser.parse_args()
@@ -347,8 +401,8 @@ def main():
               "method": {"widths": [1, 2, 4], "target_rules": "zero, one, sign boundary, complement one, complement OR, maximum",
                          "byte_input_domain": "all 256 bit patterns", "wider_input_domain": "target +/- 1 and flag/control values",
                          "focused_extra": "signed enum64 complement of a 32-bit enumerator",
-                         "cli_enum_producer": "authentic DWARF packed unsigned8/16 and signed64 enum complement boundaries",
-                         "plain_char_mode": "explicit signed/unsigned types run both host modes"}}
+                         "cli_enum_producer": "DWARF packed enums; default-width enum uses source assertions",
+                         "plain_char_mode": "signed to match x86 gcc producer; explicit signed/unsigned types run both host modes"}}
     path = output / "integer_boundaries.json"
     try:
         if args.producer != "cli":
@@ -357,8 +411,10 @@ def main():
             start_ghidra()
         for case in selected:
             variants = []
-            if args.producer != "ghidra" and case.name in ("unsigned_enum1", "unsigned_enum2", "signed_enum8"):
+            if args.producer != "ghidra":
                 variants.append("cli")
+                if case.name == "unsigned_enum4":
+                    variants.append("cli-default-enum")
             if args.producer != "cli":
                 variants.append("ghidra")
                 if args.stock:
@@ -372,9 +428,10 @@ def main():
                 directory = output / f"{case.name}-{variant}"
                 directory.mkdir(parents=True, exist_ok=True)
                 try:
-                    row["source_control"] = check_source(directory, case)
-                    if variant == "cli":
-                        run_cli(directory, case, row)
+                    effective_case = cli_default_enum(directory, row) if variant == "cli-default-enum" else case
+                    row["source_control"] = check_source(directory, effective_case)
+                    if variant.startswith("cli"):
+                        run_cli(directory, effective_case, row, variant == "cli-default-enum")
                     else:
                         run_ghidra(directory, case, row, variant == "stock")
                     row["status"] = "passed"

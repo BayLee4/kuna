@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from support import ROOT, cli as default_cli, output, tool
+from support import ROOT, cli as default_cli, output, tool, record_unrepresented_admission
 import subprocess
 import traceback
 from whole_calls import Machine, rel
@@ -105,11 +105,13 @@ try:
         metadata = json.loads(meta['stdout'])
         (args.out/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
         byname = {f['name']: f for f in metadata['functions']}
-        assert set(byname) == {entry[0] for entry in entries}, metadata
+        assert len(metadata['functions']) == len(entries) and set(byname) == {entry[0] for entry in entries}, metadata
         assert all(f.get('error') is None and f.get('code') for f in byname.values()), metadata
         for name, wanted in [('dispatch', [('raw', 1, 0)]), ('invoke', [('value', 1, 0)]), ('native_target', [('value', 1, 0)])]:
             parameters = sorted((v for v in byname[name]['variables'] if v['kind'] == 'arg'), key=lambda v: v['arg_index'])
             assert [(p['name'], p['size'], p['arg_index']) for p in parameters] == wanted, parameters
+        project = invoke([args.cli, 'decompile-project', binary, '-o', args.out/'project', *common])
+        record_unrepresented_admission(report, project, 'native-bool', ['EX13'])
     report['behavioral_checks_completed'] = True
     report['completed'] = True
 except BaseException:

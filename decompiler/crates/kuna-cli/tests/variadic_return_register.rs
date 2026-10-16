@@ -411,7 +411,11 @@ int main(void) {{
     .unwrap();
     for cc in &compilers {
         for level in ["-O0", "-O2"] {
-            let compile = Command::new(cc)
+            let mut compiler = Command::new(cc);
+            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                compiler.args(["-arch", "x86_64"]);
+            }
+            let compile = compiler
                 .args(common::CC_GCC15_DEMOTE)
                 .args(["-std=gnu11", "-w", level, "-o"])
                 .arg(&exe)
@@ -423,7 +427,14 @@ int main(void) {{
                 "{stem} {cc} {level}: {}\n{printed}",
                 String::from_utf8_lossy(&compile.stderr)
             );
-            let status = Command::new(&exe).status().unwrap();
+            let mut runner = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+                let mut runner = Command::new("/usr/bin/arch");
+                runner.arg("-x86_64").arg(&exe);
+                runner
+            } else {
+                Command::new(&exe)
+            };
+            let status = runner.status().unwrap();
             assert!(status.success(), "{stem} {cc} {level}: {status}\n{printed}");
         }
     }

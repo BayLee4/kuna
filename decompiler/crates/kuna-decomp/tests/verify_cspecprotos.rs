@@ -246,6 +246,73 @@ fn assert_recursive_join(arch: &Architecture, address: &Address, registers: [&st
     }
 }
 
+fn assert_recursive_call_storage(
+    arch: &Architecture,
+    callable: &Rc<kuna_decomp::dtype::Datatype>,
+    declared: &Rc<kuna_decomp::dtype::Datatype>,
+    inputs: [&str; 2],
+    output: [&str; 2],
+) {
+    use kuna_base::space::VarnodeStorage;
+    use kuna_decomp::action::ActionContext;
+    use kuna_decomp::coreaction_render::ActionDeindirect;
+    use kuna_decomp::dtype::TypeFactory;
+    use kuna_decomp::fspec::FuncCallSpecs;
+    use kuna_num::opcodes::OpCode;
+
+    let factory = arch.types_impl();
+    let model = arch.default_fp().unwrap();
+    let storage = |registers: [&str; 2]| {
+        let pieces = registers.map(|register| {
+            let value = arch.translate().get_register_varnode(register.as_bytes()).unwrap();
+            VarnodeStorage { space: value.space, offset: value.offset, size: 8 }
+        });
+        arch.manage().find_add_join(&pieces, 0).unwrap().get_unified().get_addr()
+    };
+    let input_storage = storage(inputs);
+    let output_storage = storage(output);
+
+    let memory = Rc::clone(arch.manage().get_default_code_space().unwrap());
+    let site = Address::new(memory, 0x1000);
+    let mut fd = arch.new_funcdata("recursive_call", site.clone(), 0).unwrap();
+    let root = fd.bblocks_ref().root.expect("bblocks root");
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let call = fd.new_op(2, site);
+    fd.op_set_opcode(call, kuna_decomp::typeop::type_op_for(OpCode::CPUI_CALLIND));
+    let target_type = factory.get_type_pointer(8, Rc::clone(callable), 1).unwrap();
+    let target = fd.new_unique(8, Some(target_type));
+    let argument = fd.new_varnode(16, &input_storage, Some(Rc::clone(declared)));
+    let argument = fd.set_input_varnode(argument).unwrap();
+    fd.op_set_input(call, target, 0).unwrap();
+    fd.op_set_input(call, argument, 1).unwrap();
+    let result = fd.new_varnode(16, &output_storage, Some(Rc::clone(declared)));
+    fd.op_set_output(call, result).unwrap();
+    fd.op_insert_end(call, block);
+    let mut fc = FuncCallSpecs::new(call, Address::new_invalid());
+    fc.proto_mut().set_internal(Rc::clone(model), factory.get_type_void().unwrap());
+    fc.init_active_input();
+    fc.get_active_input().register_trial(&input_storage, 16);
+    fd.push_call_specs(fc);
+    fd.start_type_recovery();
+    ActionDeindirect::boxed("typerecovery").apply(&mut fd, &mut ActionContext::new());
+    assert!(!fd.has_restart_pending(), "the completed held declaration must be usable at the call");
+    let operation = fd.obank().get(call).unwrap();
+    assert_eq!(operation.num_input(), 2);
+    assert_eq!(operation.get_in(0), Some(target));
+    assert_eq!(operation.get_in(1), Some(argument));
+    assert_eq!(operation.get_out(), Some(result));
+    let proto = fd.get_call_specs(0).proto();
+    assert_eq!(proto.get_model_name(), model.get_name());
+    assert_eq!(proto.num_params(), 1);
+    assert!(!proto.is_dotdotdot());
+    let input = proto.get_param(0).unwrap();
+    assert_eq!(input.get_type().unwrap().get_id(), declared.get_id());
+    assert_eq!(proto.get_output().get_type().unwrap().get_id(), declared.get_id());
+    assert!(!input.is_hidden_return() && !input.is_indirect_storage());
+    assert_recursive_join(arch, &input.get_address(), inputs);
+    assert_recursive_join(arch, &proto.get_output().get_address(), output);
+}
+
 #[test]
 fn recursive_host_callable_decodes_and_assigns_real_target_abis_in_both_query_orders() {
     use kuna_decomp::dtype::type_metatype;
@@ -261,13 +328,17 @@ fn recursive_host_callable_decodes_and_assigns_real_target_abis_in_both_query_or
                 let factory = arch.types_impl();
                 let model = arch.default_fp().unwrap();
                 factory.set_remote_type_fetch(Some(Rc::new(recursive_callable_replies(model.get_name(), with_alias))));
-                if callback_first {
-                    decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap();
+                let first = if callback_first {
+                    decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap()
                 } else {
-                    decode_recursive_typeref(arch, "RecursiveNode", RECURSIVE_NODE_HOST_ID, None).unwrap();
-                }
-                let node = decode_recursive_typeref(arch, "RecursiveNode", RECURSIVE_NODE_HOST_ID, None).unwrap();
-                let function = decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap();
+                    decode_recursive_typeref(arch, "RecursiveNode", RECURSIVE_NODE_HOST_ID, None).unwrap()
+                };
+                let node = if callback_first {
+                    decode_recursive_typeref(arch, "RecursiveNode", RECURSIVE_NODE_HOST_ID, None).unwrap()
+                } else { Rc::clone(&first) };
+                let function = if callback_first { Rc::clone(&first) } else {
+                    decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap()
+                };
                 let declared = if with_alias {
                     decode_recursive_typeref(arch, "RecursiveAlias", RECURSIVE_ALIAS_HOST_ID, None).unwrap()
                 } else { Rc::clone(&node) };
@@ -278,17 +349,16 @@ fn recursive_host_callable_decodes_and_assigns_real_target_abis_in_both_query_or
                 let next = node.get_field(1).unwrap();
                 assert_eq!((next.name.as_str(), next.ident, next.offset), ("next", 203, 8));
                 let callback = next.field_type.get_ptr_to().unwrap();
-                let proto = function.get_code_prototype().expect("host callback declaration must survive decoding");
-                assert!(callback.get_code_prototype().is_some(), "early recursive callback reference");
-                assert_eq!(proto.get_model_name(), model.get_name());
-                assert_eq!(proto.num_params(), 1);
-                assert!(!proto.is_dotdotdot());
-                let input = proto.get_param(0).unwrap();
-                assert_eq!(input.get_type().unwrap().get_id(), declared.get_id());
-                assert_eq!(proto.get_output().get_type().unwrap().get_id(), declared.get_id());
-                assert!(!input.is_hidden_return() && !input.is_indirect_storage());
-                assert_recursive_join(arch, &input.get_address(), inputs);
-                assert_recursive_join(arch, &proto.get_output().get_address(), output);
+                for held in [&function, &callback] {
+                    let source = held.get_code_prototype()
+                        .expect("the held host callback must retain its source declaration");
+                    assert_eq!(source.get_model_name(), model.get_name());
+                    assert_eq!(source.num_params(), 1);
+                    assert!(!source.is_dotdotdot());
+                    assert_eq!(source.get_param(0).unwrap().get_type().unwrap().get_id(), declared.get_id());
+                    assert_eq!(source.get_output().get_type().unwrap().get_id(), declared.get_id());
+                    assert_recursive_call_storage(arch, held, &declared, inputs, output);
+                }
             }
         }
     }
@@ -308,7 +378,7 @@ fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage(
         intypes: vec![value], innames: vec!["node".to_string()],
         first_var_arg_slot: -1, ..Default::default()
     };
-    assert!(factory.get_type_code_proto(&pieces(alias)).is_err(),
+    assert!(factory.get_type_code_proto(&pieces(Rc::clone(&alias))).is_err(),
         "an unresolved by-value layout cannot publish assigned storage");
     let callback_pointer = factory.get_type_pointer(8, factory.get_type_code().unwrap(), 1).unwrap();
     factory.set_fields_struct_raw(&node, vec![
@@ -316,6 +386,7 @@ fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage(
         TypeField::new(203, 8, "next", callback_pointer),
     ], vec![], 16, 8, 0).unwrap();
     let ready = factory.find_by_name("PendingNodeAlias").unwrap().unwrap();
+    assert_eq!(ready.get_id(), alias.get_id());
     let callback = factory.get_type_code_proto(&pieces(ready)).unwrap();
     let proto = callback.get_code_prototype().unwrap();
     assert_eq!(proto.num_params(), 1);
@@ -326,7 +397,6 @@ fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage(
 
 #[test]
 fn failed_callable_alias_is_an_error_before_and_after_declaration() {
-    use kuna_decomp::dtype::TypeFactory;
     let architecture = bootstrap("x86:LE:64:default:gcc").unwrap();
     let arch = arch_of(&architecture);
     let factory = arch.types_impl();
@@ -341,6 +411,43 @@ fn failed_callable_alias_is_an_error_before_and_after_declaration() {
         assert!(decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).is_err(),
             "an unavailable by-value source must not become a generic unprototyped callback");
         assert!(decode_recursive_typeref(arch, "RecursiveAlias", RECURSIVE_ALIAS_HOST_ID, None).is_err());
+        factory.clear_noncore();
+        let mut replies = recursive_callable_replies(arch.default_fp().unwrap().get_name(), true);
+        {
+            use kuna_base::marshal::{Encoder, PackedEncode, ATTRIB_ID, ATTRIB_METATYPE, ATTRIB_NAME, ATTRIB_SIZE};
+            use kuna_decomp::dtype::ELEM_DEF;
+            use kuna_decomp::prettyprint::ids::ELEM_TYPE;
+            replies.alias.clear();
+            let mut encoder = PackedEncode::new(&mut replies.alias);
+            encoder.open_element(&ELEM_DEF);
+            encoder.write_string(&ATTRIB_NAME, b"RecursiveAlias");
+            encoder.write_unsigned_integer(&ATTRIB_ID, RECURSIVE_ALIAS_HOST_ID);
+            encoder.open_element(&ELEM_TYPE);
+            encoder.write_string(&ATTRIB_NAME, b"");
+            encoder.write_string(&ATTRIB_METATYPE, b"int");
+            encoder.write_signed_integer(&ATTRIB_SIZE, 8);
+            encoder.close_element(&ELEM_TYPE);
+            encoder.close_element(&ELEM_DEF);
+        }
+        factory.set_remote_type_fetch(Some(Rc::new(replies)));
+        let (alias, callable) = if callback_first {
+            let callable = decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap();
+            let alias = decode_recursive_typeref(arch, "RecursiveAlias", RECURSIVE_ALIAS_HOST_ID, None).unwrap();
+            (alias, callable)
+        } else {
+            let alias = decode_recursive_typeref(arch, "RecursiveAlias", RECURSIVE_ALIAS_HOST_ID, None).unwrap();
+            let callable = decode_recursive_typeref(arch, "RecursiveFn", RECURSIVE_FN_HOST_ID, Some(1)).unwrap();
+            (alias, callable)
+        };
+        let proto = callable.get_code_prototype().expect("a valid retry must retain its callable declaration");
+        assert_eq!((alias.get_name(), alias.get_id()), ("RecursiveAlias", RECURSIVE_ALIAS_HOST_ID));
+        assert_eq!(proto.num_params(), 1);
+        for (param, name) in [(proto.get_param(0).unwrap(), "RDI"), (proto.get_output(), "RAX")] {
+            let register = arch.translate().get_register_varnode(name.as_bytes()).unwrap();
+            assert_eq!(param.get_address(), Address::new(register.space.unwrap(), register.offset));
+            assert_eq!(param.get_size(), 8);
+            assert_eq!(param.get_type().unwrap().get_id(), alias.get_id());
+        }
     }
 }
 
@@ -371,8 +478,71 @@ fn deferred_callable_rejects_invalid_alias_targets_without_poisoning_valid_retry
         let proto = callable.get_code_prototype().unwrap();
         for (param, name) in [(proto.get_param(0).unwrap(), "RDI"), (proto.get_output(), "RAX")] {
             let register = arch.translate().get_register_varnode(name.as_bytes()).unwrap();
-            assert_eq!(param.get_address().get_offset(), register.offset);
+            assert_eq!(param.get_address(), Address::new(register.space.unwrap(), register.offset));
+            assert_eq!(param.get_size(), i32::try_from(register.size).unwrap());
             assert_eq!(param.get_type().unwrap().get_id(), valid.get_id());
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires java_structural_publication.py authentic ProgramDB snapshots via KUNA_HOST_GRAPH_FIXTURES"]
+fn genuine_host_mutations_refresh_source_closure_and_retain_old_layouts() {
+    use kuna_base::marshal::{Decoder, PackedDecode};
+    use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
+    let fixtures = PathBuf::from(std::env::var_os("KUNA_HOST_GRAPH_FIXTURES")
+        .expect("run tests/ghidra/callable/java_structural_publication.py first"));
+    for case in ["union", "partial", "bitfield_alias"] {
+        let architecture = bootstrap("x86:LE:64:default:gcc").unwrap();
+        let arch = arch_of(&architecture);
+        let factory = arch.types_impl();
+        let decode = |epoch: &str, name: &str| {
+            let bytes = std::fs::read(fixtures.join(case).join(format!("{epoch}-{name}.packed"))).unwrap();
+            let mut decoder = PackedDecode::new(arch.manage());
+            decoder.ingest_stream(&bytes).unwrap();
+            factory.decode_type(&mut decoder).unwrap()
+        };
+        let old_word = decode("initial", "word");
+        let old_record = decode("initial", "record");
+        if case == "union" { decode("initial", "aggregate"); }
+        let old_source = decode("initial", "source");
+        let old_callback = decode("initial", "callback");
+        let old_pointer = factory.get_type_pointer(8, Rc::clone(&old_source), 1).unwrap();
+        let callback_record = |callback: &Rc<Datatype>| {
+            let source = callback.get_code_prototype().expect("authored callback")
+                .get_param(0).expect("source argument").get_type().unwrap();
+            if source.get_metatype() == type_metatype::TYPE_UNION {
+                source.get_field(0).unwrap().field_type.clone()
+            } else {
+                Rc::clone(source)
+            }
+        };
+        let old_callback_record = callback_record(&old_callback);
+        let old_field_name = old_record.get_field(1).map(|field| field.name.clone());
+        assert_eq!(old_word.get_metatype(), type_metatype::TYPE_UINT);
+        for epoch in ["edited_flush", "reset", "reopen"] {
+            factory.clear_noncore();
+            let new_word = decode(epoch, "word");
+            let new_record = decode(epoch, "record");
+            if case == "union" { decode(epoch, "aggregate"); }
+            let new_source = decode(epoch, "source");
+            let new_callback = decode(epoch, "callback");
+            assert_eq!(new_word.get_metatype(), type_metatype::TYPE_INT);
+            assert_eq!(old_word.get_metatype(), type_metatype::TYPE_UINT);
+            assert_eq!(new_source.get_size(), old_source.get_size());
+            assert_eq!(old_pointer.get_ptr_to().unwrap().get_size(), old_source.get_size());
+            assert_eq!(old_record.get_field(1).map(|field| field.name.clone()), old_field_name);
+            if case != "bitfield_alias" {
+                assert_eq!(new_record.get_field(1).unwrap().name, "upper");
+                assert_eq!(old_record.get_field(1).unwrap().name, "high");
+                let new_callback_record = callback_record(&new_callback);
+                assert_eq!(new_callback_record.get_field(1).unwrap().name, "upper");
+                assert_eq!(new_callback_record.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_INT);
+                assert_eq!(old_callback_record.get_field(1).unwrap().name, "high");
+                assert_eq!(old_callback_record.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_UINT);
+            }
+            assert!(old_callback.get_code_prototype().is_some(), "original authored callback");
+            assert!(new_callback.get_code_prototype().is_some(), "edited authored callback");
         }
     }
 }

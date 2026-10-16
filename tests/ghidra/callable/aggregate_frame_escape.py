@@ -4,7 +4,8 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from support import ROOT, cli as default_cli, output
+from support import ROOT, cli as default_cli, output, tool, require_provider_body
+import re
 import subprocess
 import traceback
 from whole_calls import Machine
@@ -17,15 +18,15 @@ args=parser.parse_args()
 args.cli = args.cli.resolve() if args.cli else None if args.machine_only else default_cli()
 args.out = (args.out or output("aggregate_frame_escape")/"run").resolve()
 args.out.mkdir(parents=True,exist_ok=False)
-report={'completed':False,'machine_only':args.machine_only,'cli_sha256':None if args.cli is None else hashlib.sha256(args.cli.read_bytes()).hexdigest(),'scope':'Default x86-64 gcc aggregate JOIN ABI, genuine writer machine body, native callback mutable LOAD, saved-frame alias with untouched disjoint-memory control. No substituted C callee or native signature casts.','cases':[]}
-for name in ['saved_frame']:
+report={'completed':False,'machine_only':args.machine_only,'cli_sha256':None if args.cli is None else hashlib.sha256(args.cli.read_bytes()).hexdigest(),'scope':'Default x86-64 gcc aggregate JOIN ABI, genuine writer machine body, native callback mutable LOAD, saved-frame alias negative and disjoint-memory strict positive. No substituted C callee or native signature casts.','cases':[]}
+for name in ['saved_frame','disjoint']:
  out=args.out/name;out.mkdir()
  row={'case':name,'completed':False,'commands':[]};report['cases'].append(row)
  def invoke(command):
   command=list(map(str,command));p=subprocess.run(command,cwd='/tmp',capture_output=True,text=True,timeout=240)
   result={'command':command,'status':p.returncode,'stdout':p.stdout,'stderr':p.stderr};row['commands'].append(result);return result
  try:
-  subject=bytes.fromhex('554889e7be07000000')
+  subject=bytes.fromhex('55'+('4889e7'if name=='saved_frame'else'')+'be07000000')
   subject+=bytes.fromhex('488b05')+(0x1300-(0x1100+len(subject)+7)).to_bytes(4,'little',signed=True)
   subject+=bytes.fromhex('ffd05dc3')
   entries=[('dispatch',0x1000,bytes.fromhex('55bd2a000000e8f50000004889e85dc3'),''),('subject',0x1100,subject,''),('writer',0x1200,bytes.fromhex('488937c3'),'')]
@@ -56,7 +57,7 @@ for name in ['saved_frame']:
     row['source']=[]
     for fn_name,pc,_,_ in entries:
      fn=api.createFunction(machine.address(pc),fn_name);assert fn is not None
-     parameters=[ParameterImpl('value',pair,program)]if fn_name=='writer'else[]
+     parameters=[ParameterImpl('value',pair,program)]if fn_name=='writer'else[ParameterImpl('slot',pointer,program)]if name=='disjoint'else[]
      result=wide if fn_name=='dispatch'else void
      fn.updateFunction('__stdcall',ReturnParameterImpl(result,program),Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS,False,SourceType.USER_DEFINED,JArray(Variable)(parameters))
      params=[]
@@ -79,19 +80,36 @@ for name in ['saved_frame']:
      assert emulator.getExecutionAddress()==machine.address(0x7ff0)
      got=int(str(emulator.readRegister('RAX')))&((1<<64)-1);rbp=int(str(emulator.readRegister('RBP')))&((1<<64)-1)
      stored=int.from_bytes(bytes(int(v)&255 for v in emulator.readMemory(machine.address(0x6000),8)),'little')
-     assert got==7 and rbp==0x1122334455667788 and stored==initial,(name,got,rbp,stored)
+     assert got==(7 if name=='saved_frame'else 42)and rbp==0x1122334455667788 and stored==(initial if name=='saved_frame'else 7),(name,got,rbp,stored)
      row['machine'].append({'initial_disjoint_memory':initial,'outer_result':got,'outer_RBP_restored':rbp,'disjoint_memory':stored})
     finally:emulator.dispose()
   finally:machine.close()
   if args.machine_only:row['completed']=True;continue
   common=['--raw-image','--target','x86:LE:64:default:gcc','--base','0x1000','--sleighpath',ROOT/'specs','--assert-strict','--assert','typedef typedef struct Pair { unsigned long long *slot; unsigned long long tag; } Pair;','--assert','typedef typedef void (*Writer)(Pair value);','--assert','data 0x1300 Writer callback_slot']
-  declarations={'dispatch':'unsigned long long dispatch('+'void'+')','subject':'void subject('+'void'+')','writer':'void writer(Pair value)'}
+  declarations={'dispatch':'unsigned long long dispatch('+('unsigned long long *slot'if name=='disjoint'else'void')+')','subject':'void subject('+('unsigned long long *slot'if name=='disjoint'else'void')+')','writer':'void writer(Pair value)'}
   for fn_name,pc,code,_ in entries:common+=['--addr',hex(pc),'--define-function',f'{pc:#x}-{pc+len(code):#x}={fn_name}','--assert','prototype '+fn_name+' '+declarations[fn_name]]
   meta=invoke([args.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
   metadata=json.loads(meta['stdout']);(out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n')
-  byname={f['name']:f for f in metadata['functions']}
-  assert set(byname)=={entry[0]for entry in entries} and all(f.get('error')is None for f in byname.values()),metadata
-  row['behavioral_checks_completed']=True
+  byname={f['name']:f for f in metadata['functions']};assert len(metadata['functions'])==len(entries) and set(byname)=={entry[0]for entry in entries},metadata
+  assert all(f.get('error')is None and f.get('code')for f in byname.values()),metadata
+  project=out/'project';export=invoke([args.cli,'decompile-project',binary,'-o',project,*common])
+  if name=='saved_frame':
+   row['executable_extension_contract']='EX11/EX12 historical refusal remains prerequisite-unrepresented; ordinary export status is not executable certification'
+  if name=='disjoint':
+   assert export['status']==0,export
+   for provider,_,_,_ in entries:require_provider_body(project/'aggregate_frame.c',provider)
+   header=(project/'aggregate_frame.h').read_text()
+   declaration=re.search(r'(?m)^\s*extern\s+Writer\s+callback_slot\s*;',header);assert declaration,header
+   writer_address=next(pc for fn_name,pc,_,_ in entries if fn_name=='writer')
+   original_slot=bytes(image[0x300:0x308]);assert int.from_bytes(original_slot,'little')==writer_address
+   row['original_external_data']={'address':0x1300,'size':8,'original_bytes':original_slot.hex(),'initializer_writer':writer_address,'declaration':declaration.group().strip()}
+   data=out/'fixture-data.c';data.write_text('#include "aggregate_frame.h"\nWriter callback_slot=writer;\n')
+   row['emitted_sha256']={p.name:hashlib.sha256(p.read_bytes()).hexdigest()for p in [project/'aggregate_frame.c',project/'aggregate_frame.h']}
+   driver=out/'consumer.c';driver.write_text('#include "aggregate_frame.h"\n#include <stdint.h>\n#include <stdlib.h>\n#include <string.h>\nint main(void){for(unsigned i=0;i<2;++i){void *slot=malloc(8);if(!slot)return 1;memset(slot,i?255:0,8);uint64_t got=dispatch(slot),stored=0;memcpy(&stored,slot,8);free(slot);if(got!=42||stored!=7)return 2;}return 0;}\n')
+   for opt in ['-O0','-O2']:
+    executable=out/('consumer'+opt);built=invoke([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/'aggregate_frame.c',driver,data,'-o',executable]);assert built['status']==0,built
+    ran=invoke([executable]);assert ran['status']==0,ran
+   row['unchanged_c_passed']=True
   row['completed']=True
  except BaseException:row['failure']=traceback.format_exc()
  finally:

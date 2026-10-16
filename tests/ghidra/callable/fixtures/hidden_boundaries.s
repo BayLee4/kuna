@@ -57,6 +57,21 @@ begin_subject hidden_explicit_alias
  ldr x0,[sp]
 end_subject hidden_explicit_alias
 
+begin_subject hidden_raw_child
+ mov x8,sp
+ mov x19,x8
+ blr x9
+ mov x8,x19
+ bl raw_child
+end_subject hidden_raw_child
+
+begin_subject explicit_pointer
+ mov w1,w0
+ mov x0,sp
+ blr x9
+ ldr x0,[sp]
+end_subject explicit_pointer
+
 .global make_big
 .type make_big,%function
 make_big:
@@ -81,6 +96,24 @@ make_big_explicit:
  ret
 .size make_big_explicit,.-make_big_explicit
 
+.global write_big
+.type write_big,%function
+write_big:
+ sxtw x10,w1
+ mov x11,#7
+ stp x10,x11,[x0]
+ add x10,x10,#3
+ str x10,[x0,#16]
+ ret
+.size write_big,.-write_big
+
+.global raw_child
+.type raw_child,%function
+raw_child:
+ ldr x0,[x8]
+ ret
+.size raw_child,.-raw_child
+
 .macro outer name,subject
 .global \name
 .type \name,%function
@@ -95,6 +128,32 @@ make_big_explicit:
 .endm
 outer outer_local,hidden_local
 outer outer_overlap,hidden_overlap
+
+// Exact candidate for original-raw versus conditionally-selected child reads.
+.global hidden_selected_child
+.type hidden_selected_child,%function
+hidden_selected_child:
+ sub sp,sp,#64
+ str x19,[sp,#24]
+ stp x29,x30,[sp,#48]
+ add x29,sp,#48
+ mov x9,x0
+ mov x8,sp
+ mov x0,x8
+ blr x9
+ bl selected_child
+end_subject hidden_selected_child
+
+.global make_big_zero
+.type make_big_zero,%function
+make_big_zero:
+ mov x10,#5
+ mov x11,#7
+ stp x10,x11,[x8]
+ mov x10,#8
+ str x10,[x8,#16]
+ ret
+.size make_big_zero,.-make_big_zero
 
 .global selected_child
 .type selected_child,%function
@@ -139,6 +198,18 @@ pointer_value:
 .size \name,.-\name
 .endm
 mutable_subject mutable_big,big_slot
+mutable_subject mutable_big_wrong,big_wrong_slot
+
+.global make_big_wrong
+.type make_big_wrong,%function
+make_big_wrong:
+ sxtw x10,w0
+ mov x11,#7
+ stp x10,x11,[x8]
+ add x10,x10,#3
+ str x10,[x8,#16]
+ ret x19
+.size make_big_wrong,.-make_big_wrong
 
 .global make_big_other
 .type make_big_other,%function
@@ -158,6 +229,54 @@ make_big_other:
 big_slot:
  .quad make_big
 .size big_slot,8
+.global big_wrong_slot
+.type big_wrong_slot,%object
+big_wrong_slot:
+ .quad make_big_wrong
+.size big_wrong_slot,8
+
+.text
+begin_subject hidden_callback_escape
+ adrp x10,escaped_big_slot
+ add x10,x10,:lo12:escaped_big_slot
+ str x9,[x10]
+ mov x8,sp
+ blr x9
+ ldr x0,[sp]
+ ldr x10,[sp,#16]
+ add x0,x0,x10
+end_subject hidden_callback_escape
+
+begin_subject hidden_callback_reuse
+ mov x8,sp
+ blr x9
+ blr x9
+ ldr x0,[sp]
+ ldr x10,[sp,#16]
+ add x0,x0,x10
+end_subject hidden_callback_reuse
+
+.macro mutable_consumer name,consumer
+.global \name
+.type \name,%function
+\name:
+ mov w1,w0
+ adrp x0,big_slot
+ ldr x0,[x0,:lo12:big_slot]
+ b \consumer
+.size \name,.-\name
+.endm
+mutable_consumer mutable_big_escape,hidden_callback_escape
+mutable_consumer mutable_big_reuse,hidden_callback_reuse
+
+.data
+.p2align 3
+.global escaped_big_slot
+.type escaped_big_slot,%object
+escaped_big_slot:
+ .quad 0
+.size escaped_big_slot,8
+
 .text
 .macro spill_result name,store=1,escape=0,restore=1,reallocate=0
 .global \name

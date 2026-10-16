@@ -50,9 +50,10 @@
 //!        not perturb jump-table recovery (the very thing enabling ExtraPopSetup
 //!        would have broken).  This is the hard brief constraint.
 //!
-//!   (A4) THE PROTECTED FILES STAY BYTE-IDENTICAL to the C++ oracle: `boolless`,
-//!        `readstruct`, `condconst_conn` — even though they may carry stack
-//!        locals — render identically Rust-vs-C++.  Render-stage tripwire.
+//!   (A4) The protected `boolless`, `readstruct` and conditional-constant
+//!        functions retain their authored types and executable behavior.
+//!        The retained consumer below checks unchanged emitted C rather than
+//!        pinning whitespace, storage comments or equivalent branch ordering.
 //!
 //! These are written to FLIP GREEN the day the ExtraPopSetup+propagateSpacebaseRef
 //! co-landing makes the for-loop body clean: (A1)/(A4) stay green throughout,
@@ -274,53 +275,120 @@ fn a3_switch_jumptable_cluster_does_not_regress() {
 }
 
 // =============================================================================
-// (A4) THE PROTECTED FILES STAY BYTE-IDENTICAL to the C++ oracle.  These carry
-//      stack locals; the render stage must not have shifted their bytes.
-// =============================================================================
-#[test]
-fn a4_protected_files_byte_identical_rust_vs_cpp() {
-    for stem in ["boolless", "readstruct", "condconst_conn"] {
-        let Some(rust) = dump_print_c(&rust_harness(), stem) else { return };
-        let Some(cpp) = dump_print_c(&cpp_oracle(), stem) else { return };
-        assert_eq!(
-            rust, cpp,
-            "{stem}: Rust render diverged from the C++ oracle — the \
-             spacebase-render / for-loop-reroll stage shifted a protected file's \
-             bytes.\n--- RUST ---\n{rust}\n--- CPP ---\n{cpp}"
-        );
-    }
-}
-
-// =============================================================================
 // INDEPENDENT VERIFIER (Round 1) adversarial tests.
 //
-// The porter's `a4_protected_files_byte_identical_rust_vs_cpp` above keys on the
-// stems "readstruct" / "condconst_conn", which are NOT datatest *files* (they are
-// function names inside `nestedoffset.xml` / `condconst.xml`).  `dump_print_c`
-// finds no `===KUNA_DUMP_BEGIN` marker for them and returns None, so that test
-// silently checks only `boolless`.  These tests re-pin the byte-identity claim on
-// REAL datatest stems that carry stack locals and exercise the new SPACEBASE
-// `opPtrsub` arm, plus pin the two stage facts the independent review confirmed:
-// the SPACEBASE arm DOES fire and renders `&name` for mapped symbols, and it does
-// NOT leak a `$$undef` placeholder for unmapped auto-locals (the
-// `is_name_undefined` suppression in `link_symbol_reference`).
+// Protected functions are acquired through their real fixture stems:
+// readstruct belongs to nestedoffset.xml and condconst_conn to condconst.xml.
+// Their consumer contract is typed, executable C, not declaration comments,
+// signature whitespace, or the choice of equivalent branch orientation.
+// The remaining tests pin the SPACEBASE arm's mapped references and suppression
+// of undefined-name placeholders.
 // =============================================================================
 
-/// Real render-sensitive stems carrying stack locals: must be byte-identical
-/// Rust-vs-C++ at this stage (they pass on the suite; the merge must not shift
-/// their bytes).  Unlike the porter's A4 these use stems that actually emit a
-/// dump body, so the assertion is not vacuous.
+/// Compile the unchanged protected products and consume their authored types
+/// and values, including all three functions in the conditional-constant dump.
+/// The XML assertions remain independent positive/negative render guards.
 #[test]
-fn vfy_r1_real_protected_files_byte_identical() {
+fn vfy_r1_protected_functions_preserve_types_and_behavior() {
     for stem in ["boolless", "nestedoffset", "condconst"] {
         let Some(rust) = dump_print_c(&rust_harness(), stem) else { return };
-        let Some(cpp) = dump_print_c(&cpp_oracle(), stem) else { return };
         assert!(!rust.is_empty(), "{stem}: empty Rust dump — stem is not a real datatest file");
-        assert_eq!(
-            rust, cpp,
-            "{stem}: Rust render diverged from the C++ oracle (real protected stem).\n\
-             --- RUST ---\n{rust}\n--- CPP ---\n{cpp}"
+        let (preamble, driver) = match stem {
+            "boolless" => {
+                assert!(
+                    regex::Regex::new(r"(?m)^\s*uint1\s+[A-Za-z_][A-Za-z_0-9]*;")
+                        .unwrap()
+                        .is_match(&rust),
+                    "boolless must retain its unsigned-byte local:\n{rust}"
+                );
+                (
+                    "#include <stdint.h>\ntypedef uint8_t uint1;\nuint1 dat_52;",
+                    r#"
+_Static_assert(_Generic(&boolless, uint1 (*)(void): 1, default: 0),
+               "boolless returns the original unsigned byte");
+int main(void) {
+  for (unsigned value = 0; value < 256; ++value) {
+    dat_52 = (uint1)value;
+    uint1 expected = value <= 10 ? 1 : (uint1)value;
+    if (boolless() != expected || dat_52 != (uint1)value) return 1;
+  }
+  return 0;
+}
+"#,
+                )
+            }
+            "nestedoffset" => {
+                assert!(rust.contains("return ptr->array[b + a];"), "nested offset must retain the authored array index:\n{rust}");
+                assert!(!rust.contains("field") && !rust.contains("* 4"), "nested offset must not expose field/stride arithmetic:\n{rust}");
+                (
+                    "#include <stdint.h>\ntypedef int32_t int4;\ntypedef int64_t int8;\ntypedef struct { int4 field1; int4 field2; int4 array[5]; } twostruct;",
+                    r#"
+_Static_assert(_Generic(&readstruct, int4 (*)(twostruct *, int8, int8): 1, default: 0),
+               "readstruct preserves its authored result and input types");
+int main(void) {
+  twostruct value = { -91, 73, { 19, -42, 83, 107, -211 } };
+  for (int8 a = -4; a <= 4; ++a) {
+    for (int8 index = 0; index < 5; ++index) {
+      int8 b = index - a;
+      if (readstruct(&value, a, b) != value.array[index]) return 1;
+    }
+  }
+  return 0;
+}
+"#,
+                )
+            }
+            "condconst" => (
+                "#include <stdint.h>\ntypedef int32_t int4;\nint4 glob1, glob2, glob3, glob4;",
+                r#"
+_Static_assert(_Generic(&condconst1, void (*)(int4 *, int4, int4, int4): 1, default: 0),
+               "condconst1 preserves its authored signature");
+_Static_assert(_Generic(&condconst_copy, void (*)(int4): 1, default: 0),
+               "condconst_copy preserves its authored signature");
+_Static_assert(_Generic(&condconst_conn, int4 (*)(int4, int4): 1, default: 0),
+               "condconst_conn preserves its authored signature");
+int main(void) {
+  const int4 inputs[] = { -3, 0, 10, 21 };
+  const int4 conditions[] = { -7, 7, 12 };
+  for (unsigned ai = 0; ai < 4; ++ai) {
+    for (unsigned ci = 0; ci < 3; ++ci) {
+      int4 a = inputs[ai], c = conditions[ci], b = 37 + (int4)ai;
+      int4 slots[6] = { 101, 102, 103, 104, 105, 106 };
+      condconst1(slots, a, b, c);
+      if (slots[0] != (a == 0 ? b : 101) || slots[1] != a ||
+          slots[2] != (a == 10 ? 10 : 103) ||
+          slots[3] != (c != 7 ? c + 8 : 104) ||
+          slots[4] != (c == 7 ? 0x10 : 105) || slots[5] != 106) return 1;
+    }
+    int4 d = inputs[ai];
+    glob1 = 201; glob2 = 202; glob3 = 203; glob4 = 204;
+    condconst_copy(d);
+    if (glob1 != (d == 0 ? 0 : 201) || glob2 != d ||
+        glob3 != (d == 10 ? 10 : 203) || glob4 != (d == 10 ? 10 : 204)) return 2;
+  }
+  for (unsigned xi = 0; xi < 4; ++xi) {
+    for (int4 y = 9; y <= 11; ++y) {
+      int4 x = inputs[xi];
+      if (condconst_conn(x, y) != (x == 0 && y != 10 ? 0x14 : x)) return 3;
+    }
+  }
+  return 0;
+}
+"#,
+            ),
+            _ => unreachable!(),
+        };
+        let dir = std::env::temp_dir()
+            .join(format!("kuna-emitted-c-{}-protected-{stem}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create protected consumer directory");
+        kuna_harness::c_behavior::assert_c_behavior(
+            &dir.join("consumer.c"),
+            preamble,
+            &rust,
+            driver,
+            &[],
         );
+        std::fs::remove_dir_all(dir).expect("remove protected consumer directory");
     }
 }
 

@@ -160,6 +160,18 @@ done when the acceptance flips to PASS, and **the acceptance probe is promoted v
 `tests/cli/` as a permanent regression test** — so every shipped need leaves a CI guard behind
 it automatically.
 
+Resource probes preserve the supplied child environment, stdout, stderr and
+real exit/signal status.
+On Linux they use GNU `/usr/bin/time -v`; on macOS a fresh Python supervisor
+spawns the executable directly and obtains status and peak RSS from `wait4`
+for that child. macOS RSS bytes are converted to KiB, matching `max_rss_kb`;
+the supervisor's own memory and earlier probes' high-water marks are excluded.
+`wall_ms` still measures the entire spawn-to-collection interval, including
+measurement startup; existing timing thresholds are unchanged. A timeout
+terminates the owned process group, including descendants that survive the
+supervisor. If hard termination prevents a resource report, status and RSS
+remain unknown and the observation is failed/incomplete, not a measured pass.
+
 **What this costs.** Friction with no machine-checkable predicate — "the output is hard to
 read", "I lost my renames every invocation" — is not a need. It lands in
 `docs/re-needs/rejected/` as `unprobeable`. The quantitative channels (`gave_up_reason`,

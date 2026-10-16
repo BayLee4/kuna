@@ -4,6 +4,65 @@ Guidance for working in this repository. (`CLAUDE.md` and `AGENTS.md` at the rep
 symlinks to this file, `docs/agents.md`.) This file holds only what every task needs;
 everything else is one lookup away via the **doc map** at the bottom.
 
+## CRITICAL — Evidence before changes or approval
+
+These are mandatory stop conditions, not aspirations.
+
+1. **Keep every action aligned with the user's full intent.**
+   Before taking a substantive action, consider all applicable user instructions
+   together. Understand the overall objective, the purpose behind the instructions,
+   the explicit constraints and what successful completion requires. Check that
+   the action serves that objective—not merely a literal reading of one
+   instruction that misses or undermines the bigger picture.
+   After the action, evaluate its actual result against the same objective and
+   instructions. Correct any mismatch before continuing or reporting success.
+   Respect the wording and the intent together; inferred intent never overrides
+   an explicit constraint or authorizes a change of scope.
+
+2. **Never make a claim broader than its evidence.**
+   Separate original facts, interpretations, hypotheses, execution results
+   and acceptance. Read original source and complete producer/consumer paths;
+   treat summaries and previous verdicts as navigation, not authority.
+   Missing one encoding does not prove a fact unavailable. A passing nearby
+   consumer does not prove the original contract. Completed execution does
+   not mean passing verification. Unresolved material questions block approval.
+
+3. **Aim for zero unnecessary modifications.**
+   Before removing or weakening an assertion, test, fixture or provider,
+   prove exactly which premise is wrong and why. Preserve every independent
+   valid positive, negative and later clause. One mistaken assertion does
+   not justify deleting its whole test. A production failure is not evidence
+   that its test is wrong. Additional tests require a distinct meaningful
+   regression or consumer contract.
+
+4. **Challenge the understanding, not merely the proposed patch.**
+   Give the reviewer original bodies and primary evidence before your
+   classification or justification. For architecture decisions, trace:
+   producer → first violated invariant → representation → consumer → lifecycle.
+   Repair shared causes at their correct existing owners; keep genuinely
+   independent defects local. When a fresh assessment is requested, preserve
+   its independent initial conclusion before disclosing the existing plan.
+
+5. **Derive readiness; never negotiate it through wording.**
+   Research sufficiency, implementation correctness, completed verification
+   and permission to commit are separate claims.
+   Mandatory failed, missing or incomplete gates block the corresponding
+   acceptance claim unless the user explicitly authorizes an exception.
+   Renaming work a “research checkpoint” creates no exception.
+   Pressure to finish never changes the evidence or completion criteria.
+
+6. **Correct demonstrated inefficiency before repeating it.**
+   Resolve finite source, fixture, tool and artifact-selection questions
+   before launching purported final verification. Use the smallest experiment
+   that distinguishes the remaining causes, reuse applicable retained proof,
+   and run required full coverage on the final tree.
+   Keep one current decision owner rather than accumulating competing
+   approvals, status summaries and checklists.
+
+Continue until the agreed task is complete. If a genuine blocker remains,
+finish all reachable work and report it truthfully. Never silently narrow
+the task, weaken its contracts, or manufacture certainty to declare success.
+
 ## What kuna is
 
 kuna is an **agent-first decompiler written in Rust**: a decompilation engine plus a SLEIGH
@@ -132,6 +191,8 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 
 ## Conventions
 
+- Keep tightly coupled work under one owner. Delegate substantial independent slices
+  with clear contracts; reuse retained findings when ownership changes.
 - kuna ElementIds use the 4000+ range; kuna PcodeOp addlflags bits start at 0x1000.
 - Code comments citing `decompiler/cpp/<file>.{cc,hh}` are **upstream Ghidra anchors** —
   the C++ tree kuna was ported from, *not* paths in this repo. The pinned upstream commit
@@ -188,3 +249,48 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 | `docs/nightly.md` | The nightly CI: full gates plus a decbench sample (score and speed changes night to night). |
 | `docs/release.md` | The MAJOR.MINOR version scheme (`VERSION` file + commit count, `make version`) and the binary release CI. |
 | `docs/history.md` | **Rarely needed.** The far past: milestone timeline, the C++→Rust port + its verification, a frozen index for old `DIV-N` citations, vendored-tree provenance (`GHIDRA_REV`) + sync procedure. |
+
+# Methodology
+
+These rules apply to Main and every agent working on the task. Current system, developer and user instructions take precedence over historical summaries.
+
+## Understand the problem first
+
+- Start with everything that is currently failing, to get the bigger picture. Include required checks and later assertions that were not reached because of failure, timeout, skipped execution or missing prerequisites. Do not reduce the investigation to the latest failure.
+- Gather information and understand root causes before answering architectural questions or proposing fixes. Investigate ownership, representation, lifecycle and all producers and consumers. Reproduce the first violated invariant, its provenance and downstream effects. A refusal, a located branch or a fix for the latest fixture is not root-cause closure.
+- Understand the current codebase, its documentation, actual upstream/Ghidra owners and history, and the roadmap. Check actual revisions and paths; use the supported runtime where useful. A difference from upstream is not by itself a defect. Report unavailable or unresolved evidence.
+- Web research is authorized when useful for that understanding or a concrete comparison. Use primary sources and record version, URL and applicability; do not search ceremonially.
+- Work on one concrete causal question at a time and use the smallest experiment that distinguishes possible causes. Keep the whole investigation and acceptance scope intact. Mapping architectural differences is not the completed answer about their necessity; do not prohibit the causal evidence needed to answer that question.
+
+## Architecture and justification
+
+- Fix problems in a way that is architecturally sound, will not create tech debt, respects the codebase and will not make the long-term roadmap harder.
+- Every change needs to be 100% JUSTIFIED without the shadow of a doubt. Establish concretely whether not making it would degrade RE output quality or correctness, introduce tech debt, or hinder the long-term roadmap/goal. Compare with the previous design and actual upstream. Complete the independently challenged justification before proposed fixes; unresolved doubt is not approval.
+- The more we diverge from upstream, the less likely a future upstream PR is to be accepted. Justify every divergence. Never publish a PR without explicit user approval.
+- Reuse the correct existing owner. Check simpler alternatives with evidence. Remove superseded implementations and migrate every consumer; a local pass does not justify another abstraction or compatibility shim.
+
+## Critique
+
+- Use a critique reviewer to challenge proposed understanding and fixes. It must use critical thinking, not trust assumptions, and follow the same methodology. Before giving its technical verdict, it must have perfect understanding of the current codebase, upstream and Ghidra, including the documentation, history, owners, producers and consumers, root causes, roadmap and consumer contracts. Incomplete understanding is unfinished review; narrowing the verdict does not satisfy this requirement.
+- Offer concrete and proven better alternatives if they exist. Do not find issues just for the sake of finding issues when the original solution is good, possibly better than the alternatives.
+- Gathering that understanding is long and hard: reuse the reviewer and its understanding wherever necessary. When an impartial first-time assessment is specifically needed, use a fresh reviewer with the original inputs; an influenced follow-up is not that first assessment. Keep the first result distinct from later informed reviews.
+
+## Verification and evidence
+
+- Compare original supported inputs and readable C, types, variables, call/return meaning, source-edit authority, markup, HighFunction and raw-state preservation. Exercise actual CLI, Ghidra and export consumers. Compilation or one passing family is insufficient. Performance needs representative measurements.
+- Preserve meaningful positive and negative contracts, original fixtures and historical baselines. Investigate production behavior and consumer semantics before changing expectations, deleting coverage, turning a positive case into refusal, narrowing a fixture or substituting a handwritten provider. A justified correction or removal needs executable evidence, independent challenge and meaningful retained coverage. Suppression and green counts are not acceptance.
+- After fixes are integrated, run the entire required repository suites and regression gates on the final tree. Focused checks diagnose or verify a fix; they never replace the full final run. Any verification failure returns to the same root-cause, architecture and test-integrity methodology. Further fixes require a fresh complete final-tree run; old or mixed-tree passes are not acceptance.
+- Acceptance requires the full required suite passing without test cheating, intended behavior and output quality, and real-consumer verification. Required checks that are incomplete, unexecuted, skipped, failfast, timed out or prerequisite-blocked remain WIP or blockers. Accounting for them does not prove their behavior. Only explicit user approval reduces scope.
+- Separate execution extent and results, causal confidence, challenged design, implementation and acceptance. Preserve tree, build, configuration, product and toolchain provenance. Source citations do not prove runtime compatibility. Contradictions reopen the investigation. A status report may finish while the product remains unfinished.
+- Before a diagnostic batch, select the actual parent, child and wrapper executable paths and verify the observer on a representative case. Compare baseline and observer-off/on runs with original arguments, fixture and options preserved; compare exit/timeout, complete emitted output, non-observer diagnostics and relevant structured state. An absent witness or unexplained change blocks the batch. Observer records are not an excuse to suppress diagnostics.
+- Revalidate after executable, wrapper or observer changes, or contradictory results. A representative check is not whole-family equivalence or acceptance. Use a hash only to resolve demonstrated binary-identity ambiguity, not as a permanent ledger.
+
+## Working and preserving instructions
+
+- Instruction-following problems take priority: all other work is invalid if it is not done the way it is supposed to be done. Correct the affected practice and independently check it before continuing. Saved notes or manual discipline do not guarantee compliance.
+- Prefer the user's wording as much as possible. Make only small targeted modifications that genuinely help understand it; where “etc” refers to earlier instructions, spell those out. Clear means understanding the instruction exactly as written on first reading, not retrospectively saying it could be interpreted correctly. If the first interpretation is wrong, the wording is wrong: correct the specific part.
+- When resuming, restore the whole goal, methodology, sources, boundaries and all unfinished obligations. Give agents the exact goal and all applicable instructions. When rewriting retained instructions, compare every requirement against the previous and original versions, preserving scope, qualifiers, exceptions and conditions for proceeding. Keep supporting evidence in its existing owner, read back the result and name unresolved omissions. Themes and links alone are insufficient; presence is not compliance.
+- Distinguish demonstrated information loss from failures of instruction-following, action selection, reporting, review scope or task state. Label unproved causes; do not blame context limits without evidence. Preserve unfinished obligations and check any proposed correction in practice.
+- Address an observed inefficiency before repeating the affected work. Ground it in actual rework or overhead, keep the correction with its existing owner and preserve coverage. Prefer the simpler working path to another audit or report layer.
+- Keep one integration owner for tightly coupled work and reuse retained findings. Use existing tool history and raw logs; add an artifact only for a concrete replay or consumer. Keep decisions and blockers concise rather than duplicating inventories or execution diaries.
+- Keep changing task state separate from methodology. Detailed commands, results and completed investigations belong in their existing history or evidence owners, not in the continuing instructions.

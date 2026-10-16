@@ -230,7 +230,15 @@ fn typed_callind_commits_real_operands_and_preserves_shared_signature() {
     let output_type = fd.get_call_specs(0).proto().get_output().get_type().unwrap();
     assert_eq!(output_type.get_metatype(), type_metatype::TYPE_INT);
     assert_eq!(output_type.get_size(), 4);
-    assert!(fd.get_call_specs(0).proto().is_override());
+    assert!(fd.get_call_specs(0).proto().is_input_locked());
+    let site = fd.obank().get(call).unwrap().get_addr();
+    let stored = fd.get_override().find_proto_override(site).unwrap()
+        .prototype().expect("recovered declaration persists through analysis restart");
+    assert!(stored.is_override());
+    assert_eq!(stored.num_params(), 1);
+    assert_eq!(stored.get_param(0).unwrap().get_name(), "argument");
+    assert_eq!(stored.get_param(0).unwrap().get_address().get_offset(), 0x10);
+    assert_eq!(stored.get_output().get_address().get_offset(), 0x20);
     assert!(!shared.is_override());
     assert_eq!(shared.num_params(), 1);
     assert_eq!(shared.get_param(0).unwrap().get_name(), "argument");
@@ -322,7 +330,7 @@ fn generic_code_pointer_does_not_invent_a_callable_declaration() {
 }
 
 #[test]
-fn late_external_deindirection_keeps_exact_data_signature_precedence() {
+fn late_external_deindirection_preserves_resolved_function_authority() {
     use kuna_base::address::RangeList;
     use kuna_base::partmap::PartMap;
     use crate::context::{GlobalEntry, GlobalQuery};
@@ -351,7 +359,7 @@ fn late_external_deindirection_keeps_exact_data_signature_precedence() {
                 RangeList::new(), PartMap::new(0),
             )));
         });
-        let (call, argument, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+        let (call, _, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
         if !callable_data {
             fd.op_remove_input(call, 2);
             fd.op_remove_input(call, 1);
@@ -365,19 +373,17 @@ fn late_external_deindirection_keeps_exact_data_signature_precedence() {
         fd.vbank_mut().get_mut(target).unwrap().set_flags_pub(varnode_flags::persist | varnode_flags::externref);
         fd.op_set_input(call, target, 0).unwrap();
         ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
-        assert!(!fd.has_restart_pending());
         assert_eq!(fd.get_call_specs(0).get_name(), "import_name");
+        assert_eq!(fd.get_call_specs(0).get_entry_address(), &slot);
         assert_eq!(fd.obank().get(call).unwrap().code(), OpCode::CPUI_CALL);
-        assert_eq!(fd.obank().get(call).unwrap().num_input(), if callable_data { 2 } else { 1 });
-        if callable_data {
-            assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(argument));
-            assert_eq!(fd.get_call_specs(0).proto().num_params(), 1);
-            assert_eq!(fd.get_call_specs(0).proto().get_param(0).unwrap().get_address().get_offset(), 0x10);
-        } else {
-            assert_eq!(fd.get_call_specs(0).proto().num_params(), 0);
-        }
-        let (_, _, direct) = fd.get_arch().query_function(&slot).unwrap();
+        let site = fd.obank().get(call).unwrap().get_addr();
+        assert_eq!(fd.get_override().find_indirect_override(site), Some(&slot));
+        let (_, entry, direct) = fd.get_arch().query_function(&slot).unwrap();
+        assert_eq!(entry, slot);
         assert_eq!(direct.num_params(), if callable_data { 0 } else { 1 });
+        if !fd.has_restart_pending() {
+            assert_eq!(fd.get_call_specs(0).proto().num_params(), direct.num_params());
+        }
     }
 }
 

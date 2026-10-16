@@ -45,19 +45,26 @@ START=$(date +%s)
 DEADLINE=0
 [ "$HOURS" != "0" ] && DEADLINE=$(( START + $(printf '%.0f' "$(echo "$HOURS*3600" | bc)") ))
 
-declare -A WPID   # worker_id -> pid
+WPID=()
 SEQ=0
 
 log() { echo "[$(date +%H:%M:%S)] driver: $*"; }
 
 trap 'log "signal received -> graceful stop"; touch "$STOP_FILE"' INT TERM
 
-active_count() {
-  local n=0 wid
-  for wid in "${!WPID[@]}"; do
-    if kill -0 "${WPID[$wid]}" 2>/dev/null; then n=$((n+1)); else unset 'WPID[$wid]'; fi
+refresh_workers() {
+  local pid
+  local live=()
+  ACTIVE_COUNT=0
+  for pid in "${WPID[@]+"${WPID[@]}"}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      live+=("$pid")
+      ACTIVE_COUNT=$((ACTIVE_COUNT+1))
+    else
+      wait "$pid" 2>/dev/null || true
+    fi
   done
-  echo "$n"
+  WPID=("${live[@]+"${live[@]}"}")
 }
 
 gc_merged_worktrees() {
@@ -83,8 +90,12 @@ gc_merged_worktrees() {
 disk_ok() {
   [ "$MIN_FREE_GB" = "0" ] && return 0
   local free_gb
-  free_gb=$(df -BG --output=avail "$REPO" | tail -1 | tr -dc '0-9')
-  if [ -n "$free_gb" ] && [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+  if ! free_gb=$(df -Pk "$REPO" | awk 'NR == 2 { print int($4 / 1048576) }') ||
+     [ -z "$free_gb" ]; then
+    log "disk brake: available space could not be measured; not spawning"
+    return 1
+  fi
+  if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
     log "disk brake: ${free_gb}G free < ${MIN_FREE_GB}G required; not spawning"
     return 1
   fi
@@ -117,7 +128,7 @@ spawn_worker() {
   WORKER_ID="$wid" OPP_ID="$OPP_ID" TEST_NAME="$TEST_NAME" SELECTOR="$SELECTOR" \
     BINARY="$BINARY" SLUG="$SLUG" ARCH="$ARCH" \
     bash "$REPO/$WORKER_SCRIPT" >>"$STATE_DIR/logs/driver-$wid.log" 2>&1 &
-  WPID["$wid"]=$!
+  WPID+=("$!")
   return 0
 }
 
@@ -136,14 +147,16 @@ while :; do
     DRIVER_STATUS=2
     break
   fi
-  n="$(active_count)"
-  if [ "$n" -lt "$WORKERS" ]; then
+  # Keep membership changes in this shell, not a command-substitution subshell.
+  refresh_workers
+  if [ "$ACTIVE_COUNT" -lt "$WORKERS" ]; then
     if spawn_worker; then
       SPAWNED=$((SPAWNED+1))
       [ "$ONCE" = "1" ] && { log "--once: spawned one worker, will wait for it"; break; }
     else
       case "$?" in
-        1) [ "$(active_count)" = "0" ] && { log "backlog drained and no active workers"; break; };;
+        1) refresh_workers
+           [ "$ACTIVE_COUNT" = "0" ] && { log "backlog drained and no active workers"; break; };;
         3) ;;
         *) DRIVER_STATUS=2; break;;
       esac
@@ -153,7 +166,13 @@ while :; do
 done
 
 log "waiting for in-flight workers to finish"
-for wid in "${!WPID[@]}"; do wait "${WPID[$wid]}" 2>/dev/null; done
+for pid in "${WPID[@]+"${WPID[@]}"}"; do
+  while :; do
+    wait "$pid" 2>/dev/null
+    # A trapped signal interrupts wait without completing the child.
+    [ "$?" -gt 128 ] && kill -0 "$pid" 2>/dev/null || break
+  done
+done
 log "done. $SPAWNED worker(s) launched this run."
 "$KUNA_PY" -m scripts.pipeline.status || true
 exit "$DRIVER_STATUS"

@@ -14,8 +14,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-mod common;
-use common::{c_behavior, raw_calls, scratch_file};
+use crate::common::{c_behavior, raw_calls, scratch_file};
 
 /// The `ret` of each link in `chain_entry`, and the plain epilogue after them.
 const FIRST_LINK_RET: &str = "0x8049019";

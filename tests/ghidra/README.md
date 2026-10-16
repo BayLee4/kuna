@@ -4,6 +4,13 @@ Run `python tests/ghidra/run.py` or `make test-ghidra-live`. Each selected suite
 owns a separate process/JVM. Use `--list` for the current roster and repeat
 `--suite` to select independent consumer boundaries.
 
+The default roster is the original seventeen suites plus `native-features`
+and `cpool`: `recovery`, `prototypes`, `types`, `pointers`, `integers`,
+`settings`, `symbols`, `callsites`, `callable-consumers`, `callable-transport`,
+`callable-readonly`, `callable-recursion`, `callable-internal-roles`,
+`callable-restoration`, `callable-graph-objects`, `callable-datatypes` and
+`callable-stack-results`. A filtered run does not replace this roster.
+
 ## Prerequisites
 
 Use an unmodified Ghidra Java installation and supported JDK, with `pyghidra`
@@ -50,8 +57,17 @@ The retained suites exercise real source declarations, High/markup, named
 memory spaces, source-edit freshness, machine values, finite call targets,
 calling conventions and unchanged export execution. Source-edit tests retain
 same-ID nested alias/field changes and exact nominal field-token bindings after
-flush. Ordinary repeated smoke and unsupported export certification are not
-requirements.
+flush, reset and reopen, separately from readability of held C/High/markup.
+Before/after ordinary requests on the same interface guard restoration after
+native graph/signature failures; standalone smoke does not replace them.
+
+The integer matrix retains all fourteen CLI cases, default-width enums,
+primitive assertion admission, authentic DWARF enums and plain-char modes.
+The pointer matrix crosses two banks, offsets `0x80`, `0xa0` and `0xff`,
+and direct/alias pointers. Source identities, token bindings and unchanged
+value consumers remain independent from metadata acquisition. The datatype
+suite retains all twenty bitfield, pointer-array, mixed-return and custom
+storage cases.
 
 `callable/support.py` owns the shared source-signature/storage snapshots, actual
 Kuna High/source checks, unchanged C/H publication/execution and machine helpers
@@ -59,12 +75,26 @@ used by stack-result and recursive consumers. These helpers do not depend on a
 test suite's source module or implement executable-admission certification.
 
 CLI `decompile-project` and stock `CppExporter` are diagnostic/recompilation
-exports, not atomic complete-unit or all-machine-state certification APIs.
-Omitting a provider or an unrelated export error does not establish an
-authenticated ABI/effect refusal. Historical enhanced exporters, private
-receipt identifiers and abandoned admission protocols remain external evidence,
-not active test premises. Negative source/machine observations are independent
-from the positive executable consumers that remain.
+exports, not universal all-machine-state certification APIs. The original
+mandatory frame positives still require successful unchanged C/H/value/effect
+consumption. Their exit status reports analysis/artifact completion, not finite
+recursion, preservation of ambient machine state, or a closed executable unit.
+Partial selections retain their selected definitions and omit unselected ones.
+Physical-state negatives retain their original source, raw, CFG and machine
+observations. Historical refusal-or-correct-execution requirements for a stronger
+physical-C interface remain conditional investigation evidence; an ordinary
+successful export neither satisfies that interface nor proves its C correct.
+
+Stock `CppExporter` takes the current Program and selected functions, not a
+retained result. It has warning/skip/cancellation behavior rather than atomic
+two-file replacement or historical retained-publication validation. Tests
+retain actual malformed/cancel/recovery inputs, fresh edited declarations and
+selected successful providers without inventing those contracts. Historical
+enhanced receipts and their explicitly conditional product requirements remain
+in the investigation evidence; they are not a second supported runtime domain.
+Direct emitted i386 targets are exercised separately when cleanup or register
+storage must match the original machine; a compiler-generated caller adapting
+an incompatible declaration is insufficient.
 
 ## Artifacts
 

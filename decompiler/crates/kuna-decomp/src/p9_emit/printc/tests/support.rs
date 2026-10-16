@@ -108,10 +108,14 @@ use std::rc::Rc;
     }
 
 pub(super) fn assert_c_source(source: &str, label: &str) {
+    assert_c_source_with_warnings(source, label, &["-Wall", "-Wextra"]);
+}
+
+pub(super) fn assert_c_source_with_warnings(source: &str, label: &str, warnings: &[&str]) {
     let dir = std::env::temp_dir()
         .join(format!("kuna-emitted-c-{}-{label}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    kuna_harness::c_behavior::assert_c_behavior(&dir.join("consumer.c"), "", source, "");
+    kuna_harness::c_behavior::assert_c_behavior(&dir.join("consumer.c"), "", source, "", warnings);
     std::fs::remove_dir_all(dir).unwrap();
 }
 

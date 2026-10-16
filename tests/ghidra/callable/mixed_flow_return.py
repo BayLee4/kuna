@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-from support import ROOT, cli as default_cli, output, tool
+from support import ROOT, cli as default_cli, output, tool, require_provider_body
 import subprocess
 import traceback
 from whole_calls import Machine
@@ -91,16 +91,21 @@ for case in ['balanced', 'malformed_ordinary_pop']:
         metadata = json.loads(meta['stdout'])
         (out/'metadata.json').write_text(json.dumps(metadata, indent=2)+'\n')
         byname = {f['name']: f for f in metadata['functions']}
+        assert len(metadata['functions']) == len(entries) and set(byname) == {entry[0] for entry in entries}, metadata
         assert all(f.get('error') is None and f.get('code') for f in byname.values()), metadata
         for name, wanted in [('subject', [('choice', 4, 0), ('value', 4, 1)]), ('target', [('value', 4, 0)])]:
             params = sorted((v for v in byname[name]['variables'] if v['kind'] == 'arg'), key=lambda p: p['arg_index'])
             assert [(p['name'], p['size'], p['arg_index']) for p in params] == wanted, params
-        if case == 'malformed_ordinary_pop':
-            row['completed'] = True
-            continue
         project = out/'project'
         export = invoke([args.cli, 'decompile-project', binary, '-o', project, *common])
+        if case == 'malformed_ordinary_pop':
+            row['executable_extension_contract'] = 'EX10/EX12 historical refusal remains prerequisite-unrepresented; ordinary export status is not executable certification'
+            row['behavioral_checks_completed'] = True
+            row['completed'] = True
+            continue
         assert export['status'] == 0, export
+        for provider, _, _, _ in entries:
+            require_provider_body(project/'mixed_flow_return.c', provider)
         row['emitted_sha256'] = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in [project/'mixed_flow_return.c', project/'mixed_flow_return.h']}
         consumer = out/'consumer.c'
         consumer.write_text('#include "mixed_flow_return.h"\n#include <stdint.h>\nint main(void){const unsigned choices[]={0,1,UINT32_MAX};const int values[]={-7,0,5,1234};for(unsigned i=0;i<3;++i)for(unsigned j=0;j<4;++j){int want=values[j]+(choices[i]?10:3);if(subject(choices[i],values[j])!=want)return 1;}return 0;}\n')

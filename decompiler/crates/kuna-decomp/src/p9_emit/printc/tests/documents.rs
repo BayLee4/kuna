@@ -610,7 +610,7 @@ mod comment_consumers {
             let (mut fd, arch) = fixture();
             let types = arch.types_rc();
             let node = nominal_node(&types);
-            let input = types.get_typedef(&node, "InputAlias", 72_057_594_037_927_937, 0).unwrap();
+            let input = types.get_typedef(&node, "Input alias (v2)", 72_057_594_037_927_937, 0).unwrap();
             let manager = Rc::new(build_manager());
             let space = manager.get_space_by_name("ram").unwrap().clone();
             let mut model = ProtoModel::new(&manager);
@@ -636,7 +636,7 @@ mod comment_consumers {
             };
             let nested = callable(&input, vec![node.clone()]);
             let callback = callable(&node, vec![input, nested]);
-            let alias = types.get_typedef(&callback, "Transform", 72_057_594_037_927_938, 0).unwrap();
+            let alias = types.get_typedef(&callback, "Transform (next)", 72_057_594_037_927_938, 0).unwrap();
             fd.set_high_level();
             named_call_input(&mut fd, "callback", callback);
             named_call_input(&mut fd, "named_callback", alias);
@@ -644,18 +644,18 @@ mod comment_consumers {
             let tokens = host_type_tokens(&fd, &bytes);
             let nominal: Vec<_> = tokens.iter()
                 .filter(|(at, name, _)| *at == TypePosition::Prototype
-                    && matches!(name.as_str(), "Node" | "InputAlias" | "Transform"))
+                    && matches!(name.as_str(), "Node" | "Input alias (v2)" | "Transform (next)"))
                 .map(|(_, name, id)| (name.clone(), *id))
                 .collect();
             assert_eq!(nominal, vec![
                 ("Node".into(), Some(72_057_594_037_927_936)),
-                ("InputAlias".into(), Some(72_057_594_037_927_937)),
-                ("InputAlias".into(), Some(72_057_594_037_927_937)),
+                ("Input alias (v2)".into(), Some(72_057_594_037_927_937)),
+                ("Input alias (v2)".into(), Some(72_057_594_037_927_937)),
                 ("Node".into(), Some(72_057_594_037_927_936)),
-                ("Transform".into(), Some(72_057_594_037_927_938)),
+                ("Transform (next)".into(), Some(72_057_594_037_927_938)),
             ], "{}", host_text(&fd, &bytes));
             assert!(!tokens.iter().any(|(at, name, _)| *at == TypePosition::Local
-                && matches!(name.as_str(), "Node" | "InputAlias" | "Transform")),
+                && matches!(name.as_str(), "Node" | "Input alias (v2)" | "Transform (next)")),
                 "callback parameters must not also be declared as locals: {}", host_text(&fd, &bytes));
         }
 

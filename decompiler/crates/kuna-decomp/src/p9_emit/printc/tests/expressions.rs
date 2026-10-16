@@ -1,5 +1,5 @@
 use super::*;
-use super::support::{assert_c_source, assert_rust_source, bare_arch, build_fd, build_manager,
+use super::support::{assert_c_source, assert_c_source_with_warnings, assert_rust_source, bare_arch, build_fd, build_manager,
     execution_printer, mk_op, name_call_local, ram};
 use crate::context::{ArchContext as ContextArch, TypeOp};
 use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl};
@@ -7,6 +7,9 @@ use crate::funcdata::Funcdata;
 use kuna_base::address::Address;
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
+
+mod callable_views;
+mod recovered_views;
 
     fn named(nm: &str, size: int4, meta: type_metatype) -> Rc<Datatype> {
         let types = TypeFactoryImpl::new();
@@ -734,7 +737,6 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
     use crate::fspec::{FuncCallSpecs, ParamEntry, ParameterPieces, ProtoModel};
     use crate::p5_types::kuna_calltargettype::ActionCallTargetType;
     use crate::p9_emit::coreaction_casts::get_input_cast;
-    use crate::prettyprint::TokenKind;
 
     let mut manager = build_manager();
     manager.set_default_code_space(2).unwrap();
@@ -824,8 +826,28 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
             print.op_call_ir(&fd, &arch, call);
             print.recurse();
             let tokens = print.emit_mut().take_markup_tokens();
-            assert_eq!(tokens.iter().filter(|t| t.kind == TokenKind::Type).count(), 1,
-                "{tokens:?}");
+            let presented: String = tokens.iter().flat_map(|token| token.text.chars())
+                .filter(|character| !character.is_whitespace()).collect();
+            let complete: String = text.chars().filter(|character| !character.is_whitespace()).collect();
+            assert_eq!(presented, complete, "ctypes={native}: {tokens:?}");
+            let target = fd.obank().get(call).unwrap().get_in(0).unwrap();
+            let mut target_print = execution_printer(&arch, false);
+            target_print.push_vn_ir(&fd, &arch, target, call);
+            target_print.recurse();
+            let target_expression = target_print.emit_mut().output_str().to_string();
+            let signature_consumer = format!(r#"
+#include <stdint.h>
+typedef int32_t int4;
+typedef void (*expected_callback)(int4);
+static void verify_target(uintptr_t target) {{
+    _Static_assert(_Generic(({target_expression}), expected_callback: 1, default: 0),
+                   "the real CAST target must retain its complete callable type");
+}}
+int main(void) {{ verify_target(0); return 0; }}
+"#);
+            assert_c_source_with_warnings(&signature_consumer,
+                &format!("actual-recovered-call-target-type-{native}"),
+                &["-Wall", "-Wextra", "-Werror=strict-prototypes"]);
             assert!(Rc::ptr_eq(&fd.vn_high_type_read_facing(source, call), &facing));
             assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(cast_output));
             let consumer = format!(r#"

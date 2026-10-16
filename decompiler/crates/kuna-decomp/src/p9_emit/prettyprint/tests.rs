@@ -48,6 +48,33 @@ mod stock_markup {
     }
 
     #[test]
+    fn nominal_leaves_bind_without_declarator_syntax_or_capture_changes() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let node = types.get_type_struct("Node").unwrap();
+        let alias = types.get_typedef(&node, "NodeAlias", 0x1234, 0).unwrap();
+        let id = alias.get_unsized_id().unwrap();
+        let mut emitter = EmitMarkup::new();
+        emitter.set_capture_tokens(true);
+        let document = emitter.begin_document();
+        emitter.print("\u{1f600} *", SyntaxHighlight::NoColor);
+        emitter.tag_type(alias.get_name(), SyntaxHighlight::TypeColor,
+            &MarkupRef { type_id: Some(id), type_name: Some(alias.get_name().into()),
+                ..MarkupRef::none() });
+        emitter.print("[2]", SyntaxHighlight::NoColor);
+        emitter.end_document(document);
+        let tokens = emitter.take_tokens();
+        assert_eq!(tokens[1].text, "NodeAlias");
+        assert_eq!(tokens[1].col, 4);
+        assert_eq!(tokens[1].type_name.as_deref(), Some("NodeAlias"));
+        assert_eq!(wire_types(&emitter.take_output()),
+            vec![("NodeAlias".into(), Some(id))]);
+        emitter.set_output_stream();
+        assert!(emitter.take_tokens().is_empty());
+    }
+
+    #[test]
     fn queue_wrap_replaces_type_bindings_and_syntax_slots() {
         let mut pp = EmitPrettyPrint::new();
         pp.set_max_line_size(20).unwrap();

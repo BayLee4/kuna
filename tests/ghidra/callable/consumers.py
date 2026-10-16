@@ -11,9 +11,13 @@ from support import host
 
 
 SCRIPTS = (
+    "java_producer.py",
     "java_native_publication.py",
+    "java_callable_publication.py",
     "java_source_identity.py",
     "java_structural_publication.py",
+    "java_cpp_exporter.py",
+    "native_import_provenance.py",
 )
 
 

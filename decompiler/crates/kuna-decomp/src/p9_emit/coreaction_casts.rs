@@ -2170,6 +2170,96 @@ mod verify_w10_merge_casts_r2 {
     }
 
     #[test]
+    fn variadic_float_constant_cast_preserves_bits_and_other_integer_uses() {
+        use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::varnode::varnode_flags;
+        for (other_reader, locked) in [(false, false), (true, false), (false, true)] {
+            let (mut fd, strat, ram) = build();
+            let types = fd.get_arch().types().unwrap();
+            let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let uint8 = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
+            let float8 = types.get_base(8, type_metatype::TYPE_FLOAT).unwrap();
+            let void = types.get_type_void().unwrap();
+            let mut model = ProtoModel::new(fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(model), void);
+            proto.set_override(true);
+            proto.set_dotdotdot(true);
+            for (slot, dtype) in [(0, int4), (1, float8)] {
+                proto.set_param(slot, "argument", &ParameterPieces {
+                    addr: Address::new(ram.clone(), 0x80 + slot as u64 * 8),
+                    type_: Some(dtype), flags: parameter_pieces_flags::TYPELOCK,
+                });
+            }
+            let root = fd.bblocks_root_pub();
+            let block = fd.bblocks_mut().new_block_basic(root);
+            let bits = 2.5_f64.to_bits();
+            let raw = fd.new_constant(8, bits);
+            fd.vn_update_type(raw, uint8);
+            if locked {
+                fd.vbank_mut().get_mut(raw).unwrap().set_flags_pub(varnode_flags::typelock);
+            }
+            let integer_use = if other_reader {
+                let copy = fd.new_op(1, Address::new(ram.clone(), 0x2000));
+                fd.op_set_opcode(copy, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
+                fd.op_set_input(copy, raw, 0).unwrap();
+                fd.new_unique_out(8, copy).unwrap();
+                fd.op_insert_end(copy, block);
+                Some(copy)
+            } else { None };
+            let call = fd.new_op(3, Address::new(ram.clone(), 0x2004));
+            fd.op_set_opcode(call, TypeOp::new(OpCode::CPUI_CALLIND, crate::op::pcodeop_flags::call, "CALLIND"));
+            let target = fd.new_unique(8, None);
+            let fixed = fd.new_constant(4, 7);
+            fd.op_set_input(call, target, 0).unwrap();
+            fd.op_set_input(call, fixed, 1).unwrap();
+            fd.op_set_input(call, raw, 2).unwrap();
+            fd.op_insert_end(call, block);
+            let admitted_argument = fd.obank().get(call).unwrap().get_in(2).unwrap();
+            assert_eq!(fd.vbank().get(admitted_argument).unwrap().get_offset(), bits);
+            if other_reader {
+                assert_ne!(admitted_argument, raw, "each constant read owns its own varnode");
+            }
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().copy(&proto);
+            fd.push_call_specs(specs);
+            fd.cast_input(call, 2, &strat);
+            let cast_output = fd.obank().get(call).unwrap().get_in(2).unwrap();
+            let output = fd.vbank().get(cast_output).unwrap();
+            assert_eq!(output.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
+            assert_eq!(output.get_type().get_size(), 8);
+            if output.is_constant() {
+                assert!(!locked);
+                assert_eq!(cast_output, admitted_argument);
+                assert_eq!(output.get_offset(), bits);
+            } else {
+                let cast = fd.obank().get(output.get_def().expect("locked constant conversion")).unwrap();
+                assert_eq!(cast.code(), OpCode::CPUI_CAST);
+                let input = fd.vbank().get(cast.get_in(0).expect("consumed constant")).unwrap();
+                assert!(input.is_constant());
+                assert_eq!(input.get_size(), 8);
+                assert_eq!(input.get_type().get_metatype(), type_metatype::TYPE_UINT);
+                assert_eq!(input.get_type().get_size(), 8);
+                assert_eq!(input.get_offset(), bits);
+                if locked {
+                    assert!(input.is_type_lock());
+                }
+            }
+            if other_reader || locked {
+                assert_eq!(fd.vbank().get(raw).unwrap().get_type().get_metatype(), type_metatype::TYPE_UINT);
+                assert_eq!(fd.vbank().get(raw).unwrap().get_offset(), bits);
+            }
+            if locked {
+                assert!(fd.vbank().get(raw).unwrap().is_type_lock());
+            }
+            if let Some(integer_use) = integer_use {
+                assert_eq!(fd.obank().get(integer_use).unwrap().get_in(0), Some(raw));
+            }
+        }
+    }
+
+    #[test]
     fn closed_variadic_override_cast_preserves_abi_and_concrete_argument_types() {
         use crate::dtype::type_class;
         use crate::fspec::{parameter_pieces_flags, FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel, PrototypePieces};

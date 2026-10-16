@@ -178,6 +178,22 @@ dirty_gp_natural:
 .globl dirty_gp_natural_end
 dirty_gp_natural_end:
 
+.globl direct_gp_natural_parent
+.type direct_gp_natural_parent,@function
+direct_gp_natural_parent:
+ addiu $sp,$sp,-32
+ sw $ra,28($sp)
+ jal dirty_gp_natural
+ nop
+ addiu $v0,$zero,11
+ lw $ra,28($sp)
+ addiu $sp,$sp,32
+ jr $ra
+ nop
+.size direct_gp_natural_parent,.-direct_gp_natural_parent
+.globl direct_gp_natural_parent_end
+direct_gp_natural_parent_end:
+
 .section .rodata,"a",@progbits
 .globl readonly_flag
 .type readonly_flag,@object

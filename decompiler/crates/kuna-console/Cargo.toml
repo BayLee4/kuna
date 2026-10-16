@@ -49,6 +49,10 @@ name = "integration"
 path = "tests/integration.rs"
 
 [[test]]
+name = "verify_dwarf_declarations"
+path = "tests/verify_dwarf_declarations.rs"
+
+[[test]]
 name = "verify_dwarfstructs"
 path = "tests/verify_dwarfstructs.rs"
 

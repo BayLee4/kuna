@@ -8965,6 +8965,109 @@ mod tests {
         (element, source_id, size)
     }
 
+    #[test]
+    fn callback_wire_alias_headers_preserve_source_instance_and_callable_shape() {
+        use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager, ConstantSpace};
+        use crate::fspec::{ParamEntry, ProtoModel};
+        let f = factory();
+        f.setup_sizes(Some(4), 4, 4);
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        let register = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "register", false, 4, 1, 1, 0, 1, 1));
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.set_default_code_space(1).unwrap();
+        manager.set_default_data_space(1).unwrap();
+        let manager = Rc::new(manager);
+        let mut model = ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        model.set_name("__stdcall");
+        model.input_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
+            Rc::clone(&register), 0, 4, 1, 0, 0, true, false, &[], &manager).unwrap());
+        model.input_mut().finish_decode();
+        model.output_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
+            register, 0, 4, 1, 0, 0, true, false, &[], &manager).unwrap());
+        model.output_mut().finish_decode();
+        let model = Rc::new(model);
+        f.set_proto_context(Rc::clone(&manager));
+        f.set_proto_models(Some(Rc::clone(&model)), std::collections::BTreeMap::from([("__stdcall".into(), model)]));
+        let outer = r#"<def name="Outer" id="0x500000000000001"><def name="Alias" id="0x500000000000000"><typeref name="Callback" id="0x600000000000000" size="1"/></def></def>"#;
+        let other = r#"<type name="Other" id="0x600000000000001" metatype="code" size="1"><prototype extrapop="0" model="__stdcall" modellock="true" dotdotdot="true" voidlock="true"><returnsym typelock="true"><addr/><type name="int" id="0xc000000000000095" metatype="int" size="4"/></returnsym><internallist/></prototype></type>"#;
+        for nullary in [false, true] {
+            f.clear_noncore();
+            let (flags, params) = if nullary {
+                (r#" dotdotdot="true" voidlock="true""#, "<internallist/>")
+            } else {
+                ("", r#"<internallist><param name="value" typelock="true" namelock="true"><addr/><type name="int" id="0xc000000000000095" metatype="int" size="4"/></param></internallist>"#)
+            };
+            let callback = format!(r#"<type name="Callback" id="0x600000000000000" metatype="code" size="1"><prototype extrapop="0" model="__stdcall" modellock="true"{flags}><returnsym typelock="true"><addr/><void/></returnsym>{params}</prototype></type>"#);
+            decode_regression_type(&f, &manager, &callback).unwrap();
+            let held = decode_regression_type(&f, &manager, outer).unwrap();
+            let alias = held.get_typedef().unwrap();
+            let source = alias.get_typedef().unwrap();
+            for (value, name, id) in [(&held, "Outer", 0x500000000000001),
+                (alias, "Alias", 0x500000000000000), (source, "Callback", 0x600000000000000)] {
+                assert_eq!((value.get_name(), value.get_unsized_id().unwrap(), value.get_size()), (name, id, 1));
+            }
+            let proto = source.get_code_prototype().expect("authored callback source declaration");
+            assert_eq!(proto.num_params(), if nullary { 0 } else { 1 });
+            assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+            if !nullary {
+                assert!(!proto.is_dotdotdot());
+                assert_eq!(proto.get_param(0).unwrap().get_name(), "value");
+                assert_eq!(proto.get_param(0).unwrap().get_type().unwrap().get_size(), 4);
+            }
+            let expected = (ELEM_TYPEREF.get_id(), Some(0x500000000000001), Some(1));
+            assert_eq!(encoded_regression_type_identity(&held, &manager), expected);
+            for wire in [outer, r#"<typeref name="Outer" id="0x500000000000001" size="1"/>"#, outer] {
+                let repeated = decode_regression_type(&f, &manager, wire).unwrap();
+                assert_eq!(repeated.get_typedef().unwrap().get_name(), "Alias");
+                assert_eq!(repeated.get_typedef().unwrap().get_typedef().unwrap().get_name(), "Callback");
+                assert_eq!(encoded_regression_type_identity(&repeated, &manager), expected);
+            }
+            assert!(decode_regression_type(&f, &manager,
+                r#"<typeref name="Outer" id="0x500000000000001"/>"#).is_err());
+            let available_other = decode_regression_type(&f, &manager, other).unwrap();
+            assert_eq!(available_other.get_unsized_id().unwrap(), 0x600000000000001);
+            let changed = r#"<def name="Outer" id="0x500000000000001"><typeref name="Other" id="0x600000000000001" size="1"/></def>"#;
+            assert!(decode_regression_type(&f, &manager, changed).is_err());
+            assert_eq!(held.get_typedef().unwrap().get_name(), "Alias");
+            f.clear_noncore();
+            decode_regression_type(&f, &manager, other).unwrap();
+            let fresh = decode_regression_type(&f, &manager, changed).unwrap();
+            assert_eq!(fresh.get_unsized_id().unwrap(), held.get_unsized_id().unwrap());
+            assert_eq!(fresh.get_typedef().unwrap().get_name(), "Other");
+            assert_eq!(held.get_typedef().unwrap().get_name(), "Alias");
+            let retained = held.get_typedef().unwrap().get_typedef().unwrap();
+            assert_eq!(retained.get_name(), "Callback");
+            assert_eq!(retained.get_code_prototype().unwrap().num_params(), if nullary { 0 } else { 1 });
+            assert_eq!(encoded_regression_type_identity(&held, &manager), expected);
+        }
+    }
+
+    #[test]
+    fn wire_bitfield_container_preserves_cross_byte_range() {
+        let manager = kuna_base::space::AddrSpaceManager::new();
+        for big_endian in [false, true] {
+            for size in [4, 1] {
+                let f = factory();
+                f.set_truncate_big_endian(big_endian);
+                let wire = format!(
+                    r#"<type name="Bits" size="{size}" metatype="struct"><bitfield name="middle" id="0" offset="0" first="3" size="8"><type name="" metatype="uint" size="4"/></bitfield></type>"#,
+                );
+                let decoded = decode_regression_type(&f, &manager, &wire);
+                if size == 1 {
+                    assert!(decoded.is_err(), "cross-byte field exceeds its structure");
+                } else {
+                    let record = decoded.unwrap();
+                    let DatatypeKind::Struct { bitfield, .. } = &record.kind else { panic!("structure") };
+                    let bits = bitfield[0].bits();
+                    assert_eq!((bits.byte_offset, bits.byte_size, bits.least_sig_bit, bits.num_bits), (0, 2, 3, 8));
+                    let container = crate::bitfield::BitRange::new(0, 4, 0, 32, big_endian);
+                    assert_eq!(container.translate_lsb(&bits), if big_endian { 19 } else { 3 });
+                }
+            }
+        }
+    }
 
     #[test]
     fn by_value_forward_alias_and_array_cycles_reject_then_retry_valid_fields() {
@@ -9001,10 +9104,16 @@ mod tests {
         let complete = decode_regression_type(&f, &manager,
             r#"<type name="Opaque" id="301" size="8" alignment="8" metatype="struct"><field name="value" offset="0"><type name="" metatype="int" size="4"/></field></type>"#).unwrap();
         assert!(!complete.is_incomplete());
-        for seen in [pointer.get_ptr_to().unwrap(), alias_pointer.get_ptr_to().unwrap()] {
-            assert!(!seen.is_incomplete());
-            assert_eq!((seen.get_size(), seen.get_alignment()), (8, 8));
-            assert_eq!(seen.get_field(0).unwrap().name, "value");
+        assert_eq!((complete.get_id(), complete.get_size(), complete.get_alignment()), (301, 8, 8));
+        assert_eq!(complete.get_field(0).unwrap().name, "value");
+        for held in [&pointer, &alias_pointer] {
+            assert!(held.get_ptr_to().unwrap().is_incomplete(), "the imported raw shell is immutable");
+            let (field_pointer, offset, _, _) = f.down_chain(held, 0, false).unwrap();
+            let field = field_pointer.expect("the held source pointer must resolve its completed field")
+                .get_ptr_to().unwrap();
+            assert_eq!(offset, 0);
+            assert_eq!(field.get_id(), complete.get_field(0).unwrap().field_type.get_id());
+            assert_eq!((field.get_metatype(), field.get_size()), (type_metatype::TYPE_INT, 4));
         }
     }
 

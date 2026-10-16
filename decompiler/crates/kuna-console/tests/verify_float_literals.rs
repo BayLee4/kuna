@@ -1,6 +1,6 @@
 //! Floating literals must preserve the original target bits when compiled as C.
 
-mod common;
+use crate::common;
 #[path = "common/corpus.rs"]
 mod corpus;
 
