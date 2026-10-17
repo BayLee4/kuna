@@ -6008,6 +6008,101 @@ image has a delta switch — `mcount_x86_64` 495 to 508 functions reachable from
 entry, the gnulib image 89 to 100, the MSVC fixture 2 to 6. `kuna strings` over the
 896 KB `mcount_x86_64`, which holds 470 computed jumps, 676 ms to 704 ms.
 
+(kuna) gcc's own dispatches kept most of a switch's callees out of that read all
+the same — 3,913 of the 186,139 direct call sites in 51 x86-64 decbench binaries,
+2,609 of them at `-O0`, where every computed jump of a PIE fails. Five things
+were in the way, and each is now read. **Switch reach** (`switchreach`,
+default-on) gates how far the read follows a dispatch — the unscaled index, the
+long slice across calls, the sixteen-instruction search for the range check,
+the masked index and the re-read below; off, the slice and the search stop at
+eight instructions and at the first call, as they did. How the range check is
+read once it is found is *not* gated, so the option off is not the old walk:
+ssh `-O2`'s dispatch at `0x42a26` in `main` reads 9 of its 13 cases on the old
+walk, all 13 with the option on, and none with it off.
+
+*The `-O0` chain.* gcc spends seven instructions between its `ja` and the jump:
+`mov %eax,%eax; lea 0(,%rax,4),%rdx; lea jt(%rip),%rax; mov (%rdx,%rax,1),%eax;
+cltq; lea jt(%rip),%rdx; add %rdx,%rax`. The table base sits in the *unscaled*
+index slot, which x86 SLEIGH spells as a multiply by one, so the slice follows a
+multiply by one as a copy (a multiply by anything else still prunes the
+selector's chain). The 32-bit load writes `rax = zext(eax)`, which retires the
+tracked `eax` before `cltq` reads it back, so a register with no value of its
+own reads as the low part of the wider register holding one, in the processor's
+byte order: a constant truncated, a table entry as it is. The range check is
+then ten instructions up, and it has a window of its own (sixteen instructions)
+rather than the slice's.
+
+*The range check.* The guard is the nearest conditional branch above the
+dispatch that leaves its own instruction — a `cmov` or a `rep` prefix branches
+only to the end of the instruction it is in, and clang's Duff's device in bash's
+`internal_malloc` has a `cmovae` between its mask and its jump — and the bound
+is a comparison that feeds that branch's condition —
+in the branch itself, or in the nearest instruction above it that writes what
+the condition reads. Instructions that leave the condition alone may sit in
+between (gcc `-O2` puts a `movb $0x3f,0x34(%rsp)` between `cmpb $0x56,0x9c(%rbx)`
+and its `ja`); a comparison anywhere else is not a bound, which drops the carry
+a `sub $0x18,%rsp` in the dispatch chain used to contribute and the carry of a
+`cmp` ahead of a `je`. Which side of the comparison the dispatch is on comes
+from evaluating the condition twice, with the comparison as it comes out for a
+selector above the constant `c` and for one below it and every other flag the
+comparison sets clear. A branch taken for the large selector leaves the
+dispatch `c + 1` cases. A branch taken for the small one leaves it the selectors
+from `c` up, which bounds an unsigned `w`-byte selector at `2^(8w) - c` when that
+is within `jumptablemax` and is no bound otherwise: bash's `cmp
+$0xfffffffb,%r12d; jb default` guards a five-case table indexed by `sel + 5`, and
+reading it as `0xfffffffb + 1` cases ran on into the table after it. The
+comparison may have its constant on either side and in a temporary of the same
+instruction, which is how AArch64 SLEIGH spells `cmp x8, #6` (`tmp = 6; tmpCY =
+tmp <= x8`). Nothing checks that the comparison is on the selector: the nearest
+one may test another value entirely. An index masked by `and $m`, followed back
+over the code that falls into the dispatch through scaling, copies and zero
+extensions, states at most `m + 1` cases whatever the range check says — clang
+guards `switch (x & 3)` under `if (y <= 200) *p = y;` with the `cmp $0xc8`, which
+read as 201 cases ran twenty entries into the next functions' tables, and the
+Duff's device checks the byte count against 32 above its `and $0x7` — and where
+no range check bounds the selector the mask is read only when all `m + 1`
+entries are cases.
+
+*A base far above the jump.* gcc `-O2` hoists the base out of a loop into a
+callee-saved register, as far as the prologue: diff's `main` loads its option
+table with `lea jt(%rip),%r15` right after the pushes and dispatches some sixty
+instructions and nine calls later. The slice reaches 96 instructions back; a
+call no longer ends it when everything it still wants is a register the default
+prototype model lists as unaffected, and the fold keeps only those values
+across the call. Stepping back over an instruction that does not fall through
+(a `jmp`, a `ret`) leaves the block, so the slice stops there.
+
+*Order.* The walk is breadth-first, and a `.cold` fragment that sorts ahead of
+its parent jumps back into the parent's loop, so a dispatch can be decoded
+before the code that falls into it. A read that stopped because no decoded
+instruction ends where the slice needed one records that address. When any body
+later decodes an instruction that falls through to it, that body reads the
+table again once its own queue drains and walks the cases as its own: it reaches
+the dispatch by falling into it, and it is the function the cold fragment
+belongs to.
+
+With all five, the 51 binaries miss 156 direct call sites instead of 3,913 —
+none at `-O0` outside tar and e2fsck — and the call graph gains 1,868 edges and
+loses three, two of which were jumps from a table read past its end. What is
+left is a selector the code never range-checks because its type cannot exceed
+the table (tar's `parse_expression` switches on a token type held in a byte,
+whose table is followed directly by another one, so there is no safe place to
+stop), and AArch64's byte and halfword tables scaled by four (`ldrb w11,
+[x9,x8]; add x10,x10,x11,lsl #2; br x10`), whose entries the fold does not
+compose, and a range check on another value than the selector with no mask to
+overrule it.
+
+A complete call graph is not a better one for every consumer. Case bodies are
+where an interpreter recurses, so the new edges merge recursive functions into
+larger strongly connected components of `decompile-all`'s callee-first plan, and
+`protoorder` (`cycles`) gives no member of a cycle the prototypes of its callees:
+bash `-O0`'s `execute_*` recursion grows from 206 to 367 functions and 33 of its
+signatures change, mostly to plainer integer types (`extract_arithmetic_subst`
+from `char *(char *,int *)` to `unsigned long(unsigned long,unsigned long)`,
+`execute_command`'s `struct_69 *` to `unsigned long`), as do dash's
+`subevalvar` and `evaltreenr` and coreutils `numfmt`'s `main`. With `protoorder
+off` those functions come out the same with the option on and off.
+
 (kuna) Both reads stop at the engine's own jump-table ceiling,
 `Architecture::max_jumptable_size` — 1024 unless `option jumptablemax <n>` raises
 it — so one value decides how far a switch is followed in both tiers. A range
