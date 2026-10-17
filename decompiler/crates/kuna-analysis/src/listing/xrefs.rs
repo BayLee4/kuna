@@ -729,7 +729,7 @@ fn descend(
     let preserve_bodies = sections_are_runtime
         && arch.analysis_funcstart_patterns
         && file.architecture() == object::Architecture::Arm;
-    let prologues = preserve_bodies && arch.analysis_armframes;
+    let prologues = preserve_bodies && arch.analysis_armframes && arch.analysis_armframes_full;
     let mut st = State::new(&seed_set, measure || preserve_bodies);
 
     // Reused across every decode in the walk (see [`FullCapture`]).
@@ -789,7 +789,7 @@ fn descend(
                     );
                 }
                 let frames = crate::aif::raw_arm_frames(
-                    file, &listing, arch, translate, Rc::clone(&code_space), &exec, true,
+                    file, &listing, arch, translate, Rc::clone(&code_space), &exec, true, None,
                 );
                 let found = frames.roots.clone();
                 frame_cache = frames;
@@ -1287,7 +1287,7 @@ fn gap_entries(
         crate::aif::run_aif_after_frames(
             &listing, prior, translate, Rc::clone(code_space),
             arch.analysis_aifstrict, arch.analysis_aifcorroborate, bracket, arch.analysis_aifnoppad,
-            poolslide, None,
+            poolslide, None, None,
         )
     } else {
         crate::aif::run_aif(

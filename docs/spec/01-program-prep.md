@@ -5436,9 +5436,10 @@ stripped i386 PE as 61 of one function's 174 callers.
 
 (kuna) ARM reference walks also recover the
 LR-saving frame roots used by the Listing when both `funcstart_patterns` and
-`armframes` are enabled. `armframes` defaults off and is never injected by CLI
-discovery bundles or mode presets. With it off, reference discovery keeps its
-existing seeded/AIF walk and Listing keeps its Thumb-only inventory recovery.
+`armframes on` are enabled. The default `armframes inventory` recovers A32 frames
+for the function inventory only, and no CLI discovery bundle or mode preset
+selects `on`. Below `on`, reference discovery keeps its existing seeded/AIF walk;
+with `off`, the Listing also keeps its Thumb-only inventory recovery.
 
 Frame recovery never drops an inventory entry the option-off pipeline reports
 without evidence against it
@@ -5570,6 +5571,14 @@ Mode correction also runs with AIF disabled
 (`decompiler/crates/kuna-analysis/src/listing/kuna_framemode.rs`).
 
 Frame recovery retains its original validation records across reconciliation.
+When `aifpoolslide` is enabled, frame-prefix reconciliation uses the same literal
+word evidence as the ordinary AIF gap pass, including loads from validated frame
+bodies before any prefix is considered. An accepted prefix on a referenced pool
+word moves to the code after the pool. Its retained decode records exclude the
+pool instructions, so neither their register writes nor their calls can supply
+frame evidence. If the corrected address is already a frame root, that root
+keeps its place; reconciliation never replaces an entry with itself
+(`decompiler/crates/kuna-analysis/src/analyzers/aif/kuna_framepool.rs`).
 A prefix pass reuses frame validity and claimed spans, and retains accepted prefix
 bodies directly from the gap scan instead of validating them again. An unchanged
 root set and unchanged fingerprint acceptance thresholds reuse the prior scan;
@@ -5635,8 +5644,71 @@ late root replacement or contradicted frame mode rebuilds the reference walk. Di
 disabling `aif` does not. Recovery remains heuristic and bounded: frames with other
 prologues, undecodable paths or uncorroborated flow escapes can remain undiscovered.
 
-The extra coverage can substantially increase query cost, which is why frame
-recovery is explicitly opt-in. On a 400,556-byte stripped ARM BusyBox ELF,
+The `inventory` value is the default: it validates A32 frame starts in the
+function inventory while retaining the existing Thumb-only inventory path.
+The `on` value also validates Thumb frames and expands independent reference
+walks; `off` restores the prior discovery path. The same function-start and
+Listing prerequisites still apply. In the optimized DecBench U-Boot pilot,
+full frame recovery adds 770 listed bodies and loses none; the corresponding
+Betaflight pilot exchanges one gained body for one lost body. Default recovery
+therefore targets A32 inventory roots. Short callbacks and vector-only handlers
+remain separate discovery sources.
+
+With `armframes` enabled, the Listing walk also follows an A32 jump table. GCC
+lowers an A32 switch to `cmp rN,#n` and a predicated `ldrls pc,[pc,rN,lsl #2]`
+with its table of case addresses 8 bytes past the dispatch, or to `addls
+pc,pc,rN,lsl #2` followed by one `b` per case. The dispatch's p-code is folded
+with the switch-table lattice; only those two PC-relative shapes answer. The
+case count comes from the guard, read as a Thumb `tbb` guard is, with the
+dispatch's own condition as the range branch when it is predicated. An
+unguarded dispatch reads nothing. Word-table entries must lie in the
+dispatcher's executable section. The cases become successors and code
+references of the dispatch
+(`decompiler/crates/kuna-analysis/src/listing/kuna_a32switch.rs`). Without this,
+frame recovery left every case block undefined. The AIF fingerprint histogram,
+which frame recovery fills with the whole program, then accepted case blocks as
+function entries and cut the dispatcher apart. Following a switch also decodes
+the code its cases reach, and the walk absorbs a routine reached only by a tail
+branch into the code that branches to it, as it does everywhere else. On stripped
+U-Boot O2-noinline that absorbs 7 of the 2,836 functions, all of which frame
+recovery without switch following lists: four tail-branch targets of `pointer`'s
+cases, and `memalign_simple`, `efi_process_event_queue` and `malloc_trim`, the
+tail-branch targets of functions the walk now reaches through a followed case.
+`tailcallentry` splits such routines off.
+
+A frame root is also withdrawn when the frame-expanded Listing enters it by
+straight-line flow, the way a contradicted mode withdraws it. The instruction
+just before the root must be a non-call that falls through or conditionally
+skips into it. Tracing back, its run must start at a function entry or a branch
+target. A shrink-wrapped routine saves LR a few instructions after its entry,
+and once a caller reaches that entry, its fall-through runs into the `push`. A
+run that begins at a call's fall-through is speculative and keeps the root: a
+literal pool after a no-return call decodes as such a run into the next routine
+(`decompiler/crates/kuna-analysis/src/analyzers/aif/kuna_frameflow.rs`). A
+retained prior entry that a jump-table dispatch reaches is a case block and is
+contradicted too. On the stripped U-Boot O2-noinline image these rules leave
+recall at 92.0% and raise precision from 92.6% to 98.6%; `parse_label` and
+`malloc` stay whole.
+
+One inventory recovery shares its decodes. Frame validation, the AIF gap walks
+(including the prior inventory's), prefix reconciliation and every Listing
+rebuild decode the same image again. A decode is kept only when SLEIGH certifies
+it context-free, together with the effective context words it read. It is reused
+only while its address still reads those words, so a reused record is the
+record a fresh decode makes, and it reports no context commits. These records
+keep no p-code: the inventory never replays a frame body into a reference walk,
+so the inventory's own validation records keep none either. A record is a
+fixed-size slot per halfword of executable code, with its text and flow targets
+in shared arenas, so the whole image's records cost about 16 bytes per halfword
+(`decompiler/crates/kuna-analysis/src/listing/kuna_decodememo.rs`).
+A `--jobs` worker does not search at all. The parent's recovery leaves a record of
+its final roots, code-pointer and AIF entries and retained prior entries
+(`AnalysisOutput::arm_frames`). The worker builds the final Listing from that
+record under the same context lifecycle
+(`decompiler/crates/kuna-analysis/src/analyzers/aif/kuna_framereplay.rs`).
+
+Full reference expansion can substantially increase query cost. In a historical
+measurement on a 400,556-byte stripped ARM BusyBox ELF,
 `xrefs --to puts --kind call` initially reached 2,271 instructions; frame
 recovery expanded the walk to about 74,000. The recovered query found 70 call
 references instead of 43 and took roughly twice as long. Disabling `aif` with
