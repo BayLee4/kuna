@@ -2369,3 +2369,17 @@ fn explicit_return_storage_removes_only_the_model_hidden_return_input() {
     assert_eq!(prototype.get_param(1).unwrap().get_name(), "second");
     assert_eq!(prototype.get_output().get_address().get_offset(), 0x100);
 }
+
+#[test]
+fn stack_argument_slots_can_ignore_object_alignment() {
+    let manager = AddrSpaceManager::new();
+    let stack = stack_space();
+    for (flags, expected, next) in [(0, 12, 6), (param_entry_flags::IGNORE_TYPE_ALIGN, 8, 5)] {
+        let entry = ParamEntry::seed(0, type_class::TYPECLASS_GENERAL, stack.clone(), 4, 500,
+            1, 4, flags, true, false, &[], &manager).unwrap();
+        let mut slot = 1;
+        let address = entry.get_addr_by_slot(&mut slot, 16, 8, &manager).unwrap();
+        assert_eq!(address.get_offset(), expected);
+        assert_eq!(slot, next);
+    }
+}

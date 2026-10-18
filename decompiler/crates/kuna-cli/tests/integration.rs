@@ -491,3 +491,6 @@ mod project_direct_globals;
 
 #[path = "x87_empty_return.rs"]
 mod x87_empty_return;
+
+#[path = "windows_stack_argument_alignment.rs"]
+mod windows_stack_argument_alignment;
