@@ -467,3 +467,6 @@ mod dwarf_reference_arguments;
 
 #[path = "fortran_fatal_diagnostics.rs"]
 mod fortran_fatal_diagnostics;
+
+#[path = "dwarf_array_bounds.rs"]
+mod dwarf_array_bounds;
