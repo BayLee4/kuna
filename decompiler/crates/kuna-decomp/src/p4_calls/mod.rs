@@ -75,3 +75,4 @@ pub mod kuna_callerreads; // (kuna) a function decompiled alone returns what its
 pub mod kuna_bejoin; // (kuna) a big-endian pair joins its halves in the ABI's order when its low word is returned on purpose
 
 pub(crate) mod kuna_customreturn;
+pub mod kuna_x87emptyreturn;

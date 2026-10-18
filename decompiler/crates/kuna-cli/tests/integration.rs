@@ -484,8 +484,10 @@ mod float_subword_bits;
 #[path = "x87_custom_storage.rs"]
 mod x87_custom_storage;
 
-
 #[path = "dwarf_complex_values.rs"]
 mod dwarf_complex_values;
 #[path = "project_direct_globals.rs"]
 mod project_direct_globals;
+
+#[path = "x87_empty_return.rs"]
+mod x87_empty_return;
