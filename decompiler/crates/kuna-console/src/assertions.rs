@@ -1132,40 +1132,6 @@ pub(crate) fn acquire_parameter_edits(
     Ok(edits)
 }
 
-/// Rebind portable records through the same declaration parser as the original
-/// assertion batch. Neither a High identity nor a rediscovered name is a key.
-pub(crate) fn rebind_parameter_edits(
-    prog: &ConsoleProgram,
-    binding: &kuna_decomp::kuna_exportcall::ExportBinding,
-    edits: &[kuna_decomp::kuna_exportcall::ExportParameterEdit],
-) -> kuna_base::error::KunaResult<Vec<(kuna_decomp::kuna_exportcall::ExportParameterEdit, Rc<Datatype>)>> {
-    use kuna_base::error::KunaError;
-    use kuna_decomp::kuna_exportcall::ExportAddress;
-    edits.iter().map(|edit| {
-        let mut retype = None;
-        for &index in edit.directives.iter().rev() {
-            let directive = prog.assertions().get(index)
-                .ok_or_else(|| KunaError::lowlevel("Prepared parameter assertion index is unavailable"))?;
-            match &directive.body {
-                Body::Type { decl, .. } => {
-                    let (datatype, _) = crate::grammar::parse_type(decl, prog.arch().types(), data_org(prog))
-                        .map_err(|error| KunaError::lowlevel(error.explain()))?;
-                    retype = Some(datatype);
-                    break;
-                }
-                Body::Name { .. } => {}
-                _ => return Err(KunaError::lowlevel("Prepared parameter assertion is not symbol-scoped")),
-            }
-        }
-        let datatype = retype.or_else(|| {
-            let function = binding.function_at(&edit.entry)?;
-            let parameter = function.working.get_param(edit.slot)?;
-            (ExportAddress::new(&parameter.get_address()) == edit.storage && parameter.get_size() == edit.size)
-                .then(|| parameter.get_type().cloned()).flatten()
-        }).ok_or_else(|| KunaError::lowlevel("Prepared parameter storage/type is unavailable"))?;
-        Ok((edit.clone(), datatype))
-    }).collect()
-}
 
 fn frozen_parameter_expectations(prog: &mut ConsoleProgram, entry: &Address) -> Vec<Expected> {
     let expected = prog.arch().print().export_binding()

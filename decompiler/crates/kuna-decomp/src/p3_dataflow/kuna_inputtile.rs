@@ -37,9 +37,7 @@ use crate::varnode::varnode_flags;
 /// write-masked input pieces already covering that storage.
 ///
 /// Returns the upstream `LowlevelError` when the storage overlaps an input
-/// Varnode that is not a reconcilable piece. The three `rename_recurse` call
-/// sites currently turn this into a bare panic (`re-needs/ssa-renaming-panics-
-/// protected`), so the message is built to be read standalone: it names the
+/// Varnode that is not a reconcilable piece. The message names the
 /// requested range and, from [`combine_covered_pieces`]'s own scan, the exact
 /// shape of the conflicting Varnode(s) — straddling vs. fully-contained,
 /// write-masked vs. live — rather than the bare "Overlapping input varnodes"

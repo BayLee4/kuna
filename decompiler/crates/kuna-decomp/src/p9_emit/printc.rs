@@ -6716,6 +6716,7 @@ impl PrintC {
             // (`symbol.field`) or the cast/functional dispatch.
             OpCode::CPUI_SUBPIECE => self.op_subpiece_ir(fd, arch, op, read_op)?,
             OpCode::CPUI_PIECE if self.op_partial_concat_ir(fd, arch, op)? => {},
+            OpCode::CPUI_PIECE if self.op_export_piece_ir(fd, arch, op)? => {},
             // PTRADD (printc.cc:900 opPtradd) / PTRSUB (printc.cc:953 opPtrsub).
             OpCode::CPUI_PTRADD => self.op_ptradd_ir(fd, arch, op)?,
             OpCode::CPUI_PTRSUB => self.op_ptrsub_ir(fd, arch, op)?,
@@ -7138,6 +7139,43 @@ impl PrintC {
                 format!("0x{mask:x}"), TagType::Syntax, crate::printlanguage::SyntaxHighlight::const_color,
             ));
         }
+        Ok(true)
+    }
+
+    /// Prepared C publications use scalar operators rather than global CONCAT helpers.
+    fn op_export_piece_ir(&mut self, fd: &Funcdata, arch: &Architecture, op: OpId) -> KunaResult<bool> {
+        use crate::dtype::{type_metatype::TYPE_UINT, TypeFactory};
+        if self.export_binding.is_none() || self.out_lang != crate::kuna_lang::OutLang::C {
+            return Ok(false);
+        }
+        let Some(operation) = fd.obank().get(op) else { return Ok(false) };
+        let (Some(high), Some(low)) = (operation.get_in(0), operation.get_in(1)) else { return Ok(false) };
+        let (Some(high_value), Some(low_value)) = (fd.vbank().get(high), fd.vbank().get(low)) else { return Ok(false) };
+        let (high_size, low_size) = (high_value.get_size(), low_value.get_size());
+        if high_size < 1 || low_size < 1 || high_size > 7 || low_size > 8 - high_size {
+            return Ok(false);
+        }
+        let result_size = match high_size + low_size { 2 => 2, 3 | 4 => 4, _ => 8 };
+        let types = arch.types_rc();
+        let result_type = types.get_base(result_size, TYPE_UINT)?;
+        let wide = types.get_base(8, TYPE_UINT)?;
+        self.push_cast_open(&result_type, op);
+        self.push_op(&tokens::BITWISE_OR, Some(op_key(op)));
+        self.push_op(&tokens::SHIFT_LEFT, Some(op_key(op)));
+        for (index, (value, size)) in [(high, high_size), (low, low_size)].into_iter().enumerate() {
+            self.push_op(&tokens::BITWISE_AND, Some(op_key(op)));
+            self.push_cast_open(&wide, op);
+            self.push_vn_ir(fd, arch, value, op)?;
+            self.push_cast_close(&wide);
+            let mask = (1u64 << (size * 8)) - 1;
+            self.push_atom(&Atom::syntax(format!("0x{mask:x}ULL"), TagType::Syntax,
+                crate::printlanguage::SyntaxHighlight::const_color));
+            if index == 0 {
+                self.push_atom(&Atom::syntax((low_size * 8).to_string(), TagType::Syntax,
+                    crate::printlanguage::SyntaxHighlight::const_color));
+            }
+        }
+        self.push_cast_close(&result_type);
         Ok(true)
     }
 

@@ -1,6 +1,6 @@
 --- a/ghidra/app/util/exporter/CppExporter.java
 +++ b/ghidra/app/util/exporter/CppExporter.java
-@@ -18,6 +18,7 @@
+@@ -17,6 +17,7 @@
  
  import java.io.*;
  import java.util.*;
@@ -76,7 +76,7 @@
  	@Override
  	public boolean export(File file, DomainObject domainObj, AddressSetView addrSet,
  			TaskMonitor monitor) throws IOException, ExporterException {
-@@ -118,24 +159,54 @@
+@@ -118,24 +159,64 @@
  			cFileWriter = new PrintWriter(file);
  		}
  
@@ -117,31 +117,43 @@
 +			parallelDecompiler =
 +				ParallelDecompiler.createChunkingParallelDecompiler(callback, chunkingMonitor);
 +
++			boolean printConventions = options.isConventionPrint();
++			if (configurer != null && !actualFunctions.isEmpty()) {
++				DecompInterface configured = decompilerPool.get();
++				try {
++					DecompileOptions effective = configured.getOptions();
++					printConventions = effective == null || effective.isConventionPrint();
++				}
++				finally {
++					decompilerPool.release(configured);
++				}
++			}
 +			DataTypeWriter typeWriter = null;
  			if (emitDataTypeDefinitions) {
  				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
 -				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
+-			}
 +				typeWriter = writeProgramDataTypes(program, header, headerWriter, cFileWriter,
-+					chunkingMonitor, typeNames, fakeCDefinitions);
- 			}
++					chunkingMonitor, typeNames, fakeCDefinitions, printConventions);
++			}
 +			DataTypeWriter declarations =
 +				new DataTypeWriter(null, Writer.nullWriter(), isUseCppStyleComments, typeNames);
-+			declarations.setCallingConventionContext(program.getCompilerSpec(),
-+				options.isConventionPrint());
++			declarations.setCallingConventionContext(program.getCompilerSpec(), printConventions);
  			chunkingMonitor.checkCancelled();
  
 -			decompileAndExport(addrSet, program, headerWriter, cFileWriter, parallelDecompiler,
 -				chunkingMonitor);
+-
+-			return true;
 +			decompileAndExport(actualFunctions, program, headerWriter, cFileWriter, parallelDecompiler,
 +				chunkingMonitor, typeNames, typeWriter, declarations);
- 
--			return true;
++
 +			return (headerWriter == null || !headerWriter.checkError()) &&
 +				(cFileWriter == null || !cFileWriter.checkError());
  		}
  		catch (CancelledException e) {
  			return false;
-@@ -145,8 +216,12 @@
+@@ -145,8 +226,12 @@
  			return false;
  		}
  		finally {
@@ -156,7 +168,7 @@
  
  			if (headerWriter != null) {
  				headerWriter.close();
-@@ -158,42 +233,138 @@
+@@ -158,40 +243,136 @@
  
  	}
  
@@ -251,8 +263,8 @@
 +				retained.set(i, null);
 +			}
 +		}
- 	}
- 
++	}
++
 +	private void writeExternalDeclarations(ExportDataTypeNames typeNames,
 +			DataTypeWriter typeWriter, DataTypeWriter declarations, PrintWriter writer,
 +			Set<String> processedGlobals, TaskMonitor monitor) throws IOException, CancelledException {
@@ -303,12 +315,10 @@
 +				typeNames.reserveSources(result.result(), monitor);
 +			}
 +		}
-+	}
-+
- 	private boolean excludeFunction(Function currentFunction) {
+ 	}
  
- 		if (functionTagSet.isEmpty()) {
-@@ -213,11 +384,37 @@
+ 	private boolean excludeFunction(Function currentFunction) {
+@@ -213,11 +394,37 @@
  	}
  
  	private void writeResults(List<CPPResult> results, Set<String> processedGlobals,
@@ -349,7 +359,7 @@
  
  		StringBuilder globalDecls = new StringBuilder();
  		StringBuilder headers = new StringBuilder();
-@@ -228,21 +425,50 @@
+@@ -228,21 +435,50 @@
  			if (result == null) {
  				continue;
  			}
@@ -404,7 +414,7 @@
  			if (bodyCode != null) {
  				bodies.append(bodyCode);
  				bodies.append(EOL);
-@@ -291,12 +517,17 @@
+@@ -291,13 +527,17 @@
  		}
  	}
  
@@ -412,22 +422,22 @@
 -			PrintWriter cFileWriter, TaskMonitor monitor) throws IOException, CancelledException {
 +	private DataTypeWriter writeProgramDataTypes(Program program, File header, PrintWriter headerWriter,
 +			PrintWriter cFileWriter, TaskMonitor monitor, ExportDataTypeNames typeNames,
-+			String fakeCDefinitions)
++			String fakeCDefinitions, boolean printConventions)
 +			throws IOException, CancelledException {
 +		DataTypeWriter dataTypeWriter = null;
  		if (headerWriter != null) {
  			DataTypeManager dtm = program.getDataTypeManager();
 -			DataTypeWriter dataTypeWriter =
 -				new DataTypeWriter(dtm, headerWriter, isUseCppStyleComments);
+-			headerWriter.write(getFakeCTypeDefinitions(dtm.getDataOrganization()));
 +			dataTypeWriter =
 +				new DataTypeWriter(dtm, headerWriter, isUseCppStyleComments, typeNames);
-+			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(),
-+				options.isConventionPrint());
--			headerWriter.write(getFakeCTypeDefinitions(dtm.getDataOrganization()));
++			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(), printConventions);
 +			headerWriter.write(fakeCDefinitions);
  			dataTypeWriter.write(dtm, monitor);
  
-@@ -309,8 +540,10 @@
+ 			headerWriter.println("");
+@@ -309,8 +549,9 @@
  		}
  		else if (cFileWriter != null) {
  			DataTypeManager dtm = program.getDataTypeManager();
@@ -435,12 +445,11 @@
 -				new DataTypeWriter(dtm, cFileWriter, isUseCppStyleComments);
 +			dataTypeWriter =
 +				new DataTypeWriter(dtm, cFileWriter, isUseCppStyleComments, typeNames);
-+			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(),
-+				options.isConventionPrint());
++			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(), printConventions);
  			dataTypeWriter.write(dtm, monitor);
  		}
  
-@@ -319,6 +552,7 @@
+@@ -319,6 +560,7 @@
  			cFileWriter.println("");
  		}
  
@@ -448,7 +457,7 @@
  	}
  
  	private void writeEquates(Program program, File header, PrintWriter headerWriter,
-@@ -405,68 +639,72 @@
+@@ -405,67 +647,71 @@
  		}
  	}
  
@@ -542,8 +551,7 @@
  		writer.write(EOL);
  
  		return writer.toString();
- 	}
-@@ -475,8 +713,8 @@
+@@ -475,8 +721,8 @@
  // Inner Classes
  //==================================================================================================
  
@@ -554,15 +562,16 @@
  		@Override
  		public int compareTo(CPPResult other) {
  			return address.compareTo(other.address);
-@@ -486,32 +724,63 @@
+@@ -486,32 +732,63 @@
  	private class DecompilerFactory extends CountingBasicFactory<DecompInterface> {
  
  		private Program program;
+-
+-		DecompilerFactory(Program program) {
 +		private DecompileConfigurer invocationConfigurer;
 +		private boolean requireOpen;
 +		private final DecompInterface.ExportScope exportScope;
- 
--		DecompilerFactory(Program program) {
++
 +		DecompilerFactory(Program program, DecompileConfigurer configurer, boolean requireOpen,
 +				DecompInterface.ExportScope exportScope) {
  			this.program = program;
@@ -615,9 +624,10 @@
  	private class ParallelDecompilerCallback implements QCallback<Function, CPPResult> {
  
  		private CachingPool<DecompInterface> pool;
-+		private final DecompInterface.ExportScope exportScope;
- 
+-
 -		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool) {
++		private final DecompInterface.ExportScope exportScope;
++
 +		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool,
 +				DecompInterface.ExportScope exportScope) {
  			this.pool = decompilerPool;
@@ -625,7 +635,7 @@
  		}
  
  		@Override
-@@ -531,43 +800,41 @@
+@@ -531,43 +808,41 @@
  		}
  
  		private CPPResult doWork(Function function, DecompInterface decompiler,

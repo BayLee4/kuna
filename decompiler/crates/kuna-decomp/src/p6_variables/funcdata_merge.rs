@@ -955,16 +955,9 @@ impl MergeContext for Funcdata {
         crate::p6_variables::kuna_pointeevalue::load_crosses_write(self, vn)
     }
     fn vn_load_crosses_global_write(&mut self, vn: VarnodeId, except: HighVariableId) -> bool {
-        let mut guarded = false;
-        if let Some(h) = self.high_bank().get(except) {
-            for i in 0..h.num_instances() {
-                let Some(v) = self.vbank().get(h.get_instance(i)) else { continue };
-                if v.is_persist() && self.global_store_guarded(v) {
-                    guarded = true;
-                    break;
-                }
-            }
-        }
+        let guarded = self.high_bank().get(except).is_some_and(|h| {
+            (0..h.num_instances()).any(|i| self.vbank().get(h.get_instance(i)).is_some_and(|v| v.is_persist() && self.global_store_guarded(v)))
+        });
         if !guarded {
             return false;
         }

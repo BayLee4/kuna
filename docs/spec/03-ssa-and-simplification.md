@@ -126,6 +126,12 @@ block and the walk stops at the first op that is not one), so it collects the ru
 off the block's intrusive op list rather than materializing every op of every
 successor once per CFG edge per pass.
 
+Creating a renaming input can perform a live global-property query even after
+an earlier empty, uncached answer. Acquisition failures propagate through the
+recursive renamer and heritage action with their original error class, rather
+than becoming invariant panics. Constant-address STORE conversion uses the
+same fallible varnode factory and rule result boundary.
+
 **Redundant PHIs.** `ActionMultiCse` compares the leading MULTIEQUALs in each
 basic block, allowing intervening COPYs, and repeats after every elimination.
 As in upstream `coreaction.cc:742-897`, each incoming value may be normalized
@@ -1699,6 +1705,14 @@ flow is expressible at the smaller size commits the rewrite
 logically-sized ones. It is all-or-nothing by construction: any placeholder the
 trace cannot legalize aborts the whole transform with no IR change (marks are
 cleared, `subflow.rs (SubvariableFlow::do_trace)`).
+Once replacement begins, a failed live property acquisition is an error, not
+an unchanged transform: earlier replacement steps may already have modified IR.
+The existing rule result abandons that failed function attempt while preserving
+terminal transport classification. Unsupported pre-mutation traces retain
+their ordinary no-change behavior.
+The same boundary applies when split-flow or floating-point precision reduction
+materializes address-preserving replacement pieces: a failed property query
+propagates through the rule rather than reporting an unchanged graph.
 
 An aligned, contiguous byte slice also retains its original machine-storage
 slice for P9 source comments. Its address respects the source space's byte

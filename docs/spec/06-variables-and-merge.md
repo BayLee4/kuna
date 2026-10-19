@@ -342,10 +342,9 @@ forbids a forced merge, the machinery edits the data flow until it doesn't:
    required tests *still* fail after all trims, the sweep errors out ("Unable
    to force merge of op"). *(kuna)* `option tiedphitrim` (§6.4) adds one trim
    upstream never makes: a loop head's direct read of an aliased location
-   whose loop values are loaded from memory. *(kuna)* Where upstream lets that error abort the
-   whole decompilation, `ActionMergeRequired` swallows it at the action
-   boundary and keeps the partially merged state — the failure mode is a
-   residual un-fused marker op, not a dead function.
+   whose loop values are loaded from memory. A failed forced merge propagates
+   through `ActionMergeRequired` after restoring the persistent merge owner;
+   partially merged state is not a successful action result.
 
 Late trim COPYs from a SPACEBASE value use the same unknown-byte pointer seed
 as ordinary COPY type propagation

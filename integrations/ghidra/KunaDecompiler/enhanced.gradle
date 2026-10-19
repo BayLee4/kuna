@@ -26,8 +26,7 @@ tasks.register('prepareEnhancedIntegrationSources', Exec) {
     inputs.file('prepare_enhanced.py')
     inputs.files(
         new File(install, 'Ghidra/Features/Decompiler/lib/Decompiler-src.zip'),
-        new File(install, 'Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling-src.zip'),
-        new File(install, 'Ghidra/Features/Base/lib/Base-src.zip'))
+        new File(install, 'Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling-src.zip'))
     outputs.dir(enhancedSources)
     doFirst { delete enhancedSources }
     commandLine(System.env.PYTHON ?: 'python3', file('prepare_enhanced.py'),

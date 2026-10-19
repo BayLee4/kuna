@@ -27,6 +27,15 @@ existing spelling. An active callable path prevents recursive expansion while
 allowing sibling reuse; a genuine cycle retains its existing named leaf rather
 than inventing a different signature or claiming self-contained cyclic C.
 
+Prepared C publications render scalar PIECEs with positive operand widths and
+at most eight result bytes through the existing cast, mask, shift and OR
+operators (`printc.rs (PrintC::op_export_piece_ir)`). Each operand is emitted
+once, converted to an unsigned eight-byte scalar and masked before combination.
+The result converts to a two-, four- or eight-byte unsigned scalar. This avoids
+global helper names colliding with source functions such as `CONCAT11`.
+The existing partial-concat optimization runs first; unsupported widths and
+unprepared requests keep their ordinary rendering.
+
 A volatile annotation that covers only part of its mapped symbol renders the
 covered member. An element of an array of scalars prints as `name[index]`;
 every other partial cover (a struct field, an element of a multidimensional
@@ -2950,6 +2959,9 @@ Three artifacts make up the plane, all in
   promising a meaningful `back`, because the front/back split is a C-ism: C
   declarators wrap the identifier (`int4 (*a)[1]`) where other languages' types are
   pure prefixes.
+  Java's typed spelling selects the final base datatype after unwrapping
+  object/array pointers, matching `PrintJava`; brackets are syntax outside that
+  datatype leaf. The declaration's HighSymbol still owns its complete type.
 - **`p4_calls/kuna_langabi.rs`** — `LangAbi`, the ABI seam. It owns one decision,
   consulted by the Rust prototype emitter: which `extern` a signature declares.
   Rust declares `extern "C"` exactly when the prototype is variadic (rustc admits
@@ -3744,5 +3756,6 @@ on bit patterns, including when an operand has a signed type. The IR, signatures
 and evaluation of the lower expression are unchanged. Named upper values,
 noninteger types, enums, widths above eight bytes and concatenations of unrelated
 halves keep their existing rendering. The option defaults on for C output; off
-restores the upstream CONCAT helper, and other output languages keep their own
-rendering.
+restores ordinary PIECE rendering: upstream CONCAT syntax for unprepared output,
+or the scalar expression above for prepared C publications. Other output
+languages keep their own rendering.

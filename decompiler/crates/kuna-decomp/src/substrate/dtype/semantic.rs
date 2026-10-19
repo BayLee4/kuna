@@ -1,43 +1,12 @@
 use super::*;
 use crate::fspec::{FuncProto, PrototypePieces};
 
-/// Independent semantic ownership for a held callable, without changing raw shells.
-#[derive(Clone)]
-pub struct CallableReader {
-    state: Rc<CallableReaderState>,
-}
-
-pub(super) struct CallableReaderState {
-    datatype: Rc<Datatype>,
-    dependencies: RefCell<Vec<Rc<Datatype>>>,
-}
-
 pub(super) struct CodeDecodeGuard<'a> {
     factory: &'a TypeFactoryImpl,
     key: (String, u64),
 }
 impl Drop for CodeDecodeGuard<'_> {
     fn drop(&mut self) { self.factory.store.borrow_mut().decoding_code.remove(&self.key); }
-}
-
-impl CallableReaderState {
-    fn refresh(&self) {
-        *self.dependencies.borrow_mut() = Datatype::resolved_dependencies(&self.datatype);
-    }
-}
-
-impl std::ops::Deref for CallableReader {
-    type Target = Datatype;
-    fn deref(&self) -> &Datatype { &self.state.datatype }
-}
-
-impl CallableReader {
-    pub fn datatype(&self) -> &Rc<Datatype> { &self.state.datatype }
-    pub fn prototype(&self) -> Option<Rc<FuncProto>> {
-        let root = Datatype::completed_record(&self.state.datatype);
-        let code = root.get_ptr_to().unwrap_or(root);
-        code.get_code_prototype().cloned()
-    }
 }
 
 impl Datatype {
@@ -76,26 +45,6 @@ impl TypeFactoryImpl {
         self.store.borrow_mut().decoding_code.insert(key.clone());
         CodeDecodeGuard { factory: self, key }
     }
-    /// Hold the same canonical callable root and only its missing resolved dependencies.
-    pub fn hold_callable(&self, datatype: Rc<Datatype>) -> KunaResult<CallableReader> {
-        let callable = datatype.get_metatype() == type_metatype::TYPE_CODE
-            || datatype.get_ptr_to().is_some_and(|t| t.get_metatype() == type_metatype::TYPE_CODE);
-        if !callable { return Err(KunaError::lowlevel("Semantic callable reader requires a callable type")); }
-        let state = Rc::new(CallableReaderState { datatype, dependencies: RefCell::new(Vec::new()) });
-        state.refresh();
-        self.store.borrow_mut().callable_readers.push(Rc::downgrade(&state));
-        Ok(CallableReader { state })
-    }
-
-    pub(super) fn refresh_callable_readers(&self) {
-        let readers: Vec<_> = {
-            let mut store = self.store.borrow_mut();
-            store.callable_readers.retain(|reader| reader.strong_count() != 0);
-            store.callable_readers.iter().filter_map(std::rc::Weak::upgrade).collect()
-        };
-        for reader in readers { reader.refresh(); }
-    }
-
     /// Retain already-resolved dependencies on an independent source snapshot.
     pub fn retain_source_proto(&self, proto: Rc<FuncProto>) -> Rc<FuncProto> {
         proto.retain_resolved_dependencies();

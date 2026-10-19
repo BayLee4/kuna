@@ -1147,8 +1147,9 @@ that machinery.
 - **`ActionDefaultParams`** (`coreaction_protos.rs (ActionDefaultParams)`)
   gives every call spec a model: a callee with a source-declared prototype
   gets an independent working copy through
-  `ArchHandle::query_callee_proto` and
-  `TypeFactoryImpl::acquire_working_proto`; supplied locks, storage, roles and
+  `ArchHandle::query_callee_proto`, using bounded
+  `TypeFactoryImpl::apply_source_prototype` for logical declarations and strict
+  `acquire_working_proto` for physical declarations; supplied locks, storage, roles and
   effects remain independent of model-derived storage. A site prototype takes
   precedence. Calls without a supplied prototype get the called-function
   evaluation model with a void internal store. (kuna) A

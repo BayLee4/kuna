@@ -2009,33 +2009,7 @@ pub fn print_c_recompile_prelude(arch: &Architecture) -> String {
     out.push_str("typedef unsigned long long undefined8;\n");
     out.push_str("typedef struct { unsigned char b[16]; } undefined16;\n");
     out.push_str("typedef struct { unsigned char b[32]; } undefined32;\n");
-    print_c_piece_helpers(&mut out);
     out
-}
-
-/// The native printer retains Ghidra's `CONCAT<high bytes><low bytes>` PIECE
-/// notation. Supply its scalar semantics in the recompilation header, without
-/// changing the readable/markup rendering or evaluating either operand twice.
-fn print_c_piece_helpers(out: &mut String) {
-    use std::fmt::Write;
-    out.push_str("\n/* scalar PIECE operations (unsigned bit concatenation) */\n");
-    for high in 1..8 {
-        for low in 1..=8 - high {
-            let result = match high + low {
-                2 => "unsigned short",
-                3 | 4 => "unsigned int",
-                _ => "unsigned long long",
-            };
-            let high_mask = (1u64 << (8 * high)) - 1;
-            let low_mask = (1u64 << (8 * low)) - 1;
-            let _ = writeln!(
-                out,
-                "static inline {result} CONCAT{high}{low}(unsigned long long high, unsigned long long low) {{ \
-                 return ({result})(((high & 0x{high_mask:x}ULL) << {}) | (low & 0x{low_mask:x}ULL)); }}",
-                8 * low,
-            );
-        }
-    }
 }
 
 /// A recovered variable surfaced for the machine-readable batch output

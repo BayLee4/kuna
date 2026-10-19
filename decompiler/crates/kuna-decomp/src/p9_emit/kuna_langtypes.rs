@@ -183,7 +183,7 @@ pub struct JavaSpeller;
 pub static JAVA_SPELLER: JavaSpeller = JavaSpeller;
 
 impl JavaSpeller {
-    fn spelling(&self, dt: &Rc<Datatype>) -> String {
+    fn spelling(&self, dt: &Rc<Datatype>) -> (String, Rc<Datatype>, usize) {
         let mut base = Rc::clone(dt);
         let mut arrays = 0;
         let mut object = false;
@@ -219,21 +219,32 @@ impl JavaSpeller {
                 _ => "void".into(),
             }
         };
+        let base_end = name.len();
         for _ in 0..arrays { name.push_str("[]"); }
-        name
+        (name, base, base_end)
     }
 }
 
 impl TypeSpeller for JavaSpeller {
     fn relabel(&self, _cx: &SpellCtx, dt: &Rc<Datatype>, _under_pointer: bool) -> Option<Cow<'static, str>> {
-        Some(Cow::Owned(self.spelling(dt)))
+        Some(Cow::Owned(self.spelling(dt).0))
     }
-    fn anonymous(&self, dt: &Rc<Datatype>) -> String { self.spelling(dt) }
+    fn anonymous(&self, dt: &Rc<Datatype>) -> String { self.spelling(dt).0 }
     fn declarator(&self, _cx: &SpellCtx, dt: &Rc<Datatype>) -> (String, String) {
-        (self.spelling(dt), String::new())
+        (self.spelling(dt).0, String::new())
+    }
+    fn typed_declarator(&self, _cx: &SpellCtx, dt: &Rc<Datatype>) -> TypedDeclarator {
+        let (front, datatype, end) = self.spelling(dt);
+        TypedDeclarator {
+            front, front_types: vec![DeclaratorTypeSpan { range: 0..end, datatype }],
+            ..Default::default()
+        }
     }
     fn type_name(&self, cx: &SpellCtx, dt: &Rc<Datatype>) -> (String, String) {
         self.declarator(cx, dt)
+    }
+    fn typed_type_name(&self, cx: &SpellCtx, dt: &Rc<Datatype>) -> TypedDeclarator {
+        self.typed_declarator(cx, dt)
     }
     fn unknown_base(&self, size: int4, _under_pointer: bool, _long_is_8: bool) -> Option<Cow<'static, str>> {
         Some(Cow::Borrowed(match size { 1 => "byte", 2 => "short", 4 => "int", 8 => "long", _ => return None }))

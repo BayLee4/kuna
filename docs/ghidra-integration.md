@@ -54,8 +54,8 @@ The extension patches bounded existing Java owners, not a
 second controller or ProgramDB. Its maintained diffs are in
 `integrations/ghidra/KunaDecompiler/patches/ghidra-12.1.4/`; only new helper
 classes live in `src/enhanced/java`. Existing owner bodies are extracted from the
-unmodified installation's `Decompiler-src.zip`, `SoftwareModeling-src.zip` and
-`Base-src.zip`, then patched in clean staging by the standard GNU/BSD `patch`
+unmodified installation's `Decompiler-src.zip` and `SoftwareModeling-src.zip`,
+then patched in clean staging by the standard GNU/BSD `patch`
 utility in batch/forward/fuzz-zero mode. Nonzero status and any offset, fuzz,
 reversed, skipped or rejected application fail preparation. The reference checkout
 under `ghidra/Ghidra` is not an installation target. The build is pinned
@@ -274,9 +274,10 @@ These declarations do not depend on
 addresses, not whether an existing named global needs an `extern`. Callable
 typedef ordering follows the retained source return and formal types, on both
 the whole-factory header and the per-function `structdefs` surface. The recompile
-prelude supplies unsigned scalar `CONCAT`/PIECE helpers through eight-byte
-results; each operand is evaluated once and masked to its p-code width. These
-helpers do not initialize an unknown physical input or certify an executable
+printer emits scalar PIECEs through eight-byte results as unsigned C casts,
+masks, shifts and ORs, without reserving source identifiers for helpers. Each
+operand is evaluated once and masked to its p-code width. These expressions
+do not initialize an unknown physical input or certify an executable
 body: original provider, value and runtime assertions remain independent.
 
 An inferred sixteen-byte SIMD local selected for the scalar C view uses that
@@ -568,6 +569,8 @@ language while the architecture's printer is temporarily detached. Java object
 references, primitive/object arrays, null, scope, unsigned shifts, receiver calls,
 allocation and constant-pool forms follow Ghidra's `PrintJava`; record acquisition
 uses the shared architecture constant pool and propagates provider errors.
+Java type leaves bind the final base datatype after pointer unwrapping; array
+brackets remain syntax rather than part of the datatype token.
 The original six genuine JVM consumers in `tests/ghidra/cpool_consumers.py`
 remain the semantic acceptance tests.
 
@@ -896,10 +899,10 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   localdb-backed input publication only for full function results. Source
   presence, locks, roles, storage, effects, trash, injection and convention
   remain independent.
-  `hold_callable` is the explicit independently held semantic-reader boundary:
-  it keeps the original callable root and finite completion dependencies beside
-  it; only weak reader registrations are retained by the factory. Raw borrowed
-  getters remain raw. Supplied unknown conventions are registered once as named
+  Independently retained source prototypes own their finite completion
+  dependencies; canonical recursive callable types keep weak completion links
+  so the type graph does not retain itself. Raw borrowed getters remain raw.
+  Supplied unknown conventions are registered once as named
   unknown models with the default model's behavior, while an arbitrary parser
   convention typo remains an error. Architecture, source decoding and new
   acquisitions share the same effective model registry.

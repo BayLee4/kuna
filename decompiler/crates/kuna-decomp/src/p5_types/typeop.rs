@@ -241,10 +241,7 @@ impl TypeOpInfo {
     /// `opcode`/`flags`/`name`).  This is the canonical replacement for the
     /// per-wave `type_op_lookup`/`w6_type_op`/`typeop_for` local helpers.
     pub fn to_type_op(&self) -> TypeOp {
-        let mut op = TypeOp::new(self.opcode, self.opflags, self.name);
-        op.metain = self.metain;
-        op.metaout = self.metaout;
-        op
+        TypeOp::new(self.opcode, self.opflags, self.name)
     }
 
     /// Find the minimal (suggested) data-type of an output to this op-code

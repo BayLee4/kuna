@@ -2736,7 +2736,7 @@ impl Rule for RuleSubvarAnd {
         if data.vbank().get(outvn).expect("vn").has_no_descend() {
             return Ok(0);
         }
-        Ok(run_subflow(data, vn, cmask, false, false, false))
+        run_subflow(data, vn, cmask, false, false, false)
     }
 }
 
@@ -2795,7 +2795,7 @@ impl Rule for RuleSubvarSubpiece {
                 big = true;
             }
         }
-        Ok(run_subflow(data, vn, mask, aggressive, false, big))
+        run_subflow(data, vn, mask, aggressive, false, big)
     }
 }
 
@@ -2880,7 +2880,7 @@ impl Rule for RuleSubvarCompZero {
             }
         }
 
-        Ok(run_subflow(data, vn, mask, false, false, false))
+        run_subflow(data, vn, mask, false, false, false)
     }
 }
 
@@ -2929,7 +2929,7 @@ impl Rule for RuleSubvarShift {
             return Ok(0);
         }
 
-        Ok(run_subflow(data, vn, mask, false, false, false))
+        run_subflow(data, vn, mask, false, false, false)
     }
 }
 
@@ -2965,7 +2965,7 @@ impl Rule for RuleSubvarZext {
         let mask = calc_mask(invsize);
         let ptrflow = data.vbank().get(invn).expect("vn").is_ptr_flow();
 
-        let (applied, returned) = run_subflow_returning(data, vn, mask, ptrflow, false, false);
+        let (applied, returned) = run_subflow_returning(data, vn, mask, ptrflow, false, false)?;
         if returned {
             crate::kuna_callrettype::note_returned_extension(data, false, invsize);
         }
@@ -3007,7 +3007,7 @@ impl Rule for RuleSubvarSext {
         let invsize = data.vbank().get(invn).expect("vn").get_size();
         let mask = calc_mask(invsize);
 
-        let (applied, returned) = run_subflow_returning(data, vn, mask, self.isaggressive != 0, true, false);
+        let (applied, returned) = run_subflow_returning(data, vn, mask, self.isaggressive != 0, true, false)?;
         if returned {
             crate::kuna_callrettype::note_returned_extension(data, true, invsize);
         }
@@ -3098,8 +3098,8 @@ fn run_subflow(
     aggr: bool,
     sext: bool,
     big: bool,
-) -> int4 {
-    run_subflow_returning(data, root, mask, aggr, sext, big).0
+) -> KunaResult<int4> {
+    Ok(run_subflow_returning(data, root, mask, aggr, sext, big)?.0)
 }
 
 /// (kuna `regnarrow`) Narrow the flow of the logical value `mask` of `root`,
@@ -3131,21 +3131,17 @@ fn run_subflow_returning(
     aggr: bool,
     sext: bool,
     big: bool,
-) -> (int4, bool) {
+) -> KunaResult<(int4, bool)> {
     let mut subflow = match SubvariableFlow::new(data, root, mask, aggr, sext, big) {
         Ok(sf) => sf,
-        Err(_) => return (0, false), // construction reached a stub (e.g. sext constant check)
+        Err(_) => return Ok((0, false)), // construction reached a stub (e.g. sext constant check)
     };
     match subflow.do_trace(data) {
         Ok(true) => {}
-        _ => return (0, false),
+        _ => return Ok((0, false)),
     }
-    match subflow.do_replacement(data) {
-        Ok(()) => (1, subflow.returns_traversed),
-        // C++ doReplacement() returns void; a structured error (e.g. a residual
-        // symbol/iop stub) is treated as "no change" rather than aborting the pass.
-        Err(_) => (0, false),
-    }
+    subflow.do_replacement(data)?;
+    Ok((1, subflow.returns_traversed))
 }
 
 // =============================================================================
@@ -3623,12 +3619,8 @@ impl Rule for RuleSplitFlow {
         if !split_flow.do_trace(data) {
             return Ok(0);
         }
-        Ok(match split_flow.apply(data) {
-            Ok(()) => 1,
-            // C++ apply() returns void; a structured error here (e.g. an iop/symbol
-            // stub) is treated as "no change made" rather than aborting the pass.
-            Err(_) => 0,
-        })
+        split_flow.apply(data)?;
+        Ok(1)
     }
 }
 
@@ -6436,21 +6428,14 @@ impl Rule for RuleSubfloatConvert {
                 Ok(true) => {}
                 _ => return Ok(0),
             }
-            match subflow.apply(data) {
-                Ok(()) => {}
-                // C++ apply() returns void; a structured error -> "no change".
-                Err(_) => return Ok(0),
-            }
+            subflow.apply(data)?;
         } else {
             let mut subflow = SubfloatFlow::new(data, invn, outsize);
             match subflow.do_trace(data) {
                 Ok(true) => {}
                 _ => return Ok(0),
             }
-            match subflow.apply(data) {
-                Ok(()) => {}
-                Err(_) => return Ok(0),
-            }
+            subflow.apply(data)?;
         }
         Ok(1)
     }

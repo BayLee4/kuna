@@ -169,10 +169,6 @@ pub fn install_export_callables(
         entries.push(export_entry(prog,address,name,spec.selected.len() == 1));
     }
     let binding = kuna_decomp::kuna_exportcall::ExportBinding::from_spec_with_entries(prog.arch_mut(),spec,&entries)?;
-    let edits = crate::assertions::rebind_parameter_edits(prog, &binding, &spec.parameter_edits)?;
-    let binding = if edits.is_empty() { binding } else {
-        binding.with_parameter_edits(prog.arch_mut(), &edits)?
-    };
     prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
     Ok(())
 }

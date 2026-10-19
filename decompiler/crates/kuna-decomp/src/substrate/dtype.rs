@@ -75,7 +75,6 @@ use kuna_base::types::{int4, int8, uint4, uint8};
 use crate::bitfield::BitRange;
 
 mod semantic;
-pub use semantic::CallableReader;
 
 // =============================================================================
 // type_metatype (type.hh:80-100) — verbatim, discriminants load-bearing
@@ -4901,7 +4900,6 @@ fn wire_integer_format(s: &str) -> uint4 {
 }
 
 struct FactoryStore {
-    callable_readers: Vec<std::rc::Weak<semantic::CallableReaderState>>,
     decoding_code: BTreeSet<(String, u64)>,
     /// Datatypes within this factory, sorted by `compareDependency` (C++ `tree`).
     tree: BTreeSet<TreeKey>,
@@ -4925,7 +4923,6 @@ struct FactoryStore {
 impl FactoryStore {
     fn new() -> FactoryStore {
         FactoryStore {
-            callable_readers: Vec::new(),
             decoding_code: BTreeSet::new(),
             tree: BTreeSet::new(),
             nametree: Vec::new(),
@@ -5615,7 +5612,6 @@ impl TypeFactoryImpl {
         }
         *link.borrow_mut() = Rc::downgrade(newrc);
         self.complete_record_typedefs(newrc)?;
-        self.refresh_callable_readers();
         Ok(())
     }
 
@@ -9773,9 +9769,9 @@ mod tests {
     }
 
     #[test]
-    fn held_callable_reader_owns_same_code_completion_without_recursive_backedge() {
-        for hold_before_completion in [false, true] {
-            let (reader, weak_node, weak_code, weak_proto, weak_factory) = {
+    fn acquired_callable_prototype_owns_completion_without_recursive_backedge() {
+        for observe_before_completion in [false, true] {
+            let (source, weak_node, weak_code, weak_proto, weak_factory) = {
                 let f = Rc::new(factory());
                 let manager = Rc::new(kuna_base::space::AddrSpaceManager::new());
                 let model = Rc::new(crate::fspec::ProtoModel::new(&manager));
@@ -9794,29 +9790,33 @@ mod tests {
                 let weak_proto = Rc::downgrade(code.get_code_prototype().unwrap());
                 let weak_code = Rc::downgrade(&code);
                 let alias = f.get_typedef(&code, "HeldCallbackAlias", 703, 0).unwrap();
-                let early = hold_before_completion.then(|| f.hold_callable(Rc::clone(&alias)).unwrap());
+                if observe_before_completion {
+                    let mut pieces = crate::fspec::PrototypePieces::default();
+                    code.get_code_prototype().unwrap().get_pieces(&mut pieces);
+                }
                 let callback_ptr = f.get_type_pointer(8, Rc::clone(&alias), 1).unwrap();
                 let full_node = f.set_fields_struct_raw(&node, vec![
                     TypeField::new(0, 0, "next", node_ptr),
                     TypeField::new(1, 8, "callback", callback_ptr),
                 ], vec![], 16, 8, 0).unwrap();
                 let weak_node = Rc::downgrade(&full_node);
-                let reader = early.unwrap_or_else(|| f.hold_callable(Rc::clone(&alias)).unwrap());
-                assert!(Rc::ptr_eq(reader.datatype(), &alias));
+                assert!(Rc::ptr_eq(
+                    &full_node.get_field(1).unwrap().field_type.get_ptr_to().unwrap(), &alias));
+                let mut source = crate::fspec::FuncProto::new();
+                source.copy(code.get_code_prototype().unwrap());
+                let source = f.retain_source_proto(Rc::new(source));
                 let weak_factory = Rc::downgrade(&f);
                 f.clear_noncore();
-                (reader, weak_node, weak_code, weak_proto, weak_factory)
+                (source, weak_node, weak_code, weak_proto, weak_factory)
             };
             assert!(weak_factory.upgrade().is_none());
-            let prototype = reader.prototype().unwrap();
-            let parameter = prototype.get_param(0).unwrap();
+            let parameter = source.get_param(0).unwrap();
             let node = parameter.get_type().unwrap().get_ptr_to().unwrap();
             assert_eq!(node.get_size(), 16);
             assert_eq!(node.get_field(1).unwrap().name, "callback");
             assert!(weak_code.upgrade().is_some());
             drop(node);
-            drop(prototype);
-            drop(reader);
+            drop(source);
             assert!(weak_node.upgrade().is_none());
             assert!(weak_code.upgrade().is_none());
             assert!(weak_proto.upgrade().is_none());

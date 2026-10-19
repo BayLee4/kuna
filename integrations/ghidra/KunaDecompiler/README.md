@@ -92,7 +92,7 @@ paths; see [the test setup](../../../tests/ghidra/README.md).
 The repository's reference checkout is not an installation target.
 
 The build requires the unmodified installation source/JAR pair, including
-`Decompiler-src.zip`, `SoftwareModeling-src.zip` and `Base-src.zip`. Bounded
+`Decompiler-src.zip` and `SoftwareModeling-src.zip`. Bounded
 maintained diffs in `patches/ghidra-12.1.4` apply strictly to those source members
 in clean build staging using the standard GNU/BSD `patch` executable (`PATCH`
 can select its path). Batch/forward/fuzz-zero flags are required; any nonzero
@@ -173,7 +173,8 @@ The typed writer emits genuine named callable datatypes as function-type typedef
 while preserving pointers and real aliases as separate layers. Anonymous callable
 types stay structural; an internal result placeholder does not authorize a name.
 All exporter-owned declaration writers receive the invocation's actual compiler
-specification and calling-convention display option. Each callable layer retains
+specification and the effective pooled interface's calling-convention display
+option, including a configurer's replacement options. Each callable layer retains
 its resolved nondefault convention; actual default models and convention-OFF
 output remain unannotated. Other, unconfigured datatype writers retain their
 ordinary behavior. A model named `__stdcall` is not itself evidence of a Windows

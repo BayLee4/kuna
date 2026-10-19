@@ -19,7 +19,6 @@ import zipfile
 SOURCE_ARCHIVES = {
     "Decompiler": "Ghidra/Features/Decompiler/lib/Decompiler-src.zip",
     "SoftwareModeling": "Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling-src.zip",
-    "Base": "Ghidra/Features/Base/lib/Base-src.zip",
 }
 NONEXACT_PATCH = re.compile(
     r"\b(?:offset|fuzz|reversed|previously\s+applied|skip\w*|ignor\w*|reject\w*|failed|malformed)\b",

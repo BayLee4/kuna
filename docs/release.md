@@ -184,6 +184,6 @@ For extension packaging, the driver requires the matching Ghidra installation
 and checks its version before native compilation. Without it, the driver only
 builds and stages a development native backend. Both packaging paths produce the same full normal
 extension ZIP and require Java 21 plus the unmodified installation source/JAR
-pair (`Decompiler-src.zip`, `SoftwareModeling-src.zip`, `Base-src.zip`).
+pair (`Decompiler-src.zip`, `SoftwareModeling-src.zip`).
 The existing preparation and compilation tasks apply the bounded owner patches;
 their internal enhanced-protocol names are not distribution choices.

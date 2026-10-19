@@ -2630,9 +2630,8 @@ moves.
   Qualifiers remain on their exact type layer, and typedefs retain nominal
   identity. GNU C's volatile-qualified **function** carrier is interpreted as
   no-return before qualification erasure; pointer/object volatile and Clang's
-  missing debug distinction do not supply that effect. The corresponding host
-  producer correction belongs to Ghidra's existing DWARF importer (the enhanced
-  overlay), not reconstruction by the ordinary native replacement.
+  missing debug distinction do not supply that effect. This mapping belongs to
+  Kuna's object-file loader; Ghidra's own DWARF importer remains unchanged.
   The mapping happens inside `load file`, before any
   option is applied, so the gate is the `KUNA_CALLTARGETTYPE` environment
   variable (chapter 00) the CLI exports ahead of the load from the run's options,

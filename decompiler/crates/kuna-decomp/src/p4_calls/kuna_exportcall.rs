@@ -94,11 +94,10 @@ pub struct ExportSpec {
     pub selected: Vec<ExportAddress>,
     pub functions: Vec<ExportFunctionSpec>, pub calls: Vec<ExportCallSpec>,
     pub failures: Vec<(ExportAddress, String)>,
-    pub parameter_edits: Vec<ExportParameterEdit>,
 }
 /// Successful existing symbol directives bound to an exact working occurrence.
-/// Datatypes remain on the assertion/type owners; workers rebind those same
-/// original directive indexes instead of introducing a second datatype codec.
+/// Datatypes remain on the assertion/type owners; directive indexes retain the
+/// original batch's validation and printed checks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportParameterEdit {
     pub entry: ExportAddress, pub storage: ExportAddress, pub size:i32, pub slot:i32,
@@ -212,8 +211,7 @@ impl ExportBinding {
         ExportSpec { selected:self.selected.iter().cloned().collect(),
             functions: self.functions.values().map(|f| f.spec.clone()).collect(),
             calls: self.calls.values().map(|c| c.spec.clone()).collect(),
-            failures: self.failures.iter().map(|(a,e)| (a.clone(), e.clone())).collect(),
-            parameter_edits:self.parameter_edits.values().flatten().cloned().collect() }
+            failures: self.failures.iter().map(|(a,e)| (a.clone(), e.clone())).collect() }
     }
     pub fn from_spec(arch: &mut Architecture, spec: &ExportSpec) -> KunaResult<Self> {
         Self::from_spec_with_entries(arch,spec,&[])
@@ -229,9 +227,6 @@ impl ExportBinding {
         sources:&BTreeMap<ExportAddress,Rc<FuncProto>>) -> KunaResult<Self>
     {
         let mut out = Self::default();
-        for edit in &spec.parameter_edits {
-            out.parameter_edits.entry(edit.entry.clone()).or_default().push(edit.clone());
-        }
         out.seeds.extend(entries.iter().map(|entry| (ExportAddress::new(&entry.entry),entry.seed.clone())));
         out.selected.extend(spec.selected.iter().cloned());
         let mut reserved = arch.print().reserved_identifiers()

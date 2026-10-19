@@ -1564,6 +1564,7 @@ struct MockFetch {
     tracked: std::collections::BTreeMap<u64, Vec<u8>>,
     /// Offsets whose getMappedSymbols FAILS (a wire/JavaError).
     fail_mapped: std::collections::BTreeSet<u64>,
+    defer_mapped_failure_until: usize,
     terminal: bool,
     fail_namespace: bool,
     fail_tracked: bool,
@@ -1604,7 +1605,9 @@ impl RemoteProviderFetch for MockFetch {
         decoder: &mut dyn Decoder,
     ) -> KunaResult<bool> {
         self.bump("mapped");
-        if self.fail_mapped.contains(&addr.get_offset()) {
+        if self.fail_mapped.contains(&addr.get_offset())
+            && self.calls.borrow().get("mapped").copied().unwrap_or(0) > self.defer_mapped_failure_until
+        {
             return Err(self.failure());
         }
         Self::serve(&self.mapped, addr.get_offset(), decoder)
@@ -1962,6 +1965,160 @@ fn free_varnode_property_query_propagates_transport_failure() {
     assert_eq!(&*calls.borrow(), &std::collections::BTreeMap::from([("mapped", 1)]));
     assert!(!scope.state.borrow().holes.in_range(&at, 1));
     assert!(!scope.state.borrow().answered.in_range(&at, 1));
+}
+
+#[test]
+fn store_varnode_destination_query_preserves_failure_kind() {
+    use crate::action::Rule;
+
+    for terminal in [false, true] {
+        let m = source_manager_with_registers();
+        let mut fetch = MockFetch::default();
+        fetch.terminal = terminal;
+        fetch.fail_mapped.insert(0x4444);
+        let expected = fetch.failure();
+        let calls = Rc::clone(&fetch.calls);
+        let scope = Rc::new(scope_over(&m, types_with_core(), fetch));
+        let mut context = crate::context::ArchContext::new_shared(Rc::clone(&m));
+        context.remote_scope = Some(Rc::clone(&scope));
+        let mut function = crate::funcdata::Funcdata::new(
+            "caller", "caller", Rc::new(context), Address::new(ram(&m), 0x1000), 0x10000000, 0,
+        ).unwrap();
+        let op = function.new_op(3, Address::new(ram(&m), 0x1010));
+        function.op_set_opcode_code(op, OpCode::CPUI_STORE);
+        let space = function.new_varnode_space(&ram(&m));
+        let destination = function.new_constant(8, 0x4444);
+        let value = function.new_constant(4, 7);
+        function.op_set_all_input(op, &[space, destination, value]).unwrap();
+        function.obank_mut().mark_alive(op);
+        calls.borrow_mut().clear();
+
+        let error = crate::ruleaction_4::RuleStoreVarnode::new()
+            .apply_op(op, &mut function).unwrap_err();
+        assert_eq!(matches!(error, kuna_base::error::KunaError::Transport { .. }), terminal);
+        assert_eq!(error.to_string(), expected.to_string());
+        assert_eq!(&*calls.borrow(), &std::collections::BTreeMap::from([("mapped", 1)]));
+        let operation = function.obank().get(op).unwrap();
+        assert_eq!(operation.code(), OpCode::CPUI_STORE);
+        assert_eq!(operation.num_input(), 3);
+        assert_eq!(operation.get_in(2), Some(value));
+        let at = Address::new(ram(&m), 0x4444);
+        assert!(!scope.state.borrow().holes.in_range(&at, 1));
+        assert!(!scope.state.borrow().answered.in_range(&at, 1));
+    }
+}
+
+#[test]
+fn replacement_and_renaming_preserve_retried_property_query_failures() {
+    use crate::action::Rule;
+    for operation in ["subpiece", "rename", "split", "widen", "narrow"] {
+        for terminal in [false, true] {
+            let m = source_manager_with_registers();
+            let mut fetch = MockFetch::default();
+            fetch.terminal = terminal;
+            fetch.fail_mapped.insert(0x4444);
+            fetch.defer_mapped_failure_until = 2;
+            let expected = fetch.failure();
+            let calls = Rc::clone(&fetch.calls);
+            let scope = Rc::new(scope_over(&m, types_with_core(), fetch));
+            let mut context = crate::context::ArchContext::new_shared(Rc::clone(&m));
+            context.remote_scope = Some(Rc::clone(&scope));
+            context.floatformats = vec![
+                kuna_num::float::FloatFormat::new(4),
+                kuna_num::float::FloatFormat::new(8),
+            ];
+            let mut function = crate::funcdata::Funcdata::new(
+                "caller", "caller", Rc::new(context), Address::new(ram(&m), 0x1000), 0x10000000, 0,
+            ).unwrap();
+            calls.borrow_mut().clear();
+            let at = Address::new(ram(&m), 0x4444);
+            let error = if operation == "split" {
+                let root = function.bblocks_ref().root.unwrap();
+                let entry = function.bblocks_mut().new_block_basic(root);
+                let left = function.bblocks_mut().new_block_basic(root);
+                let right = function.bblocks_mut().new_block_basic(root);
+                let join = function.bblocks_mut().new_block_basic(root);
+                function.bblocks_mut().add_edge(entry, left);
+                function.bblocks_mut().add_edge(entry, right);
+                function.bblocks_mut().add_edge(left, join);
+                function.bblocks_mut().add_edge(right, join);
+                let mut incoming = Vec::new();
+                for (block, high, low, pc) in [
+                    (left, 0x12345678, 0x9abcdef0, 0x1010),
+                    (right, 0xfedcba98, 0x76543210, 0x1020),
+                ] {
+                    let piece = function.new_op(2, Address::new(ram(&m), pc));
+                    function.op_set_opcode_code(piece, OpCode::CPUI_PIECE);
+                    let high = function.new_constant(4, high);
+                    let low = function.new_constant(4, low);
+                    function.op_set_all_input(piece, &[high, low]).unwrap();
+                    incoming.push(function.new_unique_out(8, piece).unwrap());
+                    function.op_insert_end(piece, block);
+                }
+                let phi = function.new_op(2, Address::new(ram(&m), 0x1030));
+                function.op_set_opcode_code(phi, OpCode::CPUI_MULTIEQUAL);
+                function.op_set_all_input(phi, &incoming).unwrap();
+                let wide = function.new_varnode_out(8, &at, phi).unwrap();
+                function.op_insert_end(phi, join);
+                let subpiece = function.new_op(2, Address::new(ram(&m), 0x1034));
+                function.op_set_opcode_code(subpiece, OpCode::CPUI_SUBPIECE);
+                let offset = function.new_constant(4, 4);
+                function.op_set_all_input(subpiece, &[wide, offset]).unwrap();
+                function.new_unique_out(4, subpiece).unwrap();
+                function.op_insert_end(subpiece, join);
+                crate::subflow::RuleSplitFlow::new("split").apply_op(subpiece, &mut function).unwrap_err()
+            } else if operation == "widen" || operation == "narrow" {
+                let root = function.bblocks_ref().root.unwrap();
+                let block = function.bblocks_mut().new_block_basic(root);
+                let input = function.new_unique(4, None);
+                let input = function.set_input_varnode(input).unwrap();
+                let widen = function.new_op(1, Address::new(ram(&m), 0x1010));
+                function.op_set_opcode_code(widen, OpCode::CPUI_FLOAT_FLOAT2FLOAT);
+                function.op_set_input(widen, input, 0).unwrap();
+                let wide = function.new_varnode_out(8, &at, widen).unwrap();
+                function.op_insert_end(widen, block);
+                let narrow = function.new_op(1, Address::new(ram(&m), 0x1014));
+                function.op_set_opcode_code(narrow, OpCode::CPUI_FLOAT_FLOAT2FLOAT);
+                function.op_set_input(narrow, wide, 0).unwrap();
+                function.new_unique_out(4, narrow).unwrap();
+                function.op_insert_end(narrow, block);
+                let trigger = if operation == "widen" { widen } else { narrow };
+                crate::subflow::RuleSubfloatConvert::new("float").apply_op(trigger, &mut function).unwrap_err()
+            } else {
+                let input = function.new_varnode(8, &at, None).unwrap();
+                assert_eq!(&*calls.borrow(), &std::collections::BTreeMap::from([("mapped", 2)]));
+                let rename = operation == "rename";
+                let op = function.new_op(if rename { 1 } else { 2 }, Address::new(ram(&m), 0x1010));
+                if rename {
+                    function.vbank_mut().get_mut(input).unwrap().set_active_heritage();
+                    let root = function.bblocks_ref().root.unwrap();
+                    let block = function.bblocks_mut().new_block_basic(root);
+                    function.op_set_opcode_code(op, OpCode::CPUI_COPY);
+                    function.op_set_input(op, input, 0).unwrap();
+                    function.new_unique_out(8, op).unwrap();
+                    function.op_insert_end(op, block);
+                    crate::heritage::Heritage::new().rename(&mut function).unwrap_err()
+                } else {
+                    let input = function.set_input_varnode(input).unwrap();
+                    function.vbank_mut().get_mut(input).unwrap().set_consume(0xff);
+                    function.op_set_opcode_code(op, OpCode::CPUI_SUBPIECE);
+                    let zero = function.new_constant(4, 0);
+                    function.op_set_all_input(op, &[input, zero]).unwrap();
+                    let output = function.new_unique_out(1, op).unwrap();
+                    let copy = function.new_op(1, Address::new(ram(&m), 0x1014));
+                    function.op_set_opcode_code(copy, OpCode::CPUI_COPY);
+                    function.op_set_input(copy, output, 0).unwrap();
+                    function.new_unique_out(1, copy).unwrap();
+                    crate::subflow::RuleSubvarSubpiece::new("subvar").apply_op(op, &mut function).unwrap_err()
+                }
+            };
+            assert_eq!(matches!(error, kuna_base::error::KunaError::Transport { .. }), terminal);
+            assert_eq!(error.to_string(), expected.to_string());
+            assert_eq!(&*calls.borrow(), &std::collections::BTreeMap::from([("mapped", 3)]));
+            assert!(!scope.state.borrow().holes.in_range(&at, 1));
+            assert!(!scope.state.borrow().answered.in_range(&at, 1));
+        }
+    }
 }
 
 #[test]

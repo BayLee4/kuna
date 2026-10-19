@@ -759,7 +759,33 @@ fn scalar_inputs_and_overlapping_call_results_keep_their_widths() {
         off.contains("float cast_only(unsigned int a0,unsigned int a1)"),
         "{off}"
     );
-    assert!(off.contains("CONCAT44"), "{off}");
+    let cast = off.split("// Function: ")
+        .find(|part| part.starts_with("cast_only ")).unwrap();
+    let cast = cast.lines().skip(1).collect::<Vec<_>>().join("\n");
+    kuna_harness::c_behavior::assert_c_behavior(
+        &common::scratch_file("arm-float-raw-input-bits", "c"),
+        "#include <stdint.h>\n#include <string.h>\n#include <assert.h>\n",
+        &cast,
+        r#"
+int main(void) {
+    const double values[] = {0.0, -0.0, 2.25, -3.5, 0x1.0000000000001p0, -0x1.8p30, 0x1p-40};
+    for (unsigned i=0; i<sizeof(values)/sizeof(*values); ++i) {
+        uint64_t bits;
+        memcpy(&bits, &values[i], sizeof(bits));
+        float got = cast_only((unsigned)bits, (unsigned)(bits >> 32));
+        float expected = (float)values[i];
+        uint32_t actual_bits, expected_bits;
+        memcpy(&actual_bits, &got, sizeof(actual_bits));
+        memcpy(&expected_bits, &expected, sizeof(expected_bits));
+        assert(actual_bits == expected_bits);
+    }
+    return 0;
+}
+"#,
+        &["-Wall", "-Werror=implicit-function-declaration", "-Werror=int-conversion",
+          "-Werror=uninitialized", "-Werror=return-type",
+          "-fsanitize=undefined", "-fno-sanitize-recover=undefined"],
+    );
 }
 
 #[test]

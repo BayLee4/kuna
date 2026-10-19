@@ -230,7 +230,6 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
         return Err(format!("no functions selected/discovered in {}", args.binary));
     }
     crate::interior::selections(&prog, args, &targets);
-    kuna_console::project::prepare_type_names(&mut prog);
     kuna_console::project::prepare_export_callables(&mut prog, &targets)
         .map_err(|e| e.to_string())?;
 

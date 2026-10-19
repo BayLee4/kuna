@@ -3827,7 +3827,7 @@ fn soft_float_imports_keep_their_core_register_values() {
 /// its bits into a `uint64_t`. With the libc table's `double` rows the soft
 /// image printed `double sub_10224(..)` beside `rd`'s `unsigned long long v1 =
 /// sub_10224()`, which converts 2.25 to 2, where the rows' absence returns the
-/// right `CONCAT44(v2,v1)`; the hard image printed `unsigned int sub_101f0(..)`
+/// combined r0:r1 bits; the hard image printed `unsigned int sub_101f0(..)`
 /// returning `SUB84(v1,0)`, the low half of `d0`. ARM gets none of the rows.
 #[test]
 fn arm_images_get_no_double_libc_rows() {
@@ -3841,8 +3841,52 @@ fn arm_images_get_no_double_libc_rows() {
         }
         if name.ends_with("soft") {
             assert!(
-                stdout.contains("unsigned long long sub_10224(") && stdout.contains("return CONCAT44(v2,v1);"),
+                stdout.contains("unsigned long long sub_10224("),
                 "{name}: `clampd` no longer returns its r0:r1 bits:\n{stdout}"
+            );
+            let body = printed_functions(&stdout, &["sub_10224 "]);
+            c_behavior::assert_c_behavior(
+                &common::scratch_file("arm-libc-core-return-bits", "c"),
+                r#"
+#include <stdint.h>
+#include <string.h>
+#include <assert.h>
+static uint64_t result_bits;
+static unsigned calls;
+static unsigned long long strtod(unsigned argument, unsigned end) {
+    assert(argument == 0x12345678 && end == 0);
+    ++calls;
+    return result_bits;
+}
+static int __aeabi_dcmplt(unsigned low, unsigned high, unsigned zero_low, unsigned zero_high) {
+    assert(zero_low == 0 && zero_high == 0);
+    uint64_t bits = ((uint64_t)high << 32) | low;
+    double value;
+    memcpy(&value, &bits, sizeof(value));
+    return value < 0;
+}
+"#,
+                &body,
+                r#"
+int main(void) {
+    const uint64_t samples[] = {0, UINT64_C(0x8000000000000000),
+        UINT64_C(0x4002000000000000), UINT64_C(0xc002000000000000),
+        UINT64_C(0x3ff0000000000001), UINT64_C(0x7ff8123456789abc)};
+    for (unsigned i=0; i<sizeof(samples)/sizeof(*samples); ++i) {
+        result_bits = samples[i];
+        double value;
+        memcpy(&value, &result_bits, sizeof(value));
+        uint64_t expected = value < 0 ? 0 : result_bits;
+        calls = 0;
+        assert(sub_10224(0x12345678) == expected);
+        assert(calls == 1);
+    }
+    return 0;
+}
+"#,
+                &["-Wall", "-Werror=implicit-function-declaration", "-Werror=int-conversion",
+                  "-Werror=uninitialized", "-Werror=return-type", "-fno-builtin",
+                  "-fsanitize=undefined", "-fno-sanitize-recover=undefined"],
             );
         }
     }

@@ -11,6 +11,27 @@ import traceback
 from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra, test_cores
 
 
+def assert_java_type_binding(result, source_type, spelling, count):
+    from java.util import ArrayList
+    from ghidra.app.decompiler import ClangTypeToken
+    from ghidra.app.decompiler.component import DecompilerUtils
+    from ghidra.program.model.data import Pointer
+
+    while isinstance(source_type, Pointer):
+        source_type = source_type.getDataType()
+    flattened = ArrayList()
+    result.getCCodeMarkup().flatten(flattened)
+    tokens = [token for token in flattened
+              if isinstance(token, ClangTypeToken) and str(token.getText()) == spelling]
+    assert len(tokens) == count, (spelling, tokens)
+    for token in tokens:
+        assert token.getDataType() == source_type, (spelling, token.getDataType(), source_type)
+        if DecompilerUtils.getVarnodeRef(token) is None:
+            assert DecompilerUtils.getDataType(token) == source_type, spelling
+    return {"spelling": spelling, "source_type": str(source_type.getPathName()),
+            "tokens": count}
+
+
 def execute_null_methods(output, row, code):
     """Consume the emitted bodies unchanged, including Java's boxing semantics."""
     directory = output / (row["core"] + "-null-" + row["phase"])
@@ -235,6 +256,12 @@ def main():
                                     assert '"kuna_cpool_token"' in code, code
                                 elif name == "length":
                                     assert re.search(r"\.\s*length\b", code), code
+                                    parameter = fn.getParameter(0).getDataType()
+                                    assert_return_constraints(
+                                        high.getFunctionPrototype().getParam(0).getDataType(),
+                                        parameter)
+                                    row["datatype_binding"] = assert_java_type_binding(
+                                        result, parameter, "int", 2)
                                 elif name == "array":
                                     assert re.search(r"\bnew\s+(?:java\.lang\.)?Object\s*\[", code), code
                                 elif name in ("readField", "method"):
@@ -319,6 +346,11 @@ def main():
                                     if name == "isNil":
                                         parameter = high.getFunctionPrototype().getParam(0).getDataType()
                                         assert_return_constraints(parameter, fn.getParameter(0).getDataType())
+                                    if language == DecompilerLanguage.JAVA_LANGUAGE:
+                                        source_type = (fn.getReturnType() if name == "nil"
+                                                       else fn.getParameter(0).getDataType())
+                                        row.setdefault("datatype_bindings", {})[name] = (
+                                            assert_java_type_binding(result, source_type, "Object", 1))
                                     code[name] = str(result.getDecompiledFunction().getC())
                                     (output / (core + "-null-" + phase + "-" + name + ".txt")).write_text(code[name])
                                 if language == DecompilerLanguage.C_LANGUAGE:

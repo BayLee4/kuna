@@ -60,8 +60,6 @@ fn effective_java_metadata_reaches_context_and_ir_descriptor() {
         let installed = table[opcode as usize].unwrap();
         assert_eq!(local.metain, installed.metain);
         assert_eq!(local.metaout, installed.metaout);
-        assert_eq!(descriptor.metain, installed.metain);
-        assert_eq!(descriptor.metaout, installed.metaout);
         assert_eq!(descriptor.get_flags(), type_op_info(opcode).opflags);
         assert_eq!(effective_type_op_info(opcode, OutLang::Rust).metain,
             type_op_info(opcode).metain);

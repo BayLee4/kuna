@@ -50,9 +50,6 @@ pub struct TypeOp {
     pub flags: uint4,
     /// Symbol denoting this operation (C++ `TypeOp::name`).
     pub name: String,
-    /// Effective language-selected local input and output metatypes.
-    pub metain: crate::dtype::type_metatype,
-    pub metaout: crate::dtype::type_metatype,
 }
 
 impl TypeOp {
@@ -60,8 +57,6 @@ impl TypeOp {
     pub fn new(opcode: OpCode, flags: uint4, name: impl Into<String>) -> TypeOp {
         TypeOp {
             opcode, flags, name: name.into(),
-            metain: crate::dtype::type_metatype::TYPE_UNKNOWN,
-            metaout: crate::dtype::type_metatype::TYPE_UNKNOWN,
         }
     }
 

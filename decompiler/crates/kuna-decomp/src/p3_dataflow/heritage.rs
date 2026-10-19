@@ -4002,7 +4002,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         bl: BlockId,
         varstack: &mut VariableStack,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let mut writelist: Vec<crate::context::VarnodeId> = Vec::new();
 
@@ -4033,10 +4033,7 @@ impl Heritage {
                         None => {
                             let nv = self.new_entry_input(
                                 fd, in_size, &key,
-                            )
-                            .unwrap_or_else(|e| {
-                                panic!("rename_recurse: set_input_varnode (empty stack): {e}")
-                            });
+                            )?;
                             varstack.entry(key.clone()).or_default().push(nv);
                             nv
                         }
@@ -4065,12 +4062,7 @@ impl Heritage {
                             if stacklen == 1 {
                                 let nv = self.new_entry_input(
                                     fd, in_size, &key,
-                                )
-                                .unwrap_or_else(|e| {
-                                    panic!(
-                                        "rename_recurse: set_input_varnode (indirect same-time): {e}"
-                                    )
-                                });
+                                )?;
                                 varstack.entry(key.clone()).or_default().insert(0, nv);
                                 vnnew = nv;
                             } else {
@@ -4139,10 +4131,7 @@ impl Heritage {
                     None => {
                         let nv = self.new_entry_input(
                             fd, in_size, &key,
-                        )
-                        .unwrap_or_else(|e| {
-                            panic!("rename_recurse: set_input_varnode (multi empty stack): {e}")
-                        });
+                        )?;
                         varstack.entry(key.clone()).or_default().push(nv);
                         nv
                     }
@@ -4158,7 +4147,7 @@ impl Heritage {
         let i = fd.bblocks_ref().block(bl).get_index() as usize;
         let children: Vec<BlockId> = self.domchild[i].clone();
         for child in children {
-            self.rename_recurse(fd, child, varstack);
+            self.rename_recurse(fd, child, varstack)?;
         }
 
         // Pop this block's writes off the stack.
@@ -4168,6 +4157,7 @@ impl Heritage {
                 stack.pop();
             }
         }
+        Ok(())
     }
 
     /// Borrow a block's ops in execution order (C++ `bl->beginOp()..endOp()`),
@@ -4185,13 +4175,14 @@ impl Heritage {
     /// happened.
     // `mutable_key_type`: see the note on [`rename_recurse`](Heritage::rename_recurse).
     #[allow(clippy::mutable_key_type)]
-    pub fn rename(&mut self, fd: &mut crate::funcdata::Funcdata) {
+    pub fn rename(&mut self, fd: &mut crate::funcdata::Funcdata) -> kuna_base::error::KunaResult<()> {
         let bblocks = fd.bblocks_ref();
         let root = bblocks.root.expect("rename: bblocks root");
         let start = bblocks.block(root).get_block(0);
         let mut varstack: VariableStack = VariableStack::new();
-        self.rename_recurse(fd, start, &mut varstack);
+        self.rename_recurse(fd, start, &mut varstack)?;
         self.disjoint.clear();
+        Ok(())
     }
 
     /// Concatenate a list of Varnodes together at the given location (C++
@@ -5598,7 +5589,7 @@ impl Heritage {
         if self.deadline_passed() {
             return Ok(());
         }
-        self.rename(fd);
+        self.rename(fd)?;
         // (kuna w10-chainb-gap1) reprocessFreeStores: re-derive the STORE guards
         // now that this pass completed, dropping spurious INDIRECTs on STOREs
         // that turned out not to need a guard (only reached when discovery saw
@@ -5976,7 +5967,7 @@ mod tests {
             fd.new_unique_out(8, copy).unwrap();
             fd.op_insert_end(copy, block);
             heritage.domchild = vec![vec![]];
-            heritage.rename(&mut fd);
+            heritage.rename(&mut fd).unwrap();
             assert_eq!(fd.obank().get(copy).unwrap().get_in(0), Some(whole));
             assert_eq!(fd.vbank().iter_def_flag(crate::varnode::varnode_flags::input).count(), 2);
             let old_slots: Vec<_> = fd.vbank().iter_def_flag(crate::varnode::varnode_flags::input).collect();
@@ -6490,7 +6481,7 @@ mod tests {
         h.build_adt(&fd);
         // No Varnodes to rename; the dom-tree walk visits both blocks and
         // returns without creating or linking anything.
-        h.rename(&mut fd);
+        h.rename(&mut fd).unwrap();
         assert_eq!(fd.vbank().num_varnodes(), 0, "rename created no Varnodes on an empty function");
     }
 

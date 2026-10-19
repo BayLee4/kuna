@@ -758,17 +758,16 @@ fn completed_recursive_callback_uses_the_original_callable_for_real_calls() {
                     declare("typedef struct Node (*Fn)(struct Node);");
                 }
                 let callback = factory.find_by_name("Fn").unwrap().unwrap();
-                let callback_reader = factory.hold_callable(std::rc::Rc::clone(&callback)).unwrap();
                 if observe_before_layout {
                     let mut pieces = kuna_decomp::fspec::PrototypePieces::default();
                     callback.get_ptr_to().unwrap().get_code_prototype().unwrap().get_pieces(&mut pieces);
                 }
                 declare("struct Node { float8 d; Fn next; };");
-                callback_reader
+                callback
             };
             corpus.command("parse line extern struct Node invoke(struct Node node, Fn callback);").unwrap();
             corpus.data().pending_prototypes.get_mut("invoke").unwrap().intypes[1] =
-                std::rc::Rc::clone(callback.datatype());
+                std::rc::Rc::clone(&callback);
             corpus.run_all(&["invoke"], |program, fd| {
                 assert_eq!(fd.num_calls(), 1);
                 program.arch_mut().ctypes = true;
@@ -833,14 +832,12 @@ fn original_calltarget_stage_clauses_preserve_inferred_call_domains() {
         for clause in document.get_root().get_children().iter()
             .filter(|element| element.get_name() == "stringmatch")
         {
-            let attribute = |name| std::str::from_utf8(clause.get_attribute_value(name).unwrap()).unwrap();
-            let pattern = std::str::from_utf8(clause.get_content()).unwrap();
-            let expression = regex::RegexBuilder::new(pattern).multi_line(true).build().unwrap();
-            let count = expression.find_iter(&bodies).count();
-            let min: usize = attribute("min").parse().unwrap();
-            let max: usize = attribute("max").parse().unwrap();
-            assert!((min..=max).contains(&count),
-                "{stem}: {}: expected {min}..={max}, found {count}\n{bodies}", attribute("name"));
+            let mut property = kuna_harness::testfunction::FunctionTestProperty::restore_xml(clause).unwrap();
+            property.start_test();
+            for line in bodies.lines() {
+                property.process_line(line);
+            }
+            assert!(property.end_test(), "{stem}: {}\n{bodies}", property.get_name());
         }
     }
 }

@@ -613,6 +613,95 @@ try:
             finally:
                 value.release(consumer)
 
+            from ghidra.program.model.data import ParameterDefinition, ParameterDefinitionImpl
+            from support import execute_i386_publication
+            row = {"mode": "configured_export_convention", "passed": False,
+                   "constructor_convention_print": False, "effective_convention_print": True,
+                   "failures": []}
+            report["rows"].append(row)
+            consumer = Object()
+            windows32 = DefaultLanguageService.getLanguageService().getLanguage(
+                LanguageID("x86:LE:32:default"))
+            value = ProgramDB("configured-export-convention", windows32,
+                              windows32.getCompilerSpecByID(CompilerSpecID("windows")), consumer)
+            try:
+                flat = FlatProgramAPI(value, monitor)
+                manager = value.getDataTypeManager()
+                tx = value.startTransaction("Explicit cdecl callback under Windows stdcall default")
+                try:
+                    entry = value.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000)
+                    memory = flat.createMemoryBlock("code", entry,
+                        JArray(JByte)(bytes.fromhex("8b442404ff742408ffd083c404c3")), False)
+                    memory.setExecute(True)
+                    assert flat.disassemble(entry)
+                    invoke = flat.createFunction(entry, "invoke")
+                    assert invoke is not None
+                    callback = FunctionDefinitionDataType("CallbackFunction", manager)
+                    callback.setReturnType(IntegerDataType.dataType)
+                    callback.setCallingConvention("__cdecl")
+                    callback.setArguments(JArray(ParameterDefinition)([
+                        ParameterDefinitionImpl("x", IntegerDataType.dataType, None)]))
+                    callback = manager.resolve(callback, DataTypeConflictHandler.DEFAULT_HANDLER)
+                    alias = manager.resolve(TypedefDataType("Callback", PointerDataType(callback, manager)),
+                                            DataTypeConflictHandler.DEFAULT_HANDLER)
+                    invoke.updateFunction("__cdecl", ReturnParameterImpl(IntegerDataType.dataType, value),
+                        Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, False,
+                        SourceType.USER_DEFINED, JArray(Variable)([
+                            ParameterImpl("callback", alias, value),
+                            ParameterImpl("x", IntegerDataType.dataType, value)]))
+                finally:
+                    value.endTransaction(tx, True)
+                assert str(value.getCompilerSpec().getDefaultCallingConvention().getName()) == "__stdcall"
+                assert str(callback.getCallingConventionName()) == "__cdecl"
+                assert str(invoke.getCallingConventionName()) == "__cdecl"
+                def convention_sources():
+                    return {"functions": source_snapshot({"invoke": invoke}),
+                            "invoke_convention": str(invoke.getCallingConventionName()),
+                            "callback_path": str(callback.getPathName()),
+                            "callback_id": int(manager.getID(callback)),
+                            "callback_prototype": str(callback.getPrototypeString(True)),
+                            "callback_convention": str(callback.getCallingConventionName()),
+                            "alias_path": str(alias.getPathName()),
+                            "alias_id": int(manager.getID(alias)),
+                            "alias_target_id": int(manager.getID(alias.getDataType().getDataType())),
+                            "revision": int(value.getModificationNumber())}
+                before = convention_sources()
+                defaults = DecompileOptions()
+                defaults.setConventionPrint(False)
+                effective = DecompileOptions()
+                effective.setConventionPrint(True)
+                configured_interfaces = []
+                def configure_convention(interface):
+                    assert interface.setOptions(effective)
+                    configured_interfaces.append(True)
+                configured_exporter = CppExporter(defaults, True, True, True, True, False, "")
+                configured_exporter.setConfigurer(
+                    JProxy(DecompileConfigurer, dict(configure=configure_convention)))
+                directory = output / "configured-export-convention"
+                directory.mkdir(exist_ok=True)
+                destination = directory / "unit.c"
+                with selected_core(KUNA_GHIDRA):
+                    assert configured_exporter.export(File(str(destination)), value, None, monitor)
+                assert configured_interfaces
+                header = destination.with_suffix(".h")
+                row.update(c=destination.read_text(), h=header.read_text(),
+                           configured_interfaces=len(configured_interfaces), source_before=before)
+                driver = directory / "driver.c"
+                driver.write_text('#include "unit.h"\n'
+                    'static int __cdecl provider(int x) { return x+3; }\n'
+                    'int main(void) { return invoke(provider,4)!=7; }\n')
+                # The compiler's stdcall default makes an omitted callback convention
+                # incompatible with this genuine cdecl provider, not just different text.
+                execute_i386_publication(row, directory, header, destination, driver, True)
+                row["source_after"] = convention_sources()
+                assert row["source_after"] == before
+                row.update(passed=True, source_unchanged=True)
+            except Exception:
+                row["failures"].append({"stage": "configured-export-convention",
+                                        "failure": traceback.format_exc()})
+            finally:
+                value.release(consumer)
+
         if full_java and "kuna" in cores and "kuna" in modes:
             from ghidra.app.util.opinion import ElfLoader
             from ghidra.program.model.address import AddressSet

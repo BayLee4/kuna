@@ -200,6 +200,54 @@ int main(void) {{
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A real one-argument CONCAT11 must not collide with a generated two-argument
+/// PIECE helper, even when the selected function contains no PIECE operation.
+#[test]
+fn project_preserves_a_user_function_named_concat11() {
+    let dir = out_dir("user_concat11");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("concat_collision.c");
+    std::fs::write(&source, r#"
+__attribute__((noinline)) int CONCAT11(int value) { return value + 7; }
+int main(void) { return CONCAT11(35) != 42; }
+"#).unwrap();
+    let input = kuna_harness::dwarf_fixture::compile_dwarf(&source, "c11", &[]);
+    let project = dir.join("project");
+    let (_, stderr, ok) = run_kuna(&[
+        "decompile-project", input.path.to_str().unwrap(),
+        "-o", project.to_str().unwrap(), "--sleighpath", &specs(),
+        "--functions", "CONCAT11", "--jobs", "1",
+    ]);
+    assert!(ok, "CONCAT11 project export failed:\n{stderr}");
+
+    let basename = input.path.file_name().unwrap().to_str().unwrap();
+    let driver = dir.join("driver.c");
+    std::fs::write(&driver, format!(r#"
+#include "{basename}.h"
+int main(void) {{
+    int (*provider)(int) = CONCAT11;
+    const int values[] = {{ -99, -1, 0, 1, 35, 99 }};
+    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {{
+        if (provider(values[i]) != values[i] + 7) return 1;
+    }}
+    return 0;
+}}
+"#)).unwrap();
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    for optimization in ["-O0", "-O2"] {
+        let executable = dir.join(format!("consumer-{}", &optimization[1..]));
+        let built = Command::new(&compiler).args(["-std=c11", optimization])
+            .arg("-I").arg(&project).arg(project.join(format!("{basename}.c")))
+            .arg(&driver).arg("-o").arg(&executable).output().unwrap();
+        assert!(built.status.success(), "unchanged CONCAT11 project C/H:\n{}",
+            String::from_utf8_lossy(&built.stderr));
+        let ran = Command::new(&executable).output().unwrap();
+        assert!(ran.status.success(), "authored one-argument CONCAT11 changed behavior:\n{}",
+            String::from_utf8_lossy(&ran.stderr));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// The README's entry-point row was `object`'s raw `entry()`, which on a Mach-O
 /// `LC_MAIN` image is a `__TEXT`-relative file offset -- so the export claimed an
 /// entry at `0x5b0` for a program whose `main` is at `0x1000005b0`.

@@ -44,6 +44,104 @@ mod recovered_views;
     }
 
     #[test]
+    fn prepared_scalar_concatenations_preserve_width_bits_and_single_evaluation() {
+        let mut arch = bare_arch();
+        arch.partial_concat = false;
+        let mut functions = String::new();
+        let mut checks = String::new();
+        let mut index = 0;
+        for ctypes in [false, true] {
+            arch.ctypes = ctypes;
+            for high in 1..=7 {
+                for low in 1..=8 - high {
+                    for mode in ["unsigned", "signed", "calls", "same", "parent"] {
+                        if mode == "same" && high != low { continue; }
+                        let mut fd = build_fd();
+                        fd.set_high_level();
+                        let meta = if mode == "signed" { type_metatype::TYPE_INT }
+                            else { type_metatype::TYPE_UINT };
+                        let high_type = arch.types_impl().get_base(high, meta).unwrap();
+                        let low_type = arch.types_impl().get_base(low, meta).unwrap();
+                        let first = if mode == "calls" {
+                            execution_call(&mut fd, "next_high", high_type, 0x1000)
+                        } else { execution_input(&mut fd, "high", high_type) };
+                        let first = if mode == "calls" { first }
+                            else { fd.set_input_varnode(first).unwrap() };
+                        let second = if mode == "same" { first } else if mode == "calls" {
+                            execution_call(&mut fd, "next_low", low_type, 0x1004)
+                        } else { execution_input(&mut fd, "low", low_type) };
+                        let second = if mode == "calls" || mode == "same" { second }
+                            else { fd.set_input_varnode(second).unwrap() };
+                        let piece = mk_op(&mut fd, 2, 0x1010, OpCode::CPUI_PIECE);
+                        fd.op_set_all_input(piece, &[first, second]).unwrap();
+                        let result = fd.new_unique_out(high + low, piece).unwrap();
+                        let root = if mode == "parent" {
+                            fd.vbank_mut().get_mut(result).unwrap().set_implied();
+                            let shift = mk_op(&mut fd, 2, 0x1014, OpCode::CPUI_INT_RIGHT);
+                            let one = fd.new_constant(4, 1);
+                            fd.op_set_all_input(shift, &[result, one]).unwrap();
+                            fd.new_unique_out(high + low, shift).unwrap();
+                            shift
+                        } else { piece };
+                        let mut print = execution_printer(&arch, false);
+                        print.set_export_binding(Some(Rc::new(crate::kuna_exportcall::ExportBinding::default())));
+                        print.op_push_ir(&fd, &arch, root, None).unwrap();
+                        let expression = print.emit_mut().output_str();
+                        functions.push_str(&format!(
+                            "static uint64_t piece{index}(int64_t high,int64_t low){{return {expression};}}\n"));
+                        let parent = if mode == "parent" { ">>1" } else { "" };
+                        let second = if mode == "same" { "high_bits" } else { "low_bits" };
+                        checks.push_str(&format!(
+                            "high_calls=low_calls=0; assert(piece{index}(high_bits,low_bits)==\
+                             (byte_contract((uint64_t)high_bits,(uint64_t){second},{high},{low}){parent}));\n"));
+                        checks.push_str(if mode == "calls" {
+                            "assert(high_calls==1 && low_calls==1);\n"
+                        } else { "assert(high_calls==0 && low_calls==0);\n" });
+                        if mode != "parent" {
+                            let width = if high + low == 2 { 2 } else if high + low <= 4 { 4 } else { 8 };
+                            functions.push_str(&format!(
+                                "static size_t size{index}(int64_t high,int64_t low){{return sizeof({expression});}}\n"));
+                            checks.push_str(&format!("assert(size{index}(0,0)=={width});\n"));
+                        }
+                        index += 1;
+                    }
+                }
+            }
+        }
+        let prelude = crate::decompile_drive::print_c_recompile_prelude(&arch);
+        let source = format!(r#"
+#include <stdint.h>
+#include <stddef.h>
+#include <assert.h>
+{prelude}
+static unsigned high_calls,low_calls;
+static int64_t high_bits,low_bits;
+static int64_t next_high(void){{++high_calls;return high_bits;}}
+static int64_t next_low(void){{++low_calls;return low_bits;}}
+static uint64_t byte_contract(uint64_t high,uint64_t low,unsigned h,unsigned l){{
+ uint64_t result=0;
+ for(unsigned i=0;i<l;i++) result|=((low>>(8*i))&255)<<(8*i);
+ for(unsigned i=0;i<h;i++) result|=((high>>(8*i))&255)<<(8*(i+l));
+ return result;
+}}
+{functions}
+int main(void){{
+ const uint64_t values[]={{0,1,2,UINT64_MAX,UINT64_C(0x8000000000000000),
+                         UINT64_C(0x0123456789abcdef),UINT64_C(0x7fffffffffffffff),
+                         UINT64_C(0xffffffffffffff80)}};
+ for(unsigned a=0;a<8;a++) for(unsigned b=0;b<8;b++){{
+  high_bits=(int64_t)values[a];low_bits=(int64_t)values[b];
+  {checks}
+ }}
+ return 0;
+}}
+"#);
+        assert_c_source_with_warnings(&source, "prepared-scalar-piece",
+            &["-Werror=implicit-function-declaration", "-Werror=shift-count-overflow",
+              "-fsanitize=undefined", "-fno-sanitize-recover=undefined"]);
+    }
+
+    #[test]
     fn emitted_default_high_characters_match_declared_byte_values() {
         let fd = build_fd();
         let arch = bare_arch();

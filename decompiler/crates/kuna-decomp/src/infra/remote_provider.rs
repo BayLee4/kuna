@@ -1305,7 +1305,6 @@ impl RemoteScope {
                         source.set_no_return(func_no_return);
                         source.complete_decoded_effects()?;
                         self.types.bind_prototype_injection(&mut source)?;
-                        source.retain_resolved_dependencies();
                         Ok(self.types.retain_source_proto(Rc::new(source)))
                     }).transpose()?;
                     st.functions.insert(

@@ -797,7 +797,6 @@ fn export(
     targets.sort_by(|a, b| {
         a.addr.get_offset().cmp(&b.addr.get_offset()).then_with(|| a.name.cmp(&b.name))
     });
-    kuna_console::project::prepare_type_names(&mut prog);
     kuna_console::project::prepare_export_callables(&mut prog, &targets)
         .map_err(|e| e.to_string())?;
     let specs = flatten_targets(&targets);

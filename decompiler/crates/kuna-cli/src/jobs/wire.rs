@@ -13,7 +13,7 @@ use kuna_console::engine::{EntryProvenance, ObjectLocation};
 use kuna_console::project::{FuncResult, ResultTypeBinding};
 use kuna_decomp::decompile_drive::{GlobalInfo, LineMapping, TypeInfo, VarInfo};
 use kuna_decomp::kuna_exportcall::{
-    ExportAddress, ExportCallKey, ExportCallSpec, ExportFunctionSpec, ExportInputSpec, ExportParameterEdit, ExportSpec,
+    ExportAddress, ExportCallKey, ExportCallSpec, ExportFunctionSpec, ExportInputSpec, ExportSpec,
 };
 use kuna_decomp::kuna_structsynth::shard::FunctionRecord;
 
@@ -245,17 +245,6 @@ pub(super) fn encode_export_spec(spec: &ExportSpec) -> Vec<u8> {
         put_export_address(&mut out, address);
         put_str(&mut out, error);
     }
-    put_u32(&mut out,spec.parameter_edits.len() as u32);
-    for edit in &spec.parameter_edits {
-        put_export_address(&mut out,&edit.entry);
-        put_export_address(&mut out,&edit.storage);
-        put_u32(&mut out,edit.size as u32);
-        put_u32(&mut out,edit.slot as u32);
-        put_str(&mut out,&edit.name);
-        put_str(&mut out,&edit.printed);
-        put_u32(&mut out,edit.directives.len() as u32);
-        for &index in &edit.directives { put_u64(&mut out,index as u64); }
-    }
     out
 }
 
@@ -304,21 +293,7 @@ fn decode_export_spec(bytes: &[u8]) -> Option<ExportSpec> {
     for _ in 0..n {
         failures.push((export_address(&mut r)?, r.string()?));
     }
-    let n = r.u32()? as usize;
-    let mut parameter_edits = r.sized(n);
-    for _ in 0..n {
-        let entry = export_address(&mut r)?;
-        let storage = export_address(&mut r)?;
-        let size = r.u32()? as i32;
-        let slot = r.u32()? as i32;
-        let name = r.string()?;
-        let printed = r.string()?;
-        let n = r.u32()? as usize;
-        let mut directives = r.sized(n);
-        for _ in 0..n { directives.push(usize::try_from(r.u64()?).ok()?); }
-        parameter_edits.push(ExportParameterEdit {entry,storage,size,slot,name,printed,directives});
-    }
-    (r.pos == bytes.len()).then_some(ExportSpec { selected,functions, calls, failures,parameter_edits })
+    (r.pos == bytes.len()).then_some(ExportSpec { selected,functions, calls, failures })
 }
 
 pub(crate) fn read_export_spec(path: &std::path::Path) -> Result<ExportSpec, String> {
@@ -868,10 +843,6 @@ mod export_tests {
                     helper: "kuna_call_ram_1000_ram_1020_0".into(),
                 },
             ],
-            parameter_edits:vec![ExportParameterEdit {
-                entry:target.clone(),storage:ExportAddress {space:"register".into(),offset:8},
-                size:4,slot:0,name:"observed".into(),printed:"value".into(),directives:vec![0,3],
-            }],
             failures: vec![(target, "actual per-entry error".into())],
         };
         let bytes = encode_export_spec(&spec);
