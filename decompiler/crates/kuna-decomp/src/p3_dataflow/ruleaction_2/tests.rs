@@ -36,7 +36,7 @@ fn apply_selected_rule(name: &str, fd: &mut Funcdata) -> int4 {
     let (_, excluded) = mk_written(fd, bl, 0xff10, 4, OpCode::CPUI_INT_XOR, &[v, v]);
     assert!(pool.clone_filtered(&ActionGroupList::from_names(["unrelated"])).is_none());
     let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).unwrap();
-    selected.apply(fd, &mut ActionContext::new());
+    selected.apply(fd, &mut ActionContext::new()).unwrap();
     assert_eq!(code_of(fd, excluded), OpCode::CPUI_INT_XOR);
     assert_eq!(in_of(fd, excluded, 0), Some(v));
     assert_eq!(in_of(fd, excluded, 1), Some(v));
@@ -277,7 +277,7 @@ fn mk_written(
         fd.op_set_input(defop, vn, i as int4).expect("mk_written set input");
     }
     let ram = ram_space(fd);
-    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(out_size)));
+    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(out_size))).unwrap();
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let mut no_replace =
@@ -321,7 +321,7 @@ fn floatrange_less_or_equal_collapses_to_lessequal() {
     fd.op_set_input(or, eq_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    let r = RuleFloatRange.apply_op(or, &mut fd);
+    let r = RuleFloatRange.apply_op(or, &mut fd).unwrap();
     assert_eq!(r, 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_FLOAT_LESSEQUAL);
     // Inputs collapse to (V, C): slot1 stays 0 (nvn1 = V at slot 0 of cmp1).
@@ -347,7 +347,7 @@ fn floatrange_lessequal_and_notequal_collapses_to_less() {
     fd.op_set_input(and, ne_out, 1).unwrap();
     fd.op_insert(and, bl, None);
 
-    assert_eq!(RuleFloatRange.apply_op(and, &mut fd), 1);
+    assert_eq!(RuleFloatRange.apply_op(and, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, and), OpCode::CPUI_FLOAT_LESS);
 }
 
@@ -367,7 +367,7 @@ fn floatrange_declines_mismatched_pair() {
     fd.op_set_input(or, ne_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleFloatRange.apply_op(or, &mut fd), 0);
+    assert_eq!(RuleFloatRange.apply_op(or, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_BOOL_OR);
 }
 
@@ -382,7 +382,7 @@ fn floatrange_declines_unwritten_input() {
     fd.op_set_input(or, a, 0).unwrap();
     fd.op_set_input(or, b, 1).unwrap();
     fd.op_insert(or, bl, None);
-    assert_eq!(RuleFloatRange.apply_op(or, &mut fd), 0);
+    assert_eq!(RuleFloatRange.apply_op(or, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -402,7 +402,7 @@ fn doublesub_combines_offsets() {
     fd.op_set_input(outer, c1, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleSub.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleSub.apply_op(outer, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_SUBPIECE);
     assert_eq!(in_of(&fd, outer, 0), Some(v)); // middleman skipped
     let off = in_of(&fd, outer, 1).unwrap();
@@ -421,7 +421,7 @@ fn doublesub_declines_non_subpiece_inner() {
     fd.op_set_input(outer, inner_out, 0).unwrap();
     fd.op_set_input(outer, c1, 1).unwrap();
     fd.op_insert(outer, bl, None);
-    assert_eq!(RuleDoubleSub.apply_op(outer, &mut fd), 0);
+    assert_eq!(RuleDoubleSub.apply_op(outer, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -442,7 +442,7 @@ fn doubleshift_same_direction_adds() {
     fd.op_set_input(outer, three, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_INT_LEFT);
     assert_eq!(in_of(&fd, outer, 0), Some(v)); // skip middle shift
     let sa = in_of(&fd, outer, 1).unwrap();
@@ -463,7 +463,7 @@ fn doubleshift_same_direction_overshift_zeroes() {
     fd.op_set_input(outer, s2, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(outer).unwrap().num_input(), 1);
     let z = in_of(&fd, outer, 0).unwrap();
@@ -484,7 +484,7 @@ fn doubleshift_declines_non_constant_shift() {
     fd.op_set_input(outer, sh_out, 0).unwrap();
     fd.op_set_input(outer, amt, 1).unwrap();
     fd.op_insert(outer, bl, None);
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 0);
+    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -501,7 +501,7 @@ fn trivialarith_equal_same_input_is_true() {
     fd.op_set_input(op, v, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
     let b = in_of(&fd, op, 0).unwrap();
@@ -519,7 +519,7 @@ fn trivialarith_notequal_same_input_is_false() {
     fd.op_set_input(op, v, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     let b = in_of(&fd, op, 0).unwrap();
     assert_eq!(const_val(&fd, b), 0); // boolean false
@@ -538,7 +538,7 @@ fn trivialarith_xor_same_input_is_sized_zero() {
     let _ = (op, out);
     // Use the written op so getOut() is valid.
     let xorop = _d;
-    assert_eq!(RuleTrivialArith.apply_op(xorop, &mut fd), 1);
+    assert_eq!(RuleTrivialArith.apply_op(xorop, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, xorop), OpCode::CPUI_COPY);
     let z = in_of(&fd, xorop, 0).unwrap();
     assert!(is_const(&fd, z));
@@ -554,7 +554,7 @@ fn trivialarith_and_same_input_is_identity_copy() {
     let v = mk_reg(&mut fd, 0x100, 4);
     let (op, defop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[v, v]);
     let _ = op;
-    assert_eq!(RuleTrivialArith.apply_op(defop, &mut fd), 1);
+    assert_eq!(RuleTrivialArith.apply_op(defop, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, defop), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(defop).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, defop, 0), Some(v)); // identity: input preserved
@@ -570,7 +570,7 @@ fn trivialarith_declines_distinct_unrelated_inputs() {
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     fd.op_insert(op, bl, None);
-    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd), 0);
+    assert_eq!(RuleTrivialArith.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
 }
 
@@ -590,7 +590,7 @@ fn trivialbool_and_true_is_copy_of_v() {
     fd.op_set_input(op, t, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(in_of(&fd, op, 0), Some(v));
 }
@@ -607,7 +607,7 @@ fn trivialbool_and_false_is_copy_false() {
     fd.op_set_input(op, f, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     let z = in_of(&fd, op, 0).unwrap();
     assert!(is_const(&fd, z));
@@ -626,7 +626,7 @@ fn trivialbool_xor_true_is_negate() {
     fd.op_set_input(op, t, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_BOOL_NEGATE);
     assert_eq!(in_of(&fd, op, 0), Some(v));
 }
@@ -641,7 +641,7 @@ fn trivialbool_declines_non_constant_second() {
     fd.op_set_input(op, v, 0).unwrap();
     fd.op_set_input(op, w, 1).unwrap();
     fd.op_insert(op, bl, None);
-    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd), 0);
+    assert_eq!(RuleTrivialBool.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -660,7 +660,7 @@ fn slesstoless_nonnegative_constants_convert() {
     fd.op_set_input(op, b, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
 }
 
@@ -675,7 +675,7 @@ fn slessequal_nonnegative_constants_convert() {
     fd.op_set_input(op, b, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESSEQUAL);
 }
 
@@ -690,7 +690,7 @@ fn slesstoless_declines_when_signbit_possible() {
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     fd.op_insert(op, bl, None);
-    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd), 0);
+    assert_eq!(RuleSlessToLess.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESS);
 }
 
@@ -708,7 +708,7 @@ fn andzext_sext_with_full_low_mask_becomes_zext() {
     let mask = mk_const(&mut fd, 4, 0xffff); // calc_mask(2)
     let (_anded, andop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[sext_out, mask]);
 
-    assert_eq!(RuleAndZext.apply_op(andop, &mut fd), 1);
+    assert_eq!(RuleAndZext.apply_op(andop, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, andop), OpCode::CPUI_INT_ZEXT);
     assert_eq!(fd.obank().get(andop).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, andop, 0), Some(x)); // rootvn becomes the sole input
@@ -723,7 +723,7 @@ fn andzext_declines_wrong_mask() {
     let (sext_out, _s) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_INT_SEXT, &[x]);
     let mask = mk_const(&mut fd, 4, 0x7fff); // != 0xffff
     let (_anded, andop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_AND, &[sext_out, mask]);
-    assert_eq!(RuleAndZext.apply_op(andop, &mut fd), 0);
+    assert_eq!(RuleAndZext.apply_op(andop, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, andop), OpCode::CPUI_INT_AND);
 }
 
@@ -744,7 +744,7 @@ fn lessequal_less_or_equal_to_lessequal() {
     fd.op_set_input(or, eq_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleLessEqual.apply_op(or, &mut fd), 1);
+    assert_eq!(RuleLessEqual.apply_op(or, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_INT_LESSEQUAL);
     assert_eq!(in_of(&fd, or, 0), Some(v));
     assert_eq!(in_of(&fd, or, 1), Some(w));
@@ -763,7 +763,7 @@ fn lessequal_less_or_notequal_is_copy_of_notequal() {
     fd.op_set_input(or, ne_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleLessEqual.apply_op(or, &mut fd), 1);
+    assert_eq!(RuleLessEqual.apply_op(or, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(or).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, or, 0), Some(ne_out)); // takes the NOTEQUAL output
@@ -782,7 +782,7 @@ fn lessequal_declines_when_comparands_differ() {
     fd.op_set_input(or, less_out, 0).unwrap();
     fd.op_set_input(or, eq_out, 1).unwrap();
     fd.op_insert(or, bl, None);
-    assert_eq!(RuleLessEqual.apply_op(or, &mut fd), 0);
+    assert_eq!(RuleLessEqual.apply_op(or, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -802,7 +802,7 @@ fn lessnotequal_combines_to_less() {
     fd.op_set_input(and, ne_out, 1).unwrap();
     fd.op_insert(and, bl, None);
 
-    assert_eq!(RuleLessNotEqual.apply_op(and, &mut fd), 1);
+    assert_eq!(RuleLessNotEqual.apply_op(and, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_LESS);
     assert_eq!(in_of(&fd, and, 0), Some(v));
     assert_eq!(in_of(&fd, and, 1), Some(w));
@@ -821,7 +821,7 @@ fn lessnotequal_signed_variant() {
     fd.op_set_input(and, ne_out, 1).unwrap();
     fd.op_insert(and, bl, None);
 
-    assert_eq!(RuleLessNotEqual.apply_op(and, &mut fd), 1);
+    assert_eq!(RuleLessNotEqual.apply_op(and, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, and), OpCode::CPUI_INT_SLESS);
 }
 
@@ -842,7 +842,7 @@ fn zexteliminate_drops_extension_in_equal() {
     fd.op_set_input(eq, c, 1).unwrap();
     fd.op_insert(eq, bl, None);
 
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 1);
+    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, eq), OpCode::CPUI_INT_EQUAL); // opcode unchanged
     assert_eq!(in_of(&fd, eq, 0), Some(x)); // zext input promoted
     let nc = in_of(&fd, eq, 1).unwrap();
@@ -863,7 +863,7 @@ fn zexteliminate_declines_when_constant_too_large() {
     fd.op_set_input(eq, zext_out, 0).unwrap();
     fd.op_set_input(eq, c, 1).unwrap();
     fd.op_insert(eq, bl, None);
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 0);
+    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -881,7 +881,7 @@ fn concatshift_exact_cancellation_to_zext() {
     let sa = mk_const(&mut fd, 4, 16);
     let (_shifted, shop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_RIGHT, &[cat_out, sa]);
 
-    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd), 1);
+    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, shop), OpCode::CPUI_INT_ZEXT);
     assert_eq!(fd.obank().get(shop).unwrap().num_input(), 1);
     assert_eq!(in_of(&fd, shop, 0), Some(hi)); // most significant part extended
@@ -898,7 +898,7 @@ fn concatshift_partial_inserts_extension_op() {
     let sa = mk_const(&mut fd, 4, 24);
     let (_shifted, shop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_RIGHT, &[cat_out, sa]);
 
-    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd), 1);
+    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd).unwrap(), 1);
     // Op stays an INT_RIGHT; slot 0 now reads a freshly created ZEXT output,
     // slot 1 is the reduced shift amount 8.
     assert_eq!(code_of(&fd, shop), OpCode::CPUI_INT_RIGHT);
@@ -920,7 +920,7 @@ fn concatshift_declines_shift_within_low_part() {
     let (cat_out, _c) = mk_written(&mut fd, bl, 0x10, 4, OpCode::CPUI_PIECE, &[hi, lo]);
     let sa = mk_const(&mut fd, 4, 8);
     let (_shifted, shop) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_RIGHT, &[cat_out, sa]);
-    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd), 0);
+    assert_eq!(RuleConcatShift.apply_op(shop, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, shop), OpCode::CPUI_INT_RIGHT);
 }
 
@@ -941,7 +941,7 @@ fn zextsless_drops_extension() {
     fd.op_set_input(op, c, 1).unwrap();
     fd.op_insert(op, bl, None);
 
-    assert_eq!(RuleZextSless.apply_op(op, &mut fd), 1);
+    assert_eq!(RuleZextSless.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
     assert_eq!(in_of(&fd, op, 0), Some(x));
     let nc = in_of(&fd, op, 1).unwrap();
@@ -960,7 +960,7 @@ fn zextsless_declines_when_signbit_of_small_set() {
     fd.op_set_input(op, zext_out, 0).unwrap();
     fd.op_set_input(op, c, 1).unwrap();
     fd.op_insert(op, bl, None);
-    assert_eq!(RuleZextSless.apply_op(op, &mut fd), 0);
+    assert_eq!(RuleZextSless.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -978,7 +978,7 @@ fn doublearithshift_adds_amounts() {
     let d = mk_const(&mut fd, 4, 3);
     let (_o, outer) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[inner_out, d]);
 
-    assert_eq!(RuleDoubleArithShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleArithShift.apply_op(outer, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_INT_SRIGHT);
     assert_eq!(in_of(&fd, outer, 0), Some(x));
     let sa = in_of(&fd, outer, 1).unwrap();
@@ -996,7 +996,7 @@ fn doublearithshift_saturates() {
     let d = mk_const(&mut fd, 4, 20);
     let (_o, outer) = mk_written(&mut fd, bl, 0x20, 4, OpCode::CPUI_INT_SRIGHT, &[inner_out, d]);
 
-    assert_eq!(RuleDoubleArithShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleArithShift.apply_op(outer, &mut fd).unwrap(), 1);
     let sa = in_of(&fd, outer, 1).unwrap();
     assert_eq!(const_val(&fd, sa), 31); // saturated to size*8 - 1
 }
@@ -1020,7 +1020,7 @@ fn booleanundistribute_matches_shared_clause() {
     fd.op_set_input(ne, and1_out, 1).unwrap();
     fd.op_insert(ne, bl, None);
 
-    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 1);
+    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd).unwrap(), 1);
     // central_equal starts false (NOTEQUAL) and neither clause is BOOL_OR, so
     // combine = BOOL_AND, inner = NOTEQUAL(B, C).  Slot 0 = A, slot 1 = inner.
     assert_eq!(code_of(&fd, ne), OpCode::CPUI_BOOL_AND);
@@ -1049,7 +1049,7 @@ fn booleanundistribute_declines_without_shared_clause() {
     fd.op_set_input(ne, and0_out, 0).unwrap();
     fd.op_set_input(ne, and1_out, 1).unwrap();
     fd.op_insert(ne, bl, None);
-    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 0);
+    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================

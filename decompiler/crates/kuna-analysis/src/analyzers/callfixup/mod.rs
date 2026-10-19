@@ -95,7 +95,7 @@ const LIB_CONFLICT_PREFIX: &str = "libID_conflict_";
 /// which the commit re-resolves the same way the pass matched it).
 pub fn target_fixup_map(arch: &Architecture) -> Vec<(String, String)> {
     let mut map: Vec<(String, String)> = Vec::new();
-    for payload in &arch.pcodeinjectlib.injection {
+    for payload in &arch.pcodeinjectlib.borrow().injection {
         let SleighPayload::Callfixup(cf) = payload else {
             continue;
         };

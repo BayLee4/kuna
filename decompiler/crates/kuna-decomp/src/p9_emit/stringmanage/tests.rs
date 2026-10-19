@@ -379,6 +379,69 @@ impl LoadImage for MockLoad {
     fn adjust_vma(&mut self, _adjust: i64) {}
 }
 
+struct HostStrings {
+    calls: std::cell::Cell<usize>,
+    bytes: std::cell::RefCell<Vec<u8>>,
+    fail_next: std::cell::Cell<bool>,
+}
+
+impl crate::remote_provider::RemoteProviderFetch for HostStrings {
+    fn fetch_string_data(&self, _addr: &Address, _max: int4, _ty: &Datatype)
+        -> KunaResult<(Vec<u8>, bool)>
+    {
+        self.calls.set(self.calls.get() + 1);
+        if self.fail_next.replace(false) {
+            return Err(KunaError::lowlevel("host string failure"));
+        }
+        Ok((self.bytes.borrow().clone(), true))
+    }
+    fn fetch_mapped_symbols(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+    fn fetch_namespace_path(&self, _: u64, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+    fn fetch_external_ref(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+    fn fetch_tracked_registers(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+    fn fetch_comments(&self, _: &Address, _: u32, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+}
+
+#[test]
+fn host_utf8_refusal_identity_flush_and_errors() {
+    let manager = build_manager();
+    let addr = Address::new(Rc::clone(manager.get_space_by_name("ram").unwrap()), 0x5000);
+    let host = Rc::new(HostStrings {
+        calls: std::cell::Cell::new(0),
+        bytes: std::cell::RefCell::new(b"translated \xc3\xa9\0".to_vec()),
+        fail_next: std::cell::Cell::new(false),
+    });
+    let mut strings = StringManagerUnicode::new(64);
+    strings.set_remote_fetch(Some(host.clone()));
+    let mut loader = MockLoad { base: 0x5000, bytes: b"raw\0".to_vec(), mapped_len: 64 };
+    let mut truncated = false;
+    // Source width two must not cause a second decoding of host UTF-8.
+    let mut ty = chartype(2);
+    assert_eq!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap(),
+        b"translated \xc3\xa9\0");
+    assert!(truncated);
+    assert_eq!(host.calls.get(), 1);
+    host.bytes.borrow_mut().clear();
+    assert!(!strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap().is_empty());
+    assert_eq!(host.calls.get(), 1);
+    // A distinct host type or request limit requires fresh acquisition.
+    ty.id = 7;
+    assert!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap().is_empty());
+    assert_eq!(host.calls.get(), 2);
+    strings.base.maximum_chars = 32;
+    assert!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap().is_empty());
+    assert_eq!(host.calls.get(), 3);
+    // Host refusal remains empty even though the loader contains a valid string.
+    assert!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap().is_empty());
+    assert_eq!(host.calls.get(), 3);
+    strings.clear();
+    host.fail_next.set(true);
+    assert!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).is_err());
+    *host.bytes.borrow_mut() = b"edited\0".to_vec();
+    assert_eq!(strings.get_string_data(&addr, &ty, &mut loader, &mut truncated).unwrap(), b"edited\0");
+    assert_eq!(host.calls.get(), 5);
+}
+
 #[test]
 fn get_string_data_terminated_ascii() {
     let mgr = build_manager();
@@ -398,6 +461,7 @@ fn get_string_data_terminated_ascii() {
     let mut is_trunc = true;
     let out = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     assert!(!is_trunc);
     // charsize==1 path copies the raw fetched bytes verbatim, up to and including
@@ -424,6 +488,7 @@ fn get_string_data_caches_second_lookup() {
     let mut is_trunc = false;
     let first = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     // The first 32-byte fetch finds the terminator at byte 2; the charsize==1
     // path copies all `curBufferSize` (32) fetched bytes, so the string + its
@@ -438,6 +503,7 @@ fn get_string_data_caches_second_lookup() {
     };
     let second = sm
         .get_string_data(&addr, &ct, &mut empty_loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     assert_eq!(second, first);
 }
@@ -459,12 +525,15 @@ fn cache_classification_is_scoped_to_character_width() {
         let mut is_trunc = false;
         let first = sm
             .get_string_data(&addr, &chartype(widths[0]), &mut loader, &mut is_trunc)
+            .unwrap()
             .to_vec();
         let second = sm
             .get_string_data(&addr, &chartype(widths[1]), &mut loader, &mut is_trunc)
+            .unwrap()
             .to_vec();
         let third = sm
             .get_string_data(&addr, &chartype(widths[2]), &mut loader, &mut is_trunc)
+            .unwrap()
             .to_vec();
 
         let expected_first: &[u8] = if widths[0] == 1 { b"B\0" } else { b"BM\0" };
@@ -493,8 +562,8 @@ fn cache_classification_is_scoped_to_opaque_mode() {
         let normal = chartype(1);
         let opaque = opaque_chartype(1);
         let types = if opaque_first { [&opaque, &normal] } else { [&normal, &opaque] };
-        let first = sm.get_string_data(&addr, types[0], &mut loader, &mut is_trunc).to_vec();
-        let second = sm.get_string_data(&addr, types[1], &mut loader, &mut is_trunc).to_vec();
+        let first = sm.get_string_data(&addr, types[0], &mut loader, &mut is_trunc).unwrap().to_vec();
+        let second = sm.get_string_data(&addr, types[1], &mut loader, &mut is_trunc).unwrap().to_vec();
 
         let normal_result = if opaque_first { &second } else { &first };
         let opaque_result = if opaque_first { &first } else { &second };
@@ -516,9 +585,9 @@ fn negative_result_at_one_width_does_not_poison_another() {
     };
     let mut is_trunc = false;
 
-    assert!(sm.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc).is_empty());
+    assert!(sm.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc).unwrap().is_empty());
     assert_eq!(
-        &sm.get_string_data(&addr, &chartype(2), &mut loader, &mut is_trunc)[..3],
+        &sm.get_string_data(&addr, &chartype(2), &mut loader, &mut is_trunc).unwrap()[..3],
         &[0xc2, 0x80, 0]
     );
 }
@@ -535,7 +604,7 @@ fn serialized_classification_keeps_its_identity() {
         mapped_len: 64,
     };
     let mut is_trunc = false;
-    sm.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc);
+    sm.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc).unwrap();
 
     let mut buf = Vec::new();
     {
@@ -550,11 +619,11 @@ fn serialized_classification_keeps_its_identity() {
 
     let mut unavailable = MockLoad { base: 0, bytes: Vec::new(), mapped_len: 0 };
     assert_eq!(
-        &restored.get_string_data(&addr, &chartype(1), &mut unavailable, &mut is_trunc)[..2],
+        &restored.get_string_data(&addr, &chartype(1), &mut unavailable, &mut is_trunc).unwrap()[..2],
         b"B\0"
     );
     assert_eq!(
-        &restored.get_string_data(&addr, &chartype(2), &mut loader, &mut is_trunc)[..3],
+        &restored.get_string_data(&addr, &chartype(2), &mut loader, &mut is_trunc).unwrap()[..3],
         b"BM\0"
     );
 }
@@ -588,7 +657,7 @@ fn legacy_serialized_entry_is_not_a_wildcard_cache_hit() {
     let mut is_trunc = false;
 
     assert_eq!(
-        &restored.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc)[..6],
+        &restored.get_string_data(&addr, &chartype(1), &mut loader, &mut is_trunc).unwrap()[..6],
         b"right\0"
     );
 }
@@ -612,6 +681,7 @@ fn get_string_data_unavailable_returns_empty() {
     let mut is_trunc = false;
     let out = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     assert!(out.is_empty());
     assert!(!is_trunc);
@@ -634,6 +704,7 @@ fn get_string_data_opaque_string_returns_empty() {
     let mut is_trunc = true;
     let out = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     assert!(out.is_empty());
     assert!(!is_trunc);

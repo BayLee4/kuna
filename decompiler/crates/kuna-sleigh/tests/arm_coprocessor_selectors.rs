@@ -67,7 +67,7 @@ fn generic_transfers_use_encoded_selectors_and_live_cpu_registers() {
             );
             sleigh.initialize_from_sla(&sla).unwrap();
             let mut names = Vec::new();
-            sleigh.get_user_op_names(&mut names);
+            sleigh.get_user_op_names(&mut names).unwrap();
             sleigh.set_context_default("TMode", 0);
             let control = if endian == "le" {
                 0xee012f10u32.to_le_bytes()

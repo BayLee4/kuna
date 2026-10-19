@@ -187,7 +187,7 @@ fn rust_render(stem: &str) -> Result<String, String> {
         base.early_return = false; // (kuna) C++-parity test: opt out of earlyreturn (DIV-23 default-on)
         base.switch_return = false; // (kuna) also opt out of switchreturn (DIV-25 default-on)
         if let Ok(fd) = decompile_func(base, &sym.name, entry, 0) {
-            out.push_str(&print_c(base, &fd));
+            out.push_str(&print_c(base, &fd).unwrap());
             out.push('\n');
         }
     }

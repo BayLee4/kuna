@@ -108,14 +108,14 @@ impl Rule for RuleBoolNegate {
         Some(Box::new(RuleBoolNegate { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
-        if crate::kuna_floatnegation::fold_guarded_negate(data, op) {
-            return 1;
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        if crate::kuna_floatnegation::fold_guarded_negate(data, op)? {
+            return Ok(1);
         }
         let vn = data.obank().get(op).expect("RuleBoolNegate: stale op").get_in(0).unwrap();
         let v = data.vbank().get(vn).expect("RuleBoolNegate: stale vn");
         if !v.is_written() {
-            return 0;
+            return Ok(0);
         }
         let flip_op = v.get_def().expect("RuleBoolNegate: written vn has no def");
 
@@ -125,7 +125,7 @@ impl Rule for RuleBoolNegate {
             if data.obank().get(decop).expect("RuleBoolNegate: stale descend op").code()
                 != OpCode::CPUI_BOOL_NEGATE
             {
-                return 0;
+                return Ok(0);
             }
         }
 
@@ -133,7 +133,7 @@ impl Rule for RuleBoolNegate {
         let flip_code = data.obank().get(flip_op).expect("RuleBoolNegate: stale flip_op").code();
         let opc = get_booleanflip(flip_code, &mut flipyes);
         if opc == OpCode::CPUI_MAX {
-            return 0;
+            return Ok(0);
         }
         // Set the negated opcode
         data.op_set_opcode(flip_op, type_op_lookup(opc));
@@ -144,7 +144,7 @@ impl Rule for RuleBoolNegate {
         for &decop in &descend {
             data.op_set_opcode(decop, type_op_lookup(OpCode::CPUI_COPY));
         }
-        1
+        Ok(1)
     }
 }
 
@@ -182,7 +182,7 @@ impl Rule for RuleLess2Zero {
         Some(Box::new(RuleLess2Zero { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("RuleLess2Zero: stale op");
         let lvn = o.get_in(0).unwrap();
         let rvn = o.get_in(1).unwrap();
@@ -193,7 +193,7 @@ impl Rule for RuleLess2Zero {
             if l.get_offset() == 0 {
                 // ->  NOT_EQUAL
                 data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_INT_NOTEQUAL));
-                return 1;
+                return Ok(1);
             }
             else if l.get_offset() == calc_mask(l.get_size()) {
                 // Always false
@@ -201,7 +201,7 @@ impl Rule for RuleLess2Zero {
                 data.op_remove_input(op, 1);
                 let c = data.new_constant(1, 0);
                 data.op_set_input(op, c, 0).expect("RuleLess2Zero: opSetInput");
-                return 1;
+                return Ok(1);
             }
         } else if r.is_constant() {
             if r.get_offset() == 0 {
@@ -210,15 +210,15 @@ impl Rule for RuleLess2Zero {
                 data.op_remove_input(op, 1);
                 let c = data.new_constant(1, 0);
                 data.op_set_input(op, c, 0).expect("RuleLess2Zero: opSetInput");
-                return 1;
+                return Ok(1);
             }
             // -> NOT_EQUAL
             else if r.get_offset() == calc_mask(r.get_size()) {
                 data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_INT_NOTEQUAL));
-                return 1;
+                return Ok(1);
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -257,7 +257,7 @@ impl Rule for RuleLessEqual2Zero {
         Some(Box::new(RuleLessEqual2Zero { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("RuleLessEqual2Zero: stale op");
         let lvn = o.get_in(0).unwrap();
         let rvn = o.get_in(1).unwrap();
@@ -271,27 +271,27 @@ impl Rule for RuleLessEqual2Zero {
                 data.op_remove_input(op, 1);
                 let c = data.new_constant(1, 1);
                 data.op_set_input(op, c, 0).expect("RuleLessEqual2Zero: opSetInput");
-                return 1;
+                return Ok(1);
             } else if l.get_offset() == calc_mask(l.get_size()) {
                 // No value is true except -1
                 data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_INT_EQUAL));
-                return 1;
+                return Ok(1);
             }
         } else if r.is_constant() {
             if r.get_offset() == 0 {
                 // No value is true except 0
                 data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_INT_EQUAL));
-                return 1;
+                return Ok(1);
             } else if r.get_offset() == calc_mask(r.get_size()) {
                 // All values => true
                 data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_COPY));
                 data.op_remove_input(op, 1);
                 let c = data.new_constant(1, 1);
                 data.op_set_input(op, c, 0).expect("RuleLessEqual2Zero: opSetInput");
-                return 1;
+                return Ok(1);
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -364,7 +364,7 @@ impl Rule for RuleSLess2Zero {
         Some(Box::new(RuleSLess2Zero { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("RuleSLess2Zero: stale op");
         let lvn = o.get_in(0).unwrap();
         let rvn = o.get_in(1).unwrap();
@@ -379,7 +379,7 @@ impl Rule for RuleSLess2Zero {
 
         if lvn_is_constant {
             if !data.vbank().get(rvn).unwrap().is_written() {
-                return 0;
+                return Ok(0);
             }
             // -1 s< rvn
             if lvn_off == calc_mask(lvn_size) {
@@ -401,12 +401,12 @@ impl Rule for RuleSLess2Zero {
                     let sz = data.vbank().get(hibit).unwrap().get_size();
                     let c = data.new_constant(sz, 0);
                     data.op_set_input(op, c, 0).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 } else if feed_opcode == OpCode::CPUI_SUBPIECE {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() || av.get_size() > 8 {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     let in1 = data.obank().get(feed_op).unwrap().get_in(1).unwrap();
@@ -416,26 +416,26 @@ impl Rule for RuleSLess2Zero {
                         data.op_set_input(op, avn, 1).expect("sless2zero: setInput");
                         let c = data.new_constant(avn_size, calc_mask(avn_size));
                         data.op_set_input(op, c, 0).expect("sless2zero: setInput");
-                        return 1;
+                        return Ok(1);
                     }
                 } else if feed_opcode == OpCode::CPUI_INT_NEGATE {
                     // We have -1 s< ~avn
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     data.op_set_input(op, avn, 0).expect("sless2zero: setInput");
                     let c = data.new_constant(avn_size, 0);
                     data.op_set_input(op, c, 1).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 } else if feed_opcode == OpCode::CPUI_INT_AND {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     if data.vbank().get(avn).unwrap().is_free()
                         || data.lone_descend(rvn).is_none()
                     {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = data.vbank().get(avn).unwrap().get_size();
                     let mask_vn = data.obank().get(feed_op).unwrap().get_in(1).unwrap();
@@ -445,7 +445,7 @@ impl Rule for RuleSLess2Zero {
                         // -1 s< avn & 0x8...
                         if (mask & 1) != 0 {
                             data.op_set_input(op, avn, 1).expect("sless2zero: setInput");
-                            return 1;
+                            return Ok(1);
                         }
                     }
                 } else if feed_opcode == OpCode::CPUI_PIECE {
@@ -453,38 +453,38 @@ impl Rule for RuleSLess2Zero {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap(); // most significant
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     data.op_set_input(op, avn, 1).expect("sless2zero: setInput");
                     let c = data.new_constant(avn_size, calc_mask(avn_size));
                     data.op_set_input(op, c, 0).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 } else if feed_opcode == OpCode::CPUI_INT_LEFT {
                     let coeff = data.obank().get(feed_op).unwrap().get_in(1).unwrap();
                     let cf = data.vbank().get(coeff).unwrap();
                     if !cf.is_constant() || cf.get_offset() != (lvn_size as u64) * 8 - 1 {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     let av = data.vbank().get(avn).unwrap();
                     if !av.is_written() {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_def = av.get_def().unwrap();
                     if !data.obank().get(avn_def).unwrap().is_bool_output() {
-                        return 0;
+                        return Ok(0);
                     }
                     // We have -1 s< (bool << #8*sz-1)
                     data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_BOOL_NEGATE));
                     data.op_remove_input(op, 1);
                     data.op_set_input(op, avn, 0).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 }
             }
         } else if rvn_is_constant {
             if !data.vbank().get(lvn).unwrap().is_written() {
-                return 0;
+                return Ok(0);
             }
             // ... s< 0
             if rvn_off == 0 {
@@ -503,12 +503,12 @@ impl Rule for RuleSLess2Zero {
                         data.op_set_input(op, hibit, 0).expect("sless2zero: setInput");
                     }
                     data.op_set_opcode(op, type_op_lookup(OpCode::CPUI_INT_NOTEQUAL));
-                    return 1;
+                    return Ok(1);
                 } else if feed_opcode == OpCode::CPUI_SUBPIECE {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() || av.get_size() > 8 {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     let in1 = data.obank().get(feed_op).unwrap().get_in(1).unwrap();
@@ -518,26 +518,26 @@ impl Rule for RuleSLess2Zero {
                         data.op_set_input(op, avn, 0).expect("sless2zero: setInput");
                         let c = data.new_constant(avn_size, 0);
                         data.op_set_input(op, c, 1).expect("sless2zero: setInput");
-                        return 1;
+                        return Ok(1);
                     }
                 } else if feed_opcode == OpCode::CPUI_INT_NEGATE {
                     // We have ~avn s< 0
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     data.op_set_input(op, avn, 1).expect("sless2zero: setInput");
                     let c = data.new_constant(avn_size, calc_mask(avn_size));
                     data.op_set_input(op, c, 0).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 } else if feed_opcode == OpCode::CPUI_INT_AND {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap();
                     if data.vbank().get(avn).unwrap().is_free()
                         || data.lone_descend(lvn).is_none()
                     {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = data.vbank().get(avn).unwrap().get_size();
                     let mask_vn = data.obank().get(feed_op).unwrap().get_in(1).unwrap();
@@ -547,7 +547,7 @@ impl Rule for RuleSLess2Zero {
                         // avn & 0x8... s< 0
                         if (mask & 1) != 0 {
                             data.op_set_input(op, avn, 0).expect("sless2zero: setInput");
-                            return 1;
+                            return Ok(1);
                         }
                     }
                 } else if feed_opcode == OpCode::CPUI_PIECE {
@@ -555,17 +555,17 @@ impl Rule for RuleSLess2Zero {
                     let avn = data.obank().get(feed_op).unwrap().get_in(0).unwrap(); // most significant
                     let av = data.vbank().get(avn).unwrap();
                     if av.is_free() {
-                        return 0;
+                        return Ok(0);
                     }
                     let avn_size = av.get_size();
                     data.op_set_input(op, avn, 0).expect("sless2zero: setInput");
                     let c = data.new_constant(avn_size, 0);
                     data.op_set_input(op, c, 1).expect("sless2zero: setInput");
-                    return 1;
+                    return Ok(1);
                 }
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -600,7 +600,7 @@ impl Rule for RuleEqual2Zero {
         Some(Box::new(RuleEqual2Zero { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("RuleEqual2Zero: stale op");
         let in0 = o.get_in(0).unwrap();
         let in1 = o.get_in(1).unwrap();
@@ -610,7 +610,7 @@ impl Rule for RuleEqual2Zero {
         } else {
             let v1 = data.vbank().get(in1).unwrap();
             if !v1.is_constant() || v1.get_offset() != 0 {
-                return 0;
+                return Ok(0);
             }
             in0
         };
@@ -624,16 +624,16 @@ impl Rule for RuleEqual2Zero {
                 .expect("RuleEqual2Zero: stale descend op")
                 .is_bool_output()
             {
-                return 0;
+                return Ok(0);
             }
         }
         let av = data.vbank().get(addvn).unwrap();
         let addop = match av.get_def() {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         if data.obank().get(addop).unwrap().code() != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         let addop_o = data.obank().get(addop).unwrap();
         let vn = addop_o.get_in(0).unwrap();
@@ -647,7 +647,7 @@ impl Rule for RuleEqual2Zero {
             let vn2_off = v2.get_offset();
             let space = Rc::clone(v2.get_space());
             let val = Address::new(space, uintb_negate(vn2_off.wrapping_sub(1), vn2_size));
-            let uvn = data.new_varnode(vn2_size, &val, None);
+            let uvn = data.new_varnode(vn2_size, &val, None)?;
             // STUB(W4): equate-symbol markup
             //   propagation (Varnode::copySymbolIfValid). The W3 IR carries no
             //   symbol entries (mapentry always null), so this is a no-op now.
@@ -673,32 +673,32 @@ impl Rule for RuleEqual2Zero {
                     posvn = vn;
                 } else {
                     // else return 0;
-                    return 0;
+                    return Ok(0);
                 }
             }
             let negdef = data.vbank().get(negvn).unwrap().get_def().unwrap();
             let neg_in1 = data.obank().get(negdef).unwrap().get_in(1).unwrap();
             let neg_in1_v = data.vbank().get(neg_in1).unwrap();
             if !neg_in1_v.is_constant() {
-                return 0;
+                return Ok(0);
             }
             let neg_in0 = data.obank().get(negdef).unwrap().get_in(0).unwrap();
             let multiplier = data.vbank().get(neg_in1).unwrap().get_offset();
             let unneg_size = data.vbank().get(neg_in0).unwrap().get_size();
             if multiplier != calc_mask(unneg_size) {
-                return 0;
+                return Ok(0);
             }
             unnegvn = neg_in0;
         }
         if !data.vbank().get(posvn).unwrap().is_heritage_known() {
-            return 0;
+            return Ok(0);
         }
         if !data.vbank().get(unnegvn).unwrap().is_heritage_known() {
-            return 0;
+            return Ok(0);
         }
         data.op_set_input(op, posvn, 0).expect("RuleEqual2Zero: opSetInput");
         data.op_set_input(op, unnegvn, 1).expect("RuleEqual2Zero: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -736,19 +736,19 @@ impl Rule for RuleEqual2Constant {
         Some(Box::new(RuleEqual2Constant { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("RuleEqual2Constant: stale op");
         let cvn = o.get_in(1).unwrap();
         let lhs = o.get_in(0).unwrap();
         let cv = data.vbank().get(cvn).unwrap();
         if !cv.is_constant() {
-            return 0;
+            return Ok(0);
         }
         let cvn_off = cv.get_offset();
         let cvn_size = cv.get_size();
         let lv = data.vbank().get(lhs).unwrap();
         if !lv.is_written() {
-            return 0;
+            return Ok(0);
         }
         let lhs_size = lv.get_size();
         let leftop = lv.get_def().unwrap();
@@ -759,32 +759,32 @@ impl Rule for RuleEqual2Constant {
             let otherconst = data.obank().get(leftop).unwrap().get_in(1).unwrap();
             let oc = data.vbank().get(otherconst).unwrap();
             if !oc.is_constant() {
-                return 0;
+                return Ok(0);
             }
             newconst = cvn_off.wrapping_sub(oc.get_offset()) & calc_mask(cvn_size);
         } else if opc == OpCode::CPUI_INT_MULT {
             let otherconst = data.obank().get(leftop).unwrap().get_in(1).unwrap();
             let oc = data.vbank().get(otherconst).unwrap();
             if !oc.is_constant() {
-                return 0;
+                return Ok(0);
             }
             let oc_size = oc.get_size();
             // The only multiply we transform is multiply by -1
             if oc.get_offset() != calc_mask(oc_size) {
-                return 0;
+                return Ok(0);
             }
             newconst = cvn_off.wrapping_neg() & calc_mask(oc_size);
         } else if opc == OpCode::CPUI_INT_NEGATE {
             newconst = (!cvn_off) & calc_mask(lhs_size);
         } else {
             // else return 0;
-            return 0;
+            return Ok(0);
         }
 
         let a = data.obank().get(leftop).unwrap().get_in(0).unwrap();
         let a_size = data.vbank().get(a).unwrap().get_size();
         if data.vbank().get(a).unwrap().is_free() {
-            return 0;
+            return Ok(0);
         }
 
         // Make sure the transformed form of a is only used in comparisons of similar form
@@ -795,18 +795,18 @@ impl Rule for RuleEqual2Constant {
             }
             let dcode = data.obank().get(dop).unwrap().code();
             if dcode != OpCode::CPUI_INT_EQUAL && dcode != OpCode::CPUI_INT_NOTEQUAL {
-                return 0;
+                return Ok(0);
             }
             let dop_in1 = data.obank().get(dop).unwrap().get_in(1).unwrap();
             if !data.vbank().get(dop_in1).unwrap().is_constant() {
-                return 0;
+                return Ok(0);
             }
         }
 
         data.op_set_input(op, a, 0).expect("RuleEqual2Constant: opSetInput");
         let c = data.new_constant(a_size, newconst);
         data.op_set_input(op, c, 1).expect("RuleEqual2Constant: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -848,9 +848,9 @@ impl Rule for RulePtrArith {
         Some(Box::new(RulePtrArith { group: self.group }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         let num_input = data.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
         let mut slot = num_input;
@@ -860,56 +860,56 @@ impl Rule for RulePtrArith {
                 None => continue,
             };
             // Resolve union/relptr in-flow.
-            let meta = data.vn_type_read_facing(invn, op).get_metatype();
+            let meta = data.vn_type_read_facing(invn, op)?.get_metatype();
             if meta == crate::dtype::type_metatype::TYPE_PTR {
                 slot = s;
                 break;
             }
         }
         if slot == num_input {
-            return 0;
+            return Ok(0);
         }
-        if evaluate_pointer_expression(data, op, slot) != 2 {
-            return 0;
+        if evaluate_pointer_expression(data, op, slot)? != 2 {
+            return Ok(0);
         }
-        if !verify_preferred_pointer(data, op, slot) {
-            return 0;
+        if !verify_preferred_pointer(data, op, slot)? {
+            return Ok(0);
         }
-        let mut state = match crate::addtreestate::AddTreeState::new(data, op, slot) {
+        let mut state = match crate::addtreestate::AddTreeState::new(data, op, slot)? {
             Some(s) => s,
-            None => return 0,
+            None => return Ok(0),
         };
-        if state.apply() {
-            return 1;
+        if state.apply()? {
+            return Ok(1);
         }
-        if state.init_alternate_form() && state.apply() {
-            return 1;
+        if state.init_alternate_form() && state.apply()? {
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
 /// C++ `RulePtrArith::evaluatePointerExpression(op, slot)` (ruleaction.cc:6596).
 /// Return command code: 0 = take no action, 1 = push needed, 2 = ready to convert.
-pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4) -> int4 {
+pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4) -> kuna_base::error::KunaResult<int4> {
     let mut res = 1; // Assume we are going to push
     let mut count = 0; // Count descendants
     let ptr_base = match data.obank().get(op).and_then(|o| o.get_in(slot)) {
         Some(v) => v,
-        None => return 0,
+        None => return Ok(0),
     };
     {
         let v = match data.vbank().get(ptr_base) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if v.is_free() && !v.is_constant() {
-            return 0;
+            return Ok(0);
         }
     }
     let other = data.obank().get(op).and_then(|o| o.get_in(1 - slot));
     if let Some(other) = other {
-        if data.vn_type_read_facing(other, op).get_metatype()
+        if data.vn_type_read_facing(other, op)?.get_metatype()
             == crate::dtype::type_metatype::TYPE_PTR
         {
             res = 2;
@@ -917,7 +917,7 @@ pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4)
     }
     let out_vn = match data.obank().get(op).and_then(|o| o.get_out()) {
         Some(v) => v,
-        None => return 0,
+        None => return Ok(0),
     };
     let descend: Vec<OpId> = data
         .vbank()
@@ -932,7 +932,7 @@ pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4)
             let other_vn = data.obank().get(dec_op).and_then(|o| o.get_in(1 - dec_slot));
             let other_vn = match other_vn {
                 Some(v) => v,
-                None => return 0,
+                None => return Ok(0),
             };
             let (is_free, is_const) = data
                 .vbank()
@@ -940,9 +940,9 @@ pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4)
                 .map(|v| (v.is_free(), v.is_constant()))
                 .unwrap_or((true, false));
             if is_free && !is_const {
-                return 0; // data-flow not fully linked
+                return Ok(0); // data-flow not fully linked
             }
-            if data.vn_type_read_facing(other_vn, dec_op).get_metatype()
+            if data.vn_type_read_facing(other_vn, dec_op)?.get_metatype()
                 == crate::dtype::type_metatype::TYPE_PTR
             {
                 res = 2; // Do not push in the presence of other pointers
@@ -963,7 +963,7 @@ pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4)
                 .map(|v| v.is_constant())
                 .unwrap_or(false);
             if ptr_sb && (ptr_input || ptr_const) && other_const {
-                return 0;
+                return Ok(0);
             }
             res = 2;
         } else {
@@ -971,52 +971,52 @@ pub(crate) fn evaluate_pointer_expression(data: &Funcdata, op: OpId, slot: int4)
         }
     }
     if count == 0 {
-        return 0;
+        return Ok(0);
     }
     if count > 1 {
         // For the RESULT to be a spacebase pointer it must have only 1 descendant.
         if data.vbank().get(out_vn).map(|v| v.is_spacebase()).unwrap_or(false) {
-            return 0;
+            return Ok(0);
         }
     }
-    res
+    Ok(res)
 }
 
 /// C++ `RulePtrArith::verifyPreferredPointer(op, slot)` (ruleaction.cc:6568).
-fn verify_preferred_pointer(data: &Funcdata, op: OpId, slot: int4) -> bool {
+fn verify_preferred_pointer(data: &Funcdata, op: OpId, slot: int4) -> kuna_base::error::KunaResult<bool> {
     let vn = match data.obank().get(op).and_then(|o| o.get_in(slot)) {
         Some(v) => v,
-        None => return true,
+        None => return Ok(true),
     };
     if !data.vbank().get(vn).map(|v| v.is_written()).unwrap_or(false) {
-        return true;
+        return Ok(true);
     }
     let pre_op = match data.vbank().get(vn).and_then(|v| v.get_def()) {
         Some(o) => o,
-        None => return true,
+        None => return Ok(true),
     };
     if data.obank().get(pre_op).map(|o| o.code()) != Some(OpCode::CPUI_INT_ADD) {
-        return true;
+        return Ok(true);
     }
     let mut preslot = 0;
     let meta0 = data
         .obank()
         .get(pre_op)
         .and_then(|o| o.get_in(0))
-        .map(|v| data.vn_type_read_facing(v, pre_op).get_metatype());
+        .map(|v| data.vn_type_read_facing(v, pre_op).map(|t| t.get_metatype())).transpose()?;
     if meta0 != Some(crate::dtype::type_metatype::TYPE_PTR) {
         preslot = 1;
         let meta1 = data
             .obank()
             .get(pre_op)
             .and_then(|o| o.get_in(1))
-            .map(|v| data.vn_type_read_facing(v, pre_op).get_metatype());
+            .map(|v| data.vn_type_read_facing(v, pre_op).map(|t| t.get_metatype())).transpose()?;
         if meta1 != Some(crate::dtype::type_metatype::TYPE_PTR) {
-            return true;
+            return Ok(true);
         }
     }
     // Does the earlier varnode look like the base pointer?
-    1 != evaluate_pointer_expression(data, pre_op, preslot)
+    Ok(1 != evaluate_pointer_expression(data, pre_op, preslot)?)
 }
 
 // =============================================================================
@@ -1058,10 +1058,10 @@ impl Rule for RuleStructOffset0 {
     // The nested `if size==movesize { if numElements!=1 {...} }` mirrors the C++
     // array arm verbatim (ruleaction.cc:6769-6773); kept un-collapsed for parity.
     #[allow(clippy::collapsible_if)]
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         use crate::dtype::type_metatype;
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         let code = data.obank().get(op).map(|o| o.code()).unwrap_or(OpCode::CPUI_MAX);
         let movesize = match code {
@@ -1077,48 +1077,48 @@ impl Rule for RuleStructOffset0 {
                 .and_then(|o| o.get_in(2))
                 .and_then(|v| data.vbank().get(v))
                 .map(|v| v.get_size()),
-            _ => return 0,
+            _ => return Ok(0),
         };
         let movesize = match movesize {
             Some(m) => m,
-            None => return 0,
+            None => return Ok(0),
         };
         let ptr_vn = match data.obank().get(op).and_then(|o| o.get_in(1)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         // Resolve union/relptr in-flow.
-        let ct = data.vn_type_read_facing(ptr_vn, op);
+        let ct = data.vn_type_read_facing(ptr_vn, op)?;
         if ct.get_metatype() != type_metatype::TYPE_PTR {
-            return 0;
+            return Ok(0);
         }
         let ptr_size = data.vbank().get(ptr_vn).map(|v| v.get_size()).unwrap_or(0);
         let mut base_type = match ct.get_ptr_to() {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
         // Relative-pointer arm.
         if ct.is_formal_pointer_rel() && ct.evaluate_thru_parent(0) == Some(true) {
             base_type = match ct.get_rel_parent() {
                 Some(b) => b,
-                None => return 0,
+                None => return Ok(0),
             };
             if base_type.get_metatype() != type_metatype::TYPE_STRUCT {
-                return 0;
+                return Ok(0);
             }
             let offset = ct.get_byte_offset().unwrap_or(0) as int8;
             if offset >= base_type.get_size() as int8 {
-                return 0;
+                return Ok(0);
             }
             if (base_type.get_size() as int4) < movesize {
-                return 0; // Moving something bigger than the entire structure
+                return Ok(0); // Moving something bigger than the entire structure
             }
             let (sub_type, newoff) = match base_type.get_sub_type(offset) {
                 Ok((Some(st), no)) => (st, no),
-                _ => return 0,
+                _ => return Ok(0),
             };
             if sub_type.get_size() < movesize {
-                return 0; // Subtype too small for the LOAD/STORE
+                return Ok(0); // Subtype too small for the LOAD/STORE
             }
             let word_size = ct.get_word_size().unwrap_or(1);
             let newoff_addr = AddrSpace::byte_to_address(newoff as u64, word_size);
@@ -1147,32 +1147,32 @@ impl Rule for RuleStructOffset0 {
             } else {
                 let _ = data.op_set_input(op, newop_out, 1);
             }
-            return 1;
+            return Ok(1);
         }
         // Plain-pointer arm: offset = 0.
         let meta = base_type.get_metatype();
         if meta == type_metatype::TYPE_STRUCT {
             if (base_type.get_size() as int4) < movesize {
-                return 0;
+                return Ok(0);
             }
             let sub_type = match base_type.get_sub_type(0) {
                 Ok((Some(st), _)) => st,
-                _ => return 0,
+                _ => return Ok(0),
             };
             if sub_type.get_size() < movesize {
-                return 0; // Subtype too small to handle LOAD/STORE
+                return Ok(0); // Subtype too small to handle LOAD/STORE
             }
         } else if meta == type_metatype::TYPE_ARRAY {
             if (base_type.get_size() as int4) < movesize {
-                return 0;
+                return Ok(0);
             }
             if (base_type.get_size() as int4) == movesize {
                 if base_type.num_elements() != Some(1) {
-                    return 0;
+                    return Ok(0);
                 }
             }
         } else {
-            return 0;
+            return Ok(0);
         }
         let zero = data.new_constant(ptr_size, 0);
         let newop = data.new_op_before(op, OpCode::CPUI_PTRSUB, ptr_vn, zero, None);
@@ -1187,7 +1187,7 @@ impl Rule for RuleStructOffset0 {
             .and_then(|o| o.get_out())
             .expect("RuleStructOffset0: ptrsub out");
         let _ = data.op_set_input(op, newop_out, 1);
-        1
+        Ok(1)
     }
 }
 
@@ -1232,10 +1232,10 @@ impl Rule for RulePushPtr {
     // each pass (C++ `for(;;){ iter=beginDescend(); if(iter==endDescend())break; }`),
     // and have a second early break — a plain `while let` cannot express that.
     #[allow(clippy::while_let_loop)]
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         use crate::dtype::type_metatype;
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         let num_input = data.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
         let mut slot = num_input;
@@ -1245,26 +1245,26 @@ impl Rule for RulePushPtr {
                 Some(v) => v,
                 None => continue,
             };
-            if data.vn_type_read_facing(v, op).get_metatype() == type_metatype::TYPE_PTR {
+            if data.vn_type_read_facing(v, op)?.get_metatype() == type_metatype::TYPE_PTR {
                 slot = s;
                 vni = Some(v);
                 break;
             }
         }
         if slot == num_input {
-            return 0;
+            return Ok(0);
         }
         let vni = vni.expect("RulePushPtr: pointer slot found");
-        if evaluate_pointer_expression(data, op, slot) != 1 {
-            return 0;
+        if evaluate_pointer_expression(data, op, slot)? != 1 {
+            return Ok(0);
         }
         let vn = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let vnadd2 = match data.obank().get(op).and_then(|o| o.get_in(1 - slot)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let mut duplicate_list: Vec<OpId> = Vec::new();
         if data.lone_descend(vn).is_none() {
@@ -1296,17 +1296,17 @@ impl Rule for RulePushPtr {
             data.op_insert_before(newop, decop);
         }
         if !data.vbank().get(vn).map(|v| v.is_auto_live()).unwrap_or(false) {
-            data.op_destroy(op);
+            data.op_destroy(op)?;
         }
         for dop in duplicate_list {
-            duplicate_need(data, dop);
+            duplicate_need(data, dop)?;
         }
-        1
+        Ok(1)
     }
 }
 
 /// C++ `RulePushPtr::buildVarnodeOut(vn, op, data)` (ruleaction.cc:6793).
-fn build_varnode_out(data: &mut Funcdata, vn: VarnodeId, op: OpId) -> VarnodeId {
+fn build_varnode_out(data: &mut Funcdata, vn: VarnodeId, op: OpId) -> kuna_base::error::KunaResult<VarnodeId> {
     use kuna_base::space::spacetype;
     let (addr_tied, is_internal, size, addr) = {
         let v = data.vbank().get(vn).expect("build_varnode_out: stale vn");
@@ -1318,9 +1318,9 @@ fn build_varnode_out(data: &mut Funcdata, vn: VarnodeId, op: OpId) -> VarnodeId 
         )
     };
     if addr_tied || is_internal {
-        data.new_unique_out(size, op).expect("build_varnode_out: unique out")
+        data.new_unique_out(size, op)
     } else {
-        data.new_varnode_out(size, &addr, op).expect("build_varnode_out: varnode out")
+        data.new_varnode_out(size, &addr, op)
     }
 }
 
@@ -1367,14 +1367,14 @@ fn collect_duplicate_needs(data: &Funcdata, reslist: &mut Vec<OpId>, mut vn: Var
 // Re-reads the front of `out_vn`'s descend list the loop body rewires each pass
 // (C++ `do { decOp=*iter; ...; iter=beginDescend(); } while(iter!=endDescend())`).
 #[allow(clippy::while_let_loop)]
-fn duplicate_need(data: &mut Funcdata, op: OpId) {
+fn duplicate_need(data: &mut Funcdata, op: OpId) -> kuna_base::error::KunaResult<()> {
     let out_vn = match data.obank().get(op).and_then(|o| o.get_out()) {
         Some(v) => v,
-        None => return,
+        None => return Ok(()),
     };
     let in_vn = match data.obank().get(op).and_then(|o| o.get_in(0)) {
         Some(v) => v,
-        None => return,
+        None => return Ok(()),
     };
     let num = data.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
     let opc = data.obank().get(op).map(|o| o.code()).unwrap_or(OpCode::CPUI_MAX);
@@ -1388,7 +1388,7 @@ fn duplicate_need(data: &mut Funcdata, op: OpId) {
         };
         let slot = data.obank().get(dec_op).map(|o| o.get_slot(out_vn)).unwrap_or(0);
         let new_op = data.new_op(num, op_addr.clone());
-        let new_out = build_varnode_out(data, out_vn, new_op);
+        let new_out = build_varnode_out(data, out_vn, new_op)?;
         if let Some(ot) = &out_type {
             if let Some(v) = data.vbank_mut().get_mut(new_out) {
                 v.update_type(ot.clone());
@@ -1404,7 +1404,8 @@ fn duplicate_need(data: &mut Funcdata, op: OpId) {
         let _ = data.op_set_input(dec_op, new_out, slot);
         data.op_insert_before(new_op, dec_op);
     }
-    data.op_destroy(op);
+    data.op_destroy(op)?;
+    Ok(())
 }
 
 // =============================================================================

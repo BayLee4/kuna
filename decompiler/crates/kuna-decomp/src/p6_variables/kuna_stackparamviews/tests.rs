@@ -66,7 +66,7 @@ fn early_backing_queries_keep_an_absent_parameter_contract_unknown() {
             &Address::new_invalid(),
         )
         .unwrap();
-    let input = fd.new_varnode(4, &address, None);
+    let input = fd.new_varnode(4, &address, None).unwrap();
     fd.set_input_varnode(input).unwrap();
     fd.set_high_level();
 

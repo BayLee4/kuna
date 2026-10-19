@@ -67,7 +67,7 @@ fn decompile_with(directives: Vec<Directive>) -> String {
     let target = prog
         .resolve_entry(&EntrySelector::Numeric(CHAIN_ENTRY))
         .expect("the fixture has a function at chain_entry");
-    let funcs = decompile_targets(&mut prog, vec![target], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![target], false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     assert_eq!(funcs[0].error, None, "the pipeline aborted:\n{code}");
     code
@@ -154,7 +154,7 @@ fn immediate_ret_transfer_never_registers_the_encrypted_target_as_a_function() {
     let target = prog
         .resolve_entry(&EntrySelector::Numeric(0x0040_2000))
         .expect("the PE entry is a function");
-    let _ = decompile_targets(&mut prog, vec![target], false, false, false);
+    let _ = decompile_targets(&mut prog, vec![target], false, false, false).unwrap();
     assert!(
         prog.function_entries_canonical()
             .iter()

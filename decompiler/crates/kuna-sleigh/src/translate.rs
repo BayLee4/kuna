@@ -476,7 +476,8 @@ pub trait Translate: RegisterLookup {
     /// instructions are all identified by a name and an index.  This method
     /// returns a list of these ops in index order.
     /// \param res is the resulting vector of user op names
-    fn get_user_op_names(&self, res: &mut Vec<String>);
+    /// Enumeration errors are propagated without appending partial names.
+    fn get_user_op_names(&self, res: &mut Vec<String>) -> KunaResult<()>;
 
     /// \brief Get the length of a machine instruction
     ///
@@ -656,25 +657,25 @@ mod tests {
             Err(KunaError::sleigh(format!("Unknown register name: {nm}")))
         }
 
-        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             for (name, offset, sz) in &self.regs {
                 if Rc::ptr_eq(base, &self.space)
                     && *offset <= off
                     && off + u64::from(size as u32) <= *offset + u64::from(*sz)
                 {
-                    return (*name).to_string();
+                    return Ok((*name).to_string());
                 }
             }
-            String::new()
+            Ok(String::new())
         }
 
-        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             for (name, offset, sz) in &self.regs {
                 if Rc::ptr_eq(base, &self.space) && *offset == off && *sz == size as u32 {
-                    return (*name).to_string();
+                    return Ok((*name).to_string());
                 }
             }
-            String::new()
+            Ok(String::new())
         }
     }
 
@@ -1121,14 +1122,49 @@ mod tests {
 
         // mergeSequence: AX-halves merge into the formally-named EAX...
         let mut seq = vec![reg(&manager, 2, 2), reg(&manager, 0, 2)];
-        JoinRecord::merge_sequence(&mut seq, lookup.as_ref());
+        JoinRecord::merge_sequence(&mut seq, lookup.as_ref()).unwrap();
         assert_eq!(seq.len(), 1);
         assert_eq!((seq[0].offset, seq[0].size), (0, 4));
         // ...but an informally-named merge keeps the original sequence
         let mut seq = vec![reg(&manager, 6, 2), reg(&manager, 4, 2)];
         let orig = seq.clone();
-        JoinRecord::merge_sequence(&mut seq, lookup.as_ref());
+        JoinRecord::merge_sequence(&mut seq, lookup.as_ref()).unwrap();
         assert_eq!(seq, orig);
+    }
+
+    #[test]
+    fn join_helpers_preserve_register_query_errors() {
+        struct FailedRegisters;
+
+        impl RegisterLookup for FailedRegisters {
+            fn get_register(&self, _: &str) -> KunaResult<VarnodeStorage> {
+                Err(KunaError::lowlevel("register query refused"))
+            }
+
+            fn get_register_name(&self, _: &Rc<AddrSpace>, _: u64, _: i32) -> KunaResult<String> {
+                Err(KunaError::lowlevel("register query refused"))
+            }
+
+            fn get_exact_register_name(&self, _: &Rc<AddrSpace>, _: u64, _: i32) -> KunaResult<String> {
+                Err(KunaError::lowlevel("exact register query refused"))
+            }
+        }
+
+        let manager = test_manager(false);
+        let register = Rc::clone(manager.get_space_by_name("register").unwrap());
+        let hi = Address::new(Rc::clone(&register), 2);
+        let lo = Address::new(register, 0);
+        assert_eq!(
+            manager.construct_join_address(&FailedRegisters, &hi, 2, &lo, 2).unwrap_err(),
+            KunaError::lowlevel("register query refused")
+        );
+        let mut seq = vec![reg(&manager, 2, 2), reg(&manager, 0, 2)];
+        let original = seq.clone();
+        assert_eq!(
+            JoinRecord::merge_sequence(&mut seq, &FailedRegisters).unwrap_err(),
+            KunaError::lowlevel("exact register query refused")
+        );
+        assert_eq!(seq, original, "failed acquisition must not publish a partial merge");
     }
 
     /// SpacebaseSpace: constructor wiring, base-register attachment with
@@ -1434,10 +1470,10 @@ mod tests {
         fn get_register(&self, nm: &str) -> KunaResult<VarnodeStorage> {
             self.regs.get_register(nm)
         }
-        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             self.regs.get_register_name(base, off, size)
         }
-        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             self.regs.get_exact_register_name(base, off, size)
         }
     }
@@ -1471,8 +1507,9 @@ mod tests {
                 );
             }
         }
-        fn get_user_op_names(&self, res: &mut Vec<String>) {
+        fn get_user_op_names(&self, res: &mut Vec<String>) -> KunaResult<()> {
             res.push("pcodeop_one".to_string());
+            Ok(())
         }
         fn instruction_length(&self, _baseaddr: &Address) -> KunaResult<i32> {
             Ok(4)
@@ -1550,7 +1587,7 @@ mod tests {
         let names: Vec<&str> = regs.values().map(String::as_str).collect();
         assert_eq!(names, ["EAX", "EDX"]);
         let mut userops = Vec::new();
-        dyn_trans.get_user_op_names(&mut userops);
+        dyn_trans.get_user_op_names(&mut userops).unwrap();
         assert_eq!(userops, ["pcodeop_one"]);
 
         let addr = Address::new(Rc::clone(&register), 0);

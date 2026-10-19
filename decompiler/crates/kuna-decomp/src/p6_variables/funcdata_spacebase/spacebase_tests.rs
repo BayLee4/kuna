@@ -58,7 +58,7 @@ pub(crate) fn reg_addr(fd: &Funcdata, off: u64) -> Address {
 }
 
 pub(crate) fn make_sp_in(fd: &mut Funcdata) -> VarnodeId {
-    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None);
+    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }
 
@@ -70,7 +70,7 @@ fn spacebase_marks_input_stack_pointer() {
     // Before: the SP input is not yet a spacebase.
     assert!(!fd.vbank().get(sp_in).unwrap().is_spacebase());
 
-    fd.spacebase();
+    fd.spacebase().unwrap();
 
     // After: Funcdata::spacebase has marked the SP-input Varnode spacebase.
     assert!(
@@ -84,10 +84,10 @@ fn spacebase_leaves_free_varnodes_unmarked() {
     let mut fd = build_fd();
     // A free Varnode at the SP location (not input, not written) must be skipped
     // (C++ `if (vn->isFree()) continue;`).
-    let free_vn = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let free_vn = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     assert!(fd.vbank().get(free_vn).unwrap().is_free());
 
-    fd.spacebase();
+    fd.spacebase().unwrap();
 
     assert!(
         !fd.vbank().get(free_vn).unwrap().is_spacebase(),
@@ -106,7 +106,7 @@ fn annotate_raw_stack_ptr_splices_ptrsub_zero_before_nonadditive_use() {
 
     let mut fd = build_fd();
     let sp_in = make_sp_in(&mut fd);
-    fd.spacebase(); // marks + types the SP input
+    fd.spacebase().unwrap(); // marks + types the SP input
     assert!(fd.start_type_recovery());
 
     // A non-additive, non-special reader of the SP input, inside a basic block
@@ -120,7 +120,7 @@ fn annotate_raw_stack_ptr_splices_ptrsub_zero_before_nonadditive_use() {
     let bl = fd.bblocks_mut().new_block_basic(root);
     let store = fd.new_op(1, reg_addr(&fd, 0x1000));
     fd.op_set_opcode_code(store, OpCode::CPUI_INT_NEGATE);
-    let out = fd.new_varnode(8, &reg_addr(&fd, 0x200), None);
+    let out = fd.new_varnode(8, &reg_addr(&fd, 0x200), None).unwrap();
     fd.op_set_output(store, out).unwrap();
     fd.op_set_input(store, sp_in, 0).unwrap();
     fd.bb_insert_op(store, bl, None);
@@ -152,7 +152,7 @@ fn annotate_raw_stack_ptr_skips_additive_use() {
 
     let mut fd = build_fd();
     let sp_in = make_sp_in(&mut fd);
-    fd.spacebase();
+    fd.spacebase().unwrap();
     assert!(fd.start_type_recovery());
 
     // An INT_ADD off the SP (additive use) — must be left untouched.
@@ -181,7 +181,7 @@ fn apply_type_recommendations_locks_input_varnode_type() {
     // A plain 8-byte input Varnode at a register slot (not the SP, so its initial
     // type is unlocked).
     let in_addr = reg_addr(&fd, 0x80);
-    let in_vn = fd.new_varnode(8, &in_addr, None);
+    let in_vn = fd.new_varnode(8, &in_addr, None).unwrap();
     let in_vn = fd.set_input_varnode(in_vn).unwrap();
     assert!(!fd.vbank().get(in_vn).unwrap().is_type_lock());
 
@@ -229,7 +229,7 @@ fn w10_stacklocal_typing_annotate_raw_stack_ptr_noop_before_type_recovery() {
 
     let mut fd = build_fd();
     let sp_in = make_sp_in(&mut fd);
-    fd.spacebase();
+    fd.spacebase().unwrap();
     // NOTE: deliberately do NOT call start_type_recovery().
     assert!(!fd.has_type_recovery_started());
 
@@ -238,7 +238,7 @@ fn w10_stacklocal_typing_annotate_raw_stack_ptr_noop_before_type_recovery() {
     let store = fd.new_op(3, reg_addr(&fd, 0x1000));
     fd.op_set_opcode_code(store, OpCode::CPUI_STORE);
     let spaceconst = fd.new_constant(8, 0);
-    let value = fd.new_varnode(4, &reg_addr(&fd, 0x100), None);
+    let value = fd.new_varnode(4, &reg_addr(&fd, 0x100), None).unwrap();
     fd.op_set_input(store, spaceconst, 0).unwrap();
     fd.op_set_input(store, sp_in, 1).unwrap();
     fd.op_set_input(store, value, 2).unwrap();
@@ -268,7 +268,7 @@ fn w10_stacklocal_typing_apply_type_recommendations_size_mismatch_no_lock() {
     let mut fd = build_fd();
     // An 8-byte input Varnode at a register slot.
     let in_addr = reg_addr(&fd, 0x80);
-    let in_vn = fd.new_varnode(8, &in_addr, None);
+    let in_vn = fd.new_varnode(8, &in_addr, None).unwrap();
     let in_vn = fd.set_input_varnode(in_vn).unwrap();
     assert!(!fd.vbank().get(in_vn).unwrap().is_type_lock());
 
@@ -301,7 +301,7 @@ fn w10_stacklocal_typing_apply_type_recommendations_unknown_stays_unlocked() {
 
     let mut fd = build_fd();
     let in_addr = reg_addr(&fd, 0x80);
-    let in_vn = fd.new_varnode(4, &in_addr, None);
+    let in_vn = fd.new_varnode(4, &in_addr, None).unwrap();
     let in_vn = fd.set_input_varnode(in_vn).unwrap();
 
     use crate::dtype::TypeFactory as _;

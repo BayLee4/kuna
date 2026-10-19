@@ -119,17 +119,17 @@ pub fn guess_extra_pop(
     entry: &Address,
     call_sp: VarnodeId,
     call_out: VarnodeId,
-) -> int4 {
-    if !is_imported(data, entry) {
-        return RETURN_ADDRESS_ONLY;
+) -> KunaResult<int4> {
+    if !is_imported(data, entry)? {
+        return Ok(RETURN_ADDRESS_ONLY);
     }
     let (base, delta) = match decompose(data, spacebase, call_sp) {
         Some(bd) => bd,
-        None => return RETURN_ADDRESS_ONLY,
+        None => return Ok(RETURN_ADDRESS_ONLY),
     };
     let step = match data.vbank().get(call_sp).map(|v| v.get_size()) {
         Some(s) if s > 0 => s,
-        _ => return RETURN_ADDRESS_ONLY,
+        _ => return Ok(RETURN_ADDRESS_ONLY),
     };
     // Count the argument pushes back from the return-address slot.  `delta` is
     // measured against whatever base the additive normalization settled on, so
@@ -152,9 +152,9 @@ pub fn guess_extra_pop(
     // mid-function `pop reg` also raises the stack pointer, and restoring one
     // saved register does not account for a multi-argument run.
     if bytes > 0 && caller_cleans_up(data, spacebase, call_out, bytes) {
-        return RETURN_ADDRESS_ONLY;
+        return Ok(RETURN_ADDRESS_ONLY);
     }
-    RETURN_ADDRESS_ONLY + bytes
+    Ok(RETURN_ADDRESS_ONLY + bytes)
 }
 
 /// Is the callee an imported function?
@@ -166,15 +166,15 @@ pub fn guess_extra_pop(
 /// imports were never marked up (a raw `.text` blob, or `peimportcall` off) has
 /// no imported callees by this test, which leaves the whole function at
 /// upstream's answer.
-pub(crate) fn is_imported(data: &Funcdata, entry: &Address) -> bool {
+pub(crate) fn is_imported(data: &Funcdata, entry: &Address) -> KunaResult<bool> {
     // A call whose target was never resolved carries the invalid Address, whose
     // space pointer is the sentinel — the property query would dereference it.
     let size = match entry.get_space() {
         Some(s) => s.get_addr_size() as int4,
-        None => return false,
+        None => return Ok(false),
     };
-    let props = data.get_arch().query_global_properties(entry, size, entry);
-    (props & crate::varnode::varnode_flags::externref) != 0
+    let props = data.get_arch().query_global_properties(entry, size, entry)?;
+    Ok((props & crate::varnode::varnode_flags::externref) != 0)
 }
 
 /// Did the *caller* raise the stack pointer past the argument run after the

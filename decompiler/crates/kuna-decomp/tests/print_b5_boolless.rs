@@ -206,7 +206,7 @@ fn render_vn(arch: &Architecture, fd: &Funcdata, vn: kuna_decomp::context::Varno
         Some(s) => s,
         None => return "<nospace>".to_string(),
     };
-    let regname = trans.get_register_name(spc, loc.get_offset(), size);
+    let regname = trans.get_register_name(spc, loc.get_offset(), size).unwrap();
     let mut tok = if !regname.is_empty() {
         regname
     } else {
@@ -309,7 +309,7 @@ fn zz_dump_boolless_cfg() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     eprintln!("=== RUST print C ===\n{rust}");
 }
 
@@ -341,7 +341,7 @@ fn boolless_print_c_emits_structured_body() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
 
     eprintln!("\n=== RUST print C (boolless) ===\n{rust}");
     eprintln!("=== C++ B5 oracle ===\n{CPP_B5_ORACLE}");
@@ -442,7 +442,7 @@ fn w10_boolless_lessequal_comes_from_real_ir_not_printer() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     eprintln!("=== RUST print C (boolless) ===\n{rust}");
     // The printer renders that IR as the oracle's `dat_52 <= 10`.
     assert!(
@@ -469,7 +469,7 @@ fn w10_boolless_positive_datatest_assertion_now_real() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     // The datatest's min=1 positive assertion `if (dat_52 <= 10)` is now MET.
     assert!(
         rust.contains("if (dat_52 <= 10)"),
@@ -500,7 +500,7 @@ fn w10_boolless_full_byte_parity_modulo_type_inference() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
 
     // The merge/naming/output-storage layer is real: a named `v1` local, the
     // `v1 = dat_52;` trim COPY, the `uint1 v1; // acc` decl, and `return v1`.
@@ -548,7 +548,7 @@ fn w10_boolless_if_body_contains_assignment() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
 
     // The if introduces a brace; the assignment (`= 1`) sits between that open
     // brace and its matching close brace (real nesting, not a flat list).
@@ -645,7 +645,7 @@ fn w10_merge_trim_copy_is_real_ir_artifact() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     assert!(rust.contains("v1 = dat_52;"), "trim COPY must render as `v1 = dat_52;`, got:\n{rust}");
 }
 
@@ -703,7 +703,7 @@ fn w10_merged_high_has_multiple_instances_and_acc_storage() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     assert!(has_decl_source(&rust, "v1", "acc"), "storage comment must include the ACC reg name lowercased, got:\n{rust}");
 }
 
@@ -732,7 +732,7 @@ fn w10_naming_conditional_other_function_gets_no_vn_name() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
 
     // CRITICAL anti-hardcode: NO boolless-specific string may leak across
     // functions — condconst recovers its own storage, never boolless's.  These
@@ -876,7 +876,7 @@ fn verify_w10_infertypes_is_settled_fixpoint_refining_the_seed() {
 
     // The pipeline already ran ActionInferTypes to fixpoint; one more engine
     // pass over the settled types must report no change (writeBack -> false).
-    let _ = run_infer_types(&mut fd);
+    let _ = run_infer_types(&mut fd).unwrap();
 
     let after: Vec<(type_metatype, i32)> = fd
         .vbank()
@@ -938,7 +938,7 @@ fn verify_w10_infertypes_no_uint1_acc_leak_into_condconst() {
     // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    let rust = print_c(arch, &fd);
+    let rust = print_c(arch, &fd).unwrap();
     // The boolless ACC artifact (a `uint1 vN; // acc` decl) must not appear.
     assert!(
         !rust.contains("uint1 v") || !has_source(&rust, "acc"),

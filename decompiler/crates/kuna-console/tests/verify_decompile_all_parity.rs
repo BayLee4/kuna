@@ -78,7 +78,7 @@ fn whole_binary_main(arch: &str, formatstring_on: bool) -> String {
         /* no_vars= */ true,
         false,
         false,
-    );
+    ).unwrap();
     assert_eq!(out.len(), 1, "[{arch}] one target in, one result out");
     out[0].code.clone().unwrap_or_else(|| {
         panic!("[{arch}] main failed to decompile: {:?}", out[0].error)
@@ -94,7 +94,7 @@ fn provenance_collection_preserves_the_plain_code_bytes() {
         .into_iter()
         .find(|e| e.name == "main")
         .expect("the fixture exports main");
-    let out = decompile_targets(&mut prog, vec![entry], true, false, true);
+    let out = decompile_targets(&mut prog, vec![entry], true, false, true).unwrap();
     let result = &out[0];
 
     assert_eq!(result.code.as_deref(), Some(plain.as_str()));

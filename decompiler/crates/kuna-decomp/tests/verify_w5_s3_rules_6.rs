@@ -101,7 +101,7 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -343,7 +343,7 @@ fn w5s3r6_sub_normal_boundary_equal_collapses_not_extension() {
     set_in(&mut fd, sub, c, 1);
     let _o = give_output(&mut fd, sub, 0x30, 4);
 
-    assert_eq!(rule.apply_op(sub, &mut fd), 1, "n folds to 0 -> commit");
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 1, "n folds to 0 -> commit");
     assert_eq!(fd.obank().get(sub).unwrap().get_in(0), Some(a), "op now reads a directly");
     let new_c = fd.obank().get(sub).unwrap().get_in(1).unwrap();
     assert!(fd.vbank().get(new_c).unwrap().is_constant());
@@ -403,7 +403,7 @@ fn w5s3r6_sub_normal_shrink_k_then_commits() {
     // The new-op/newUniqueOut commit is now wired: shrink-k folds to `c += k`
     // (= 4), `n -= k*8` (= 8 != 0, < out*8) and the rule fires, building a fresh
     // `SUBPIECE(a, 4)` and turning `sub` into `INT_RIGHT(<that>, 8)`.
-    assert_eq!(rule.apply_op(sub, &mut fd), 1, "shrink-k path commits");
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 1, "shrink-k path commits");
     // `sub` is now the INT_RIGHT by n = 8.
     assert_eq!(fd.obank().get(sub).unwrap().code(), OpCode::CPUI_INT_RIGHT);
     let shift_c = fd.obank().get(sub).unwrap().get_in(1).unwrap();

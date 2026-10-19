@@ -6,32 +6,23 @@
 //! `ExecutablePcodeSleigh`, `InjectPayloadDynamic`, `InjectContextSleigh`, and
 //! `PcodeInjectLibrarySleigh`.
 //!
-//! ## What is fully ported vs boundary-deferred
-//!
-//! The **decode** half of every payload — the `<callfixup>`/`<callotherfixup>`/
-//! `<pcode>`/`<body>` element parsing, the parameter ordering, and the
-//! library's `allocateInject`/`registerInject` payload-factory + namespace
-//! registration — is ported faithfully and is the test target.
-//!
-//! The **emit/compile** half routes through the W2 kuna-sleigh runtime:
-//!   - `parseInject` builds a [`kuna_sleigh::pcodeparse::PcodeSnippet`] over the
-//!     SLEIGH language boundary ([`kuna_sleigh::pcodeparse::SnippetLanguage`]) and
-//!     calls `addOperand`/`setUniqueBase`/`parseStream`/`releaseResult` — all
-//!     **public** kuna-sleigh API. It is ported as [`parse_inject`], generic
-//!     over the `SnippetLanguage` so a caller with a wired language can drive it.
-//!   - `InjectPayloadSleigh::inject` / `ExecutablePcodeSleigh::inject` and the
-//!     `ExecutablePcode::build`/`evaluate` emulator wiring need
-//!     `SleighBuilder`/`PcodeCacher`/`ParserWalkerChange` and the private
-//!     `ParserContext` mutators (`setAddr`/`allocateOperand`/`deallocateState`),
-//!     which are **private to `kuna-sleigh`'s `sleigh.rs`** and cannot be
-//!     reached or made public from this crate. They sit behind the
-//!     [`crate::pcodeinject::InjectEngine`] boundary. (LOSS reported.)
+//! Decoding and registration share one architecture-lifetime library. Local
+//! compilation uses [`parse_inject`] and emission uses [`SleighInjectEngine`].
+//! Host executable helpers are fetched once into the same `EmulateSnippet`
+//! backend; ordinary call-site injections remain site-bound. Executable code
+//! survives program-fact flushes, while LOAD follows the canonical live image.
+//! [`emit_payload_shared`] routes all payload kinds through that same owner,
+//! resolving local templates without copying them and releasing the library
+//! before replaying operations or requesting a site-bound host body.
+//! Library and frame borrows end before host callbacks and evaluation; Weak
+//! loader/resolver backedges avoid retaining an expired architecture.
 //!
 //! Per ADR 0004, fallible decode returns `Result<_, KunaError>`; the
 //! `DecoderError` C++ throw in `ExecutablePcodeSleigh::decode` maps to
 //! [`KunaError::decoder`](kuna_base::error::KunaError).
 
-use std::rc::Rc;
+use std::cell::{OnceCell, RefCell};
+use std::rc::{Rc, Weak};
 
 use kuna_base::address::{calc_mask, Address};
 use kuna_base::error::{KunaError, KunaResult};
@@ -274,10 +265,8 @@ impl InjectPayload for InjectPayloadCallother {
 /// \brief A SLEIGH p-code snippet that can be executed as a script (C++
 /// `ExecutablePcodeSleigh`).
 ///
-/// The C++ derives from `ExecutablePcode` (an `InjectPayload` with an embedded
-/// `EmulateSnippet`). The emulator wiring (build/evaluate) is the
-/// emit/emulate boundary (module docs); this port carries the parse string, the
-/// source, and the snippet layout reservation, decoding faithfully.
+/// The payload owns one shared build-once executable cache. Independent
+/// evaluation frames share the emitted operations but never their memory state.
 #[derive(Debug, Clone)]
 pub struct ExecutablePcodeSleigh {
     /// Engine-neutral payload data (type EXECUTABLEPCODE_TYPE).
@@ -290,6 +279,7 @@ pub struct ExecutablePcodeSleigh {
     pub built: bool,
     /// Whether the SLEIGH `tpl` has been compiled (C++ `tpl != null`).
     pub tpl_compiled: bool,
+    executable: Rc<OnceCell<Rc<BuiltExecutable>>>,
 }
 
 impl ExecutablePcodeSleigh {
@@ -303,6 +293,7 @@ impl ExecutablePcodeSleigh {
             parsestring: Vec::new(),
             built: false,
             tpl_compiled: false,
+            executable: Rc::new(OnceCell::new()),
         }
     }
 
@@ -426,9 +417,27 @@ pub struct PcodeInjectLibrarySleigh {
     /// them parallel to `injection` so a `&self` `get_tpl` does not borrow the
     /// payload mutably).  `None` until `parse_inject` runs for that id.
     pub tpls: Vec<Option<kuna_sleigh::semantics::ConstructTpl>>,
+    runtime: Option<Rc<ExecutableEnvironment>>,
 }
 
 impl PcodeInjectLibrarySleigh {
+    /// Bind execution to the canonical loader and the architecture-owned host
+    /// resolver. Neither backedge keeps the architecture or host session alive.
+    pub fn bind_executable_runtime(
+        &mut self,
+        manager: Rc<kuna_base::space::AddrSpaceManager>,
+        loader: Weak<RefCell<Box<dyn kuna_sleigh::loadimage::LoadImage>>>,
+        resolver: Option<Weak<dyn crate::pcodeinject::InjectPcodeResolver>>,
+        behaviors: Vec<Option<Rc<dyn kuna_num::opbehavior::OpBehavior>>>,
+    ) {
+        self.runtime = Some(Rc::new(ExecutableEnvironment {
+            manager,
+            loader,
+            resolver,
+            behaviors,
+        }));
+    }
+
     /// C++ `PcodeInjectLibrarySleigh(Architecture*)`: the C++
     /// chains `PcodeInjectLibrary(g, g->translate->getUniqueStart(INJECT))` —
     /// the caller supplies the unique-start tempbase.
@@ -437,6 +446,7 @@ impl PcodeInjectLibrarySleigh {
             base: PcodeInjectLibraryBase::new(tempbase),
             injection: Vec::new(),
             tpls: Vec::new(),
+            runtime: None,
         }
     }
 
@@ -448,13 +458,19 @@ impl PcodeInjectLibrarySleigh {
     /// \brief Allocate a new InjectPayload object (C++ `allocateInject`).
     ///
     /// The factory: maps the payload type to the concrete SLEIGH payload and
-    /// returns its id (= the index it is pushed to).
+    /// returns its id (= the index it is pushed to). Manual registration uses
+    /// the supplied name; XML decoding replaces it with `name` or `targetop`.
     pub fn allocate_inject(&mut self, source_name: &[u8], name: &[u8], ptype: int4) -> int4 {
         let injectid = self.injection.len() as int4;
         let payload = if ptype == CALLFIXUP_TYPE {
-            SleighPayload::Callfixup(InjectPayloadCallfixup::new(source_name))
+            SleighPayload::Callfixup(InjectPayloadCallfixup {
+                payload: InjectPayloadSleigh::new(source_name, name, CALLFIXUP_TYPE),
+                target_symbol_names: Vec::new(),
+            })
         } else if ptype == CALLOTHERFIXUP_TYPE {
-            SleighPayload::Callother(InjectPayloadCallother::new(source_name))
+            SleighPayload::Callother(InjectPayloadCallother {
+                payload: InjectPayloadSleigh::new(source_name, name, CALLOTHERFIXUP_TYPE),
+            })
         } else if ptype == EXECUTABLEPCODE_TYPE {
             SleighPayload::Executable(ExecutablePcodeSleigh::new(source_name, name))
         } else {
@@ -488,14 +504,14 @@ impl PcodeInjectLibrarySleigh {
             if self.tpls[id].is_some() {
                 continue;
             }
-            let parsestring = self.injection[id].parsestring().to_vec();
+            let parsestring = self.injection[id].parsestring();
             if parsestring.is_empty() {
                 continue; // dynamic / not-yet-bodied payload (C++ tpl stays null)
             }
             let tempbase = self.base.tempbase;
             let (tpl, new_tempbase) = {
                 let payload = self.injection[id].as_payload();
-                slgh.parse_inject(payload, &parsestring, tempbase)?
+                slgh.parse_inject(payload, parsestring, tempbase)?
             };
             self.base.tempbase = new_tempbase;
             self.tpls[id] = Some(tpl);
@@ -597,6 +613,195 @@ impl PcodeInjectLibrarySleigh {
         self.register_inject(injectid)?;
         Ok(injectid)
     }
+}
+
+struct ExecutableEnvironment {
+    manager: Rc<kuna_base::space::AddrSpaceManager>,
+    loader: Weak<RefCell<Box<dyn kuna_sleigh::loadimage::LoadImage>>>,
+    resolver: Option<Weak<dyn crate::pcodeinject::InjectPcodeResolver>>,
+    behaviors: Vec<Option<Rc<dyn kuna_num::opbehavior::OpBehavior>>>,
+}
+
+impl std::fmt::Debug for ExecutableEnvironment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ExecutableEnvironment")
+    }
+}
+
+impl InjectArchitecture for ExecutableEnvironment {
+    fn get_default_code_space(&self) -> Rc<AddrSpace> {
+        Rc::clone(self.manager.get_default_code_space().expect("no default code space"))
+    }
+    fn get_unique_space(&self) -> Rc<AddrSpace> {
+        Rc::clone(self.manager.get_unique_space().expect("no unique space"))
+    }
+}
+
+/// A forwarding image, not a byte snapshot or a second image authority.
+struct ExecutableLoader {
+    loader: Weak<RefCell<Box<dyn kuna_sleigh::loadimage::LoadImage>>>,
+}
+
+impl kuna_sleigh::loadimage::LoadImage for ExecutableLoader {
+    fn get_file_name(&self) -> &str { "executable snippet" }
+    fn load_fill(&mut self, bytes: &mut [u8], address: &Address) -> KunaResult<()> {
+        let loader = self.loader.upgrade()
+            .ok_or_else(|| KunaError::lowlevel("Executable snippet loader has expired"))?;
+        let result = loader.borrow_mut().load_fill(bytes, address);
+        result
+    }
+    fn get_arch_type(&self) -> Vec<u8> {
+        let loader = self.loader.upgrade().expect("Executable snippet loader has expired");
+        let architecture = loader.borrow().get_arch_type();
+        architecture
+    }
+    fn adjust_vma(&mut self, adjust: i64) {
+        self.loader.upgrade().expect("Executable snippet loader has expired")
+            .borrow_mut().adjust_vma(adjust);
+    }
+}
+
+struct BuiltExecutable {
+    code: kuna_sleigh::emulateutil::EmulateSnippet,
+    /// Ordinary evaluation reuses a frame. Taking it releases the cell borrow
+    /// before LOAD callbacks; recursive evaluation gets a distinct frame.
+    frame: RefCell<Option<kuna_sleigh::emulateutil::EmulateSnippet>>,
+    layout: crate::pcodeinject::SnippetLayout,
+}
+
+impl std::fmt::Debug for BuiltExecutable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BuiltExecutable").field("layout", &self.layout).finish()
+    }
+}
+
+impl BuiltExecutable {
+    fn evaluate(&self, inputs: &[u64]) -> KunaResult<u64> {
+        use kuna_sleigh::emulate::Emulate;
+        if inputs.len() != self.layout.input_list.len() {
+            return Err(KunaError::lowlevel("Wrong number of input parameters to executable snippet"));
+        }
+        let output = *self.layout.output_list.first()
+            .ok_or_else(|| KunaError::lowlevel("No registered outputs to executable snippet"))?;
+        let mut frame = self.frame.borrow_mut().take().unwrap_or_else(|| self.code.fork());
+        let result = (|| {
+            frame.reset_memory();
+            for (offset, value) in self.layout.input_list.iter().zip(inputs) {
+                frame.set_varnode_value(*offset, *value);
+            }
+            while !frame.get_halt() {
+                frame.execute_current_op()?;
+            }
+            Ok(frame.get_temp_value(output))
+        })();
+        let mut parked = self.frame.borrow_mut();
+        if parked.is_none() {
+            *parked = Some(frame);
+        }
+        result
+    }
+}
+
+/// Emit any registered payload through the architecture's live library.
+///
+/// Compiled templates are resolved under a short library borrow, without
+/// cloning the template. The resulting operations are replayed only after that
+/// borrow ends, so even an emitter can reenter registration. Missing templates
+/// use the architecture-owned Weak host resolver with the payload's exact name
+/// and kind (including `CALLMECHANISM_TYPE`), without caching site-bound bodies
+/// or retaining a library guard across the callback.
+pub fn emit_payload_shared(
+    library: &Rc<RefCell<PcodeInjectLibrarySleigh>>,
+    id: int4,
+    context: &mut InjectContext,
+    emit: &mut dyn PcodeEmit,
+) -> KunaResult<()> {
+    let (name, ptype, resolver) = {
+        let library = library.borrow();
+        let payload = library.injection.get(id as usize)
+            .ok_or_else(|| KunaError::lowlevel("Unknown injection payload"))?
+            .as_payload();
+        let runtime = library.runtime.as_ref()
+            .ok_or_else(|| KunaError::lowlevel("Injection payload runtime is not initialized"))?;
+        if let Some(tpl) = library.get_tpl(id) {
+            let engine = SleighInjectEngine::new(
+                Rc::clone(runtime.manager.get_constant_space().expect("no constant space")),
+                runtime.get_unique_space(),
+                runtime.get_default_code_space(),
+            );
+            let (baseaddr, code) = engine.build_payload(payload, tpl, context)?;
+            drop(library);
+            code.emit(&baseaddr, emit);
+            return Ok(());
+        }
+        let resolver = runtime.resolver.as_ref().and_then(Weak::upgrade)
+            .ok_or_else(|| KunaError::lowlevel("Injection payload host resolver has expired"))?;
+        (payload.core().get_name().to_vec(), payload.core().get_type(), resolver)
+    };
+    resolver.fetch_inject_pcode(&name, ptype, context, emit)
+}
+
+/// Inspect helper arity through the same live ID authority as call fixups.
+pub fn executable_input_size(
+    library: &Rc<RefCell<PcodeInjectLibrarySleigh>>,
+    id: int4,
+) -> KunaResult<int4> {
+    let library = library.borrow();
+    match library.injection.get(id as usize) {
+        Some(SleighPayload::Executable(payload)) => Ok(payload.core.size_input()),
+        _ => Err(KunaError::lowlevel("Injection payload is not executable")),
+    }
+}
+
+/// Build once per payload, then evaluate without holding library/cache guards.
+pub fn evaluate_executable(
+    library: &Rc<RefCell<PcodeInjectLibrarySleigh>>,
+    id: int4,
+    inputs: &[u64],
+) -> KunaResult<u64> {
+    let cache = {
+        let library = library.borrow();
+        match library.injection.get(id as usize) {
+            Some(SleighPayload::Executable(payload)) => Rc::clone(&payload.executable),
+            _ => return Err(KunaError::lowlevel("Injection payload is not executable")),
+        }
+    };
+    if let Some(executable) = cache.get() {
+        return executable.evaluate(inputs);
+    }
+    let (runtime, core) = {
+        let library = library.borrow();
+        let runtime = library.runtime.as_ref()
+            .ok_or_else(|| KunaError::lowlevel("Executable snippet runtime is not initialized"))?;
+        (Rc::clone(runtime), library.get_payload(id).core().clone())
+    };
+    let mut context = InjectContext::default();
+    context.baseaddr = Some(Address::new(runtime.get_default_code_space(), 0x1000));
+    context.nextaddr = context.baseaddr.clone();
+    let layout = crate::pcodeinject::SnippetLayout::build(&core, &mut context, runtime.as_ref());
+    let loader: Rc<RefCell<dyn kuna_sleigh::loadimage::LoadImage>> =
+        Rc::new(RefCell::new(ExecutableLoader { loader: runtime.loader.clone() }));
+    let mut code = kuna_sleigh::emulateutil::EmulateSnippet::new(
+        loader, Rc::clone(&runtime.manager),
+    );
+    {
+        let mut emitter = code.build_emitter(&runtime.behaviors, layout.uniq_reserve);
+        emit_payload_shared(library, id, &mut context, &mut emitter)?;
+    }
+    if !code.check_for_legal_code() {
+        return Err(KunaError::lowlevel("Illegal p-code in executable snippet"));
+    }
+    let frame = code.fork();
+    let executable = Rc::new(BuiltExecutable { code, frame: RefCell::new(Some(frame)), layout });
+    // A callback may have completed the same build while this one was emitting.
+    let _ = cache.set(executable);
+    {
+        let mut library = library.borrow_mut();
+        if let SleighPayload::Executable(payload) = &mut library.injection[id as usize] {
+            payload.built = true;
+        }
+    }
+    cache.get().expect("executable cache initialized").evaluate(inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1427,18 @@ impl SleighInjectEngine {
         context: &mut InjectContext,
         emit: &mut dyn PcodeEmit,
     ) -> KunaResult<()> {
+        let (baseaddr, code) = self.build_payload(payload, tpl, context)?;
+        code.emit(&baseaddr, emit);
+        Ok(())
+    }
+
+    /// Resolve the borrowed template before handing control to an emitter.
+    fn build_payload(
+        &self,
+        payload: &dyn InjectPayload,
+        tpl: &ConstructTpl,
+        context: &mut InjectContext,
+    ) -> KunaResult<(Address, PcodeCacher)> {
         let core = payload.core();
         let handles = setup_handles(core, context)?;
 
@@ -1252,8 +1469,7 @@ impl SleighInjectEngine {
         // the main section
         builder.build(Some(tpl), -1)?;
         builder.cache.resolve_relatives()?;
-        builder.cache.emit(&baseaddr, emit);
-        Ok(())
+        Ok((baseaddr, builder.cache))
     }
 }
 

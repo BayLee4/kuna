@@ -142,9 +142,9 @@ const READ_DEPTH: u32 = 8;
 /// unused trials are still present. `trialvn` holds each trial's INDIRECT
 /// creation, by original slot. Returns `false`, changing nothing, unless the
 /// pair is built.
-pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: &[Option<VarnodeId>]) -> bool {
+pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: &[Option<VarnodeId>]) -> kuna_base::error::KunaResult<bool> {
     if (!live(data) && !crate::kuna_rustabi::live(data)) || !fc.proto().has_model() {
-        return false;
+        return Ok(false);
     }
     let mut reads: Vec<(Address, int4, VarnodeId, bool)> = Vec::new();
     {
@@ -157,7 +157,7 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
         }
     }
     if reads.iter().filter(|r| r.3).count() > 1 {
-        return false;
+        return Ok(false);
     }
     let op = fc.get_op();
     let killed: Vec<(Address, int4, VarnodeId, bool)> = killed_reads(data, op)
@@ -165,11 +165,11 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
         .filter(|(_, _, vn)| !trialvn.contains(&Some(*vn)))
         .map(|(addr, size, vn)| (addr, size, vn, false))
         .collect();
-    let Some(list) = fc.proto().model().output_list() else { return false };
+    let Some(list) = fc.proto().model().output_list() else { return Ok(false) };
     let Some((first, second)) =
         reads.iter().chain(&killed).filter(|r| !r.3).find_map(|r| pair_of(list, &r.0, r.1))
     else {
-        return false;
+        return Ok(false);
     };
     let manager = data.get_arch().manage.clone();
     let mut probe = ParamActive::new(false);
@@ -182,11 +182,11 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
     if fc.proto().derive_output_map(&mut probe, &manager).is_err()
         || !(0..2).all(|i| probe.get_trial(i).is_used())
     {
-        return false;
+        return Ok(false);
     }
     let order = crate::kuna_bejoin::call_join_order(data, &probe, Some(fc.get_entry_address()));
     if order != probe.join_pair_order() {
-        return false;
+        return Ok(false);
     }
     let piece = |i: int4| (probe.get_trial(i).get_address().clone(), probe.get_trial(i).get_size());
     let ((lo_addr, lo_size), (hi_addr, hi_size)) = (piece(order.0), piece(order.1));
@@ -204,7 +204,7 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
         .map(|(addr, size, vn, _)| offset(addr, *size).map(|off| (*vn, off)))
         .collect::<Option<Vec<(VarnodeId, int4)>>>()
     else {
-        return false;
+        return Ok(false);
     };
     let killed: Vec<(Address, int4, VarnodeId, bool)> =
         killed.into_iter().filter(|(addr, size, _, _)| offset(addr, *size).is_some()).collect();
@@ -217,20 +217,20 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
         })
         .collect();
     let entry = fc.get_entry_address();
-    let Some(callee) = data.kuna_callee_ret_writes(entry) else { return false };
+    let Some(callee) = data.kuna_callee_ret_writes(entry) else { return Ok(false) };
     if !read_regs.iter().all(|reg| writes(callee, &reg.0, reg.1))
         || !callee_returns_cover(data, entry, &read_regs)
         || !orphans.iter().any(|r| read_by_the_function(data, r.2, READ_DEPTH))
     {
-        return false;
+        return Ok(false);
     }
-    let Some(call_addr) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return false };
+    let Some(call_addr) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return Ok(false) };
     let Some(joinaddr) =
-        crate::kuna_rustabi::pair_join_address(data, &hi_addr, hi_size, &lo_addr, lo_size, &call_addr)
+        crate::kuna_rustabi::pair_join_address(data, &hi_addr, hi_size, &lo_addr, lo_size, &call_addr)?
     else {
-        return false;
+        return Ok(false);
     };
-    let Ok(whole) = data.new_varnode_out(lo_size + hi_size, &joinaddr, op) else { return false };
+    let whole = data.new_varnode_out(lo_size + hi_size, &joinaddr, op)?;
     if let Some(v) = data.vbank_mut().get_mut(whole) {
         v.set_write_mask();
     }
@@ -239,15 +239,15 @@ pub fn build_partial_pair(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: 
         let sub = data.new_op(2, call_addr.clone());
         data.op_set_opcode_code(sub, OpCode::CPUI_SUBPIECE);
         let c = data.new_constant(4, off as u64);
-        let _ = data.op_set_input(sub, whole, 0);
-        let _ = data.op_set_input(sub, c, 1);
-        let _ = data.op_set_output(sub, vn);
+        data.op_set_input(sub, whole, 0)?;
+        data.op_set_input(sub, c, 1)?;
+        data.op_set_output(sub, vn)?;
         data.op_insert_after(sub, op);
         if let Some(indop) = indop {
-            data.op_destroy(indop);
+            data.op_destroy(indop)?;
         }
     }
-    true
+    Ok(true)
 }
 
 /// The read register values `callop` creates that are not output trials: the

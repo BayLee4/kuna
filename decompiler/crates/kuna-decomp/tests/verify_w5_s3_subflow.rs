@@ -95,7 +95,7 @@ fn mk_op(fd: &mut Funcdata, off: u64, ninput: int4, opc: OpCode) -> kuna_decomp:
 
 fn mk_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
 }
 
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
@@ -147,7 +147,7 @@ fn w5s3_subvar_shift_amount_64_panics_where_cpp_is_masked_ub_f1() {
 
     let mut rule = RuleSubvarShift::new("g");
     // C++: `mask >> 64` is UB-but-masked -> returns 0 (no crash).  Rust: panics.
-    let _ = rule.apply_op(shr, &mut fd);
+    let _ = rule.apply_op(shr, &mut fd).unwrap();
 }
 
 // A control: a *small* shift (sa < 64) on the same shape does NOT panic and
@@ -165,7 +165,7 @@ fn w5s3_subvar_shift_small_amount_no_panic_returns_zero() {
     let _outvn = wire_out(&mut fd, shr, outvn);
 
     let mut rule = RuleSubvarShift::new("g");
-    assert_eq!(rule.apply_op(shr, &mut fd), 0);
+    assert_eq!(rule.apply_op(shr, &mut fd).unwrap(), 0);
 }
 
 // ---- F-check: forward INT_LESS aggressive gate (subflow.cc:560-575) ---------

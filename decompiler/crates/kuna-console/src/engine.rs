@@ -571,20 +571,9 @@ pub struct ConsoleProgram {
     /// Non-zero sizes only: a bare declaration with no extent leaves the entry
     /// unbounded, which is the engine-wide `UNBOUNDED_SIZE` default.
     declared_extents: BTreeMap<u64, int4>,
-    /// (kuna) **Caller-declared function entries**, entry VMA — every address a
-    /// caller asserted a function at through `function bounds` /
-    /// `--define-function`, extent or no extent.
-    ///
-    /// Separate from [`Self::declared_extents`] because a bare declaration
-    /// carries no size and would otherwise be indistinguishable from a
-    /// discovered entry. What reads it is the whole-binary target list
-    /// ([`Self::function_entries_executable`]): a declaration is an assertion
-    /// that this address IS a function, so it outranks the section-flag test
-    /// that list otherwise filters by.
-    declared_entries: BTreeSet<u64>,
     /// (kuna) The name `--define-function <start>[-<end>]=<name>` gave each
     /// declared entry, keyed by the same normalized VMA as
-    /// [`Self::declared_entries`].
+    /// [`Self::is_declared_entry`].
     ///
     /// The declaration is an assertion, so it has to outrank every name
     /// discovery registered at that address -- otherwise which name is reported
@@ -610,16 +599,6 @@ pub struct ConsoleProgram {
     pending_prototypes: BTreeMap<String, kuna_decomp::fspec::PrototypePieces>,
     /// Raw-input address-unit width and whether bit zero is an ARM state bit.
     raw_address_units: Option<(u64, bool)>,
-    /// (kuna) The loader's **import pointer slots** as half-open `[lo, hi)` VMA
-    /// ranges — the PE Import Address Table words, read off
-    /// `ObjectLoadImage::import_slot_ranges` at bootstrap.
-    ///
-    /// The loader registers a `FunctionSymbol` at each slot so a
-    /// `call dword ptr [slot]` renders the import name, and that is the whole
-    /// point of them; the slot is still a pointer word rather than a function
-    /// entry, which is what [`Self::function_entries_executable`] reads this for.
-    /// Empty on the XML datatest path and for every non-PE image.
-    import_slots: Vec<(u64, u64)>,
     /// (kuna, issue #666) Does this container decorate a C identifier with a
     /// leading `_` in its symbol table?
     ///
@@ -967,7 +946,7 @@ impl ConsoleProgram {
     /// directory passes the flag test at every slot, so 50 of a 56-entry
     /// inventory were pointer words that decompiled to a body dereferencing an
     /// uninitialized pointer. The loader knows which addresses those are
-    /// ([`Self::import_slots`]) because it put the names there, so the slots are
+    /// ([`Self::is_import_slot`]) because it put the names there, so the slots are
     /// excluded on that knowledge instead.
     ///
     /// A CALLER-DECLARED entry is kept whatever either test says. The flag test
@@ -1022,9 +1001,13 @@ impl ConsoleProgram {
     ///
     /// The address half of the loader's import resolution
     /// (`ObjectLoadImage::import_slot_ranges`). Always false on the XML datatest
-    /// path, for a raw image, and for every non-PE object.
+    /// path and for a raw image.
     pub fn is_import_slot(&self, vma: u64) -> bool {
-        self.import_slots.iter().any(|&(lo, hi)| vma >= lo && vma < hi)
+        let arch = self.arch();
+        arch.manage().get_default_code_space().is_some_and(|space| {
+            arch.translate().loader_rc().borrow()
+                .is_import_slot(&Address::new(Rc::clone(space), self.thumb_normalized(vma)))
+        })
     }
 
     /// Whether `vma` may be treated as the start of a function body.
@@ -1033,7 +1016,10 @@ impl ConsoleProgram {
     /// bind to the import name and prototype, but the word itself is not code.
     /// A caller declaration deliberately outranks the loader classification.
     pub fn is_body_entry(&self, vma: u64) -> bool {
-        self.is_declared_entry(vma) || !self.is_import_slot(vma)
+        let arch = self.arch();
+        arch.manage().get_default_code_space().is_some_and(|space| {
+            arch.is_body_entry(&Address::new(Rc::clone(space), self.thumb_normalized(vma)))
+        })
     }
 
     /// (kuna, issue #197) Resolve a canonical entry by ANY of its names — the
@@ -2174,7 +2160,10 @@ impl ConsoleProgram {
     /// Did a caller assert a function at `vma` (`function bounds` /
     /// `--define-function`)?
     pub fn is_declared_entry(&self, vma: u64) -> bool {
-        self.declared_entries.contains(&self.thumb_normalized(vma))
+        let arch = self.arch();
+        arch.manage().get_default_code_space().is_some_and(|space| {
+            arch.is_declared_body_entry(&Address::new(Rc::clone(space), self.thumb_normalized(vma)))
+        })
     }
 
     /// (kuna) Whether `name` is NOT the one the caller declared at `vma`.
@@ -2293,10 +2282,10 @@ impl ConsoleProgram {
         let vma = addr.get_offset();
         self.register_symbol(&name, addr.clone());
         self.declare_extent(vma, size);
-        self.declared_entries.insert(vma);
+        self.arch_mut().declare_body_entry(&addr)?;
         if explicit.is_some() {
             self.declared_names.insert(vma, name.clone());
-            self.seed_declared_libc_prototype(&name, &addr);
+            self.seed_declared_libc_prototype(&name, &addr)?;
         }
         Ok(name)
     }
@@ -2345,9 +2334,9 @@ impl ConsoleProgram {
     /// A silent no-op when the option is off, when neither table knows the name, or
     /// when the declaration named an entry that already carries a locked prototype
     /// from a stronger source.
-    fn seed_declared_libc_prototype(&mut self, name: &str, addr: &Address) {
+    fn seed_declared_libc_prototype(&mut self, name: &str, addr: &Address) -> KunaResult<()> {
         if !self.arch().analysis_declaredlibcproto {
-            return;
+            return Ok(());
         }
         let (_addr_size, word_size) = self.arch().data_org();
         // The layout is the load-time pass's decision, not a fresh one: only an
@@ -2367,8 +2356,9 @@ impl ConsoleProgram {
         let whole = kuna_decomp::kuna_typedcallabi::returns_doubles_whole(self.arch());
         let pieces = pieces.filter(|p| whole || !kuna_decomp::kuna_typedcallabi::declares_a_float(p));
         if let Some(pieces) = pieces {
-            self.arch_mut().set_function_prototype_pieces_at(addr, pieces);
+            self.arch_mut().set_function_prototype_pieces_at(addr, pieces)?;
         }
+        Ok(())
     }
 
     /// (kuna) Build the `map addr`-shaped stack-symbol specs for the DWARF stack
@@ -2449,9 +2439,9 @@ impl ConsoleProgram {
     /// `--entry` addresses, and the synthetic `CODE` section it publishes for
     /// the whole file. A seed is never dropped, so the inventory can only grow;
     /// an image whose bytes hold no direct call returns unchanged.
-    fn discover_raw_entries(&mut self) {
+    fn discover_raw_entries(&mut self) -> KunaResult<()> {
         let Some(code_space) = self.analysis_code_space.clone() else {
-            return;
+            return Ok(());
         };
         let exec: Vec<(u64, u64)> = self
             .sections()
@@ -2470,7 +2460,7 @@ impl ConsoleProgram {
                 &code_space,
                 &exec,
                 &seeds,
-            )
+            )?
         };
         for vma in found {
             if known.contains(&vma) {
@@ -2478,6 +2468,7 @@ impl ConsoleProgram {
             }
             self.pending_synthetic_entries.push(Address::new(Rc::clone(&code_space), vma));
         }
+        Ok(())
     }
 
     /// (kuna) Commit the stashed per-pass analysis facts, gated by the per-pass
@@ -2511,7 +2502,7 @@ impl ConsoleProgram {
             // `object::File`. Discover the rest first, so the entries it finds
             // are named and installed by the same loop.
             if self.container == ProgramContainer::Raw && self.arch().analysis_rawdiscover {
-                self.discover_raw_entries();
+                self.discover_raw_entries()?;
             }
             let entries = std::mem::take(&mut self.pending_synthetic_entries);
             let symbols = entries
@@ -2730,7 +2721,7 @@ impl ConsoleProgram {
                             &merged.fde_interior_entries,
                             &plan,
                             self.arm_frames.as_ref(),
-                        );
+                        )?;
                         for (id, mut out) in consumer_out {
                             if let Some(record) = out.arm_frames.take() {
                                 self.arm_frames = Some(record);
@@ -2784,9 +2775,11 @@ impl ConsoleProgram {
         // terms: see `suppress_pdb_interior_entries`.
         suppress_pdb_interior_entries(self.arch(), &code_space, &mut merged);
         merged.context_paints.extend(input_context_paints);
-        let committed = commit_analysis_output(self, &code_space, merged);
+        commit_analysis_output(self, &code_space, merged)?;
+        self.arch_mut().invalidate_body_caches();
+        self.arch_mut().print_mut().set_export_binding(None);
         self.stash_float_scan();
-        committed
+        Ok(())
     }
 
     /// (kuna `floatglobals`) Hand the engine what the whole-program float-global
@@ -3669,13 +3662,11 @@ fn empty_program(
         arm_frames: None,
         loader_data_objects: Vec::new(),
         declared_extents: BTreeMap::new(),
-        declared_entries: BTreeSet::new(),
         declared_names: BTreeMap::new(),
         assertions: Vec::new(),
         assertion_outcomes: Vec::new(),
         pending_prototypes: BTreeMap::new(),
         raw_address_units: None,
-        import_slots: Vec::new(),
         symbol_underscore_prefix: false,
         load_notes: Vec::new(),
         elf_functions: Default::default(),
@@ -4159,7 +4150,7 @@ pub fn bootstrap_from_object_with_isa(
         // `.sla` is loaded and the loadimage attached (above), so a flag-gated
         // `Listing::build` can decode through it. Default-off ⇒ unused.
         sleigh.base().unwrap().translate(),
-    );
+    )?;
     pending_analysis.extend(input_isa_stash(input_context_paints));
 
     // (kuna `dynrelocs`) The PT_GNU_RELRO-frozen dynamic-relocation slots, read
@@ -4170,11 +4161,6 @@ pub fn bootstrap_from_object_with_isa(
     // `option readonly`. Empty for a non-ELF, an `ET_REL` object, or the gate off.
     let dynreloc_const: Vec<(u64, u64)> = loader.dynreloc_const_ranges().to_vec();
 
-    // (kuna, RE-need `bulk-decompilation-decodes-pe`) The import pointer slots,
-    // read off the same loader: `read_loader_symbols_generic` below installs a
-    // FunctionSymbol at each of them for call naming, and the whole-binary
-    // enumeration needs to know those addresses hold a pointer, not a body.
-    let import_slots: Vec<(u64, u64)> = loader.import_slot_ranges().to_vec();
     let elfv1_tocs = loader.elfv1_descriptors().entry_tocs();
     let elf_functions = loader.elf_function_provenance().clone();
     let loader_aliases = loader.func_symbol_aliases();
@@ -4297,7 +4283,6 @@ pub fn bootstrap_from_object_with_isa(
     // here (it is unused below this point).
     prog.analysis_image = Some((path.to_string(), bytes));
     prog.loader_data_objects = loader_data_objects;
-    prog.import_slots = import_slots;
     prog.symbol_underscore_prefix = symbol_underscore_prefix;
     if let Ok(loc) = prog.arch().get_register_varnode(b"r2") {
         if loc.size == 8 {
@@ -4354,6 +4339,60 @@ pub fn bootstrap_from_object_with_isa(
 /// overlap check no-ops a duplicate). Bound to the real-ELF path; the XML
 /// `<binaryimage>` path never produces an `AnalysisOutput`, so this never runs
 /// there. See `docs/missing-analyses.md` for the per-fact-kind API rationale.
+fn publish_typed_data(
+    prog: &mut ConsoleProgram,
+    fact: &kuna_analysis::pass::TypedDataFact,
+    num_spaces: i32,
+) -> KunaResult<()> {
+    let size = fact.type_.get_size();
+    if size <= 0 || fact.addr.checked_add(size as u64 - 1).is_none() {
+        return Ok(());
+    }
+    let Some(space) = fact.space.clone()
+        .or_else(|| prog.arch().manage().get_default_data_space().cloned())
+    else {
+        return Ok(());
+    };
+    let addr = Address::new(space, fact.addr);
+    let arch = prog.arch_mut();
+    if let Some(global) = arch.symboltab.get_global_scope() {
+        if arch.symboltab.find_overlap(global, &addr, size).is_some() {
+            return Ok(());
+        }
+    }
+    let (scope, base) =
+        arch.symboltab.find_create_scope_from_symbol_name(&fact.name, "::", None, num_spaces)?;
+    if arch.symboltab.find_overlap(scope, &addr, size).is_some() {
+        return Ok(());
+    }
+    let (sid, _) = arch.symboltab.add_symbol_mapped(
+        scope, &base, Rc::clone(&fact.type_), &addr, &Address::new_invalid(),
+    )?;
+    arch.symboltab.set_attribute(
+        sid,
+        kuna_decomp::varnode::varnode_flags::typelock
+            | kuna_decomp::varnode::varnode_flags::namelock,
+    );
+    let mut object_type = Rc::clone(&fact.type_);
+    let volatile = loop {
+        if kuna_decomp::kuna_typequal::is_volatile(&object_type) {
+            break true;
+        }
+        match object_type.get_array_base() {
+            Some(element) => object_type = element,
+            None => break false,
+        }
+    };
+    if volatile {
+        let end = fact.addr.checked_add(size as u64)
+            .map(|end| Address::new(addr.get_space().unwrap().clone(), end))
+            .unwrap_or_else(Address::new_invalid);
+        arch.symboltab.set_attribute(sid, kuna_decomp::varnode::varnode_flags::volatil);
+        arch.symboltab.set_property_range(kuna_decomp::varnode::varnode_flags::volatil, &addr, &end);
+    }
+    Ok(())
+}
+
 fn commit_analysis_output(
     prog: &mut ConsoleProgram,
     code_space: &Rc<AddrSpace>,
@@ -4374,6 +4413,7 @@ fn commit_analysis_output(
         let cpp = std::mem::take(&mut out.cpp_dwarf);
         out.symbols.extend(cpp.symbols);
         out.locals.extend(cpp.locals);
+        out.source_prototypes.extend(cpp.source_prototypes);
         out.cpp_dwarf.prototypes = cpp.prototypes;
     } else {
         out.cpp_dwarf.prototypes.clear();
@@ -4444,58 +4484,12 @@ fn commit_analysis_output(
         }
     }
 
-    // 1a. Named data globals with a known byte size (`out.data_objects`, the DWARF
-    //     top-level variables). Mapped into the global scope with an
-    //     `undefined<size>` type so a memory access of the object's storage
-    //     (`mov [max_width], eax`) queries `queryContainer(addr, size)` and finds a
-    //     covering SymbolEntry — the ActionNameVars global-scope query then binds the
-    //     name, rendering `max_width` instead of `dat_<addr>`. A plain `SymFact{Data}`
-    //     is installed with a size-1 code type, which only covers a 1-byte access, so
-    //     multi-byte globals (`int`/`char*`) were left unnamed. Matches IDA Pro /
-    //     Ghidra, which name data globals from the symbol table. `namelock` keeps the
-    //     name; the `undefined<size>` type is NOT typelocked, so type propagation still
-    //     infers the object's real type from its uses. A synthetic-`namelock` symbol
-    //     is skipped where the address already carries a function or a covering data
-    //     Symbol (a string `s_<addr>` or a hand-`map addr`ed global must not be
-    //     shadowed) — the same guard the string-literal placement uses.
-    //     The extent is clamped into the type factory's `int4` domain exactly as
-    //     arm 4a does. This arm cannot actually overflow — `d.size` is produced
-    //     from a `Datatype::get_size()`, itself an `int4`, and filtered to `>= 1`
-    //     (`analyzers/dwarf/mod.rs`), so it already lives in `1..=int4::MAX` —
-    //     but the two arms must not differ in shape, or the safe one reads as an
-    //     endorsement of the unsafe one.
-    for d in &out.data_objects {
-        let addr = Address::new(Rc::clone(code_space), d.addr);
-        let occupied = {
-            let arch = prog.arch();
-            match arch.symboltab.get_global_scope() {
-                Some(global) => {
-                    arch.symboltab.find_function(global, &addr).is_some()
-                        || arch
-                            .symboltab
-                            .find_container(global, &addr, 1, &Address::new_invalid())
-                            .is_some()
-                }
-                None => false,
-            }
-        };
-        if occupied {
-            continue;
-        }
-        let ct = prog
-            .arch()
-            .types()
-            .get_base(
-                d.size.clamp(1, int4::MAX as u32) as int4,
-                kuna_decomp::dtype::type_metatype::TYPE_UNKNOWN,
-            )?;
-        let arch = prog.arch_mut();
-        let (scope, base) =
-            arch.symboltab.find_create_scope_from_symbol_name(&d.name, "::", None, num_spaces)?;
-        let (sid, _) =
-            arch.symboltab.add_symbol_mapped(scope, &base, ct, &addr, &Address::new_invalid())?;
-        arch.symboltab.set_attribute(sid, kuna_decomp::varnode::varnode_flags::namelock);
+    // Debug declarations claim their full typed extent before heuristic strings
+    // and untyped names. Existing analyst mappings always retain precedence.
+    for fact in out.typed_data.iter().filter(|fact| fact.dwarf) {
+        publish_typed_data(prog, fact, num_spaces)?;
     }
+
 
     // 1b. Extra read-only address ranges a pass discovered (`out.readonly`) — e.g.
     //     the MSVC RTTI vftable slot arrays (`rtti` R3). OR `Varnode::readonly`
@@ -4842,44 +4836,10 @@ fn commit_analysis_output(
     //     and `libctypes` only decides what the named object IS. There is no half
     //     of this to keep: the type rides on the symbol, and with no symbol there
     //     is nothing to lock a type onto.
-    let stream_syms = if prog.arch().analysis_datasyms { out.typed_data.as_slice() } else { &[] };
-    for fact in stream_syms {
-        let addr = Address::new(Rc::clone(code_space), fact.addr);
-        let occupied = {
-            let arch = prog.arch();
-            match arch.symboltab.get_global_scope() {
-                Some(global) => {
-                    arch.symboltab.find_function(global, &addr).is_some()
-                        || arch
-                            .symboltab
-                            .find_container(global, &addr, 1, &Address::new_invalid())
-                            .is_some()
-                }
-                None => false,
-            }
-        };
-        if occupied {
-            continue;
+    for fact in out.typed_data.iter().filter(|fact| !fact.dwarf) {
+        if prog.arch().analysis_datasyms {
+            publish_typed_data(prog, fact, num_spaces)?;
         }
-        let arch = prog.arch_mut();
-        let (scope, base) = arch.symboltab.find_create_scope_from_symbol_name(
-            &fact.name,
-            "::",
-            None,
-            num_spaces,
-        )?;
-        let (sid, _) = arch.symboltab.add_symbol_mapped(
-            scope,
-            &base,
-            Rc::clone(&fact.type_),
-            &addr,
-            &Address::new_invalid(),
-        )?;
-        arch.symboltab.set_attribute(
-            sid,
-            kuna_decomp::varnode::varnode_flags::typelock
-                | kuna_decomp::varnode::varnode_flags::namelock,
-        );
     }
 
     // 4a. Loader data symbols: the defined `STT_OBJECT` entries of `.symtab` /
@@ -4913,7 +4873,7 @@ fn commit_analysis_output(
                     arch.symboltab.find_function(global, &addr).is_some()
                         || arch
                             .symboltab
-                            .find_container(global, &addr, 1, &Address::new_invalid())
+                            .find_overlap(global, &addr, (*size).clamp(1, int4::MAX as u64) as int4)
                             .is_some()
                 }
                 None => false,
@@ -4955,6 +4915,25 @@ fn commit_analysis_output(
         prog.arch_mut().elfmain_main_decl = Some((Address::new(Rc::clone(code_space), addr), pieces));
     }
 
+    // A C runtime import is `__cdecl` even where the image's default
+    // convention leaves cleanup to each callee (`x86win.cspec`'s `__stdcall`).
+    // Publish the convention before either library declaration stream: the
+    // address-keyed constructor must see it for both the IAT slot and its thunk.
+    let default_pop_unknown = prog
+        .arch()
+        .default_fp()
+        .is_some_and(|m| m.get_extra_pop() == kuna_decomp::fspec::EXTRAPOP_UNKNOWN);
+    let cdecl = prog
+        .arch()
+        .get_model("__cdecl")
+        .filter(|m| m.get_alias_parent().is_none())
+        .filter(|m| m.get_extra_pop() != kuna_decomp::fspec::EXTRAPOP_UNKNOWN);
+    if let (true, Some(cdecl)) = (default_pop_unknown, cdecl) {
+        for name in &out.c_runtime_imports {
+            prog.arch_mut().set_function_prototype_model(name, Rc::clone(&cdecl));
+        }
+    }
+
     // 5. Library prototypes (the kuna analog of ApplyDataArchiveAnalyzer): park each
     //    on its named global callee. `ActionDefaultParams` later copies the callee's
     //    prototype into the caller's call spec, so the argument constants get typed
@@ -4964,7 +4943,7 @@ fn commit_analysis_output(
     //    silent no-op.
     for pieces in out.prototypes {
         let name = pieces.name.clone();
-        prog.arch_mut().set_function_prototype_pieces(&name, pieces);
+        prog.arch_mut().set_function_prototype_pieces(&name, pieces)?;
     }
 
     // 5c. Library prototypes bound by ENTRY ADDRESS. Same
@@ -4978,26 +4957,7 @@ fn commit_analysis_output(
     //     C++ streams below so DWARF ground truth still wins over both.
     for (addr, pieces) in out.prototypes_at {
         let a = Address::new(Rc::clone(code_space), addr);
-        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
-    }
-
-    // 5d. A C runtime import is `__cdecl` even where the image's default
-    //     convention leaves the cleanup to each callee (`x86win.cspec`'s
-    //     `__stdcall`), so its signature must not be read as bytes it pops.
-    let default_pop_unknown = prog
-        .arch()
-        .default_fp()
-        .is_some_and(|m| m.get_extra_pop() == kuna_decomp::fspec::EXTRAPOP_UNKNOWN);
-    let cdecl = prog
-        .arch()
-        .get_model("__cdecl")
-        .filter(|m| m.get_alias_parent().is_none())
-        .filter(|m| m.get_extra_pop() != kuna_decomp::fspec::EXTRAPOP_UNKNOWN)
-        .cloned();
-    if let (true, Some(cdecl)) = (default_pop_unknown, cdecl) {
-        for name in &out.c_runtime_imports {
-            prog.arch_mut().set_function_prototype_model(name, Rc::clone(&cdecl));
-        }
+        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces)?;
     }
 
     // 5b. (kuna `cppsig`) The DEMANGLED prototypes, bound by entry address like
@@ -5022,7 +4982,7 @@ fn commit_analysis_output(
         let a = Address::new(Rc::clone(code_space), addr);
         let model = match model {
             Some(name) => {
-                let model = prog.arch().get_model(name).filter(|m| m.get_alias_parent().is_none()).cloned();
+                let model = prog.arch().get_model(name).filter(|m| m.get_alias_parent().is_none());
                 let Some(model) = model else { continue };
                 prog.arch_mut().set_function_prototype_model_at(&a, Rc::clone(&model));
                 Some(model)
@@ -5037,12 +4997,16 @@ fn commit_analysis_output(
             }
             msvc_applied.insert(addr);
         }
-        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
+        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces)?;
     }
     let space_index = code_space.get_index();
-    for (addr, decl) in msvc_byval {
+    for (addr, mut decl) in msvc_byval {
         if msvc_applied.contains(&addr) {
-            Rc::make_mut(&mut prog.arch_mut().msvc_byval_decls).insert((space_index, addr), decl);
+            let at = Address::new(Rc::clone(code_space), addr);
+            if let Some(source) = prog.arch().symboltab.function_source_proto_across_scopes(&at) {
+                decl.bind_generated_source(source);
+                Rc::make_mut(&mut prog.arch_mut().msvc_byval_decls).insert((space_index, addr), decl);
+            }
         }
     }
     for (addr, kind) in msvc_builders {
@@ -5060,7 +5024,13 @@ fn commit_analysis_output(
     //     global by-name query never reaches). Empty when the gate is off.
     for (addr, pieces) in out.cpp_dwarf.prototypes {
         let a = Address::new(Rc::clone(code_space), addr);
-        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces);
+        prog.arch_mut().set_function_prototype_pieces_at(&a, pieces)?;
+    }
+
+    // Complete producer declarations supersede the legacy pieces projection.
+    for (entry, source) in &out.source_prototypes {
+        let addr = Address::new(Rc::clone(code_space), *entry);
+        prog.arch_mut().set_function_source_proto_at(&addr, Rc::clone(source));
     }
 
     // 6. Processor-context decode-mode paints (the kuna analog of ARM's
@@ -5155,6 +5125,7 @@ fn commit_analysis_output(
             let injectid = prog
                 .arch()
                 .pcodeinjectlib
+                .borrow()
                 .base
                 .get_payload_id(kuna_decomp::pcodeinject::CALLFIXUP_TYPE, fixup_name.as_bytes());
             if injectid < 0 {

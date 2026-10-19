@@ -235,7 +235,7 @@ fn rust_print_c(stem: &str, sym_name: &str) -> Result<String, String> {
     );
     let entry = Address::new(space, sym.offset);
     let fd = decompile_func(base, &sym.name, entry, 0).map_err(|e| format!("decompile: {e}"))?;
-    Ok(print_c(base, &fd))
+    Ok(print_c(base, &fd).unwrap())
 }
 
 // ===========================================================================

@@ -119,14 +119,14 @@ fn wire(fd: &mut Funcdata, vn: kuna_decomp::context::VarnodeId, op: kuna_decomp:
 fn mk_var(fd: &mut Funcdata, off: u64, size: int4) -> kuna_decomp::context::VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     set_def(fd, vn, defop)
 }
 
 fn run_present(fd: &mut Funcdata) -> int4 {
     let mut action = ActionPresentCompareForm::new(true, "analysis");
     let mut ctx = ActionContext::new();
-    action.apply(fd, &mut ctx);
+    action.apply(fd, &mut ctx).unwrap();
     action.base().count
 }
 
@@ -406,7 +406,7 @@ fn r2_t3_idempotent_and_mark_gated() {
         // Re-run on the already-restored function: nothing left marked / matching.
         let mut again = ActionPresentCompareForm::new(true, "analysis");
         let mut ctx = ActionContext::new();
-        again.apply(&mut fd, &mut ctx);
+        again.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(again.base().count, 0, "second restore must be a no-op (idempotent)");
         assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESSEQUAL);
         assert_eq!(const_in(&fd, op, 1), start, "constant must NOT be decremented twice");

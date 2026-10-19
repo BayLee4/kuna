@@ -248,14 +248,14 @@ impl Rule for RuleLoadVarnode {
         Some(Box::new(RuleLoadVarnode::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let (baseoff, offoff) = match RuleLoadVarnode::check_spacebase(data, op) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let size = size_of(data, out_vn(data, op));
         let offoff = kuna_base::space::AddrSpace::address_to_byte(offoff, baseoff.get_word_size());
-        let newvn = data.new_varnode_space_off(size, Rc::clone(&baseoff), offoff);
+        let newvn = data.new_varnode_space_off(size, Rc::clone(&baseoff), offoff)?;
         data.op_set_input(op, newvn, 0).expect("RuleLoadVarnode: opSetInput");
         data.op_remove_input(op, 1);
         set_opcode(data, op, OpCode::CPUI_COPY);
@@ -287,7 +287,7 @@ impl Rule for RuleLoadVarnode {
                 }
             }
         }
-        1
+        Ok(1)
     }
 }
 
@@ -327,10 +327,10 @@ impl Rule for RuleStoreVarnode {
         Some(Box::new(RuleStoreVarnode::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let (baseoff, offoff) = match RuleLoadVarnode::check_spacebase(data, op) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let size = size_of(data, in_vn(data, op, 2));
         let offoff = kuna_base::space::AddrSpace::address_to_byte(offoff, baseoff.get_word_size());
@@ -348,8 +348,8 @@ impl Rule for RuleStoreVarnode {
         if store_unmapped {
             data.scope_local_mark_not_mapped(&baseoff, offoff, size, false);
         }
-        super::kuna_storecopyeffects::collapse(data, op);
-        1
+        super::kuna_storecopyeffects::collapse(data, op)?;
+        Ok(1)
     }
 }
 
@@ -387,19 +387,19 @@ impl Rule for RuleSubExtComm {
         Some(Box::new(RuleSubExtComm::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let base = in_vn(data, op, 0);
         if !is_written(data, base) {
-            return 0;
+            return Ok(0);
         }
         let extop = def_of(data, base);
         let extcode = code(data, extop);
         if extcode != OpCode::CPUI_INT_ZEXT && extcode != OpCode::CPUI_INT_SEXT {
-            return 0;
+            return Ok(0);
         }
         let invn = in_vn(data, extop, 0);
         if is_free(data, invn) {
-            return 0;
+            return Ok(0);
         }
         let subcut = offset_of(data, in_vn(data, op, 1)) as int4;
         let outvn = out_vn(data, op);
@@ -411,11 +411,11 @@ impl Rule for RuleSubExtComm {
                 data.op_remove_input(op, 1);
                 set_opcode(data, op, OpCode::CPUI_COPY);
             }
-            return 1;
+            return Ok(1);
         }
 
         if subcut >= invn_size {
-            return 0;
+            return Ok(0);
         }
 
         let newvn;
@@ -436,7 +436,7 @@ impl Rule for RuleSubExtComm {
         data.op_remove_input(op, 1);
         set_opcode(data, op, extcode);
         data.op_set_input(op, newvn, 0).expect("RuleSubExtComm: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -459,15 +459,15 @@ impl RuleSubCommute {
     ///
     /// The output of an INT_ZEXT/INT_SEXT is replaced with a smaller/truncated
     /// Varnode; returns the new smaller Varnode.
-    pub fn shorten_extension(data: &mut Funcdata, ext_op: OpId, max_size: int4) -> VarnodeId {
+    pub fn shorten_extension(data: &mut Funcdata, ext_op: OpId, max_size: int4) -> kuna_base::error::KunaResult<VarnodeId> {
         let orig_out = out_vn(data, ext_op);
         let orig_size = size_of(data, orig_out);
         let mut addr = data.vbank().get(orig_out).expect("shorten_extension: stale out").get_addr().clone();
         if addr.is_big_endian() {
             addr = &addr + ((orig_size - max_size) as i64);
         }
-        data.op_unset_output(ext_op);
-        data.new_varnode_out_unlaned(max_size, &addr, ext_op).expect("newVarnodeOut")
+        data.op_unset_output(ext_op)?;
+        data.new_varnode_out_unlaned(max_size, &addr, ext_op)
     }
 
     /// \brief Eliminate input extensions on the given binary PcodeOp (C++
@@ -480,52 +480,52 @@ impl RuleSubCommute {
         sub_op: OpId,
         mut ext0_in: VarnodeId,
         mut ext1_in: VarnodeId,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         let max_size;
         let outvn = out_vn(data, longform);
         if data.lone_descend(outvn) != Some(sub_op) {
-            return false;
+            return Ok(false);
         }
         let e0sz = size_of(data, ext0_in);
         let e1sz = size_of(data, ext1_in);
         if e0sz == e1sz {
             max_size = e0sz;
             if is_free(data, ext0_in) {
-                return false;
+                return Ok(false);
             }
             if is_free(data, ext1_in) {
-                return false;
+                return Ok(false);
             }
         } else if e0sz < e1sz {
             max_size = e1sz;
             if is_free(data, ext1_in) {
-                return false;
+                return Ok(false);
             }
             let lin0 = in_vn(data, longform, 0);
             if data.lone_descend(lin0) != Some(longform) {
-                return false;
+                return Ok(false);
             }
             let ext0_def = def_of(data, lin0);
-            ext0_in = RuleSubCommute::shorten_extension(data, ext0_def, max_size);
+            ext0_in = RuleSubCommute::shorten_extension(data, ext0_def, max_size)?;
         } else {
             max_size = e0sz;
             if is_free(data, ext0_in) {
-                return false;
+                return Ok(false);
             }
             let lin1 = in_vn(data, longform, 1);
             if data.lone_descend(lin1) != Some(longform) {
-                return false;
+                return Ok(false);
             }
             let ext1_def = def_of(data, lin1);
-            ext1_in = RuleSubCommute::shorten_extension(data, ext1_def, max_size);
+            ext1_in = RuleSubCommute::shorten_extension(data, ext1_def, max_size)?;
         }
-        data.op_unset_output(longform);
+        data.op_unset_output(longform)?;
         // Truncated longform output.
         let outvn = data.new_unique_out_unlaned(max_size, longform).expect("newUniqueOut");
         data.op_set_input(longform, ext0_in, 0).expect("cancel_extensions: opSetInput");
         data.op_set_input(longform, ext1_in, 1).expect("cancel_extensions: opSetInput");
         data.op_set_input(sub_op, outvn, 0).expect("cancel_extensions: opSetInput");
-        true
+        Ok(true)
     }
 }
 
@@ -547,17 +547,17 @@ impl Rule for RuleSubCommute {
         Some(Box::new(RuleSubCommute::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let base = in_vn(data, op, 0);
         if !is_written(data, base) {
-            return 0;
+            return Ok(0);
         }
         let offset = offset_of(data, in_vn(data, op, 1)) as int4;
         let outvn = out_vn(data, op);
         {
             let ov = data.vbank().get(outvn).expect("RuleSubCommute: stale out");
             if ov.is_precis_lo() || ov.is_precis_hi() {
-                return 0;
+                return Ok(0);
             }
         }
         let insize = size_of(data, base);
@@ -569,7 +569,7 @@ impl Rule for RuleSubCommute {
             OpCode::CPUI_INT_LEFT => {
                 j = 1; // Special processing for shift amount param
                 if offset != 0 {
-                    return 0;
+                    return Ok(0);
                 }
                 let lin0 = in_vn(data, longform, 0);
                 if is_written(data, lin0) {
@@ -580,79 +580,79 @@ impl Rule for RuleSubCommute {
                                 data, op, longform, outsize,
                             );
                         if byte_cancellation.is_none() {
-                            return 0;
+                            return Ok(0);
                         }
                     }
                 } else {
-                    return 0;
+                    return Ok(0);
                 }
             }
             OpCode::CPUI_INT_REM | OpCode::CPUI_INT_DIV => {
                 // Only commutes if inputs are zero extended
                 if offset != 0 {
-                    return 0;
+                    return Ok(0);
                 }
                 let lin0 = in_vn(data, longform, 0);
                 if !is_written(data, lin0) {
-                    return 0;
+                    return Ok(0);
                 }
                 let zext0 = def_of(data, lin0);
                 if code(data, zext0) != OpCode::CPUI_INT_ZEXT {
-                    return 0;
+                    return Ok(0);
                 }
                 let zext0_in = in_vn(data, zext0, 0);
                 let lin1 = in_vn(data, longform, 1);
                 if is_written(data, lin1) {
                     let zext1 = def_of(data, lin1);
                     if code(data, zext1) != OpCode::CPUI_INT_ZEXT {
-                        return 0;
+                        return Ok(0);
                     }
                     let zext1_in = in_vn(data, zext1, 0);
                     if size_of(data, zext1_in) > outsize || size_of(data, zext0_in) > outsize {
                         // Special case: PARTIAL commute of the SUBPIECE
-                        if RuleSubCommute::cancel_extensions(data, longform, op, zext0_in, zext1_in) {
-                            return 1; // Leave SUBPIECE intact
+                        if RuleSubCommute::cancel_extensions(data, longform, op, zext0_in, zext1_in)? {
+                            return Ok(1); // Leave SUBPIECE intact
                         }
-                        return 0;
+                        return Ok(0);
                     }
                     // ZEXT sizes both not bigger -> commute SUBPIECE (fallthru)
                 } else if is_constant(data, lin1) && (size_of(data, zext0_in) <= outsize) {
                     let val = offset_of(data, lin1);
                     let smallval = val & calc_mask(outsize);
                     if val != smallval {
-                        return 0;
+                        return Ok(0);
                     }
                 } else {
-                    return 0;
+                    return Ok(0);
                 }
             }
             OpCode::CPUI_INT_SREM | OpCode::CPUI_INT_SDIV => {
                 // Only commutes if inputs are sign extended
                 if offset != 0 {
-                    return 0;
+                    return Ok(0);
                 }
                 let lin0 = in_vn(data, longform, 0);
                 if !is_written(data, lin0) {
-                    return 0;
+                    return Ok(0);
                 }
                 let sext0 = def_of(data, lin0);
                 if code(data, sext0) != OpCode::CPUI_INT_SEXT {
-                    return 0;
+                    return Ok(0);
                 }
                 let sext0_in = in_vn(data, sext0, 0);
                 let lin1 = in_vn(data, longform, 1);
                 if is_written(data, lin1) {
                     let sext1 = def_of(data, lin1);
                     if code(data, sext1) != OpCode::CPUI_INT_SEXT {
-                        return 0;
+                        return Ok(0);
                     }
                     let sext1_in = in_vn(data, sext1, 0);
                     if size_of(data, sext1_in) > outsize || size_of(data, sext0_in) > outsize {
                         // Special case: PARTIAL commute of the SUBPIECE
-                        if RuleSubCommute::cancel_extensions(data, longform, op, sext0_in, sext1_in) {
-                            return 1; // Leave SUBPIECE intact
+                        if RuleSubCommute::cancel_extensions(data, longform, op, sext0_in, sext1_in)? {
+                            return Ok(1); // Leave SUBPIECE intact
                         }
-                        return 0;
+                        return Ok(0);
                     }
                     // SEXT sizes both not bigger -> commute SUBPIECE (fallthru)
                 } else if is_constant(data, lin1) && (size_of(data, sext0_in) <= outsize) {
@@ -660,25 +660,25 @@ impl Rule for RuleSubCommute {
                     let mut smallval = val & calc_mask(outsize);
                     smallval = sign_extend_sized(smallval, outsize, insize);
                     if val != smallval {
-                        return 0;
+                        return Ok(0);
                     }
                 } else {
-                    return 0;
+                    return Ok(0);
                 }
             }
             OpCode::CPUI_INT_ADD => {
                 if offset != 0 {
-                    return 0; // Only commutes with least significant SUBPIECE
+                    return Ok(0); // Only commutes with least significant SUBPIECE
                 }
                 // Deconflict RulePtrArith
                 let lin0 = in_vn(data, longform, 0);
                 if data.vbank().get(lin0).expect("RuleSubCommute: stale lin0").is_spacebase() {
-                    return 0;
+                    return Ok(0);
                 }
             }
             OpCode::CPUI_INT_MULT => {
                 if offset != 0 {
-                    return 0; // Only commutes with least significant SUBPIECE
+                    return Ok(0); // Only commutes with least significant SUBPIECE
                 }
             }
             // Bitwise ops, type of subpiece doesn't matter
@@ -688,13 +688,13 @@ impl Rule for RuleSubCommute {
             | OpCode::CPUI_INT_OR => {}
             _ => {
                 // Most ops don't commute
-                return 0;
+                return Ok(0);
             }
         }
 
         // Make sure no other piece of base is getting used
         if data.lone_descend(base) != Some(op) {
-            return 0;
+            return Ok(0);
         }
 
         if offset == 0 {
@@ -704,14 +704,14 @@ impl Rule for RuleSubCommute {
                 if code(data, nextop) == OpCode::CPUI_INT_ZEXT
                     && size_of(data, out_vn(data, nextop)) == insize
                 {
-                    return 0;
+                    return Ok(0);
                 }
             }
         }
 
         if let Some(plan) = byte_cancellation {
             crate::p3_dataflow::kuna_cancelbytearithmetic::apply_cancellation(data, plan);
-            return 1;
+            return Ok(1);
         }
 
         let numinput = data.obank().get(longform).expect("RuleSubCommute: stale longform").num_input();
@@ -746,8 +746,8 @@ impl Rule for RuleSubCommute {
         }
         data.op_move_output(longform, outvn).expect("opSetOutput");
         // Get rid of old SUBPIECE
-        data.op_destroy(op);
-        1
+        data.op_destroy(op)?;
+        Ok(1)
     }
 }
 
@@ -785,14 +785,14 @@ impl Rule for RuleConcatCommute {
         Some(Box::new(RuleConcatCommute::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if crate::p3_dataflow::kuna_floatnegpiece::recover(data, op) {
-            return 1;
+            return Ok(1);
         }
         let outsz = size_of(data, out_vn(data, op));
         // FIXME precision for constants
         if outsz as usize > std::mem::size_of::<uintb>() {
-            return 0;
+            return Ok(0);
         }
         for i in 0..2i32 {
             let vn = in_vn(data, op, i);
@@ -855,9 +855,9 @@ impl Rule for RuleConcatCommute {
             let newvn_size = size_of(data, newvn);
             let cvn = data.new_constant(newvn_size, val);
             data.op_set_input(op, cvn, 1).expect("RuleConcatCommute: opSetInput");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -893,22 +893,22 @@ impl Rule for RuleConcatZext {
         Some(Box::new(RuleConcatZext::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut hi = in_vn(data, op, 0);
         if !is_written(data, hi) {
-            return 0;
+            return Ok(0);
         }
         let zextop = def_of(data, hi);
         if code(data, zextop) != OpCode::CPUI_INT_ZEXT {
-            return 0;
+            return Ok(0);
         }
         hi = in_vn(data, zextop, 0);
         let lo = in_vn(data, op, 1);
         if is_free(data, hi) {
-            return 0;
+            return Ok(0);
         }
         if is_free(data, lo) {
-            return 0;
+            return Ok(0);
         }
 
         // Create new (earlier) concat out of hi and lo
@@ -924,7 +924,7 @@ impl Rule for RuleConcatZext {
         data.op_remove_input(op, 1);
         data.op_set_input(op, newvn, 0).expect("RuleConcatZext: opSetInput");
         set_opcode(data, op, OpCode::CPUI_INT_ZEXT);
-        1
+        Ok(1)
     }
 }
 
@@ -969,27 +969,27 @@ impl Rule for RuleZextCommute {
         Some(Box::new(RuleZextCommute::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let zextvn = in_vn(data, op, 0);
         if !is_written(data, zextvn) {
-            return 0;
+            return Ok(0);
         }
         let zextop = def_of(data, zextvn);
         if code(data, zextop) != OpCode::CPUI_INT_ZEXT {
-            return 0;
+            return Ok(0);
         }
         let zextin = in_vn(data, zextop, 0);
         if is_free(data, zextin) {
-            return 0;
+            return Ok(0);
         }
         let savn = in_vn(data, op, 1);
         if !is_constant(data, savn) && is_free(data, savn) {
-            return 0;
+            return Ok(0);
         }
         let amount = data.vbank().get(savn).expect("RuleZextCommute: shift amount");
         let maximum = if amount.is_constant() { amount.get_offset() } else { amount.get_nz_mask() };
         if maximum >= Self::count_limit(data, size_of(data, zextin)) {
-            return 0;
+            return Ok(0);
         }
 
         let opaddr = addr_of(data, op);
@@ -1002,7 +1002,7 @@ impl Rule for RuleZextCommute {
         data.op_set_input(newop, zextin, 0).expect("RuleZextCommute: opSetInput");
         data.op_set_input(newop, savn, 1).expect("RuleZextCommute: opSetInput");
         data.op_insert_before(newop, op);
-        1
+        Ok(1)
     }
 }
 
@@ -1038,48 +1038,48 @@ impl Rule for RuleZextShiftZext {
         Some(Box::new(RuleZextShiftZext::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let invn = in_vn(data, op, 0);
         if !is_written(data, invn) {
-            return 0;
+            return Ok(0);
         }
         let shiftop = def_of(data, invn);
         if code(data, shiftop) == OpCode::CPUI_INT_ZEXT {
             // Check for ZEXT( ZEXT( a ) )
             let vn = in_vn(data, shiftop, 0);
             if is_free(data, vn) {
-                return 0;
+                return Ok(0);
             }
             // Only propagate if -op- is only use of -invn-
             if data.lone_descend(invn) != Some(op) {
-                return 0;
+                return Ok(0);
             }
             data.op_set_input(op, vn, 0).expect("RuleZextShiftZext: opSetInput");
-            return 1;
+            return Ok(1);
         }
         if code(data, shiftop) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         if !is_constant(data, in_vn(data, shiftop, 1)) {
-            return 0;
+            return Ok(0);
         }
         let sin0 = in_vn(data, shiftop, 0);
         if !is_written(data, sin0) {
-            return 0;
+            return Ok(0);
         }
         let zext2op = def_of(data, sin0);
         if code(data, zext2op) != OpCode::CPUI_INT_ZEXT {
-            return 0;
+            return Ok(0);
         }
         let rootvn = in_vn(data, zext2op, 0);
         if is_free(data, rootvn) {
-            return 0;
+            return Ok(0);
         }
 
         let sa = offset_of(data, in_vn(data, shiftop, 1));
         let zext2_out_size = size_of(data, out_vn(data, zext2op));
         if sa > 8 * ((zext2_out_size - size_of(data, rootvn)) as uintb) {
-            return 0; // Shift might lose bits off the top
+            return Ok(0); // Shift might lose bits off the top
         }
         let opaddr = addr_of(data, op);
         let newop = data.new_op(1, opaddr);
@@ -1091,7 +1091,7 @@ impl Rule for RuleZextShiftZext {
         let cvn = data.new_constant(4, sa);
         data.op_insert_input(op, cvn, 1).expect("RuleZextShiftZext: opInsertInput");
         data.op_insert_before(newop, op);
-        1
+        Ok(1)
     }
 }
 
@@ -1128,27 +1128,27 @@ impl Rule for RuleShiftAnd {
         Some(Box::new(RuleShiftAnd::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let cvn = in_vn(data, op, 1);
         if !is_constant(data, cvn) {
-            return 0;
+            return Ok(0);
         }
         let shiftin = in_vn(data, op, 0);
         if !is_written(data, shiftin) {
-            return 0;
+            return Ok(0);
         }
         let andop = def_of(data, shiftin);
         if code(data, andop) != OpCode::CPUI_INT_AND {
-            return 0;
+            return Ok(0);
         }
         let maskvn = in_vn(data, andop, 1);
         if !is_constant(data, maskvn) {
-            return 0;
+            return Ok(0);
         }
         let mut mask = offset_of(data, maskvn);
         let invn = in_vn(data, andop, 0);
         if is_free(data, invn) {
-            return 0;
+            return Ok(0);
         }
 
         let mut opc = code(data, op);
@@ -1159,12 +1159,12 @@ impl Rule for RuleShiftAnd {
             // Make sure the multiply is really a shift
             sa = leastsigbit_set(offset_of(data, cvn));
             if sa <= 0 {
-                return 0;
+                return Ok(0);
             }
             let mut testval: uintb = 1;
             testval <<= sa as u32;
             if testval != offset_of(data, cvn) {
-                return 0;
+                return Ok(0);
             }
             opc = OpCode::CPUI_INT_LEFT; // Treat CPUI_INT_MULT as CPUI_INT_LEFT
         }
@@ -1185,11 +1185,11 @@ impl Rule for RuleShiftAnd {
             mask &= fullmask;
         }
         if (mask & nzm) != nzm {
-            return 0;
+            return Ok(0);
         }
         // Bypass the INT_AND
         data.op_set_input(op, invn, 0).expect("RuleShiftAnd: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -1225,13 +1225,13 @@ impl Rule for RuleConcatZero {
         Some(Box::new(RuleConcatZero::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = in_vn(data, op, 1);
         if !is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         if offset_of(data, in1) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         let sa = 8 * size_of(data, in1);
@@ -1246,7 +1246,7 @@ impl Rule for RuleConcatZero {
         data.op_set_input(op, cvn, 1).expect("RuleConcatZero: opSetInput");
         data.op_set_input(newop, highvn, 0).expect("RuleConcatZero: opSetInput");
         data.op_insert_before(newop, op);
-        1
+        Ok(1)
     }
 }
 
@@ -1283,43 +1283,43 @@ impl Rule for RuleConcatLeftShift {
         Some(Box::new(RuleConcatLeftShift::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn2 = in_vn(data, op, 1);
         if !is_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let shiftop = def_of(data, vn2);
         if code(data, shiftop) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         let shift_sa = in_vn(data, shiftop, 1);
         if !is_constant(data, shift_sa) {
-            return 0; // Must be a constant shift
+            return Ok(0); // Must be a constant shift
         }
         let mut sa = offset_of(data, shift_sa) as int4;
         if (sa & 7) != 0 {
-            return 0; // Not a multiple of 8
+            return Ok(0); // Not a multiple of 8
         }
         let tmpvn = in_vn(data, shiftop, 0);
         if !is_written(data, tmpvn) {
-            return 0;
+            return Ok(0);
         }
         let zextop = def_of(data, tmpvn);
         if code(data, zextop) != OpCode::CPUI_INT_ZEXT {
-            return 0;
+            return Ok(0);
         }
         let b = in_vn(data, zextop, 0);
         if is_free(data, b) {
-            return 0;
+            return Ok(0);
         }
         let vn1 = in_vn(data, op, 0);
         if is_free(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         sa /= 8; // bits to bytes
         // Must shift to most sig boundary
         if sa + size_of(data, b) != size_of(data, tmpvn) {
-            return 0;
+            return Ok(0);
         }
 
         let opaddr = addr_of(data, op);
@@ -1333,7 +1333,7 @@ impl Rule for RuleConcatLeftShift {
         let csize = size_of(data, out_vn(data, op)) - size_of(data, newout);
         let cvn = data.new_constant(csize, 0);
         data.op_set_input(op, cvn, 1).expect("RuleConcatLeftShift: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -1371,10 +1371,10 @@ impl Rule for RuleSubZext {
         Some(Box::new(RuleSubZext::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let subvn = in_vn(data, op, 0);
         if !is_written(data, subvn) {
-            return 0;
+            return Ok(0);
         }
         let mut subop = def_of(data, subvn);
         let outvn = out_vn(data, op);
@@ -1382,20 +1382,20 @@ impl Rule for RuleSubZext {
         if code(data, subop) == OpCode::CPUI_SUBPIECE {
             let basevn = in_vn(data, subop, 0);
             if is_free(data, basevn) {
-                return 0;
+                return Ok(0);
             }
             // Truncating then extending to same size
             if size_of(data, basevn) != out_size {
-                return 0;
+                return Ok(0);
             }
             if size_of(data, basevn) as usize > std::mem::size_of::<uintb>() {
-                return 0;
+                return Ok(0);
             }
             let sub_in1 = in_vn(data, subop, 1);
             if offset_of(data, sub_in1) != 0 {
                 // If truncating from middle: there must be no other use of subvn
                 if data.lone_descend(subvn) != Some(op) {
-                    return 0;
+                    return Ok(0);
                 }
                 let basesize = size_of(data, basevn);
                 let newvn = data.new_unique(basesize, None);
@@ -1415,34 +1415,34 @@ impl Rule for RuleSubZext {
             let constvn = data.new_constant(basesize, val);
             set_opcode(data, op, OpCode::CPUI_INT_AND);
             data.op_insert_input(op, constvn, 1).expect("RuleSubZext: opInsertInput");
-            return 1;
+            return Ok(1);
         } else if code(data, subop) == OpCode::CPUI_INT_RIGHT {
             let shiftop = subop;
             let shift_sa = in_vn(data, shiftop, 1);
             if !is_constant(data, shift_sa) {
-                return 0;
+                return Ok(0);
             }
             let midvn = in_vn(data, shiftop, 0);
             if !is_written(data, midvn) {
-                return 0;
+                return Ok(0);
             }
             subop = def_of(data, midvn);
             if code(data, subop) != OpCode::CPUI_SUBPIECE {
-                return 0;
+                return Ok(0);
             }
             let basevn = in_vn(data, subop, 0);
             if is_free(data, basevn) {
-                return 0;
+                return Ok(0);
             }
             // Truncating then extending to same size
             if size_of(data, basevn) != out_size {
-                return 0;
+                return Ok(0);
             }
             if data.lone_descend(midvn) != Some(shiftop) {
-                return 0;
+                return Ok(0);
             }
             if data.lone_descend(subvn) != Some(op) {
-                return 0;
+                return Ok(0);
             }
             let val = calc_mask(size_of(data, midvn)); // Mask based on truncated size
             let sa = offset_of(data, in_vn(data, shiftop, 1)); // shift shrinks the mask
@@ -1463,9 +1463,9 @@ impl Rule for RuleSubZext {
             let constvn = data.new_constant(basesize, val);
             set_opcode(data, op, OpCode::CPUI_INT_AND); // Turn the ZEXT into an AND
             data.op_insert_input(op, constvn, 1).expect("RuleSubZext: opInsertInput");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1504,10 +1504,10 @@ impl Rule for RuleSubCancel {
         Some(Box::new(RuleSubCancel::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let base = in_vn(data, op, 0);
         if !is_written(data, base) {
-            return 0;
+            return Ok(0);
         }
         let extop = def_of(data, base);
         let mut opc = code(data, extop);
@@ -1515,7 +1515,7 @@ impl Rule for RuleSubCancel {
             && opc != OpCode::CPUI_INT_SEXT
             && opc != OpCode::CPUI_INT_AND
         {
-            return 0;
+            return Ok(0);
         }
         let offset = offset_of(data, in_vn(data, op, 1)) as int4;
         let outsize = size_of(data, out_vn(data, op));
@@ -1526,10 +1526,10 @@ impl Rule for RuleSubCancel {
                 let thruvn = in_vn(data, extop, 0);
                 if !is_free(data, thruvn) {
                     data.op_set_input(op, thruvn, 0).expect("RuleSubCancel: opSetInput");
-                    return 1;
+                    return Ok(1);
                 }
             }
-            return 0;
+            return Ok(0);
         }
         let insize = size_of(data, base);
         let farinsize = size_of(data, in_vn(data, extop, 0));
@@ -1549,7 +1549,7 @@ impl Rule for RuleSubCancel {
                     let toff = offset_of(data, thruvn);
                     thruvn = data.new_constant(tsize, toff); // with new constant varnode
                 } else {
-                    return 0; // original is constant or undefined: don't proceed
+                    return Ok(0); // original is constant or undefined: don't proceed
                 }
             } else if outsize == farinsize {
                 opc = OpCode::CPUI_COPY; // Total elimination of extension
@@ -1562,7 +1562,7 @@ impl Rule for RuleSubCancel {
             thruvn = data.new_constant(outsize, 0);
         } else {
             // Missing one case here
-            return 0;
+            return Ok(0);
         }
 
         set_opcode(data, op, opc); // SUBPIECE <- EXT replaced with one op
@@ -1571,7 +1571,7 @@ impl Rule for RuleSubCancel {
         if opc != OpCode::CPUI_SUBPIECE {
             data.op_remove_input(op, 1); // ZEXT, SEXT, or COPY has only 1 input
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1607,40 +1607,40 @@ impl Rule for RuleShiftSub {
         Some(Box::new(RuleShiftSub::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in0 = in_vn(data, op, 0);
         if !is_written(data, in0) {
-            return 0;
+            return Ok(0);
         }
         let shiftop = def_of(data, in0);
         if code(data, shiftop) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         let sa = in_vn(data, shiftop, 1);
         if !is_constant(data, sa) {
-            return 0;
+            return Ok(0);
         }
         let n = offset_of(data, sa) as int4;
         if (n & 7) != 0 {
-            return 0; // Must shift by a multiple of 8 bits
+            return Ok(0); // Must shift by a multiple of 8 bits
         }
         let mut c = offset_of(data, in_vn(data, op, 1)) as int4;
         let vn = in_vn(data, shiftop, 0);
         if is_free(data, vn) {
-            return 0;
+            return Ok(0);
         }
         let insize = size_of(data, vn);
         let outsize = size_of(data, out_vn(data, op));
         c -= n / 8;
         // natural truncation?
         if c < 0 || c + outsize > insize {
-            return 0;
+            return Ok(0);
         }
         data.op_set_input(op, vn, 0).expect("RuleShiftSub: opSetInput");
         let csize = size_of(data, in_vn(data, op, 1));
         let cvn = data.new_constant(csize, c as uintb);
         data.op_set_input(op, cvn, 1).expect("RuleShiftSub: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -1676,27 +1676,27 @@ impl Rule for RuleHumptyDumpty {
         Some(Box::new(RuleHumptyDumpty::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = in_vn(data, op, 0);
         if !is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let sub1 = def_of(data, vn1);
         if code(data, sub1) != OpCode::CPUI_SUBPIECE {
-            return 0; // from piece1
+            return Ok(0); // from piece1
         }
         let vn2 = in_vn(data, op, 1);
         if !is_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let sub2 = def_of(data, vn2);
         if code(data, sub2) != OpCode::CPUI_SUBPIECE {
-            return 0; // from piece2
+            return Ok(0); // from piece2
         }
 
         let root = in_vn(data, sub1, 0);
         if root != in_vn(data, sub2, 0) {
-            return 0; // pieces of the same whole
+            return Ok(0); // pieces of the same whole
         }
 
         let pos1 = offset_of(data, in_vn(data, sub1, 1));
@@ -1706,7 +1706,7 @@ impl Rule for RuleHumptyDumpty {
 
         // Pieces do not match up
         if pos1 != pos2 + (size2 as uintb) {
-            return 0;
+            return Ok(0);
         }
 
         // Pieced together whole thing
@@ -1722,7 +1722,7 @@ impl Rule for RuleHumptyDumpty {
             data.op_set_input(op, cvn, 1).expect("RuleHumptyDumpty: opSetInput");
             set_opcode(data, op, OpCode::CPUI_SUBPIECE);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1761,14 +1761,14 @@ impl Rule for RuleDumptyHump {
         Some(Box::new(RuleDumptyHump::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let base = in_vn(data, op, 0);
         if !is_written(data, base) {
-            return 0;
+            return Ok(0);
         }
         let pieceop = def_of(data, base);
         if code(data, pieceop) != OpCode::CPUI_PIECE {
-            return 0;
+            return Ok(0);
         }
         let mut offset = offset_of(data, in_vn(data, op, 1)) as int4;
         let outsize = size_of(data, out_vn(data, op));
@@ -1780,7 +1780,7 @@ impl Rule for RuleDumptyHump {
         if offset < size_of(data, vn2) {
             // Sub draws from vn2
             if offset + outsize > size_of(data, vn2) {
-                return 0; // Also from vn1
+                return Ok(0); // Also from vn1
             }
             vn = vn2;
         } else {
@@ -1790,7 +1790,7 @@ impl Rule for RuleDumptyHump {
         }
 
         if is_free(data, vn) && !is_constant(data, vn) {
-            return 0;
+            return Ok(0);
         }
         if (offset == 0) && (outsize == size_of(data, vn)) {
             // Eliminate SUB and CONCAT altogether
@@ -1803,7 +1803,7 @@ impl Rule for RuleDumptyHump {
             let cvn = data.new_constant(4, offset as uintb);
             data.op_set_input(op, cvn, 1).expect("RuleDumptyHump: opSetInput");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1840,22 +1840,22 @@ impl Rule for RuleHumptyOr {
         Some(Box::new(RuleHumptyOr::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = in_vn(data, op, 0);
         if !is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let vn2 = in_vn(data, op, 1);
         if !is_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let and1 = def_of(data, vn1);
         if code(data, and1) != OpCode::CPUI_INT_AND {
-            return 0;
+            return Ok(0);
         }
         let and2 = def_of(data, vn2);
         if code(data, and2) != OpCode::CPUI_INT_AND {
-            return 0;
+            return Ok(0);
         }
         let mut a = in_vn(data, and1, 0);
         let mut b = in_vn(data, and1, 1);
@@ -1875,7 +1875,7 @@ impl Rule for RuleHumptyOr {
             b = a;
             a = d;
         } else {
-            return 0;
+            return Ok(0);
         }
         // Reaching here: a matches across both ANDs; b and c are the other params.
         // a is not free (>= two references).
@@ -1896,18 +1896,18 @@ impl Rule for RuleHumptyOr {
             }
         } else {
             if !data.vbank().get(b).expect("RuleHumptyOr: stale b").is_heritage_known() {
-                return 0;
+                return Ok(0);
             }
             if !data.vbank().get(c).expect("RuleHumptyOr: stale c").is_heritage_known() {
-                return 0;
+                return Ok(0);
             }
             let a_mask = nzmask_of(data, a);
             // RuleAndDistribute would reverse us
             if (nzmask_of(data, b) & a_mask) == 0 {
-                return 0;
+                return Ok(0);
             }
             if (nzmask_of(data, c) & a_mask) == 0 {
-                return 0;
+                return Ok(0);
             }
             let opaddr = addr_of(data, op);
             let new_or_op = data.new_op(2, opaddr);
@@ -1920,7 +1920,7 @@ impl Rule for RuleHumptyOr {
             data.op_set_input(op, or_vn, 1).expect("RuleHumptyOr: opSetInput");
             set_opcode(data, op, OpCode::CPUI_INT_AND);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1963,19 +1963,19 @@ impl Rule for RuleSwitchSingle {
         Some(Box::new(RuleSwitchSingle::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let bb = match data.obank().get(op).expect("RuleSwitchSingle: stale op").get_parent() {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
         if data.bblocks_ref().block(bb).size_out() != 1 {
-            return 0;
+            return Ok(0);
         }
         //   -- STUB(W?-jumptable): findJumpTable + JumpTable accessors + newCodeRef
         //   + removeJumpTable + getStructure().clear() + warningHeader unported.
         //   The remaining body (label scan, BRANCHIND->BRANCH conversion) is
         //   transcribed in the C++ but unreachable until the jumptable surface lands.
-        0
+        Ok(0)
     }
 }
 
@@ -2020,12 +2020,12 @@ impl Rule for RuleCondNegate {
         Some(Box::new(RuleCondNegate::new()))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !data.obank().get(op).expect("RuleCondNegate: stale op").is_boolean_flip() {
-            return 0;
+            return Ok(0);
         }
         if data.op_normalize_flip(op).expect("RuleCondNegate: opNormalizeFlip") {
-            return 1;
+            return Ok(1);
         }
 
         let vn = in_vn(data, op, 1);
@@ -2041,7 +2041,7 @@ impl Rule for RuleCondNegate {
         //   boolean_flip so the rule does not re-fire — the oscillation fix).
         data.op_flip_condition(op);
         let _ = seqnum_of(data, op); // keep the op-read helper in scope (no-op)
-        1
+        Ok(1)
     }
 }
 

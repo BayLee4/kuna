@@ -158,11 +158,11 @@ fn w7_s37_stub_bodies_are_total_noops_under_repetition() {
     // Realize the one live body first so the stubs run against a "hot" Funcdata.
     let mut assign = ActionAssignHigh::boxed("merge");
     assert!(!fd.is_high_on());
-    assert_eq!(assign.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(assign.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert_eq!(assign.base().count, 0, "setHighLevel signals no change (C++ return 0)");
     assert!(fd.is_high_on(), "high layer on after assignhigh");
     // Idempotent: re-apply changes nothing and never signals.
-    assert_eq!(assign.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(assign.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert_eq!(assign.base().count, 0);
     assert!(fd.is_high_on());
 
@@ -184,7 +184,7 @@ fn w7_s37_stub_bodies_are_total_noops_under_repetition() {
     let high_before = fd.is_high_on();
     for act in &mut stubs {
         for _ in 0..5 {
-            let r = act.apply(&mut fd, &mut ctx);
+            let r = act.apply(&mut fd, &mut ctx).unwrap();
             assert_eq!(r, 0, "{} stub must return 0", act.get_name());
         }
         assert_eq!(
@@ -234,7 +234,7 @@ fn w7_s37_clone_filtered_group_filter_and_independence() {
     assert_eq!(cl.get_group(), "merge");
     let mut fd = build_fd();
     let mut ctx = ActionContext::new();
-    let _ = cl.apply(&mut fd, &mut ctx); // assignhigh signals 0 anyway, but mutate the clone path
+    let _ = cl.apply(&mut fd, &mut ctx).unwrap(); // assignhigh signals 0 anyway, but mutate the clone path
     cl.base_mut().count += 7; // forcibly diverge the clone's state
     assert_eq!(cl.base().count, 7);
     assert_eq!(orig.base().count, 0, "clone state must not leak back to the original");

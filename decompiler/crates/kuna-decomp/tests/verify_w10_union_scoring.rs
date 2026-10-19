@@ -95,7 +95,7 @@ fn new_op_code(fd: &mut Funcdata, inputs: int4, opc: OpCode, name: &str) -> OpId
 fn wire_input(fd: &mut Funcdata, op: OpId, slot: int4, off: u64, size: int4, ty: Rc<Datatype>) -> VarnodeId {
     let r = ram(fd);
     let m = Address::new(r, off);
-    let vn = fd.new_varnode(size, &m, Some(ty));
+    let vn = fd.new_varnode(size, &m, Some(ty)).unwrap();
     fd.op_set_input(op, vn, slot).unwrap();
     vn
 }

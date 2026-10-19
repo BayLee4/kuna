@@ -1265,18 +1265,19 @@ pub fn seed(arch: &Architecture, data: &mut Funcdata) {
 /// and the function a return trial there, when no op of the function names it:
 /// heritage registers a return trial only for a range some op reads or writes,
 /// and `call g; ret` names no return register at all.
-pub fn plant(data: &mut Funcdata) {
+pub fn plant(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     if data.get_func_proto().is_output_locked() || data.get_active_output().is_none() {
-        return;
+        return Ok(());
     }
     for (addr, size) in data.kuna_forced_return().to_vec() {
-        plant_piece(data, addr, size);
+        plant_piece(data, addr, size)?;
     }
+    Ok(())
 }
 
-pub(crate) fn plant_piece(data: &mut Funcdata, addr: Address, size: int4) {
+pub(crate) fn plant_piece(data: &mut Funcdata, addr: Address, size: int4) -> kuna_base::error::KunaResult<()> {
     if crate::p4_calls::kuna_passthrough::suppresses_return_trial(data, &addr, size) || touched_beyond(data, &addr, size) {
-        return;
+        return Ok(());
     }
     let rets: Vec<crate::context::OpId> = data
         .obank()
@@ -1285,13 +1286,13 @@ pub(crate) fn plant_piece(data: &mut Funcdata, addr: Address, size: int4) {
         .collect();
     let nins: Vec<int4> = rets.iter().filter_map(|&r| data.obank().get(r).map(|o| o.num_input())).collect();
     if rets.is_empty() || nins.len() != rets.len() || nins.iter().any(|&n| n != nins[0]) {
-        return;
+        return Ok(());
     }
     let slot = nins[0];
     for &r in &rets {
-        let vn = data.new_varnode(size, &addr, None);
+        let vn = data.new_varnode(size, &addr, None)?;
         if data.op_insert_input(r, vn, slot).is_err() {
-            return;
+            return Ok(());
         }
     }
     if let Some(active) = data.get_active_output_mut() {
@@ -1300,6 +1301,7 @@ pub(crate) fn plant_piece(data: &mut Funcdata, addr: Address, size: int4) {
         active.get_trial_mut(t).set_slot(slot);
     }
     data.kuna_note_forced_return_planted(addr, size);
+    Ok(())
 }
 
 /// Does a Varnode of the function share a byte with `[addr, addr+size)` and
@@ -1353,9 +1355,9 @@ pub fn score_forced(
     active: &mut crate::fspec::ParamActive,
     return_ops: &[crate::context::OpId],
     maxancestor: int4,
-) {
+) -> kuna_base::error::KunaResult<()> {
     if data.kuna_forced_return().is_empty() {
-        return;
+        return Ok(());
     }
     let live: Vec<crate::context::OpId> = return_ops
         .iter()
@@ -1371,9 +1373,10 @@ pub fn score_forced(
             break;
         }
         for i in 0..active.get_num_trials() {
-            score_trial(data, active, i, anchored, &live, maxancestor);
+            score_trial(data, active, i, anchored, &live, maxancestor)?;
         }
     }
+    Ok(())
 }
 
 /// After the model has mapped the return trials, keep a forced return whole or
@@ -1445,7 +1448,7 @@ fn score_trial(
     anchored: bool,
     live: &[crate::context::OpId],
     maxancestor: int4,
-) -> bool {
+) -> kuna_base::error::KunaResult<bool> {
     let (addr, size, slot) = {
         let t = active.get_trial(i);
         (t.get_address().clone(), t.get_size(), t.get_slot())
@@ -1455,7 +1458,7 @@ fn score_trial(
         || live.is_empty()
         || read_width(data, &addr, size).is_some() != anchored
     {
-        return false;
+        return Ok(false);
     }
     let mut width = read_width(data, &addr, size).unwrap_or(size);
     for &r in live {
@@ -1475,10 +1478,10 @@ fn score_trial(
                 }
             }
         }
-        return false;
+        return Ok(false);
     }
     if hands_on_unstated(data, &addr, size, width, live, slot) || merges_in_pieces(data, live, slot) {
-        return false;
+        return Ok(false);
     }
     let every = live.iter().all(|&r| {
         let Some(vn) = data.obank().get(r).and_then(|o| o.get_in(slot)) else { return false };
@@ -1493,11 +1496,11 @@ fn score_trial(
         data.kuna_set_forced_scoring(false);
         only
     });
-    if !every || (width < size && !narrow(data, active, i, live, slot, width)) {
-        return false;
+    if !every || (width < size && !narrow(data, active, i, live, slot, width)?) {
+        return Ok(false);
     }
     active.get_trial_mut(i).mark_active();
-    true
+    Ok(true)
 }
 
 /// Does a live RETURN read the trial as pieces that each merge on their own?
@@ -1892,7 +1895,7 @@ fn narrow(
     live: &[crate::context::OpId],
     slot: int4,
     width: int4,
-) -> bool {
+) -> kuna_base::error::KunaResult<bool> {
     let (addr, size) = {
         let t = active.get_trial(i);
         (t.get_address().clone(), t.get_size())
@@ -1901,15 +1904,15 @@ fn narrow(
     if !active.test_shrink(i, &low, width)
         || data.get_func_proto().characterize_as_output(&low, width) != crate::fspec::Containment::ContainsJustified
     {
-        return false;
+        return Ok(false);
     }
     for &r in live {
         let Some((vn, at)) = data.obank().get(r).and_then(|o| Some((o.get_in(slot)?, o.get_addr().clone()))) else {
-            return false;
+            return Ok(false);
         };
         let op = data.new_op(2, at);
         data.op_set_opcode_code(op, kuna_num::opcodes::OpCode::CPUI_SUBPIECE);
-        let Ok(out) = data.new_varnode_out(width, &low, op) else { return false };
+        let out = data.new_varnode_out(width, &low, op)?;
         if let Some(v) = data.vbank_mut().get_mut(out) {
             v.set_write_mask();
         }
@@ -1920,7 +1923,7 @@ fn narrow(
         let _ = data.op_set_input(r, out, slot);
     }
     active.shrink(i, low, width);
-    true
+    Ok(true)
 }
 
 /// Is the return trial `[addr, addr+size)` on the storage the function's

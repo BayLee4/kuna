@@ -54,6 +54,7 @@ use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, intb, uint4, uint8, uintb, Wrap};
 
 use crate::dtype::{type_metatype, Datatype, TypeFactory};
+use crate::varnode::varnode_flags;
 
 // ===========================================================================
 // RangeType + RangeHint flag constants (varmap.hh:95-104)
@@ -947,8 +948,8 @@ pub struct ScopeLocal {
     /// typelocked Symbols, which do not survive `clearUnlockedCategory(-1)` at
     /// restructure — C++ collects them (`collectNameRecs`) and re-applies at
     /// naming time (`recoverNameRecommendationsForSymbols`, the mechanism that
-    /// makes a GUI rename of an untyped local persist).  kuna's ghidra-mode
-    /// seeds these directly from the host `<localdb>` answer.
+    /// makes a GUI rename of an untyped local persist). Source import collects
+    /// these before analysis can discard the unlocked mappings.
     name_recommend: Vec<NameRecommend>,
     /// Dynamic-storage name recommendations (C++ `list<DynamicRecommend>
     /// dynRecommend`, `varmap.hh:217`): the same identity carrier as
@@ -1130,13 +1131,13 @@ impl ScopeLocal {
     /// whatever its size, so a host's 8-byte local names the 16-byte array the
     /// restructure built over the same slot.
     pub fn recover_addrtied_name_recommendations(&mut self) {
-        let recs: Vec<(Address, int4, String)> = self
+        let recs: Vec<(Address, int4, String, u64)> = self
             .name_recommend
             .iter()
             .filter(|r| r.useaddr.is_invalid())
-            .map(|r| (r.addr.clone(), r.size, r.name.clone()))
+            .map(|r| (r.addr.clone(), r.size, r.name.clone(), r.symbol_id))
             .collect();
-        for (addr, size, name) in recs {
+        for (addr, size, name, symbol_id) in recs {
             let Some(eref) = self.db.find_overlap(self.scope, &addr, size) else { continue };
             let entry = self.db.entry(self.scope, eref);
             if *entry.get_addr() != addr {
@@ -1151,7 +1152,7 @@ impl ScopeLocal {
             }
             let unique = self.db.public_make_name_unique(self.scope, &name);
             if self.db.rename_symbol(sym, &unique).is_ok() {
-                self.db.set_attribute(sym, crate::varnode::varnode_flags::namelock);
+                self.restore_recommended_identity(sym, symbol_id);
             }
         }
     }
@@ -1188,6 +1189,104 @@ impl ScopeLocal {
     /// The local scope id within the owned database.
     pub fn scope_id(&self) -> crate::database::ScopeId {
         self.scope
+    }
+
+    pub(crate) fn seed_remote_symbol(
+        &mut self,
+        source: &crate::remote_provider::RemoteSymbolRecord,
+        working: Option<(int4, &dyn crate::fspec::ProtoParameter, &Address)>,
+    ) -> KunaResult<()> {
+        // A dynamic source parameter may declare the value without physical
+        // storage. Project only an assigned working carrier, before analysis;
+        // supplied physical mappings and ordinary dynamic locals stay intact.
+        let projection = match working {
+            Some((_, parameter, input_usepoint)) if source.category == 0
+                && source.entries.iter().all(|entry| entry.addr.is_invalid())
+                && parameter.get_type().is_some_and(|ty| ty.get_size() > 0) => {
+                let address = parameter.get_address();
+                if address.is_invalid() { None } else {
+                    let usepoint = self.parameter_usepoint(&address, parameter.get_size(), input_usepoint);
+                    Some((parameter, address, usepoint))
+                }
+            }
+            _ => None,
+        };
+        let sym = self.db.import_remote_symbol(self.scope, source, working.map(|(slot, _, _)| slot),
+            projection.as_ref().map(|(parameter, address, usepoint)| (*parameter, address, usepoint)))?;
+        let symbol = self.db.symbol(sym);
+        if symbol.get_category() < 0 && symbol.is_name_locked() && !symbol.is_type_locked() {
+            let entry = symbol.mapentry.iter().copied()
+                .map(|entry| self.db.entry(self.scope, entry))
+                .find(|entry| entry.get_offset() == 0);
+            if let Some(entry) = entry {
+                if entry.is_dynamic() {
+                    self.dyn_recommend.push(DynamicRecommend::new(
+                        entry.get_first_use_address(), entry.get_hash(),
+                        symbol.name.clone(), symbol.get_id(),
+                    ));
+                } else {
+                    self.name_recommend.push(NameRecommend::new(
+                        entry.get_addr().clone(), entry.get_first_use_address(), entry.get_size(),
+                        symbol.name.clone(), symbol.get_id(),
+                    ));
+                }
+                self.db.remove_symbol(sym);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_recommended_identity(&mut self, sym: crate::database::SymbolId, id: u64) {
+        if id != 0 {
+            self.db.symbol_mut(sym).symbol_id = id;
+        }
+        self.db.set_attribute(sym, crate::varnode::varnode_flags::namelock);
+    }
+
+    pub(crate) fn remap_symbol_dynamic(
+        &mut self,
+        sym: crate::database::SymbolId,
+        usepoint: &Address,
+        hash: uint8,
+    ) -> crate::database::SymbolEntry {
+        self.db.remap_symbol_dynamic(sym, usepoint, hash)
+    }
+
+    pub(crate) fn parameter_symbol(&self, index: int4) -> Option<crate::database::SymbolId> {
+        self.db.parameter_symbol(self.scope, index)
+    }
+
+    pub(crate) fn update_parameter_type(
+        &mut self,
+        sym: crate::database::SymbolId,
+        dtype: Rc<Datatype>,
+    ) -> KunaResult<()> {
+        if !self.db.symbol(sym).is_type_locked()
+            && self.db.symbol(sym).dtype.as_ref()
+                .is_some_and(|old| old.get_size() == dtype.get_size() && !Rc::ptr_eq(old, &dtype))
+        {
+            self.db.retype_symbol(sym, dtype)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_parameter_attributes(
+        &mut self,
+        sym: crate::database::SymbolId,
+        flags: uint4,
+        this_pointer: bool,
+    ) {
+        self.db.set_attribute(sym, flags);
+        if this_pointer {
+            self.db.symbol_mut(sym).dispflags |= crate::database::symbol_dispflags::IS_THIS_PTR;
+        }
+    }
+
+    pub(crate) fn reset_parameter_attributes(&mut self, sym: crate::database::SymbolId) {
+        let symbol = self.db.symbol_mut(sym);
+        symbol.flags &= !(varnode_flags::namelock | varnode_flags::typelock
+            | varnode_flags::indirectstorage | varnode_flags::hiddenretparm);
+        symbol.dispflags &= !crate::database::symbol_dispflags::IS_THIS_PTR;
     }
 
     /// Encode this scope as a `<localdb>` element (C++ `ScopeLocal::encode`,
@@ -1415,17 +1514,7 @@ impl ScopeLocal {
         // registers and the stack, or its whole-function piece entries link a
         // later write of one of its registers to a piece of the parameter.
         // `discover_scope` returns null for both, as in C++.
-        let restrict = addr.is_join()
-            || addr
-                .get_space()
-                .is_some_and(|s| s.get_type() == kuna_base::space::spacetype::IPTR_PROCESSOR);
-        let usepoint = if restrict
-            && self.db.discover_scope(self.scope, addr, ct.get_size(), &Address::new_invalid()).is_none()
-        {
-            restricted_usepoint.clone()
-        } else {
-            Address::new_invalid()
-        };
+        let usepoint = self.parameter_usepoint(addr, ct.get_size(), restricted_usepoint);
         let (sym, _eref) = self.db.add_symbol_mapped(self.scope, name, ct, addr, &usepoint)?;
         self.db.set_category(
             self.scope,
@@ -1434,6 +1523,16 @@ impl ScopeLocal {
             i,
         );
         Ok(Some(sym))
+    }
+
+    fn parameter_usepoint(&self, addr: &Address, size: int4, restricted_usepoint: &Address) -> Address {
+        let restrict = addr.is_join() || addr.get_space().is_some_and(|space|
+            space.get_type() == kuna_base::space::spacetype::IPTR_PROCESSOR);
+        if restrict && self.db.discover_scope(self.scope, addr, size, &Address::new_invalid()).is_none() {
+            restricted_usepoint.clone()
+        } else {
+            Address::new_invalid()
+        }
     }
 
     /// A reused stack local does not replace the incoming parameter symbol.

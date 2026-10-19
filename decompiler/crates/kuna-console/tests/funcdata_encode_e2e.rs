@@ -382,7 +382,7 @@ fn scripted_functions_preserve_ghidra_ast_and_markup_relationships() {
             "{stem}:{name} lost its required semantic operation {required_opcode:?}");
         let arch = data.conf.as_mut().unwrap().arch_mut();
         let mut printer = arch.take_print();
-        let markup = printer.doc_function_markup(fd, arch);
+        let markup = printer.doc_function_markup(fd, arch).unwrap();
         arch.put_print(printer);
         verify_markup(&ast, fd.get_arch().manage(), &markup, stem);
     }

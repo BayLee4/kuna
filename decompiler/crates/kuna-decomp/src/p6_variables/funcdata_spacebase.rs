@@ -45,7 +45,7 @@ impl Funcdata {
     /// it is the input it is typed as a pointer to the space.  A base register
     /// that is **already** marked and is defined by `INT_ADD` is split so a stale
     /// multi-descendant chain doesn't block promotion (`splitUses`).
-    pub fn spacebase(&mut self) {
+    pub fn spacebase(&mut self) -> kuna_base::error::KunaResult<()> {
         let numspaces = self.get_arch().manage().num_spaces();
         for j in 0..numspaces {
             let spc = match self.get_arch().manage().get_space(j) {
@@ -101,7 +101,7 @@ impl Funcdata {
                         if let Some(op) = def {
                             if self.obank().get(op).map(|o| o.code()) == Some(OpCode::CPUI_INT_ADD)
                             {
-                                self.split_uses(vn);
+                                self.split_uses(vn)?;
                             }
                         }
                     } else {
@@ -131,6 +131,7 @@ impl Funcdata {
                 }
             }
         }
+        Ok(())
     }
 
     /// C++ `TypePointer::isPtrsubMatching` (`type.cc:1260-1312`), with the
@@ -149,7 +150,7 @@ impl Funcdata {
         off: int8,
         extra: int8,
         multiplier: int8,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use crate::dtype::type_metatype;
         // Only the TYPE_PTR -> TYPE_SPACEBASE case needs scope resolution.
         if ptrtype.get_metatype() == type_metatype::TYPE_PTR {
@@ -159,34 +160,29 @@ impl Funcdata {
                     let (lm, types) =
                         match (self.get_scope_local(), self.get_arch().types_rc()) {
                             (Some(lm), Some(t)) => (lm, t),
-                            _ => return false,
+                            _ => return Ok(false),
                         };
                     let new_off =
                         kuna_base::space::AddrSpace::address_to_byte_int(off, word_size);
-                    let (sub_type, new_off2) =
-                        match lm.spacebase_get_sub_type(new_off, types.as_ref()) {
-                            Ok(r) => r,
-                            Err(_) => return false,
-                        };
+                    let (sub_type, new_off2) = lm.spacebase_get_sub_type(new_off, types.as_ref())?;
                     // subType is always Some here (TypeSpacebase::getSubType never
                     // returns null), so only newoff must be zero.
                     if new_off2 != 0 {
-                        return false;
+                        return Ok(false);
                     }
                     let extra_b =
                         kuna_base::space::AddrSpace::address_to_byte_int(extra, word_size);
                     if extra_b < 0 || extra_b >= sub_type.get_size() as i64 {
-                        match crate::dtype::Datatype::test_for_array_slack(&sub_type, extra_b) {
-                            Ok(true) => {}
-                            _ => return false,
+                        if !crate::dtype::Datatype::test_for_array_slack(&sub_type, extra_b)? {
+                            return Ok(false);
                         }
                     }
-                    return true;
+                    return Ok(true);
                 }
             }
         }
         // Non-spacebase: the pure method is fully faithful.
-        ptrtype.is_ptrsub_matching(off, extra, multiplier).unwrap_or(false)
+        ptrtype.is_ptrsub_matching(off, extra, multiplier)
     }
 
     /// C++ `TypeSpacebase::getSubType` (`type.cc:3411-3433`), resolved against the
@@ -210,15 +206,15 @@ impl Funcdata {
         &self,
         sb_type: &Rc<crate::dtype::Datatype>,
         off: int8,
-    ) -> Option<(Rc<crate::dtype::Datatype>, int8)> {
+    ) -> kuna_base::error::KunaResult<Option<(Rc<crate::dtype::Datatype>, int8)>> {
         use crate::dtype::type_metatype;
-        let (spaceid, localframe) = sb_type.spacebase_parts()?;
-        let spaceid = spaceid?;
-        let types = self.get_arch().types_rc()?;
+        let Some((spaceid, localframe)) = sb_type.spacebase_parts() else { return Ok(None) };
+        let Some(spaceid) = spaceid else { return Ok(None) };
+        let Some(types) = self.get_arch().types_rc() else { return Ok(None) };
         // Local-frame spacebase: getMap() -> the owning function's ScopeLocal.
         if !localframe.is_invalid() {
-            let lm = self.get_scope_local()?;
-            return lm.spacebase_get_sub_type(off, types.as_ref()).ok();
+            let Some(lm) = self.get_scope_local() else { return Ok(None) };
+            return lm.spacebase_get_sub_type(off, types.as_ref()).map(Some);
         }
         // Global spacebase: getMap() -> the global scope (the GlobalQuery snapshot).
         // addrOff = byteToAddress(off, wordSize); addr = resolveConstant(spaceid,
@@ -229,61 +225,60 @@ impl Funcdata {
         let glb = Rc::clone(self.get_arch());
         let mut full_encoding: uintb = 0;
         let addr = glb
-            .resolve_constant(&spaceid, addr_off, -1, &null_point, &mut full_encoding)
-            .ok()?;
+            .resolve_constant(&spaceid, addr_off, -1, &null_point, &mut full_encoding)?;
         // smallest = scope->queryContainer(addr, 1, nullPoint).
-        match glb.query_container_global(&addr, 1, &null_point) {
+        Ok(Some(match glb.query_container_global(&addr, 1, &null_point)? {
             Some(entry) => {
                 // newoff = (addr - smallest.addr) + smallest.offset.
                 let newoff = (addr.get_offset().wrapping_sub(entry.entry_addr.get_offset())
                     as int8)
                     + entry.symbol_offset as int8;
                 match entry.symbol_type {
-                    Some(t) => Some((t, newoff)),
+                    Some(t) => (t, newoff),
                     // A Symbol with no snapshot type degrades to UNKNOWN(1) (the C++
                     // Symbol always has a type here).
-                    None => Some((types.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?, 0)),
+                    None => (types.get_base(1, type_metatype::TYPE_UNKNOWN)?, 0),
                 }
             }
             // No covering Symbol: *newoff = 0; return getBase(1, TYPE_UNKNOWN).
-            None => Some((types.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?, 0)),
-        }
+            None => (types.get_base(1, type_metatype::TYPE_UNKNOWN)?, 0),
+        }))
     }
 
     /// Make a clone of the defining op for every descendant after the first, so
     /// each descendant has its own copy (C++ `Funcdata::splitUses`).
     ///
     /// Dead-code actions remove the now-unused original op.
-    pub fn split_uses(&mut self, vn: VarnodeId) {
+    pub fn split_uses(&mut self, vn: VarnodeId) -> kuna_base::error::KunaResult<()> {
         let op = match self.vbank().get(vn).and_then(|v| v.get_def()) {
             Some(o) => o,
-            None => return,
+            None => return Ok(()),
         };
         let descend: Vec<OpId> = match self.vbank().get(vn) {
             Some(v) => v.descend_iter().collect(),
-            None => return,
+            None => return Ok(()),
         };
         if descend.len() < 2 {
-            return; // No descendants, or only one
+            return Ok(()); // No descendants, or only one
         }
         let numinput = match self.obank().get(op) {
             Some(o) => o.num_input(),
-            None => return,
+            None => return Ok(()),
         };
         let opaddr = match self.obank().get(op) {
             Some(o) => o.get_addr().clone(),
-            None => return,
+            None => return Ok(()),
         };
         let opcode = match self.obank().get(op) {
             Some(o) => o.code(),
-            None => return,
+            None => return Ok(()),
         };
         let vnsize = self.vbank().get(vn).map(|v| v.get_size()).unwrap_or(0);
         let vnaddr = self.vbank().get(vn).map(|v| v.get_addr().clone());
         let vntype = self.vbank().get(vn).map(|v| v.get_type().clone());
         let (vnaddr, vntype) = match (vnaddr, vntype) {
             (Some(a), Some(t)) => (a, t),
-            _ => return,
+            _ => return Ok(()),
         };
         // The op's input list (snapshot before cloning).
         let inputs: Vec<Option<VarnodeId>> = (0..numinput)
@@ -298,9 +293,9 @@ impl Funcdata {
             };
             // newop = newOp(numinput, opaddr); newvn = newVarnode(size, addr, type);
             let newop = self.new_op(numinput, opaddr.clone());
-            let newvn = self.new_varnode(vnsize, &vnaddr, Some(Rc::clone(&vntype)));
+            let newvn = self.new_varnode(vnsize, &vnaddr, Some(Rc::clone(&vntype)))?;
             // opSetOutput(newop, newvn);
-            let _ = self.op_set_output(newop, newvn);
+            self.op_set_output(newop, newvn)?;
             // opSetOpcode(newop, op->code());  -- the only opcode `spacebase`
             // splits is INT_ADD (binary | commutative; typeop.cc TypeOpIntAdd).
             self.op_set_opcode(
@@ -322,6 +317,7 @@ impl Funcdata {
             // opInsertBefore(newop, op);
             self.op_insert_before(newop, op);
         }
+        Ok(())
     }
 
     /// Locate the unique input Varnode that holds the incoming value of a
@@ -524,7 +520,7 @@ impl Funcdata {
     /// `markUnaliased`/`annotateRawStackPtr`) refines parameter and alias
     /// bookkeeping; the layout-creating core (gather + restructure) is realized
     /// here.
-    pub fn restructure_varnode(&mut self, aliasyes: bool) -> int4 {
+    pub fn restructure_varnode(&mut self, aliasyes: bool) -> kuna_base::error::KunaResult<int4> {
         use crate::varmap::MapState;
 
         // C++ `restructureVarnode` head (varmap.cc:1259): clear out the unlocked
@@ -552,13 +548,13 @@ impl Funcdata {
         // Guarded on a present proto store: a partial-clone / jump-table-recovery
         // Funcdata reaches restructure with no `ProtoStoreInternal` attached.
         if self.get_func_proto().has_store() {
-            self.link_proto_params();
+            self.link_proto_params()?;
         }
 
         let (space, local_range, param_range, default_unknown, bounds) = {
             let lm = match self.get_scope_local() {
                 Some(lm) => lm,
-                None => return 0,
+                None => return Ok(0),
             };
             let space = Rc::clone(lm.get_space_id());
             // MapState clears the proto's param range out of the analysis range;
@@ -568,12 +564,12 @@ impl Funcdata {
                 self.get_func_proto().param_range(self.get_arch().proto_ranges).clone();
             let types = match self.get_arch().types() {
                 Some(t) => t,
-                None => return 0,
+                None => return Ok(0),
             };
             let default_unknown = match types.get_base(1, crate::dtype::type_metatype::TYPE_UNKNOWN)
             {
                 Ok(t) => t,
-                Err(_) => return 0,
+                Err(error) => return Err(error),
             };
             let bounds = proto_boundaries(self.get_func_proto(), self.get_arch().proto_ranges);
             (space, rangetree, param_range, default_unknown, bounds)
@@ -612,7 +608,7 @@ impl Funcdata {
             self.record_cast_objects(declared);
         }
 
-        crate::kuna_stackviews::gather(self, &mut state, &space);
+        crate::kuna_stackviews::gather(self, &mut state, &space)?;
 
         super::kuna_stackstruct::coalesce(self, &mut state, &space);
 
@@ -667,7 +663,7 @@ impl Funcdata {
         // which is the only reader.  The config `Architecture` carrying that option
         // is not reachable from the per-function `ArchContext` seam here.
         self.record_frame_layout_pass(&space);
-        rebased
+        Ok(rebased)
     }
 
     /// (kuna `framelayout`) Snapshot the NO_CATEGORY stack Symbols this pass

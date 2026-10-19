@@ -67,7 +67,7 @@ mod storage {
     /// A global read: a persistent, address-tied varnode at `off`.
     fn glob(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let addr = Address::new(ram(fd), off);
-        let vn = fd.new_varnode(size, &addr, None);
+        let vn = fd.new_varnode(size, &addr, None).unwrap();
         fd.vbank_mut()
             .get_mut(vn)
             .unwrap()

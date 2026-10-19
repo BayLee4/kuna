@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Genuine javac/JVM analysis/injection/constant-pool/Java-rendering consumer."""
+"""Genuine JVM constant-pool consumers and executable Java null/default replay."""
+import hashlib
 import json
 import os
 import re
@@ -7,7 +8,82 @@ from pathlib import Path
 import subprocess
 import traceback
 
-from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra, test_cores
+
+
+def execute_null_methods(output, row, code):
+    """Consume the emitted bodies unchanged, including Java's boxing semantics."""
+    directory = output / (row["core"] + "-null-" + row["phase"])
+    directory.mkdir(parents=True, exist_ok=True)
+    methods = []
+    names = {}
+    row["signature_accommodations"] = []
+    for name, return_type, parameters in [
+        ("nil", r"(?:java\.lang\.)?Object", r"(?P<void>void)?"),
+        ("isNil", "boolean", r"(?:java\.lang\.)?Object\s+[A-Za-z_$][\w$]*"),
+    ]:
+        text = code[name]
+        signature = re.search(
+            r"(?m)^[ \t]*" + return_type +
+            r"\s+(?P<name>[A-Za-z_$][\w$]*)\s*\(\s*" + parameters + r"\s*\)",
+            text,
+        )
+        assert signature, (name, text)
+        names[name] = signature.group("name")
+        # Stock's inherited Java printer spells a zero-parameter method with
+        # C's `(void)`. Java 21 needs `()`. Only this signature token changes;
+        # the reference-valued return/comparison bodies must reach javac intact.
+        if name == "nil" and signature.group("void") is not None:
+            start, end = signature.span("void")
+            row["signature_accommodations"].append({
+                "method": name, "before": signature.group(),
+                "after": text[signature.start():start] + text[end:signature.end()],
+            })
+            text = text[:start] + text[end:]
+        methods.append(text)
+    consumer = f"""
+public static void main(String[] args) {{
+    Object value = new Object();
+    Object original = CpoolConsumers.nil();
+    boolean originalNull = CpoolConsumers.isNil(null);
+    boolean originalObject = CpoolConsumers.isNil(value);
+    RecoveredNull recovered = new RecoveredNull();
+    Object actual = recovered.{names["nil"]}();
+    boolean actualNull = recovered.{names["isNil"]}(null);
+    boolean actualObject = recovered.{names["isNil"]}(value);
+    System.out.println("original_nil=" + (original == null));
+    System.out.println("emitted_nil=" + (actual == null));
+    System.out.println("original_isNil_null=" + originalNull);
+    System.out.println("emitted_isNil_null=" + actualNull);
+    System.out.println("original_isNil_object=" + originalObject);
+    System.out.println("emitted_isNil_object=" + actualObject);
+    if (original != null || !originalNull || originalObject)
+        throw new AssertionError("original javac producer");
+    if (actual != null || !actualNull || actualObject)
+        throw new AssertionError("emitted reference-null semantics");
+}}
+"""
+    source = directory / "RecoveredNull.java"
+    source.write_text("public class RecoveredNull {\n" + "\n".join(methods) + consumer + "\n}\n")
+    row["consumer_source_sha256"] = hashlib.sha256(source.read_bytes()).hexdigest()
+    row["consumer_composition"] = (
+        "Emitted methods enclosed in one class and called as instance methods; "
+        "no static modifier or method-body changes. Only recorded nil(void) "
+        "signature accommodation is permitted."
+    )
+    row["consumer_commands"] = []
+    commands = [
+        [os.environ.get("JAVAC", "javac"), "-cp", str(output.resolve()),
+         "-d", str(directory), str(source)],
+        [os.environ.get("JAVA", "java"), "-cp",
+         os.pathsep.join([str(directory.resolve()), str(output.resolve())]), "RecoveredNull"],
+    ]
+    for command in commands:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        receipt = {"command": command, "exit": result.returncode,
+                   "stdout": result.stdout, "stderr": result.stderr}
+        row["consumer_commands"].append(receipt)
+        assert result.returncode == 0, receipt
 
 
 def main():
@@ -26,7 +102,7 @@ def main():
         from jpype import JArray, JByte, JLong
         from java.util import ArrayList
         from ghidra.app.decompiler import DecompInterface, DecompileOptions
-        from ghidra.program.model.data import Pointer
+        from ghidra.program.model.data import BooleanDataType, Pointer
         from ghidra.program.model.lang import InjectPayload
         from ghidra.program.model.lang import ConstantPool
         from ghidra.program.model.lang import DecompilerLanguage
@@ -50,6 +126,17 @@ def main():
                 matches = [fn for key, fn in functions.items() if key == name or key.startswith(name + "_")]
                 assert len(matches) == 1, (name, list(functions))
                 targets[name] = matches[0]
+            null_targets = {}
+            for name in ("nil", "isNil"):
+                matches = [fn for key, fn in functions.items() if key == name or key.startswith(name + "_")]
+                assert len(matches) == 1, (name, list(functions))
+                null_targets[name] = matches[0]
+            assert isinstance(null_targets["nil"].getReturnType(), Pointer)
+            assert isinstance(null_targets["isNil"].getReturnType(), BooleanDataType)
+            assert null_targets["nil"].getParameterCount() == 0
+            assert null_targets["isNil"].getParameterCount() == 1
+            assert isinstance(null_targets["isNil"].getParameter(0).getDataType(), Pointer)
+            null_source_before = {name: str(fn.getSignature()) for name, fn in null_targets.items()}
             setup = report["genuine_cpool_inputs"] = []
             for name, fn in targets.items():
                 operations = []
@@ -120,8 +207,8 @@ def main():
                 finally:
                     program.endTransaction(tx, True)
 
-            for core, executable in (("stock", None), ("kuna", KUNA_GHIDRA)):
-                with selected_core(executable):
+            for core in test_cores():
+                with selected_core(KUNA_GHIDRA if core == "kuna" else None):
                     interface = DecompInterface()
                     try:
                         options = DecompileOptions()
@@ -194,6 +281,56 @@ def main():
                         except Exception:
                             row["passed"] = False
                             row["failure"] = traceback.format_exc()
+                        # Keep the original six CPOOLREF producers and malformed
+                        # recovery above independent of this additional contract.
+                        # Default false is omitted by Java's sparse options;
+                        # replay must restore Java defaults, not C's numeric zero.
+                        for phase, language, null_token in [
+                            ("default_java", DecompilerLanguage.JAVA_LANGUAGE, False),
+                            ("explicit_null_on", DecompilerLanguage.JAVA_LANGUAGE, True),
+                            ("default_java_again", DecompilerLanguage.JAVA_LANGUAGE, False),
+                            ("default_c", DecompilerLanguage.C_LANGUAGE, False),
+                            ("java_after_c", DecompilerLanguage.JAVA_LANGUAGE, False),
+                        ]:
+                            row = {"core": core, "case": "reference_null_replay", "phase": phase,
+                                   "language": str(language), "java_null_option": null_token}
+                            report["rows"].append(row)
+                            try:
+                                if phase != "default_java":
+                                    replay = DecompileOptions()
+                                    replay.grabFromProgram(program)
+                                    replay.setDisplayLanguage(language)
+                                    replay.setNullToken(null_token)
+                                    assert interface.setOptions(replay)
+                                interface.flushCache()
+                                code = row["c"] = {}
+                                row["source_signatures"] = {}
+                                row["high_returns"] = {}
+                                for name, fn in null_targets.items():
+                                    result = interface.decompileFunction(fn, 60, monitor)
+                                    assert result.decompileCompleted(), str(result.getErrorMessage())
+                                    high = result.getHighFunction()
+                                    assert high is not None and result.getCCodeMarkup() is not None
+                                    returned = high.getFunctionPrototype().getReturnType()
+                                    assert_return_constraints(returned, fn.getReturnType())
+                                    row["high_returns"][name] = str(returned)
+                                    assert str(fn.getSignature()) == null_source_before[name]
+                                    row["source_signatures"][name] = str(fn.getSignature())
+                                    if name == "isNil":
+                                        parameter = high.getFunctionPrototype().getParam(0).getDataType()
+                                        assert_return_constraints(parameter, fn.getParameter(0).getDataType())
+                                    code[name] = str(result.getDecompiledFunction().getC())
+                                    (output / (core + "-null-" + phase + "-" + name + ".txt")).write_text(code[name])
+                                if language == DecompilerLanguage.C_LANGUAGE:
+                                    assert re.search(r"\bObject\s*\*", code["nil"]), code["nil"]
+                                    assert re.search(r"\breturn\s+\([^)]*\*\)\s*(?:0x0|0)\s*;",
+                                                     code["nil"]), code["nil"]
+                                else:
+                                    execute_null_methods(output, row, code)
+                                row["passed"] = True
+                            except Exception:
+                                row["passed"] = False
+                                row["failure"] = traceback.format_exc()
                     finally:
                         interface.dispose()
         report["completed"] = True

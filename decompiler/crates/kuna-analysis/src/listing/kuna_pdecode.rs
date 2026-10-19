@@ -594,7 +594,7 @@ fn run_interval(
             break;
         }
         while let Some(vma) = router.local_insn.pop() {
-            if walk::step(
+            if walk::step_without_tables(
                 ctx,
                 vma,
                 &mut st.insns,

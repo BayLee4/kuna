@@ -453,14 +453,14 @@ fn first_calls(data: &Funcdata) -> Vec<OpId> {
 /// in place, so "touched" is asked of the whole function once, and only at a
 /// call no other call can precede ([`first_calls`]), where the read is the
 /// function's own input. Inert with the option off.
-pub fn claim_untouched_registers(data: &mut Funcdata) {
+pub fn claim_untouched_registers(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     if !data.get_arch().pass_through {
-        return;
+        return Ok(());
     }
     let variadic = reads_the_vararg_count(data);
     data.kuna_set_passthrough_variadic(variadic);
     if variadic {
-        return;
+        return Ok(());
     }
     let returned_call_result = stated_tail_return(data).map(|(pieces, producers, beside_own)| {
         let pieces: Vec<_> = pieces.into_iter().map(|(a, s)| (touched(data, &a, s), a, s)).collect();
@@ -496,7 +496,7 @@ pub fn claim_untouched_registers(data: &mut Funcdata) {
                 continue;
             }
             let nin = data.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
-            let vn = data.new_varnode(size, &addr, None);
+            let vn = data.new_varnode(size, &addr, None)?;
             if data.op_insert_input(op, vn, nin).is_err() {
                 continue;
             }
@@ -520,9 +520,10 @@ pub fn claim_untouched_registers(data: &mut Funcdata) {
         }
     }
     if let Some(ret) = returned_call_result {
-        claim_tail_return(data, &mut claims, ret);
+        claim_tail_return(data, &mut claims, ret)?;
     }
     data.kuna_set_passthrough_claims(claims);
+    Ok(())
 }
 
 /// Can the claim of the register at `pos` in the callee's stated list be made
@@ -750,7 +751,7 @@ fn claim_tail_return(
     data: &mut Funcdata,
     claims: &mut Vec<PassThroughClaim>,
     ret: (Vec<(bool, Address, int4)>, Vec<OpId>, bool),
-) {
+) -> kuna_base::error::KunaResult<()> {
     let (pieces, producers, beside_own) = ret;
     let rets: Vec<OpId> = data
         .obank()
@@ -759,14 +760,14 @@ fn claim_tail_return(
         .collect();
     let nins: Vec<int4> = rets.iter().filter_map(|&r| data.obank().get(r).map(|o| o.num_input())).collect();
     if nins.len() != rets.len() || nins.iter().any(|&n| n != nins[0]) {
-        return;
+        return Ok(());
     }
     for (k, (body_touches, addr, size)) in pieces.into_iter().enumerate() {
         let slot = nins[0] + k as int4;
         for &r in &rets {
-            let vn = data.new_varnode(size, &addr, None);
+            let vn = data.new_varnode(size, &addr, None)?;
             if data.op_insert_input(r, vn, slot).is_err() {
-                return;
+                return Ok(());
             }
         }
         if let Some(active) = data.get_active_output_mut() {
@@ -789,6 +790,7 @@ fn claim_tail_return(
             }),
         }
     }
+    Ok(())
 }
 
 /// Is `vn`, read by a RETURN in `[addr, addr+size)`, the result of a tail call
@@ -1077,36 +1079,40 @@ fn reassembled(data: &Funcdata, vn: VarnodeId, addr: &Address, size: int4) -> bo
 /// is, and must be a leading run of the stated list. Registers are taken in the
 /// stated order and the extension stops at the first one the function does not
 /// forward untouched.
-pub fn extend_pending(data: &mut Funcdata, pending: &[PendingPassThrough]) -> int4 {
-    pending.iter().filter(|p| extend_one(data, p)).count() as int4
+pub fn extend_pending(data: &mut Funcdata, pending: &[PendingPassThrough]) -> kuna_base::error::KunaResult<int4> {
+    let mut count = 0;
+    for p in pending {
+        if extend_one(data, p)? { count += 1; }
+    }
+    Ok(count)
 }
 
 /// [`extend_pending`] for one call.
-fn extend_one(data: &mut Funcdata, p: &PendingPassThrough) -> bool {
-    let Some(idx) = data.get_call_specs_index(p.op) else { return false };
+fn extend_one(data: &mut Funcdata, p: &PendingPassThrough) -> kuna_base::error::KunaResult<bool> {
+    let Some(idx) = data.get_call_specs_index(p.op) else { return Ok(false) };
     let (entry, current) = {
         let fc = data.get_call_specs(idx);
         (fc.get_entry_address().clone(), fc.final_input_storage().to_vec())
     };
     let nin = match data.obank().get(p.op) {
         Some(o) if !o.is_dead() && o.code() == OpCode::CPUI_CALL => o.num_input(),
-        _ => return false,
+        _ => return Ok(false),
     };
     if nin != current.len() as int4 + 1 || current.iter().any(|(a, _)| !is_register(a)) {
-        return false;
+        return Ok(false);
     }
-    let Some(stated) = data.kuna_protoorder_types(&entry) else { return false };
+    let Some(stated) = data.kuna_protoorder_types(&entry) else { return Ok(false) };
     let stated: Vec<Address> = stated.inputs.iter().map(|(a, _, _)| a.clone()).collect();
     let have: Vec<Address> = current.iter().map(|(a, _)| a.clone()).collect();
     let offered: Vec<Address> = p.candidates.iter().map(|(a, _, _)| a.clone()).collect();
     let added: Vec<(Address, int4, VarnodeId)> =
         extension(&have, &stated, &offered).into_iter().map(|k| p.candidates[k].clone()).collect();
     if added.is_empty() {
-        return false;
+        return Ok(false);
     }
     let mut newparam: Vec<VarnodeId> = (0..nin).filter_map(|i| data.obank().get(p.op).and_then(|o| o.get_in(i))).collect();
     if newparam.len() != nin as usize {
-        return false;
+        return Ok(false);
     }
     let mut storage = current;
     for (addr, width, vn) in added {
@@ -1120,12 +1126,12 @@ fn extend_one(data: &mut Funcdata, p: &PendingPassThrough) -> bool {
             })
             .map(|v| v.get_size())
         else {
-            return false;
+            return Ok(false);
         };
         let arg = if width < vsize {
-            match truncate_before(data, vn, width, p.op) {
+            match truncate_before(data, vn, width, p.op)? {
                 Some(v) => v,
-                None => return false,
+                None => return Ok(false),
             }
         } else {
             vn
@@ -1134,10 +1140,10 @@ fn extend_one(data: &mut Funcdata, p: &PendingPassThrough) -> bool {
         storage.push((addr, width));
     }
     if data.op_set_all_input(p.op, &newparam).is_err() {
-        return false;
+        return Ok(false);
     }
     data.get_call_specs_mut(idx).set_final_input_storage(storage);
-    true
+    Ok(true)
 }
 
 /// Which of `offered` extend the argument list `have` along the callee's stated
@@ -1155,19 +1161,19 @@ pub fn extension(have: &[Address], stated: &[Address], offered: &[Address]) -> V
 
 /// The low `width` bytes of `vn`, as a `SUBPIECE` inserted before `op`: what
 /// `buildInputFromTrials` does for a trial narrower than its Varnode.
-pub(crate) fn truncate_before(data: &mut Funcdata, vn: VarnodeId, width: int4, op: OpId) -> Option<VarnodeId> {
-    let (vaddr, vsize) = data.vbank().get(vn).map(|v| (v.get_addr().clone(), v.get_size()))?;
+pub(crate) fn truncate_before(data: &mut Funcdata, vn: VarnodeId, width: int4, op: OpId) -> kuna_base::error::KunaResult<Option<VarnodeId>> {
+    let Some((vaddr, vsize)) = data.vbank().get(vn).map(|v| (v.get_addr().clone(), v.get_size())) else { return Ok(None); };
     let big_endian = data.get_arch().manage().get_default_code_space().map(|s| s.is_big_endian()).unwrap_or(false);
     let outaddr = if big_endian { &vaddr + ((vsize - width) as i64) } else { vaddr };
-    let opaddr = data.obank().get(op)?.get_addr().clone();
+    let Some(opaddr) = data.obank().get(op).map(|op| op.get_addr().clone()) else { return Ok(None); };
     let newop = data.new_op(2, opaddr);
-    let out = data.new_varnode_out(width, &outaddr, newop).ok()?;
+    let out = data.new_varnode_out(width, &outaddr, newop)?;
     data.op_set_opcode_code(newop, OpCode::CPUI_SUBPIECE);
-    data.op_set_input(newop, vn, 0).ok()?;
+    data.op_set_input(newop, vn, 0)?;
     let zero = data.new_constant(1, 0);
-    data.op_set_input(newop, zero, 1).ok()?;
+    data.op_set_input(newop, zero, 1)?;
     data.op_insert_before(newop, op);
-    Some(out)
+    Ok(Some(out))
 }
 
 #[cfg(test)]

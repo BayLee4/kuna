@@ -396,7 +396,7 @@ mod harness {
         // (kuna DIV-37) The frozen C++ oracles pin the upstream braced
     // single-statement if-body form; reset braceelide for the comparison.
     arch.print_mut().options.set_brace_elide(false);
-    Ok(print_c(arch, &fd))
+    Ok(print_c(arch, &fd).unwrap())
     }
 }
 

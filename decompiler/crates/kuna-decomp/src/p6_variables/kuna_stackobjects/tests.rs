@@ -220,7 +220,7 @@ fn a_calls_own_indirect_guard_describes_its_output_not_its_input() {
         .op(block, 0x1002, OpCode::CPUI_CALL, &[destination], None)
         .0;
     let address = Address::new(Rc::clone(&f.stack), 0x20);
-    let guard = f.fd.new_indirect_op(call, &address, 4, 0);
+    let guard = f.fd.new_indirect_op(call, &address, 4, 0).unwrap();
     f.fd.op_set_input(guard, initial, 0).unwrap();
     let later = f.point(block, 0x1003);
     assert_eq!(
@@ -257,7 +257,7 @@ fn a_loop_retains_the_previous_iterations_effect_at_the_same_call_point() {
         .op(body, 0x1011, OpCode::CPUI_CALL, &[destination], None)
         .0;
     let address = Address::new(Rc::clone(&f.stack), 0x20);
-    let guard = f.fd.new_indirect_op(call, &address, 4, 0);
+    let guard = f.fd.new_indirect_op(call, &address, 4, 0).unwrap();
     f.fd.op_set_input(guard, out.unwrap(), 0).unwrap();
     let changed = f.fd.obank().get(guard).unwrap().get_out().unwrap();
     f.fd.op_set_input(phi, changed, 1).unwrap();
@@ -350,14 +350,14 @@ fn integer_frame_addresses_keep_unbounded_positive_parameter_aliases() {
             width as i32,
             &Address::new(Rc::clone(&f.ram), 0x80),
             Some(Rc::clone(&ty)),
-        );
+        ).unwrap();
         let base = f.fd.set_input_varnode(base).unwrap();
         f.fd.vbank_mut().get_mut(base).unwrap().set_spacebase();
         let index = f.fd.new_varnode(
             width as i32,
             &Address::new(Rc::clone(&f.ram), 0x90),
             Some(Rc::clone(&ty)),
-        );
+        ).unwrap();
         let index = f.fd.set_input_varnode(index).unwrap();
         let (op, _) = f.op(block, 0x1001, OpCode::CPUI_INT_ADD, &[base, index], None);
         let address = f.fd.new_unique_out(width as i32, op).unwrap();
@@ -405,7 +405,7 @@ fn absent_call_contracts_keep_frame_effects_and_later_locked_views() {
         let expected = vec![BTreeSet::from([
             write(0x1001), ByteSource::Effect(SourcePoint { space: 2, address: 0x1002 }),
         ]); 4];
-        assert!(crate::kuna_stackuses::declared_view(&f.fd, call, 1).is_none());
+        assert!(crate::kuna_stackuses::declared_view(&f.fd, call, 1).unwrap().is_none());
         assert!(!f.fd.get_call_specs(index).proto().has_store());
         assert_eq!(f.bytes(point, 0x20, 4), expected);
 
@@ -420,9 +420,9 @@ fn absent_call_contracts_keep_frame_effects_and_later_locked_views() {
         proto.set_param(0, "value", &ParameterPieces {
             addr: parameter_address, type_: Some(Rc::new(pointer)), flags: 0,
         });
-        assert!(crate::kuna_stackuses::declared_view(&f.fd, call, 1).is_none());
+        assert!(crate::kuna_stackuses::declared_view(&f.fd, call, 1).unwrap().is_none());
         f.fd.get_call_specs_mut(index).proto_mut().set_input_lock(true);
-        let view = crate::kuna_stackuses::declared_view(&f.fd, call, 1).unwrap();
+        let view = crate::kuna_stackuses::declared_view(&f.fd, call, 1).unwrap().unwrap();
         assert!(Rc::ptr_eq(&view, &value_type));
         assert_eq!(f.bytes(point, 0x20, 4), expected);
     }

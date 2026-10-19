@@ -68,7 +68,7 @@ impl Fx {
     }
 
     fn input(&mut self, off: u64) -> VarnodeId {
-        let vn = self.fd.new_varnode(8, &Address::new(self.reg(), off), None);
+        let vn = self.fd.new_varnode(8, &Address::new(self.reg(), off), None).unwrap();
         self.fd.set_input_varnode(vn).unwrap()
     }
 

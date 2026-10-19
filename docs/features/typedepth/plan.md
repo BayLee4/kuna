@@ -32,6 +32,9 @@ forged chain before it can exhaust the stack.
 - Therefore the borrowed name can collide: `intern_aggregate` falls back to the
   anonymous name when the alias does not yield an aggregate (analysis.md §4). Only
   an aggregate with no name of its own falls back.
+  A producer-specific identity does not bypass a conflicting non-aggregate name.
+  Typedef publication retains the aggregate's selected collision fallback rather
+  than reintroducing the rejected alias; unrelated nominal aliases stay distinct.
 
 ## 3. The gate — an env-var bridge, and why it cannot be a commit gate
 
@@ -65,8 +68,9 @@ mapping byte for byte.
 - `kuna-console/tests/verify_typedepth.rs` — six two-pass e2e assertions against a
   new `-g -O0` C fixture (`typedepth_x86_64`, source vendored): the local
   `const char *const *`, three pointer hops, the anonymous-typedef alias, the
-  `code` name collision, the global's extent, and termination on self-referential
-  and mutually recursive structs. A Rust integration test rather than stage XML
+  `code` name collision, the global's qualified array versus the loader's
+  extent-only fallback, and termination on self-referential and mutually
+  recursive structs. A Rust integration test rather than stage XML
   because the XML `<binaryimage>` bootstrap never runs the analyzer tier
   (precedent: `verify_cppcallnames.rs` #262, `verify_fdeinterior.rs` #263,
   `verify_cppsig.rs` #266). The gate is set through the env var **before**

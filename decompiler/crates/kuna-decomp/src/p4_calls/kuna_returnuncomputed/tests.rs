@@ -56,7 +56,7 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
 /// location the function only ever reads.
 fn unwritten(fd: &mut Funcdata, off: u64, sz: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(sz, &Address::new(r, off), None)
+    fd.new_varnode(sz, &Address::new(r, off), None).unwrap()
 }
 
 /// Build `out = <opc>(inputs...)` at a fresh ram address and return `out`.
@@ -259,13 +259,13 @@ fn live_return(fd: &mut Funcdata, bl: crate::context::BlockId, value: VarnodeId)
 fn each_half_of_one_register_sits_in_its_own_bytes() {
     let (mut fd, _) = build_fd_with_blocks();
     let r = ram(&fd);
-    let whole = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None);
+    let whole = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None).unwrap();
     assert_eq!(slot_storage(&fd, whole, 0, 4), Some(Address::new(Rc::clone(&r), 0x3000)), "little-endian low half");
     assert_eq!(slot_storage(&fd, whole, 4, 4), Some(Address::new(Rc::clone(&r), 0x3004)), "little-endian high half");
     assert!(!spans_two_locations(&fd, whole), "one register is one location");
 
     let be = Rc::clone(fd.get_arch().manage().get_space_by_name("breg").unwrap());
-    let whole_be = fd.new_varnode(8, &Address::new(Rc::clone(&be), 0x100), None);
+    let whole_be = fd.new_varnode(8, &Address::new(Rc::clone(&be), 0x100), None).unwrap();
     assert_eq!(slot_storage(&fd, whole_be, 0, 4), Some(Address::new(Rc::clone(&be), 0x104)), "big-endian low half");
     assert_eq!(slot_storage(&fd, whole_be, 4, 4), Some(Address::new(be, 0x100)), "big-endian high half");
 }
@@ -276,13 +276,13 @@ fn a_never_written_high_half_of_one_register_is_still_dropped() {
     // function computed only the low half into its return register.
     let (mut fd, bl) = build_fd_with_blocks();
     let r = ram(&fd);
-    let leftover = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x3004), None);
+    let leftover = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x3004), None).unwrap();
     let a = unwritten(&mut fd, 0x2000, 4);
     let b = unwritten(&mut fd, 0x2008, 4);
     let sum = live_def(&mut fd, bl, OpCode::CPUI_INT_ADD, &[a, b], 0x3000, 4);
     let whole = live_def(&mut fd, bl, OpCode::CPUI_PIECE, &[leftover, sum], 0x3000, 8);
     let ret = live_return(&mut fd, bl, whole);
-    assert!(strip_uncomputed_return_piece(&mut fd));
+    assert!(strip_uncomputed_return_piece(&mut fd).unwrap());
     assert_eq!(fd.obank().get(ret).unwrap().get_in(1), Some(sum), "the return narrows to the computed low half");
 }
 
@@ -295,10 +295,10 @@ fn the_high_half_of_one_register_is_never_returned_alone() {
     let a = unwritten(&mut fd, 0x2000, 4);
     let b = unwritten(&mut fd, 0x2008, 4);
     let sum = live_def(&mut fd, bl, OpCode::CPUI_INT_ADD, &[a, b], 0x3100, 4);
-    let leftover = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x3000), None);
+    let leftover = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x3000), None).unwrap();
     let whole = live_def(&mut fd, bl, OpCode::CPUI_PIECE, &[sum, leftover], 0x3000, 8);
     let ret = live_return(&mut fd, bl, whole);
-    assert!(!strip_uncomputed_return_piece(&mut fd), "nothing is dropped from a value built in one register");
+    assert!(!strip_uncomputed_return_piece(&mut fd).unwrap(), "nothing is dropped from a value built in one register");
     assert_eq!(fd.obank().get(ret).unwrap().get_in(1), Some(whole), "the return keeps all eight bytes");
 }
 
@@ -319,7 +319,7 @@ fn folded_zero_pair(hi_computed: bool) -> (Funcdata, OpId, VarnodeId) {
     let mut fd = Funcdata::new("func", "func", glb, Address::new(Rc::clone(&ram), 0x1000), 0x1000_0000, 0x40).unwrap();
     let root = fd.bblocks_ref().root.expect("bblocks root");
     let bl = fd.bblocks_mut().new_block_basic(root);
-    let arg = fd.new_varnode(4, &Address::new(Rc::clone(&breg), 0x104), None);
+    let arg = fd.new_varnode(4, &Address::new(Rc::clone(&breg), 0x104), None).unwrap();
     let hi = if hi_computed {
         let k = fd.new_constant(4, 3);
         live_def(&mut fd, bl, OpCode::CPUI_INT_MULT, &[arg, k], 0x3200, 4)
@@ -350,7 +350,7 @@ fn the_folded_form_of_a_zero_low_half_is_read_as_the_pair() {
 fn a_leftover_beside_a_folded_zero_is_dropped_from_a_pair_joined_against_the_abi() {
     let (mut fd, ret, whole) = folded_zero_pair(false);
     fd.kuna_set_pairs_first_low(true);
-    assert!(strip_uncomputed_return_piece(&mut fd));
+    assert!(strip_uncomputed_return_piece(&mut fd).unwrap());
     let kept = fd.obank().get(ret).unwrap().get_in(1).unwrap();
     assert_ne!(kept, whole);
     let v = fd.vbank().get(kept).unwrap();
@@ -360,7 +360,7 @@ fn a_leftover_beside_a_folded_zero_is_dropped_from_a_pair_joined_against_the_abi
 #[test]
 fn a_folded_zero_is_left_alone_where_the_pair_joins_in_the_abis_order() {
     let (mut fd, ret, whole) = folded_zero_pair(false);
-    assert!(!strip_uncomputed_return_piece(&mut fd), "the folded form can be the value");
+    assert!(!strip_uncomputed_return_piece(&mut fd).unwrap(), "the folded form can be the value");
     assert_eq!(fd.obank().get(ret).unwrap().get_in(1), Some(whole));
 }
 
@@ -368,6 +368,6 @@ fn a_folded_zero_is_left_alone_where_the_pair_joins_in_the_abis_order() {
 fn a_computed_high_half_beside_a_folded_zero_keeps_the_pair() {
     let (mut fd, ret, whole) = folded_zero_pair(true);
     fd.kuna_set_pairs_first_low(true);
-    assert!(!strip_uncomputed_return_piece(&mut fd));
+    assert!(!strip_uncomputed_return_piece(&mut fd).unwrap());
     assert_eq!(fd.obank().get(ret).unwrap().get_in(1), Some(whole));
 }

@@ -107,7 +107,7 @@ fn mk_compare(fd: &mut Funcdata, opc: OpCode) -> (OpId, VarnodeId, VarnodeId) {
     fd.op_set_input(op, a, 0).unwrap();
     fd.op_set_input(op, b, 1).unwrap();
     let ram = ram_space(fd);
-    let out = fd.new_varnode(1, &Address::new(ram, 0x40), Some(unk(1)));
+    let out = fd.new_varnode(1, &Address::new(ram, 0x40), Some(unk(1))).unwrap();
     fd.op_set_output(op, out).unwrap();
     (op, a, b)
 }
@@ -150,7 +150,7 @@ fn w10_charptr_slesss_propagates_a_signed_char() {
     let chr = make_char(&f);
     assert_eq!(chr.get_metatype(), type_metatype::TYPE_INT, "a char must be TYPE_INT");
     // Propagate FROM input slot 0 (a) TO input slot 1 (b).
-    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1).unwrap();
     let out = out.expect("a signed char propagates across INT_SLESS");
     assert!(Rc::ptr_eq(&out, &chr), "the SLESS arm returns the incoming type unchanged");
 }
@@ -165,7 +165,7 @@ fn w10_charptr_sless_declines_an_unsigned_byte() {
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
     assert_eq!(u1.get_metatype(), type_metatype::TYPE_UINT);
-    let out = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1).unwrap();
     assert!(out.is_none(), "a uint1 must NOT propagate across a signed compare");
 }
 
@@ -180,7 +180,7 @@ fn w10_charptr_sless_declines_a_pointer() {
     let chr = make_char(&f);
     let cptr = f.get_type_pointer(8, chr, 1).expect("char *");
     assert_eq!(cptr.get_metatype(), type_metatype::TYPE_PTR);
-    let out = propagate_type_pub(&mut fd, cptr, op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, cptr, op, a, b, 0, 1).unwrap();
     assert!(out.is_none(), "a pointer must NOT propagate across a signed compare");
 }
 
@@ -192,10 +192,10 @@ fn w10_charptr_slessequal_matches_sless_exactly() {
     let f = factory();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESSEQUAL);
     let chr = make_char(&f);
-    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, b, 0, 1).unwrap();
     assert!(out.is_some(), "char propagates across INT_SLESSEQUAL");
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
-    let out_u = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1);
+    let out_u = propagate_type_pub(&mut fd, u1, op, a, b, 0, 1).unwrap();
     assert!(out_u.is_none(), "uint1 declines across INT_SLESSEQUAL");
 }
 
@@ -216,12 +216,12 @@ fn w10_charptr_sless_declines_when_a_slot_is_the_output() {
     let chr = make_char(&f);
     // input(0) -> output(-1): declines.
     assert!(
-        propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, out, 0, -1).is_none(),
+        propagate_type_pub(&mut fd, Rc::clone(&chr), op, a, out, 0, -1).unwrap().is_none(),
         "char must not flow from an input to the boolean output"
     );
     // output(-1) -> input(1): declines.
     assert!(
-        propagate_type_pub(&mut fd, chr, op, out, a, -1, 0).is_none(),
+        propagate_type_pub(&mut fd, chr, op, out, a, -1, 0).unwrap().is_none(),
         "char must not flow from the boolean output to an input"
     );
 }
@@ -242,7 +242,7 @@ fn w10_charptr_unsigned_int_less_still_propagates_a_uint1() {
     let f = factory();
     let (op, a, b) = mk_compare(&mut fd, OpCode::CPUI_INT_LESS);
     let u1 = f.get_base(1, type_metatype::TYPE_UINT).expect("uint1");
-    let out = propagate_type_pub(&mut fd, Rc::clone(&u1), op, a, b, 0, 1);
+    let out = propagate_type_pub(&mut fd, Rc::clone(&u1), op, a, b, 0, 1).unwrap();
     let out = out.expect("INT_LESS (unsigned) propagates a uint1 via propagateAcrossCompare");
     assert_eq!(
         out.get_metatype(),
@@ -252,7 +252,7 @@ fn w10_charptr_unsigned_int_less_still_propagates_a_uint1() {
     // And the SIGNED arm rejects the very same type — the split has teeth.
     let (sop, sa, sb) = mk_compare(&mut fd, OpCode::CPUI_INT_SLESS);
     assert!(
-        propagate_type_pub(&mut fd, u1, sop, sa, sb, 0, 1).is_none(),
+        propagate_type_pub(&mut fd, u1, sop, sa, sb, 0, 1).unwrap().is_none(),
         "INT_SLESS rejects the uint1 the INT_LESS arm accepts — distinct behaviour"
     );
 }

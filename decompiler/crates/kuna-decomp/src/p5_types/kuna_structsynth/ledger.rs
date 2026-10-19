@@ -371,10 +371,9 @@ fn key_of(f: &TypeField) -> Option<FieldKey> {
 /// Read a completed structure's layout, or `None` when it is not one this pass
 /// could have minted.
 ///
-/// Every member of a synthesized structure is named for its own offset, so a
-/// member named anything else says the name `struct_N` is held by a type that
-/// came from somewhere else -- a DWARF record, a parsed header -- and such a
-/// type is never handed out as the answer to an access pattern.
+/// This validates the layout, not its ownership: an authored record can have
+/// exactly the same names and fields. Ledger admission also requires the
+/// provenance stamped by the actual synthesis constructor.
 pub(crate) fn layout_of(ct: &Datatype) -> Option<Layout> {
     if ct.get_metatype() != type_metatype::TYPE_STRUCT {
         return None;
@@ -487,7 +486,7 @@ fn entries(
                 break;
             }
             Ok(Some(t)) => {
-                if !sizes.contains(&i64::from(t.get_size())) {
+                if !sizes.contains(&i64::from(t.get_size())) || synthesized_owner(&t).is_none() {
                     continue;
                 }
                 if let Some(layout) = layout_of(&t) {
@@ -622,7 +621,7 @@ pub(super) fn mint(
     size: int4,
     selfs: &[int4],
 ) -> Option<Rc<Datatype>> {
-    let shell = types.get_type_struct(name).ok()?;
+    let shell = types.kuna_synthesized_record(name).ok()?;
     for f in fields.iter_mut().filter(|f| selfs.contains(&f.offset)) {
         f.field_type = types.get_type_pointer(f.field_type.get_size(), Rc::clone(&shell), 1).ok()?;
     }
@@ -634,8 +633,21 @@ pub fn is_minted(ct: &Datatype) -> bool {
     minted_number(ct).is_some()
 }
 
+/// Follow only qualifier views, retaining the distinction between a minted
+/// record and a typedef alias whose shape and flags were copied from it.
+fn synthesized_owner(mut ct: &Datatype) -> Option<&Datatype> {
+    while let Some(base) = ct.qualified_base() {
+        ct = base.as_ref();
+    }
+    if ct.get_typedef().is_some() || ct.flags & crate::dtype::flags::kuna_synthesized == 0 {
+        return None;
+    }
+    Some(ct)
+}
+
 /// The number `N` of a structure this pass minted, or `None` for any other type.
 pub(super) fn minted_number(ct: &Datatype) -> Option<u32> {
+    let ct = synthesized_owner(ct)?;
     let n = ct.get_name().strip_prefix("struct_")?;
     if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) || layout_of(ct).is_none() {
         return None;
@@ -700,6 +712,66 @@ mod tests {
         assert_ne!(inferred.get_name(), authority.get_name(), "authored same shape must remain authored");
         assert_eq!(layout_of(&inferred), layout_of(&authority));
         assert_eq!(types.find_by_name("struct_0").unwrap().unwrap().get_id(), authority.get_id());
+    }
+
+    #[test]
+    fn inferred_provenance_starts_on_the_shell_and_excludes_qualified_aliases() {
+        use crate::kuna_typequal::{qualified_type, CONST};
+        let types = crate::dtype::TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let source = types.get_type_struct("struct_0").unwrap();
+        assert!(minted_number(&source).is_none());
+        assert!(types.kuna_synthesized_record("struct_0").is_err());
+        assert!(Rc::ptr_eq(&types.get_type_struct("struct_0").unwrap(), &source));
+
+        let shell = types.kuna_synthesized_record("struct_1").unwrap();
+        assert_eq!(minted_number(&shell), Some(1));
+        assert_eq!((shell.alignment, shell.align_size), (source.alignment, source.align_size));
+        assert!(types.kuna_synthesized_record("struct_1").is_err());
+        let pointer = types.get_type_pointer(8, shell.clone(), 1).unwrap();
+        assert!(crate::kuna_structsynth::points_at_synthesized_record(&pointer));
+        assert_eq!(minted_number(&qualified_type(shell, CONST)), Some(1));
+
+        let word = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let recursive = mint(
+            &types, "struct_2", vec![TypeField::new(0, 0, "field_0x0", pointer)], 8, &[0],
+        ).unwrap();
+        let self_pointer = recursive.get_field(0).unwrap().field_type.clone();
+        let self_shell = self_pointer.get_ptr_to().unwrap();
+        assert!(self_shell.is_incomplete());
+        assert_eq!(minted_number(&self_shell), Some(2));
+        assert_eq!(minted_number(&recursive), Some(2));
+        assert!(crate::kuna_structsynth::points_at_synthesized_record(&self_pointer));
+        assert!(Rc::ptr_eq(
+            &crate::kuna_structsynth::resolve_self_pointer(&types, &self_pointer)
+                .unwrap().get_ptr_to().unwrap(),
+            &recursive,
+        ));
+        assert_eq!(minted_number(&qualified_type(recursive.clone(), CONST)), Some(2));
+
+        let alias = types.get_typedef(&recursive, "struct_3", 0, 0).unwrap();
+        assert!(minted_number(&alias).is_none());
+        let qualified_alias = qualified_type(alias, CONST);
+        assert!(qualified_alias.get_typedef().is_none(),
+            "the qualifier view itself deliberately hides typedef_imm");
+        assert!(minted_number(&qualified_alias).is_none());
+        assert!(minted_number(&qualified_type(source, CONST)).is_none());
+
+        // A source name with a foreign (non-hash) identity is also held.
+        let foreign = types.get_typedef(&word, "struct_4", 203, 0).unwrap();
+        assert!(types.kuna_synthesized_record("struct_4").is_err());
+        assert!(Rc::ptr_eq(&types.find_by_name("struct_4").unwrap().unwrap(), &foreign));
+
+        // The ownership bit never becomes source evidence on the wire.
+        let encode = |ct: &Datatype| {
+            let mut bytes = Vec::new();
+            ct.encode(&mut kuna_base::marshal::XmlEncode::new(&mut bytes)).unwrap();
+            bytes
+        };
+        let mut unmarked = (*recursive).clone();
+        unmarked.flags &= !crate::dtype::flags::kuna_synthesized;
+        assert_eq!(encode(&recursive), encode(&unmarked));
     }
 
     /// A claimed scalar field.

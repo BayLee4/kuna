@@ -19,6 +19,107 @@ mod documents;
 mod type_definitions;
 
 #[test]
+fn mapped_wide_string_geometry_retains_source_identity_width_and_piece_offset() {
+    use std::rc::Rc;
+    use crate::context::GlobalContainer;
+    use crate::dtype::{flags, type_metatype, Datatype, DatatypeKind};
+    use crate::varnode::varnode_flags;
+
+    let fd = support::build_fd();
+    let start = Address::new(support::ram(&fd), 0x5000);
+    let mut character = Datatype::new(4, type_metatype::TYPE_INT);
+    character.flags |= flags::utf32;
+    let character = Rc::new(character);
+    let array = |element: Rc<Datatype>| {
+        let mut ty = Datatype::new(24, type_metatype::TYPE_ARRAY);
+        ty.kind = DatatypeKind::Array { arrayof: element, arraysize: 6 };
+        Rc::new(ty)
+    };
+    let mut entry = GlobalContainer {
+        symbol_type: Some(array(Rc::clone(&character))),
+        entry_addr: start.clone(),
+        all_flags: varnode_flags::typelock,
+        symbol_offset: 0,
+        symbol_id: 17,
+    };
+    let tail = &start + 4i64;
+    assert_eq!(source_wide_character_array(&entry, &tail, 4).map(|(ty, size)| {
+        assert!(Rc::ptr_eq(&ty, &character));
+        size
+    }), Some(20));
+    for offset in [1i64, 2, 3, 24] {
+        assert!(source_wide_character_array(&entry, &(&start + offset), 4).is_none());
+    }
+    entry.symbol_offset = 4;
+    assert_eq!(source_wide_character_array(&entry, &start, 4).map(|(_, size)| size), Some(20));
+    entry.symbol_offset = -4;
+    assert!(source_wide_character_array(&entry, &start, 4).is_none());
+    entry.symbol_offset = 0;
+    entry.all_flags = 0;
+    assert!(source_wide_character_array(&entry, &start, 4).is_none());
+    entry.all_flags = varnode_flags::typelock;
+    entry.symbol_type = Some(array(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))));
+    assert!(source_wide_character_array(&entry, &start, 4).is_none());
+    let mut opaque = (*character).clone();
+    opaque.flags |= flags::opaque_string;
+    entry.symbol_type = Some(array(Rc::new(opaque)));
+    assert!(source_wide_character_array(&entry, &start, 4).is_none());
+    let mut narrow = Datatype::new(2, type_metatype::TYPE_INT);
+    narrow.flags |= flags::utf16;
+    entry.symbol_type = Some(array(Rc::new(narrow)));
+    assert!(source_wide_character_array(&entry, &start, 4).is_none());
+    assert_eq!(source_wide_character_array(&entry, &start, 2).map(|(_, size)| size), Some(24));
+    assert!(source_wide_character_array(&entry, &(&start + 1i64), 2).is_none());
+}
+
+#[test]
+fn callback_cast_tokens_register_actual_return_and_formal_not_outer_pointer() {
+    use std::rc::Rc;
+    use crate::dtype::{type_metatype::*, Datatype, DatatypeKind};
+    use crate::fspec::{FuncProto, ParameterPieces};
+
+    let named = |id| {
+        let mut ty = Datatype::new(4, TYPE_STRUCT);
+        ty.id = id;
+        ty.name = "Same".into();
+        ty.display_name = "Same".into();
+        Rc::new(ty)
+    };
+    let result = named(101);
+    let formal = named(102);
+    let mut proto = FuncProto::new();
+    proto.attach_internal_store(Rc::new(Datatype::new(0, TYPE_VOID)));
+    proto.set_output(&ParameterPieces { type_: Some(Rc::clone(&result)), ..Default::default() });
+    proto.store_set_input(0, "", &ParameterPieces {
+        type_: Some(Rc::clone(&formal)), ..Default::default()
+    });
+    let mut code = Datatype::new(1, TYPE_CODE);
+    code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+    let mut callback = Datatype::new(8, TYPE_PTR);
+    callback.kind = DatatypeKind::Pointer {
+        ptrto: Rc::new(code), spaceid: None, truncate: None, wordsize: 1,
+    };
+    let callback = Rc::new(callback);
+    let table = crate::resulttypes::ResultTypeTable::shared();
+    let mut print = PrintC::new();
+    print.set_markup(true);
+    match &mut print.emit {
+        PrintEmit::RawMarkup(emit) => emit.set_result_types(Rc::clone(&table)),
+        _ => unreachable!(),
+    }
+    print.emit_atom(&Atom::syntax(
+        "Same (*)(Same)", TagType::TypeToken,
+        crate::printlanguage::SyntaxHighlight::type_color,
+    ).with_datatype(&callback));
+    print.emit.flush().unwrap();
+    // Only the two rendered nominal leaves have been registered. Their equal
+    // spelling must not collapse their owners, nor bind them to the callback.
+    assert_eq!(table.borrow_mut().markup_handle(&result), Some(1));
+    assert_eq!(table.borrow_mut().markup_handle(&formal), Some(2));
+    assert_eq!(table.borrow_mut().markup_handle(&callback), Some(3));
+}
+
+#[test]
 fn case_labels_without_ops_keep_their_numeric_value() {
     let mut print = PrintC::new();
     print.set_output_stream();
@@ -177,7 +278,7 @@ mod stack_pointer_high_leaf {
     fn render_leaf(fd: &Funcdata, vn: VarnodeId, op: OpId) -> String {
         let mut print = PrintC::new();
         print.set_output_stream();
-        print.push_vn_explicit_ir(fd, &bare_arch(), vn, op);
+        print.push_vn_explicit_ir(fd, &bare_arch(), vn, op).unwrap();
         print.emit_mut().output_str().to_string()
     }
 
@@ -190,7 +291,7 @@ mod stack_pointer_high_leaf {
         call.set_funcdata(entry, "callee_1").unwrap();
         fd.push_call_specs(call);
 
-        let occupied = declaration_occupied_names(&fd, vec!["param_1".to_string()]);
+        let occupied = declaration_occupied_names(&fd, vec!["param_1".to_string()]).unwrap();
         assert!(occupied.iter().any(|name| name == "callee_1"));
 
         let mut allocator = crate::kuna_dedupvardecls::DeclNameUniquifier::new(
@@ -204,7 +305,7 @@ mod stack_pointer_high_leaf {
     #[test]
     fn merged_unaffected_input_stack_pointer_canonicalizes_every_member() {
         let (mut fd, register) = build_fd();
-        let sp = fd.new_varnode(8, &Address::new(Rc::clone(&register), 0), Some(unknown8()));
+        let sp = fd.new_varnode(8, &Address::new(Rc::clone(&register), 0), Some(unknown8())).unwrap();
         let sp = fd.set_input_varnode(sp).unwrap();
         {
             let sp = fd.vbank_mut().get_mut(sp).unwrap();
@@ -215,7 +316,7 @@ mod stack_pointer_high_leaf {
             8,
             &Address::new(Rc::clone(&register), 0x20),
             Some(unknown8()),
-        );
+        ).unwrap();
         let scratch_unique = fd.new_unique(8, Some(unknown8()));
         merge_highs(&mut fd, sp, &[scratch_register, scratch_unique]);
         let high = fd.vbank().get(sp).unwrap().get_high();
@@ -231,7 +332,7 @@ mod stack_pointer_high_leaf {
     #[test]
     fn input_spacebase_without_unaffected_flag_does_not_canonicalize_high() {
         let (mut fd, register) = build_fd();
-        let sp = fd.new_varnode(8, &Address::new(Rc::clone(&register), 0), Some(unknown8()));
+        let sp = fd.new_varnode(8, &Address::new(Rc::clone(&register), 0), Some(unknown8())).unwrap();
         let sp = fd.set_input_varnode(sp).unwrap();
         fd.vbank_mut().get_mut(sp).unwrap().set_spacebase();
         let scratch_unique = fd.new_unique(8, Some(unknown8()));
@@ -265,7 +366,7 @@ mod stack_pointer_high_leaf {
                 fd.vbank_mut().get_mut(vn).unwrap().update_type(named_int(8));
                 vn
             } else {
-                fd.new_varnode(8, &Address::new(register, 0x20), Some(named_int(8)))
+                fd.new_varnode(8, &Address::new(register, 0x20), Some(named_int(8))).unwrap()
             };
             fd.set_high_level();
             let high = fd.vbank().get(vn).unwrap().get_high().unwrap();
@@ -274,9 +375,43 @@ mod stack_pointer_high_leaf {
             h.set_symbol_type(named_int(object_size));
             h.set_symbol_offset(0);
             let p = PrintC::new();
-            let (front, back, array, _, _) = p.rendered_local_decl(&fd, &bare_arch(), high);
+            let (front, back, array, _, _) = p.rendered_local_decl(&fd, &bare_arch(), high).unwrap();
             assert_eq!(front, want, "reference={reference}, object_size={object_size}");
             assert!(back.is_empty() && array.is_none());
+        }
+    }
+
+    #[test]
+    fn array_declaration_retains_the_whole_object_type_for_register_local_rows() {
+        for mapped in [false, true] {
+            let (mut fd, register) = build_fd();
+            let mut element = Datatype::new(4, type_metatype::TYPE_INT);
+            element.name = "int4".into();
+            element.display_name = element.name.clone();
+            let mut array = Datatype::new(16, type_metatype::TYPE_ARRAY);
+            array.kind = crate::dtype::DatatypeKind::Array {
+                arrayof: Rc::new(element),
+                arraysize: 4,
+            };
+            let array = Rc::new(array);
+            let storage_type = if mapped { unknown8() } else { Rc::clone(&array) };
+            let vn = fd.new_varnode(
+                storage_type.get_size(),
+                &Address::new(register, 0x20),
+                Some(storage_type),
+            ).unwrap();
+            fd.set_high_level();
+            let high = fd.vbank().get(vn).unwrap().get_high().unwrap();
+            if mapped {
+                fd.high_bank_mut().get_mut(high).unwrap().set_symbol_type(Rc::clone(&array));
+            }
+            let (front, back, extent, _, datatype) =
+                PrintC::new().rendered_local_decl(&fd, &bare_arch(), high).unwrap();
+            assert_eq!((front.as_str(), back.as_str()), ("int4", ""));
+            assert_eq!(extent, Some(("int4".into(), 4)));
+            let datatype = datatype.unwrap();
+            assert!(Rc::ptr_eq(&datatype, &array));
+            assert_eq!(datatype.get_size(), 16);
         }
     }
 
@@ -317,7 +452,7 @@ mod stack_pointer_high_leaf {
             let local = lm.add_symbol("local", named_int(4), &at(-0x14), &inv).unwrap();
             if let Some((off, size)) = neighbour {
                 lm.add_symbol("next", named_int(size), &at(off), &inv).unwrap();
-                fd.new_varnode(size, &at(off), Some(named_int(size)));
+                fd.new_varnode(size, &at(off), Some(named_int(size))).unwrap();
             }
             let vn = fd.new_constant(8, stack.wrap_offset(-0x14i64 as u64));
             fd.vbank_mut().get_mut(vn).unwrap().update_type(named_int(8));
@@ -329,7 +464,7 @@ mod stack_pointer_high_leaf {
             h.set_symbol_offset(0);
             h.set_kuna_ref_symbol(local);
             let p = PrintC::new();
-            let (front, _, _, _, _) = p.rendered_local_decl(&fd, &bare_arch(), high);
+            let (front, _, _, _, _) = p.rendered_local_decl(&fd, &bare_arch(), high).unwrap();
             assert_eq!(front, want, "neighbour={neighbour:?}");
         }
     }
@@ -341,13 +476,13 @@ mod stack_pointer_high_leaf {
             4,
             &Address::new(Rc::clone(&register), 0x20),
             Some(Rc::new(Datatype::new(4, type_metatype::TYPE_UNKNOWN))),
-        );
+        ).unwrap();
         let reference = fd.new_constant(8, 0xffff_ffff_ffff_fff0);
         let whole = fd.new_varnode(
             8,
             &Address::new(register, 0x28),
             Some(unknown8()),
-        );
+        ).unwrap();
         fd.set_high_level();
 
         let partial_high = fd.vbank().get(partial).unwrap().get_high().unwrap();
@@ -424,7 +559,7 @@ mod w10_input_prototype_declarator {
     fn base_type_no_modifier() {
         let t = named(8, type_metatype::TYPE_INT, "int8");
         assert_eq!(
-            declarator_parts(&t, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&t, &crate::printc::RealTypeCtx::OFF),
             ("int8".to_string(), String::new())
         );
     }
@@ -437,7 +572,7 @@ mod w10_input_prototype_declarator {
         let base = named(8, type_metatype::TYPE_STRUCT, "twostruct");
         let p = ptr_to(base);
         assert_eq!(
-            declarator_parts(&p, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&p, &crate::printc::RealTypeCtx::OFF),
             ("twostruct *".to_string(), String::new())
         );
     }
@@ -449,7 +584,7 @@ mod w10_input_prototype_declarator {
         let base = named(4, type_metatype::TYPE_INT, "int4");
         let a = array_of(base, 4);
         assert_eq!(
-            declarator_parts(&a, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&a, &crate::printc::RealTypeCtx::OFF),
             ("int4".to_string(), "[4]".to_string())
         );
     }
@@ -464,13 +599,13 @@ mod w10_input_prototype_declarator {
         // pointer-to-array int4 (*)[1]
         let pta = ptr_to(array_of(base.clone(), 1));
         assert_eq!(
-            declarator_parts(&pta, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&pta, &crate::printc::RealTypeCtx::OFF),
             ("int4 (*".to_string(), ")[1]".to_string())
         );
         // array-of-pointer int4 *[1]
         let aop = array_of(ptr_to(base), 1);
         assert_eq!(
-            declarator_parts(&aop, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&aop, &crate::printc::RealTypeCtx::OFF),
             ("int4 *".to_string(), "[1]".to_string())
         );
     }
@@ -488,7 +623,7 @@ mod w10_input_prototype_declarator {
         assert_eq!(
             declarator_parts(
                 &pointer_to_array_of_pointer,
-                crate::printc::RealTypeCtx::OFF
+                &crate::printc::RealTypeCtx::OFF
             ),
             ("int4 *(*".to_string(), ")[2]".to_string())
         );
@@ -496,7 +631,7 @@ mod w10_input_prototype_declarator {
         // array[2] of pointer to array[3] of int4: int4 (*x[2])[3]
         let array_of_pointer_to_array = array_of(ptr_to(array_of(base, 3)), 2);
         assert_eq!(
-            declarator_parts(&array_of_pointer_to_array, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&array_of_pointer_to_array, &crate::printc::RealTypeCtx::OFF),
             ("int4 (*".to_string(), "[2])[3]".to_string())
         );
     }
@@ -509,7 +644,7 @@ mod w10_input_prototype_declarator {
         use crate::printc::{array_decl_parts, type_name_for_decl, RealTypeCtx};
 
         let base = named(4, type_metatype::TYPE_INT, "int4");
-        let rt = RealTypeCtx::OFF;
+        let rt = &RealTypeCtx::OFF;
         let parts = |front: &str, back: &str| (front.to_string(), back.to_string());
 
         assert_eq!(
@@ -542,7 +677,7 @@ mod w10_input_prototype_declarator {
     #[test]
     fn corpus_exported_type_strings_preserve_modifier_order() {
         fn abstract_spelling(dt: &Rc<Datatype>) -> String {
-            let (front, back) = declarator_parts(dt, crate::printc::RealTypeCtx::OFF);
+            let (front, back) = declarator_parts(dt, &crate::printc::RealTypeCtx::OFF);
             format!("{front}{back}")
         }
 
@@ -579,12 +714,12 @@ mod w10_input_prototype_declarator {
         let anon = Rc::new(Datatype::new_with_align(4, -1, type_metatype::TYPE_UNKNOWN));
         let p = ptr_to(anon);
         assert_eq!(
-            declarator_parts(&p, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&p, &crate::printc::RealTypeCtx::OFF),
             ("undefined4 *".to_string(), String::new())
         );
         let v = Rc::new(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID));
         assert_eq!(
-            declarator_parts(&v, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&v, &crate::printc::RealTypeCtx::OFF),
             ("void".to_string(), String::new())
         );
     }
@@ -596,7 +731,7 @@ mod w10_input_prototype_declarator {
         let base = named(1, type_metatype::TYPE_INT, "char");
         let pp = ptr_to(ptr_to(base));
         assert_eq!(
-            declarator_parts(&pp, crate::printc::RealTypeCtx::OFF),
+            declarator_parts(&pp, &crate::printc::RealTypeCtx::OFF),
             ("char **".to_string(), String::new())
         );
     }
@@ -611,36 +746,36 @@ mod w10_input_prototype_declarator {
         let on = crate::printc::RealTypeCtx { enabled: true, long_is_8: true, ..crate::printc::RealTypeCtx::OFF };
         let unk = |sz: i32| Rc::new(Datatype::new_with_align(sz, -1, type_metatype::TYPE_UNKNOWN));
         // Scalars: 1->char, 2->unsigned short, 4->unsigned int, 8->unsigned long.
-        assert_eq!(declarator_parts(&unk(1), on).0, "char");
-        assert_eq!(declarator_parts(&unk(2), on).0, "unsigned short");
-        assert_eq!(declarator_parts(&unk(4), on).0, "unsigned int");
-        assert_eq!(declarator_parts(&unk(8), on).0, "unsigned long");
+        assert_eq!(declarator_parts(&unk(1), &on).0, "char");
+        assert_eq!(declarator_parts(&unk(2), &on).0, "unsigned short");
+        assert_eq!(declarator_parts(&unk(4), &on).0, "unsigned int");
+        assert_eq!(declarator_parts(&unk(8), &on).0, "unsigned long");
         // LLP64: 8-byte unknown reads `unsigned long long` when long is 4 bytes.
         let llp64 = crate::printc::RealTypeCtx { enabled: true, long_is_8: false, ..crate::printc::RealTypeCtx::OFF };
-        assert_eq!(declarator_parts(&unk(8), llp64).0, "unsigned long long");
+        assert_eq!(declarator_parts(&unk(8), &llp64).0, "unsigned long long");
         // Odd size keeps the placeholder.
-        assert_eq!(declarator_parts(&unk(3), on).0, "undefined3");
+        assert_eq!(declarator_parts(&unk(3), &on).0, "undefined3");
         // Pointer-to-unknown relabels the pointee through the same size table, so
         // the declared stride matches the one `opLoad`/`opPtradd` index with.
         assert_eq!(
-            declarator_parts(&ptr_to(unk(8)), on),
+            declarator_parts(&ptr_to(unk(8)), &on),
             ("unsigned long *".to_string(), String::new())
         );
         assert_eq!(
-            declarator_parts(&ptr_to(unk(4)), on),
+            declarator_parts(&ptr_to(unk(4)), &on),
             ("unsigned int *".to_string(), String::new())
         );
         assert_eq!(
-            declarator_parts(&ptr_to(ptr_to(unk(1))), on),
+            declarator_parts(&ptr_to(ptr_to(unk(1))), &on),
             ("char **".to_string(), String::new())
         );
         // Only a residual size with no natural C type degrades to `void` under a
         // pointer (as a scalar it still keeps the placeholder).
-        assert_eq!(declarator_parts(&ptr_to(unk(3)), on), ("void *".to_string(), String::new()));
+        assert_eq!(declarator_parts(&ptr_to(unk(3)), &on), ("void *".to_string(), String::new()));
         // Array of unknown -> `char [8]` (element relabelled, count preserved).
-        assert_eq!(declarator_parts(&array_of(unk(1), 8), on), ("char".to_string(), "[8]".to_string()));
+        assert_eq!(declarator_parts(&array_of(unk(1), 8), &on), ("char".to_string(), "[8]".to_string()));
         // Gate OFF leaves the placeholder untouched.
-        assert_eq!(declarator_parts(&unk(4), crate::printc::RealTypeCtx::OFF).0, "undefined4");
+        assert_eq!(declarator_parts(&unk(4), &crate::printc::RealTypeCtx::OFF).0, "undefined4");
     }
 
     /// (kuna DIV-6) A genuine `TYPE_VOID` pointee is not a residual unknown, so the
@@ -651,10 +786,10 @@ mod w10_input_prototype_declarator {
         let on = crate::printc::RealTypeCtx { enabled: true, long_is_8: true, ..crate::printc::RealTypeCtx::OFF };
         let void = || Rc::new(Datatype::new_with_align(0, 1, type_metatype::TYPE_VOID));
         for rt in [on, crate::printc::RealTypeCtx::OFF] {
-            assert_eq!(declarator_parts(&void(), rt), ("void".to_string(), String::new()));
-            assert_eq!(declarator_parts(&ptr_to(void()), rt), ("void *".to_string(), String::new()));
+            assert_eq!(declarator_parts(&void(), &rt), ("void".to_string(), String::new()));
+            assert_eq!(declarator_parts(&ptr_to(void()), &rt), ("void *".to_string(), String::new()));
             assert_eq!(
-                declarator_parts(&ptr_to(ptr_to(void())), rt),
+                declarator_parts(&ptr_to(ptr_to(void())), &rt),
                 ("void **".to_string(), String::new())
             );
         }
@@ -745,7 +880,7 @@ mod decompile_project_type_render {
                 (16, "arr", array_of(i4, 4)),
             ],
         );
-        let body = compose_type_body(&s, "mystruct", RealTypeCtx::OFF);
+        let body = compose_type_body(&s, "mystruct", &RealTypeCtx::OFF);
         assert_eq!(
             body,
             "struct mystruct {\n\
@@ -775,7 +910,7 @@ mod decompile_project_type_render {
             ],
         };
         let u = Rc::new(u);
-        let body = compose_type_body(&u, "myunion", RealTypeCtx::OFF);
+        let body = compose_type_body(&u, "myunion", &RealTypeCtx::OFF);
         assert_eq!(
             body,
             "union myunion {\n\
@@ -797,12 +932,14 @@ mod decompile_project_type_render {
             type_metatype::TYPE_INT,
             &[(0, "OK"), (0xffff_ffff, "FAIL")],
         );
-        let body = compose_enum_body(&se, "serrs");
+        let body = compose_enum_body(&se, "serrs", None);
         assert_eq!(
             body,
-            "typedef enum serrs {\n\
+            "typedef enum __attribute__((packed)) serrs {\n\
              \x20   OK = 0,\n\
-             \x20   FAIL = -1\n\
+             \x20   FAIL = -1,\n\
+             \x20   serrs__kuna_min = -2147483648,\n\
+             \x20   serrs__kuna_max = 2147483647LL,\n\
              } serrs;\n"
         );
         // Unsigned 4-byte enum: hex values.
@@ -812,12 +949,14 @@ mod decompile_project_type_render {
             type_metatype::TYPE_UINT,
             &[(0x1, "LO"), (0x80, "HI")],
         );
-        let body = compose_enum_body(&ue, "uflags");
+        let body = compose_enum_body(&ue, "uflags", None);
         assert_eq!(
             body,
-            "typedef enum uflags {\n\
-             \x20   LO = 0x1,\n\
-             \x20   HI = 0x80\n\
+            "typedef enum __attribute__((packed)) uflags {\n\
+             \x20   LO = 0x1ULL,\n\
+             \x20   HI = 0x80ULL,\n\
+             \x20   uflags__kuna_min = 0,\n\
+             \x20   uflags__kuna_max = 0xffffffffULL,\n\
              } uflags;\n"
         );
     }
@@ -835,7 +974,7 @@ mod decompile_project_type_render {
             t.typedef_imm = Some(Rc::clone(&i4));
             Rc::new(t)
         };
-        let out = render_type_definitions(&[Rc::clone(&i4), Rc::clone(&td)], RealTypeCtx::OFF);
+        let out = render_type_definitions(&[Rc::clone(&i4), Rc::clone(&td)], &RealTypeCtx::OFF);
         assert!(
             out.contains("typedef int4 myint;\n"),
             "scalar typedef line missing:\n{out}"
@@ -851,7 +990,7 @@ mod decompile_project_type_render {
             t.typedef_imm = Some(Rc::clone(&pstr));
             Rc::new(t)
         };
-        let out = render_type_definitions(&[tdp], RealTypeCtx::OFF);
+        let out = render_type_definitions(&[tdp], &RealTypeCtx::OFF);
         assert!(
             out.contains("typedef char *mystr;\n"),
             "pointer typedef line missing:\n{out}"
@@ -875,7 +1014,7 @@ mod decompile_project_type_render {
             Rc::new(s)
         };
         let out =
-            render_type_definitions(&[Rc::clone(&opaque), Rc::clone(&complete)], RealTypeCtx::OFF);
+            render_type_definitions(&[Rc::clone(&opaque), Rc::clone(&complete)], &RealTypeCtx::OFF);
         assert!(
             out.contains("typedef struct mystery mystery; /* opaque */\n"),
             "opaque forward decl missing:\n{out}"
@@ -907,7 +1046,7 @@ mod decompile_project_type_render {
 
         let i4 = named(4, type_metatype::TYPE_INT, "int4");
         let s = struct_of("bad-name$1", 4, &[(0, "a", i4)]);
-        let out = render_type_definitions(&[s], RealTypeCtx::OFF);
+        let out = render_type_definitions(&[s], &RealTypeCtx::OFF);
         assert!(
             out.contains(
                 "typedef struct bad_name_1 bad_name_1; /* renamed from \"bad-name$1\" */"
@@ -928,7 +1067,7 @@ mod decompile_project_type_render {
         for raw in ["ev*/il", "ev\nil", "ev/*il"] {
             let out = render_type_definitions(
                 &[struct_of(raw, 4, &[(0, "a", Rc::clone(&i4))])],
-                RealTypeCtx::OFF,
+                &RealTypeCtx::OFF,
             );
             for line in out.lines().filter(|l| l.contains("renamed from")) {
                 let note = &line[line.find("/* renamed").unwrap() + 2..];
@@ -943,7 +1082,7 @@ mod decompile_project_type_render {
         // A name with no comment delimiter and no control byte is quoted verbatim.
         let plain = render_type_definitions(
             &[struct_of("bad-name$1", 4, &[(0, "a", i4)])],
-            RealTypeCtx::OFF,
+            &RealTypeCtx::OFF,
         );
         assert!(plain.contains("/* renamed from \"bad-name$1\" */"), "{plain}");
     }
@@ -956,7 +1095,7 @@ mod decompile_project_type_render {
         let i8t = named(8, type_metatype::TYPE_INT, "int8");
         let first = struct_of("dup", 4, &[(0, "a", i4)]);
         let second = struct_of("dup", 8, &[(0, "b", i8t)]);
-        let out = render_type_definitions(&[first, second], RealTypeCtx::OFF);
+        let out = render_type_definitions(&[first, second], &RealTypeCtx::OFF);
         assert_eq!(
             out.matches("typedef struct dup dup;").count(),
             1,
@@ -1001,7 +1140,7 @@ mod decompile_project_type_render {
         let colliding_enum = make_enum("tagged", 4, type_metatype::TYPE_UINT, &[(1, "ONE")]);
         let out = render_type_definitions(
             &[core_struct, anon, Rc::clone(&named_struct), colliding_enum],
-            RealTypeCtx::OFF,
+            &RealTypeCtx::OFF,
         );
         assert!(!out.contains("sys"), "core types must be skipped:\n{out}");
         assert!(out.contains("struct tagged {"), "named struct body missing:\n{out}");
@@ -1009,7 +1148,7 @@ mod decompile_project_type_render {
             out.contains("/* duplicate type name skipped: tagged */"),
             "enum colliding with a struct tag must be skipped as a duplicate:\n{out}"
         );
-        assert!(!out.contains("typedef enum tagged"), "colliding enum must not define:\n{out}");
+        assert!(!out.contains("typedef enum __attribute__((packed)) tagged"), "colliding enum must not define:\n{out}");
     }
 }
 
@@ -1256,6 +1395,27 @@ fn option_defaults_match_reset_defaults_printc() {
     assert_eq!(o.brace_ifelse, BraceStyle::SameLine);
     assert_eq!(o.brace_loop, BraceStyle::SameLine);
     assert_eq!(o.brace_switch, BraceStyle::SameLine);
+}
+
+#[test]
+fn sparse_native_defaults_are_distinct_from_console_defaults() {
+    let mut print = PrintC::new();
+    assert!(print.options.null && print.options.inplace_ops);
+    assert_eq!(print.options.brace_func, BraceStyle::NextLine);
+    print.reset_wire_option_defaults();
+    for _ in 0..2 {
+        assert!(!print.options.null && !print.options.inplace_ops);
+        assert!(print.options.convention);
+        assert_eq!(print.options.brace_func, BraceStyle::SkipLine);
+        assert_eq!(print.max_line_size, 100);
+        print.set_null_printing(true);
+        print.set_inplace_ops(true);
+        print.set_convention_printing(false);
+        print.set_brace_format(crate::options::BraceCategory::Function, BraceStyle::SameLine);
+        print.set_max_line_size(20).unwrap();
+        print.reset_wire_option_defaults();
+    }
+    assert!(PrintCOptions::new().null && PrintCOptions::new().inplace_ops);
 }
 
 #[test]
@@ -1887,7 +2047,7 @@ mod w10_enum_render {
 // ---------------------------------------------------------------------------
 
 /// Postsurround (function-call `( )`) wrapping a lower-precedence binary
-/// subexpression.  This is the only RPN path where one stack entry's `id2` is
+/// subexpression. This RPN path has a stack entry whose `id2` is
 /// SET by `emit_op` at `visited==1` (openParen) and then READ at `visited==2`
 /// (closeParen).  The Rust port clones the entry for each `emit_op` and mirrors
 /// `id2` back onto the live stack top; if that mirror is wrong the close paren
@@ -1904,6 +2064,70 @@ fn w10_postsurround_call_id2_roundtrips() {
         p.push_atom(&var_atom("b"));
     });
     assert_eq!(out, "foo(a + b)", "postsurround call: {out:?}");
+}
+
+#[test]
+fn queued_rpn_surrounds_preserve_their_open_close_identity() {
+    use crate::prettyprint::ids;
+    use kuna_base::marshal::{Decoder, PackedDecode, ATTRIB_CONTENT};
+    use std::collections::BTreeSet;
+
+    for token in [&tokens::FUNCTION_CALL, &tokens::TYPECAST] {
+        for nested in [false, true] {
+            let call = std::ptr::eq(token, &tokens::FUNCTION_CALL);
+            let mut print = PrintC::new();
+            print.emit = PrintEmit::markup(100);
+            let document = print.emit.begin_document();
+            print.push_op(token, None);
+            print.push_atom(&var_atom(if call { "foo" } else { "T" }));
+            if nested {
+                print.push_op(&tokens::BINARY_PLUS, None);
+                print.push_atom(&var_atom("a"));
+                print.push_atom(&var_atom("b"));
+            } else {
+                print.push_atom(&var_atom("a"));
+            }
+            assert!(print.is_stack_empty());
+            print.emit.end_document(document);
+
+            let bytes = print.emit.take_markup_bytes();
+            let manager = kuna_base::space::AddrSpaceManager::new();
+            let mut decoder = PackedDecode::new(&manager);
+            decoder.ingest_stream(&bytes).unwrap();
+            let root = decoder.open_element_id(&ids::ELEM_CLANG_DOCUMENT).unwrap();
+            let mut active = Vec::new();
+            let mut opened = BTreeSet::new();
+            let mut text = String::new();
+            while decoder.peek_element().unwrap() != 0 {
+                let element = decoder.open_element().unwrap();
+                loop {
+                    let attribute = decoder.get_next_attribute_id().unwrap();
+                    if attribute == 0 { break; }
+                    if attribute == ids::ATTRIB_OPEN.get_id() {
+                        let id = decoder.read_signed_integer().unwrap();
+                        assert!(opened.insert(id), "reused opening id {id}");
+                        active.push(id);
+                    } else if attribute == ids::ATTRIB_CLOSE.get_id() {
+                        let id = decoder.read_signed_integer().unwrap();
+                        assert_eq!(active.pop(), Some(id), "{text}: unmatched closing id");
+                    } else if attribute == ATTRIB_CONTENT.get_id() {
+                        text.push_str(&String::from_utf8(decoder.read_string().unwrap()).unwrap());
+                    }
+                }
+                decoder.close_element(element).unwrap();
+            }
+            decoder.close_element(root).unwrap();
+            assert!(active.is_empty(), "{text}: unclosed pair");
+            assert_eq!(opened.len(), if !call && nested { 2 } else { 1 });
+            let expected = match (call, nested) {
+                (true, false) => "foo(a)",
+                (true, true) => "foo(a + b)",
+                (false, false) => "(T)a",
+                (false, true) => "(T)(a + b)",
+            };
+            assert_eq!(text, expected);
+        }
+    }
 }
 
 /// Deep right-nested non-associative subtraction.  `BINARY_MINUS` is
@@ -2055,9 +2279,9 @@ mod w10_float_family {
         let r = ram(fd);
         // The definer op (e.g. INT_ZEXT) producing a written varnode.
         let defop = mk_op(fd, 1, 0x10, def_opc);
-        let src = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x200), Some(unk(4)));
+        let src = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x200), Some(unk(4))).unwrap();
         fd.op_set_input(defop, src, 0).unwrap();
-        let widened = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x300), Some(unk(8)));
+        let widened = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x300), Some(unk(8))).unwrap();
         fd.op_set_output(defop, widened).unwrap();
         // op_set_output marks `widened` written; re-fetch its id (set_def may
         // remap) from the definer's output.
@@ -2068,7 +2292,7 @@ mod w10_float_family {
         // The FLOAT_INT2FLOAT reading `widened` in slot 0.
         let i2f = mk_op(fd, 1, 0x20, OpCode::CPUI_FLOAT_INT2FLOAT);
         fd.op_set_input(i2f, widened, 0).unwrap();
-        let out = fd.new_varnode(8, &Address::new(r, 0x400), Some(unk(8)));
+        let out = fd.new_varnode(8, &Address::new(r, 0x400), Some(unk(8))).unwrap();
         fd.op_set_output(i2f, out).unwrap();
         (i2f, defop)
     }
@@ -2120,11 +2344,11 @@ mod w10_float_family {
         let mut fd = build_fd();
         let r = ram(&fd);
         let i2f = mk_op(&mut fd, 1, 0x20, OpCode::CPUI_FLOAT_INT2FLOAT);
-        let free_in = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x500), Some(unk(8)));
+        let free_in = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x500), Some(unk(8))).unwrap();
         // A free varnode marked implied (implied alone must not trigger absorb).
         fd.vbank_mut().get_mut(free_in).unwrap().set_implied();
         fd.op_set_input(i2f, free_in, 0).unwrap();
-        let out = fd.new_varnode(8, &Address::new(r, 0x600), Some(unk(8)));
+        let out = fd.new_varnode(8, &Address::new(r, 0x600), Some(unk(8))).unwrap();
         fd.op_set_output(i2f, out).unwrap();
         assert_eq!(
             absorb_zext(&fd, i2f),
@@ -2143,14 +2367,14 @@ mod w10_float_family {
         t.name = "float8".to_string();
         t.display_name = "float8".to_string();
         let t = Rc::new(t);
-        let (front, back) = declarator_parts(&t, crate::printc::RealTypeCtx::OFF);
+        let (front, back) = declarator_parts(&t, &crate::printc::RealTypeCtx::OFF);
         assert_eq!(front, "float8");
         assert_eq!(back, "");
         // float4 likewise (the conversion-source-width family).
         let mut t4 = Datatype::new_with_align(4, -1, type_metatype::TYPE_FLOAT);
         t4.name = "float4".to_string();
         t4.display_name = "float4".to_string();
-        let (f4, b4) = declarator_parts(&Rc::new(t4), crate::printc::RealTypeCtx::OFF);
+        let (f4, b4) = declarator_parts(&Rc::new(t4), &crate::printc::RealTypeCtx::OFF);
         assert_eq!((f4.as_str(), b4.as_str()), ("float4", ""));
     }
 }
@@ -2216,10 +2440,20 @@ mod w10_printc_cast_render {
     }
 
     fn bare_arch() -> crate::architecture::Architecture {
-        crate::architecture::Architecture::new(
+        let arch = crate::architecture::Architecture::new(
             "t",
             Sleigh::new(Box::new(DummyImg), Box::new(ContextInternal::new())),
-        )
+        );
+        // Aggregate byte addresses need the same core character and pointer
+        // organization that architecture initialization supplies in production.
+        let types = arch.types_impl();
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.setup_sizes(Some(4), 4, 4);
+        types.set_core_type("char", 1, type_metatype::TYPE_INT, true).unwrap();
+        types.set_core_type("undefined1", 1, type_metatype::TYPE_UNKNOWN, false).unwrap();
+        types.cache_core_types().unwrap();
+        arch
     }
 
     fn build_manager() -> AddrSpaceManager {
@@ -2280,7 +2514,7 @@ mod w10_printc_cast_render {
         let op = mk_op(fd, 1, 0x20, opc);
         let cst = fd.new_constant(8, k);
         fd.op_set_input(op, cst, 0).unwrap();
-        let out = fd.new_varnode(out_ty.get_size(), &Address::new(r, 0x400), Some(out_ty));
+        let out = fd.new_varnode(out_ty.get_size(), &Address::new(r, 0x400), Some(out_ty)).unwrap();
         fd.op_set_output(op, out).unwrap();
         op
     }
@@ -2294,8 +2528,347 @@ mod w10_printc_cast_render {
         let mut p = PrintC::new();
         p.set_no_cast_printing(nocasts);
         p.set_output_stream();
-        p.op_type_cast_ir(fd, &arch, op);
+        p.op_type_cast_ir(fd, &arch, op).unwrap();
         p.emit_mut().output_str().to_string()
+    }
+
+    struct WideSnapshotFixture {
+        fd: Funcdata,
+        source: super::super::VarnodeId,
+        snapshot: super::super::VarnodeId,
+        target: super::super::VarnodeId,
+        extraction: super::super::OpId,
+        restore: super::super::OpId,
+        object: Rc<Datatype>,
+        unknown: Rc<Datatype>,
+    }
+
+    fn wide_snapshot_fixture(big: bool, name: &str, size: int4, mapped_copy: bool) -> WideSnapshotFixture {
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+        manager.insert_space(Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "ram", big, 4, 1, 2,
+            addrspace_flags::hasphysical, 1, 1,
+        ))).unwrap();
+        let glb = Rc::new(ContextArch::new(manager));
+        let memory = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
+        let mut fd = Funcdata::new("func", "func", glb,
+            Address::new(Rc::clone(&memory), 0x1000), 0x1000_0000, 0x40).unwrap();
+        let mut pad = Datatype::new(64, type_metatype::TYPE_ARRAY);
+        pad.kind = crate::dtype::DatatypeKind::Array {
+            arrayof: named("int", 4, type_metatype::TYPE_INT), arraysize: 16,
+        };
+        let mut object = Datatype::new(72, type_metatype::TYPE_STRUCT);
+        object.name = name.into();
+        object.display_name = name.into();
+        object.kind = crate::dtype::DatatypeKind::Struct {
+            field: vec![
+                crate::dtype::TypeField::new(0, 0, "temp",
+                    named("callback", 4, type_metatype::TYPE_PTR)),
+                crate::dtype::TypeField::new(1, 4, "pad", Rc::new(pad)),
+                crate::dtype::TypeField::new(2, 68, "t",
+                    named("short", 2, type_metatype::TYPE_INT)),
+            ],
+            bitfield: vec![],
+        };
+        let object = Rc::new(object);
+        let offset = 72 - size;
+        // Match native aggregate partials: oversized unknown storage strips to
+        // the factory's canonical array of unknown bytes, not a fake scalar.
+        let arch = bare_arch();
+        let unknown = arch.types().get_type_partial_struct(Rc::clone(&object), offset, size).unwrap();
+        let source = fd.new_varnode(if mapped_copy { size } else { 72 },
+            &Address::new(Rc::clone(&memory), 0x400),
+            Some(if mapped_copy { Rc::clone(&unknown) } else { Rc::clone(&object) })).unwrap();
+        // An incoming value may be read by both the extraction and later
+        // definitions; a free pre-heritage read has only one descendant.
+        let source = fd.vbank_mut().set_input(source, &mut |_, _, _| Ok(())).unwrap();
+        let extraction = mk_op(&mut fd, if mapped_copy { 1 } else { 2 }, 0x20,
+            if mapped_copy { OpCode::CPUI_COPY } else { OpCode::CPUI_SUBPIECE });
+        fd.op_set_input(extraction, source, 0).unwrap();
+        if !mapped_copy {
+            let low = fd.new_constant(4, if big { 0 } else { offset as u64 });
+            fd.op_set_input(extraction, low, 1).unwrap();
+        }
+        let snapshot = fd.new_varnode(size, &Address::new(Rc::clone(&memory), 0x800),
+            Some(Rc::clone(&unknown))).unwrap();
+        fd.op_set_output(extraction, snapshot).unwrap();
+        let restore = mk_op(&mut fd, 1, 0x24, OpCode::CPUI_COPY);
+        fd.op_set_input(restore, snapshot, 0).unwrap();
+        let target = fd.new_varnode(size, &Address::new(Rc::clone(&memory), 0xc00),
+            Some(Rc::clone(&unknown))).unwrap();
+        fd.op_set_output(restore, target).unwrap();
+        fd.set_high_level();
+        for (value, label, symbol_offset) in [
+            (source, "whole", if mapped_copy { offset } else { 0 }),
+            (target, "restored", offset),
+        ] {
+            let high = fd.vbank().get(value).unwrap().get_high().unwrap();
+            let high = fd.high_bank_mut().get_mut(high).unwrap();
+            high.set_kuna_name(label);
+            high.set_symbol_type(Rc::clone(&object));
+            high.set_symbol_offset(symbol_offset);
+        }
+        let high = fd.vbank().get(snapshot).unwrap().get_high().unwrap();
+        fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("snapshot");
+        WideSnapshotFixture { fd, source, snapshot, target, extraction, restore, object, unknown }
+    }
+
+    #[test]
+    fn wide_aggregate_snapshots_use_bounded_byte_storage_without_partialaccess() {
+        for big in [false, true] {
+            for name in ["dev", "other"] {
+                for size in [9, 12, 16, 28, 56, 60, 64, 68] {
+                    for mapped_copy in [false, true] {
+                        let WideSnapshotFixture { mut fd, source, snapshot, extraction, restore, object, unknown, .. } =
+                            wide_snapshot_fixture(big, name, size, mapped_copy);
+                        let offset = 72 - size;
+                        let high = fd.vbank().get(snapshot).unwrap().get_high().unwrap();
+                        let address = fd.vbank().get(snapshot).unwrap().get_addr().clone();
+                        let arch = bare_arch();
+                        let mut printer = PrintC::new();
+                        assert!(!printer.options.partial_access);
+                        let (front, back, count, _, _) = printer.rendered_local_decl(&fd, &arch, high).unwrap();
+                        assert_eq!((front.as_str(), back.as_str()), ("unsigned char", ""));
+                        assert_eq!(count, Some(("unsigned char".into(), size)));
+                        for op in [extraction, restore] {
+                            printer.set_output_stream();
+                            printer.emit_expression_ir(&fd, &arch, op).unwrap();
+                            let text = printer.emit_mut().output_str();
+                            assert!(text.starts_with("__builtin_memcpy("), "{big} {name} {size}: {text}");
+                            assert!(text.contains("&snapshot") && !text.contains("._"), "{text}");
+                            let count = text.rsplit_once(',').unwrap().1.strip_suffix(')').unwrap();
+                            let count = if let Some(hex) = count.strip_prefix("0x") {
+                                int4::from_str_radix(hex, 16).unwrap()
+                            } else {
+                                count.parse::<int4>().unwrap()
+                            };
+                            assert_eq!(count, size, "{text}");
+                        }
+                        assert!(Rc::ptr_eq(fd.vbank().get(snapshot).unwrap().get_type(), &unknown));
+                        assert_eq!(fd.vbank().get(snapshot).unwrap().get_addr(), &address);
+                        assert_eq!(object.get_size(), 72);
+                        assert_eq!(object.get_field(2).unwrap().name, "t");
+                        // A source range outside either the native input or the
+                        // named aggregate cannot acquire a byte-storage spelling.
+                        if mapped_copy {
+                            let source_high = fd.vbank().get(source).unwrap().get_high().unwrap();
+                            fd.high_bank_mut().get_mut(source_high).unwrap().set_symbol_offset(offset + 1);
+                        } else {
+                            let outside = fd.new_constant(4, 73);
+                            fd.op_set_input(extraction, outside, 1).unwrap();
+                        }
+                        assert_eq!(printer.wide_snapshot_size(&fd, &arch, high), None);
+                        printer.set_output_stream();
+                        assert!(!printer.emit_wide_copy(&fd, &arch, extraction).unwrap());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unrelated_large_unknown_is_not_redeclared_as_snapshot_storage() {
+        let mut fd = build_fd();
+        let value = fd.new_varnode(56, &Address::new(ram(&fd), 0x400),
+            Some(named("undefined56", 56, type_metatype::TYPE_UNKNOWN))).unwrap();
+        fd.set_high_level();
+        let high = fd.vbank().get(value).unwrap().get_high().unwrap();
+        assert_eq!(PrintC::new().wide_snapshot_size(&fd, &bare_arch(), high), None);
+    }
+
+    #[test]
+    fn snapshot_byte_storage_keeps_named_qualified_typed_and_host_arrays() {
+        use kuna_base::marshal::{Decoder, PackedDecode, PackedEncode};
+        let mut fixture = wide_snapshot_fixture(false, "dev", 56, false);
+        let arch = bare_arch();
+        let raw = arch.types().get_base(56, type_metatype::TYPE_UNKNOWN).unwrap();
+        assert_eq!(raw.get_metatype(), type_metatype::TYPE_ARRAY);
+        let high = fixture.fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+        fixture.fd.vn_update_type(fixture.snapshot, Rc::clone(&raw));
+        let printer = PrintC::new();
+        assert_eq!(printer.wide_snapshot_size(&fixture.fd, &arch, high), Some(56));
+
+        let mut named_array = (*raw).clone();
+        named_array.name = "AuthoredBytes".into();
+        named_array.display_name = named_array.name.clone();
+        let qualified = arch.types().get_qualified_type(Rc::clone(&raw), crate::kuna_typequal::CONST).unwrap();
+        let typed = arch.types().get_type_array(56, arch.types().get_base(1, type_metatype::TYPE_UINT).unwrap()).unwrap();
+        let wider = arch.types().get_type_array(28, arch.types().get_base(2, type_metatype::TYPE_UNKNOWN).unwrap()).unwrap();
+        // The real host codec marks ownership, independently of empty spelling.
+        let mut bytes = Vec::new();
+        raw.encode(&mut PackedEncode::new(&mut bytes)).unwrap();
+        let mut decoder = PackedDecode::new(fixture.fd.get_arch().manage());
+        decoder.ingest_stream(&bytes).unwrap();
+        let host = arch.types_impl().decode_type(&mut decoder).unwrap();
+        drop(decoder);
+        assert!(host.is_host_type());
+        for ty in [Rc::new(named_array), qualified, typed, wider, host] {
+            fixture.fd.vn_update_type(fixture.snapshot, ty);
+            assert_eq!(printer.wide_snapshot_size(&fixture.fd, &arch, high), None);
+        }
+    }
+
+    #[test]
+    fn a_named_nested_record_is_not_an_unnamed_snapshot_piece() {
+        for big in [false, true] {
+            for mapped_copy in [false, true] {
+                let mut fixture = wide_snapshot_fixture(big, "dev", 56, mapped_copy);
+                let mut words = Datatype::new(56, type_metatype::TYPE_ARRAY);
+                words.kind = crate::dtype::DatatypeKind::Array {
+                    arrayof: named("word", 8, type_metatype::TYPE_UINT), arraysize: 7,
+                };
+                let mut nested = Datatype::new(56, type_metatype::TYPE_STRUCT);
+                nested.name = "nested_record".into();
+                nested.display_name = nested.name.clone();
+                nested.kind = crate::dtype::DatatypeKind::Struct {
+                    field: vec![crate::dtype::TypeField::new(0, 0, "words", Rc::new(words))],
+                    bitfield: vec![],
+                };
+                let mut tail = Datatype::new(16, type_metatype::TYPE_ARRAY);
+                tail.kind = crate::dtype::DatatypeKind::Array {
+                    arrayof: named("int", 4, type_metatype::TYPE_INT), arraysize: 4,
+                };
+                let mut root = Datatype::new(72, type_metatype::TYPE_STRUCT);
+                root.name = "root_record".into();
+                root.display_name = root.name.clone();
+                root.kind = crate::dtype::DatatypeKind::Struct {
+                    field: vec![
+                        crate::dtype::TypeField::new(0, 0, "record", Rc::new(nested)),
+                        crate::dtype::TypeField::new(1, 56, "tail", Rc::new(tail)),
+                    ],
+                    bitfield: vec![],
+                };
+                let root = Rc::new(root);
+                let fd = &mut fixture.fd;
+                let source_high = fd.vbank().get(fixture.source).unwrap().get_high().unwrap();
+                fd.high_bank_mut().get_mut(source_high).unwrap().set_symbol_type(Rc::clone(&root));
+                fd.high_bank_mut().get_mut(source_high).unwrap().set_symbol_offset(0);
+                if !mapped_copy {
+                    fd.vbank_mut().get_mut(fixture.source).unwrap().update_type(Rc::clone(&root));
+                    let low = fd.new_constant(4, if big { 16 } else { 0 });
+                    fd.op_set_input(fixture.extraction, low, 1).unwrap();
+                }
+                let high = fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+                let source_type = Rc::clone(fd.vbank().get(fixture.source).unwrap().get_type());
+                let address = fd.vbank().get(fixture.snapshot).unwrap().get_addr().clone();
+                let arch = bare_arch();
+                let mut printer = PrintC::new();
+                assert!(printer.wide_aggregate_source(fd, fixture.extraction).is_some());
+                assert!(printer.wide_aggregate_piece(fd, &arch, fixture.extraction).is_none());
+                assert_eq!(printer.wide_snapshot_size(fd, &arch, high), None);
+                assert!(printer.rendered_local_decl(fd, &arch, high).unwrap().2.is_none());
+                printer.set_output_stream();
+                assert!(!printer.emit_wide_copy(fd, &arch, fixture.extraction).unwrap());
+                assert!(Rc::ptr_eq(fd.vbank().get(fixture.source).unwrap().get_type(), &source_type));
+                assert!(Rc::ptr_eq(fd.vbank().get(fixture.snapshot).unwrap().get_type(), &fixture.unknown));
+                assert_eq!(fd.vbank().get(fixture.snapshot).unwrap().get_addr(), &address);
+            }
+        }
+    }
+
+    fn add_snapshot_definition(fixture: &mut WideSnapshotFixture, opcode: OpCode, flags: u32) {
+        let fd = &mut fixture.fd;
+        let count = if matches!(opcode, OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INT_ADD | OpCode::CPUI_INDIRECT) { 2 } else { 1 };
+        let op = mk_op(fd, count, 0x28, opcode);
+        for slot in 0..count {
+            let input = if opcode == OpCode::CPUI_CALL {
+                fd.new_constant(4, 0x2000)
+            } else if opcode == OpCode::CPUI_INT_ADD {
+                fixture.source
+            } else {
+                fixture.snapshot
+            };
+            fd.op_set_input(op, input, slot).unwrap();
+        }
+        let output = fd.new_varnode(56, &Address::new(ram(fd), 0x1000),
+            Some(Rc::clone(&fixture.unknown))).unwrap();
+        fd.op_set_output(op, output).unwrap();
+        fd.obank_mut().get_mut(op).unwrap().set_flag(flags);
+        if fd.vbank().get(output).unwrap().get_high().is_none() {
+            fd.assign_high_var(output);
+        }
+        let previous = fd.vbank().get(output).unwrap().get_high().unwrap();
+        let high = fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+        fd.high_remove_member(previous, output);
+        let mut update = None;
+        fd.with_high_split(|bank, context| bank.insert_member(high, output, 0, context,
+            &mut |vn, high, group| update = Some((vn, high, group))));
+        let (vn, high, group) = update.unwrap();
+        fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
+    }
+
+    #[test]
+    fn wide_snapshot_admission_closes_every_definition_and_existing_print_disposition() {
+        use crate::op::pcodeop_flags;
+        for (opcode, flags, eligible) in [
+            (OpCode::CPUI_COPY, 0, false),
+            (OpCode::CPUI_COPY, pcodeop_flags::nonprinting, true),
+            (OpCode::CPUI_MULTIEQUAL, 0, false),
+            (OpCode::CPUI_MULTIEQUAL, pcodeop_flags::marker, true),
+            (OpCode::CPUI_CALL, 0, false),
+            (OpCode::CPUI_INT_ADD, 0, false),
+            (OpCode::CPUI_INDIRECT, pcodeop_flags::marker, false),
+        ] {
+            let mut fixture = wide_snapshot_fixture(false, "dev", 56, true);
+            let high = fixture.fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+            add_snapshot_definition(&mut fixture, opcode, flags);
+            assert_eq!(PrintC::new().wide_snapshot_size(&fixture.fd, &bare_arch(), high),
+                eligible.then_some(56), "{opcode:?} {flags:#x}");
+            assert!(Rc::ptr_eq(fixture.fd.vbank().get(fixture.snapshot).unwrap().get_type(), &fixture.unknown));
+            assert_eq!(fixture.fd.vbank().get(fixture.snapshot).unwrap().get_offset(), 0x800);
+        }
+    }
+
+    #[test]
+    fn wide_snapshot_admission_rejects_raw_value_consumers_and_implied_instances() {
+        for opcode in [OpCode::CPUI_CALL, OpCode::CPUI_SUBPIECE] {
+            let mut fixture = wide_snapshot_fixture(false, "dev", 56, true);
+            let fd = &mut fixture.fd;
+            let use_op = mk_op(fd, 2, 0x28, opcode);
+            let constant = fd.new_constant(4, if opcode == OpCode::CPUI_CALL { 0x2000 } else { 0 });
+            if opcode == OpCode::CPUI_CALL {
+                fd.op_set_input(use_op, constant, 0).unwrap();
+                fd.op_set_input(use_op, fixture.snapshot, 1).unwrap();
+            } else {
+                fd.op_set_input(use_op, fixture.snapshot, 0).unwrap();
+                fd.op_set_input(use_op, constant, 1).unwrap();
+                let output = fd.new_varnode(4, &Address::new(ram(fd), 0x1000),
+                    Some(named("word", 4, type_metatype::TYPE_UINT))).unwrap();
+                fd.op_set_output(use_op, output).unwrap();
+            }
+            let high = fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+            assert_eq!(PrintC::new().wide_snapshot_size(fd, &bare_arch(), high), None);
+            assert!(Rc::ptr_eq(fd.vbank().get(fixture.snapshot).unwrap().get_type(), &fixture.unknown));
+        }
+        let mut fixture = wide_snapshot_fixture(false, "dev", 56, true);
+        let high = fixture.fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+        fixture.fd.vbank_mut().get_mut(fixture.snapshot).unwrap().set_implied();
+        assert_eq!(PrintC::new().wide_snapshot_size(&fixture.fd, &bare_arch(), high), None);
+    }
+
+    #[test]
+    fn mandatory_wide_physical_copies_do_not_replace_volatile_operand_accesses() {
+        use crate::varnode::varnode_flags;
+        for source_volatile in [false, true] {
+            let mut fixture = wide_snapshot_fixture(false, "dev", 56, true);
+            // Bypass snapshot admission: this is the independent
+            // composite-destination/composite-source mandatory route.
+            fixture.fd.op_set_input(fixture.restore, fixture.source, 0).unwrap();
+            let operand = if source_volatile { fixture.source } else { fixture.target };
+            fixture.fd.vbank_mut().get_mut(operand).unwrap().set_flags_pub(varnode_flags::volatil);
+            let mut printer = PrintC::new();
+            printer.set_output_stream();
+            assert!(!printer.emit_wide_copy(&fixture.fd, &bare_arch(), fixture.restore).unwrap());
+        }
+        for operand_index in 0..3 {
+            let mut fixture = wide_snapshot_fixture(false, "dev", 56, false);
+            let operand = [fixture.source, fixture.snapshot, fixture.target][operand_index];
+            fixture.fd.vbank_mut().get_mut(operand).unwrap().set_flags_pub(varnode_flags::volatil);
+            let high = fixture.fd.vbank().get(fixture.snapshot).unwrap().get_high().unwrap();
+            assert_eq!(PrintC::new().wide_snapshot_size(&fixture.fd, &bare_arch(), high), None);
+        }
     }
 
     #[test]
@@ -2308,7 +2881,8 @@ mod w10_printc_cast_render {
         printer.set_output_stream();
         printer.op_bit_transfer_ir(&fd, &bare_arch(), op, crate::kuna_bitcast::Transfer {
             input, target: named("float", 4, type_metatype::TYPE_FLOAT), size: 4, to_float: true,
-        });
+            object_source: None,
+        }).unwrap();
         assert_eq!(printer.emit_mut().output_str(), "f32::from_bits(0x1u32)");
     }
 
@@ -2347,14 +2921,14 @@ mod w10_printc_cast_render {
                 8,
                 &Address::new(ram.clone(), 0x400),
                 Some(named("word", 8, source_meta)),
-            );
+            ).unwrap();
             let op = mk_op(&mut fd, 2, 0x20, OpCode::CPUI_SUBPIECE);
             fd.op_set_input(op, source, 0).unwrap();
             let output = fd.new_varnode(
                 4,
                 &Address::new(ram, 0x500),
                 Some(named("float", 4, type_metatype::TYPE_FLOAT)),
-            );
+            ).unwrap();
             fd.op_set_output(op, output).unwrap();
             fd.set_high_level();
             let high = fd.vbank().get(source).unwrap().get_high().unwrap();
@@ -2365,7 +2939,7 @@ mod w10_printc_cast_render {
             for offset in 0..=4 {
                 let shift = fd.new_constant(4, offset);
                 fd.op_set_input(op, shift, 1).unwrap();
-                assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).is_some());
+                assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).unwrap().is_some());
                 for language in ["c", "rust"] {
                     for nocasts in [false, true] {
                         let mut printer = PrintC::new();
@@ -2376,7 +2950,7 @@ mod w10_printc_cast_render {
                         printer.rt_ctx.ctypes = true;
                         printer.set_no_cast_printing(nocasts);
                         printer.set_output_stream();
-                        printer.op_push_ir(&fd, &bare_arch(), op, None);
+                        printer.op_push_ir(&fd, &bare_arch(), op, None).unwrap();
                         let text = printer.emit_mut().output_str();
                         assert_eq!(text.matches("workspace").count(), 1, "{text}");
                         assert!(!text.contains("SUB84"), "{text}");
@@ -2410,7 +2984,7 @@ mod w10_printc_cast_render {
             for offset in [5, u64::MAX] {
                 let shift = fd.new_constant(8, offset);
                 fd.op_set_input(op, shift, 1).unwrap();
-                assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).is_none());
+                assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).unwrap().is_none());
             }
             let zero = fd.new_constant(4, 0);
             fd.op_set_input(op, zero, 1).unwrap();
@@ -2419,14 +2993,14 @@ mod w10_printc_cast_render {
                 4,
                 type_metatype::TYPE_UINT,
             ));
-            assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).is_none());
+            assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).unwrap().is_none());
             fd.vbank_mut().get_mut(output).unwrap().update_type(named(
                 "float",
                 4,
                 type_metatype::TYPE_FLOAT,
             ));
             fd.op_set_opcode_code(op, OpCode::CPUI_FLOAT_FLOAT2FLOAT);
-            assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).is_none());
+            assert!(crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).unwrap().is_none());
         }
         execute_float_slice_expressions(&cases);
     }
@@ -2463,7 +3037,7 @@ mod w10_printc_cast_render {
                 8,
                 &Address::new(ram.clone(), 0x400),
                 Some(named("undefined8", 8, type_metatype::TYPE_UNKNOWN)),
-            );
+            ).unwrap();
             fd.op_set_output(def, source).unwrap();
             fd.vbank_mut().get_mut(source).unwrap().set_implied();
             let op = mk_op(&mut fd, 2, 0x20, OpCode::CPUI_SUBPIECE);
@@ -2474,11 +3048,11 @@ mod w10_printc_cast_render {
                 4,
                 &Address::new(ram, 0x500),
                 Some(named("float", 4, type_metatype::TYPE_FLOAT)),
-            );
+            ).unwrap();
             fd.op_set_output(op, output).unwrap();
             fd.set_high_level();
             assert_eq!(
-                crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).is_some(),
+                crate::p9_emit::kuna_floatslice::recognize(&fd, false, op).unwrap().is_some(),
                 producer == OpCode::CPUI_LOAD
             );
         }
@@ -2612,7 +3186,7 @@ mod w10_printc_cast_render {
                 size,
                 &Address::new(Rc::clone(&space), 0x400),
                 Some(named("word", size, type_metatype::TYPE_UINT)),
-            );
+            ).unwrap();
             let float = fd.new_varnode(
                 size,
                 &Address::new(Rc::clone(&space), 0x408),
@@ -2621,7 +3195,7 @@ mod w10_printc_cast_render {
                     size,
                     type_metatype::TYPE_FLOAT,
                 )),
-            );
+            ).unwrap();
             let op = mk_op(&mut fd, 2, 0x20, OpCode::CPUI_SUBPIECE);
             fd.op_set_input(op, source, 0).unwrap();
             let offset = fd.new_constant(4, 0);
@@ -2630,7 +3204,7 @@ mod w10_printc_cast_render {
                 2,
                 &Address::new(space, 0x410),
                 Some(named("short", 2, type_metatype::TYPE_INT)),
-            );
+            ).unwrap();
             fd.op_set_output(op, output).unwrap();
             fd.set_high_level();
             let first = fd.vbank().get(source).unwrap().get_high().unwrap();
@@ -2650,7 +3224,7 @@ mod w10_printc_cast_render {
                 .unwrap()
                 .set_kuna_name("workspace");
             assert_eq!(
-                fd.vn_type_read_facing(source, op).get_metatype(),
+                fd.vn_type_read_facing(source, op).unwrap().get_metatype(),
                 type_metatype::TYPE_UINT
             );
             assert_eq!(
@@ -2661,12 +3235,12 @@ mod w10_printc_cast_render {
             );
             let mut arch = bare_arch();
             arch.decl_high_type = true;
-            assert!(crate::kuna_bitcast::truncated_float_storage(&fd, true, op).is_some());
+            assert!(crate::kuna_bitcast::truncated_float_storage(&fd, true, op).unwrap().is_some());
             for lang in ["c", "rust"] {
                 let mut printer = PrintC::new();
                 printer.set_name(lang);
                 printer.set_output_stream();
-                printer.op_push_ir(&fd, &arch, op, None);
+                printer.op_push_ir(&fd, &arch, op, None).unwrap();
                 let text = printer.emit_mut().output_str();
                 if lang == "c" {
                     let expected = format!(
@@ -2731,7 +3305,7 @@ mod w10_printc_cast_render {
             fd.op_set_input(op, offset, 1).unwrap();
             let mut printer = PrintC::new();
             printer.set_output_stream();
-            printer.op_push_ir(&fd, &arch, op, None);
+            printer.op_push_ir(&fd, &arch, op, None).unwrap();
             let text = printer.emit_mut().output_str();
             assert!(text.starts_with("SUB"), "{text}");
             assert!(!text.contains("union"), "{text}");
@@ -2753,7 +3327,7 @@ mod w10_printc_cast_render {
             );
             let mut printer = PrintC::new();
             printer.set_output_stream();
-            printer.op_push_ir(&fd, &arch, op, None);
+            printer.op_push_ir(&fd, &arch, op, None).unwrap();
             let text = printer.emit_mut().output_str();
             assert!(text.starts_with("SUB"), "{text}");
             assert!(!text.contains("union"), "{text}");
@@ -2770,12 +3344,12 @@ mod w10_printc_cast_render {
         context.types = Some(Rc::clone(&types));
         let space = Rc::clone(context.manage().get_space_by_name("ram").unwrap());
         let mut fd = Funcdata::new("func", "func", Rc::new(context), Address::new(Rc::clone(&space), 0x1000), 0x1000, 0x40).unwrap();
-        let source = fd.new_varnode(4, &Address::new(Rc::clone(&space), 0x400), Some(named("float", 4, type_metatype::TYPE_FLOAT)));
+        let source = fd.new_varnode(4, &Address::new(Rc::clone(&space), 0x400), Some(named("float", 4, type_metatype::TYPE_FLOAT))).unwrap();
         let op = mk_op(&mut fd, 2, 0x20, OpCode::CPUI_SUBPIECE);
         fd.op_set_input(op, source, 0).unwrap();
         let offset = fd.new_constant(4, 0);
         fd.op_set_input(op, offset, 1).unwrap();
-        let output = fd.new_varnode(2, &Address::new(space, 0x410), Some(named("short", 2, type_metatype::TYPE_INT)));
+        let output = fd.new_varnode(2, &Address::new(space, 0x410), Some(named("short", 2, type_metatype::TYPE_INT))).unwrap();
         fd.op_set_output(op, output).unwrap();
         let mut backing = Datatype::new_with_align(4, 4, type_metatype::TYPE_UNION);
         backing.name = "stack_views_test".to_owned();
@@ -2796,10 +3370,10 @@ mod w10_printc_cast_render {
         let resolution = crate::unionresolve::ResolvedUnion::new_field(Rc::clone(&backing), 0, types.as_ref()).unwrap();
         fd.set_union_field(&backing, op, 0, resolution);
         assert_eq!(super::super::declared_variable_type(&fd, true, source).unwrap().get_metatype(), type_metatype::TYPE_FLOAT);
-        assert_eq!(crate::kuna_stackviews::access_type(&fd, source, op, 0).unwrap().get_metatype(), type_metatype::TYPE_UINT);
+        assert_eq!(crate::kuna_stackviews::access_type(&fd, source, op, 0).unwrap().unwrap().get_metatype(), type_metatype::TYPE_UINT);
         let mut printer = PrintC::new();
         printer.set_output_stream();
-        printer.op_push_ir(&fd, &bare_arch(), op, None);
+        printer.op_push_ir(&fd, &bare_arch(), op, None).unwrap();
         assert_eq!(printer.emit_mut().output_str(), "(short)workspace.word");
     }
 
@@ -2814,13 +3388,13 @@ mod w10_printc_cast_render {
                 fd.vbank_mut().get_mut(input).unwrap().update_type(named("bits", size, type_metatype::TYPE_UINT));
                 fd.op_set_input(op, input, 0).unwrap();
                 let out = fd.new_varnode(size, &Address::new(ram(&fd), 0x400),
-                    Some(named(if size == 4 { "float" } else { "double" }, size, type_metatype::TYPE_FLOAT)));
+                    Some(named(if size == 4 { "float" } else { "double" }, size, type_metatype::TYPE_FLOAT))).unwrap();
                 fd.op_set_output(op, out).unwrap();
                 for nocasts in [false, true] {
                     let mut p = PrintC::new();
                     p.set_no_cast_printing(nocasts);
                     p.set_output_stream();
-                    p.op_push_ir(&fd, &bare_arch(), op, None);
+                    p.op_push_ir(&fd, &bare_arch(), op, None).unwrap();
                     let text = p.emit_mut().output_str();
                     if opcode == OpCode::CPUI_CAST {
                         assert!(text.contains("union {") && text.ends_with(".to"), "{opcode:?} {size}: {text}");
@@ -2828,6 +3402,121 @@ mod w10_printc_cast_render {
                         assert!(!text.contains("union"), "{opcode:?} {size}: {text}");
                     }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn full_object_storage_casts_use_actual_typed_members_and_evaluate_once() {
+        for meta in [type_metatype::TYPE_STRUCT, type_metatype::TYPE_UNION] {
+            for size in [1, 2, 4, 8] {
+                for to_object in [false, true] {
+                    let mut fd = build_fd();
+                    let object = named("Pair", size, meta);
+                    let word = named("StorageWord", size, type_metatype::TYPE_UINT);
+                    let (from, to) = if to_object { (word, object) } else { (object, word) };
+                    let cast = mk_op(&mut fd, 1, 0x24, OpCode::CPUI_CAST);
+                    let input = if to_object {
+                        let literal = fd.new_constant(size, 85);
+                        fd.vbank_mut().get_mut(literal).unwrap().update_type(Rc::clone(&from));
+                        literal
+                    } else {
+                        let call = mk_op(&mut fd, 1, 0x20, OpCode::CPUI_CALL);
+                        let callee = fd.new_constant(8, 0x2000);
+                        fd.op_set_input(call, callee, 0).unwrap();
+                        let value = fd.new_varnode(size, &Address::new(ram(&fd), 0x400), Some(Rc::clone(&from))).unwrap();
+                        fd.op_set_output(call, value).unwrap();
+                        fd.vbank_mut().get_mut(value).unwrap().set_implied();
+                        value
+                    };
+                    fd.op_set_input(cast, input, 0).unwrap();
+                    let out = fd.new_varnode(size, &Address::new(ram(&fd), 0x408), Some(Rc::clone(&to))).unwrap();
+                    fd.op_set_output(cast, out).unwrap();
+                    let transfer = crate::kuna_bitcast::storage_transfer(&fd, false, cast).unwrap().unwrap();
+                    assert!(Rc::ptr_eq(transfer.object_source.as_ref().unwrap(), &from));
+                    assert!(Rc::ptr_eq(&transfer.target, &to));
+                    for nocasts in [false, true] {
+                        let mut p = PrintC::new();
+                        p.set_no_cast_printing(nocasts);
+                        p.set_output_stream();
+                        p.op_push_ir(&fd, &bare_arch(), cast, None).unwrap();
+                        let text = p.emit_mut().output_str();
+                        assert!(text.starts_with("((union { ") && text.ends_with(" }).to"), "{text}");
+                        assert!(text.contains("Pair") && text.contains("from;") && text.contains("to;"), "{text}");
+                        if to_object {
+                            assert!(text.contains(".from = 0x55"), "{text}");
+                            assert!(!text.contains("(Pair)"), "{text}");
+                        } else {
+                            assert_eq!(text.matches("func_0x2000()").count(), 1, "{text}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_scalar_member_in_an_equal_sized_container_is_not_a_whole_object_transfer() {
+        for to_container in [false, true] {
+            let mut fd = build_fd();
+            fd.get_func_proto_mut().attach_internal_store(
+                Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            assert!(!fd.get_arch().stack_views);
+            let scalar = named("float4", 4, type_metatype::TYPE_FLOAT);
+            let word = named("uint4", 4, type_metatype::TYPE_UINT);
+            let mut container = Datatype::new(4, type_metatype::TYPE_STRUCT);
+            container.name = "FloatStorage".into();
+            container.display_name = container.name.clone();
+            container.kind = crate::dtype::DatatypeKind::Struct {
+                field: vec![crate::dtype::TypeField::new(0, 0, "value", Rc::clone(&scalar))],
+                bitfield: vec![],
+            };
+            let container = Rc::new(container);
+            let (from, to) = if to_container { (word, scalar) } else { (scalar, word) };
+            let cast = mk_op(&mut fd, 1, 0x20, OpCode::CPUI_CAST);
+            let input = fd.new_varnode(4, &Address::new(ram(&fd), 0x400), Some(from)).unwrap();
+            fd.op_set_input(cast, input, 0).unwrap();
+            let out = fd.new_varnode(4, &Address::new(ram(&fd), 0x408), Some(to)).unwrap();
+            fd.op_set_output(cast, out).unwrap();
+            let backing = fd.new_varnode(4, &Address::new(ram(&fd), 0x410),
+                Some(Rc::clone(&container))).unwrap();
+            let backing = fd.vbank_mut().set_input(backing, &mut |_, _, _| Ok(())).unwrap();
+            fd.vbank_mut().get_mut(backing).unwrap()
+                .set_flags_pub(crate::varnode::varnode_flags::addrtied);
+            fd.set_high_level();
+            let member = if to_container { out } else { input };
+            let previous = fd.vbank().get(member).unwrap().get_high().unwrap();
+            let high = fd.vbank().get(backing).unwrap().get_high().unwrap();
+            fd.high_remove_member(previous, member);
+            let mut update = None;
+            fd.with_high_split(|bank, context| bank.insert_member(high, member, 0, context,
+                &mut |vn, high, group| update = Some((vn, high, group))));
+            let (vn, high, group) = update.unwrap();
+            fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
+            let high = fd.high_bank_mut().get_mut(high).unwrap();
+            high.set_kuna_name("protected_float");
+            high.set_symbol_type(Rc::clone(&container));
+            high.set_symbol_offset(0);
+            assert!(Rc::ptr_eq(
+                &crate::printc::declared_variable_type(&fd, false, member).unwrap(), &container));
+            assert!(crate::kuna_bitcast::storage_transfer(&fd, false, cast).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn object_storage_transfer_requires_explicit_full_width_integer_cast() {
+        for opcode in [OpCode::CPUI_CAST, OpCode::CPUI_COPY, OpCode::CPUI_FLOAT_INT2FLOAT] {
+            for (size, meta) in [(4, type_metatype::TYPE_UINT), (2, type_metatype::TYPE_UINT), (4, type_metatype::TYPE_FLOAT)] {
+                let mut fd = build_fd();
+                let op = mk_op(&mut fd, 1, 0x20, opcode);
+                let input = fd.new_varnode(4, &Address::new(ram(&fd), 0x400),
+                    Some(named("Pair", 4, type_metatype::TYPE_STRUCT))).unwrap();
+                fd.op_set_input(op, input, 0).unwrap();
+                let out = fd.new_varnode(size, &Address::new(ram(&fd), 0x408),
+                    Some(named("word", size, meta))).unwrap();
+                fd.op_set_output(op, out).unwrap();
+                let transfer = crate::kuna_bitcast::storage_transfer(&fd, false, op).unwrap();
+                assert_eq!(transfer.is_some(), opcode == OpCode::CPUI_CAST && size == 4 && meta == type_metatype::TYPE_UINT);
             }
         }
     }
@@ -2841,13 +3530,13 @@ mod w10_printc_cast_render {
             fd.vbank_mut().get_mut(input).unwrap().update_type(named("float", size, type_metatype::TYPE_FLOAT));
             fd.op_set_input(op, input, 0).unwrap();
             let out = fd.new_varnode(size, &Address::new(ram(&fd), 0x400),
-                Some(named("bits", size, type_metatype::TYPE_UINT)));
+                Some(named("bits", size, type_metatype::TYPE_UINT))).unwrap();
             fd.op_set_output(op, out).unwrap();
             for language in ["c", "rust"] {
                 let mut p = PrintC::new();
                 p.set_name(language);
                 p.set_output_stream();
-                p.op_push_ir(&fd, &bare_arch(), op, None);
+                p.op_push_ir(&fd, &bare_arch(), op, None).unwrap();
                 let text = p.emit_mut().output_str();
                 let want = if language == "rust" { format!("0x{payload:x}u{}", size * 8) }
                     else { format!("0x{payload:x}") };
@@ -2863,19 +3552,19 @@ mod w10_printc_cast_render {
         let callee = fd.new_constant(8, 0x2000);
         fd.op_set_input(call, callee, 0).unwrap();
         let value = fd.new_varnode(8, &Address::new(ram(&fd), 0x400),
-            Some(named("double", 8, type_metatype::TYPE_FLOAT)));
+            Some(named("double", 8, type_metatype::TYPE_FLOAT))).unwrap();
         fd.op_set_output(call, value).unwrap();
         fd.vbank_mut().get_mut(value).unwrap().set_implied();
         let cast = mk_op(&mut fd, 1, 0x24, OpCode::CPUI_CAST);
         fd.op_set_input(cast, value, 0).unwrap();
         let out = fd.new_varnode(8, &Address::new(ram(&fd), 0x408),
-            Some(named("bits", 8, type_metatype::TYPE_UINT)));
+            Some(named("bits", 8, type_metatype::TYPE_UINT))).unwrap();
         fd.op_set_output(cast, out).unwrap();
         for language in ["c", "rust"] {
             let mut p = PrintC::new();
             p.set_name(language);
             p.set_output_stream();
-            p.op_push_ir(&fd, &bare_arch(), cast, None);
+            p.op_push_ir(&fd, &bare_arch(), cast, None).unwrap();
             let text = p.emit_mut().output_str();
             assert_eq!(text.matches("func_0x2000()").count(), 1, "{text}");
         }
@@ -2889,17 +3578,17 @@ mod w10_printc_cast_render {
             let callee = fd.new_constant(8, 0x2000);
             fd.op_set_input(call, callee, 0).unwrap();
             let value = fd.new_varnode(size, &Address::new(ram(&fd), 0x400),
-                Some(named(float, size, type_metatype::TYPE_FLOAT)));
+                Some(named(float, size, type_metatype::TYPE_FLOAT))).unwrap();
             fd.op_set_output(call, value).unwrap();
             fd.vbank_mut().get_mut(value).unwrap().set_implied();
             let cast = mk_op(&mut fd, 1, 0x24, OpCode::CPUI_CAST);
             fd.op_set_input(cast, value, 0).unwrap();
             let out = fd.new_varnode(size, &Address::new(ram(&fd), 0x408),
-                Some(named("sword", size, type_metatype::TYPE_INT)));
+                Some(named("sword", size, type_metatype::TYPE_INT))).unwrap();
             fd.op_set_output(cast, out).unwrap();
             let mut p = PrintC::new();
             p.set_output_stream();
-            p.op_push_ir(&fd, &bare_arch(), cast, None);
+            p.op_push_ir(&fd, &bare_arch(), cast, None).unwrap();
             let text = p.emit_mut().output_str();
             assert_eq!(text, format!("((union {{ {float} from; {word} to; }}){{ .from = func_0x2000() }}).to"));
         }
@@ -2912,17 +3601,17 @@ mod w10_printc_cast_render {
             let call = mk_op(&mut fd, 1, 0x20, OpCode::CPUI_CALL);
             let callee = fd.new_constant(8, 0x2000);
             fd.op_set_input(call, callee, 0).unwrap();
-            let value = fd.new_varnode(4, &Address::new(ram(&fd), 0x400), Some(named("word", 4, meta)));
+            let value = fd.new_varnode(4, &Address::new(ram(&fd), 0x400), Some(named("word", 4, meta))).unwrap();
             fd.op_set_output(call, value).unwrap();
             fd.vbank_mut().get_mut(value).unwrap().set_implied();
             let cast = mk_op(&mut fd, 1, 0x24, OpCode::CPUI_CAST);
             fd.op_set_input(cast, value, 0).unwrap();
             let out = fd.new_varnode(4, &Address::new(ram(&fd), 0x408),
-                Some(named("float", 4, type_metatype::TYPE_FLOAT)));
+                Some(named("float", 4, type_metatype::TYPE_FLOAT))).unwrap();
             fd.op_set_output(cast, out).unwrap();
             let mut p = PrintC::new();
             p.set_output_stream();
-            p.op_push_ir(&fd, &bare_arch(), cast, None);
+            p.op_push_ir(&fd, &bare_arch(), cast, None).unwrap();
             let text = p.emit_mut().output_str();
             assert_eq!(text.contains("union {"), meta == type_metatype::TYPE_UINT, "{text}");
         }
@@ -3018,13 +3707,13 @@ mod w10_printc_cast_render {
         let c2 = fd.new_constant(8, 2);
         fd.op_set_input(add, c1, 0).unwrap();
         fd.op_set_input(add, c2, 1).unwrap();
-        let mid = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x300), Some(named("int8", 8, type_metatype::TYPE_INT)));
+        let mid = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x300), Some(named("int8", 8, type_metatype::TYPE_INT))).unwrap();
         fd.op_set_output(add, mid).unwrap();
         let mid = fd.obank().get(add).unwrap().get_out().unwrap();
         fd.vbank_mut().get_mut(mid).unwrap().set_implied();
         let cast = mk_op(&mut fd, 1, 0x20, OpCode::CPUI_CAST);
         fd.op_set_input(cast, mid, 0).unwrap();
-        let out = fd.new_varnode(8, &Address::new(r, 0x400), Some(named("float8", 8, type_metatype::TYPE_FLOAT)));
+        let out = fd.new_varnode(8, &Address::new(r, 0x400), Some(named("float8", 8, type_metatype::TYPE_FLOAT))).unwrap();
         fd.op_set_output(cast, out).unwrap();
         let rendered = render_cast(&fd, cast, false);
         assert_eq!(

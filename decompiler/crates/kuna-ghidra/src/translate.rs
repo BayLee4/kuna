@@ -74,6 +74,11 @@ pub fn build_registry() -> IdRegistry {
     let mut registry = IdRegistry::with_base_ids();
     register_translate_ids(&mut registry);
     register_ghidra_ids(&mut registry);
+    registry.register_attribute(&kuna_decomp::resulttypes::ATTRIB_KUNA_RESULT_VERSION);
+    registry.register_attribute(&kuna_decomp::resulttypes::ATTRIB_KUNA_LOCAL);
+    registry.register_element(&kuna_decomp::resulttypes::ELEM_KUNA_RESULT);
+    registry.register_element(&kuna_decomp::resulttypes::ELEM_KUNA_TYPE);
+    registry.register_element(&kuna_decomp::resulttypes::ELEM_KUNA_DEFINITION);
     registry
 }
 
@@ -309,9 +314,9 @@ impl<R: Read, W: Write> RegisterLookup for GhidraRegisterLookup<R, W> {
 
     /// C++ `GhidraTranslate::getRegisterName` (ghidra_translate.cc:72-87).
     #[allow(clippy::mutable_key_type)] // see cache_register
-    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         if base.get_type() != spacetype::IPTR_PROCESSOR {
-            return String::new();
+            return Ok(String::new());
         }
         let vndata = VarnodeStorage {
             space: Some(Rc::clone(base)),
@@ -321,27 +326,24 @@ impl<R: Read, W: Write> RegisterLookup for GhidraRegisterLookup<R, W> {
         {
             let cache = self.addr2nm.borrow();
             if let Some(nm) = cache.get(&vndata) {
-                return nm.clone();
+                return Ok(nm.clone());
             }
         }
-        let bytes = match self.client.borrow_mut().get_register_name(&vndata) {
-            Ok(b) => b,
-            Err(_) => return String::new(),
-        };
+        let bytes = self.client.borrow_mut().get_register_name(&vndata).map_err(wire_to_kuna)?;
         if bytes.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
         let name = String::from_utf8_lossy(&bytes).into_owned();
         // Cache the FULL register (the queried vndata may be a truncated piece).
-        let _ = self.get_register(&name);
-        name
+        self.get_register(&name)?;
+        Ok(name)
     }
 
     /// C++ `GhidraTranslate::getExactRegisterName` (ghidra_translate.cc:89-106).
     #[allow(clippy::mutable_key_type)] // see cache_register
-    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         if base.get_type() != spacetype::IPTR_PROCESSOR {
-            return String::new();
+            return Ok(String::new());
         }
         let vndata = VarnodeStorage {
             space: Some(Rc::clone(base)),
@@ -351,21 +353,16 @@ impl<R: Read, W: Write> RegisterLookup for GhidraRegisterLookup<R, W> {
         {
             let cache = self.addr2nm.borrow();
             if let Some(nm) = cache.get(&vndata) {
-                return nm.clone();
+                return Ok(nm.clone());
             }
         }
-        let bytes = match self.client.borrow_mut().get_register_name(&vndata) {
-            Ok(b) => b,
-            Err(_) => return String::new(),
-        };
+        let bytes = self.client.borrow_mut().get_register_name(&vndata).map_err(wire_to_kuna)?;
         if bytes.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
         let name = String::from_utf8_lossy(&bytes).into_owned();
-        match self.get_register(&name) {
-            Ok(full) if full.size == size as u32 => name,
-            _ => String::new(),
-        }
+        let full = self.get_register(&name)?;
+        Ok(if full.size == size as u32 { name } else { String::new() })
     }
 }
 
@@ -448,13 +445,13 @@ impl<R: Read, W: Write> RegisterLookup for GhidraTranslate<R, W> {
     }
 
     /// C++ `GhidraTranslate::getRegisterName` — delegated.
-    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         self.ensure_lookup_wired();
         self.reglookup.get_register_name(base, off, size)
     }
 
     /// C++ `GhidraTranslate::getExactRegisterName` — delegated.
-    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         self.ensure_lookup_wired();
         self.reglookup.get_exact_register_name(base, off, size)
     }
@@ -482,14 +479,18 @@ impl<R: Read, W: Write> Translate for GhidraTranslate<R, W> {
     fn get_all_registers(&self, _reglist: &mut BTreeMap<VarnodeData, String>) {}
     /// C++ `GhidraTranslate::getUserOpNames` (ghidra_translate.cc:108-118):
     /// the init-time index probe — query `getUserOpName(i)` for `i=0,1,…`
-    /// until the host answers an empty name.  Infallible: a query error also
-    /// ends the loop (spec risks).
-    fn get_user_op_names(&self, res: &mut Vec<String>) {
+    /// until the host answers an empty name. Failed acquisition does not
+    /// publish a partial user-op table.
+    fn get_user_op_names(&self, res: &mut Vec<String>) -> KunaResult<()> {
+        let original_len = res.len();
         let mut i = 0i32;
         loop {
             let bytes = match self.client.borrow_mut().get_user_op_name(i) {
-                Ok(b) => b,
-                Err(_) => break,
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    res.truncate(original_len);
+                    return Err(wire_to_kuna(err));
+                }
             };
             if bytes.is_empty() {
                 break;
@@ -497,6 +498,7 @@ impl<R: Read, W: Write> Translate for GhidraTranslate<R, W> {
             res.push(String::from_utf8_lossy(&bytes).into_owned());
             i += 1;
         }
+        Ok(())
     }
     /// C++ throws (ghidra_translate.hh:53-54) — the length is only knowable by
     /// disassembling, which is the host's job.
@@ -552,7 +554,7 @@ impl<R: Read, W: Write> Translate for GhidraTranslate<R, W> {
     }
 }
 
-impl<R: Read, W: Write> EngineTranslate for GhidraTranslate<R, W> {
+impl<R: Read + 'static, W: Write + 'static> EngineTranslate for GhidraTranslate<R, W> {
     fn manager(&self) -> &AddrSpaceManager {
         &self.manager
     }
@@ -639,6 +641,42 @@ impl<R: Read, W: Write> EngineTranslate for GhidraTranslate<R, W> {
         context: &InjectContext,
         emit: &mut dyn PcodeEmit,
     ) -> KunaResult<()> {
+        fetch_injection(&self.client, &self.manager, name, ptype, context, emit)
+    }
+
+    fn injection_resolver(&self) -> Option<Rc<dyn kuna_decomp::pcodeinject::InjectPcodeResolver>> {
+        Some(Rc::new(GhidraInjectResolver {
+            client: Rc::clone(&self.client),
+            manager: Rc::clone(&self.manager),
+        }))
+    }
+}
+
+struct GhidraInjectResolver<R: Read, W: Write> {
+    client: SharedClient<R, W>,
+    manager: Rc<AddrSpaceManager>,
+}
+
+impl<R: Read, W: Write> kuna_decomp::pcodeinject::InjectPcodeResolver for GhidraInjectResolver<R, W> {
+    fn fetch_inject_pcode(
+        &self,
+        name: &[u8],
+        ptype: int4,
+        context: &InjectContext,
+        emit: &mut dyn PcodeEmit,
+    ) -> KunaResult<()> {
+        fetch_injection(&self.client, &self.manager, name, ptype, context, emit)
+    }
+}
+
+fn fetch_injection<R: Read, W: Write>(
+    client: &SharedClient<R, W>,
+    manager: &AddrSpaceManager,
+    name: &[u8],
+    ptype: int4,
+    context: &InjectContext,
+    emit: &mut dyn PcodeEmit,
+) -> KunaResult<()> {
         let itype = match ptype {
             CALLFIXUP_TYPE => InjectType::CallFixup,
             CALLOTHERFIXUP_TYPE => InjectType::CallOtherFixup,
@@ -649,8 +687,8 @@ impl<R: Read, W: Write> EngineTranslate for GhidraTranslate<R, W> {
         // The decoder's space indices come from the tspec manager, as in
         // `one_instruction`; the borrow is a statement temporary so the client
         // is free again before `emit` is touched (the query re-entry rule).
-        let mut decoder = PackedDecode::new(&self.manager);
-        let answered = match self.client.borrow_mut().get_pcode_inject(
+        let mut decoder = PackedDecode::new(manager);
+        let answered = match client.borrow_mut().get_pcode_inject(
             &nm,
             itype,
             |e| encode_inject_context(context, e),
@@ -691,9 +729,6 @@ impl<R: Read, W: Write> EngineTranslate for GhidraTranslate<R, W> {
         }
         decoder.close_element(elem)?;
         Ok(())
-    }
-    // as_sleigh / as_sleigh_mut: take the trait defaults (None) — this is not
-    // the standalone Sleigh engine.
 }
 
 #[cfg(test)]
@@ -1021,13 +1056,50 @@ mod tests {
         let mut reader = Vec::new();
         reader.extend_from_slice(&string_response(b"COUNTLEADINGZEROS"));
         reader.extend_from_slice(&string_response(b"COUNTLEADINGONES"));
-        reader.extend_from_slice(&empty_response());
+        // DecompileProcess.getUserOpName always writes a string stream,
+        // including the empty name that terminates enumeration.
+        reader.extend_from_slice(&string_response(b""));
         let client = shared(reader);
         let tr = translate(client);
 
         let mut names = Vec::new();
-        tr.get_user_op_names(&mut names);
+        tr.get_user_op_names(&mut names).unwrap();
         assert_eq!(names, vec!["COUNTLEADINGZEROS", "COUNTLEADINGONES"]);
+    }
+
+    #[test]
+    fn missing_userop_string_is_an_error_not_an_enumeration_terminator() {
+        let mut reader = string_response(b"partial");
+        reader.extend_from_slice(&empty_response());
+        reader.extend_from_slice(&string_response(b"complete"));
+        reader.extend_from_slice(&string_response(b""));
+        let tr = translate(shared(reader));
+        let mut names = vec!["existing".to_owned()];
+        let error = tr.get_user_op_names(&mut names).unwrap_err();
+        assert!(matches!(error, KunaError::Java { ref type_name, ref explain }
+            if type_name == "alignment" && explain == "Expecting string"));
+        assert_eq!(names, ["existing"], "failed enumeration must not publish partial names");
+        tr.get_user_op_names(&mut names).unwrap();
+        assert_eq!(names, ["existing", "complete"]);
+    }
+
+    #[test]
+    fn userop_eof_does_not_publish_partial_enumeration() {
+        let tr = translate(shared(string_response(b"first")));
+        let mut names = vec!["existing".to_owned()];
+        let err = tr.get_user_op_names(&mut names).unwrap_err();
+        assert!(matches!(err, KunaError::Transport { .. }));
+        assert_eq!(names, ["existing"]);
+    }
+
+    #[test]
+    fn register_name_followup_eof_is_not_an_empty_or_uncached_name() {
+        let tr = translate(shared(string_response(b"myreg")));
+        let space = tr.manager.get_space_by_name("register").unwrap();
+        let err = tr.get_register_name(space, 0x10, 4).unwrap_err();
+        assert!(matches!(err, KunaError::Transport { .. }));
+        assert!(tr.reglookup.nm2addr.borrow().is_empty());
+        assert!(tr.reglookup.addr2nm.borrow().is_empty());
     }
 }
 

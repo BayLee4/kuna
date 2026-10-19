@@ -135,8 +135,7 @@ pub fn print_signatures(
 /// full feature description (`smanage.encode`).  This port takes the resolved
 /// `&Funcdata`, the parsed `maxiter_override`, and the destination encoder (the
 /// file-open / filename parse is the W9 console surface), running the same
-/// generate + `encode` path.  The `<varsig>`/`<blocksig>` encodes need the W8
-/// marshal surface and STUB inside [`GraphSigManager::encode`].
+/// generate + `encode` path, retaining each feature's function-local origin.
 pub fn save_signatures(
     fd: &Funcdata,
     maxiter_override: Option<i32>,
@@ -149,7 +148,7 @@ pub fn save_signatures(
     smanage.initialize_from_stream(maxiter_override);
     smanage.set_current_function(fd)?;
     smanage.generate(fd);
-    smanage.encode(encoder)
+    smanage.encode(fd, encoder)
 }
 
 // ===========================================================================
@@ -201,7 +200,7 @@ pub fn saveall_signature_record(
     smanage.generate(fd);
     let numsigs = smanage.num_signatures();
     if numsigs != 0 {
-        smanage.encode(encoder)?;
+        smanage.encode(fd, encoder)?;
     }
     Ok(numsigs)
 }
@@ -278,7 +277,7 @@ mod tests {
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
 
-        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let p = fd.set_input_varnode(p).unwrap();
         let c = fd.new_constant(4, 5);
         let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));

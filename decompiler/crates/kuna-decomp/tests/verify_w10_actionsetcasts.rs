@@ -165,7 +165,7 @@ fn w10_multiequal_output_edge_does_not_fan_out() {
 
     let phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x10);
     let r = ram(&fd);
-    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x300), None);
+    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x300), None).unwrap();
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), 0);
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), 1);
 
@@ -201,7 +201,7 @@ fn w10_multiequal_fanout_is_op_local() {
     let phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x20);
     let other_phi = new_op_code(&mut fd, 2, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL", 0x28);
     let r = ram(&fd);
-    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x400), None);
+    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x400), None).unwrap();
     for slot in 0..2 {
         fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), slot);
         fd.obank_mut().get_mut(other_phi).unwrap().set_input(Some(same), slot);

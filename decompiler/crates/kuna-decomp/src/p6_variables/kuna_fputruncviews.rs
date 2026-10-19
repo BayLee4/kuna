@@ -234,12 +234,8 @@ pub(crate) fn recover(fd: &mut Funcdata) -> KunaResult<()> {
         } else {
             M::TYPE_INT
         };
-        let (Ok(integer), Ok(float)) = (
-            factory.get_base(size, meta),
-            factory.get_base(size, M::TYPE_FLOAT),
-        ) else {
-            continue;
-        };
+        let integer = factory.get_base(size, meta)?;
+        let float = factory.get_base(size, M::TYPE_FLOAT)?;
         let mut uses = Vec::new();
         for user in users {
             let marker = marker_view(fd, user, &numeric_roots);

@@ -77,7 +77,7 @@ fn code(prog: &mut ConsoleProgram) -> String {
     let entry = prog
         .resolve_entry(&EntrySelector::Numeric(0x10000))
         .unwrap();
-    let funcs = decompile_targets(prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(prog, vec![entry], false, false, false).unwrap();
     funcs[0]
         .code
         .clone()

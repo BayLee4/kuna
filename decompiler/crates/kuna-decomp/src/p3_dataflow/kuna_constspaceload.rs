@@ -143,31 +143,31 @@ impl Rule for RuleConstSpaceLoad {
         Some(Box::new(RuleConstSpaceLoad { enabled: self.enabled, group: self.group.clone() }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !self.enabled && !data.get_arch().const_space_load_fold {
-            return 0;
+            return Ok(0);
         }
         let (spacevn, ptr, out) = {
             let o = match data.obank().get(op) {
                 Some(o) => o,
-                None => return 0,
+                None => return Ok(0),
             };
             match (o.get_in(0), o.get_in(1), o.get_out()) {
                 (Some(s), Some(p), Some(out)) => (s, p, out),
-                _ => return 0,
+                _ => return Ok(0),
             }
         };
         if !is_constant_space(data, spacevn) {
-            return 0;
+            return Ok(0);
         }
         let ptrv = match data.vbank().get(ptr) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         // A constant pointer is RuleLoadVarnode's case; it also resolves the
         // spacebase-placeholder tail, which a bare COPY would drop.
         if ptrv.is_constant() || ptrv.is_free() {
-            return 0;
+            return Ok(0);
         }
         let is_placeholder = data
             .vbank()
@@ -175,12 +175,12 @@ impl Rule for RuleConstSpaceLoad {
             .map(|v| v.is_spacebase_placeholder())
             .unwrap_or(false);
         if is_placeholder {
-            return 0;
+            return Ok(0);
         }
         let ptr_size = ptrv.get_size();
         let out_size = match data.vbank().get(out) {
             Some(v) => v.get_size(),
-            None => return 0,
+            None => return Ok(0),
         };
         // Only the same-width identity. A dynamic `export *[const]:N tmp` gives
         // the operand and `tmp` the same size, so N != S is some other shape and
@@ -189,7 +189,7 @@ impl Rule for RuleConstSpaceLoad {
         // registers, one of which lost its reaching definition.  See the module
         // docs, "Bounds".
         if out_size != ptr_size {
-            return 0;
+            return Ok(0);
         }
 
         // `RuleLoadVarnode`'s order: overwrite the space operand first, then drop
@@ -197,7 +197,7 @@ impl Rule for RuleConstSpaceLoad {
         data.op_set_input(op, ptr, 0).expect("RuleConstSpaceLoad: opSetInput");
         data.op_remove_input(op, 1);
         data.op_set_opcode(op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
-        1
+        Ok(1)
     }
 }
 

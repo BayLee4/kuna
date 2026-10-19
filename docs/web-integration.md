@@ -144,7 +144,11 @@ kuna_wasm <binary> <spec-root> project [<display-name>] [--mode MODE]
 `project` is the `kuna decompile-project` flow with the folder write replaced by one JSON
 document — `{binary, name, count, ok, failed, files:{"<name>.c", "<name>.h", "<name>.asm",
 "README.md"}}` (artifacts named after `<display-name>`, default the binary's basename;
-whole binary only). Omitted mode and explicit `--mode auto` use the shared
+whole binary only). Before rendering, the native/WASI API prepares the complete
+selected invocation through the shared callable-export owner, just as the CLI
+project export does. Source declarations remain public while any wider live
+machine inputs use the prepared private implementations and call bindings.
+Omitted mode and explicit `--mode auto` use the shared
 native/browser policy: `<500 KiB` selects `aggressive`, `500 KiB–<2 MiB`
 selects `reliable`, and `>=2 MiB` selects `fast`, each with `auto`'s own
 `ctypes=on` and `partialaccess=on`, so the browser prints C type names and C

@@ -89,7 +89,7 @@ fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_byte(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(1, &Address::new(r, off), None);
+    let vn = fd.new_varnode(1, &Address::new(r, off), None).unwrap();
     set_def(fd, vn, defop)
 }
 
@@ -145,7 +145,7 @@ fn fuses_carry_chain_to_wide_add() {
         }
 
         let mut rule = RuleAddCarryChain::new(true);
-        assert_eq!(rule.apply_op(op, &mut fd), 1);
+        assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
         // op is now INT_ADD(base, zext(index)).
         let o = fd.obank().get(op).unwrap();
@@ -174,7 +174,7 @@ fn gate_off_is_noop() {
     let mut fd = build_fd();
     let (op, _a, _b, _hi) = build_idiom(&mut fd);
     let mut rule = RuleAddCarryChain::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_PIECE);
 }
 
@@ -205,7 +205,7 @@ fn non_carry_high_input_declines() {
     fd.op_insert(op, bl, None);
 
     let mut rule = RuleAddCarryChain::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_PIECE);
 }
 
@@ -218,7 +218,7 @@ fn wide_halves_decline() {
     // Build hi/lo as 2-byte written varnodes.
     let mk_word = |fd: &mut Funcdata, off: u64| -> VarnodeId {
         let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-        let vn = fd.new_varnode(2, &Address::new(Rc::clone(&r), off), None);
+        let vn = fd.new_varnode(2, &Address::new(Rc::clone(&r), off), None).unwrap();
         set_def(fd, vn, defop)
     };
     let hivn = mk_word(&mut fd, 0x40);
@@ -231,7 +231,7 @@ fn wide_halves_decline() {
     fd.op_insert(op, bl, None);
 
     let mut rule = RuleAddCarryChain::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]

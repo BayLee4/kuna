@@ -37,7 +37,7 @@ def main():
 def run(output, report):
     import pyghidra
     from error_recovery import field
-    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra
+    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra, test_cores
     from prototype_facts import execute_c, execute_export
 
     start_ghidra()
@@ -267,7 +267,7 @@ def run(output, report):
             "fixture did not persist one replacement override"
 
     try:
-        for core in ("stock", "kuna"):
+        for core in test_cores():
             with program("settings_session") as (value, api):
                 with transaction(value):
                     null = function(value, api, 0x1000, "31c0c3", "return_null", [],
@@ -553,13 +553,25 @@ def run(output, report):
                     observe(ifc, arithmetic, core, "unsupported_renderer_recovery", full_arithmetic,
                             driver="int main(void) { return plus_seven(35)!=42; }\n")
                     if core == "kuna":
+                        java_source = fingerprint(null)
                         java_options = DecompileOptions()
                         java_options.setDisplayLanguage(DecompilerLanguage.JAVA_LANGUAGE)
-                        assert not ifc.setOptions(java_options), "unsupported Java renderer silently accepted"
+                        java_options.setNullToken(True)
+                        assert ifc.setOptions(java_options), str(ifc.getLastMessage())
+                        assert pid(ifc) == language_pid, "Java selection replaced the native process"
+                        def java_null(result, ops, row):
+                            assert row["highfunction"] and result.getCCodeMarkup() is not None, row
+                            assert re.search(r"\breturn\s+null\s*;", row["c"]), row
+                            assert not re.search(r"\bNULL\b", row["c"]), row
+                            assert fingerprint(null) == java_source, "Java rendering changed source facts"
+                            assert pid(ifc) == language_pid, "Java rendering replaced the native process"
+                        observe(ifc, null, core, "java_renderer_selection", java_null)
                         assert ifc.setOptions(DecompileOptions()), str(ifc.getLastMessage())
-                        assert pid(ifc) == language_pid, "renderer rejection replaced the native process"
-                        observe(ifc, arithmetic, core, "unsupported_java_renderer_recovery", full_arithmetic,
+                        assert pid(ifc) == language_pid, "C restoration replaced the native process"
+                        observe(ifc, arithmetic, core, "java_renderer_return_to_c", full_arithmetic,
                                 driver="int main(void) { return plus_seven(35)!=42; }\n")
+                        assert pid(ifc) == language_pid, "C recovery replaced the native process"
+                        assert fingerprint(null) == java_source, "language roundtrip changed source facts"
                     def c_parameter_markup(result, ops, row):
                         assert re.search(r"\bplus_seven\s*\(", row["c"]), row
                         assert any(op.getOpcode() == PcodeOp.INT_ADD for op in ops), row

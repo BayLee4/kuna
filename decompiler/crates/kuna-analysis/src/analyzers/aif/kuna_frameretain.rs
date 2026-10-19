@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use kuna_base::space::AddrSpace;
+use kuna_base::error::KunaResult;
 use kuna_decomp::architecture::Architecture;
 use kuna_sleigh::translate::Translate;
 
@@ -29,13 +30,13 @@ pub(crate) fn prior_inventory(
     file: &object::File,
     listing: &Listing,
     seeds: &[u64],
-    rebuild: impl FnOnce(&[u64]) -> Listing,
+    rebuild: impl FnOnce(&[u64]) -> KunaResult<Listing>,
     arch: &Architecture,
     translate: &dyn Translate,
     code_space: &Rc<AddrSpace>,
     bracket: Option<&BracketEvidence>,
     memo: &Rc<crate::listing::kuna_decodememo::DecodeMemo>,
-) -> Prior {
+) -> KunaResult<Prior> {
     let _scope = translate.context_scope();
     let mut thumb = seeds.to_vec();
     thumb.extend(super::raw_thumb_prologue_seeds(
@@ -43,7 +44,7 @@ pub(crate) fn prior_inventory(
     ));
     thumb.sort_unstable();
     thumb.dedup();
-    let rebuilt = (thumb.len() != seeds.len()).then(|| rebuild(&thumb));
+    let rebuilt = (thumb.len() != seeds.len()).then(|| rebuild(&thumb)).transpose()?;
     let base = rebuilt.as_ref().unwrap_or(listing);
     let walked: BTreeSet<u64> = base.functions().map(|(&entry, _)| entry).collect();
     let mut entries = walked.clone();
@@ -62,7 +63,7 @@ pub(crate) fn prior_inventory(
         entries.extend(checked.pool_entries);
         entries.extend(checked.pointer_entries);
     }
-    Prior { walked, entries }
+    Ok(Prior { walked, entries })
 }
 
 impl Prior {

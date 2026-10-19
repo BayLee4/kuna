@@ -5,7 +5,7 @@ Run in the live-smoke PyGhidra environment. --producer cli needs only Python,
 clang, a native C compiler, and the release CLI. Each case groups seven equality
 predicates, not a combinatorial product of independent expression generators.
 Original Ghidra instructions and separately compiled source check the bitvector
-oracle; stock output is optional diagnostic evidence, never the oracle.
+oracle; stock output is a separate regression/reference control, never the oracle.
 """
 
 import argparse
@@ -391,8 +391,11 @@ def main():
     parser.add_argument("--case", action="append", help="select a case, e.g. unsigned1 or signed_enum2")
     parser.add_argument("--surface", action="append", choices=("cli", "cli-default-enum", "ghidra", "stock"),
                         help="select a producer surface within the case filter")
-    parser.add_argument("--stock", action="store_true", help="record stock comparisons without making parity an oracle")
+    parser.add_argument("--stock", action="store_true",
+                        help="retain additive diagnostic stock comparisons in product runs; stock-controls selects stock directly")
     args = parser.parse_args()
+    from kuna_vs_stock import test_cores
+    product = "kuna" in test_cores()
     selected = [case for case in cases() if not args.case or case.name in args.case]
     assert selected and (not args.case or set(args.case) <= {case.name for case in selected}), args.case
     output = Path(os.environ.get("KUNA_SMOKE_OUT", "live-integer-boundaries-out")).resolve()
@@ -411,19 +414,21 @@ def main():
             start_ghidra()
         for case in selected:
             variants = []
-            if args.producer != "ghidra":
+            if product and args.producer != "ghidra":
                 variants.append("cli")
                 if case.name == "unsigned_enum4":
                     variants.append("cli-default-enum")
             if args.producer != "cli":
-                variants.append("ghidra")
-                if args.stock:
+                if product:
+                    variants.append("ghidra")
+                if not product or args.stock:
                     variants.append("stock")
             if args.surface:
                 variants = [variant for variant in variants if variant in args.surface]
             for variant in variants:
                 row = {"case": case.name, "producer": variant, "status": "running",
-                       "diagnostic_only": variant == "stock"}
+                       "diagnostic_only": product and variant == "stock",
+                       "role": "stock-control" if variant == "stock" else "product"}
                 report["rows"].append(row)
                 directory = output / f"{case.name}-{variant}"
                 directory.mkdir(parents=True, exist_ok=True)
@@ -443,7 +448,10 @@ def main():
         report["completed"] = True
         report["status"] = "failed"
         semantic_rows = [row for row in report["rows"] if not row["diagnostic_only"]]
-        assert semantic_rows, "filters selected no Kuna scenarios; stock is an additive diagnostic only"
+        assert semantic_rows, (
+            "filters selected no Kuna scenarios; stock is an additive diagnostic only"
+            if product else "filters selected no stock-control scenarios"
+        )
         failures = [row for row in semantic_rows if row["status"] != "passed"]
         report["status"] = "failed" if failures else "passed"
         assert not failures, [(row["producer"], row["case"], row.get("failure")) for row in failures]

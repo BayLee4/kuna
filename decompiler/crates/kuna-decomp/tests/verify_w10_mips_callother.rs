@@ -202,7 +202,7 @@ fn decompile_one(arch: &mut Architecture, sym: &SymbolFn) -> Result<String, Stri
         .ok_or_else(|| format!("no space {}", sym.space))?;
     let entry = Address::new(space, sym.offset);
     let fd = decompile_func(arch, &sym.name, entry, 0).map_err(|e| format!("decompile: {e}"))?;
-    Ok(print_c(arch, &fd))
+    Ok(print_c(arch, &fd).unwrap())
 }
 
 // ===========================================================================
@@ -305,7 +305,8 @@ fn w10_mips_callother_setisamode_is_marked_injected_in_the_userop_table() {
     // `incidentalcopy="true"`) — the precondition that lets deadcode fold the
     // injected COPY.  (T3 folded in here: same bootstrap.)
     let injectid = op.get_inject_id().unwrap() as i32;
-    let payload = arch.pcodeinjectlib.get_payload(injectid);
+    let library = arch.pcodeinjectlib.borrow();
+    let payload = library.get_payload(injectid);
     assert!(
         payload.core().is_incidental_copy(),
         "setISAMode fixup payload must be incidental-copy (cspec incidentalcopy=true)"

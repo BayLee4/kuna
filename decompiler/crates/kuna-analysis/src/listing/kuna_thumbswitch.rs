@@ -44,6 +44,7 @@
 
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
@@ -97,10 +98,10 @@ impl<'a> HalfwordTables<'a> {
         exec: &[(u64, u64)],
         decoded: &dyn Fn(u64) -> bool,
         from: u64,
-    ) -> (Vec<u64>, Option<usize>) {
+    ) -> KunaResult<(Vec<u64>, Option<usize>)> {
         let mut cap = FullCapture::default();
         if decode(translate, from, code_space, &mut cap).is_none() {
-            return (Vec::new(), None);
+            return Ok((Vec::new(), None));
         }
         let data = self.data_space.as_ref();
         let mut vals: Vec<(Key, Val)> = Vec::new();
@@ -110,16 +111,16 @@ impl<'a> HalfwordTables<'a> {
                 let Some(Val::Short { table, width, base }) =
                     op.ins.first().and_then(|vn| value_of(vn, &vals, data))
                 else {
-                    return (Vec::new(), None);
+                    return Ok((Vec::new(), None));
                 };
-                let Some(index) = index.filter(|_| table == base) else { return (Vec::new(), None) };
-                let Some(cases) = guard_cases(translate, code_space, data, decoded, from, index, false)
+                let Some(index) = index.filter(|_| table == base) else { return Ok((Vec::new(), None)) };
+                let Some(cases) = guard_cases(translate, code_space, data, decoded, from, index, false)?
                     .filter(|&n| n >= MIN_ENTRIES)
                 else {
-                    return (Vec::new(), None);
+                    return Ok((Vec::new(), None));
                 };
                 let read = offset_targets(table, width, cases, self.max_entries, from, &self.pool, exec);
-                return if read.is_empty() { (read, None) } else { (read, Some(cases)) };
+                return Ok(if read.is_empty() { (read, None) } else { (read, Some(cases)) });
             }
             if index.is_none()
                 && matches!(op.opcode, OpCode::CPUI_COPY | OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_MULT)
@@ -140,7 +141,7 @@ impl<'a> HalfwordTables<'a> {
                 }
             }
         }
-        (Vec::new(), None)
+        Ok((Vec::new(), None))
     }
 }
 
@@ -162,19 +163,22 @@ pub(super) fn guard_cases(
     from: u64,
     index: Key,
     predicated: bool,
-) -> Option<usize> {
+) -> KunaResult<Option<usize>> {
     let mut cap = FullCapture::default();
     let mut cur = from;
     let mut inclusive: Option<bool> = None;
     if predicated {
-        decode(translate, from, code_space, &mut cap)?;
-        inclusive = Some(range_branch(cap.ops(), from, from, translate, data)??);
+        if decode(translate, from, code_space, &mut cap).is_none() {
+            return Ok(None);
+        }
+        let Some(Some(range)) = range_branch(cap.ops(), from, from, translate, data)? else { return Ok(None) };
+        inclusive = Some(range);
     }
     for _ in 0..MAX_GUARD_INSNS {
-        let prev = [2, 4].iter().filter_map(|&d| cur.checked_sub(d)).find(|&at| decoded(at))?;
-        let len = decode(translate, prev, code_space, &mut cap)?;
+        let Some(prev) = [2, 4].iter().filter_map(|&d| cur.checked_sub(d)).find(|&at| decoded(at)) else { return Ok(None) };
+        let Some(len) = decode(translate, prev, code_space, &mut cap) else { return Ok(None) };
         if prev + u64::from(len) != cur {
-            return None;
+            return Ok(None);
         }
         let ops = cap.ops();
         if ops.iter().any(|op| {
@@ -182,12 +186,19 @@ pub(super) fn guard_cases(
                 || matches!(op.opcode, OpCode::CPUI_BRANCH | OpCode::CPUI_BRANCHIND
                     | OpCode::CPUI_CALL | OpCode::CPUI_CALLIND | OpCode::CPUI_RETURN)
         }) {
-            return None;
+            return Ok(None);
         }
         if let Some(inclusive) = inclusive {
-            let carry = ops.iter().rev().find(|op| {
-                op.out.as_ref().is_some_and(|out| flag_name(out, translate) == "CY")
-            }).and_then(|op| {
+            let mut carry_op = None;
+            for op in ops.iter().rev() {
+                if let Some(out) = op.out.as_ref() {
+                    if flag_name(out, translate)? == "CY" {
+                        carry_op = Some(op);
+                        break;
+                    }
+                }
+            }
+            let carry = carry_op.and_then(|op| {
                 let source = if op.opcode == OpCode::CPUI_COPY { op.ins.first() } else { op.out.as_ref() };
                 source.and_then(|vn| key_of(vn, data))
             });
@@ -201,86 +212,104 @@ pub(super) fn guard_cases(
                 .then_some(n.offset)
             });
             if let Some(n) = bound {
-                return usize::try_from(n).ok()?.checked_add(usize::from(inclusive));
+                return Ok(usize::try_from(n).ok().and_then(|n| n.checked_add(usize::from(inclusive))));
             }
-            if ops.iter().any(|op| {
-                op.opcode == OpCode::CPUI_CBRANCH
-                    || op.out.as_ref().is_some_and(|out| matches!(flag_name(out, translate).as_str(), "CY" | "ZR"))
-            }) {
-                return None;
+            for op in ops {
+                if op.opcode == OpCode::CPUI_CBRANCH {
+                    return Ok(None);
+                }
+                if let Some(out) = op.out.as_ref() {
+                    if matches!(flag_name(out, translate)?.as_str(), "CY" | "ZR") {
+                        return Ok(None);
+                    }
+                }
             }
         }
         if inclusive.is_none() {
-            if let Some(range) = range_branch(ops, cur, from, translate, data) {
-                inclusive = Some(range?);
+            if let Some(range) = range_branch(ops, cur, from, translate, data)? {
+                let Some(range) = range else { return Ok(None) };
+                inclusive = Some(range);
             }
         }
         cur = prev;
     }
-    None
+    Ok(None)
 }
 
 /// The range branch among `ops`: `None` when they hold no conditional branch,
 /// `Some(None)` when theirs is not one, and otherwise whether the case count
-/// includes the compared bound.
+/// includes the compared bound. Register acquisition errors propagate unchanged.
 fn range_branch(
     ops: &[FullOp],
     cur: u64,
     from: u64,
     translate: &dyn Translate,
     data: Option<&Rc<AddrSpace>>,
-) -> Option<Option<bool>> {
+) -> KunaResult<Option<Option<bool>>> {
     let mut branches = ops.iter().enumerate().filter(|(_, op)| op.opcode == OpCode::CPUI_CBRANCH);
-    let (at, branch) = branches.next()?;
-    let range = || {
-        let target = branch.ins.first()?;
+    let Some((at, branch)) = branches.next() else { return Ok(None) };
+    let range = || -> KunaResult<Option<bool>> {
+        let Some(target) = branch.ins.first() else { return Ok(None) };
         if branches.clone().next().is_some() || is_constant(target) || (cur..=from).contains(&target.offset) {
-            return None;
+            return Ok(None);
         }
-        match guard_mask(branch.ins.get(1)?, &ops[..at], translate, data)? {
-            0b100 => Some(true),
-            0b110 => Some(false),
+        let Some(condition) = branch.ins.get(1) else { return Ok(None) };
+        Ok(match guard_mask(condition, &ops[..at], translate, data)? {
+            Some(0b100) => Some(true),
+            Some(0b110) => Some(false),
             _ => None,
-        }
+        })
     };
-    Some(range())
+    Ok(Some(range()?))
 }
 
-fn flag_name(vn: &VarnodeData, translate: &dyn Translate) -> String {
+fn flag_name(vn: &VarnodeData, translate: &dyn Translate) -> KunaResult<String> {
     if vn.size != 1 || !matches!(key_of(vn, None), Some(Key::Reg(..))) {
-        return String::new();
+        return Ok(String::new());
     }
-    vn.space.as_ref().map_or_else(String::new, |space| translate.get_register_name(space, vn.offset, 1))
+    match vn.space.as_ref() {
+        Some(space) => translate.get_register_name(space, vn.offset, 1),
+        None => Ok(String::new()),
+    }
 }
 
 /// The condition for an index below, equal to, or above the unsigned bound.
-fn guard_mask(vn: &VarnodeData, ops: &[FullOp], translate: &dyn Translate, data: Option<&Rc<AddrSpace>>) -> Option<u8> {
+fn guard_mask(vn: &VarnodeData, ops: &[FullOp], translate: &dyn Translate, data: Option<&Rc<AddrSpace>>) -> KunaResult<Option<u8>> {
     if vn.size != 1 {
-        return None;
+        return Ok(None);
     }
     if is_constant(vn) {
-        return match vn.offset { 0 => Some(0), 1 => Some(0b111), _ => None };
+        return Ok(match vn.offset { 0 => Some(0), 1 => Some(0b111), _ => None });
     }
-    let key = key_of(vn, data)?;
+    let Some(key) = key_of(vn, data) else { return Ok(None) };
     if let Some(at) = ops.iter().rposition(|op| op.out.as_ref().and_then(|out| key_of(out, data)) == Some(key)) {
         let op = &ops[at];
-        let a = guard_mask(op.ins.first()?, &ops[..at], translate, data)?;
-        let b = || guard_mask(op.ins.get(1)?, &ops[..at], translate, data);
-        return match op.opcode {
-            OpCode::CPUI_COPY => Some(a),
-            OpCode::CPUI_BOOL_NEGATE => Some(a ^ 0b111),
-            OpCode::CPUI_BOOL_AND => Some(a & b()?),
-            OpCode::CPUI_BOOL_OR => Some(a | b()?),
-            OpCode::CPUI_BOOL_XOR | OpCode::CPUI_INT_NOTEQUAL => Some(a ^ b()?),
-            OpCode::CPUI_INT_EQUAL => Some((a ^ b()?) ^ 0b111),
+        let Some(first) = op.ins.first() else { return Ok(None) };
+        let Some(a) = guard_mask(first, &ops[..at], translate, data)? else { return Ok(None) };
+        if op.opcode == OpCode::CPUI_COPY {
+            return Ok(Some(a));
+        }
+        if op.opcode == OpCode::CPUI_BOOL_NEGATE {
+            return Ok(Some(a ^ 0b111));
+        }
+        if !matches!(op.opcode, OpCode::CPUI_BOOL_AND | OpCode::CPUI_BOOL_OR | OpCode::CPUI_BOOL_XOR | OpCode::CPUI_INT_NOTEQUAL | OpCode::CPUI_INT_EQUAL) {
+            return Ok(None);
+        }
+        let Some(second) = op.ins.get(1) else { return Ok(None) };
+        let Some(b) = guard_mask(second, &ops[..at], translate, data)? else { return Ok(None) };
+        return Ok(match op.opcode {
+            OpCode::CPUI_BOOL_AND => Some(a & b),
+            OpCode::CPUI_BOOL_OR => Some(a | b),
+            OpCode::CPUI_BOOL_XOR | OpCode::CPUI_INT_NOTEQUAL => Some(a ^ b),
+            OpCode::CPUI_INT_EQUAL => Some((a ^ b) ^ 0b111),
             _ => None,
-        };
+        });
     }
-    match flag_name(vn, translate).as_str() {
+    Ok(match flag_name(vn, translate)?.as_str() {
         "CY" => Some(0b110),
         "ZR" => Some(0b010),
         _ => None,
-    }
+    })
 }
 
 /// The first `limit` of the `cases` targets of a `width`-byte offset table at

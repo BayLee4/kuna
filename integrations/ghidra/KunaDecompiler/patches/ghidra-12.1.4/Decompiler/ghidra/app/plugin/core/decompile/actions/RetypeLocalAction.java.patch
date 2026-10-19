@@ -1,0 +1,50 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RetypeLocalAction.java
++++ b/ghidra/app/plugin/core/decompile/actions/RetypeLocalAction.java
+@@ -25,11 +25,9 @@
+ import ghidra.app.util.HelpTopics;
+ import ghidra.framework.plugintool.PluginTool;
+ import ghidra.program.model.data.DataType;
+-import ghidra.program.model.data.DataTypeManager;
+ import ghidra.program.model.listing.Function;
+ import ghidra.program.model.listing.Program;
+ import ghidra.program.model.pcode.*;
+-import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
+ import ghidra.program.model.symbol.SourceType;
+ import ghidra.util.*;
+ import ghidra.util.exception.*;
+@@ -84,30 +82,14 @@
+ 				return;
+ 			}
+ 		}
+-		DataTypeManager dataTypeManager = program.getDataTypeManager();
+ 		boolean successfulMod = false;
+ 		int transaction = program.startTransaction("Retype Variable");
+ 		try {
+-			if (dt.getDataTypeManager() != dataTypeManager) {
+-				dt = dataTypeManager.resolve(dt, null);
+-			}
+-			if (commitRequired) {
+-				// Don't use datatypes of other parameters if the datatypes were floating.
+-				// Datatypes were floating if signature source was DEFAULT
+-				boolean useDataTypes =
+-					hfunction.getFunction().getSignatureSource() != SourceType.DEFAULT;
+-				try {
+-					HighFunctionDBUtil.commitParamsToDatabase(hfunction, useDataTypes,
+-						ReturnCommitOption.NO_COMMIT, SourceType.USER_DEFINED);
+-				}
+-				catch (DuplicateNameException e) {
+-					throw new AssertException("Unexpected exception", e);
+-				}
+-				catch (InvalidInputException e) {
+-					Msg.showError(this, null, "Parameter Commit Failed", e.getMessage());
+-				}
+-			}
+-			HighFunctionDBUtil.updateDBVariable(highSymbol, null, dt, SourceType.USER_DEFINED);
++			// Floating parameters keep their original undefined-type commit policy.
++			boolean useDataTypes =
++				hfunction.getFunction().getSignatureSource() != SourceType.DEFAULT;
++			HighFunctionDBUtil.updateDBVariableAndCommitParameters(highSymbol, null, dt,
++				SourceType.USER_DEFINED, commitRequired, useDataTypes, SourceType.USER_DEFINED);
+ 			successfulMod = true;
+ 		}
+ 		catch (DuplicateNameException e) {

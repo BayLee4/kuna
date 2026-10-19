@@ -49,7 +49,7 @@
     <com>lo fu register_parameter_reuse</com>
     <com>decompile</com>
     <com>print C</com>
-    <com>rename property_00 cleared_property</com>
+    <com>rename key cleared_property</com>
     <com>decompile</com>
     <com>print C</com>
     <com>parse line struct Node { struct Node *next; struct Node *previous; uint4 identity; uint1 padding[4]; };</com>

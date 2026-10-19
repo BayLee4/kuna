@@ -194,7 +194,7 @@ fn render_vn(arch: &Architecture, fd: &Funcdata, vn: kuna_decomp::context::Varno
     let trans = arch.translate();
     let spc = loc.get_space().expect("render_vn: vn space");
     // printRawNoMarkup: try the register name first.
-    let regname = trans.get_register_name(spc, loc.get_offset(), size);
+    let regname = trans.get_register_name(spc, loc.get_offset(), size).unwrap();
     let (mut tok, expect) = if !regname.is_empty() {
         // off = loc - point.offset; appended as "+off" when nonzero — for the
         // exact-named registers in our corpus off is always 0.
@@ -363,7 +363,7 @@ fn run_to_b3(stem: &str, which: usize) -> Result<(XmlArchitecture, Funcdata), St
     // single op_heritage directly reproduces the C++ "first heritage" boundary.
     let mut fd =
         build_and_follow_flow(arch, &name, entry, 0).map_err(|e| format!("flow: {e}"))?;
-    fd.op_heritage();
+    fd.op_heritage().map_err(|e| format!("heritage: {e}"))?;
     Ok((xarch, fd))
 }
 

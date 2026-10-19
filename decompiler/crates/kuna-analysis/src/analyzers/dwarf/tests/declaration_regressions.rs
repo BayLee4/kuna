@@ -132,6 +132,38 @@ fn dwarf_compiler_callbacks_import_as_code_not_void() {
 }
 
 #[test]
+fn c_callback_arity_does_not_depend_on_cpp_mapper_visit_order() {
+    if !callable_child("c_callback_arity_does_not_depend_on_cpp_mapper_visit_order") {
+        return;
+    }
+    for standard in ["c89", "c11"] {
+        with_declarations("dwarf_callback_prototyped.c", standard, &[], |dies, path, bytes| {
+            for cpp_first in [false, true] {
+                let architecture = target_architecture(path, bytes);
+                let types = architecture.base().unwrap().types();
+                for cpp in [cpp_first, !cpp_first] {
+                    for name in ["Open", "Closed", "Fixed", "Variadic"] {
+                        let (off, _) = named(dies, gimli::DW_TAG_typedef, name);
+                        let pointer = build_datatype(
+                            Some(off), dies, types, 1, &mut TypeWalk::with_gate(true), cpp,
+                        ).expect("retain the genuine C callback declaration");
+                        let code = pointer.get_ptr_to().unwrap();
+                        let proto = code.get_code_prototype().unwrap();
+                        assert_eq!(
+                            proto.is_input_locked() && !proto.is_dotdotdot(),
+                            matches!(name, "Closed" | "Fixed"),
+                            "{standard} {name}, cpp_first={cpp_first}, cpp={cpp}",
+                        );
+                        assert_eq!(proto.is_dotdotdot(), name == "Variadic");
+                        assert_eq!(proto.num_params(), if matches!(name, "Fixed" | "Variadic") { 1 } else { 0 });
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[test]
 fn dwarf_callback_parameter_order_and_aliases_are_source_authored() {
     if !callable_child("dwarf_callback_parameter_order_and_aliases_are_source_authored") {
         return;
@@ -345,5 +377,144 @@ fn original_default_authors_retains_declared_three_element_extent() {
         assert_eq!(ty.num_elements(), Some(3));
         assert_eq!(ty.get_size(), 3 * types.get_size_of_pointer());
         assert_eq!(ty.get_array_base().unwrap().get_ptr_to().unwrap().get_name(), "char");
+    });
+}
+
+#[test]
+fn disabled_layout_definitions_are_terminal_but_true_forwards_remain_pending() {
+    with_declarations("dwarf_declarations.c", "c11", &[], |dies, _, _| {
+        let types = factory();
+        let (_, definition) = named(dies, gimli::DW_TAG_structure_type, "Node");
+        assert!(!definition.declaration);
+        assert!(definition.byte_size.is_some());
+        let opaque = intern_disabled_aggregate(&types, definition, "Node", false).unwrap();
+        assert!(!opaque.is_incomplete(), "disabled layout has no pending member walk");
+        assert_eq!(opaque.get_id(), definition.identity);
+        assert_eq!(opaque.get_size(), 0, "retain the original disabled classifier geometry");
+        assert_eq!(opaque.num_depend(), 0);
+        let repeated = intern_disabled_aggregate(&types, definition, "Node", false).unwrap();
+        assert!(Rc::ptr_eq(&opaque, &repeated));
+
+        let (_, declaration) = named(dies, gimli::DW_TAG_structure_type, "Forward");
+        assert!(declaration.declaration);
+        let forward = intern_disabled_aggregate(&types, declaration, "Forward", false).unwrap();
+        assert!(forward.is_incomplete(), "a genuine forward has no terminal definition");
+        assert_eq!(forward.get_id(), declaration.identity);
+    });
+}
+
+#[test]
+fn original_narrow_enum_typedef_preserves_anonymous_definition_in_either_visit_order() {
+    use kuna_decomp::dtype::DatatypeKind;
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/narrowext_rv64.o");
+    let bytes = std::fs::read(path).expect("read original RV64 DWARF fixture");
+    let raw = crate::loadimage_object::parse_object(&bytes).unwrap();
+    let view = crate::loader::kuna_relocrebase::rebased_view(&raw, &bytes);
+    assert!(view.is_some(), "original ET_REL fixture requires its canonical relocated view");
+    let (file, _) = crate::loader::kuna_relocrebase::select(raw, &bytes, &view);
+    let endian = if file.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+    let sections = gimli::DwarfSections::load(|id| -> Result<Vec<u8>, gimli::Error> {
+        Ok(dwarf_section_data(&file, id).unwrap_or_default())
+    }).unwrap();
+    let dwarf = sections.borrow(|bytes| gimli::EndianSlice::new(bytes, endian));
+    let mut units = dwarf.units();
+    let mut dies = BTreeMap::new();
+    while let Some(header) = units.next().unwrap() {
+        dies.extend(snapshot_unit(&dwarf, &dwarf.unit(header).unwrap()));
+    }
+    assign_nominal_aliases(&mut dies);
+    let (alias_off, alias_die) = named(&dies, gimli::DW_TAG_typedef, "E2");
+    let enum_off = alias_die.type_ref.expect("original typedef refers to an enum");
+    let enum_die = &dies[&enum_off];
+    assert_eq!(enum_die.tag, gimli::DW_TAG_enumeration_type);
+    assert!(enum_die.name.is_empty(), "the producer supplies no enum tag");
+    assert_eq!(enum_die.nominal_alias, "E2");
+    assert_eq!(enum_die.byte_size, Some(2));
+    assert_eq!(enum_signed(enum_die, &dies), Some(false));
+    for (full_depth, cpp) in [(true, false), (true, true), (false, true)] {
+        for alias_first in [false, true] {
+            let types = factory();
+            let import = |off| build_datatype(Some(off), &dies, &types, 1,
+                &mut TypeWalk::with_gate(full_depth), cpp).expect("original enum builds");
+            let first = if alias_first { alias_off } else { enum_off };
+            let _ = import(first);
+            let alias = import(alias_off);
+            let enumeration = import(enum_off);
+            assert_eq!(alias.get_name(), "E2");
+            assert_eq!(alias.get_id(), alias_die.identity);
+            assert_eq!(enumeration.get_id(), enum_die.identity);
+            assert_ne!(alias.get_id(), enumeration.get_id());
+            assert!(enumeration.get_name().is_empty(), "a typedef must not invent an enum tag");
+            assert_eq!(alias.get_typedef().unwrap().get_id(), enumeration.get_id());
+            for ty in [&alias, &enumeration] {
+                assert_eq!((ty.get_size(), ty.get_metatype()), (2, type_metatype::TYPE_UINT));
+                let DatatypeKind::Enum { namemap } = &ty.kind else {
+                    panic!("original enum definition must not become a scalar typedef");
+                };
+                assert_eq!(namemap, &BTreeMap::from([
+                    (0, "EA".to_string()), (40000, "EB".to_string()), (50000, "EC".to_string()),
+                ]));
+            }
+        }
+    }
+    let types = factory();
+    let off = build_datatype(Some(alias_off), &dies, &types, 1,
+        &mut TypeWalk::with_gate(false), false).unwrap();
+    assert_eq!((off.get_size(), off.get_metatype()), (2, type_metatype::TYPE_UINT));
+    assert!(!off.is_enum_type(), "the original C OFF view does not expose an anonymous alias");
+    assert!(off.get_typedef().is_none());
+    assert_eq!(dies[&enum_off].nominal_alias, "E2", "view selection must not erase source facts");
+}
+
+#[test]
+fn original_state_typedef_name_is_selected_only_by_full_depth_or_cpp() {
+    with_declarations("typedepth_x86_64.c", "c11", &[], |dies, _, _| {
+        let (alias_off, alias_die) = named(dies, gimli::DW_TAG_typedef, "state_t");
+        let target_off = alias_die.type_ref.unwrap();
+        let target = &dies[&target_off];
+        assert!(target.name.is_empty());
+        assert_eq!(target.nominal_alias, "state_t");
+        for (full_depth, cpp, named_alias) in [(false, false, false), (true, false, true), (false, true, true)] {
+            for alias_first in [false, true] {
+                let types = factory();
+                let import = |off| build_datatype(Some(off), dies, &types, 1,
+                    &mut TypeWalk::with_gate(full_depth), cpp).expect("original state builds");
+                let _ = import(if alias_first { alias_off } else { target_off });
+                let alias_view = import(alias_off);
+                let target_view = import(target_off);
+                assert_eq!(alias_view.get_name() == "state_t", named_alias);
+                assert_eq!(target_view.get_name() == "state_t", named_alias,
+                    "preassigned source aliases must obey the same receiving policy");
+                assert_eq!(target_view.get_id(), target.identity);
+                if !named_alias {
+                    assert!(alias_view.get_typedef().is_none());
+                }
+            }
+        }
+        assert_eq!(dies[&target_off].nominal_alias, "state_t");
+    });
+}
+
+#[test]
+fn c_off_alias_selection_does_not_erase_object_or_pointee_qualifiers() {
+    with_declarations("dwarf_declarations.c", "c11", &[], |dies, _, _| {
+        for full_depth in [false, true] {
+            let types = factory();
+            for (name, top_volatile, pointee_volatile) in [
+                ("object_volatile", true, None),
+                ("pointer_volatile", true, Some(false)),
+                ("pointee_volatile", false, Some(true)),
+            ] {
+                let (_, variable) = named(dies, gimli::DW_TAG_variable, name);
+                let ty = build_datatype(variable.type_ref, dies, &types, 1,
+                    &mut TypeWalk::with_gate(full_depth), false).unwrap();
+                assert_eq!(kuna_decomp::kuna_typequal::is_volatile(&ty), top_volatile, "{name}");
+                if let Some(expected) = pointee_volatile {
+                    assert_eq!(kuna_decomp::kuna_typequal::is_volatile(&ty.get_ptr_to().unwrap()),
+                        expected, "{name}");
+                }
+            }
+        }
     });
 }

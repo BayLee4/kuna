@@ -51,12 +51,9 @@
 //!     resolved `TypeOp`, so the public surface here is
 //!     [`op_set_opcode`](Funcdata::op_set_opcode) which takes the resolved
 //!     [`TypeOp`] (caller / W6 supplies it) — matching the op.rs test harness.
-//!   - `opSetInput`'s constant-duplication guard calls `newConstant`/`copySymbol`
-//!     (funcdata_varnode + W4 symbol).  Transcribed with a `// STUB`-noted
-//!     fallback: a constant with an existing non-spacebase descendant is *not*
-//!     re-duplicated (the W3 IR never shares constants across reads until the
-//!     factory lands), and the link is made directly.  The exact note is in the
-//!     method body.
+//!   - `opSetInput` duplicates a constant already used by a non-spacebase read,
+//!     retaining its datatype, locks and optional symbol binding before linking
+//!     the new operand.
 //!   - `cloneOp` clones the input/output Varnodes (`cloneVarnode`); deferred.
 //!   - `opDestroy`/`opDestroyRaw`/`opDestroyRecursive` destroy Varnodes
 //!     (`destroyVarnode`); the op-graph half (unset inputs, dead-list move) is
@@ -250,20 +247,21 @@ impl Funcdata {
     // -----------------------------------------------------------------------
 
     /// Extension preserves its input exactly in the low bytes of its output.
-    fn kuna_preserve_extension_storage(&mut self, op: OpId) {
+    fn kuna_preserve_extension_storage(&mut self, op: OpId) -> KunaResult<()> {
         if !self.get_arch().name_style_angr {
-            return;
+            return Ok(());
         }
-        let Some(operation) = self.obank().get(op) else { return };
+        let Some(operation) = self.obank().get(op) else { return Ok(()) };
         if !matches!(operation.code(), OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_SEXT) {
-            return;
+            return Ok(());
         }
-        let Some(input) = operation.get_in(0) else { return };
-        let Some(output) = operation.get_out() else { return };
-        let Some(size) = self.vbank().get(input).map(|v| v.get_size()) else { return };
+        let Some(input) = operation.get_in(0) else { return Ok(()) };
+        let Some(output) = operation.get_out() else { return Ok(()) };
+        let Some(size) = self.vbank().get(input).map(|v| v.get_size()) else { return Ok(()) };
         if self.vbank().get(output).is_some_and(|v| v.get_size() > size) {
-            self.kuna_inherit_storage_slice(input, output, 0, size);
+            self.kuna_inherit_storage_slice(input, output, 0, size)?;
         }
+        Ok(())
     }
 
     /// Unset the output Varnode of the given op (C++ `Funcdata::opUnsetOutput`,
@@ -271,9 +269,16 @@ impl Funcdata {
     /// deleted.
     ///
     /// Statement order is load-bearing: `op->setOutput(0)` MUST come before
-    /// `vbank.makeFree(vn)`.
-    pub fn op_unset_output(&mut self, op: OpId) {
-        self.kuna_preserve_extension_storage(op);
+    /// `vbank.makeFree(vn)`. Query-bearing extension storage preservation
+    /// completes before either link changes.
+    pub fn op_unset_output(&mut self, op: OpId) -> KunaResult<()> {
+        self.kuna_preserve_extension_storage(op)?;
+        self.op_unset_output_links(op);
+        Ok(())
+    }
+
+    /// Unlink only after query-bearing storage preservation has succeeded.
+    fn op_unset_output_links(&mut self, op: OpId) {
         let vn = match self.obank().get(op).expect("op_unset_output: stale op").get_out() {
             Some(v) => v,
             None => return, // Nothing to do
@@ -315,11 +320,19 @@ impl Funcdata {
         if self.obank().get(op).expect("op_set_output: stale op").get_out() == Some(vn) {
             return Ok(());
         }
-        if self.obank().get(op).expect("op_set_output: stale op").get_out().is_some() {
-            self.op_unset_output(op);
+        let old_output = self.obank().get(op).expect("op_set_output: stale op").get_out();
+        let old_definition = self.vbank().get(vn).expect("op_set_output: stale vn").get_def();
+        if old_output.is_some() {
+            self.kuna_preserve_extension_storage(op)?;
         }
-        if let Some(defop) = self.vbank().get(vn).expect("op_set_output: stale vn").get_def() {
-            self.op_unset_output(defop);
+        if let Some(defop) = old_definition {
+            self.kuna_preserve_extension_storage(defop)?;
+        }
+        if old_output.is_some() {
+            self.op_unset_output_links(op);
+        }
+        if let Some(defop) = old_definition {
+            self.op_unset_output_links(defop);
         }
         // Split-borrow both banks so the xref
         //   read-repointing callback can reach obank mid-vbank-mutation.  Scoped so
@@ -334,7 +347,7 @@ impl Funcdata {
         self.kuna_rekey_storage_sources(original_vn, vn);
         self.kuna_forget_call_transport(vn);
         if refresh {
-            self.set_varnode_properties(vn);
+            self.set_varnode_properties(vn)?;
         } else {
             self.ensure_varnode_cover(vn);
         }
@@ -439,13 +452,8 @@ impl Funcdata {
     /// read.  Now that the funcdata_varnode factory has landed, the
     /// re-duplication is ported faithfully.
     ///
-    /// STUB(W4): `cvn->copySymbol(vn)` propagates the original constant's
-    /// data-type and `SymbolEntry`/`typelock|namelock` markup onto the duplicate.
-    /// The type-/symbol-propagation machinery (mapentry, `HighVariable`,
-    /// `TypeFactory`) is W4/W6; until it lands the duplicate carries the unknown
-    /// base of its size (exactly what `newConstant` builds — and what the original
-    /// `vn` itself carries in the W3 IR, where no symbol is attached yet), so the
-    /// `copySymbol` is currently a structural no-op.  Recorded as a (latent) loss.
+    /// The identical-size duplicate retains the original datatype, type/name
+    /// locks and any symbol binding, even when no symbol entry is present.
     pub fn op_set_input(&mut self, op: OpId, vn: VarnodeId, slot: int4) -> KunaResult<()> {
         let mut vn = vn;
         // C++ `opSetInput` takes `Varnode *vn`, which may be `(Varnode *)0`
@@ -472,8 +480,11 @@ impl Funcdata {
         {
             let v = self.vbank().get(vn).expect("op_set_input: stale vn");
             if v.is_constant() && !v.has_no_descend() && !v.is_spacebase() {
-                let (size, off) = (v.get_size(), v.get_offset());
+                let (size, off, dtype, flags) =
+                    (v.get_size(), v.get_offset(), Rc::clone(v.get_type()), v.get_flags());
                 let cvn = self.new_constant(size, off);
+                self.vbank_mut().get_mut(cvn).expect("fresh constant")
+                    .copy_symbol_fields(dtype, flags);
                 // Preserve any bound (dynamic) SymbolEntry
                 // onto the duplicated constant (C++ `funcdata_op.cc:111`).  Without
                 // this an equate parked on a shared constant is lost the first time
@@ -555,6 +566,63 @@ impl Funcdata {
         self.obank_mut().create_at(inputs, pc)
     }
 
+    /// Inject a prototype model's nonbranching raw p-code into a live block,
+    /// preserving payload order at the supplied insertion point.
+    pub(crate) fn do_live_inject(
+        &mut self,
+        payload_id: int4,
+        address: &kuna_base::address::Address,
+        block: crate::context::BlockId,
+        before: Option<OpId>,
+    ) -> KunaResult<()> {
+        use kuna_sleigh::translate::PcodeEmit;
+        struct LiveEmit<'a> {
+            data: &'a mut Funcdata,
+            error: Option<KunaError>,
+        }
+        impl PcodeEmit for LiveEmit<'_> {
+            fn dump(
+                &mut self,
+                address: &kuna_base::address::Address,
+                opcode: OpCode,
+                output: Option<&kuna_num::pcoderaw::VarnodeData>,
+                inputs: &[kuna_num::pcoderaw::VarnodeData],
+            ) {
+                if self.error.is_some() { return; }
+                let type_op = self.data.get_arch().type_op_info(opcode).to_type_op();
+                if let Err(error) = crate::flow::emit_pcode_op(self.data, type_op, address, output, inputs) {
+                    self.error = Some(error);
+                }
+            }
+        }
+        let library = self.get_arch().injection_library.clone()
+            .ok_or_else(|| KunaError::lowlevel("Live injection requires the architecture injection library"))?;
+        let marker = self.obank().dead_back();
+        let mut context = crate::pcodeinject::InjectContext {
+            baseaddr: Some(address.clone()),
+            nextaddr: Some(address.clone()),
+            ..Default::default()
+        };
+        let mut emitter = LiveEmit { data: self, error: None };
+        let result = crate::inject_sleigh::emit_payload_shared(
+            &library, payload_id, &mut context, &mut emitter,
+        );
+        if let Some(error) = emitter.error { return Err(error); }
+        result?;
+        let mut next = match marker {
+            Some(op) => self.obank().dead_next(op),
+            None => self.obank().dead_front(),
+        };
+        while let Some(op) = next {
+            next = self.obank().dead_next(op);
+            if self.obank().get(op).expect("live injection op").is_call_or_branch() {
+                return Err(KunaError::lowlevel("Illegal branching injection"));
+            }
+            self.op_insert(op, block, before);
+        }
+        Ok(())
+    }
+
     /// Create a new PcodeOp with `inputs` operands and a specific sequence number
     /// (C++ `Funcdata::newOp(int4,const SeqNum&)`, `funcdata_op.cc:332`).
     ///
@@ -574,11 +642,11 @@ impl Funcdata {
             .space
             .clone()
             .ok_or_else(|| KunaError::lowlevel("newSpacebasePtr: spacebase has no space"))?;
-        Ok(self.new_varnode(
+        self.new_varnode(
             point.size as int4,
             &kuna_base::address::Address::new(space, point.offset),
             None,
-        ))
+        )
     }
 
     /// Build the stack-pointer-relative reference `INT_ADD(spacebase, off)` for a
@@ -687,18 +755,18 @@ impl Funcdata {
         addr: &kuna_base::address::Address,
         sz: int4,
         extra_flags: uint4,
-    ) -> OpId {
+    ) -> KunaResult<OpId> {
         let indaddr = self.obank().get(indeffect).expect("newIndirectOp: stale op").get_addr().clone();
-        let newin = self.new_varnode(sz, addr, None);
+        let newin = self.new_varnode(sz, addr, None)?;
         let newop = self.new_op(2, indaddr);
         self.obank_mut().get_mut(newop).expect("newIndirectOp").set_flag(extra_flags);
-        let _ = self.new_varnode_out(sz, addr, newop);
+        self.new_varnode_out(sz, addr, newop)?;
         self.op_set_opcode_code(newop, OpCode::CPUI_INDIRECT);
-        let _ = self.op_set_input(newop, newin, 0);
+        self.op_set_input(newop, newin, 0)?;
         let iop = self.new_varnode_iop(indeffect);
-        let _ = self.op_set_input(newop, iop, 1);
+        self.op_set_input(newop, iop, 1)?;
         self.op_insert_before(newop, indeffect);
-        newop
+        Ok(newop)
     }
 
     /// Build a `CPUI_INDIRECT` *creation* op modeling a register killed (and
@@ -716,7 +784,7 @@ impl Funcdata {
         addr: &kuna_base::address::Address,
         sz: int4,
         possibleout: bool,
-    ) -> OpId {
+    ) -> KunaResult<OpId> {
         use crate::op::pcodeop_flags;
         use crate::varnode::varnode_flags;
         let indaddr = self.obank().get(indeffect).expect("newIndirectCreation: stale op").get_addr().clone();
@@ -726,7 +794,7 @@ impl Funcdata {
             .get_mut(newop)
             .expect("newIndirectCreation")
             .set_flag(pcodeop_flags::indirect_creation);
-        let newout = self.new_varnode_out(sz, addr, newop).expect("newIndirectCreation out");
+        let newout = self.new_varnode_out(sz, addr, newop)?;
         if !possibleout {
             self.vbank_mut()
                 .get_mut(newin)
@@ -738,11 +806,11 @@ impl Funcdata {
             .expect("newIndirectCreation out")
             .set_flags_pub(varnode_flags::indirect_creation);
         self.op_set_opcode_code(newop, OpCode::CPUI_INDIRECT);
-        let _ = self.op_set_input(newop, newin, 0);
+        self.op_set_input(newop, newin, 0)?;
         let iop = self.new_varnode_iop(indeffect);
-        let _ = self.op_set_input(newop, iop, 1);
+        self.op_set_input(newop, iop, 1)?;
         self.op_insert_before(newop, indeffect);
-        newop
+        Ok(newop)
     }
 
     /// Create a new PcodeOp with 2 or 3 operands and a unique-space output, inserted
@@ -778,8 +846,9 @@ impl Funcdata {
     ///
     /// `finalize` controls whether the recreated index Varnode picks up the
     /// (read-facing) data-type of the offset/multiplier — used by the late
-    /// finalization pass.
-    pub fn op_undo_ptradd(&mut self, op: OpId, finalize: bool) {
+    /// finalization pass. Failure to acquire that facing type propagates to
+    /// the invoking rule or cast action.
+    pub fn op_undo_ptradd(&mut self, op: OpId, finalize: bool) -> KunaResult<()> {
         let mult_vn = self.obank().get(op).expect("op_undo_ptradd: stale op").get_in(2)
             .expect("op_undo_ptradd: PTRADD missing slot 2");
         let mult_off = self.vbank().get(mult_vn).expect("op_undo_ptradd: stale multVn").get_offset();
@@ -789,7 +858,7 @@ impl Funcdata {
         self.op_set_opcode_code(op, OpCode::CPUI_INT_ADD);
         // No multiplier, done.
         if mult_size == 1 {
-            return;
+            return Ok(());
         }
         let off_vn = self.obank().get(op).expect("op_undo_ptradd: stale op").get_in(1)
             .expect("op_undo_ptradd: missing slot 1");
@@ -801,12 +870,11 @@ impl Funcdata {
             let new_val = (mult_off.wrapping_mul(off_off)) & kuna_base::address::calc_mask(off_size);
             let new_off_vn = self.new_constant(off_size, new_val);
             if finalize {
-                let rf = self.vbank().get(off_vn).expect("op_undo_ptradd: stale offVn")
-                    .get_type_read_facing(op).clone();
+                let rf = self.vn_type_read_facing(off_vn, op)?;
                 self.vbank_mut().get_mut(new_off_vn).expect("op_undo_ptradd: stale newOff").update_type(rf);
             }
             let _ = self.op_set_input(op, new_off_vn, 1);
-            return;
+            return Ok(());
         }
         let op_addr = self.obank().get(op).expect("op_undo_ptradd: stale op").get_addr().clone();
         let mult_op = self.new_op(2, op_addr);
@@ -822,6 +890,7 @@ impl Funcdata {
         let _ = self.op_set_input(mult_op, mult_vn, 1);
         let _ = self.op_set_input(op, add_vn, 1);
         self.op_insert_before(mult_op, op);
+        Ok(())
     }
 
     /// Collapse `z = (x * #c) * #d` to `z = x * #(c*d)` (C++
@@ -908,7 +977,7 @@ impl Funcdata {
         }
         let outvn = self.obank().get(op).expect("clone_op").get_out();
         if let Some(outvn) = outvn {
-            let newout = self.clone_varnode(outvn);
+            let newout = self.clone_varnode(outvn)?;
             self.op_set_output(newop, newout)?;
         }
         for i in 0..numinput {
@@ -918,7 +987,7 @@ impl Funcdata {
                 .expect("clone_op")
                 .get_in(i)
                 .expect("clone_op: missing input");
-            let newin = self.clone_varnode(invn);
+            let newin = self.clone_varnode(invn)?;
             self.op_set_input(newop, newin, i)?;
         }
         Ok(newop)
@@ -943,7 +1012,7 @@ impl Funcdata {
         self.obank_mut().get_mut(newop).expect("clone_op_from").set_flag(fl);
         let outvn = src.obank().get(op).expect("clone_op_from").get_out();
         if let Some(outvn) = outvn {
-            let newout = self.clone_varnode_from(src, outvn);
+            let newout = self.clone_varnode_from(src, outvn)?;
             self.op_set_output(newop, newout)?;
         }
         for i in 0..numinput {
@@ -953,7 +1022,7 @@ impl Funcdata {
                 .expect("clone_op_from")
                 .get_in(i)
                 .expect("clone_op_from: missing input");
-            let newin = self.clone_varnode_from(src, invn);
+            let newin = self.clone_varnode_from(src, invn)?;
             self.op_set_input(newop, newin, i)?;
         }
         Ok(newop)
@@ -1222,7 +1291,7 @@ impl Funcdata {
             let to = self.obank().get(replace).expect("cse_elimination").get_out()
                 .expect("cseElimination: replace has no output (C++ UB)");
             self.total_replace(from, to)?;
-            self.op_destroy(op1);
+            self.op_destroy(op1)?;
         }
         if replace != op2 {
             let from = self.obank().get(op2).expect("cse_elimination").get_out()
@@ -1230,7 +1299,7 @@ impl Funcdata {
             let to = self.obank().get(replace).expect("cse_elimination").get_out()
                 .expect("cseElimination: replace has no output (C++ UB)");
             self.total_replace(from, to)?;
-            self.op_destroy(op2);
+            self.op_destroy(op2)?;
         }
         Ok(replace)
     }
@@ -1315,7 +1384,7 @@ impl Funcdata {
                 let from = self.obank().get(oop).expect("build_copy_temp").get_out().expect("other out");
                 let to = self.obank().get(used_copy).expect("build_copy_temp").get_out().expect("used out");
                 self.total_replace(from, to)?;
-                self.op_destroy(oop);
+                self.op_destroy(oop)?;
             }
         }
         Ok(self.obank().get(used_copy).expect("build_copy_temp").get_out().expect("used out"))
@@ -1870,8 +1939,8 @@ impl Funcdata {
     /// Extricate the op from all its Varnode connections and remove it from its
     /// basic block; the op stays in the dead list, block connections unchanged
     /// (C++ `Funcdata::opUnlink`, `funcdata_op.cc:179`).
-    pub fn op_unlink(&mut self, op: OpId) {
-        self.op_unset_output(op);
+    pub fn op_unlink(&mut self, op: OpId) -> KunaResult<()> {
+        self.op_unset_output(op)?;
         let n = self.obank().get(op).expect("op_unlink: stale op").num_input();
         for i in 0..n {
             self.op_unset_input(op, i);
@@ -1879,6 +1948,7 @@ impl Funcdata {
         if self.obank().get(op).expect("op_unlink").get_parent().is_some() {
             self.op_uninsert(op);
         }
+        Ok(())
     }
 
     /// Destroy the given op: unset its output/inputs and move it permanently to
@@ -1888,9 +1958,10 @@ impl Funcdata {
     /// that `destroy_varnode` is ported), which also purges it from its
     /// HighVariable's instance list (the `~Varnode` `high->remove` step) so a
     /// later naming pass never derefs a freed member.  Then the input links are
-    /// unset, the op is marked dead and removed from its block.
-    pub fn op_destroy(&mut self, op: OpId) {
-        self.kuna_preserve_extension_storage(op);
+    /// unset, the op is marked dead and removed from its block. Register-query
+    /// failures during extension storage preservation leave these links intact.
+    pub fn op_destroy(&mut self, op: OpId) -> KunaResult<()> {
+        self.kuna_preserve_extension_storage(op)?;
         if let Some(out) = self.obank().get(op).expect("op_destroy: stale op").get_out() {
             // destroyVarnode clears each reader's input, nulls out->def (and the
             // op's output back-link), then frees the varnode — purging it from
@@ -1907,6 +1978,7 @@ impl Funcdata {
             self.obank_mut().mark_dead(op);
             self.bb_remove_op(parent, op);
         }
+        Ok(())
     }
 
     /// Recursively remove the op and any single-use, non-special ops feeding only
@@ -1914,7 +1986,7 @@ impl Funcdata {
     ///
     /// `scratch` is reused exactly as the C++ scratch vector (worklist order is
     /// observable).
-    pub fn op_destroy_recursive(&mut self, op: OpId, scratch: &mut Vec<OpId>) {
+    pub fn op_destroy_recursive(&mut self, op: OpId, scratch: &mut Vec<OpId>) -> KunaResult<()> {
         scratch.clear();
         scratch.push(op);
         let mut pos = 0;
@@ -1943,8 +2015,9 @@ impl Funcdata {
                 }
                 scratch.push(def_op);
             }
-            self.op_destroy(op);
+            self.op_destroy(op)?;
         }
+        Ok(())
     }
 
     /// Destroy a \e dead op replaced during flow generation, with all of its
@@ -2286,7 +2359,7 @@ impl Funcdata {
                 let slot = self.obank().get(otherop).expect("op_flip_in_place_execute: stale otherop").get_slot(out_vn);
                 // Propagate -vn- into otherop.
                 self.op_set_input(otherop, vn, slot)?;
-                self.op_destroy(op);
+                self.op_destroy(op)?;
             } else if opc == OpCode::CPUI_MAX {
                 // Swap BOOL_AND <-> BOOL_OR.
                 if code == OpCode::CPUI_BOOL_AND {

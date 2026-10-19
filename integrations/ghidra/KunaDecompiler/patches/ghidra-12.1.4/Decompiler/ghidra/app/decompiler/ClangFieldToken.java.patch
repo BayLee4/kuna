@@ -1,0 +1,31 @@
+--- a/ghidra/app/decompiler/ClangFieldToken.java
++++ b/ghidra/app/decompiler/ClangFieldToken.java
+@@ -56,6 +56,7 @@
+ 	public void decode(Decoder decoder, PcodeFactory pfactory) throws DecoderException {
+ 		String datatypestring = null;
+ 		long id = 0;
++		long local = 0;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+ 			if (attribId == 0) {
+@@ -67,6 +68,9 @@
+ 			else if (attribId == ATTRIB_ID.id()) {
+ 				id = decoder.readUnsignedInteger();
+ 			}
++			else if (attribId == PcodeDataTypeManager.ATTRIB_KUNA_LOCAL.id()) {
++				local = decoder.readUnsignedInteger();
++			}
+ 			else if (attribId == ATTRIB_OFF.id()) {
+ 				offset = (int) decoder.readSignedInteger();
+ 			}
+@@ -75,8 +79,8 @@
+ 				op = pfactory.getOpRef(refid);
+ 			}
+ 		}
+-		if (datatypestring != null) {
+-			datatype = pfactory.getDataTypeManager().findBaseType(datatypestring, id);
++		if (datatypestring != null || local != 0) {
++			datatype = pfactory.getDataTypeManager().findResultType(datatypestring, id, local);
+ 		}
+ 		decoder.rewindAttributes();
+ 		super.decode(decoder, pfactory);

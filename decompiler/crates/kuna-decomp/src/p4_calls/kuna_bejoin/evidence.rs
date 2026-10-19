@@ -50,6 +50,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::{spacetype, AddrSpace};
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
@@ -117,16 +118,16 @@ impl WideView {
 }
 
 /// The verdict for `key`, taken once per image.
-fn verdict(arch: &Architecture, map: &mut HashMap<Entry, bool>, model: &Rc<ProtoModel>, pair: &WidePair, key: Entry) -> bool {
+fn verdict(arch: &Architecture, map: &mut HashMap<Entry, bool>, model: &Rc<ProtoModel>, pair: &WidePair, key: Entry) -> KunaResult<bool> {
     if let Some(&v) = map.get(&key) {
-        return v;
+        return Ok(v);
     }
-    let v = arch
-        .manage()
-        .get_space(key.0)
-        .is_some_and(|sp| proves_wide(arch, model, pair, &Address::new(Rc::clone(sp), key.1)));
+    let v = match arch.manage().get_space(key.0) {
+        Some(sp) => proves_wide(arch, model, pair, &Address::new(Rc::clone(sp), key.1))?,
+        None => false,
+    };
     map.insert(key, v);
-    v
+    Ok(v)
 }
 
 /// A symbolic value.
@@ -300,18 +301,18 @@ pub fn wide_pair(model: &ProtoModel, manager: &kuna_base::space::AddrSpaceManage
 /// decompile asked about, and its pair, for the RETURN and CALL seams to read.
 /// Inert unless `option bejoin` is `evidence` and the image's model joins its
 /// pair high word first.
-pub fn seed(arch: &mut Architecture, data: &mut Funcdata) {
+pub fn seed(arch: &mut Architecture, data: &mut Funcdata) -> KunaResult<()> {
     if arch.be_join != super::BeJoinMode::Evidence {
-        return;
+        return Ok(());
     }
-    let Some(model) = arch.default_fp().cloned() else { return };
+    let Some(model) = arch.default_fp().cloned() else { return Ok(()) };
     let mut cache = std::mem::take(&mut arch.kuna_wide);
     if cache.pair.is_none() {
         cache.pair = Some(wide_pair(&model, arch.manage()));
     }
     let Some(Some(pair)) = cache.pair.clone() else {
         arch.kuna_wide = cache;
-        return;
+        return Ok(());
     };
     let mut entries: Vec<Entry> = Vec::new();
     let key = |a: &Address| a.get_space().map(|sp| (sp.get_index(), a.get_offset()));
@@ -327,33 +328,40 @@ pub fn seed(arch: &mut Architecture, data: &mut Funcdata) {
         entries.extend(earlier.missed.borrow().iter().copied());
     }
     let mut verdicts = HashMap::new();
+    let result = (|| {
     for k in entries {
         if !verdicts.contains_key(&k) {
-            verdicts.insert(k, verdict(arch, &mut cache.map, &model, &pair, k));
+            verdicts.insert(k, verdict(arch, &mut cache.map, &model, &pair, k)?);
         }
     }
     data.kuna_set_wide(WideView { pair, verdicts, missed: Default::default() });
+    Ok(())
+    })();
     arch.kuna_wide = cache;
+    result
 }
 
 /// After a pass of the pipeline: did a call ask about a callee no verdict was
 /// taken for (one the pipeline resolved an indirect call to), and is any such
 /// callee proven? Then the driver runs the pass again, and [`seed`] takes
 /// those callees' verdicts too.
-pub fn missed_proven(arch: &mut Architecture, data: &Funcdata) -> bool {
-    let Some(view) = data.kuna_wide() else { return false };
+pub fn missed_proven(arch: &mut Architecture, data: &Funcdata) -> KunaResult<bool> {
+    let Some(view) = data.kuna_wide() else { return Ok(false) };
     let missed = view.missed.borrow().clone();
     if missed.is_empty() {
-        return false;
+        return Ok(false);
     }
-    let Some(model) = arch.default_fp().cloned() else { return false };
+    let Some(model) = arch.default_fp().cloned() else { return Ok(false) };
     let mut cache = std::mem::take(&mut arch.kuna_wide);
     let mut any = false;
+    let result = (|| {
     for k in missed {
-        any |= verdict(arch, &mut cache.map, &model, &view.pair, k);
+        any |= verdict(arch, &mut cache.map, &model, &view.pair, k)?;
     }
+    Ok(any)
+    })();
     arch.kuna_wide = cache;
-    any
+    result
 }
 
 /// Is the function at `entry` proven to return its pair as one wide value,
@@ -366,10 +374,10 @@ pub fn proven(data: &Funcdata, entry: &Address) -> bool {
 
 /// The walk: does every RETURN of the function at `entry` hand back one
 /// value twice a register's width in `pair` (see the module header)?
-fn proves_wide(arch: &Architecture, model: &Rc<ProtoModel>, pair: &WidePair, entry: &Address) -> bool {
-    let (Some(hi_key), Some(lo_key)) = (WidePair::key(&pair.hi), WidePair::key(&pair.lo)) else { return false };
+fn proves_wide(arch: &Architecture, model: &Rc<ProtoModel>, pair: &WidePair, entry: &Address) -> KunaResult<bool> {
+    let (Some(hi_key), Some(lo_key)) = (WidePair::key(&pair.hi), WidePair::key(&pair.lo)) else { return Ok(false) };
     if entry.get_space().is_none_or(|s| s.get_type() != spacetype::IPTR_PROCESSOR) {
-        return false;
+        return Ok(false);
     }
     let mut w = Walk {
         arch,
@@ -416,12 +424,12 @@ fn proves_wide(arch: &Architecture, model: &Rc<ProtoModel>, pair: &WidePair, ent
     let mut todo = vec![(start, 0usize)];
     let mut paths = 1usize;
     while let Some((path, op)) = todo.pop() {
-        if w.run(path, op, &mut todo, &mut paths).is_none() || paths > MAX_PATHS {
-            return false;
+        if w.run(path, op, &mut todo, &mut paths)?.is_none() || paths > MAX_PATHS {
+            return Ok(false);
         }
     }
     let sites = std::mem::take(&mut w.sites);
-    !sites.is_empty() && sites.iter().all(|site| w.proves(site))
+    Ok(!sites.is_empty() && sites.iter().all(|site| w.proves(site)))
 }
 
 struct Walk<'a> {
@@ -455,12 +463,16 @@ fn overlaps(a: &Key, b: &Key) -> bool {
 
 impl<'a> Walk<'a> {
     /// Decode (once per walk) the instruction at `at`.
-    fn insn(&mut self, at: &Address) -> Option<Rc<Insn>> {
+    fn insn(&mut self, at: &Address) -> KunaResult<Option<Rc<Insn>>> {
         if let Some(i) = self.insns.get(&at.get_offset()) {
-            return Some(Rc::clone(i));
+            return Ok(Some(Rc::clone(i)));
         }
         let mut c = Collect::default();
-        let len = self.arch.translate().one_instruction(&mut c, at).ok().filter(|&n| n > 0)?;
+        let len = match self.arch.translate().one_instruction(&mut c, at) {
+            Ok(len) if len > 0 => len,
+            Err(err @ KunaError::Transport { .. }) => return Err(err),
+            _ => return Ok(None),
+        };
         let mut copies = 0;
         for (opc, out, ins) in &c.ops {
             for v in out.iter().chain(ins.iter()) {
@@ -475,7 +487,7 @@ impl<'a> Walk<'a> {
         }
         let i = Rc::new(Insn { len: len as u64, ops: c.ops, window: copies >= 3 });
         self.insns.insert(at.get_offset(), Rc::clone(&i));
-        Some(i)
+        Ok(Some(i))
     }
 
     fn key(v: &VarnodeData) -> Option<Key> {
@@ -604,22 +616,22 @@ impl<'a> Walk<'a> {
     /// Run one path from op `op` of the instruction at `path.at`: `Some(true)`
     /// at a RETURN holding a wide value, `Some(false)` at a path end that is no
     /// RETURN (a no-return call), `None` when the function proves nothing.
-    fn run(&mut self, mut path: Path, mut op: usize, todo: &mut Vec<(Path, usize)>, paths: &mut usize) -> Option<bool> {
+    fn run(&mut self, mut path: Path, mut op: usize, todo: &mut Vec<(Path, usize)>, paths: &mut usize) -> KunaResult<Option<bool>> {
         loop {
             let at = path.at.clone();
             if op == 0 {
                 if path.visited.contains(&at.get_offset()) || path.insns >= MAX_PATH_INSNS {
-                    return None;
+                    return Ok(None);
                 }
                 path.visited.push(at.get_offset());
                 path.insns += 1;
             }
-            let insn = self.insn(&at)?;
+            let Some(insn) = self.insn(&at)? else { return Ok(None) };
             let mut next: Option<Address> = Some(&at + insn.len as i64);
             while op < insn.ops.len() {
                 self.ops += 1;
                 if self.ops > MAX_OPS {
-                    return None;
+                    return Ok(None);
                 }
                 let (opc, out, ins) = &insn.ops[op];
                 let here = at.get_offset();
@@ -667,11 +679,14 @@ impl<'a> Walk<'a> {
                             .then(|| ins[0].space.as_ref().map(|sp| Address::new(Rc::clone(sp), ins[0].offset)))
                             .flatten();
                         if target.as_ref().is_some_and(|t| *t == self.entry && here == self.entry.get_offset()) {
-                            return None;
+                            return Ok(None);
                         }
-                        if target.is_some_and(|t| crate::p4_calls::kuna_calleenoreturn::is_no_return(self.arch, &t)) {
+                        if match target {
+                            Some(target) => crate::p4_calls::kuna_calleenoreturn::is_no_return(self.arch, &target)?,
+                            None => false,
+                        } {
                             self.reads.append(&mut path.reads);
-                            return Some(false);
+                            return Ok(Some(false));
                         }
                         for i in 0..path.regs.len() {
                             if !self.preserved(&path.regs[i].0) {
@@ -685,7 +700,7 @@ impl<'a> Walk<'a> {
                     }
                     OpCode::CPUI_CALLOTHER => {
                         if ins[1..].iter().all(Self::is_const) {
-                            return None;
+                            return Ok(None);
                         }
                         for v in &ins[1..] {
                             let t = self.value(&mut path, v);
@@ -696,12 +711,12 @@ impl<'a> Walk<'a> {
                             self.write(&mut path, o, t, here);
                         }
                     }
-                    OpCode::CPUI_BRANCHIND => return None,
+                    OpCode::CPUI_BRANCHIND => return Ok(None),
                     OpCode::CPUI_RETURN => {
-                        let site = self.site(&path)?;
+                        let Some(site) = self.site(&path) else { return Ok(None) };
                         self.sites.push(site);
                         self.reads.append(&mut path.reads);
-                        return Some(true);
+                        return Ok(Some(true));
                     }
                     OpCode::CPUI_BRANCH | OpCode::CPUI_CBRANCH => {
                         let cond = if *opc == OpCode::CPUI_CBRANCH {
@@ -714,7 +729,7 @@ impl<'a> Walk<'a> {
                         if cond == Some(false) {
                             continue;
                         }
-                        let dest = self.destination(&insn, op - 1, &ins[0], &next)?;
+                        let Some(dest) = self.destination(&insn, op - 1, &ins[0], &next) else { return Ok(None) };
                         if cond == Some(true) {
                             match dest {
                                 Dest::Op(i) => op = i,
@@ -758,7 +773,7 @@ impl<'a> Walk<'a> {
                     }
                 }
             }
-            let to = next?;
+            let Some(to) = next else { return Ok(None) };
             let spaces = &self.spaces;
             path.regs.retain(|(k, _, _)| spaces.get(&k.0).is_none_or(|s| s.get_type() != spacetype::IPTR_INTERNAL));
             path.at = to;
@@ -923,9 +938,9 @@ impl<'a> Walk<'a> {
 /// Runs in `buildOutputFromTrials` while the unused trials are still present;
 /// `trialvn` holds each trial's INDIRECT creation, by original slot. Returns
 /// `false`, changing nothing, unless the pair is built.
-pub(crate) fn build_high_read(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: &[Option<VarnodeId>]) -> bool {
+pub(crate) fn build_high_read(fc: &mut FuncCallSpecs, data: &mut Funcdata, trialvn: &[Option<VarnodeId>]) -> KunaResult<bool> {
     if super::mode(data) != super::BeJoinMode::Evidence {
-        return false;
+        return Ok(false);
     }
     let reads: Vec<(Address, int4, VarnodeId)> = {
         let active = fc.get_active_output();
@@ -935,24 +950,24 @@ pub(crate) fn build_high_read(fc: &mut FuncCallSpecs, data: &mut Funcdata, trial
             .filter_map(|t| trialvn.get((t.get_slot() - 1) as usize).copied().flatten().map(|vn| (t.get_address().clone(), t.get_size(), vn)))
             .collect()
     };
-    let [(ref raddr, rsize, vn)] = reads[..] else { return false };
+    let [(ref raddr, rsize, vn)] = reads[..] else { return Ok(false) };
     let entry = fc.get_entry_address().clone();
     if !proven(data, &entry) {
-        return false;
+        return Ok(false);
     }
-    let Some(pair) = data.kuna_wide().map(|w| w.pair.clone()) else { return false };
+    let Some(pair) = data.kuna_wide().map(|w| w.pair.clone()) else { return Ok(false) };
     let ((hi_addr, hi_size), (lo_addr, lo_size)) = (pair.hi, pair.lo);
     let within = hi_addr.justified_contain(hi_size, raddr, rsize, false);
     if within < 0 {
-        return false;
+        return Ok(false);
     }
     let op = fc.get_op();
-    let Some(call_addr) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return false };
-    let Some(joinaddr) = crate::kuna_rustabi::pair_join_address(data, &hi_addr, hi_size, &lo_addr, lo_size, &call_addr)
+    let Some(call_addr) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return Ok(false) };
+    let Some(joinaddr) = crate::kuna_rustabi::pair_join_address(data, &hi_addr, hi_size, &lo_addr, lo_size, &call_addr)?
     else {
-        return false;
+        return Ok(false);
     };
-    let Ok(whole) = data.new_varnode_out(lo_size + hi_size, &joinaddr, op) else { return false };
+    let whole = data.new_varnode_out(lo_size + hi_size, &joinaddr, op)?;
     if let Some(v) = data.vbank_mut().get_mut(whole) {
         v.set_write_mask();
     }
@@ -960,12 +975,12 @@ pub(crate) fn build_high_read(fc: &mut FuncCallSpecs, data: &mut Funcdata, trial
     let sub = data.new_op(2, call_addr);
     data.op_set_opcode_code(sub, OpCode::CPUI_SUBPIECE);
     let c = data.new_constant(4, (lo_size + within) as u64);
-    let _ = data.op_set_input(sub, whole, 0);
-    let _ = data.op_set_input(sub, c, 1);
-    let _ = data.op_set_output(sub, vn);
+    data.op_set_input(sub, whole, 0)?;
+    data.op_set_input(sub, c, 1)?;
+    data.op_set_output(sub, vn)?;
     data.op_insert_after(sub, op);
     if let Some(indop) = indop {
-        data.op_destroy(indop);
+        data.op_destroy(indop)?;
     }
-    true
+    Ok(true)
 }

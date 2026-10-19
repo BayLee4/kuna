@@ -96,7 +96,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, off: u64, ninput: int4, opc: OpCode) ->
 
 /// The spacebase input Varnode `SP_in` at the SP register location.
 fn make_sp_in(fd: &mut Funcdata) -> VarnodeId {
-    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None);
+    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }
 
@@ -110,13 +110,13 @@ fn build_probe_loop(fd: &mut Funcdata, bl: BlockId, limitconst: u64) -> (OpId, V
     let limc = fd.new_constant(SP_SIZE, limitconst);
     fd.op_set_input(limop, sp_in, 0).unwrap();
     fd.op_set_input(limop, limc, 1).unwrap();
-    let limit = fd.new_varnode(SP_SIZE, &reg_addr(fd, 0x40), None);
+    let limit = fd.new_varnode(SP_SIZE, &reg_addr(fd, 0x40), None).unwrap();
     fd.op_set_output(limop, limit).unwrap();
 
     // phiout = MULTIEQUAL(SP_in, step)   (output at the SP register location)
     let phi = fd.new_op(2, reg_addr(fd, 0x20));
     fd.op_set_opcode(phi, TypeOp::new(OpCode::CPUI_MULTIEQUAL, 0, "MULTIEQUAL"));
-    let phiout = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None);
+    let phiout = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None).unwrap();
     fd.op_set_output(phi, phiout).unwrap();
     fd.op_insert_end(phi, bl);
 
@@ -125,7 +125,7 @@ fn build_probe_loop(fd: &mut Funcdata, bl: BlockId, limitconst: u64) -> (OpId, V
     let pagec = fd.new_constant(SP_SIZE, PAGE);
     fd.op_set_input(stepop, phiout, 0).unwrap();
     fd.op_set_input(stepop, pagec, 1).unwrap();
-    let step = fd.new_varnode(SP_SIZE, &reg_addr(fd, 0x48), None);
+    let step = fd.new_varnode(SP_SIZE, &reg_addr(fd, 0x48), None).unwrap();
     fd.op_set_output(stepop, step).unwrap();
 
     // MULTIEQUAL inputs: entry = SP_in (stack-relative, off 0); back-edge = step
@@ -175,7 +175,7 @@ fn rewrites_multiequal_to_constant_add() {
     let limitconst: u64 = 0x3000;
     let (phi, sp_in) = build_probe_loop(&mut fd, bl, limitconst);
 
-    let changed = rule(true).apply_op(phi, &mut fd);
+    let changed = rule(true).apply_op(phi, &mut fd).unwrap();
     assert_eq!(changed, 1, "the canonical probe loop must be rewritten");
 
     // The MULTIEQUAL became INT_ADD(SP_in, limitconst - PAGE).
@@ -200,7 +200,7 @@ fn gate_off_is_inert() {
     let bl = new_block(&mut fd);
     let (phi, _sp_in) = build_probe_loop(&mut fd, bl, 0x3000);
 
-    let changed = rule(false).apply_op(phi, &mut fd);
+    let changed = rule(false).apply_op(phi, &mut fd).unwrap();
     assert_eq!(changed, 0, "gate-off must decline");
     // The op is still a MULTIEQUAL — untouched.
     assert_eq!(fd.obank().get(phi).unwrap().code(), OpCode::CPUI_MULTIEQUAL);
@@ -218,14 +218,14 @@ fn non_two_input_multiequal_declines() {
     // A 3-input MULTIEQUAL at the SP location: not a 2-edge loop header.
     let phi = fd.new_op(3, reg_addr(&fd, 0x20));
     fd.op_set_opcode(phi, TypeOp::new(OpCode::CPUI_MULTIEQUAL, 0, "MULTIEQUAL"));
-    let out = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let out = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(phi, out).unwrap();
     fd.op_insert_end(phi, bl);
     for i in 0..3 {
         let c = fd.new_constant(SP_SIZE, i as u64);
         fd.op_set_input(phi, c, i).unwrap();
     }
-    assert_eq!(rule(true).apply_op(phi, &mut fd), 0);
+    assert_eq!(rule(true).apply_op(phi, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -238,7 +238,7 @@ fn missing_exit_compare_declines() {
 
     let phi = fd.new_op(2, reg_addr(&fd, 0x20));
     fd.op_set_opcode(phi, TypeOp::new(OpCode::CPUI_MULTIEQUAL, 0, "MULTIEQUAL"));
-    let phiout = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let phiout = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(phi, phiout).unwrap();
     fd.op_insert_end(phi, bl);
 
@@ -247,13 +247,13 @@ fn missing_exit_compare_declines() {
     let pagec = fd.new_constant(SP_SIZE, PAGE);
     fd.op_set_input(stepop, phiout, 0).unwrap();
     fd.op_set_input(stepop, pagec, 1).unwrap();
-    let _step = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x48), None);
+    let _step = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x48), None).unwrap();
     fd.op_set_output(stepop, _step).unwrap();
 
     fd.op_set_input(phi, sp_in, 0).unwrap();
     fd.op_set_input(phi, _step, 1).unwrap();
 
-    assert_eq!(rule(true).apply_op(phi, &mut fd), 0);
+    assert_eq!(rule(true).apply_op(phi, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------

@@ -44,6 +44,211 @@ fn bare_sleigh() -> Sleigh {
 }
 
 #[test]
+fn sparse_data_organization_uses_source_defaults_and_explicit_abi_overrides() {
+    let mut arch = Architecture::new("test:LE:32", bare_sleigh());
+    arch.set_cspec_xml(br#"<compiler_spec><data_organization><pointer_size value="4"/></data_organization></compiler_spec>"#.to_vec());
+    arch.decode_data_organization().unwrap();
+    let types = arch.types();
+    assert_eq!(types.get_size_of_int(), 4);
+    assert_eq!(types.get_size_of_long(), 4);
+    assert_eq!(types.get_size_of_long_long(), 8);
+    assert_eq!(types.get_size_of_short(), 2);
+    assert_eq!(types.get_size_of_char(), 1);
+    assert_eq!(types.get_size_of_wchar(), 2);
+    assert_eq!(types.get_size_of_pointer(), 4);
+    assert_eq!(types.get_alignment(8).unwrap(), 8);
+    arch.reset_defaults();
+    assert_eq!(arch.types().get_size_of_long(), 4, "option reset does not change registered source organization");
+
+    arch.set_cspec_xml(br#"<compiler_spec><data_organization><pointer_size value="8"/><long_size value="8"/><long_double_size value="10"/><size_alignment_map><entry size="16" alignment="16"/></size_alignment_map></data_organization></compiler_spec>"#.to_vec());
+    arch.decode_data_organization().unwrap();
+    assert_eq!(arch.types().get_size_of_pointer(), 8);
+    assert_eq!(arch.types().get_size_of_long(), 8);
+    assert_eq!(arch.types().get_size_of_long_double(), 10);
+    assert_eq!(arch.types().get_alignment(4).unwrap(), 4);
+    assert_eq!(arch.types().get_alignment(8).unwrap(), 8);
+    assert_eq!(arch.types().get_alignment(16).unwrap(), 16);
+}
+
+#[test]
+fn default_model_visibility_is_live_while_held_prototypes_keep_their_models() {
+    let mut arch = Architecture::new("test", bare_sleigh());
+    arch.set_cspec_xml(br#"<compiler_spec>
+        <default_proto><prototype name="__stdcall" extrapop="0"/></default_proto>
+        <prototype name="__regparm3" extrapop="0"/>
+        </compiler_spec>"#.to_vec());
+    arch.build_default_proto().unwrap();
+    let held_default = arch.get_model("__stdcall").unwrap();
+    let held_named = arch.get_model("__regparm3").unwrap();
+    let mut source_default = crate::fspec::FuncProto::new();
+    source_default.set_model(Some(Rc::clone(&held_default)));
+    let mut source_named = crate::fspec::FuncProto::new();
+    source_named.set_model(Some(Rc::clone(&held_named)));
+    assert!(!held_default.print_in_decl(), "the source default is implicit");
+    assert!(held_named.print_in_decl(), "a distinct named convention is explicit");
+    assert!(!arch.model_print_in_decl(&source_default));
+    assert!(arch.model_print_in_decl(&source_named));
+    assert!(arch.print().options.convention, "visibility is not a printer-option override");
+    let spelling = crate::printc::RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, true);
+    assert_eq!(spelling.convention_name(&source_default), None);
+    assert_eq!(spelling.convention_name(&source_named), Some("__regparm3"));
+    let mut unnamed = crate::fspec::FuncProto::new();
+    unnamed.set_model(Some(Rc::new(ProtoModel::copy_named("", &held_named))));
+    assert!(!arch.model_print_in_decl(&unnamed));
+    assert_eq!(spelling.convention_name(&unnamed), None,
+        "an empty visible model name is not a calling-convention token");
+    let mut unregistered = crate::fspec::FuncProto::new();
+    unregistered.set_model(Some(Rc::new(ProtoModel::copy_named("__source_only", &held_named))));
+    assert_eq!(spelling.convention_name(&unregistered), Some("__source_only"),
+        "an unregistered source spelling uses its held model visibility");
+    let mut implicit_unregistered = ProtoModel::copy_named("__source_implicit", &held_named);
+    implicit_unregistered.set_print_in_decl(false);
+    unregistered.set_model(Some(Rc::new(implicit_unregistered)));
+    assert_eq!(spelling.convention_name(&unregistered), None);
+    assert_eq!(spelling.convention_name(&crate::fspec::FuncProto::new()), None);
+    arch.set_eval_current_model("__stdcall").unwrap();
+
+    arch.set_default_model("__regparm3").unwrap();
+    assert_eq!(arch.default_fp().unwrap().get_name(), "__regparm3");
+    assert!(!arch.default_fp().unwrap().print_in_decl());
+    assert!(!arch.get_model("__regparm3").unwrap().print_in_decl());
+    assert!(arch.get_model("__stdcall").unwrap().print_in_decl());
+    assert!(arch.evalfp_current.as_ref().unwrap().print_in_decl());
+    assert!(!held_default.print_in_decl(), "held snapshots are not repainted");
+    assert!(held_named.print_in_decl(), "held named snapshots remain independent");
+    assert!(arch.model_print_in_decl(&source_default),
+        "current presentation sees the former default as explicit");
+    assert!(!arch.model_print_in_decl(&source_named),
+        "current presentation hides the selected default without changing its ABI");
+    assert_eq!(spelling.convention_name(&source_default), Some("__stdcall"),
+        "a held spelling context shares live visibility, not a registry snapshot");
+    assert_eq!(spelling.convention_name(&source_named), None);
+    let hidden = crate::printc::RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, false);
+    assert_eq!(hidden.convention_name(&source_default), None,
+        "the active printer option is independent of registered visibility");
+
+    arch.set_default_model("__stdcall").unwrap();
+    assert!(!arch.get_model("__stdcall").unwrap().print_in_decl());
+    assert!(arch.get_model("__regparm3").unwrap().print_in_decl());
+    assert!(!arch.evalfp_current.as_ref().unwrap().print_in_decl());
+    assert!(!arch.model_print_in_decl(&source_default));
+    assert!(arch.model_print_in_decl(&source_named));
+    assert_eq!(spelling.convention_name(&source_default), None);
+    assert_eq!(spelling.convention_name(&source_named), Some("__regparm3"));
+    arch.reset_wire_defaults();
+    assert!(!arch.get_model("__stdcall").unwrap().print_in_decl());
+    assert!(arch.print().options.convention);
+}
+
+#[test]
+fn frozen_export_binding_survives_body_reflow_but_not_explicit_mutations() {
+    let mut arch = Architecture::new("test", bare_sleigh());
+    let held = Rc::new(crate::kuna_exportcall::ExportBinding::default());
+    let install = |arch: &mut Architecture| {
+        arch.print_mut().set_export_binding(Some(Rc::clone(&held)));
+    };
+    install(&mut arch);
+    arch.invalidate_body_caches();
+    assert!(Rc::ptr_eq(arch.print().export_binding().unwrap(), &held),
+        "derived body refresh is not an invocation configuration change");
+
+    arch.context_allow_set(false);
+    assert!(arch.print().export_binding().is_none());
+    install(&mut arch);
+    arch.set_kuna_option("exportinline", "on").unwrap();
+    assert!(arch.print().export_binding().is_none());
+    install(&mut arch);
+    arch.set_flow_options(0);
+    assert!(arch.print().export_binding().is_none());
+    install(&mut arch);
+    arch.set_print_language_checked("c-language").unwrap();
+    assert!(arch.print().export_binding().is_none());
+    install(&mut arch);
+    arch.print_mut().reset_wire_option_defaults();
+    assert!(arch.print().export_binding().is_none());
+    install(&mut arch);
+    arch.flush_remote_caches();
+    assert!(arch.print().export_binding().is_none());
+    assert!(held.spec().functions.is_empty(), "detached immutable bindings remain readable");
+}
+
+#[test]
+fn body_authority_is_exact_shared_and_published_before_cached_probes() {
+    struct ImportImage { space: Rc<kuna_base::space::AddrSpace> }
+    impl LoadImage for ImportImage {
+        fn is_import_slot(&self, at: &Address) -> bool {
+            at.get_space().is_some_and(|space| Rc::ptr_eq(space, &self.space))
+                && (0x1000..0x1008).contains(&at.get_offset())
+        }
+        fn get_file_name(&self) -> &str { "import-word" }
+        fn load_fill(&mut self, _: &mut [u8], _: &Address) -> KunaResult<()> {
+            Err(KunaError::data_unavail("import-word"))
+        }
+        fn get_arch_type(&self) -> Vec<u8> { Vec::new() }
+        fn adjust_vma(&mut self, _: i64) {}
+    }
+    let (mut arch, entry, queries) = crate::engine_translate::test_support::failure_arch(true);
+    let space = Rc::clone(entry.get_space().unwrap());
+    assert!(arch.is_body_entry(&entry), "images without negative loader evidence retain real bodies");
+    arch.set_loader(Box::new(ImportImage { space: Rc::clone(&space) }));
+    let key = (space.get_index(), entry.get_offset());
+    let summary = Rc::new(crate::kuna_calleedeadarg::CalleeEntryDead::from_parts(
+        2, vec![(2, 0x18, 8)], vec![], true));
+    arch.kuna_callee_dead_cache.insert(key, Rc::clone(&summary));
+    assert!(!arch.is_body_entry(&entry));
+    assert!(crate::kuna_calleedeadarg::probe_cached(&mut arch, &entry, 2).unwrap().is_none(),
+        "known bodyless addresses are declined before cached evidence or decode");
+    assert_eq!(queries.get(), 0);
+
+    let held = Rc::new(crate::kuna_exportcall::ExportBinding::default());
+    arch.print_mut().set_export_binding(Some(Rc::clone(&held)));
+    arch.declare_body_entry(&entry).unwrap();
+    assert!(arch.is_declared_body_entry(&entry));
+    assert!(arch.is_body_entry(&entry));
+    assert!(arch.kuna_callee_dead_cache.is_empty());
+    assert!(arch.print().export_binding().is_none());
+    assert!(matches!(crate::kuna_calleedeadarg::probe_cached(&mut arch, &entry, 2),
+        Err(KunaError::Transport { .. })), "real declared body errors still propagate");
+    assert_eq!(queries.get(), 1);
+
+    arch.kuna_callee_dead_cache.insert(key, Rc::clone(&summary));
+    arch.print_mut().set_export_binding(Some(Rc::clone(&held)));
+    arch.declare_body_entry(&entry).unwrap();
+    assert!(Rc::ptr_eq(arch.kuna_callee_dead_cache.get(&key).unwrap(), &summary));
+    assert!(Rc::ptr_eq(arch.print().export_binding().unwrap(), &held),
+        "an identical declaration does not mutate invocation authority");
+    arch.set_loader(Box::new(ImportImage { space: Rc::clone(&space) }));
+    assert!(arch.is_declared_body_entry(&entry), "same-manager wrapper replacement keeps assertions");
+    assert!(arch.is_body_entry(&entry));
+
+    let (other, foreign, _) = crate::engine_translate::test_support::failure_arch(true);
+    assert_eq!(foreign.get_space().unwrap().get_index(), space.get_index());
+    assert!(!arch.is_declared_body_entry(&foreign));
+    assert!(!arch.is_body_entry(&foreign));
+    assert!(arch.declare_body_entry(&foreign).is_err());
+    assert!(!other.is_declared_body_entry(&foreign), "fresh architectures inherit no assertions");
+    arch.declared_body_entries.replace(foreign);
+    assert!(!arch.is_declared_body_entry(&entry),
+        "canonical request identity alone cannot authorize a stale stored bank");
+    assert!(!arch.is_body_entry(&entry));
+    arch.print_mut().set_export_binding(Some(Rc::clone(&held)));
+    arch.kuna_callee_dead_cache.insert(key, summary);
+    arch.declare_body_entry(&entry).unwrap();
+    assert!(arch.is_declared_body_entry(&entry), "a new assertion replaces the stale binding");
+    assert!(arch.kuna_callee_dead_cache.is_empty());
+    assert!(arch.print().export_binding().is_none());
+    assert!(!arch.is_body_entry(&Address::default()));
+    for index in [-1, i32::MAX] {
+        let unmanaged = Address::new(Rc::new(kuna_base::space::AddrSpace::new(
+            kuna_base::space::spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, index, 0, 1, 1,
+        )), 0x1000);
+        assert!(!arch.is_body_entry(&unmanaged));
+        assert!(arch.declare_body_entry(&unmanaged).is_err(),
+            "invalid indices are rejected before indexing the manager");
+    }
+}
+
+#[test]
 fn decode_recipe_requires_both_bootstrap_inputs() {
     let mut arch = Architecture::new("test:LE:32", bare_sleigh());
     assert!(
@@ -299,6 +504,17 @@ fn comment_database_dedups_matching_text() {
     // Different text at the same address is stored.
     assert!(db.add_comment_no_duplicate(comment_type::warning, &fad, &ad, "WARNING: y"));
     assert_eq!(db.comments().len(), 2);
+
+    db.clear();
+    assert!(db.add_generated_comment_no_duplicate(comment_type::warning, &fad, &ad, "same text"));
+    assert!(!db.add_comment_no_duplicate(crate::comment::comment_type::USER2, &fad, &ad, "same text"));
+    db.clear_generated(&fad);
+    assert_eq!(db.comments().len(), 1, "authored duplicate takes ownership without reinserting");
+    assert!(!db.add_generated_comment_no_duplicate(comment_type::warning, &fad, &ad, "same text"));
+    assert!(db.add_generated_comment_no_duplicate(comment_type::warningheader, &fad, &ad, "generated only"));
+    db.clear_generated(&fad);
+    assert_eq!(db.comments().len(), 1, "generated duplicates cannot take ownership from source");
+    assert_eq!(db.comments()[0].text, "same text");
 }
 
 #[test]
@@ -317,7 +533,7 @@ fn inject_tempbase_comes_from_unique_start() {
     let sleigh = bare_sleigh();
     let expected = sleigh.get_unique_start(UniqueLayout::INJECT);
     let arch = Architecture::new("t", sleigh);
-    assert_eq!(arch.pcodeinjectlib.base.tempbase, expected);
+    assert_eq!(arch.pcodeinjectlib.borrow().base.tempbase, expected);
 }
 
 // --- Strand 2: real-`.sla` bootstrap + Funcdata lift -----------------------
@@ -391,7 +607,7 @@ fn owned_subsystems_are_constructed_and_accessible() {
     assert!(arch.default_fp().is_none());
     assert!(!arch.has_model("unknown"));
     // build_default_proto seeds an `unknown` default model.
-    arch.build_default_proto();
+    arch.build_default_proto().unwrap();
     assert!(arch.has_model("unknown"));
     assert!(arch.default_fp().is_some());
     assert_eq!(arch.get_model("unknown").unwrap().get_name(), "unknown");
@@ -400,6 +616,94 @@ fn owned_subsystems_are_constructed_and_accessible() {
     // real path.  Here (a bare Sleigh, no spaces) the factory is the empty
     // container `build_typegrp` produces.
     arch.build_typegrp();
+}
+
+#[test]
+fn malformed_model_payloads_propagate_without_abi_fallback() {
+    for (default_body, named_body, expected_name) in [
+        (r#"<pcode inject="uponentry"/>"#, "", "default"),
+        ("", r#"<prototype name="named" extrapop="0"><pcode inject="uponreturn"/></prototype>"#, "named"),
+    ] {
+        let mut arch = Architecture::new("test", bare_sleigh());
+        arch.set_cspec_xml(format!(
+            r#"<compiler_spec><default_proto><prototype name="default" extrapop="0">{default_body}</prototype></default_proto>{named_body}</compiler_spec>"#
+        ).into_bytes());
+        let error = arch.build_default_proto().expect_err("required payload errors must propagate");
+        assert!(matches!(error, KunaError::Lowlevel { ref explain }
+            if explain == &format!("Missing <body> subtag in <pcode>: Protomodel : {expected_name}")));
+        assert!(!arch.has_model("unknown"), "an injection failure is not a default-model fallback");
+        assert!(!arch.has_model("named"), "a named model with a malformed body is not admitted");
+    }
+}
+
+#[test]
+fn model_snippet_compile_failure_reaches_architecture_initialization() {
+    let Some(mut arch) = build_arch_from_sla("Ghidra/Processors/ARM/data/languages/ARM7_le.sla")
+    else {
+        return;
+    };
+    arch.set_cspec_xml(br#"<compiler_spec><default_proto><prototype name="broken" extrapop="0">
+        <pcode inject="uponreturn"><body>local value:4 = ;</body></pcode>
+        </prototype></default_proto></compiler_spec>"#.to_vec());
+    assert!(arch.init_post_engine().is_err(), "a model body compile failure must abort initialization");
+    let model = arch.default_fp().expect("model registration precedes compilation");
+    assert_eq!(model.get_name(), "broken", "the compiler error is not an ABI decode fallback");
+    let id = model.get_inject_upon_return();
+    assert!(id >= 0);
+    assert!(arch.pcodeinjectlib.borrow().get_tpl(id).is_none());
+}
+
+#[test]
+fn repeated_model_decode_reuses_both_role_ids_and_aliases() {
+    let mut arch = Architecture::new("test", bare_sleigh());
+    let spec = br#"<compiler_spec><default_proto><prototype name="default" extrapop="0">
+        <pcode inject="uponentry" dynamic="true"/>
+        <pcode inject="uponreturn"><body>local value:4 = 1;</body></pcode>
+        </prototype></default_proto><modelalias name="alias" parent="default"/></compiler_spec>"#;
+    let library = Rc::clone(&arch.pcodeinjectlib);
+    for _ in 0..2 {
+        arch.set_cspec_xml(spec.to_vec());
+        arch.build_default_proto().unwrap();
+        let model = arch.default_fp().unwrap();
+        assert_eq!(model.get_inject_upon_entry(), 0);
+        assert_eq!(model.get_inject_upon_return(), 1);
+        let alias = arch.get_model("alias").unwrap();
+        assert_eq!(alias.get_inject_upon_entry(), 0);
+        assert_eq!(alias.get_inject_upon_return(), 1);
+        assert!(Rc::ptr_eq(&arch.pcodeinjectlib, &library));
+        assert_eq!(library.borrow().injection.len(), 2, "no duplicate or orphan registration");
+        assert!(library.borrow().get_payload(0).core().is_dynamic());
+        assert!(!library.borrow().get_payload(1).core().is_dynamic());
+    }
+}
+
+#[test]
+fn conflicting_model_redecode_preserves_the_original_live_payload() {
+    let mut arch = Architecture::new("test", bare_sleigh());
+    arch.set_cspec_xml(br#"<compiler_spec><default_proto><prototype name="default" extrapop="0">
+        <pcode inject="uponentry" dynamic="true"/>
+        </prototype></default_proto></compiler_spec>"#.to_vec());
+    arch.build_default_proto().unwrap();
+    let id = arch.default_fp().unwrap().get_inject_upon_entry();
+    for replacement in [
+        r#"<pcode inject="uponentry"><body>local value:4 = 1;</body></pcode>"#,
+        r#"<pcode inject="uponentry" dynamic="true" incidentalcopy="true"/>"#,
+        r#"<pcode inject="uponentry" dynamic="true"><input name="changed" size="4"/></pcode>"#,
+        r#"<pcode inject="uponentry" dynamic="true"><output name="changed" size="4"/></pcode>"#,
+    ] {
+        arch.set_cspec_xml(format!(
+            r#"<compiler_spec><default_proto><prototype name="default" extrapop="0">{replacement}</prototype></default_proto></compiler_spec>"#
+        ).into_bytes());
+        assert_eq!(arch.build_default_proto(), Err(KunaError::lowlevel(
+            "Duplicate <callmechanism>: default@@inject_uponentry"
+        )));
+        let library = arch.pcodeinjectlib.borrow();
+        assert_eq!(library.injection.len(), 1, "conflict never allocates a second live payload");
+        assert!(library.get_payload(id).core().is_dynamic());
+        assert!(!library.get_payload(id).core().is_incidental_copy());
+        assert_eq!(library.get_payload(id).core().size_input(), 0);
+        assert_eq!(library.get_payload(id).core().size_output(), 0);
+    }
 }
 
 #[test]
@@ -455,7 +759,7 @@ fn arch_option_context_drives_the_printer() {
 #[test]
 fn arch_option_context_proto_model_registry() {
     let mut arch = Architecture::new("t", bare_sleigh());
-    arch.build_default_proto();
+    arch.build_default_proto().unwrap();
     // set_default_extra_pop mutates the shared default model.
     arch.set_default_extra_pop(8);
     assert_eq!(arch.default_fp().unwrap().get_extra_pop(), 8);

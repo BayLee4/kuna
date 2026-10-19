@@ -505,25 +505,25 @@ impl BitFieldInsertTransform {
 
     /// Test if a call is producing the \e original \e value (C++
     /// `testCallOriginal`, bitfield.cc:445-469).
-    fn test_call_original(&mut self, data: &mut Funcdata, state: &BitFieldNodeState, op: OpId) -> bool {
+    fn test_call_original(&mut self, data: &mut Funcdata, state: &BitFieldNodeState, op: OpId) -> kuna_base::error::KunaResult<bool> {
         if !data.obank().get(op).map(|o| o.is_call()).unwrap_or(false) {
-            return false;
+            return Ok(false);
         }
         if self.final_code(data) == OpCode::CPUI_STORE {
-            return false;
+            return Ok(false);
         }
         if state.bits_field.least_sig_bit != state.orig_least_sig_bit {
-            return false;
+            return Ok(false);
         }
         let mapped = self.mapped_vn.unwrap();
         if data.vbank().get(mapped).unwrap().is_addr_tied() {
-            return false;
+            return Ok(false);
         }
         if self.original_value.is_some() {
-            return false;
+            return Ok(false);
         }
         let out = data.obank().get(op).unwrap().get_out().unwrap();
-        let mut dt = data.vn_type_def_facing(out);
+        let mut dt = data.vn_type_def_facing(out)?;
         let off;
         let meta = dt.get_metatype();
         if meta == type_metatype::TYPE_STRUCT {
@@ -532,39 +532,39 @@ impl BitFieldInsertTransform {
             off = dt.get_partial_offset().unwrap_or(0);
             dt = match dt.get_partial_base() {
                 Some(p) => p,
-                None => return false,
+                None => return Ok(false),
             };
         } else {
-            return false;
+            return Ok(false);
         }
         let parent = self.base.parent_struct.as_ref().unwrap();
         if !Rc::ptr_eq(&dt, parent) {
-            return false;
+            return Ok(false);
         }
         if off != self.base.initial_offset {
-            return false;
+            return Ok(false);
         }
         self.original_value = Some(out);
-        true
+        Ok(true)
     }
 
     /// Follow field back, creating an InsertRecord if possible (C++
     /// `processBackward`, bitfield.cc:473-553).
-    fn process_backward(&mut self, data: &mut Funcdata, state: &mut BitFieldNodeState) -> bool {
+    fn process_backward(&mut self, data: &mut Funcdata, state: &mut BitFieldNodeState) -> kuna_base::error::KunaResult<bool> {
         while state.node != VarnodeId::default() {
             if data.vbank().get(state.node).map(|v| v.is_constant()).unwrap_or(false) {
-                return self.add_constant_write(data, state);
+                return Ok(self.add_constant_write(data, state));
             }
             if self.is_original_value(data, state) {
                 state.node = VarnodeId::default();
-                return true;
+                return Ok(true);
             }
             if state.field().is_some() && state.is_field_aligned() {
                 self.add_field_write(data, state);
-                return true;
+                return Ok(true);
             }
             if !data.vbank().get(state.node).map(|v| v.is_written()).unwrap_or(false) {
-                return false;
+                return Ok(false);
             }
             let op = data.vbank().get(state.node).unwrap().get_def().unwrap();
             let code = data.obank().get(op).unwrap().code();
@@ -582,10 +582,10 @@ impl BitFieldInsertTransform {
                 OpCode::CPUI_SUBPIECE => self.handle_subpiece_back(data, state, op),
                 OpCode::CPUI_INT_SRIGHT => self.handle_right_back(data, state, op),
                 OpCode::CPUI_CALL | OpCode::CPUI_CALLIND | OpCode::CPUI_CALLOTHER => {
-                    let r = self.test_call_original(data, state, op);
+                    let r = self.test_call_original(data, state, op)?;
                     if r {
                         state.node = VarnodeId::default();
-                        return true;
+                        return Ok(true);
                     }
                     false
                 }
@@ -593,26 +593,26 @@ impl BitFieldInsertTransform {
             };
             if !lift_res {
                 if state.field().is_none() {
-                    return false;
+                    return Ok(false);
                 }
                 if state.bits_field.byte_size > SIZEOF_UINTB {
-                    return false;
+                    return Ok(false);
                 }
                 let nz = data.vbank().get(state.node).unwrap().get_nz_mask();
                 let mut non_zero_bits = state.bits_field;
                 non_zero_bits.intersect_mask(nz);
                 if non_zero_bits.num_bits == 0 {
-                    return self.add_zero_out(state);
+                    return Ok(self.add_zero_out(state));
                 }
                 state.bits_used.intersect_mask(nz);
                 if non_zero_bits.num_bits == state.bits_used.num_bits {
                     self.add_field_write(data, state);
-                    return true;
+                    return Ok(true);
                 }
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Return true if specified bits in a Varnode are overwritten in the same
@@ -813,10 +813,10 @@ impl BitFieldInsertTransform {
 
     /// Look for redundant INSERTs and delete the second (C++ `checkRedundancy`,
     /// bitfield.cc:746-785).
-    fn check_redundancy(&self, data: &mut Funcdata, rec: &InsertRecord) {
+    fn check_redundancy(&self, data: &mut Funcdata, rec: &InsertRecord) -> kuna_base::error::KunaResult<()> {
         let rec_vn = match rec.vn {
             Some(v) => v,
-            None => return,
+            None => return Ok(()),
         };
         let mut immed_op: Option<OpId> = None;
         let descend: Vec<OpId> = data.vbank().get(rec_vn).unwrap().descend_iter().collect();
@@ -870,13 +870,14 @@ impl BitFieldInsertTransform {
                 let ord1 = data.obank().get(store1).unwrap().get_seq_num().get_order();
                 let ord2 = data.obank().get(store2).unwrap().get_seq_num().get_order();
                 if ord1 < ord2 {
-                    data.op_destroy_recursive(store2, &mut scratch);
+                    data.op_destroy_recursive(store2, &mut scratch)?;
                 } else {
-                    data.op_destroy_recursive(store1, &mut scratch);
+                    data.op_destroy_recursive(store1, &mut scratch)?;
                 }
             }
-            return;
+            return Ok(());
         }
+        Ok(())
     }
 
     // --- verify (bitfield.cc:827-917) -----------------------------------------
@@ -1018,20 +1019,21 @@ impl BitFieldInsertTransform {
 
     /// Trace bitfields backward from the terminating op (C++ `doTrace`,
     /// bitfield.cc:921-934).
-    pub fn do_trace(&mut self, data: &mut Funcdata) -> bool {
+    /// A semantic trace refusal is `Ok(false)`; facing-type acquisition failures propagate.
+    pub fn do_trace(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if self.base.work_list.is_empty() {
-            return false;
+            return Ok(false);
         }
         while !self.base.work_list.is_empty() {
             let mut node = self.base.work_list.remove(0);
-            if !self.process_backward(data, &mut node) && !self.is_overwritten_partial(data, &node) {
-                return false;
+            if !self.process_backward(data, &mut node)? && !self.is_overwritten_partial(data, &node) {
+                return Ok(false);
             }
         }
         if self.insert_list.is_empty() {
-            return false;
+            return Ok(false);
         }
-        self.verify_original_value_bits(data)
+        Ok(self.verify_original_value_bits(data))
     }
 
     /// Build the (partial) data-type associated with the root bitfield container
@@ -1056,21 +1058,23 @@ impl BitFieldInsertTransform {
 
     /// Transform recovered expressions into INSERT operations (C++ `apply`,
     /// bitfield.cc:936-1017).
-    pub fn apply(&mut self, data: &mut Funcdata) {
+    /// Propagates facing-type and mapped-varnode acquisition failures to the rule.
+    pub fn apply(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         let partial_type = self.build_partial_type(data);
         let records: Vec<InsertRecord> = self.insert_list.clone();
         if self.final_code(data) == OpCode::CPUI_STORE {
-            self.apply_store(data, &partial_type, &records);
+            self.apply_store(data, &partial_type, &records)?;
         } else {
-            self.apply_mapped(data, &partial_type, &records);
+            self.apply_mapped(data, &partial_type, &records)?;
         }
         for rec in &records {
-            self.check_redundancy(data, rec);
+            self.check_redundancy(data, rec)?;
         }
+        Ok(())
     }
 
     /// STORE-terminated apply (C++ `apply`, bitfield.cc:941-987).
-    fn apply_store(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) {
+    fn apply_store(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) -> kuna_base::error::KunaResult<()> {
         let dead_point = data.obank().get(self.final_write_op).unwrap().get_in(2).unwrap();
         let mut current_store = Some(self.final_write_op);
         let mut load_model: Option<OpId> = None;
@@ -1080,7 +1084,7 @@ impl BitFieldInsertTransform {
         } else {
             let ov = self.original_value.unwrap();
             load_model = data.vbank().get(ov).unwrap().get_def();
-            load_type = Some(data.vn_type_def_facing(ov));
+            load_type = Some(data.vn_type_def_facing(ov)?);
         }
         for rec in records {
             if current_store.is_none() {
@@ -1122,7 +1126,7 @@ impl BitFieldInsertTransform {
             self.add_field_shift(data, insert_op, rec);
             current_store = None;
         }
-        data.destroy_varnode_recursive(dead_point).ok();
+        data.destroy_varnode_recursive(dead_point)?;
         if let Some(lm) = load_model {
             if data.obank().get(lm).map(|o| o.code()).unwrap_or(OpCode::CPUI_COPY) == OpCode::CPUI_LOAD
                 && self.fold_load(data, lm)
@@ -1130,10 +1134,11 @@ impl BitFieldInsertTransform {
                 self.fold_ptrsub(data, lm);
             }
         }
+        Ok(())
     }
 
     /// Mapped-variable apply (C++ `apply`, bitfield.cc:988-1013).
-    fn apply_mapped(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) {
+    fn apply_mapped(&mut self, data: &mut Funcdata, partial_type: &Rc<Datatype>, records: &[InsertRecord]) -> kuna_base::error::KunaResult<()> {
         let num_in = data.obank().get(self.final_write_op).unwrap().num_input();
         let mut dead_points: Vec<VarnodeId> = Vec::new();
         for i in 0..num_in {
@@ -1156,14 +1161,15 @@ impl BitFieldInsertTransform {
             let last_op = insert_op;
             data.op_unset_input(last_op, 0);
             insert_op = self.set_insert_inputs(data, None, rec);
-            let new_out = data.new_varnode_out(self.base.container_size, &mapped_addr, insert_op).unwrap();
+            let new_out = data.new_varnode_out(self.base.container_size, &mapped_addr, insert_op)?;
             data.vbank_mut().get_mut(new_out).map(|v| v.update_type(Rc::clone(partial_type)));
             data.op_set_input(last_op, new_out, 0).ok();
             data.op_insert_before(insert_op, last_op);
             self.add_field_shift(data, insert_op, rec);
         }
         for vn in dead_points {
-            data.destroy_varnode_recursive(vn).ok();
+            data.destroy_varnode_recursive(vn)?;
         }
+        Ok(())
     }
 }

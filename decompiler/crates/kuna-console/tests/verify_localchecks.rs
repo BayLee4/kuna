@@ -61,7 +61,7 @@ fn a_directive_the_output_does_not_show_is_reported() {
         .expect("applies")
         .expect("binds a Symbol");
     let expected = assertions::expected_locals(&fd, &[(0, renamed, None), (1, retyped, Some(float8))]);
-    let code = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);
+    let code = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap();
     let unapplied = refusals(&prog, &fd, &code, &expected);
     assert_eq!(unapplied.len(), 2, "{unapplied:?}");
     assert!(unapplied.contains(&(0, "nothing is declared as `hash` after it".into())), "{unapplied:?}");

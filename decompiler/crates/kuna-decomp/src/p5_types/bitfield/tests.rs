@@ -431,8 +431,76 @@ fn fixture_out(fd: &Funcdata, op: OpId) -> VarnodeId {
 
 fn fixture_input(fd: &mut Funcdata, size: i32, offset: u64, ty: Option<Rc<Datatype>>) -> VarnodeId {
     let ram = fd.get_arch().manage().get_space_by_name("ram").unwrap().clone();
-    let input = fd.new_varnode(size, &Address::new(ram, offset), ty);
+    let input = fd.new_varnode(size, &Address::new(ram, offset), ty).unwrap();
     fd.set_input_varnode(input).unwrap()
+}
+
+#[test]
+fn cached_bitfield_root_preserves_unsigned_middle_extraction_off_on_off() {
+    use crate::action::{build_default_groups, ActionDatabase};
+    use crate::dtype::TypeFactory;
+
+    fn evaluate(fd: &Funcdata, value: VarnodeId, loaded: u64) -> u64 {
+        let vn = fd.vbank().get(value).unwrap();
+        if vn.is_constant() { return vn.get_offset(); }
+        let op = fd.obank().get(vn.get_def().unwrap()).unwrap();
+        let input = |slot| evaluate(fd, op.get_in(slot).unwrap(), loaded);
+        match op.code() {
+            OpCode::CPUI_LOAD => loaded,
+            OpCode::CPUI_COPY => input(0),
+            OpCode::CPUI_INT_RIGHT => input(0) >> input(1),
+            OpCode::CPUI_INT_AND => input(0) & input(1),
+            OpCode::CPUI_ZPULL => (input(0) >> input(1)) & ((1u64 << input(2)) - 1),
+            code => panic!("unexpected extraction operation: {code:?}"),
+        }
+    }
+
+    let mut pool = ActionPool::new(0, "bitfields");
+    for (index, name) in ["bitfield_store", "bitfield_out", "bitfield_load", "bitfield_in", "pull_absorb", "insert_absorb"].into_iter().enumerate() {
+        pool.add_rule(RuleState::new("bitfields", 0, name), (specs()[index].ctor)());
+    }
+    let mut db = ActionDatabase::new();
+    db.set_universal(Box::new(pool));
+    build_default_groups(&mut db);
+    db.set_current("decompile").unwrap();
+    for enabled in [false, true, false] {
+        db.toggle_action("decompile", "bitfields", enabled).unwrap();
+        let (mut fd, block) = rule_fixture();
+        let mut middle = TypeBitField::new(0, 5, false, "middle",
+            Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)));
+        middle.byte_offset = 0;
+        middle.byte_size = 4;
+        middle.least_sig_bit = 3;
+        let mut bits = Datatype::new_with_align(4, 4, type_metatype::TYPE_STRUCT);
+        bits.flags |= flags::has_bitfields;
+        bits.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![middle] };
+        let pointer_type = fd.get_arch().types_impl().unwrap().get_type_pointer(8, Rc::new(bits), 1).unwrap();
+        let pointer = fixture_input(&mut fd, 8, 0x2100, Some(pointer_type));
+        let space = fd.new_constant(8, 2);
+        let load = fixture_op(&mut fd, block, OpCode::CPUI_LOAD, &[space, pointer], 4);
+        let loaded = fixture_out(&fd, load);
+        let shift = fd.new_constant(4, 3);
+        let right = fixture_op(&mut fd, block, OpCode::CPUI_INT_RIGHT, &[loaded, shift], 4);
+        let shifted = fixture_out(&fd, right);
+        let mask = fd.new_constant(4, 31);
+        let and = fixture_op(&mut fd, block, OpCode::CPUI_INT_AND, &[shifted, mask], 4);
+        let extracted = fixture_out(&fd, and);
+        let sink = fixture_op(&mut fd, block, OpCode::CPUI_COPY, &[extracted], 4);
+        let root = db.get_current_mut().unwrap();
+        root.reset(&mut fd);
+        root.perform(&mut fd, &mut ActionContext::new()).unwrap();
+        let codes: Vec<_> = fd.bb_ops(block).iter().map(|&op| fd.obank().get(op).unwrap().code()).collect();
+        assert_eq!(codes.contains(&OpCode::CPUI_ZPULL), enabled);
+        if !enabled {
+            assert!(!codes.contains(&OpCode::CPUI_INSERT));
+            assert!(!codes.contains(&OpCode::CPUI_SPULL));
+            assert!(codes.contains(&OpCode::CPUI_INT_RIGHT));
+            assert!(codes.contains(&OpCode::CPUI_INT_AND));
+        }
+        for loaded in [0, 5 | (19 << 3) | (123 << 8), 0x1234_5678, 0xffff_ffff] {
+            assert_eq!(evaluate(&fd, fixture_out(&fd, sink), loaded), (loaded >> 3) & 31);
+        }
+    }
 }
 
 #[test]
@@ -497,7 +565,7 @@ fn all_bitfield_rules_require_registered_group_for_real_rewrites() {
             let mut filtered = pool.clone_filtered(&groups);
             if let Some(action) = filtered.as_mut() {
                 action.reset(&mut fd);
-                action.perform(&mut fd, &mut ActionContext::new());
+                action.perform(&mut fd, &mut ActionContext::new()).unwrap();
             }
             if !enabled {
                 assert!(filtered.is_none(), "{name}");
@@ -530,7 +598,7 @@ fn schedule_registration_controls_unconditional_analysis_clone() {
         groups.insert("base");
         if enabled { groups.insert("analysis"); }
         let mut filtered = pool.clone_filtered(&groups);
-        if let Some(action) = filtered.as_mut() { action.perform(&mut fd, &mut ActionContext::new()); }
+        if let Some(action) = filtered.as_mut() { action.perform(&mut fd, &mut ActionContext::new()).unwrap(); }
         assert_eq!(filtered.is_some(), enabled);
         assert_eq!(fd.obank().get(xor).unwrap().code(), if enabled { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_XOR });
         if enabled {

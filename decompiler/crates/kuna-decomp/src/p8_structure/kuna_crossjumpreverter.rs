@@ -114,13 +114,13 @@ impl Action for ActionCrossJumpReverter {
         }
         Some(Box::new(ActionCrossJumpReverter { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option crossjumprevert on|off`, carried on the Architecture boundary.
         if !data.get_arch().revert_cross_jumps {
-            return 0;
+            return Ok(0);
         }
         if data.sblocks_get_size() == 0 {
-            return 0; // not structured
+            return Ok(0); // not structured
         }
         let root = data.sblocks_root();
 
@@ -177,7 +177,7 @@ impl Action for ActionCrossJumpReverter {
             conversions.push((n, chain, target, warn_addr));
         }
         if conversions.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut count: int4 = 0;
@@ -199,7 +199,7 @@ impl Action for ActionCrossJumpReverter {
         crate::p8_structure::kuna_gotolabel::release_converted_labels(data, &converted_targets);
 
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 

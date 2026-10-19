@@ -198,7 +198,7 @@ fn broadcast_lane_read_is_reanchored_on_the_source_lane_zero() {
     let (op, src) = build_lane_read(&mut fd, SHUF_ID, 16, true, 5, 1);
 
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     let (code, in0, k) = subpiece_shape(&fd, op);
     assert_eq!(code, OpCode::CPUI_SUBPIECE);
@@ -212,7 +212,7 @@ fn the_gate_off_leaves_the_lane_read_alone() {
     let mut fd = build_fd_gated(vec![SHUF_ID as u32], false);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID, 16, true, 5, 1);
     let mut rule = RuleSimdShuffleLane::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -220,7 +220,7 @@ fn a_non_constant_mask_is_declined() {
     let mut fd = build_fd(vec![SHUF_ID as u32]);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID, 16, false, 5, 1);
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn a_multi_byte_lane_read_is_declined() {
     let mut fd = build_fd(vec![SHUF_ID as u32]);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID, 16, true, 4, 2);
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -239,7 +239,7 @@ fn an_unnamed_user_op_is_declined() {
     let mut fd = build_fd(vec![SHUF_ID as u32]);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID + 1, 16, true, 5, 1);
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -247,7 +247,7 @@ fn an_architecture_with_no_shuffle_user_op_never_fires() {
     let mut fd = build_fd(vec![]);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID, 16, true, 5, 1);
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -257,7 +257,7 @@ fn an_unsupported_vector_width_is_declined() {
     let mut fd = build_fd(vec![SHUF_ID as u32]);
     let (op, _src) = build_lane_read(&mut fd, SHUF_ID, 32, true, 5, 1);
     let mut rule = RuleSimdShuffleLane::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]

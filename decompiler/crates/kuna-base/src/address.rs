@@ -608,11 +608,19 @@ impl SeqNum {
         Ok(())
     }
 
-    /// Decode a SeqNum from a stream
+    /// Decode a SeqNum from a stream.
+    ///
+    /// Like Java's `SequenceNumber.decode`, read the address attributes on the
+    /// opened `<seqnum>` itself. `Address::decode` consumes a separate element.
     pub fn decode(decoder: &mut dyn Decoder) -> KunaResult<SeqNum> {
         let mut uniq: u32 = u32::MAX; // ~((uintm)0)
         let elem_id = decoder.open_element_id(&ELEM_SEQNUM)?;
-        let pc = Address::decode(decoder)?; // Recover address
+        let space = decoder.read_space_id(&ATTRIB_SPACE)?;
+        decoder.rewind_attributes();
+        let mut size = 0;
+        let offset = space.decode_attributes(decoder, &mut size)?;
+        let pc = Address::new(space, offset);
+        decoder.rewind_attributes();
         loop {
             let attrib_id = decoder.get_next_attribute_id()?;
             if attrib_id == 0 {
@@ -2156,6 +2164,61 @@ mod tests {
         dec.ingest_stream(&buf).unwrap();
         let rt = Address::decode(&mut dec).unwrap();
         assert!(rt == addr);
+    }
+
+    #[test]
+    fn test_seqnum_decode_consumes_own_attributes() {
+        use crate::marshal::{
+            IdRegistry, PackedDecode, PackedEncode, XmlDecode, XmlEncode, ELEM_DATA,
+        };
+
+        fn encode_document(encoder: &mut dyn Encoder, address: &Address, next: &Address) {
+            encoder.open_element(&ELEM_DATA);
+            SeqNum::new(address.clone(), 0x89ab_cdef).encode(encoder).unwrap();
+            // Attribute order is not significant to the ordinary Java reader.
+            encoder.open_element(&ELEM_SEQNUM);
+            encoder.write_unsigned_integer(&ATTRIB_UNIQ, 17);
+            address.get_space().unwrap().encode_attributes(encoder, address.get_offset()).unwrap();
+            encoder.close_element(&ELEM_SEQNUM);
+            // Java also accepts an omitted unique id as the -1 sentinel.
+            encoder.open_element(&ELEM_SEQNUM);
+            address.get_space().unwrap().encode_attributes(encoder, address.get_offset()).unwrap();
+            encoder.close_element(&ELEM_SEQNUM);
+            next.encode(encoder).unwrap();
+            encoder.close_element(&ELEM_DATA);
+        }
+
+        fn decode_document(decoder: &mut dyn Decoder, address: &Address, next: &Address) {
+            let root = decoder.open_element_id(&ELEM_DATA).unwrap();
+            for expected in [0x89ab_cdef, 17, u32::MAX] {
+                let sequence = SeqNum::decode(decoder).unwrap();
+                assert_eq!(sequence.get_addr(), address);
+                assert_eq!(sequence.get_time(), expected);
+            }
+            assert_eq!(decoder.peek_element().unwrap(), ELEM_ADDR.get_id());
+            assert_eq!(&Address::decode(decoder).unwrap(), next);
+            decoder.close_element(root).unwrap();
+            assert_eq!(decoder.peek_element().unwrap(), 0);
+        }
+
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(ram()).unwrap();
+        let space = Rc::clone(manager.get_space(3).unwrap());
+        let address = Address::new(Rc::clone(&space), 0x1234_5678_9abc);
+        let next = Address::new(space, 0x401000);
+
+        let mut packed = Vec::new();
+        encode_document(&mut PackedEncode::new(&mut packed), &address, &next);
+        let mut decoder = PackedDecode::new(&manager);
+        decoder.ingest_stream(&packed).unwrap();
+        decode_document(&mut decoder, &address, &next);
+
+        let mut xml = Vec::new();
+        encode_document(&mut XmlEncode::new(&mut xml), &address, &next);
+        let registry = IdRegistry::with_base_ids();
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(&xml).unwrap();
+        decode_document(&mut decoder, &address, &next);
     }
 
     #[test]

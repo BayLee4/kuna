@@ -521,12 +521,12 @@ impl Action for ActionStripStackGuard {
     /// C++ `ActionStripStackGuard::apply`, `kuna_stackguard.cc:115`.
     ///
     /// Remove a structurally proven canary failure branch and its unreachable handler.
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ `if (!data.getArch()->strip_stack_guard) return 0;` — the live gate
         // is carried on the boundary Architecture (`build_arch_handle`); `enabled`
         // stays as the unit-test OR-override (action registered false).
         if !self.enabled && !data.get_arch().strip_stack_guard {
-            return 0; // P0 assertion not set
+            return Ok(0); // P0 assertion not set
         }
 
         let size = data.bblocks_get_size();
@@ -627,9 +627,9 @@ impl Action for ActionStripStackGuard {
             self.base.count += 1;
             // One canary per apply; the fullloop re-invokes and self-gates (the
             // compare/handler are gone on the next pass).
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 

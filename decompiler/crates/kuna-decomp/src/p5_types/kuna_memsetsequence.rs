@@ -137,43 +137,45 @@ impl Rule for RuleMemsetCopy {
     }
 
     /// Recover a validated constant-fill run, subject to the resolved gate.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !self.enabled && !data.get_arch().memset_recover {
-            return 0;
+            return Ok(0);
         }
         let in0 = match data.obank().get(op).and_then(|o| o.get_in(0)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !data.vbank().get(in0).map(|v| v.is_constant()).unwrap_or(false) {
-            return 0;
+            return Ok(0);
         }
         let outvn = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let ct = Rc::clone(
             data.vbank().get(outvn).expect("RuleMemsetCopy: stale outvn").get_type_def_facing(),
         );
         if !ct.is_char_print() {
-            return 0;
+            return Ok(0);
         }
         if ct.is_opaque_string() {
-            return 0;
+            return Ok(0);
         }
         if !data.vbank().get(outvn).unwrap().is_addr_tied() {
-            return 0;
+            return Ok(0);
         }
         // Local stack scope first, then the frozen global-scope snapshot
         // (mirrors `RuleStringCopy::apply_op`).
         let out_addr = data.vbank().get(outvn).unwrap().get_addr().clone();
         let out_size = data.vbank().get(outvn).unwrap().get_size();
         let op_addr = data.obank().get(op).unwrap().get_addr().clone();
-        let entry = data
+        let local_entry = data
             .get_scope_local()
-            .and_then(|lm| lm.query_container(&out_addr, out_size, &op_addr))
-            .or_else(|| {
-                data.get_arch().query_container_global(&out_addr, out_size, &op_addr).and_then(|g| {
+            .and_then(|lm| lm.query_container(&out_addr, out_size, &op_addr));
+        let entry = match local_entry {
+            Some(entry) => Some(entry),
+            None => {
+                data.get_arch().query_container_global(&out_addr, out_size, &op_addr)?.and_then(|g| {
                     let sym_type = g.symbol_type.clone()?;
                     Some(crate::varmap::StringContainerEntry {
                         first: g.entry_addr.get_offset(),
@@ -182,25 +184,26 @@ impl Rule for RuleMemsetCopy {
                         sym_type,
                     })
                 })
-            });
+            }
+        };
         let entry = match entry {
             Some(e) => e,
-            None => return 0,
+            None => return Ok(0),
         };
         // The array type-walk + COPY collection (reusing the StringSequence
         // machinery), then the single-value-fill detection.
         let mut sequence = match StringSequence::build_for_fill(data, ct, entry, op, out_addr) {
             Some(s) => s,
-            None => return 0,
+            None => return Ok(0),
         };
         let (fill_value, fill_count) = match detect_fill_run(data, sequence.fill_move_ops_mut()) {
             Some(fv) => fv,
-            None => return 0,
+            None => return Ok(0),
         };
-        if !sequence.transform_memset(data, fill_value, fill_count) {
-            return 0;
+        if !sequence.transform_memset(data, fill_value, fill_count)? {
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 }
 

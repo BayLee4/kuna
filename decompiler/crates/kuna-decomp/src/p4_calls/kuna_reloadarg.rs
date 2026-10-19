@@ -59,10 +59,10 @@ pub(crate) fn note(data: &mut Funcdata, idx: int4, i: int4, loads: &[OpId]) {
 
 /// Drop the flagged trials of call spec `idx` that [`junk`] rejects and that
 /// no other active trial sits above in the callee model's order, unless the
-/// call's format string names them.
-pub(crate) fn recheck(data: &mut Funcdata, idx: int4, mut alias: Option<&mut AliasChecker>) {
+/// call's format string names them. Propagate failures acquiring its arguments.
+pub(crate) fn recheck(data: &mut Funcdata, idx: int4, mut alias: Option<&mut AliasChecker>, source_inputs: Option<&crate::fspec::FuncProto>) -> kuna_base::error::KunaResult<()> {
     if !data.get_call_specs(idx).proto().has_model() {
-        return;
+        return Ok(());
     }
     let op = data.get_call_specs(idx).get_op();
     let mut order: Vec<(int4, int4, bool)> = Vec::new();
@@ -82,30 +82,34 @@ pub(crate) fn recheck(data: &mut Funcdata, idx: int4, mut alias: Option<&mut Ali
         flagged |= reload;
     }
     if !flagged {
-        return;
+        return Ok(());
     }
     order.sort_by(|a, b| b.cmp(a));
     let mut format_arguments = None;
     for (_, i, reload) in order {
         if !reload {
-            return;
+            return Ok(());
         }
         let slot = data.get_call_specs(idx).active_input().get_trial(i).get_slot();
-        let Some(vn) = data.obank().get(op).and_then(|o| o.get_in(slot)) else { return };
+        let Some(vn) = data.obank().get(op).and_then(|o| o.get_in(slot)) else { return Ok(()) };
         if !junk(data, vn, 16, &mut alias) {
-            return;
+            return Ok(());
         }
-        let args = format_arguments.get_or_insert_with(|| {
-            super::kuna_varargformat::arguments(data, data.get_call_specs(idx))
-        });
-        if super::kuna_varargformat::activate_trial(data, idx, i, args) {
-            return;
+        let args = match &mut format_arguments {
+            Some(args) => args,
+            empty => empty.insert(
+                super::kuna_varargformat::arguments(data, data.get_call_specs(idx))?
+            ),
+        };
+        if super::kuna_varargformat::activate_trial(data, idx, i, args, source_inputs) {
+            return Ok(());
         }
         data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i).mark_no_use();
         let width = data.vbank().get(vn).map(|v| v.get_size()).unwrap_or(0);
         let zero = data.new_constant(width, 0);
         let _ = data.op_set_input(op, zero, slot);
     }
+    Ok(())
 }
 
 /// Is the register input at `addr` one the function's prototype kills across

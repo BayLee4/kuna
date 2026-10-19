@@ -8,6 +8,9 @@ and real shared libraries importable by Ghidra for its normal symbol resolver.
 UNKNOWN/unmodeled providers retain actual source provenance, never a libc guess.
 The installed stock FormatStringAnalyzer supplies the printf/scanf overrides.
 Library consumers use genuine host imports; no stock-only synthetic analyzer matrix.
+The selected test group controls independent native-core observations, not the
+stock-native Java analyzer/import producers needed by the Kuna product cases.
+Stock controls assert correct outcomes; their failures remain real failures.
 """
 
 import contextlib
@@ -62,9 +65,16 @@ def run(output, report):
     import pyghidra
 
     from error_recovery import field as java_field
-    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra
+    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra, test_cores
     from prototype_facts import execute_c, execute_export, parameter_markup, selected_results, source_facts
 
+    cores = test_cores()
+    report["test_group"] = "product" if cores == ("kuna",) else "stock-controls"
+    report["selected_cores"] = list(cores)
+    report["producer_scope"] = {
+        "format_overrides": "Installed Java FormatStringAnalyzer with stock-native producer authority",
+        "native_imports": "Genuine host imports analyzed with stock native before selected-core consumption",
+    }
     start_ghidra()
     from jpype import JArray, JByte
     from java.io import File
@@ -218,7 +228,8 @@ def run(output, report):
 
     def observe(ifc, fn, label, core, expected, preamble, driver, opcode=None,
                 returns=None, committed_parameters=False,
-                physical_input_size=None, input_text=None, callable_unit=False, functions=()):
+                physical_input_size=None, input_text=None, callable_unit=False, functions=(),
+                provider_sources=(), provider_headers=()):
         row = {"case": label, "core": core}
         rows.append(row)
         result = None
@@ -276,7 +287,9 @@ def run(output, report):
             if callable_unit:
                 row["stdout"] = execute_export(fn.getProgram(), [result], driver,
                                                 output=output, stem=f"{label}-{core}",
-                                                input_text=input_text, functions=functions)
+                                                input_text=input_text, functions=functions,
+                                                provider_sources=provider_sources,
+                                                provider_headers=provider_headers)
                 row["c_executed"] = True
             else:
                 row["stdout"] = execute_c(row["c"], PREAMBLE + preamble, driver, input_text=input_text)
@@ -341,7 +354,7 @@ def run(output, report):
         return b"\xbf" + struct.pack("<I", first) + b"\xbe" + struct.pack("<I", second) + call(entry + 10) + b"\xc3"
 
     try:
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("direct_override") as (value, api):
                 with transaction(value):
                     # One-input override/arity witness: the body ignores ESI in every phase.
@@ -393,80 +406,81 @@ def run(output, report):
 
         # Preserve the original two-register body as a separate physical-state
         # witness. Its one-argument source declaration cannot erase the ESI read.
-        with program("direct_physical_sum") as (value, api):
-            with transaction(value):
-                target = function(value, api, 0x2000, bytes.fromhex("89f801f0c3"), "sum_target")
-                signature(target, [("first", integer)])
-                namespace = value.getSymbolTable().createNameSpace(value.getGlobalNamespace(), "Physical", user)
-                target.setParentNamespace(namespace)
-                caller = function(value, api, 0x1000, direct_code(0x1000, 5, 6), "sum_caller")
-                other = function(value, api, 0x1100, direct_code(0x1100, 7, 8), "sum_other")
-                signature(caller, [])
-                signature(other, [])
-                memory(value, api, 0x7000, bytes(0x1000), "machine_stack", executable=False)
-            unchanged = fingerprint(target)
-            with interface(value, "kuna") as ifc:
-                options = DecompileOptions()
-                options.setNamespaceStrategy(DecompileOptions.NamespaceStrategy.Never)
-                assert ifc.setOptions(options)
-                for phase in ("baseline", "override", "removed"):
-                    if phase != "baseline":
-                        with transaction(value):
-                            if phase == "override":
-                                override(caller, 0x100a, [integer, integer])
-                            else:
-                                remove_override(caller, 0x100a)
-                        ifc.flushCache()
-                    override_scope = HighFunction.findOverrideSpace(caller)
-                    records = [] if override_scope is None else [
-                        record for symbol in value.getSymbolTable().getSymbols(override_scope)
-                        if (record := HighFunctionDBUtil.readOverride(symbol)) is not None
-                        and record.getAddress() == address(value, 0x100a)
-                    ]
-                    assert len(records) == (1 if phase == "override" else 0), records
-                    if records:
-                        declared = records[0].getDataType()
-                        assert not declared.hasVarArgs() and declared.getReturnType().isEquivalent(integer)
-                        assert len(declared.getArguments()) == 2
-                        assert all(arg.getDataType().isEquivalent(integer) for arg in declared.getArguments())
-                    target_result = ifc.decompileFunction(target, 60, monitor)
-                    assert target_result.decompileCompleted(), str(target_result.getErrorMessage())
-                    source = target_result.getHighFunction().getFunctionPrototype()
-                    assert source.getNumParams() == 1
-                    first = source.getParam(0)
-                    assert str(first.getName()) == "first"
-                    assert first.isTypeLocked() and first.isNameLocked()
-                    assert first.getDataType().getLength() == 4 and first.getDataType().isEquivalent(integer)
-                    assert first.getStorage() == target.getParameter(0).getVariableStorage()
-                    manager = value.getDataTypeManager()
-                    assert manager.getID(first.getDataType()) == manager.getID(target.getParameter(0).getDataType())
-                    assert target_result.getDecompiledFunction() is not None
-                    target_c = str(target_result.getDecompiledFunction().getC())
-                    (output / f"physical_sum_target_{phase}-kuna.c").write_text(target_c)
-                    results = []
-                    for fn, entry, inputs, expected in (
-                        (caller, 0x1000, (5, 6), 11), (other, 0x1100, (7, 8), 15)
-                    ):
-                        native = machine_return(value, entry)
-                        assert native == expected, (phase, entry, native)
-                        args = [(None, None, constant) for constant in inputs]
-                        # Export the actual target and callers; do not repair getC.
-                        result = observe(ifc, fn, f"physical_{fn.getName()}_{phase}", "kuna",
-                                [(entry + 10, args)], "",
-                                f"int main(void) {{ return {fn.getName()}() != {expected}; }}\n",
-                                opcode=PcodeOp.CALL, committed_parameters=True,
-                                physical_input_size=4, callable_unit=True)
-                        rows[-1]["machine_result"] = native
-                        assert rows[-1]["passed"], rows[-1]
-                        results.append(result)
-                    results = selected_results(ifc, [caller, other], monitor)
-                    rows[-1]["joint_stdout"] = execute_export(value, results,
-                        "int main(void) { return sum_caller() != 11 || sum_other() != 15; }\n",
-                        output=output, stem=f"physical_joint_{phase}-kuna")
-                    rows[-1]["joint_c_executed"] = True
-                    assert fingerprint(target) == unchanged, "physical transport changed source authority"
+        if "kuna" in cores:
+            with program("direct_physical_sum") as (value, api):
+                with transaction(value):
+                    target = function(value, api, 0x2000, bytes.fromhex("89f801f0c3"), "sum_target")
+                    signature(target, [("first", integer)])
+                    namespace = value.getSymbolTable().createNameSpace(value.getGlobalNamespace(), "Physical", user)
+                    target.setParentNamespace(namespace)
+                    caller = function(value, api, 0x1000, direct_code(0x1000, 5, 6), "sum_caller")
+                    other = function(value, api, 0x1100, direct_code(0x1100, 7, 8), "sum_other")
+                    signature(caller, [])
+                    signature(other, [])
+                    memory(value, api, 0x7000, bytes(0x1000), "machine_stack", executable=False)
+                unchanged = fingerprint(target)
+                with interface(value, "kuna") as ifc:
+                    options = DecompileOptions()
+                    options.setNamespaceStrategy(DecompileOptions.NamespaceStrategy.Never)
+                    assert ifc.setOptions(options)
+                    for phase in ("baseline", "override", "removed"):
+                        if phase != "baseline":
+                            with transaction(value):
+                                if phase == "override":
+                                    override(caller, 0x100a, [integer, integer])
+                                else:
+                                    remove_override(caller, 0x100a)
+                            ifc.flushCache()
+                        override_scope = HighFunction.findOverrideSpace(caller)
+                        records = [] if override_scope is None else [
+                            record for symbol in value.getSymbolTable().getSymbols(override_scope)
+                            if (record := HighFunctionDBUtil.readOverride(symbol)) is not None
+                            and record.getAddress() == address(value, 0x100a)
+                        ]
+                        assert len(records) == (1 if phase == "override" else 0), records
+                        if records:
+                            declared = records[0].getDataType()
+                            assert not declared.hasVarArgs() and declared.getReturnType().isEquivalent(integer)
+                            assert len(declared.getArguments()) == 2
+                            assert all(arg.getDataType().isEquivalent(integer) for arg in declared.getArguments())
+                        target_result = ifc.decompileFunction(target, 60, monitor)
+                        assert target_result.decompileCompleted(), str(target_result.getErrorMessage())
+                        source = target_result.getHighFunction().getFunctionPrototype()
+                        assert source.getNumParams() == 1
+                        first = source.getParam(0)
+                        assert str(first.getName()) == "first"
+                        assert first.isTypeLocked() and first.isNameLocked()
+                        assert first.getDataType().getLength() == 4 and first.getDataType().isEquivalent(integer)
+                        assert first.getStorage() == target.getParameter(0).getVariableStorage()
+                        manager = value.getDataTypeManager()
+                        assert manager.getID(first.getDataType()) == manager.getID(target.getParameter(0).getDataType())
+                        assert target_result.getDecompiledFunction() is not None
+                        target_c = str(target_result.getDecompiledFunction().getC())
+                        (output / f"physical_sum_target_{phase}-kuna.c").write_text(target_c)
+                        results = []
+                        for fn, entry, inputs, expected in (
+                            (caller, 0x1000, (5, 6), 11), (other, 0x1100, (7, 8), 15)
+                        ):
+                            native = machine_return(value, entry)
+                            assert native == expected, (phase, entry, native)
+                            args = [(None, None, constant) for constant in inputs]
+                            # Export the actual target and callers; do not repair getC.
+                            result = observe(ifc, fn, f"physical_{fn.getName()}_{phase}", "kuna",
+                                    [(entry + 10, args)], "",
+                                    f"int main(void) {{ return {fn.getName()}() != {expected}; }}\n",
+                                    opcode=PcodeOp.CALL, committed_parameters=True,
+                                    physical_input_size=4, callable_unit=True)
+                            rows[-1]["machine_result"] = native
+                            assert rows[-1]["passed"], rows[-1]
+                            results.append(result)
+                        results = selected_results(ifc, [caller, other], monitor)
+                        rows[-1]["joint_stdout"] = execute_export(value, results,
+                            "int main(void) { return sum_caller() != 11 || sum_other() != 15; }\n",
+                            output=output, stem=f"physical_joint_{phase}-kuna")
+                        rows[-1]["joint_c_executed"] = True
+                        assert fingerprint(target) == unchanged, "physical transport changed source authority"
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("callfixup_precedence") as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000, b"\xc3", "fixup_target")
@@ -494,10 +508,14 @@ def run(output, report):
                         else:
                             assert str(target.getCallFixup()) == "fentry"
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("indirect_override") as (value, api):
                 with transaction(value):
                     caller = function(value, api, 0x1000, bytes.fromhex("4889f8bf05000000be06000000ffd0c3"), "indirect_caller")
+                organization = value.getDataTypeManager().getDataOrganization()
+                assert (organization.getPointerSize(), organization.getIntegerSize(),
+                        organization.getLongSize(), organization.getLongLongSize()) == (8, 4, 8, 8)
+                assert str(organization.getIntegerCTypeApproximation(8, False)) == "unsigned long"
                 with interface(value, core) as ifc:
                     for phase in ("baseline", "override", "removed"):
                         if phase != "baseline":
@@ -511,12 +529,15 @@ def run(output, report):
                         args = [(4, integer, 5)] if one else [(None, None, 5), (None, None, 6)]
                         preamble = ("typedef int code(int);\nstatic int calls, observed;\n"
                                     "int callback(int x) { ++calls; observed = x; return x + 10; }\n"
-                                    if one else "typedef void code(uint64_t, uint64_t);\nstatic int calls, observed;\n"
-                                    "void callback(uint64_t x, uint64_t y) { ++calls; observed = (int)(x * 10 + y); }\n")
+                                    if one else "#include <limits.h>\n"
+                                    "_Static_assert(CHAR_BIT == 8 && sizeof(unsigned long) == 8 && sizeof(void *) == 8, "
+                                    "\"x86-64 GCC fixture requires matching LP64 C provider\");\n"
+                                    "typedef void code(unsigned long, unsigned long);\nstatic int calls, observed;\n"
+                                    "void callback(unsigned long x, unsigned long y) { ++calls; observed = (int)(x * 10 + y); }\n")
                         observe(ifc, caller, "indirect_" + phase, core, [(0x100d, args)], preamble,
                                 f"int main(void) {{ indirect_caller(callback); return observed != {5 if one else 56} || calls != 1; }}\n")
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("two_direct_sites") as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000,
@@ -580,7 +601,7 @@ def run(output, report):
                         rows[-1]["source_override_arity"] = 1 if phase == "override" else None
                         assert fingerprint(target) == unchanged
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("deindirect_override") as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000, bytes.fromhex("89f8c3"), "resolved_target")
@@ -604,6 +625,48 @@ def run(output, report):
                                 opcode=PcodeOp.CALL)
                 assert fingerprint(target) == unchanged
 
+        # Export-private input projection must retain all ordinary source argument effects.
+        if "kuna" in cores:
+            with program("projected_source_argument_effects") as (value,api):
+                with transaction(value):
+                    target=function(value,api,0x2000,bytes.fromhex("89f8c3"),"projected_target")
+                    signature(target,[("first",integer),("second",integer)])
+                    authored=function(value,api,0x1000,direct_code(0x1000,5,6),"projected_authored")
+                    signature(authored,[])
+                    override(authored,0x100a,[integer])
+                    memory(value,api,0x5000,bytes(8),"counter_storage",False)
+                    for offset,name in ((0x5000,"first_count"),(0x5004,"second_count")):
+                        api.createData(address(value,offset),integer)
+                        api.createLabel(address(value,offset),name,True)
+                    for entry,offset,name,result in ((0x3000,0x5000,"first_value",7),(0x3100,0x5004,"second_value",8)):
+                        code=b"\xff\x05"+struct.pack("<i",offset-entry-6)+b"\xb8"+struct.pack("<I",result)+b"\xc3"
+                        provider=function(value,api,entry,code,name)
+                        signature(provider,[])
+                    code=b"\x53"
+                    first_site=0x1100+len(code);code+=call(first_site,0x3000)+bytes.fromhex("89c3")
+                    second_site=0x1100+len(code);code+=call(second_site,0x3100)+bytes.fromhex("89c689df")
+                    target_site=0x1100+len(code);code+=call(target_site,0x2000)+bytes.fromhex("5bc3")
+                    ordinary=function(value,api,0x1100,code,"projected_ordinary")
+                    signature(ordinary,[])
+                    memory(value,api,0x7000,bytes(0x1000),"machine_stack",False)
+                target_facts=fingerprint(target)
+                assert machine_return(value,0x1000)==5
+                assert machine_return(value,0x1100)==7
+                with interface(value,"kuna") as ifc:
+                    target_result=ifc.decompileFunction(target,60,monitor)
+                    assert target_result.decompileCompleted(),str(target_result.getErrorMessage())
+                    assert target_result.getHighFunction().getFunctionPrototype().getNumParams()==2
+                    first=observe(ifc,authored,"projected_authored","kuna",[(0x100a,[(4,integer,5)])],"",
+                        "int main(void) { return projected_authored()!=5; }\n",opcode=PcodeOp.CALL,callable_unit=True)
+                    second=observe(ifc,ordinary,"projected_ordinary","kuna",[(first_site,[]),(second_site,[]),(target_site,[(4,integer,None),(4,integer,None)])],"",
+                        "extern int first_count,second_count; int main(void) { return projected_ordinary()!=7 || first_count!=1 || second_count!=1; }\n",
+                        opcode=PcodeOp.CALL,callable_unit=True)
+                    assert first is not None and second is not None
+                    driver="extern int first_count,second_count; int main(void) { return projected_authored()!=5 || projected_ordinary()!=7 || first_count!=1 || second_count!=1 || projected_target(9,10)!=9; }\n"
+                    rows[-1]["joint_stdout"]=execute_export(value,[first,second],driver,output=output,stem="projected_joint")
+                    rows[-1]["joint_C_executed"]=True
+                    assert fingerprint(target)==target_facts,"export projection changed canonical source"
+
         native_apple = platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
         assert native_apple or platform.machine().lower() in ("x86_64", "amd64"), \
             "aggregate native witness requires Darwin arm64 or x86-64"
@@ -611,6 +674,8 @@ def run(output, report):
         if native_apple:
             aggregate_cases.append((True, "kuna", True))
         for logical, core, apple in aggregate_cases:
+            if core not in cores:
+                continue
             native_caller = logical and (apple or not native_apple)
             label = ("aggregate_logical_native" if native_caller else "aggregate_logical_x86") \
                 if logical else "aggregate_explicit_pointer"
@@ -736,7 +801,8 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                             returns={site: VoidDataType.dataType if apple else pointer},
                             committed_parameters=True, callable_unit=logical and core == "kuna")
                     records = captured_overrides(capture)
-                    assert records and all(record == {"first": 2, "inputs": len(arguments), "open": False}
+                    expected_first = 1 if logical else 2
+                    assert records and all(record == {"first": expected_first, "inputs": len(arguments), "open": False}
                                            for record in records), records
                     rows[-1]["supplied_declaration"] = {
                         "signature": "Big24(int,int,double)" if logical else "Big24*(Big24*,int,int,double)",
@@ -752,7 +818,7 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                 assert (fingerprint(target), fingerprint(caller)) == unchanged, \
                     "callsite aggregate override changed current or callee facts"
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("override_convention", bits=32) as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000, bytes.fromhex("89c801d0c3"), "fast_target")
@@ -825,7 +891,7 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                         row["failure"] = traceback.format_exc()
                     print(f"{'PASS' if row['passed'] else 'FAIL'} kuna: inferred_fastcall_lifecycle", flush=True)
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("typed_indirect_fastcall", bits=32) as (value, api):
                 with transaction(value):
                     callback = FunctionDefinitionDataType("FastCallback", value.getDataTypeManager())
@@ -868,38 +934,90 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                                          callable_unit=True, functions=(target,))
                         assert (fingerprint(target), fingerprint(caller)) == unchanged
 
-        with program("inferred_fastcall_wrong_cleanup", bits=32) as (value, api):
-            with transaction(value):
-                target = function(value, api, 0x2000, bytes.fromhex("89c801d0c20800"), "wrong_cleanup")
-                memory(value, api, 0x7000, bytes(0x1000), "machine_stack", executable=False)
-            unchanged = fingerprint(target)
-            native = machine_return(value, 0x2000, [("ECX", 5), ("EDX", 6)], extra_pop=12)
-            assert native == 11, native
-            row = {"case": "inferred_fastcall_wrong_cleanup", "core": "kuna", "machine_result": native}
-            rows.append(row)
-            try:
+        if "kuna" in cores:
+            with program("typed_indirect_fastcall_upper_once", bits=32) as (value, api):
+                with transaction(value):
+                    callback = FunctionDefinitionDataType("FastCallback", value.getDataTypeManager())
+                    callback.setCallingConvention("__fastcall")
+                    callback.setReturnType(integer)
+                    callback.setArguments(JArray(ParameterDefinition)([
+                        ParameterDefinitionImpl("left", integer, None),
+                        ParameterDefinitionImpl("right", integer, None),
+                    ]))
+                    target = function(value, api, 0x2000,
+                                      bytes.fromhex("ff050030000089c801d00500003412c3"), "typed_fast_target")
+                    signature(target, [("left", integer), ("right", integer)], model="__fastcall")
+                    caller = function(value, api, 0x1000,
+                                      bytes.fromhex("8b442404b905000000ba06000000ffd0c3"), "typed_fast_caller")
+                    signature(caller, [("callback", PointerDataType(callback, value.getDataTypeManager()))],
+                              model="__cdecl")
+                    memory(value, api, 0x3000, bytes(4), "call_counter", executable=False)
+                    api.createData(address(value, 0x3000), integer)
+                    value.getSymbolTable().createLabel(address(value, 0x3000), "call_count", user)
+                    memory(value, api, 0x7000, bytes(0x1000), "typed_indirect_stack", executable=False)
+                    value.getMemory().setBytes(address(value, 0x7fe4), JArray(JByte)((0x2000).to_bytes(4, "little")))
+                    override(caller, 0x100e, [integer, integer], short, model="__fastcall")
+                unchanged = fingerprint(target), fingerprint(caller)
+                emulator = EmulatorHelper(value)
+                try:
+                    emulator.writeRegister("ESP", 0x7fe0)
+                    emulator.writeMemory(address(value, 0x7fe0), JArray(JByte)((0x7ff0).to_bytes(4, "little")))
+                    emulator.setBreakpoint(address(value, 0x7ff0))
+                    assert emulator.run(address(value, 0x1000), None, monitor), str(emulator.getLastError())
+                    assert emulator.getExecutionAddress() == address(value, 0x7ff0)
+                    native = int(str(emulator.readRegister("EAX"))) & 0xffffffff
+                    final_esp = int(str(emulator.readRegister("ESP")))
+                    calls = int.from_bytes(bytes(int(b) & 255 for b in
+                        emulator.readMemory(address(value, 0x3000), 4)), "little")
+                    assert (native, final_esp, calls) == (0x1234000b, 0x7fe4, 1)
+                finally:
+                    emulator.dispose()
                 with interface(value, "kuna") as ifc:
-                    result = ifc.decompileFunction(target, 60, monitor)
-                    assert result.decompileCompleted(), str(result.getErrorMessage())
-                    high = result.getHighFunction()
-                    assert high is not None and result.getCCodeMarkup() is not None
-                    row["stack_cleanup"] = int(high.getFunctionPrototype().getExtraPop())
-                    assert row["stack_cleanup"] == 12, row
-                    execute_export(value, [result], "int main(void) { return 0; }\n",
-                                   output=output, stem="wrong-cleanup-kuna",
-                                   direct_call={"function": "wrong_cleanup",
-                                                "registers": {"ECX": 5, "EDX": 6},
-                                                "initial_esp": 0x7fe0,
-                                                "expected_result": 11,
-                                                "expected_final_esp": 0x7fec})
-                assert fingerprint(target) == unchanged, "Cleanup verification changed source authority"
-                row["passed"] = True
-            except Exception:
-                row["passed"] = False
-                row["failure"] = traceback.format_exc()
-            print(f"{'PASS' if row['passed'] else 'FAIL'} kuna: inferred_fastcall_wrong_cleanup", flush=True)
+                    observe(ifc, caller, "typed_fastcall_upper_result_once", "kuna",
+                            [(0x100e, [(4, integer, 5), (4, integer, 6)])], "",
+                            "extern int call_count;\n"
+                            "int main(void) { call_count = 0; int result = typed_fast_caller(typed_fast_target); "
+                            "return result != 0x1234000b || call_count != 1; }\n",
+                            opcode=PcodeOp.CALLIND, committed_parameters=True,
+                            returns={0x100e: short}, callable_unit=True, functions=(target,))
+                    rows[-1]["machine"] = {"result": native, "final_esp": final_esp, "calls": calls}
+                assert (fingerprint(target), fingerprint(caller)) == unchanged
+                assert caller.getParameter(0).getDataType().getDataType().getReturnType().isEquivalent(integer)
+                assert value.getListing().getDataAt(address(value, 0x3000)).getDataType().isEquivalent(integer)
 
-        for core in ("stock", "kuna"):
+        if "kuna" in cores:
+            with program("inferred_fastcall_wrong_cleanup", bits=32) as (value, api):
+                with transaction(value):
+                    target = function(value, api, 0x2000, bytes.fromhex("89c801d0c20800"), "wrong_cleanup")
+                    memory(value, api, 0x7000, bytes(0x1000), "machine_stack", executable=False)
+                unchanged = fingerprint(target)
+                native = machine_return(value, 0x2000, [("ECX", 5), ("EDX", 6)], extra_pop=12)
+                assert native == 11, native
+                row = {"case": "inferred_fastcall_wrong_cleanup", "core": "kuna", "machine_result": native}
+                rows.append(row)
+                try:
+                    with interface(value, "kuna") as ifc:
+                        result = ifc.decompileFunction(target, 60, monitor)
+                        assert result.decompileCompleted(), str(result.getErrorMessage())
+                        high = result.getHighFunction()
+                        assert high is not None and result.getCCodeMarkup() is not None
+                        row["stack_cleanup"] = int(high.getFunctionPrototype().getExtraPop())
+                        assert row["stack_cleanup"] == 12, row
+                        execute_export(value, [result], "int main(void) { return 0; }\n",
+                                       output=output, stem="wrong-cleanup-kuna",
+                                       direct_call={"function": "wrong_cleanup",
+                                                    "registers": {"ECX": 5, "EDX": 6},
+                                                    "initial_esp": 0x7fe0,
+                                                    "expected_result": 11,
+                                                    "expected_final_esp": 0x7fec})
+                    assert fingerprint(target) == unchanged, "Cleanup verification changed source authority"
+                    row["passed"] = True
+                except Exception:
+                    row["passed"] = False
+                    row["failure"] = traceback.format_exc()
+                print(f"{'PASS' if row['passed'] else 'FAIL'} kuna: inferred_fastcall_wrong_cleanup", flush=True)
+
+        for core in cores:
             with program("override_flow_effect") as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000, bytes.fromhex("8d470ac3"), "flow_target")
@@ -1004,7 +1122,7 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                     assert instruction.getFlowOverride() == FlowOverride.NONE
                 assert target.hasNoReturn()
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("unmarked_trap_boundary") as (value, api):
                 with transaction(value):
                     trap = function(value, api, 0x1000, bytes.fromhex("cc"), "unmarked_trap")
@@ -1044,7 +1162,7 @@ __attribute__((noinline)) Big24 *big_callback(Big24 *storage, int tag, ...) {
                     row["passed"] = False
                     row["failure"] = traceback.format_exc()
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("shared_callback") as (value, api):
                 pointer = PointerDataType(integer, value.getDataTypeManager())
                 with transaction(value):
@@ -1083,10 +1201,10 @@ int main(void) {
                             returns={0x1011: integer, 0x101e: pointer}, committed_parameters=True)
                 assert fingerprint(caller) == unchanged, "site casts changed the callback declaration"
 
-        for name, text, first, second in [
+        for name, text, first, second in ([
             ("printf", "%d %lld", 65, 0x1122334455667788),
             ("scanf", "%d %hd", 0x4000, 0x5000),
-        ]:
+        ] if "stock" in cores else ()):
             with program("analyzed_" + name) as (value, api):
                 charptr = PointerDataType(CharDataType.dataType, value.getDataTypeManager())
                 with transaction(value):
@@ -1247,7 +1365,7 @@ int main(void) {
                 with transaction(value):
                     log = MessageLog()
                     assert FormatStringAnalyzer().added(value, repeated.getBody(), monitor, log), str(log)
-                for core in ("stock", "kuna"):
+                for core in cores:
                     with interface(value, core) as ifc:
                         discovered = ifc.decompileFunction(repeated, 60, monitor)
                         assert discovered.decompileCompleted(), str(discovered.getErrorMessage())
@@ -1265,7 +1383,8 @@ int main(void) {
                                 opcode=PcodeOp.CALL, callable_unit=True)
                         if rows[-1].get("c_executed"):
                             assert rows[-1]["stdout"] == "5:5:7|7:5:5", rows[-1]
-                for name, text in (("printf", "%d %lld"), ("scanf", "%d %hd")):
+                for name, text in ((("printf", "%d %lld"), ("scanf", "%d %hd"))
+                                   if "kuna" in cores else ()):
                     callers = [fn for fn in functions if str(fn.getName()) == "call_" + name]
                     assert len(callers) == 1, f"missing imported debug caller call_{name}: {imported}"
                     caller = callers[0]
@@ -1337,13 +1456,22 @@ int main(void) {
                                   (ptrsize, expected_types[1], None), (ptrsize, expected_types[2], None)])
                     expected_stdout = "65 1234605616436508552" if name == "printf" else ""
                     input_text = None if name == "printf" else "65 -7!"
-                    driver = ('#include <stdio.h>\nint main(void) { return call_printf() != 22; }\n'
-                              if name == "printf" else r"""#include <stdio.h>
+                    provider_sources = ()
+                    if name == "scanf":
+                        # Keep the real SDK and exported source datatype definitions in
+                        # separate translation units, as in native_import_provenance.
+                        stdio_provider = output / "analyzer_scanf-stdio-provider.c"
+                        stdio_provider.write_text('#include <stdio.h>\n'
+                            "int check_input_terminator(void) {"
+                            "return fgetc(stdin) != '!' || fgetc(stdin) != EOF; }\n")
+                        provider_sources = (stdio_provider,)
+                    driver = ('int main(void) { return call_printf() != 22; }\n'
+                              if name == "printf" else r"""int check_input_terminator(void);
 int main(void) {
     int first = 0;
     short second = 0;
     if (call_scanf(&first, &second) != 2 || first != 65 || second != -7) return 1;
-    return fgetc(stdin) != '!' || fgetc(stdin) != EOF;
+    return check_input_terminator();
 }
 """)
                     with interface(value, "kuna") as ifc:
@@ -1352,7 +1480,8 @@ int main(void) {
                         result = observe(ifc, caller, "analyzer_" + name, "kuna", [(site, arguments)],
                                          "#include <stdio.h>\n", driver, opcode=PcodeOp.CALL,
                                          returns={site: integer}, committed_parameters=True,
-                                         input_text=input_text, callable_unit=True)
+                                         input_text=input_text, callable_unit=True,
+                                         provider_sources=provider_sources)
                         row = rows[-1]
                         assert row["passed"] and row.get("c_executed"), row
                         assert row["stdout"] == expected_stdout, row
@@ -1458,7 +1587,7 @@ int main(void) {
                             value.endTransaction(tx, False)
                         print(f"PASS kuna: {negative['case']}", flush=True)
 
-        for core in ("stock", "kuna"):
+        for core in cores:
             with program("variadic_indirect") as (value, api):
                 double = DoubleDataType.dataType
                 callback_type = FunctionDefinitionDataType("variadic_callback", value.getDataTypeManager())
@@ -1569,8 +1698,12 @@ static int (*volatile runtime_callback)(int, ...);
                         value.getReferenceManager().setPrimary(direct_ref, True)
                     assert any(op.getOpcode() == PcodeOp.CALL for op in instruction.getPcode(True))
                     ifc.flushCache()
+                    # Declare the separate real provider without changing exported C/H or import facts.
+                    provider_header = output / f"variadic-original-provider-{core}.h"
+                    provider_header.write_text("int variadic_target(int tag, ...);\n")
                     observe(ifc, caller, "explicit_call_reference", core, [(site, args)], preamble,
-                            consumer + driver, opcode=PcodeOp.CALL, callable_unit=True)
+                            consumer + driver, opcode=PcodeOp.CALL, callable_unit=True,
+                            provider_headers=(provider_header,))
                 assert fingerprint(target) == unchanged
     finally:
         field.set(None, original)

@@ -101,7 +101,7 @@ impl Fx {
 
     fn with_fd(mut fd: Funcdata) -> Self {
         let sp = make_sp_in(&mut fd);
-        fd.spacebase();
+        fd.spacebase().unwrap();
         let reg = Rc::clone(
             fd.get_arch()
                 .manage()
@@ -124,7 +124,7 @@ impl Fx {
     }
 
     fn input(&mut self, offset: u64, size: int4) -> VarnodeId {
-        let vn = self.fd.new_varnode(size, &reg_addr(&self.fd, offset), None);
+        let vn = self.fd.new_varnode(size, &reg_addr(&self.fd, offset), None).unwrap();
         self.fd.set_input_varnode(vn).unwrap()
     }
 
@@ -386,7 +386,7 @@ fn surviving_stack_copy_restore_is_still_a_value_read() {
     let save = fx.copy_save(source);
     let slot = fx
         .fd
-        .new_varnode(4, &Address::new(Rc::clone(&fx.stack), SLOT), None);
+        .new_varnode(4, &Address::new(Rc::clone(&fx.stack), SLOT), None).unwrap();
     let register_space = Rc::clone(&fx.reg);
     fx.emit(
         OpCode::CPUI_COPY,

@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RenameUnionFieldTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RenameUnionFieldTask.java
+@@ -37,6 +37,7 @@
+ 
+ 	@Override
+ 	public void commit() throws DuplicateNameException, InvalidInputException {
++		requireSourceAuthority(composite);
+ 		DataTypeComponent dtc = composite.getComponent(ordinal);
+ 		dtc.setFieldName(newName);
+ 	}

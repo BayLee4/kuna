@@ -91,7 +91,7 @@ fn r2_startcleanup_snapshots_live_create_index() {
     );
 
     // First apply: snapshot must capture the *live* index, not the default 0.
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     let snap1 = fd.get_clean_up_index();
     assert_eq!(
@@ -106,7 +106,7 @@ fn r2_startcleanup_snapshots_live_create_index() {
     let live2 = fd.vbank().get_create_index();
     assert!(live2 > live, "more creation advances the index further");
 
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     let snap2 = fd.get_clean_up_index();
     assert_eq!(snap2, live2, "second startCleanUp re-snapshots the new live index");
@@ -139,7 +139,7 @@ fn r2_redundbranch_multi_out_distinct_targets_not_removed() {
     let size_before = fd.bblocks_get_size();
 
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // getOut(1) != getOut(0) -> j stops at 1 != sizeOut(2) -> `continue`.
     // No removeBranch (seamed) AND no splice -> count stays 0, nothing removed.
@@ -170,7 +170,7 @@ fn r2_redundbranch_all_exits_same_block_removes_one_edge() {
     let size_before = fd.bblocks_get_size();
 
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // sizeOut==2 so the single-out splice arm is never entered; the all-same
     // detection now reaches the realized removeBranch -> one edge severed.
@@ -196,7 +196,7 @@ fn r2_redundbranch_empty_graph_is_noop() {
     assert_eq!(fd.bblocks_get_size(), 0);
 
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0);
     assert_eq!(fd.bblocks_get_size(), 0);

@@ -1,0 +1,58 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RetypeFieldTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RetypeFieldTask.java
+@@ -20,6 +20,8 @@
+ import ghidra.framework.plugintool.PluginTool;
+ import ghidra.program.model.data.*;
+ import ghidra.program.model.listing.Program;
++import ghidra.program.model.pcode.HighFunctionDBUtil;
++import ghidra.util.exception.InvalidInputException;
+ import ghidra.util.Msg;
+ 
+ public abstract class RetypeFieldTask {
+@@ -31,6 +33,7 @@
+ 	protected Program program;
+ 	protected DecompilerProvider provider;
+ 	protected ClangToken tokenAtCursor;
++	private boolean sourceAuthorityGranted;
+ 
+ 	public RetypeFieldTask(PluginTool tool, Program program, DecompilerProvider provider,
+ 			ClangToken token, Composite composite) {
+@@ -66,6 +69,21 @@
+ 	 */
+ 	public abstract void commit() throws IllegalArgumentException;
+ 
++	protected final void requireSourceAuthority() {
++		if (sourceAuthorityGranted || tokenAtCursor.getClangFunction() == null ||
++			tokenAtCursor.getClangFunction().getHighFunction() == null) {
++			return;
++		}
++		try {
++			var high = tokenAtCursor.getClangFunction().getHighFunction();
++			HighFunctionDBUtil.requireSourceAuthority(high, composite);
++			HighFunctionDBUtil.requireSourceAuthority(high, newType);
++		}
++		catch (InvalidInputException e) {
++			throw new IllegalArgumentException(e.getMessage(), e);
++		}
++	}
++
+ 	public void runTask() {
+ 		if (!isValidBefore()) {
+ 			Msg.showError(this, null, "Retype Failed", errorMsg);
+@@ -78,6 +96,8 @@
+ 
+ 		int transaction = program.startTransaction(getTransactionName());
+ 		try {
++			requireSourceAuthority();
++			sourceAuthorityGranted = true;
+ 			DataTypeManager dtm = program.getDataTypeManager();
+ 			newType = dtm.resolve(newType, null);
+ 			if (!isValidAfter()) {
+@@ -92,6 +112,7 @@
+ 				"Failed to retype field in '" + composite.getName() + "': " + e.getMessage(), e);
+ 		}
+ 		finally {
++			sourceAuthorityGranted = false;
+ 			program.endTransaction(transaction, true);
+ 		}
+ 

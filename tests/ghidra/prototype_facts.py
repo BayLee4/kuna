@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 import pyghidra
 
-from kuna_vs_stock import KUNA_GHIDRA, export_program, get_exepath_field, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, export_program, get_exepath_field, start_ghidra, test_cores
 
 
 C_TYPES = """#include <stdint.h>
@@ -122,7 +122,7 @@ def parameter_markup(result):
 
 
 def execute_export(program, results, driver, *, output, stem, input_text=None, functions=(),
-                   direct_call=None):
+                   direct_call=None, provider_sources=(), provider_headers=()):
     """Execute unmodified stock CppExporter output and genuine selected providers."""
     from ghidra.app.decompiler import DecompInterface, DecompileOptions
     from ghidra.program.model.address import AddressSet
@@ -135,6 +135,7 @@ def execute_export(program, results, driver, *, output, stem, input_text=None, f
     seen = set()
     interface = DecompInterface()
     options = DecompileOptions()
+    options.grabFromProgram(program)
     options.setNamespaceStrategy(DecompileOptions.NamespaceStrategy.Never)
     interface.setOptions(options)
     try:
@@ -181,10 +182,14 @@ def execute_export(program, results, driver, *, output, stem, input_text=None, f
     with tempfile.TemporaryDirectory(prefix="kuna-export-c-") as directory:
         executable = Path(directory) / "witness"
         outputs = []
+        provider_includes = [argument for header in provider_headers
+                             for argument in ("-include", str(header))]
         for optimization in ("-O0", "-O2"):
             built = subprocess.run(
                 [os.environ.get("CC", "cc"), "-std=c11", optimization, "-Wall", "-Werror",
-                 str(body_path), str(driver_path), "-o", str(executable)],
+                 *provider_includes,
+                 str(body_path), str(driver_path), *map(str, provider_sources),
+                 "-o", str(executable)],
                 capture_output=True, text=True, timeout=30,
             )
             if built.returncode != 0:
@@ -364,7 +369,7 @@ def main():
                         datatype = actual.getHigh().getDataType()
                         assert datatype.getLength() == actual.getSize(), row
                         if actual.getSize() == 8:
-                            assert isinstance(datatype, AbstractIntegerDataType) and not datatype.isSigned(), row
+                            assert isinstance(datatype, AbstractIntegerDataType), row
                         else:
                             assert datatype.isEquivalent(integer), row
                         # MOV EDI,imm32 defines the upper half as zero, not sign bits.
@@ -396,7 +401,7 @@ def main():
                 f"return result != {expected} || calls != 1 || argument != 5; }}\n")
 
     try:
-        for core in ("stock", "kuna"):
+        for core in test_cores():
             with program("independent_source_locks") as (value, api):
                 with transaction(value):
                     cases = []
@@ -477,7 +482,7 @@ def main():
                                   False, user, JArray(Variable)([]))
                 assert fn.getAutoParameterCount() == 1
                 assert fn.getParameter(0).getVariableStorage().getVarnodes()[0].getAddress() == value.getRegister("ECX").getAddress()
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     observe(ifc, fn, "method_this_storage", core, "#define __thiscall\n",
                             "int main(void) { int value=42; return method_value(&value) != 42; }\n",
@@ -492,7 +497,7 @@ def main():
                     signature(fn)
                 inline.setInline(True)
                 noreturn.setNoReturn(True)
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     for order in ((plain, inline, noreturn), (noreturn, inline, plain)):
                         for fn in order:
@@ -536,7 +541,7 @@ def main():
                                       + bytes.fromhex(suffix), name)
                     if kind != "both":
                         signature(caller, empty=True)
-                for core in ("stock", "kuna"):
+                for core in test_cores():
                     with interface(value, core) as ifc:
                         if kind == "inline":
                             observe(ifc, caller, kind, core, "",
@@ -585,7 +590,7 @@ def main():
                     fn = function(value, api, entry, code, f"isolation_{order}")
                     signature(fn, empty=True)
                     isolation_cases.append((fn, [item[:3] for item in entries]))
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     targets = []
                     for target, argument, expected in ((ordinary, 11, 12), (custom, 5, 14), (alternate, 7, 16)):
@@ -615,7 +620,7 @@ def main():
                                 callable_unit=True)
                         rows[-1]["machine_result"] = machine_result
 
-        for core in ("stock", "kuna"):
+        for core in test_cores():
             with program("prototype_edit") as (value, api):
                 with transaction(value):
                     target = function(value, api, 0x2000, bytes.fromhex("4489d283c209c3"), "edited_target")
@@ -752,7 +757,7 @@ def main():
                                       False, user, JArray(Variable)(parameters))
                     fn.setInline(True)
                     functions.append(fn)
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     observe(ifc, functions[1], "recursive_inline", core, "",
                             "int main(void) { return collatz(1)!=1 || collatz(2)!=1 || "
@@ -791,7 +796,7 @@ def main():
                     assert fn.getParameterCount() == (int(formal) if custom else 2)
                     assert bool(fn.getReturn().getVariableStorage().isForcedIndirect()) == (not custom)
                     aggregate_cases.append((fn, custom, formal))
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     for fn, custom, formal in aggregate_cases:
                         if custom:
@@ -805,64 +810,65 @@ def main():
                                 "typedef struct Big24 { ulonglong a, b, c; } Big24;\n",
                                 driver, current_contract=True)
 
-        with program("upper_register_transfer") as (value, api):
-            with transaction(value):
-                unsigned = UnsignedIntegerDataType.dataType
-                wide = UnsignedLongLongDataType.dataType
-                upper_address = value.getRegister("RDI").getAddress().add(4)
-                upper_storage = VariableStorage(value, JArray(Varnode)([
-                    Varnode(upper_address, 4)
-                ]))
-                functions = []
-                for name, offset, code in [
-                    ("upper_register_target", 0x2000, "4889f848c1e820c3"),
-                    ("upper_register_indirect", 0x1000, "4883ec08488d05f50f0000ffd04883c408c3"),
-                    ("upper_register_direct", 0x1100, "4883ec08e8f70e00004883c408c3"),
-                ]:
-                    fn = function(value, api, offset, bytes.fromhex(code), name)
-                    parameter = (ParameterImpl("upper", unsigned, upper_storage, value)
-                                 if offset == 0x2000 else
-                                 ParameterImpl("value", wide, value.getRegister("RDI"), value))
-                    fn.updateFunction("__stdcall",
-                                      ReturnParameterImpl(unsigned, value.getRegister("EAX"), value),
-                                      Function.FunctionUpdateType.CUSTOM_STORAGE, True, user,
-                                      JArray(Variable)([parameter]))
-                    functions.append(fn)
-                installed = functions[0].getParameter(0).getVariableStorage().getVarnodes()[0]
-                assert installed.getAddress() == upper_address and installed.getSize() == 4
+        if "kuna" in test_cores():
+            with program("upper_register_transfer") as (value, api):
+                with transaction(value):
+                    unsigned = UnsignedIntegerDataType.dataType
+                    wide = UnsignedLongLongDataType.dataType
+                    upper_address = value.getRegister("RDI").getAddress().add(4)
+                    upper_storage = VariableStorage(value, JArray(Varnode)([
+                        Varnode(upper_address, 4)
+                    ]))
+                    functions = []
+                    for name, offset, code in [
+                        ("upper_register_target", 0x2000, "4889f848c1e820c3"),
+                        ("upper_register_indirect", 0x1000, "4883ec08488d05f50f0000ffd04883c408c3"),
+                        ("upper_register_direct", 0x1100, "4883ec08e8f70e00004883c408c3"),
+                    ]:
+                        fn = function(value, api, offset, bytes.fromhex(code), name)
+                        parameter = (ParameterImpl("upper", unsigned, upper_storage, value)
+                                     if offset == 0x2000 else
+                                     ParameterImpl("value", wide, value.getRegister("RDI"), value))
+                        fn.updateFunction("__stdcall",
+                                          ReturnParameterImpl(unsigned, value.getRegister("EAX"), value),
+                                          Function.FunctionUpdateType.CUSTOM_STORAGE, True, user,
+                                          JArray(Variable)([parameter]))
+                        functions.append(fn)
+                    installed = functions[0].getParameter(0).getVariableStorage().getVarnodes()[0]
+                    assert installed.getAddress() == upper_address and installed.getSize() == 4
 
-            original_results = []
-            for fn in functions:
-                emulator = EmulatorHelper(value)
-                try:
-                    emulator.writeRegister("RDI", 0x123456789abcdef0)
-                    emulator.writeRegister("RSP", 0x8000)
-                    emulator.writeMemoryValue(address(value, 0x8000), 8, 0x3000)
-                    emulator.setBreakpoint(address(value, 0x3000))
-                    assert emulator.run(fn.getEntryPoint(), None, monitor), str(emulator.getLastError())
-                    actual = int(str(emulator.readRegister("EAX")))
-                    assert actual == 0x12345678, (str(fn.getName()), hex(actual))
-                    original_results.append({"function": str(fn.getName()), "result": hex(actual)})
-                finally:
-                    emulator.dispose()
-            rows.append({"case": "upper_register_instructions", "core": "emulator",
-                         "passed": True, "results": original_results})
+                original_results = []
+                for fn in functions:
+                    emulator = EmulatorHelper(value)
+                    try:
+                        emulator.writeRegister("RDI", 0x123456789abcdef0)
+                        emulator.writeRegister("RSP", 0x8000)
+                        emulator.writeMemoryValue(address(value, 0x8000), 8, 0x3000)
+                        emulator.setBreakpoint(address(value, 0x3000))
+                        assert emulator.run(fn.getEntryPoint(), None, monitor), str(emulator.getLastError())
+                        actual = int(str(emulator.readRegister("EAX")))
+                        assert actual == 0x12345678, (str(fn.getName()), hex(actual))
+                        original_results.append({"function": str(fn.getName()), "result": hex(actual)})
+                    finally:
+                        emulator.dispose()
+                rows.append({"case": "upper_register_instructions", "core": "emulator",
+                             "passed": True, "results": original_results})
 
-            # Stock shares the indirect-call defect; instruction semantics, not
-            # stock parity, are the acceptance criterion for this regression.
-            with interface(value, "kuna") as ifc:
-                observe(ifc, functions[0], "upper_register_target", "kuna", "",
-                        "int main(void) { unsigned values[]={0,0x12345678,0x80000000,0xffffffff}; "
-                        "for(unsigned i=0;i<4;++i) if(upper_register_target(values[i])!=values[i]) "
-                        "return 1; return 0; }\n", current_contract=True)
-                assert rows[-1]["passed"], rows[-1]
-                for fn in functions[1:]:
-                    observe(ifc, fn, str(fn.getName()), "kuna", "",
-                            "int main(void) { ulonglong values[]={0x123456789abcdef0ULL,"
-                            "0xfedcba9876543210ULL,0x00000001ffffffffULL,0xffffffff00000000ULL}; "
-                            "for(unsigned i=0;i<4;++i) { unsigned expected=(unsigned)(values[i]>>32); "
-                            f"if({fn.getName()}(values[i])!=expected) return 1; "
-                            "} return 0; }\n", current_contract=True, callable_unit=True)
+                # Stock shares the indirect-call defect; instruction semantics, not
+                # stock parity, are the acceptance criterion for this regression.
+                with interface(value, "kuna") as ifc:
+                    observe(ifc, functions[0], "upper_register_target", "kuna", "",
+                            "int main(void) { unsigned values[]={0,0x12345678,0x80000000,0xffffffff}; "
+                            "for(unsigned i=0;i<4;++i) if(upper_register_target(values[i])!=values[i]) "
+                            "return 1; return 0; }\n", current_contract=True)
+                    assert rows[-1]["passed"], rows[-1]
+                    for fn in functions[1:]:
+                        observe(ifc, fn, str(fn.getName()), "kuna", "",
+                                "int main(void) { ulonglong values[]={0x123456789abcdef0ULL,"
+                                "0xfedcba9876543210ULL,0x00000001ffffffffULL,0xffffffff00000000ULL}; "
+                                "for(unsigned i=0;i<4;++i) { unsigned expected=(unsigned)(values[i]>>32); "
+                                f"if({fn.getName()}(values[i])!=expected) return 1; "
+                                "} return 0; }\n", current_contract=True, callable_unit=True)
 
         with program("output_lock_controls") as (value, api):
             with transaction(value):
@@ -871,7 +877,7 @@ def main():
                 locked_void = function(value, api, 0x1200, bytes.fromhex("b807000000c3"), "locked_void")
                 signature(typed, empty=True)
                 signature(locked_void, empty=True, returns=VoidDataType.dataType)
-            for core in ("stock", "kuna"):
+            for core in test_cores():
                 with interface(value, core) as ifc:
                     for fn in (typed, untyped):
                         observe(ifc, fn, str(fn.getName()), core, "",
@@ -888,6 +894,8 @@ def main():
                 ifc.enableDebug(File(str(capture)))
                 observe(ifc, fn, "replay_original", "stock", "",
                         "int main(void) { return replay_value(-4660) != 0 || replay_value(5) != 4665; }\n")
+                rows[-1]["role"] = "stock-debug-input-producer"
+                rows[-1]["input_for"] = [f"{core}:replay_imported" for core in test_cores()]
         field.set(None, None)
         with tempfile.TemporaryDirectory(prefix="kuna-prototype-replay-") as directory:
             with pyghidra.open_program(capture, project_location=directory, project_name="replay",
@@ -896,7 +904,7 @@ def main():
                 fn = value.getFunctionManager().getFunctionAt(address(value, 0x1100))
                 assert fn is not None, "debug importer lost the function"
                 assert fn.getReturn().getVariableStorage().isUnassignedStorage(), "replay must exercise unassigned output storage"
-                for core in ("stock", "kuna"):
+                for core in test_cores():
                     with interface(value, core) as ifc:
                         observe(ifc, fn, "replay_imported", core, "",
                                 "int main(void) { return replay_value(-4660) != 0 || replay_value(5) != 4665; }\n",

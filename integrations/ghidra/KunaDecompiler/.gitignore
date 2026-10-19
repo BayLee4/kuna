@@ -2,7 +2,8 @@
 .gradle/
 build/
 dist/
-bin/
+# Root build output only; maintained patches include ghidra/app/util/bin/.
+/bin/
 
 # IDE metadata (Eclipse GhidraDev / VSCode)
 .classpath

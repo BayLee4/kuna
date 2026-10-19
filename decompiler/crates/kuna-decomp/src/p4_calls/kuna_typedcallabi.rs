@@ -8,8 +8,9 @@
 //! value sit in one non-floating-point location: ARM passes every variadic value
 //! in core registers, and a locked variadic prototype with a floating-point
 //! return or a register-pair parameter misreads the arguments past it.  A return
-//! value narrower than its register is forced only where the model extends it by
-//! its type, `narrowext` states its extension, or the caller extends it: a MIPS
+//! value narrower than its register, when the call needs storage beyond that
+//! value, is forced only where the model extends it by its type, `narrowext`
+//! states its extension, or the caller extends it: a MIPS
 //! model states no extension, a RISC-V one zero-extends signed values, and an
 //! Apple arm64 callee sign-extends a signed value narrower than 32 bits that the
 //! model zero-extends.  A declared function or direct-callee prototype that
@@ -20,7 +21,7 @@
 use crate::{
     context::ArchContext,
     dtype::{type_class, type_metatype, TypeFactory},
-    fspec::{FuncProto, ProtoModel, PrototypePieces},
+    fspec::{FuncCallSpecs, FuncProto, ProtoModel, PrototypePieces},
     funcdata::Funcdata,
     infra::architecture::Architecture,
     kuna_narrowext::Widen,
@@ -87,9 +88,14 @@ pub fn soft_model(arch: &Architecture, evidence: Option<bool>) -> Option<Rc<Prot
     }
     let soft = arch.get_model(SOFT_FLOAT_MODEL)?;
     let Some(default) = arch.default_fp() else {
-        return Some(Rc::clone(soft));
+        return Some(soft);
     };
-    let mut model = (**soft).clone();
+    if let Some((soft_key, default_key, model)) = arch.kuna_soft_float_model.borrow().as_ref() {
+        if Rc::ptr_eq(soft_key, &soft) && Rc::ptr_eq(default_key, default) {
+            return Some(Rc::clone(model));
+        }
+    }
+    let mut model = (*soft).clone();
     for entry in model.input_mut().kuna_entries_mut() {
         let same = default.input().get_entry().iter().find(|d| {
             d.get_type() == entry.get_type()
@@ -101,7 +107,10 @@ pub fn soft_model(arch: &Architecture, evidence: Option<bool>) -> Option<Rc<Prot
             entry.kuna_copy_extension(same);
         }
     }
-    Some(Rc::new(model))
+    let model = Rc::new(model);
+    *arch.kuna_soft_float_model.borrow_mut() =
+        Some((soft, Rc::clone(default), Rc::clone(&model)));
+    Some(model)
 }
 
 /// The image states no floating-point hardware.  A declaration that names no
@@ -161,6 +170,22 @@ pub fn undeclared_model_for(arch: &Architecture, pieces: &PrototypePieces) -> Op
     soft_layout(&soft, arch.default_fp()?, pieces, arch.types(), arch.manage())
 }
 
+/// A retained declaration already acquired under this context's derived ABI.
+pub(crate) fn retains_derived_model(arch: &ArchContext, proto: &FuncProto) -> bool {
+    if !proto.has_model() || proto.is_model_unknown() || proto.has_custom_storage() {
+        return false;
+    }
+    let Some(pieces) = proto.logical_pieces() else { return false };
+    if !pieces.input_storage.is_empty() || pieces.output_storage.is_some() {
+        return false;
+    }
+    (may_use_float_storage(pieces)
+        && arch.soft_float_declarations.as_ref().is_some_and(|model| proto.has_matching_model(model)))
+        || (arch.vfp_variadic && crate::kuna_vfpvariadic::moves_return(pieces)
+            && arch.variadic_declarations.get().and_then(Option::as_ref)
+                .is_some_and(|model| proto.has_matching_model(model)))
+}
+
 fn may_use_float_storage(pieces: &PrototypePieces) -> bool {
     pieces.outtype.iter().chain(&pieces.intypes).any(|ty| {
         matches!(
@@ -199,14 +224,19 @@ fn soft_layout(
 /// The prototype to force at a CALLIND typed with `proto`, or `None` to leave the
 /// call to model recovery.  A prototype whose return value is narrower than its
 /// register and extended by neither the model by type nor the caller is
-/// declined.  A variadic prototype is forced only when no fixed parameter or
+/// declined unless this call's settled output fits entirely within the declared
+/// return storage.  A variadic prototype is forced only when no fixed parameter or
 /// return value lives in a join or in the model's floating-point registers.  Any
 /// other prototype that puts nothing in those registers, or names its own
 /// convention, is forced as declared.  Otherwise the stated convention decides:
 /// hard-float keeps it; soft-float rebuilds it under the soft-float model, or
 /// declines when the spec has none; single-float or no stated convention
 /// declines.
-pub fn admit(data: &Funcdata, proto: Rc<FuncProto>) -> Option<Rc<FuncProto>> {
+pub fn admit(
+    data: &Funcdata,
+    call: &FuncCallSpecs,
+    proto: Rc<FuncProto>,
+) -> Option<Rc<FuncProto>> {
     if !proto.has_model() {
         return Some(proto);
     }
@@ -214,6 +244,7 @@ pub fn admit(data: &Funcdata, proto: Rc<FuncProto>) -> Option<Rc<FuncProto>> {
     if proto.get_output().get_size() < arch.caller_extends_returns_from
         && unextended_return(&proto)
         && !abi_extended_return(arch.narrow_ext.output, &proto)
+        && !return_value_is_covered(data, call, &proto)
     {
         return None;
     }
@@ -226,6 +257,12 @@ pub fn admit(data: &Funcdata, proto: Rc<FuncProto>) -> Option<Rc<FuncProto>> {
     if !in_float {
         return Some(proto);
     }
+    // A supplied convention remains explicit even when it names the effective
+    // default. Internal model selection alone does not populate this wire fact.
+    let declared = proto.declared_model_name();
+    if !matches!(declared, "" | "default" | "unknown") && declared == proto.get_model_name() {
+        return Some(proto);
+    }
     let default = arch.defaultfp.as_ref().map(|model| model.get_name());
     if default.is_some_and(|name| name != proto.get_model_name()) {
         return Some(proto);
@@ -235,6 +272,36 @@ pub fn admit(data: &Funcdata, proto: Rc<FuncProto>) -> Option<Rc<FuncProto>> {
         Some(false) => rebuild(arch, &proto),
         None => None,
     }
+}
+
+/// A recovered output wholly inside the declaration has no dependency on the
+/// containing register's extension. Recovery must be inactive and every retained
+/// live trial must be covered by that output: unsupported multi-trial recovery
+/// can stop without consolidating its trials. An absent output is not proof.
+fn return_value_is_covered(data: &Funcdata, call: &FuncCallSpecs, proto: &FuncProto) -> bool {
+    if call.is_output_active() {
+        return false;
+    }
+    let Some(value) = data.obank().get(call.get_op())
+        .and_then(|op| op.get_out())
+        .and_then(|vn| data.vbank().get(vn))
+    else {
+        return false;
+    };
+    let declared = proto.get_output();
+    if declared.get_address().justified_contain(
+        declared.get_size(), value.get_addr(), value.get_size(), false,
+    ) < 0 {
+        return false;
+    }
+    let trials = call.active_output();
+    (0..trials.get_num_trials()).all(|i| {
+        let trial = trials.get_trial(i);
+        !(trial.is_used() || trial.is_active())
+            || value.get_addr().justified_contain(
+                value.get_size(), trial.get_address(), trial.get_size(), false,
+            ) >= 0
+    })
 }
 
 /// The (space index, offset, size) of each floating-point entry of the model.

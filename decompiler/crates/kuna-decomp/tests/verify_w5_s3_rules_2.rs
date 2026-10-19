@@ -142,7 +142,7 @@ fn mk_written(
         fd.op_set_input(defop, vn, i as int4).expect("mk_written set input");
     }
     let ram = ram_space(fd);
-    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(out_size)));
+    let outvn = fd.new_varnode(out_size, &Address::new(ram, off + 0x800), Some(dt(out_size))).unwrap();
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let mut no_replace =
@@ -195,7 +195,7 @@ fn w5_s3_rules_2_zexteliminate_wide_input_masked_f1() {
 
     // (val >> 64) is x86-masked to (val >> 0) == 0x1234 != 0, so the guard
     // `(val>>(8*smallsize))==0` is false and the rule declines without mutating.
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 0);
+    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, eq), OpCode::CPUI_INT_EQUAL);
     assert_eq!(in_of(&fd, eq, 0), Some(zext_out)); // ZEXT input unchanged
     assert_eq!(in_of(&fd, eq, 1), Some(c)); // constant unchanged
@@ -216,7 +216,7 @@ fn w5_s3_rules_2_zexteliminate_narrow_input_ok() {
     fd.op_set_input(eq, c, 1).unwrap();
     fd.op_insert(eq, bl, None);
 
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 1);
+    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd).unwrap(), 1);
     assert_eq!(in_of(&fd, eq, 0), Some(x)); // extension dropped
     let nc = in_of(&fd, eq, 1).unwrap();
     assert_eq!(const_val(&fd, nc), 7);
@@ -241,7 +241,7 @@ fn w5_s3_rules_2_zexteliminate_zext_in_slot1() {
     fd.op_set_input(eq, zext_out, 1).unwrap(); // zext in slot 1
     fd.op_insert(eq, bl, None);
 
-    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd), 1);
+    assert_eq!(RuleZextEliminate.apply_op(eq, &mut fd).unwrap(), 1);
     // zextslot == 1: the ZEXT input X lands in slot 1; the resized const in slot 0.
     assert_eq!(in_of(&fd, eq, 1), Some(x));
     let nc = in_of(&fd, eq, 0).unwrap();
@@ -271,7 +271,7 @@ fn w5_s3_rules_2_floatrange_swapped_slots_noncconst_comparand() {
     fd.op_set_input(or, less_out, 1).unwrap(); // LESS in slot 1
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleFloatRange.apply_op(or, &mut fd), 1);
+    assert_eq!(RuleFloatRange.apply_op(or, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_FLOAT_LESSEQUAL);
     // nvn1 = V (slot 0 of cmp1=LESS), cvn1 = W (non-constant) goes to slot 1.
     assert_eq!(in_of(&fd, or, 0), Some(v));
@@ -294,7 +294,7 @@ fn w5_s3_rules_2_floatrange_declines_distinct_noncconst_comparand() {
     fd.op_set_input(or, less_out, 1).unwrap();
     fd.op_insert(or, bl, None);
 
-    assert_eq!(RuleFloatRange.apply_op(or, &mut fd), 0);
+    assert_eq!(RuleFloatRange.apply_op(or, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, or), OpCode::CPUI_BOOL_OR);
 }
 
@@ -322,7 +322,7 @@ fn w5_s3_rules_2_doubleshift_opposite_partial_negative_diffsa() {
     fd.op_set_input(outer, s_outer, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd).unwrap(), 1);
     // Outer op becomes INT_RIGHT by diffsa=16, slot0 reads a fresh INT_AND.
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_INT_RIGHT);
     let sa = in_of(&fd, outer, 1).unwrap();
@@ -366,7 +366,7 @@ fn w5_s3_rules_2_r2_shiftcompare_left_info_loss_andmask() {
     fd.op_set_input(eq, d, 1).unwrap();
     fd.op_insert(eq, bl, None);
 
-    assert_eq!(RuleShiftCompare.apply_op(eq, &mut fd), 1);
+    assert_eq!(RuleShiftCompare.apply_op(eq, &mut fd).unwrap(), 1);
     // op stays INT_EQUAL; slot1 const becomes newconst = 3.
     assert_eq!(code_of(&fd, eq), OpCode::CPUI_INT_EQUAL);
     assert_eq!(const_val(&fd, in_of(&fd, eq, 1).unwrap()), 3);
@@ -396,7 +396,7 @@ fn w5_s3_rules_2_r2_doubleshift_same_dir_overshift_to_zero() {
     fd.op_set_input(outer, s_outer, 1).unwrap();
     fd.op_insert(outer, bl, None);
 
-    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd), 1);
+    assert_eq!(RuleDoubleShift.apply_op(outer, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, outer), OpCode::CPUI_COPY);
     // input 1 was removed; the COPY now has exactly one input (the zero const).
     assert_eq!(fd.obank().get(outer).unwrap().num_input(), 1_i32);
@@ -424,7 +424,7 @@ fn w5_s3_rules_2_r2_booleanundistribute_identical_shared_clause_fires() {
     fd.op_set_input(ne, and1, 1).unwrap();
     fd.op_insert(ne, bl, None);
 
-    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 1);
+    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd).unwrap(), 1);
     // Outer op becomes BOOL_AND; slot0 = finalA = A (not flipped); slot1 = inner.
     assert_eq!(code_of(&fd, ne), OpCode::CPUI_BOOL_AND);
     assert_eq!(in_of(&fd, ne, 0), Some(a));
@@ -461,7 +461,7 @@ fn w5_s3_rules_2_r2_booleanundistribute_stub_declines_structural_match() {
     fd.op_insert(ne, bl, None);
 
     // Stub declines (returns 0); the op graph is left untouched.
-    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd), 0);
+    assert_eq!(RuleBooleanUndistribute.apply_op(ne, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, ne), OpCode::CPUI_INT_NOTEQUAL);
     assert_eq!(in_of(&fd, ne, 0), Some(and0));
     assert_eq!(in_of(&fd, ne, 1), Some(and1));

@@ -1,5 +1,6 @@
 //! Constant integer-format evidence for variadic trials with competing readers.
 //! Uses `varargforward`; unknown formats retain the exclusive-reader rule.
+use kuna_base::address::Address;
 use kuna_base::space::spacetype;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
@@ -72,8 +73,8 @@ fn integer_arguments(format: &[u8]) -> Option<Vec<bool>> {
 
 /// Assign the full format's integer arguments through the call's variadic ABI,
 /// rather than treating a conversion count as a count of every register class.
-pub(crate) fn arguments(data: &Funcdata, fc: &FuncCallSpecs) -> Vec<ParameterPieces> {
-    let resolve = || -> Option<Vec<ParameterPieces>> {
+pub(crate) fn arguments(data: &Funcdata, fc: &FuncCallSpecs) -> kuna_base::error::KunaResult<Vec<ParameterPieces>> {
+    let resolve = || -> Option<(VarnodeId, Address, int4)> {
         if !data.get_arch().vararg_forward
             || !fc.is_dotdotdot()
             || !fc.proto().is_input_locked()
@@ -98,13 +99,17 @@ pub(crate) fn arguments(data: &Funcdata, fc: &FuncCallSpecs) -> Vec<ParameterPie
         }
         let call = data.obank().get(fc.get_op())?;
         let vn = call.get_in(active.get_trial(index).get_slot())?;
-        let (value, width) = constant_value(data, vn, 0)?;
-        let format = super::kuna_formatwitness::pointed_readonly_format(
+        Some((vn, call.get_addr().clone(), fixed))
+    };
+    let Some((vn, point, fixed)) = resolve() else { return Ok(Vec::new()) };
+    let Some((value, width)) = constant_value(data, vn, 0)? else { return Ok(Vec::new()) };
+    let Some(format) = super::kuna_formatwitness::pointed_readonly_format(
             data,
             value,
             width,
-            call.get_addr(),
-        )?;
+            &point,
+        )? else { return Ok(Vec::new()) };
+    let resolve = || -> Option<Vec<ParameterPieces>> {
         let args = integer_arguments(&format)?;
         if args.is_empty() {
             return None;
@@ -138,7 +143,7 @@ pub(crate) fn arguments(data: &Funcdata, fc: &FuncCallSpecs) -> Vec<ParameterPie
         let args: Vec<_> = res.into_iter().skip(fixed as usize + 1).collect();
         args.iter().all(|a| a.flags == 0).then_some(args)
     };
-    resolve().unwrap_or_default()
+    Ok(resolve().unwrap_or_default())
 }
 
 /// Prove the consumed bytes through bounded copies and integer expressions.
@@ -149,6 +154,7 @@ pub(super) fn defined_bytes(
     offset: int4,
     width: int4,
     budget: &mut u32,
+    source_inputs: Option<&crate::fspec::FuncProto>,
 ) -> bool {
     if *budget == 0 {
         return false;
@@ -165,7 +171,7 @@ pub(super) fn defined_bytes(
         return true;
     }
     if v.is_input() {
-        let proto = data.get_func_proto();
+        let proto = source_inputs.unwrap_or_else(|| data.get_func_proto());
         return proto.is_input_locked()
             && (0..proto.num_params())
                 .filter_map(|i| proto.get_param(i))
@@ -181,7 +187,7 @@ pub(super) fn defined_bytes(
     };
     let mut input = |slot, off, len| {
         op.get_in(slot)
-            .is_some_and(|id| defined_bytes(data, id, off, len, budget))
+            .is_some_and(|id| defined_bytes(data, id, off, len, budget, source_inputs))
     };
     match op.code() {
         OpCode::CPUI_COPY | OpCode::CPUI_CAST => input(0, offset, width),
@@ -219,7 +225,7 @@ pub(super) fn defined_bytes(
         }
         OpCode::CPUI_MULTIEQUAL => (0..op.num_input()).all(|slot| input(slot, offset, width)),
         OpCode::CPUI_LOAD => true,
-        OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => declared_value(data, vn),
+        OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => declared_value(data, vn, source_inputs),
         OpCode::CPUI_INT_ADD
         | OpCode::CPUI_INT_SUB
         | OpCode::CPUI_INT_MULT
@@ -271,6 +277,7 @@ pub(crate) fn activate_trial(
     idx: int4,
     i: int4,
     args: &[ParameterPieces],
+    source_inputs: Option<&crate::fspec::FuncProto>,
 ) -> bool {
     if args.is_empty() {
         return false;
@@ -350,16 +357,16 @@ pub(crate) fn activate_trial(
         else {
             return false;
         };
-        if !defined_bytes(data, value, 0, preceding_width, &mut 64) {
+        if !defined_bytes(data, value, 0, preceding_width, &mut 64, source_inputs) {
             return false;
         }
     }
     let (cond, killed) = (trial.has_cond_exe_effect(), trial.is_killed_by_call());
     let mut ancestry = None;
-    if !defined_bytes(data, vn, 0, width, &mut 64) {
+    if !defined_bytes(data, vn, 0, width, &mut 64, source_inputs) {
         return false;
     }
-    if !data.vbank().get(vn).is_some_and(|v| v.is_input()) && !declared_value(data, vn) {
+    if !data.vbank().get(vn).is_some_and(|v| v.is_input()) && !declared_value(data, vn, source_inputs) {
         let mut ancestor = AncestorRealistic::new();
         let (realistic, solid) = ancestor.execute(data, op, slot, width, cond, killed, false);
         if !(realistic || solid) {

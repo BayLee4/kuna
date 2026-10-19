@@ -101,7 +101,7 @@ pub(super) fn absolute_literal_target(operands: &str) -> Option<u64> {
 /// there is no decode mode at all; the base is the word-aligned PC. The delta is a
 /// closure because resolving it is a context-database lookup and all but a handful
 /// of instructions never reach it.
-fn pcrel_literal_target(
+pub(crate) fn pcrel_literal_target(
     addr: u64,
     operands: &str,
     pc_delta: impl FnOnce() -> Option<u64>,

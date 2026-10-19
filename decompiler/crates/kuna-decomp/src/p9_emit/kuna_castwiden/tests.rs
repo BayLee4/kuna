@@ -9,6 +9,13 @@
 
 use super::*;
 
+use kuna_base::address::Address;
+use kuna_base::error::KunaError;
+use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace};
+
+use crate::context::{ArchContext, HighVariableId};
+use crate::dtype::TypeFactoryImpl;
+
 /// A promoted C integer type as (bits, signed).
 fn shape(t: u8) -> (u32, bool) {
     match t {
@@ -133,4 +140,166 @@ fn a_long_suffix_where_long_is_four_bytes_is_long_long() {
     assert_eq!(token_types("8LL", 4), Some(LONG));
     assert_eq!(token_types("8ULL", 4), Some(ULONG));
     assert_eq!(token_types("8L", 4), Some(INT));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Query {
+    ExtensionCast,
+    ExtensionHidden,
+    Truncation,
+    Integer,
+    Suffix,
+}
+
+struct Forms {
+    fail: Option<Query>,
+    token: Option<&'static str>,
+    extension_cast: bool,
+}
+
+impl Forms {
+    fn acquire<T>(&self, query: Query, value: T) -> KunaResult<T> {
+        if self.fail == Some(query) {
+            Err(KunaError::data_unavail("printed widening acquisition"))
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+impl PrintedForms for Forms {
+    fn spell(&self, ty: &Rc<Datatype>) -> String {
+        ty.get_name().to_owned()
+    }
+
+    fn extension_is_cast(&self, _op: OpId) -> KunaResult<bool> {
+        self.acquire(Query::ExtensionCast, self.extension_cast)
+    }
+
+    fn extension_hidden(&self, _op: OpId, _read_op: Option<OpId>) -> KunaResult<bool> {
+        self.acquire(Query::ExtensionHidden, false)
+    }
+
+    fn sign_dropped(&self, _op: OpId) -> bool {
+        false
+    }
+
+    fn truncation_is_cast(&self, _op: OpId) -> KunaResult<bool> {
+        self.acquire(Query::Truncation, true)
+    }
+
+    fn high_name(&self, _high: HighVariableId) -> Option<String> {
+        None
+    }
+
+    fn planned_decl_type(&self, _high: HighVariableId) -> Option<Rc<Datatype>> {
+        None
+    }
+
+    fn is_statement(&self, _op: OpId) -> bool {
+        false
+    }
+
+    fn literal_token(&self, vn: VarnodeId, op: OpId) -> KunaResult<Option<String>> {
+        self.integer_token(vn, op, None)
+    }
+
+    fn long_size(&self) -> i32 {
+        8
+    }
+
+    fn integer_token(&self, _vn: VarnodeId, _op: OpId, suffix: Option<bool>) -> KunaResult<Option<String>> {
+        let query = if suffix.is_some() { Query::Suffix } else { Query::Integer };
+        self.acquire(query, self.token.map(|token| match suffix {
+            Some(true) => format!("{token}UL"),
+            Some(false) => format!("{token}L"),
+            None => token.to_owned(),
+        }))
+    }
+}
+
+fn query_fd() -> Funcdata {
+    let mut manager = AddrSpaceManager::new();
+    manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+    manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+    let ram = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 2,
+        addrspace_flags::hasphysical, 1, 1,
+    ));
+    manager.insert_space(ram.clone()).unwrap();
+    let types = TypeFactoryImpl::new();
+    types.setup_sizes(Some(4), 8, 8);
+    types.set_default_alignment_map();
+    types.set_max_basetype_size(8);
+    let mut arch = ArchContext::new(manager);
+    arch.types = Some(Rc::new(types));
+    Funcdata::new("widen", "widen", Rc::new(arch), Address::new(ram, 0x1000), 0x1000_0000, 0x40).unwrap()
+}
+
+fn query_op(fd: &mut Funcdata, code: OpCode, inputs: &[VarnodeId], size: i32) -> (OpId, VarnodeId) {
+    let op = fd.new_op(inputs.len() as i32, fd.get_address().clone());
+    fd.op_set_opcode_code(op, code);
+    for (slot, &input) in inputs.iter().enumerate() {
+        fd.op_set_input(op, input, slot as i32).unwrap();
+    }
+    let out = fd.new_unique_out(size, op).unwrap();
+    fd.vn_update_type(out, Rc::new(Datatype::new(size, type_metatype::TYPE_INT)));
+    fd.vbank_mut().get_mut(out).unwrap().set_implied();
+    (op, out)
+}
+
+#[test]
+fn literal_acquisition_errors_are_not_semantic_absence() {
+    let mut fd = query_fd();
+    let literal = fd.new_constant(8, 8);
+    let (reader, _) = query_op(&mut fd, OpCode::CPUI_COPY, &[literal], 8);
+    let ic = ImpliedCasts::default();
+    let w = Widening { op: reader, to: LONG, from: INT, keeps: true };
+    let mut forms = Forms { fail: None, token: Some("8"), extension_cast: true };
+
+    assert_eq!(operand_set(&ic, &forms, &fd, literal, reader, 0).unwrap(), Some(INT));
+    assert_eq!(literal_suffix(&forms, &fd, literal, reader, &w).unwrap(), Some(false));
+    forms.token = None;
+    assert_eq!(operand_set(&ic, &forms, &fd, literal, reader, 0).unwrap(), None);
+    assert_eq!(literal_suffix(&forms, &fd, literal, reader, &w).unwrap(), None);
+
+    forms.token = Some("8");
+    forms.fail = Some(Query::Integer);
+    assert!(operand_set(&ic, &forms, &fd, literal, reader, 0).unwrap_err().to_string().contains("printed widening acquisition"));
+    assert!(literal_suffix(&forms, &fd, literal, reader, &w).unwrap_err().to_string().contains("printed widening acquisition"));
+    forms.fail = Some(Query::Suffix);
+    assert!(literal_suffix(&forms, &fd, literal, reader, &w).unwrap_err().to_string().contains("printed widening acquisition"));
+}
+
+#[test]
+fn widening_plan_propagates_extension_queries_without_changing_refusal() {
+    let mut fd = query_fd();
+    let input = fd.new_unique(4, Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))));
+    let (_, widened) = query_op(&mut fd, OpCode::CPUI_INT_SEXT, &[input], 8);
+    let literal = fd.new_constant(8, 8);
+    let (reader, _) = query_op(&mut fd, OpCode::CPUI_INT_ADD, &[literal, widened], 8);
+    let ic = ImpliedCasts::default();
+    let mut forms = Forms { fail: None, token: Some("8"), extension_cast: false };
+
+    assert_eq!(plan(&ic, &forms, &fd, reader, 0).unwrap(), Plan::default());
+    assert_eq!(operand_set(&ic, &forms, &fd, widened, reader, 0).unwrap(), None);
+    forms.extension_cast = true;
+    for query in [Query::ExtensionCast, Query::ExtensionHidden] {
+        forms.fail = Some(query);
+        assert!(plan(&ic, &forms, &fd, reader, 0).unwrap_err().to_string().contains("printed widening acquisition"));
+        assert!(operand_set(&ic, &forms, &fd, widened, reader, 0).unwrap_err().to_string().contains("printed widening acquisition"));
+    }
+}
+
+#[test]
+fn truncation_query_errors_propagate_through_operand_types() {
+    let mut fd = query_fd();
+    let input = fd.new_constant(8, 8);
+    let offset = fd.new_constant(4, 0);
+    let (reader, truncated) = query_op(&mut fd, OpCode::CPUI_SUBPIECE, &[input, offset], 4);
+    let ic = ImpliedCasts::default();
+    let mut forms = Forms { fail: None, token: Some("8"), extension_cast: true };
+    assert_eq!(operand_set(&ic, &forms, &fd, truncated, reader, 0).unwrap(), Some(INT));
+    forms.fail = Some(Query::Truncation);
+    assert!(operand_set(&ic, &forms, &fd, truncated, reader, 0).unwrap_err().to_string().contains("printed widening acquisition"));
 }

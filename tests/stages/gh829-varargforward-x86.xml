@@ -54,12 +54,27 @@ c3
 <bytechunk space="ram" offset="0x100400" readonly="true">
 256900
 </bytechunk>
+<!-- The first optional int follows ECX in MSABI, not the SysV EDI/ESI pair.
+     The guarded body captures only inside its terminal consuming leaf.
+     The two-tail body does not qualify for a single first-tail capture. -->
+<bytechunk space="ram" offset="0x100500">
+89c801d0c3
+</bytechunk>
+<bytechunk space="ram" offset="0x100520">
+85c9740589c801d0c331c0c3
+</bytechunk>
+<bytechunk space="ram" offset="0x100540">
+89c801d04401c0c3
+</bytechunk>
 <symbol space="ram" offset="0x100200" name="stored"/>
 <symbol space="ram" offset="0x100300" name="render_value"/>
 <symbol space="ram" offset="0x100000" name="d2"/>
 <symbol space="ram" offset="0x100010" name="d3"/>
 <symbol space="ram" offset="0x100030" name="d5"/>
 <symbol space="ram" offset="0x100100" name="pr"/>
+<symbol space="ram" offset="0x100500" name="entry_capture"/>
+<symbol space="ram" offset="0x100520" name="entry_guarded"/>
+<symbol space="ram" offset="0x100540" name="entry_two"/>
 </binaryimage>
 <script>
   <com>parse line extern int4 pr(char *f, ...);</com>
@@ -68,6 +83,9 @@ c3
   <com>parse line extern int4 d5(char *f, int4 a, int4 b, int4 c);</com>
   <com>parse line extern uint8 MSABI stored(int4 *value);</com>
   <com>parse line extern uint8 MSABI render_value(char *format, ...);</com>
+  <com>parse line extern int4 MSABI entry_capture(int4 tag, ...);</com>
+  <com>parse line extern int4 MSABI entry_guarded(int4 tag, ...);</com>
+  <com>parse line extern int4 MSABI entry_two(int4 tag, ...);</com>
   <com>option varargforward off</com>
   <com>lo fu d2</com>
   <com>decompile</com>
@@ -91,10 +109,65 @@ c3
   <com>lo fu d3</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>option varargentry off</com>
+  <com>lo fu entry_capture</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>option varargentry on</com>
+  <com>lo fu entry_capture</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu entry_guarded</com>
+  <com>decompile</com>
+  <com>print C</com>
+  <com>lo fu entry_two</com>
+  <com>decompile</com>
+  <com>print C</com>
   <com>quit</com>
 </script>
 <stringmatch name="GH829 x86 #1: varargforward off drops every forwarded argument in d2 and d5 (bug reproduced), and d3 keeps pr(f) with it on" min="3" max="3">return pr\(f\);</stringmatch>
 <stringmatch name="GH829 x86 #2: varargforward on keeps the int forwarded in esi" min="2" max="2">return pr\(f,a\);|return render_value\("%i",[^;]+\);</stringmatch>
 <stringmatch name="GH829 x86 #3: varargforward on keeps esi, edx and ecx" min="2" max="2">return render_value\("%i"\);|return pr\(f,a,b,c\);</stringmatch>
 <stringmatch name="GH829 x86 #4: d3 also compares its parameter, so its call is left as it was" min="1" max="1">if \(6 &lt;= a\)</stringmatch>
+<stringmatch name="VARARGENTRY #1: the source signature retains one fixed parameter and ellipsis in both passes" min="2" max="2">entry_capture\(int4 tag,\.\.\.\)</stringmatch>
+<stringmatch name="VARARGENTRY #2: the entry and terminal consuming leaf receive the standard dependency" min="2" max="2">#include &lt;stdarg.h&gt;</stringmatch>
+<stringmatch name="VARARGENTRY #3: capture is option-gated, conditionally scoped and immediately cleaned up" min="1" max="1">^int4 MSABI entry_capture\(int4 tag,\.\.\.\)$
+^\{$
+^\s*int4 [A-Za-z_][A-Za-z_0-9]*;.*$
+^\s*$
+^\s*return tag \+ [A-Za-z_][A-Za-z_0-9]*;$
+^\}$
+^\s*$
+^#include &lt;stdarg.h&gt;$
+^\s*$
+^int4 MSABI entry_capture\(int4 tag,\.\.\.\)$
+^\{$
+^\s*int4 [A-Za-z_][A-Za-z_0-9]*;.*$
+^\s*$
+^\s*va_list kuna_args;$
+^\s*va_start\(kuna_args,tag\);$
+^\s*[A-Za-z_][A-Za-z_0-9]* = va_arg\(kuna_args,int\);$
+^\s*va_end\(kuna_args\);$
+^\s*$
+^\s*return tag \+ [A-Za-z_][A-Za-z_0-9]*;$
+^\}$
+^\s*$
+^#include &lt;stdarg.h&gt;$
+^\s*$
+^int4 MSABI entry_guarded\(int4 tag,\.\.\.\)$
+^\{$
+^\s*int4 [A-Za-z_][A-Za-z_0-9]*;.*$
+^\s*$
+^\s*if \(tag\) \{$
+^\s*va_list kuna_args;$
+^\s*va_start\(kuna_args,tag\);$
+^\s*[A-Za-z_][A-Za-z_0-9]* = va_arg\(kuna_args,int\);$
+^\s*va_end\(kuna_args\);$
+^\s*$
+^\s*return tag \+ [A-Za-z_][A-Za-z_0-9]*;$
+^\s*\}$
+^\s*return 0;$
+^\}$</stringmatch>
+<stringmatch name="VARARGENTRY #4: va_start uses the fixed source parameter, not an invented tail formal" min="2" max="2">va_start\(kuna_args,tag\);</stringmatch>
+<stringmatch name="VARARGENTRY #5: each recovered optional value is evaluated once" min="2" max="2">va_arg\(</stringmatch>
 </decompilertest>

@@ -105,7 +105,7 @@ mod config_ir_regressions {
             .unwrap();
         selected.reset(&mut fd);
         let mut ctx = ActionContext::new();
-        assert_eq!(selected.perform(&mut fd, &mut ctx), 1);
+        assert_eq!(selected.perform(&mut fd, &mut ctx).unwrap(), 1);
         let rewritten = fd.obank().get(or).unwrap();
         assert_eq!(rewritten.code(), OpCode::CPUI_COPY);
         assert_eq!(rewritten.num_input(), 1);
@@ -656,7 +656,7 @@ fn action_apply_bails_on_unreachable_blocks() {
 
     let mut act = ActionConditionalExe::new("condexe");
     let mut ctx = crate::action::ActionContext::new();
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0, "apply returns 0 immediately on unreachable blocks");
     assert_eq!(act.base().count, 0, "no hits recorded");
 }
@@ -683,7 +683,7 @@ fn orpredicate_noop_on_nonpredicate_inputs() {
     place(&mut fd, or, bl);
 
     let mut rule = RuleOrPredicate::new("condexe");
-    assert_eq!(rule.apply_op(or, &mut fd), 0, "no predicate form => no change");
+    assert_eq!(rule.apply_op(or, &mut fd).unwrap(), 0, "no predicate form => no change");
 }
 
 /// PIN the W6 opcode-resolution stub: building the predicate form and driving

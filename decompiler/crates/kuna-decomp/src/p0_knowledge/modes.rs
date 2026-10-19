@@ -559,12 +559,15 @@ mod tests {
         /// `armconstshift` makes signed ARM constant shifts defined C at the
         /// cost of a cast pair on every sign-bit test (`x << 0x18 < 0`), which
         /// firmware uses for nearly every register flag check.
+        ///
+        /// `exportinline` belongs to an explicitly prepared export invocation;
+        /// ordinary mode selection must not inline its selected roots.
         const EXCLUDED_ON_PURPOSE: &[&str] =
             &["v850indirectbranch", "dwarf_lines", "ifuncfpret",
               "aifcorroborate", "linuxsyscall", "nulterminator", "msvcstrappend",
               "structdefs", "indirectonly", "protoorder", "stackalias", "stackviews", "bejoin",
               "mixedtailret", "varargsharedfloat", "callarrayextent",
-              "armconstshift"];
+              "armconstshift", "exportinline"];
 
         /// Default-off options that predate this test and are **not** in the preset,
         /// i.e. are currently unreachable on the default path. Each is a genuine open

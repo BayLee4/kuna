@@ -16,7 +16,7 @@ Learn more about this approach in this [post](https://noelo.org/blog/kuna-releas
 [![Discord](https://img.shields.io/discord/1542982153912975470?label=Discord&logo=discord&logoColor=white&color=5865F2&style=flat)](https://discord.gg/vAQ8BKUPXv)
 
 ## Install & Usage
-Kuna is distributed as a single Rust binary and can be run on most systems.
+The Kuna CLI is distributed as a single Rust binary and can be run on most systems.
 It can be used either on the [CLI](#cli-usage), the [web browser](#web-browser-usage), or in the [Ghidra GUI](#ghidra-gui-usage) (as the decompiler backend), most found in [releases](https://github.com/Noelo-Lab/kuna/releases).
 
 ### CLI Usage
@@ -46,11 +46,14 @@ The code for deploying your own site can be found in `./integrations/web`
 ### Ghidra GUI Usage
 Since Kuna is originally a Ghidra port, the output format has remained largely compatible with Ghidra proper.
 You can use the Kuna core as the Ghidra decompiler inside of the traditional Ghidra GUI.
-You can either build the extension (`./integrations/ghidra`), or download the extension for the latest release.
+Install the full KunaDecompiler extension for **Ghidra 12.1.4 with Java 21**.
+It includes the Java integration and native backends for Linux x86_64/arm64,
+macOS x86_64/arm64 and Windows x86_64. For a source build, use
+`GHIDRA_INSTALL_DIR=/abs/ghidra_12.1.4_PUBLIC integrations/ghidra/KunaDecompiler/build.sh`;
+see the [extension README](integrations/ghidra/KunaDecompiler/README.md).
 
-The extension will work on all platforms Kuna is supported on.
 To install and activate Kuna in Ghidra, do the following:
-1. Download it from the [releases](https://github.com/Noelo-Lab/kuna/releases/download/v1.157/kuna-v1.157-KunaDecompiler-ghidra_12.1.2.zip) , named `kuna-version-KunaDecompiler-ghidra....zip`.
+1. Download `kuna-v<ver>-KunaDecompiler-ghidra_12.1.4.zip` from the [releases](https://github.com/Noelo-Lab/kuna/releases). Do not bypass a version mismatch with **Install Anyway**.
 2. In Ghidra: File → Install Extensions… → + → select the zip → restart.
 3. In Ghidra: File → Configure → Miscellaneous → check KunaDecompilerPlugin.
 
@@ -59,30 +62,22 @@ Now, when you decompile, you should see `/* Kuna v{version} */` in the decompila
 ![](./assets/kuna_ghidra.png)
 
 All native Ghidra features are not yet supported, so please report them when you find issues.
-To disable the Kuna backend, simply disable the plugin in `File -> Configure`.
+To select the stock native backend for diagnosis, uncheck **Tools → Kuna Decompiler →
+Use Kuna Core** or disable the plugin in **File → Configure**. Loaded Java classes
+remain active until you uninstall the extension and restart. Uninstall the old
+extension and restart before installing a replacement, then restart again.
 
 ### Ghidra Headless Usage
 
-The Kuna extension swaps the decompiler from a CodeBrowser plugin, and headless Ghidra (`analyzeHeadless`, PyGhidra, or tools built on them like [REA](https://github.com/morluto/rea)) never loads GUI plugins.
-To use Kuna as the decompiler backend there, swap the native decompiler binary directly.
-
-1. Locate the stock Ghidra decompiler binary and back it up:
-   ```bash
-   cd "$GHIDRA_INSTALL_DIR/Ghidra/Features/Decompiler/os/linux_x86_64"
-   cp decompile decompile.ghidra.orig
-   ```
-2. Replace it with the Kuna backend from the extension zip's `KunaDecompiler/os/linux_x86_64/` directory:
-   ```bash
-   cp /path/to/KunaDecompiler/os/linux_x86_64/kuna_ghidra decompile
-   chmod +x decompile
-   ```
-3. Verify the swap: decompile a function and check for the `/* Kuna v<version> */` marker in the output.
-
-No specs download is needed: `kuna_ghidra` gets the processor specs and p-code from Ghidra itself.
-On other platforms, use the matching `os/<platform>/` directory (`linux_arm_64`, `mac_x86_64`, `mac_arm_64`, or `win_x86_64`, where both files end in `.exe`).
-To revert to the stock Ghidra decompiler, restore the backup with `cp decompile.ghidra.orig decompile`.
-The [extension README](integrations/ghidra/KunaDecompiler/README.md#use-with-pyghidra-headless--scripting) also covers an in-script PyGhidra toggle and a drop-in that leaves the stock binary untouched.
-This method was tested with Ghidra 12.1.2 and REA 3.1.0.
+Headless Ghidra (`analyzeHeadless`, PyGhidra, or tools built on them like
+[REA](https://github.com/morluto/rea)) does not load CodeBrowser plugins. Install
+the same full extension in the selected per-user profile and restart the JVM.
+Then select its native backend before constructing a `DecompInterface`, using
+the installed `kuna.KunaCoreSwap` selection APIs in Ghidra scripts or the
+[PyGhidra selection example](integrations/ghidra/KunaDecompiler/README.md#use-with-pyghidra-headless--scripting).
+These controls select the native process only; they do not install or unload Java.
+No stock Ghidra binary needs to be overwritten, and no specs download is needed:
+`kuna_ghidra` gets processor specs and p-code from Ghidra itself.
 
 ## Project Goals
 

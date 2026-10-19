@@ -2,47 +2,184 @@
 
 A standard Ghidra extension that makes the **stock Ghidra GUI** spawn **kuna** (the Rust
 port of the Ghidra decompiler, this repository) as its native decompiler backend, in
-place of the stock C++ `decompile` binary — the *unchanged* Ghidra GUI (Decompiler
-window, analyzers, scripts) running on the kuna engine. It is a drop-in, backwards-
-compatible backend: Ghidra's Java side is untouched; only the spawned process changes.
+place of the stock C++ `decompile` binary. The normal Ghidra GUI (Decompiler
+window, analyzers, scripts) runs on the kuna engine, with bounded, versioned Java
+owner patches for result-local types, source-edit authority and export configuration.
+There is one full extension product, not a separate native-only installation.
 
-**Status: Phase 2 — kuna decompiles.** The `kuna_ghidra` binary speaks the complete
-Ghidra⇄decompiler wire protocol *and* drives kuna's engine, so the Decompiler window
-shows **real C produced by kuna**, with working click-to-address. Current scope: simple,
-self-contained functions decompile cleanly; a function that references globals/types the
-engine can't yet resolve shows placeholder names (`sub_…`/`DAT_…`) and default types —
-correct names/types at scale is Phase 3 (the lazy symbol scope). See
+The `kuna_ghidra` binary speaks the Ghidra⇄decompiler wire protocol and drives kuna's
+engine, including lazy source-symbol/type queries and HighFunction/token markup.
+The Decompiler window shows **C produced by kuna**, with click-to-address and
+source-edit bindings. Unsupported engine paths remain per-function failures; these
+integration capabilities do not promise correct decompilation of every input. See
 [`docs/ghidra-integration.md`](../../../docs/ghidra-integration.md) for the design and
-phase plan. Developed against Ghidra **12.2-DEV**; release zips are built against the
-latest stable release (currently **12.1.2**). The swap relies on the exact shape of
-`DecompileProcessFactory`, which is identical across both (see *How it works* below).
+protocol contracts. The extension is strictly qualified for **Ghidra 12.1.4 with
+Java 21**, identified in the release ZIP filename.
 
 ## Install from a GitHub Release (recommended; works airgapped)
 
 Every kuna release ships a ready-to-install extension zip —
-`kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip` on the
+`kuna-v<ver>-KunaDecompiler-ghidra_12.1.4.zip` on the
 [releases tab](https://github.com/Noelo-Lab/kuna/releases) — with prebuilt `kuna_ghidra`
 backends for **all platforms** already inside: Linux x86_64 and arm64, macOS x86_64 and
 arm64, Windows x86_64 (`kuna_ghidra.exe`). Ghidra picks the right one at runtime, and
 its built-in arm→x86 fallbacks cover the rest (Windows-on-ARM runs the x86_64 binary
 under emulation; an Apple-Silicon install missing `mac_arm_64` would fall back to
 `mac_x86_64` under Rosetta). No cargo, no network, no separate specs download —
-`kuna_ghidra` receives everything over the wire, so the zip plus a Ghidra release
-install are the only two files an airgapped machine needs.
+`kuna_ghidra` receives everything over the wire. An airgapped machine needs the
+extension ZIP, the matching Ghidra installation and Java 21, but no Rust toolchain.
 
-1. Download the `…KunaDecompiler-ghidra_<version>.zip` asset from the kuna releases tab.
+1. Download the `…KunaDecompiler-ghidra_12.1.4.zip` asset from the kuna releases tab.
 2. In Ghidra's project window: **File → Install Extensions… → `+` → select the zip**,
    then restart Ghidra when prompted.
 3. Enable the plugin: open a program in the CodeBrowser, then **File → Configure →
    Miscellaneous** and check **KunaDecompilerPlugin**.
 
-The zip is built against — and version-locked to — the Ghidra version in its filename
-(the extension installer compares versions). On another Ghidra 12.x, the installer shows
-an **Extension Version Mismatch** dialog; **Install Anyway** generally works because the
-factory seam the plugin relies on is stable across 12.x, but those pairings are
-unverified.
+The zip is built against — and version-stamped with — the Ghidra version in its
+filename. Ghidra warns on a version mismatch; that is not compatibility proof.
+Use exactly **Ghidra 12.1.4 with Java 21**. **Install Anyway** is not a
+compatibility path. Retargeting requires matching owner patches and qualification,
+not merely changing a version string.
 
 The sections below are the from-source paths: building the backend and the zip yourself.
+
+## Build the full extension from source (Ghidra 12.1.4)
+
+Use an unmodified Ghidra **12.1.4** installation, Java 21, the Gradle version
+required by `application.gradle.min` in its `Ghidra/application.properties`,
+Rust, Python 3 and the standard GNU/BSD `patch` utility. Build the native backend
+and full normal extension ZIP from the same source:
+
+```bash
+cd integrations/ghidra/KunaDecompiler
+GHIDRA_INSTALL_DIR=/abs/stock-ghidra-12.1.4 ./build.sh
+# -> dist/ghidra_12.1.4_PUBLIC_<date>_KunaDecompiler.zip
+
+# If a compatible native backend is freshly built and staged in os/<platform>/:
+gradle -PGHIDRA_INSTALL_DIR=/abs/stock-ghidra-12.1.4 buildExtension
+```
+
+To produce the extension ZIP, the driver requires `GHIDRA_INSTALL_DIR` and checks
+its exact version before native compilation. Without it, the driver only builds
+and stages a development native backend. It selects Rust's host target and reads Cargo's artifact
+report, so a configured cross target or nondefault `CARGO_TARGET_DIR` cannot
+mislabel the packaged host backend. A source build packages only that host;
+release CI stages all five platforms. Direct Gradle packaging requires a matching
+native backend already staged in `os/<platform>/`; use `-PkunaPlatform=<platform>`
+to select just that platform.
+
+Install that ZIP through **File → Install Extensions… → `+`**, then restart Ghidra.
+The package keeps the `KunaDecompiler` module name, existing plugin JAR in `lib/`
+and native assets in `os/`. Its complete freshly compiled enhanced owner/helper
+closure is in `KunaDecompiler/bin/main/`: normal extension discovery places those
+classes before the original module JARs in the same `GhidraClassLoader`. There is
+no separate Java artifact to install and no modification of Ghidra's module JARs.
+Enable **KunaDecompilerPlugin** through **File → Configure → Miscellaneous** to
+activate the native backend. Ghidra's stock `buildExtension` still owns the plugin
+JAR, embedded `zipSource` source archive, module metadata and license rules.
+The existing `prepareEnhancedIntegrationSources` / `compileEnhancedIntegration`
+tasks prepare and compile the Java closure; these are internal protocol-owner
+names, not separate distribution choices.
+
+Uninstall the previous `KunaDecompiler` through **File → Install Extensions…** and
+restart before installing its replacement; restart again to load the replacement.
+The native **Use Kuna Core** toggle does not unload enhanced Java classes. To remove
+those classes, uninstall the extension and restart. An untouched-Java
+control uses the same stock installation with a separate per-user settings profile
+that has no extension. Use Ghidra's `ApplicationLayout` to resolve that
+profile's settings and extension directories, rather than guessing user-prefix
+paths; see [the test setup](../../../tests/ghidra/README.md).
+The repository's reference checkout is not an installation target.
+
+The build requires the unmodified installation source/JAR pair, including
+`Decompiler-src.zip`, `SoftwareModeling-src.zip` and `Base-src.zip`. Bounded
+maintained diffs in `patches/ghidra-12.1.4` apply strictly to those source members
+in clean build staging using the standard GNU/BSD `patch` executable (`PATCH`
+can select its path). Batch/forward/fuzz-zero flags are required; any nonzero
+status or offset/fuzz/reverse/skip/reject diagnostic is a failure. Existing
+Ghidra class bodies are not duplicated in the repository. Only new helper classes
+are kept whole under `src/enhanced/java`.
+
+Enhanced managers offer result protocol version 1 in `coretypes`; a supporting
+native result acknowledges it even when no local definitions are needed. Old peers
+without that acknowledgment retain ordinary grammar and do not gain enhanced
+authority. Inferred types stay result-local, managed source/core identities are
+shared, and held results retain used temporary bindings. Current enhanced source
+edits require the captured Program revision and registered-context snapshot to
+remain current; readability is retained. Export publication checks its separate
+invocation authority rather than granting working export results source-edit authority.
+
+For invocation-owned selected-root preparation, use
+`CppExporter.setConfigurer(DecompileConfigurer)` and
+`prepareSelectedRoots(program, explicitFunctions, monitor)` before provider
+discovery. Configure `DecompileOptions.setExportInline(true)` through that same
+configurer for preparation and every fresh exporter interface. This is opt-in;
+ordinary exports and normal decompile requests retain their existing defaults.
+Preparation uses ordinary canonical decompilation. The exporter inventories actual
+functions once using the existing listing selection and function-tag filter, then
+captures one immutable `DecompInterface.ExportScope` for that entire inventory.
+The same datatype-name owner first reserves program source names and supplies an
+immutable identifier snapshot to `createExportScope(program, functions,
+reservedIdentifiers)`, so private native identifiers avoid the writer's existing
+source-name namespace, including its C identifier transformations.
+The same inventory drives chunking; selected membership is neither queried again
+nor widened to include additional bodies. Every fresh private interface installs
+the same scope after its options, configurer, program registration and toggles,
+and scoped callbacks use `decompileFunctionForExport`. Pool disposal closes the
+scope before disposing each interface. Before each scoped acquisition, callbacks
+reinstall the same immutable scope: this is idempotent while active and allows the
+next independent target to recover after a target-local failure closes its scope.
+A backend without enhanced acknowledgment
+retains ordinary canonical requests and receives no export-only commands.
+Preparation and working requests retain one NONDB temporary-ID epoch; only
+working requests omit automatic clearing and body flushing. Explicit flush,
+scope close, cancellation, decode failure and acquisition errors still flush and
+clear that private epoch. Captured result bindings stay readable independently.
+Revision, registered-core and effective option/action/output snapshots are checked
+before acquisition and after complete decoding. Working results never authorize
+source edits; their export-authority snapshot retains no live interface/process.
+Physical export metadata selects the actual typed public prototype in the result's
+markup; the mapped printer renders that group with the invocation's datatype names.
+An implementation-only result contributes no public header declaration. Descriptor
+identifiers are reserved before local datatype names are assigned, and native markup
+retains ownership of helper and dependency declaration ordering. Headers are not
+inferred from the first implementation signature or rewritten as text.
+Descriptor identities match raw received function-name tokens; supported template,
+operator, Unicode and suffix spellings retain the existing renderer's name policy.
+
+See [the integration contract](../../../docs/ghidra-integration.md)
+for protocol IDs, lifetime and typed-name behavior.
+
+The bounded exporter keeps ordinary per-function failure behavior: diagnostic
+comments are optional, skipped results do not make a successful batch fail, and
+chunks still stream in address order. Cancellation and output-stream errors
+remain failures. The ordinary untouched-Java profile does not load these owner
+patches. The datatype writer renders a source pointer with no referent as `void *`,
+including inside typedefs; its internal display name (`pointer64`, for example)
+is not a C type declaration. Neither behavior changes imported source metadata.
+
+The enhanced Java exporter additionally retains referenced external function declarations
+through actual High CALL targets and source thunk associations. Only declarations
+are added, not unselected bodies. Their source prototypes, varargs and type closure
+use the invocation's existing writer/name authority. Mach-O and ELF exports target
+the GCC/Clang dialect: `__asm__` binds the unchanged source C identifier to the real
+retained imported label, including Mach-O's leading underscore. Renamed imports use
+their original imported name; an unchanged label is authoritative only when its
+source is `IMPORTED`. Missing or non-printable labels, other object formats,
+custom parameter/return storage and non-default calling conventions are
+ineligible for the optional added declaration/binding, not newly refused exports.
+Their existing declaration/body behavior remains unchanged.
+The typed writer emits genuine named callable datatypes as function-type typedefs,
+while preserving pointers and real aliases as separate layers. Anonymous callable
+types stay structural; an internal result placeholder does not authorize a name.
+All exporter-owned declaration writers receive the invocation's actual compiler
+specification and calling-convention display option. Each callable layer retains
+its resolved nondefault convention; actual default models and convention-OFF
+output remain unannotated. Other, unconfigured datatype writers retain their
+ordinary behavior. A model named `__stdcall` is not itself evidence of a Windows
+ABI: the x86-64 GCC specification uses that name for its System V default.
+Synthetic external declaration roots are structural and cannot introduce a typedef
+that conflicts with the imported function identifier.
 
 ## How it works
 
@@ -57,77 +194,31 @@ Tools-menu checkbox toggles between the kuna core and the stock one at runtime.
 
 ## Run the kuna backend in a real Ghidra instance
 
-The whole flow, against a **Ghidra release install** — build the backend, package the
-extension, install it, enable the plugin, decompile:
-
-```bash
-# 1. Build the kuna_ghidra backend and package the extension in one step.
-#    build.sh compiles the release binary, stages it into os/<platform>/, and
-#    (because GHIDRA_INSTALL_DIR is set) builds the installable zip.
-cd integrations/ghidra/KunaDecompiler
-GHIDRA_INSTALL_DIR=/abs/path/to/ghidra_12.2 ./build.sh
-#    -> dist/ghidra_12.2_..._KunaDecompiler.zip
-```
-
+1. **Build the full extension** as described above against Ghidra 12.1.4 and Java 21.
 2. **Install the extension:** in Ghidra's project window, **File → Install Extensions… →
    `+` → select `dist/…_KunaDecompiler.zip`**, then restart Ghidra when prompted.
 3. **Enable the plugin:** open a program in the CodeBrowser, then **File → Configure →
    Miscellaneous** and check **KunaDecompilerPlugin**. On load it swaps the decompiler
    core and logs `Decompiler core is now KUNA: <path>`.
-4. **Decompile:** open any function — the Decompiler window now shows kuna's C. (Try a
-   small, self-contained function first; see the status note above for what Phase 2 does
-   and doesn't yet resolve.)
+4. **Decompile:** open a function — the Decompiler window now shows kuna's C.
+   Unsupported engine paths produce a per-function error rather than guaranteeing
+   output for every function.
 5. **Toggle / revert** at runtime with **Tools → Kuna Decompiler → Use Kuna Core** (see
    *Revert* below).
 
-Manual equivalents and the dev-checkout path are in the sections below.
+### Development native override (full extension already installed)
 
-### Just the binary (manual)
-
-`build.sh` with no `GHIDRA_INSTALL_DIR` builds + stages the binary only; the equivalent
-by hand, from the repo root:
-
+For native iteration, keep the full Java extension installed in the selected
+Ghidra 12.1.4 profile and start a fresh JVM with
+`-Dkuna.decompiler.exe=/abs/path/to/kuna_ghidra` pointing to a matching native build:
 ```bash
 cd decompiler
 cargo build --release -p kuna-ghidra
-cp target/release/kuna_ghidra ../integrations/ghidra/KunaDecompiler/os/linux_x86_64/
 ```
 
-The binary is a gitignored build artifact; it must be present under
-`os/<platform>/` **before** building the extension zip so it gets packaged (`build.sh`
-picks the right `os/<platform>/` dir for your host; for other platforms see
-`os/linux_x86_64/README.md`).
-
-## Build & install the extension
-
-### Against a Ghidra release install
-
-Use the Gradle version named by `application.gradle.min` in
-`<GHIDRA_INSTALL_DIR>/Ghidra/application.properties`:
-
-```bash
-cd integrations/ghidra/KunaDecompiler
-gradle -PGHIDRA_INSTALL_DIR=<Absolute path to Ghidra> buildExtension
-# -> dist/ghidra_<version>_<release>_<date>_KunaDecompiler.zip
-```
-
-Then in Ghidra's project window: **File → Install Extensions… → + → select the zip**,
-and restart Ghidra when prompted.
-
-### Against a Ghidra source (dev) checkout
-
-No zip needed — inject this directory as an external module when launching Ghidra
-(this is the seam GhidraDev/VSCode dev launches use,
-`GhidraApplicationLayout.java:174-181`):
-
-```
--Dghidra.external.modules=/abs/path/to/kuna/integrations/ghidra/KunaDecompiler
-```
-
-added to the launcher's VM args (e.g. the Eclipse/VSCode launch configuration created
-by `gradle prepDev` / the VSCode integration), with the extension's Java compiled into
-the project. During development you can skip copying the binary and instead pass
-`-Dkuna.decompiler.exe=/abs/path/to/kuna/decompiler/target/release/kuna_ghidra`.
+This selects only the native executable; it neither installs Java classes nor
+replaces normal extension installation. For manual native staging and platform
+directory names, see [`os/linux_x86_64/README.md`](os/linux_x86_64/README.md).
 
 ## Enable the plugin
 
@@ -156,84 +247,97 @@ leaves the stock core active.
   process keep it until that process restarts (reopen the program, or the process is
   reset after an error/timeout); reopening the program is the reliable nudge.
 - **Plugin off:** un-check the plugin in File → Configure (its dispose restores the
-  stock core), or **File → Install Extensions…** and uncheck KunaDecompiler, then
-  restart Ghidra.
-
-## Alternative: the no-code file-drop seam
-
-You can run kuna under Ghidra without this extension at all: copy the kuna binary
-**named `decompile`** to
-
-```
-<GHIDRA_INSTALL_DIR>/Ghidra/Features/Decompiler/build/os/<platform>/decompile
-```
-
-`Application.getModuleOSFile` searches a module's `build/os/<platform>/` *before*
-`os/<platform>/`, so this shadows the stock binary without overwriting it (delete the
-`build/os` copy to revert). Tradeoffs versus the extension:
-
-- applies **unconditionally** to that install — every project, every tool, no toggle,
-  no logging of which core is active;
-- invisible: nothing in the GUI indicates the core was swapped (use
-  `KunaCoreStatus.java`'s output path, or the phase-1 message, to tell);
-- survives extension uninstalls but may be wiped by Ghidra upgrades/rebuilds;
-- per-install file surgery rather than a distributable artifact.
-
-The extension is the recommended path; the file drop is handy for quick experiments on
-a release install.
+  stock core). This changes native selection, not already loaded enhanced Java.
+- **Uninstall:** **File → Install Extensions…**, uncheck KunaDecompiler, then
+  restart Ghidra. Enhanced Java remains loaded until restart. Uninstall/restart
+  before installing a replacement; restart again to load the replacement.
 
 ## Use with PyGhidra (headless / scripting)
 
-Build the backend once (`cd decompiler && cargo build --release -p kuna-ghidra`), install
-pyghidra (`pip install "$GHIDRA_INSTALL_DIR"/Ghidra/Features/PyGhidra/pypkg/dist/pyghidra-*.whl`,
-or `pip install pyghidra`), and set `GHIDRA_INSTALL_DIR`. Then pick one of two ways to make
-Ghidra use kuna.
+Install the full extension above into the selected per-user profile, install
+PyGhidra (`pip install "$GHIDRA_INSTALL_DIR"/Ghidra/Features/PyGhidra/pypkg/dist/pyghidra-*.whl`,
+or `pip install pyghidra`), and set `GHIDRA_INSTALL_DIR` to the matching Ghidra 12.1.4
+installation. Start a fresh JVM under Java 21. The installed `KunaCoreSwap` API
+resolves the extension's matching platform executable; for native development
+only, set `-Dkuna.decompiler.exe=/abs/path/to/kuna_ghidra` before JVM startup.
 
-### In-script toggle — recommended (no file changes)
+### In-script native selection (no installation file changes)
 
-The GUI plugin can't load headless, but you can do exactly what it does — set
-`DecompileProcessFactory`'s cached `exepath` by reflection — straight from Python. This
-flips the core on and off at runtime with **no file surgery**; it takes effect on the next
-decompiler-process spawn (a freshly constructed `DecompInterface`):
+The GUI plugin can't load headless, but the installed `kuna.KunaCoreSwap` owner
+exposes the same native-selection seam. It sets `DecompileProcessFactory`'s cached
+`exepath` by reflection, with **no file surgery**. Selection takes effect on the
+next decompiler-process spawn:
 
 ```python
-import os, pyghidra
+import pyghidra
 pyghidra.start()
-from ghidra.app.decompiler import DecompileProcessFactory, DecompInterface
+from jpype import JClass
+from ghidra.app.decompiler import DecompInterface
 from ghidra.util.task import ConsoleTaskMonitor
 
-def _exepath():
-    f = DecompileProcessFactory.class_.getDeclaredField("exepath")
-    f.setAccessible(True)
-    return f
-def enable_kuna(exe):  _exepath().set(None, exe)    # kuna ON  (abs path to kuna_ghidra)
-def disable_kuna():    _exepath().set(None, None)   # back to the stock decompiler
-def active_core():     return _exepath().get(None)  # what Ghidra will spawn next
+KunaCoreSwap = JClass("kuna.KunaCoreSwap")
 
 with pyghidra.open_program("a.out") as flat:        # analyze=True by default
     program = flat.getCurrentProgram()
-    enable_kuna(os.environ["KUNA_GHIDRA_EXE"])       # target/release/kuna_ghidra
-    ifc = DecompInterface(); ifc.openProgram(program)
-    for func in program.getFunctionManager().getFunctions(True):
-        print(ifc.decompileFunction(func, 60, ConsoleTaskMonitor()).getDecompiledFunction().getC())
-    ifc.dispose()
-    disable_kuna()                                   # later DecompInterfaces use stock again
+    previous = KunaCoreSwap.getInstalledExePath()
+    KunaCoreSwap.setInstalledExePath(KunaCoreSwap.findKunaBinary().getAbsolutePath())
+    ifc = DecompInterface()
+    try:
+        if not ifc.openProgram(program):
+            raise RuntimeError(str(ifc.getLastMessage()))
+        for func in program.getFunctionManager().getFunctions(True):
+            result = ifc.decompileFunction(func, 60, ConsoleTaskMonitor())
+            print(result.getDecompiledFunction().getC()
+                  if result.decompileCompleted() else result.getErrorMessage())
+    finally:
+        try:
+            ifc.dispose()
+        finally:
+            KunaCoreSwap.setInstalledExePath(previous)
 ```
 
-`enable_kuna`/`disable_kuna` are the headless equivalent of the extension's
-**Tools → Kuna Decompiler → Use Kuna Core** checkbox (which already toggles the GUI at
-runtime). An already-open `DecompInterface` keeps its current core until it respawns, so
-toggle *before* constructing the one you want to run.
+`KunaCoreSwap.swapToKuna(originator)` / `restoreStock(originator)` expose the
+GUI checkbox's selection and diagnostic behavior. `getInstalledExePath()` /
+`setInstalledExePath(path)` let a script capture and restore its exact prior
+selection as above. An already-open `DecompInterface` keeps its current core until it respawns, so
+toggle *before* constructing the one you want to run. These controls select only
+the native core. Enhanced Java must already be installed as the normal extension
+in the selected per-user profile before starting PyGhidra; use a fresh JVM after
+installation, replacement or uninstall.
 
-### Persistent swap — the file-drop seam
+For `analyzeHeadless`, select the same native backend in a Java Ghidra script
+before opening its `DecompInterface`, using that same installed owner:
 
-When you can't inject Python (e.g. `analyzeHeadless`) or want *every* Ghidra invocation to
-use kuna, drop the binary named `decompile` into the module's `build/os/<platform>/` (Ghidra
-searches it before `os/<platform>/`, so it shadows the stock binary without overwriting it —
-delete the copy to revert):
-
-```bash
-PLAT=mac_arm_64   # or linux_x86_64 | mac_x86_64 | linux_arm_64 (see build.sh)
-DROP="$GHIDRA_INSTALL_DIR/Ghidra/Features/Decompiler/build/os/$PLAT"
-mkdir -p "$DROP" && cp decompiler/target/release/kuna_ghidra "$DROP/decompile"
+```java
+String previous = kuna.KunaCoreSwap.getInstalledExePath();
+kuna.KunaCoreSwap.setInstalledExePath(
+    kuna.KunaCoreSwap.findKunaBinary().getAbsolutePath());
+ghidra.app.decompiler.DecompInterface ifc = new ghidra.app.decompiler.DecompInterface();
+try {
+    if (!ifc.openProgram(currentProgram)) {
+        throw new IllegalStateException(ifc.getLastMessage());
+    }
+    for (ghidra.program.model.listing.Function function :
+            currentProgram.getFunctionManager().getFunctions(true)) {
+        ghidra.app.decompiler.DecompileResults result =
+            ifc.decompileFunction(function, 60, monitor);
+        if (result.decompileCompleted()) {
+            println(result.getDecompiledFunction().getC());
+        }
+        else {
+            printerr(result.getErrorMessage());
+        }
+    }
+}
+finally {
+    try {
+        ifc.dispose();
+    }
+    finally {
+        kuna.KunaCoreSwap.setInstalledExePath(previous);
+    }
+}
 ```
+
+This selection presumes the full extension is installed in the launch profile.
+It does not overwrite the stock binary or install the Java closure.

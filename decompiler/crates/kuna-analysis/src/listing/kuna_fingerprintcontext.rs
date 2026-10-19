@@ -89,6 +89,13 @@ impl FingerprintContexts {
                 at = at.wrapping_add(u64::from(insn.len));
             }
         }
+        // Literal-pool admission consumes real operand facts, not just the
+        // mnemonic fingerprints. The xrefs partition retains those read edges.
+        for reference in listing.refs.edges() {
+            if reference.kind == super::RefKind::Read && listing.in_exec(reference.to) {
+                needed.insert(reference.from);
+            }
+        }
         let mut runs = self.runs.iter().peekable();
         let mut words = &[][..];
         let mut mnemonic = Mnemonic::default();
@@ -106,23 +113,43 @@ impl FingerprintContexts {
                 }
             });
             mnemonic.0.clear();
+            mnemonic.1.clear();
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 translate.print_assembly(&mut mnemonic, &addr)
             }));
             if matches!(rendered, Ok(Ok(n)) if n > 0 && n as u32 == len) {
+                // Resolve a PC-relative literal while its genuine decode context
+                // is active. Later admission must not recompute it from a mode
+                // that another decoded path has since repainted.
+                if (mnemonic.0.starts_with("ldr") || mnemonic.0.starts_with("vldr"))
+                    && mnemonic.1.contains("[pc")
+                {
+                    let delta = || arch.with_context_db_mut(|db|
+                        db.get_variable_value(b"TMode", &addr)).ok()
+                        .map(|mode| if mode == 1 { 4 } else { 8 });
+                    if let Some(target) = crate::aif::kuna_poolentry::pcrel_literal_target(at, &mnemonic.1, delta) {
+                        let start = mnemonic.1.find("[pc").unwrap();
+                        let end = start + mnemonic.1[start..].find(']').unwrap() + 1;
+                        mnemonic.1.replace_range(start..end, &format!("[0x{target:x}]"));
+                    }
+                }
                 let interned = listing.insns.intern_mnemonic(&mnemonic.0);
-                listing.insns.get_mut(&at).unwrap().mnemonic = interned;
+                let insn = listing.insns.get_mut(&at).unwrap();
+                insn.mnemonic = interned;
+                insn.operands.clone_from(&mnemonic.1);
             }
         }
     }
 }
 
 #[derive(Default)]
-struct Mnemonic(String);
+struct Mnemonic(String, String);
 
 impl AssemblyEmit for Mnemonic {
-    fn dump(&mut self, _addr: &Address, mnemonic: &str, _body: &str) {
+    fn dump(&mut self, _addr: &Address, mnemonic: &str, body: &str) {
         self.0.clear();
         self.0.push_str(mnemonic);
+        self.1.clear();
+        self.1.push_str(body);
     }
 }

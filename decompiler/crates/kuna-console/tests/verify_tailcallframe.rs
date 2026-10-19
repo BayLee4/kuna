@@ -75,7 +75,7 @@ fn callback_body(prog: &mut ConsoleProgram) -> String {
         &[],
     );
     let fd = step.result.expect("the callback decompiles");
-    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)
+    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap()
 }
 
 /// The precondition the whole rule exists for: nothing discovers the renderer,

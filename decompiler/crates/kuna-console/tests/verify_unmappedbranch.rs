@@ -54,7 +54,7 @@ fn a_function_that_branches_into_unmapped_memory_still_decompiles() {
     let mut prog = boot();
 
     let target = entry_at(&prog, ENTRY);
-    let out = decompile_targets(&mut prog, vec![target], true, false, false);
+    let out = decompile_targets(&mut prog, vec![target], true, false, false).unwrap();
     assert_eq!(out.len(), 1);
     let r = &out[0];
     assert!(r.error.is_none(), "the selection must not fail, got: {:?}", r.error);
@@ -79,7 +79,7 @@ fn the_lost_edge_is_reported_at_its_branch_site() {
     let mut prog = boot();
 
     let target = entry_at(&prog, ENTRY);
-    let out = decompile_targets(&mut prog, vec![target], true, false, false);
+    let out = decompile_targets(&mut prog, vec![target], true, false, false).unwrap();
     let code = out[0].code.as_deref().unwrap_or("");
     assert!(
         code.contains("Function flows into unmapped memory"),

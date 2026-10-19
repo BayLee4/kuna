@@ -418,7 +418,13 @@ pub fn retain_in_image(out: &mut AnalysisOutput, view: &RebasedView) {
     let keep_range = |&(lo, hi): &(u64, u64)| view.contains(lo) && (hi <= lo || view.contains(hi - 1));
 
     out.symbols.retain(|s| keep(s.addr));
-    out.data_objects.retain(|d| keep(d.addr));
+    out.source_prototypes.retain(|(addr, _)| keep(*addr));
+
+    out.typed_data.retain(|d| {
+        d.type_.get_size() > 0
+            && d.addr.checked_add(d.type_.get_size() as u64 - 1)
+                .is_some_and(|end| keep(d.addr) && keep(end))
+    });
     out.entries.retain(|&a| keep(a));
     out.fde_bodies.retain(keep_range);
     out.pdb_bodies.retain(keep_range);
@@ -439,6 +445,7 @@ pub fn retain_in_image(out: &mut AnalysisOutput, view: &RebasedView) {
     out.comments.retain(|c| keep(c.func_addr) && keep(c.addr));
     out.fid_names.retain(|f| keep(f.addr));
     out.cpp_dwarf.symbols.retain(|s| keep(s.addr));
+    out.cpp_dwarf.source_prototypes.retain(|(addr, _)| keep(*addr));
     out.cpp_dwarf.locals.retain(|l| keep(l.func_addr));
     out.cpp_dwarf.prototypes.retain(|(a, _)| keep(*a));
     out.cpp_sig.proven.retain(|(a, _)| keep(*a));

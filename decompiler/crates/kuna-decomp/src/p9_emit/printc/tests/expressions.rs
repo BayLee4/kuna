@@ -103,7 +103,7 @@ mod recovered_views;
         fd.op_set_output(add, result).unwrap();
         let arch = bare_arch();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None);
+        print.op_push_ir(&fd, &arch, add, None).unwrap();
         let emitted = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 use std::sync::atomic::{{AtomicU32, Ordering}};
@@ -132,7 +132,7 @@ fn main() {{
         fd.op_set_output(add, result).unwrap();
         let arch = bare_arch();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None);
+        print.op_push_ir(&fd, &arch, add, None).unwrap();
         let emitted = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 fn consumer(a: u128, b: u128) -> u128 {{ {emitted} }}
@@ -142,6 +142,41 @@ fn main() {{
 }}
 "#);
         assert_rust_source(&source, "u128-variable");
+    }
+
+    /// Neither an untyped literal receiver nor an outer expected type may
+    /// choose the machine operation's width. In particular, the u64 constant
+    /// must not first be interpreted as a default i32 on the way into a cast.
+    #[test]
+    fn emitted_rust_constant_arithmetic_uses_the_operation_width() {
+        let arch = bare_arch();
+        let mut source = String::from("fn main() {\n");
+        for size in [1, 2, 4, 8] {
+            let bits = size * 8;
+            let mask = kuna_base::address::calc_mask(size);
+            let tyname = format!("u{bits}");
+            for (opcode, left, right, expected) in [
+                (OpCode::CPUI_INT_ADD, mask, 2, 1),
+                (OpCode::CPUI_INT_SUB, 0, 1, mask),
+                (OpCode::CPUI_INT_MULT, mask, 2, mask - 1),
+            ] {
+                let mut fd = build_fd();
+                fd.set_high_level();
+                let op = mk_op(&mut fd, 2, 0x1000, opcode);
+                let a = fd.new_constant(size, left);
+                let b = fd.new_constant(size, right);
+                fd.op_set_input(op, a, 0).unwrap();
+                fd.op_set_input(op, b, 1).unwrap();
+                let out = fd.new_unique(size, Some(named(&tyname, size, type_metatype::TYPE_UINT)));
+                fd.op_set_output(op, out).unwrap();
+                let mut print = execution_printer(&arch, true);
+                print.op_push_ir(&fd, &arch, op, None).unwrap();
+                let expression = print.emit_mut().output_str();
+                source.push_str(&format!("assert_eq!({expression}, {expected}{tyname});\n"));
+            }
+        }
+        source.push_str("}\n");
+        assert_rust_source(&source, "constant-operation-width");
     }
 
     #[test]
@@ -166,7 +201,7 @@ fn main() {{
         fd.op_set_output(extend, result).unwrap();
         let arch = bare_arch();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, extend, None);
+        print.op_push_ir(&fd, &arch, extend, None).unwrap();
         let emitted = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 fn consumer(a: u8, b: u8) -> u32 {{ {emitted} }}
@@ -177,6 +212,35 @@ fn main() {{
 }}
 "#);
         assert_rust_source(&source, "narrow-before-widening");
+    }
+
+    #[test]
+    fn emitted_rust_mixed_signed_words_preserve_the_operation_bits() {
+        let arch = bare_arch();
+        let mut source = String::from("fn main() {\nlet a = -1i64;\nlet b = 2u64;\n");
+        for (opcode, expected) in [
+            (OpCode::CPUI_INT_ADD, 1i64),
+            (OpCode::CPUI_INT_SUB, -3),
+            (OpCode::CPUI_INT_MULT, -2),
+        ] {
+            let mut fd = build_fd();
+            fd.set_high_level();
+            let signed = named("i64", 8, type_metatype::TYPE_INT);
+            let unsigned = named("u64", 8, type_metatype::TYPE_UINT);
+            let a = execution_input(&mut fd, "a", signed.clone());
+            let b = execution_input(&mut fd, "b", unsigned);
+            let op = mk_op(&mut fd, 2, 0x1000, opcode);
+            fd.op_set_input(op, a, 0).unwrap();
+            fd.op_set_input(op, b, 1).unwrap();
+            let result = fd.new_unique(8, Some(signed));
+            fd.op_set_output(op, result).unwrap();
+            let mut print = execution_printer(&arch, true);
+            print.op_push_ir(&fd, &arch, op, None).unwrap();
+            let expression = print.emit_mut().output_str();
+            source.push_str(&format!("assert_eq!({expression}, {expected}i64);\n"));
+        }
+        source.push_str("}\n");
+        assert_rust_source(&source, "mixed-signed-words");
     }
 
     #[test]
@@ -212,9 +276,16 @@ fn main() {{
         let result = fd.new_unique(8, Some(pointer));
         fd.op_set_output(add, result).unwrap();
         fd.op_insert_end(add, block);
-        fd.action_set_casts();
+        fd.action_set_casts().unwrap();
+        // Cast reconciliation may replace PTRADD with integer byte arithmetic
+        // and append the conversion defining this original pointer result.
+        // Render that result, not the former producer's new integer temporary.
+        let result_value = fd.vbank().get(result).unwrap();
+        assert_eq!(result_value.get_type().get_metatype(), type_metatype::TYPE_PTR);
+        assert_eq!(result_value.get_size(), 8);
+        let result_op = result_value.get_def().expect("cast pipeline keeps the pointer result defined");
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None);
+        print.op_push_ir(&fd, &arch, result_op, None).unwrap();
         let emitted = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 use std::sync::atomic::{{AtomicU32, Ordering}};
@@ -254,7 +325,7 @@ fn main() {{ unsafe {{
         let result = fd.new_unique(target_size, Some(pointer));
         fd.op_set_output(add, result).unwrap();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None);
+        print.op_push_ir(&fd, &arch, add, None).unwrap();
         let emitted = print.emit_mut().output_str().to_string();
         let bits = target_size * 8;
         let source = format!(
@@ -306,7 +377,7 @@ fn main() {{ unsafe {{
         fd.op_set_output(add, address).unwrap();
         fd.vbank_mut().get_mut(address).unwrap().set_implied();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None);
+        print.op_push_ir(&fd, &arch, add, None).unwrap();
         let address_text = print.emit_mut().output_str().to_string();
         let load = mk_op(&mut fd, 2, 0x1004, OpCode::CPUI_LOAD);
         let space = fd.new_constant(4, ram(&fd).get_index() as u64);
@@ -315,7 +386,7 @@ fn main() {{ unsafe {{
         let loaded = fd.new_unique(4, Some(cell.clone()));
         fd.op_set_output(load, loaded).unwrap();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, load, None);
+        print.op_push_ir(&fd, &arch, load, None).unwrap();
         let load_text = print.emit_mut().output_str().to_string();
         let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
         let value = execution_input(&mut fd, "value", cell);
@@ -323,7 +394,7 @@ fn main() {{ unsafe {{
         fd.op_set_input(store, address, 1).unwrap();
         fd.op_set_input(store, value, 2).unwrap();
         let mut print = execution_printer(&arch, true);
-        print.emit_statement(&fd, &arch, store);
+        print.emit_statement(&fd, &arch, store).unwrap();
         let store_text = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 fn main() {{ unsafe {{
@@ -410,8 +481,8 @@ fn main() {{ unsafe {{
                             arch.ctypes = false;
                             arch.realtypes = false;
                             let mut print = execution_printer(&arch, rust);
-                            if compound { print.emit_statement(&fd, &arch, op); }
-                            else { print.op_push_ir(&fd, &arch, op, None); }
+                            if compound { print.emit_statement(&fd, &arch, op).unwrap(); }
+                            else { print.op_push_ir(&fd, &arch, op, None).unwrap(); }
                             let emitted = print.emit_mut().output_str().to_string();
                             let body = if compound { format!("{emitted}\nreturn a;") }
                                 else { format!("return {emitted};") };
@@ -484,7 +555,7 @@ fn main() {{ unsafe {{
             fd.op_set_output(add, address).unwrap();
             fd.vbank_mut().get_mut(address).unwrap().set_implied();
             let mut print = execution_printer(&arch, rust);
-            print.op_push_ir(&fd, &arch, add, None);
+            print.op_push_ir(&fd, &arch, add, None).unwrap();
             let address_text = print.emit_mut().output_str().to_string();
             let load = mk_op(&mut fd, 2, 0x1004, OpCode::CPUI_LOAD);
             let space = fd.new_constant(4, ram(&fd).get_index() as u64);
@@ -493,7 +564,7 @@ fn main() {{ unsafe {{
             let loaded = fd.new_unique(4, Some(cell.clone()));
             fd.op_set_output(load, loaded).unwrap();
             let mut print = execution_printer(&arch, rust);
-            print.op_push_ir(&fd, &arch, load, None);
+            print.op_push_ir(&fd, &arch, load, None).unwrap();
             let load_text = print.emit_mut().output_str().to_string();
             let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
             let value = execution_input(&mut fd, "value", cell);
@@ -501,7 +572,7 @@ fn main() {{ unsafe {{
             fd.op_set_input(store, address, 1).unwrap();
             fd.op_set_input(store, value, 2).unwrap();
             let mut print = execution_printer(&arch, rust);
-            print.emit_statement(&fd, &arch, store);
+            print.emit_statement(&fd, &arch, store).unwrap();
             let store_text = print.emit_mut().output_str().to_string();
             let source = if rust {
                 format!(r#"
@@ -548,6 +619,43 @@ int main(void) {{
     }
 
     #[test]
+    fn raw_pointer_language_switch_keeps_the_analyzed_operation_and_types() {
+        let arch = bare_arch();
+        let width = std::mem::size_of::<usize>() as int4;
+        let types = arch.types_rc();
+        let cell = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
+        let pointer = types.get_type_pointer(width, cell, 1).unwrap();
+        let integer = types.get_base(width, type_metatype::TYPE_INT).unwrap();
+        let mut fd = build_fd();
+        fd.set_high_level();
+        let base = execution_input(&mut fd, "p", pointer.clone());
+        let index = execution_input(&mut fd, "i", integer);
+        let stride = fd.new_constant(width, 4);
+        let op = mk_op(&mut fd, 3, 0x1000, OpCode::CPUI_PTRADD);
+        fd.op_set_input(op, base, 0).unwrap();
+        fd.op_set_input(op, index, 1).unwrap();
+        fd.op_set_input(op, stride, 2).unwrap();
+        let result = fd.new_unique(width, Some(pointer.clone()));
+        fd.op_set_output(op, result).unwrap();
+        let mut rendered = Vec::new();
+        for rust in [false, true, false] {
+            let mut print = execution_printer(&arch, rust);
+            print.op_push_ir(&fd, &arch, op, None).unwrap();
+            rendered.push(print.emit_mut().output_str().to_owned());
+            let operation = fd.obank().get(op).unwrap();
+            assert_eq!(operation.code(), OpCode::CPUI_PTRADD);
+            assert_eq!(operation.get_out(), Some(result));
+            assert_eq!((operation.get_in(0), operation.get_in(1), operation.get_in(2)),
+                (Some(base), Some(index), Some(stride)));
+            assert!(Rc::ptr_eq(fd.vbank().get(base).unwrap().get_type(), &pointer));
+            assert!(Rc::ptr_eq(fd.vbank().get(result).unwrap().get_type(), &pointer));
+        }
+        assert_eq!(rendered[0], rendered[2]);
+        assert!(rendered[1].contains(".wrapping_offset("), "{}", rendered[1]);
+        assert!(!rendered[1].contains("&mut"), "{}", rendered[1]);
+    }
+
+    #[test]
     fn emitted_rust_fallback_pointer_load_and_store_keep_the_memory_access() {
         use crate::dtype::TypeFactory;
         use std::process::Command;
@@ -576,7 +684,7 @@ int main(void) {{
         let loaded = fd.new_unique(4, Some(cell.clone()));
         fd.op_set_output(load, loaded).unwrap();
         let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, load, None);
+        print.op_push_ir(&fd, &arch, load, None).unwrap();
         let load_text = print.emit_mut().output_str().to_string();
         let store = mk_op(&mut fd, 3, 0x1008, OpCode::CPUI_STORE);
         let value = execution_input(&mut fd, "value", cell);
@@ -584,7 +692,7 @@ int main(void) {{
         fd.op_set_input(store, address, 1).unwrap();
         fd.op_set_input(store, value, 2).unwrap();
         let mut print = execution_printer(&arch, true);
-        print.emit_statement(&fd, &arch, store);
+        print.emit_statement(&fd, &arch, store).unwrap();
         let store_text = print.emit_mut().output_str().to_string();
         let source = format!(r#"
 extern "C" {{ fn PTRADD(p: *mut u32, index: i32, stride: i32) -> *mut u32; }}
@@ -677,7 +785,7 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
         let strategy = CastStrategyC::new(types.clone());
         assert!(Rc::ptr_eq(&strategy.cast_standard(&destination, &source_type, false, true)
             .expect("distinct declared prototypes require a conversion"), &destination));
-        let source = fd.new_varnode(8, &Address::new(memory, 0x400), Some(source_type.clone()));
+        let source = fd.new_varnode(8, &Address::new(memory, 0x400), Some(source_type.clone())).unwrap();
         let source = fd.set_input_varnode(source).unwrap();
         name_call_local(&mut fd, source, "callback");
         let root = fd.bblocks_root_pub();
@@ -688,7 +796,7 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
         fd.vn_update_type(converted, destination.clone());
         name_call_local(&mut fd, converted, "converted");
         fd.op_insert_end(copy, block);
-        fd.action_set_casts();
+        fd.action_set_casts().unwrap();
         let cast_output = fd.obank().get(copy).unwrap().get_in(0).unwrap();
         let cast = fd.vbank().get(cast_output).unwrap().get_def()
             .expect("real cast stage must insert the declared conversion");
@@ -699,7 +807,7 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
             let mut arch = bare_arch();
             arch.ctypes = native;
             let mut print = execution_printer(&arch, false);
-            print.op_type_cast_ir(&fd, &arch, cast);
+            print.op_type_cast_ir(&fd, &arch, cast).unwrap();
             let emitted = print.emit_mut().output_str().to_string();
             assert!(emitted.contains(if native { "int" } else { "int4" })
                 && emitted.contains("(*)"), "{emitted}");
@@ -755,11 +863,14 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
     model.output_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
         memory.clone(), 0x200, 8, 1, 0, 0, true, false, &[], &manager).unwrap());
     model.output_mut().finish_decode();
-    let model = Rc::new(model);
+    let mut arch = bare_arch();
+    arch.realtypes = false;
+    arch.set_default_model_rc(Rc::new(model));
+    let model = arch.default_fp().unwrap().clone();
     types.set_proto_context(manager.clone());
-    types.set_proto_models(Some(model.clone()), std::collections::BTreeMap::from([
+    types.set_proto_models(Some(model.clone()), Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::from([
         ("recovered_abi".to_string(), model.clone()),
-    ]));
+    ]))));
     let mut context = ContextArch::new_shared(manager);
     context.types = Some(types.clone());
     context.defaultfp = Some(model.clone());
@@ -769,7 +880,7 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
     fd.get_func_proto_mut().set_internal(model.clone(), void.clone());
     let source_type = types.get_base(8, type_metatype::TYPE_UINT).unwrap();
     let address = Address::new(memory.clone(), 0x400);
-    let source = fd.new_varnode(8, &address, Some(source_type.clone()));
+    let source = fd.new_varnode(8, &address, Some(source_type.clone())).unwrap();
     let source = fd.set_input_varnode(source).unwrap();
     fd.get_func_proto_mut().set_param(0, "target", &ParameterPieces {
         addr: address, type_: Some(source_type.clone()), flags: 0,
@@ -788,8 +899,8 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
     fd.op_insert_end(call, block);
     fd.set_high_level();
     name_call_local(&mut fd, source, "target");
-    ActionCallTargetType::boxed("analysis").apply(&mut fd, &mut ActionContext::new());
-    let facing = fd.vn_high_type_read_facing(source, call);
+    ActionCallTargetType::boxed("analysis").apply(&mut fd, &mut ActionContext::new()).unwrap();
+    let facing = fd.vn_high_type_read_facing(source, call).unwrap();
     assert!(Rc::ptr_eq(&facing, &source_type));
     let authority = fd.kuna_call_target_type(call)
         .expect("ABI-compatible integer target must publish its per-call signature");
@@ -802,28 +913,26 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
     assert!(!signature.is_dotdotdot());
     let strategy = CastStrategyC::new(types.clone());
     assert!(Rc::ptr_eq(&get_input_cast(&mut fd, &strategy, call, 0)
-        .expect("published authority must reach the cast consumer"), &authority));
-    fd.action_set_casts();
+        .unwrap().expect("published authority must reach the cast consumer"), &authority));
+    fd.action_set_casts().unwrap();
     let cast_output = fd.obank().get(call).unwrap().get_in(0).unwrap();
     let cast = fd.vbank().get(cast_output).unwrap().get_def()
         .expect("real cast owner must insert the numeric callable conversion");
     assert_eq!(fd.obank().get(cast).unwrap().code(), OpCode::CPUI_CAST);
     assert_eq!(fd.obank().get(cast).unwrap().get_in(0), Some(source));
     assert!(Rc::ptr_eq(fd.vbank().get(cast_output).unwrap().get_type(), &authority));
-    let mut arch = bare_arch();
-    arch.realtypes = false;
     for _ in 0..2 {
-        assert!(get_input_cast(&mut fd, &strategy, call, 0).is_none());
+        assert!(get_input_cast(&mut fd, &strategy, call, 0).unwrap().is_none());
         for native in [false, true] {
             arch.ctypes = native;
             let mut plain = execution_printer(&arch, false);
-            plain.op_call_ir(&fd, &arch, call);
+            plain.op_call_ir(&fd, &arch, call).unwrap();
             plain.recurse();
             let text = plain.emit_mut().output_str().to_string();
             let mut print = execution_printer(&arch, false);
             print.set_markup(true);
             print.emit_mut().set_capture_tokens(true);
-            print.op_call_ir(&fd, &arch, call);
+            print.op_call_ir(&fd, &arch, call).unwrap();
             print.recurse();
             let tokens = print.emit_mut().take_markup_tokens();
             let presented: String = tokens.iter().flat_map(|token| token.text.chars())
@@ -832,7 +941,7 @@ fn recovered_callable_projection_retains_cast_provenance_and_authority() {
             assert_eq!(presented, complete, "ctypes={native}: {tokens:?}");
             let target = fd.obank().get(call).unwrap().get_in(0).unwrap();
             let mut target_print = execution_printer(&arch, false);
-            target_print.push_vn_ir(&fd, &arch, target, call);
+            target_print.push_vn_ir(&fd, &arch, target, call).unwrap();
             target_print.recurse();
             let target_expression = target_print.emit_mut().output_str().to_string();
             let signature_consumer = format!(r#"
@@ -848,7 +957,7 @@ int main(void) {{ verify_target(0); return 0; }}
             assert_c_source_with_warnings(&signature_consumer,
                 &format!("actual-recovered-call-target-type-{native}"),
                 &["-Wall", "-Wextra", "-Werror=strict-prototypes"]);
-            assert!(Rc::ptr_eq(&fd.vn_high_type_read_facing(source, call), &facing));
+            assert!(Rc::ptr_eq(&fd.vn_high_type_read_facing(source, call).unwrap(), &facing));
             assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(cast_output));
             let consumer = format!(r#"
 #include <assert.h>
@@ -868,7 +977,7 @@ int main(void) {{
     return 0;
 }}
 "#);
-            assert_c_source(&consumer, &format!("recovered-call-expression-integer-{native}"));
+            assert_c_source(&consumer, &format!("actual-recovered-call-expression-integer-{native}"));
         }
     }
 }

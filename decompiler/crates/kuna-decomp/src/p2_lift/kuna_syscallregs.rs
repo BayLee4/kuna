@@ -580,7 +580,7 @@ fn rewrite(data: &mut Funcdata, op: OpId, regs: &SyscallStorage) -> KunaResult<(
     let reads = read_set(data, op, regs);
     let base = data.obank().get(op).map(|o| o.num_input()).unwrap_or(1);
     for (i, (addr, size)) in reads.iter().enumerate() {
-        let vn = data.new_varnode(*size, addr, None);
+        let vn = data.new_varnode(*size, addr, None)?;
         data.op_insert_input(op, vn, base + i as int4)?;
     }
     data.new_varnode_out(regs.result.1, &regs.result.0, op)?;
@@ -641,13 +641,13 @@ impl Action for ActionSyscallRegs {
             base: self.base.clone(),
         }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let arch = data.get_arch();
         if !arch.syscall_regs || arch.syscall_regs_userops.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let Some(family) = arch.syscall_regs_family else {
-            return 0;
+            return Ok(0);
         };
         let found: Vec<OpId> = data
             .obank()
@@ -655,10 +655,10 @@ impl Action for ActionSyscallRegs {
             .filter(|op| is_bare_syscall(data, *op))
             .collect();
         if found.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let Some(regs) = resolve(data, family) else {
-            return 0;
+            return Ok(0);
         };
         let mut changed = 0;
         for op in found {
@@ -666,7 +666,7 @@ impl Action for ActionSyscallRegs {
                 changed = 1;
             }
         }
-        changed
+        Ok(changed)
     }
 }
 
@@ -696,7 +696,7 @@ pub fn guard_memory(
     addr: &Address,
     size: int4,
     write: &mut Vec<crate::context::VarnodeId>,
-) {
+) -> KunaResult<()> {
     use crate::varnode::varnode_flags;
     use kuna_base::space::spacetype;
 
@@ -708,10 +708,10 @@ pub fn guard_memory(
                     .is_some_and(|ram| ram.get_index() == s.get_index())
         })
     {
-        return;
+        return Ok(());
     }
     for op in memory_calls(data) {
-        let guard = data.new_indirect_op(op, addr, size, 0);
+        let guard = data.new_indirect_op(op, addr, size, 0)?;
         if let Some(input) = data.obank().get(guard).and_then(|o| o.get_in(0)) {
             data.vbank_mut().get_mut(input)
                 .expect("syscall memory input").set_active_heritage();
@@ -725,6 +725,7 @@ pub fn guard_memory(
             write.push(output);
         }
     }
+    Ok(())
 }
 
 /// Does the rewritten system call `op` read `vn` as one of its registers?

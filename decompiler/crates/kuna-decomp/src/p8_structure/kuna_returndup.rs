@@ -121,10 +121,10 @@ impl Action for ActionReturnDup {
         }
         Some(Box::new(ActionReturnDup { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option returndup on|off`, carried on the Architecture boundary.
         if !data.get_arch().duplicate_shared_returns {
-            return 0;
+            return Ok(0);
         }
         // The whole split loop (reuse of the existing `return_split_is_splittable`
         // filter + `node_split`) lives on Funcdata, next to `return_split_apply`,
@@ -137,7 +137,7 @@ impl Action for ActionReturnDup {
             ));
         }
         self.base_mut().count += changes;
-        0
+        Ok(0)
     }
 }
 

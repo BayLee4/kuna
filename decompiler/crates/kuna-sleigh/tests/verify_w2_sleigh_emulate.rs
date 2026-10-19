@@ -138,11 +138,11 @@ impl RegisterLookup for CannedTranslator {
         }
         Err(KunaError::sleigh(format!("Unknown register name: {nm}")))
     }
-    fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> String {
-        String::new()
+    fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> KunaResult<String> {
+        Ok(String::new())
     }
-    fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> String {
-        String::new()
+    fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> KunaResult<String> {
+        Ok(String::new())
     }
 }
 
@@ -159,7 +159,7 @@ impl Translate for CannedTranslator {
     // mutable_key_type: see the trait declaration (translate.rs)
     #[allow(clippy::mutable_key_type)]
     fn get_all_registers(&self, _reglist: &mut BTreeMap<VarnodeData, String>) {}
-    fn get_user_op_names(&self, _res: &mut Vec<String>) {}
+    fn get_user_op_names(&self, _res: &mut Vec<String>) -> KunaResult<()> { Ok(()) }
     fn instruction_length(&self, baseaddr: &Address) -> KunaResult<i32> {
         match self.program.get(&baseaddr.get_offset()) {
             None => Err(KunaError::bad_data("no instruction")),

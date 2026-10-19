@@ -189,6 +189,9 @@ def mutation_matrix():
                 if kind == "union":
                     assert ("whole" if epoch == "initial" else "signed_whole") in header_text
                 include = f'#include "{header_path.name}"\n'
+                if kind == "bitfield_alias":
+                    include += (f'_Static_assert(sizeof(SourceAlias) == {source.getLength()}, "source record extent");\n'
+                                f'_Static_assert(_Alignof(SourceAlias) == {source.getAlignment()}, "source record alignment");\n')
                 expression = "read_value(value)" if kind == "partial" else "read_value(&value)"
                 expected = "((unsigned)(raw >> 3) & 255)" if kind == "bitfield_alias" else "(unsigned)(raw >> 32)"
                 driver_path.write_text(include + "#include <string.h>\n" + f"""

@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/OverridePrototypeAction.java
++++ b/ghidra/app/plugin/core/decompile/actions/OverridePrototypeAction.java
+@@ -292,6 +292,7 @@
+ 		int transaction = program.startTransaction("Override Signature");
+ 		boolean commit = false;
+ 		try {
++			HighFunctionDBUtil.requireSourceAuthority(context.getHighFunction(), fdef);
+ 			Address addr = op.getSeqnum().getTarget();
+ 			HighFunctionDBUtil.writeOverride(func, addr, fdef);
+ 			commit = true;

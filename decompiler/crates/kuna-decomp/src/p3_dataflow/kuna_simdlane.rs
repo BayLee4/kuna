@@ -172,70 +172,70 @@ impl Rule for RuleSimdShuffleLane {
         Some(Box::new(RuleSimdShuffleLane { enabled: self.enabled, group: self.group.clone() }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !self.enabled && !data.get_arch().simd_lane_fold {
-            return 0;
+            return Ok(0);
         }
         if data.get_arch().simd_shuffle_userops.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // The lane read must be a one-byte extraction at a constant offset.
         let offvn = match op_in(data, op, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, offvn) {
-            return 0;
+            return Ok(0);
         }
         let k = vn_offset(data, offvn) as int4;
         if op_out_size(data, op) != 1 {
-            return 0;
+            return Ok(0);
         }
 
         // ... of a CALLOTHER the architecture named as a byte shuffle.
         let shufvn = match op_in(data, op, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let shuf = match vn_def(data, shufvn) {
             Some(d) => d,
-            None => return 0,
+            None => return Ok(0),
         };
         if op_code(data, shuf) != OpCode::CPUI_CALLOTHER || op_num_input(data, shuf) != 3 {
-            return 0;
+            return Ok(0);
         }
         let idvn = match op_in(data, shuf, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, idvn) {
-            return 0;
+            return Ok(0);
         }
         let userop_id = vn_offset(data, idvn) as uint4;
         if !data.get_arch().simd_shuffle_userops.contains(&userop_id) {
-            return 0;
+            return Ok(0);
         }
 
         let srcvn = match op_in(data, shuf, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let maskvn = match op_in(data, shuf, 2) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let n = vn_size(data, srcvn);
         if (n != 8 && n != 16) || vn_size(data, maskvn) != n || vn_size(data, shufvn) != n {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_constant(data, maskvn) {
-            return 0;
+            return Ok(0);
         }
 
         let sel = match shuffle_lane_source(vn_offset(data, maskvn), vn_size(data, maskvn), n, k) {
             Some(s) => s,
-            None => return 0,
+            None => return Ok(0),
         };
 
         match sel {
@@ -253,7 +253,7 @@ impl Rule for RuleSimdShuffleLane {
                 data.op_set_input(op, c, 1).expect("RuleSimdShuffleLane: opSetInput");
             }
         }
-        1
+        Ok(1)
     }
 }
 

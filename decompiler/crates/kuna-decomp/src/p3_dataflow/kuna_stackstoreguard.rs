@@ -3,6 +3,7 @@
 //! indexed STORE of any width guards a written slot inside the array it may write.
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use std::rc::Rc;
 
@@ -167,7 +168,7 @@ pub(super) fn prune_indexed(
     store_guard: &[super::heritage::LoadGuard],
     bounds: &mut StoreBounds,
     guards: &[(crate::context::OpId, crate::context::OpId)],
-) {
+) -> KunaResult<()> {
     use kuna_num::opcodes::OpCode;
     for &(indirect, store) in guards {
         let Some(guard) = store_guard.iter().find(|g| g.op == store) else {
@@ -200,9 +201,10 @@ pub(super) fn prune_indexed(
         if window_overlaps(guard, store_size, bound, lo, size) {
             continue;
         }
-        fd.total_replace(output, input).expect("remove indexed store guard");
-        fd.op_destroy(indirect);
+        fd.total_replace(output, input)?;
+        fd.op_destroy(indirect)?;
     }
+    Ok(())
 }
 
 fn constant_write(fd: &crate::funcdata::Funcdata, mut vn: crate::context::VarnodeId) -> bool {

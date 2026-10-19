@@ -677,8 +677,8 @@ impl DynamicHash {
     /// (8 off / 16 on) at the call site.
     pub fn unique_hash(&mut self, root: VarnodeId, maxduplicates: uint4, data: &mut Funcdata) {
         let mut champion: Vec<VarnodeId> = Vec::new();
-        let mut tmphash: uint8 = 0;
-        let mut tmpaddr: Address = Address::default();
+        let mut champion_hash: uint8 = 0;
+        let mut champion_addr: Address = Address::default();
 
         let mut method: uint4 = 0;
         while method < 4 {
@@ -687,8 +687,8 @@ impl DynamicHash {
             if self.hash == 0 {
                 return; // Can't get a good hash
             }
-            tmphash = self.hash;
-            tmpaddr = self.addrresult.clone();
+            let tmphash = self.hash;
+            let tmpaddr = self.addrresult.clone();
             let mut vnlist: Vec<VarnodeId> = Vec::new();
             let mut vnlist2: Vec<VarnodeId> = Vec::new();
             Self::gather_first_level_vars(&mut vnlist, data, &tmpaddr, tmphash);
@@ -707,6 +707,8 @@ impl DynamicHash {
                 && (champion.is_empty() || vnlist2.len() < champion.len())
             {
                 champion = vnlist2;
+                champion_hash = tmphash;
+                champion_addr = tmpaddr;
                 if champion.len() == 1 {
                     break; // Current hash is unique
                 }
@@ -731,9 +733,9 @@ impl DynamicHash {
             self.addrresult = Address::default();
             return;
         }
-        self.hash = tmphash | ((pos as uint8) << 49); // three bits for position
+        self.hash = champion_hash | ((pos as uint8) << 49); // three bits for position
         self.hash |= (total as uint8) << 52; // three bits for total
-        self.addrresult = tmpaddr;
+        self.addrresult = champion_addr;
     }
 
     /// Select unique hash for given PcodeOp and slot (C++ `uniqueHash(const

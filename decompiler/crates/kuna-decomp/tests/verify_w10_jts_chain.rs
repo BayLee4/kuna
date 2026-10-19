@@ -238,7 +238,7 @@ fn render_datatest(name: &str) -> String {
         };
         let entry = Address::new(space, sym.offset);
         if let Ok(fd) = decompile_func(base, &sym.name, entry, 0) {
-            out.push_str(&print_c(base, &fd));
+            out.push_str(&print_c(base, &fd).unwrap());
             out.push('\n');
         }
     }

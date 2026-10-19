@@ -7,6 +7,7 @@
 //! recovery reuse the same collection and replacement machinery.
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
@@ -810,9 +811,9 @@ impl HeapSequence {
     }
 
     /// C++ `HeapSequence::deduplicatePairs`.
-    fn deduplicate_pairs(&self, data: &mut Funcdata, pairs: &mut [IndirectPair]) -> bool {
+    fn deduplicate_pairs(&self, data: &mut Funcdata, pairs: &mut [IndirectPair]) -> KunaResult<bool> {
         if pairs.is_empty() {
-            return true;
+            return Ok(true);
         }
         // sort(copy, compareOutput) — sort the indices into `pairs`.
         let mut order: Vec<usize> = (0..pairs.len()).collect();
@@ -830,11 +831,11 @@ impl HeapSequence {
                 vhead.characterize_overlap(vcur)
             };
             if overlap == 1 {
-                return false; // Partial overlap
+                return Ok(false); // Partial overlap
             }
             if overlap == 2 {
                 if pairs[cur].in_vn != pairs[head].in_vn {
-                    return false;
+                    return Ok(false);
                 }
                 pairs[cur].duplicate = true;
                 dup_count += 1;
@@ -849,13 +850,13 @@ impl HeapSequence {
                 if pairs[cur].duplicate {
                     let from = pairs[cur].out_vn;
                     let to = pairs[head].out_vn;
-                    data.total_replace(from, to).ok();
+                    data.total_replace(from, to)?;
                 } else {
                     head = cur;
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// C++ `HeapSequence::removeStoreOps`.
@@ -865,20 +866,20 @@ impl HeapSequence {
         indirects: &[OpId],
         indirect_pairs: &[IndirectPair],
         replace_op: OpId,
-    ) {
+    ) -> KunaResult<()> {
         let mut scratch: Vec<OpId> = Vec::new();
         // Unhook Varnodes we don't want destroyed.
         for p in indirect_pairs.iter() {
             if let Some(def) = data.vbank().get(p.out_vn).and_then(|v| v.get_def()) {
-                data.op_unset_output(def);
+                data.op_unset_output(def)?;
             }
         }
         for i in 0..self.base.move_ops.len() {
             let op = self.base.move_ops[i].op;
-            data.op_destroy_recursive(op, &mut scratch);
+            data.op_destroy_recursive(op, &mut scratch)?;
         }
         for &op in indirects.iter() {
-            data.op_destroy(op);
+            data.op_destroy(op)?;
         }
         let replace_addr = data.obank().get(replace_op).unwrap().get_addr().clone();
         for p in indirect_pairs.iter() {
@@ -887,28 +888,29 @@ impl HeapSequence {
             }
             let new_ind = data.new_op(2, replace_addr.clone());
             data.op_set_opcode_code(new_ind, OpCode::CPUI_INDIRECT);
-            data.op_set_output(new_ind, p.out_vn).ok();
+            data.op_set_output(new_ind, p.out_vn)?;
             data.op_set_input(new_ind, p.in_vn, 0).ok();
             let iop = data.new_varnode_iop(replace_op);
             data.op_set_input(new_ind, iop, 1).ok();
             data.op_insert_before(new_ind, replace_op);
         }
+        Ok(())
     }
 
     /// C++ `HeapSequence::transform`.
-    fn transform(&self, data: &mut Funcdata) -> bool {
+    fn transform(&self, data: &mut Funcdata) -> KunaResult<bool> {
         let mut indirects: Vec<OpId> = Vec::new();
         let mut indirect_pairs: Vec<IndirectPair> = Vec::new();
         self.gather_indirect_pairs(data, &mut indirects, &mut indirect_pairs);
-        if !self.deduplicate_pairs(data, &mut indirect_pairs) {
-            return false;
+        if !self.deduplicate_pairs(data, &mut indirect_pairs)? {
+            return Ok(false);
         }
         let mem_cpy_op = match self.build_string_copy(data) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
-        self.remove_store_ops(data, &indirects, &indirect_pairs, mem_cpy_op);
-        true
+        self.remove_store_ops(data, &indirects, &indirect_pairs, mem_cpy_op)?;
+        Ok(true)
     }
 }
 
@@ -1311,7 +1313,7 @@ impl StringSequence {
     }
 
     /// C++ `StringSequence::removeCopyOps`.
-    fn remove_copy_ops(&self, data: &mut Funcdata, replace_op: OpId) {
+    fn remove_copy_ops(&self, data: &mut Funcdata, replace_op: OpId) -> KunaResult<()> {
         let mut concat_set: std::collections::HashMap<OpId, usize> = std::collections::HashMap::new();
         let mut points: Vec<RemovePoint> = Vec::new();
         let mut dead_ops: Vec<WriteNode> = Vec::new();
@@ -1347,27 +1349,28 @@ impl StringSequence {
                 data.op_set_input(ind_op, new_in, 0).ok();
                 let iop = data.new_varnode_iop(replace_op);
                 data.op_set_input(ind_op, iop, 1).ok();
-                data.op_set_output(ind_op, vn).ok();
+                data.op_set_output(ind_op, vn)?;
                 data.mark_indirect_creation(ind_op, false).ok();
                 data.op_insert_before(ind_op, replace_op);
             }
         }
         for i in 0..self.base.move_ops.len() {
-            data.op_destroy(self.base.move_ops[i].op);
+            data.op_destroy(self.base.move_ops[i].op)?;
         }
         for i in 0..dead_ops.len() {
-            data.op_destroy(dead_ops[i].op);
+            data.op_destroy(dead_ops[i].op)?;
         }
+        Ok(())
     }
 
     /// C++ `StringSequence::transform`.
-    fn transform(&self, data: &mut Funcdata) -> bool {
+    fn transform(&self, data: &mut Funcdata) -> KunaResult<bool> {
         let mem_cpy_op = match self.build_string_copy(data) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
-        self.remove_copy_ops(data, mem_cpy_op);
-        true
+        self.remove_copy_ops(data, mem_cpy_op)?;
+        Ok(true)
     }
 
     // ---------------------------------------------------------------------
@@ -1584,13 +1587,13 @@ impl StringSequence {
         data: &mut Funcdata,
         fill_value: u8,
         fill_count: int4,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         let memset_op = match self.build_memset(data, fill_value, fill_count) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
-        self.remove_copy_ops(data, memset_op);
-        true
+        self.remove_copy_ops(data, memset_op)?;
+        Ok(true)
     }
 
     // ---------------------------------------------------------------------
@@ -1635,14 +1638,14 @@ impl StringSequence {
     /// (kuna `rodatastring`) `StringSequence::transform` for a block-copy run:
     /// build the `builtin_strncpy` over the assembled byte array, then reuse the
     /// shared [`remove_copy_ops`](Self::remove_copy_ops) teardown.
-    pub(crate) fn transform_rodata(&self, data: &mut Funcdata) -> bool {
+    pub(crate) fn transform_rodata(&self, data: &mut Funcdata) -> KunaResult<bool> {
         let num_bytes = self.base.byte_array.len() as int4;
         let copy_op = match self.build_string_copy_sized(data, num_bytes) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
-        self.remove_copy_ops(data, copy_op);
-        true
+        self.remove_copy_ops(data, copy_op)?;
+        Ok(true)
     }
 }
 
@@ -1697,27 +1700,27 @@ impl Rule for RuleStringCopy {
     }
 
     /// C++ `RuleStringCopy::applyOp` (`constseq.cc:981`).
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in0 = match data.obank().get(op).and_then(|o| o.get_in(0)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !data.vbank().get(in0).map(|v| v.is_constant()).unwrap_or(false) {
-            return 0;
+            return Ok(0);
         }
         let outvn = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let ct = Rc::clone(data.vbank().get(outvn).expect("RuleStringCopy: stale outvn").get_type_def_facing());
         if !ct.is_char_print() {
-            return 0;
+            return Ok(0);
         }
         if ct.is_opaque_string() {
-            return 0;
+            return Ok(0);
         }
         if !data.vbank().get(outvn).unwrap().is_addr_tied() {
-            return 0;
+            return Ok(0);
         }
         let out_addr = data.vbank().get(outvn).unwrap().get_addr().clone();
         let out_size = data.vbank().get(outvn).unwrap().get_size();
@@ -1727,12 +1730,14 @@ impl Rule for RuleStringCopy {
         // function's stack scope; a global-mapped array (`map addr ... char
         // globstring[32]`) lives in the frozen global-scope snapshot on `glb`.  So
         // try the local stack scope first, then fall back to the global container.
-        let entry = data
+        let local_entry = data
             .get_scope_local()
-            .and_then(|lm| lm.query_container(&out_addr, out_size, &op_addr))
-            .or_else(|| {
+            .and_then(|lm| lm.query_container(&out_addr, out_size, &op_addr));
+        let entry = match local_entry {
+            Some(entry) => Some(entry),
+            None => {
                 data.get_arch()
-                    .query_container_global(&out_addr, out_size, &op_addr)
+                    .query_container_global(&out_addr, out_size, &op_addr)?
                     .and_then(|g| {
                         let sym_type = g.symbol_type.clone()?;
                         // entry->getFirst()/getSize() for a whole-symbol global
@@ -1744,22 +1749,23 @@ impl Rule for RuleStringCopy {
                             sym_type,
                         })
                     })
-            });
+            }
+        };
         let entry = match entry {
             Some(e) => e,
-            None => return 0,
+            None => return Ok(0),
         };
         let sequence = match StringSequence::build(data, ct, entry, op, out_addr) {
             Some(s) => s,
-            None => return 0,
+            None => return Ok(0),
         };
         if !sequence.is_valid() {
-            return 0;
+            return Ok(0);
         }
-        if !sequence.transform(data) {
-            return 0;
+        if !sequence.transform(data)? {
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1799,42 +1805,42 @@ impl Rule for RuleStringStore {
     }
 
     /// C++ `RuleStringStore::applyOp` (`constseq.cc:1013`).
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in2 = match data.obank().get(op).and_then(|o| o.get_in(2)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !data.vbank().get(in2).map(|v| v.is_constant()).unwrap_or(false) {
-            return 0;
+            return Ok(0);
         }
         let ptrvn = match data.obank().get(op).and_then(|o| o.get_in(1)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let ct = Rc::clone(
             data.vbank().get(ptrvn).expect("RuleStringStore: stale ptrvn").get_type_read_facing(op),
         );
         if ct.get_metatype() != type_metatype::TYPE_PTR {
-            return 0;
+            return Ok(0);
         }
         let ct = match ct.get_ptr_to() {
             Some(c) => c,
-            None => return 0,
+            None => return Ok(0),
         };
         if !ct.is_char_print() {
-            return 0;
+            return Ok(0);
         }
         if ct.is_opaque_string() {
-            return 0;
+            return Ok(0);
         }
         let sequence = HeapSequence::build(data, ct, op);
         if !sequence.is_valid() {
-            return 0;
+            return Ok(0);
         }
-        if !sequence.transform(data) {
-            return 0;
+        if !sequence.transform(data)? {
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 }
 

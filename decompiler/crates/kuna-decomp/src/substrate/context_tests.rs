@@ -38,8 +38,8 @@ mod config_ir_regressions {
         let mut context = config_context();
         context.peimportcall = true;
         context.global_query = Some(Rc::new(query(vec![imported, data])));
-        assert!(matches!(context.query_indirect_slot_type(&at, 8, &Address::new_invalid()), Some(IndirectSlotType::Untyped)));
-        let (name, entry, prototype) = context.query_function(&at).expect("independent import flow metadata");
+        assert!(matches!(context.query_indirect_slot_type(&at, 8, &Address::new_invalid()).unwrap(), Some(IndirectSlotType::Untyped)));
+        let (name, entry, prototype) = context.query_function(&at).unwrap().expect("independent import flow metadata");
         assert_eq!(name, "known_exit");
         assert_eq!(entry, at);
         assert_eq!(prototype.num_params(), 0);
@@ -47,6 +47,66 @@ mod config_ir_regressions {
         assert!(prototype.is_no_return());
         assert!(prototype.is_inline());
         assert_eq!(prototype.get_inject_id(), 17);
+    }
+
+    #[test]
+    fn complete_source_keeps_independent_callee_effects_without_source_mutation() {
+        let memory = space(3);
+        let at = addr(&memory, 0x100);
+        let mut context = config_context();
+        let mut prototype = crate::fspec::FuncProto::new();
+        prototype.set_internal(
+            context.defaultfp.clone().unwrap(),
+            Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)),
+        );
+        prototype.set_param(0, "status", &crate::fspec::ParameterPieces {
+            addr: addr(&memory, 0x20),
+            type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_UINT))),
+            flags: crate::fspec::parameter_pieces_flags::TYPELOCK
+                | crate::fspec::parameter_pieces_flags::NAMELOCK,
+        });
+        prototype.set_output_lock(true);
+        let source = Rc::new(prototype);
+        let mut imported = typed_entry(&memory, 0x100, 8, "known_exit", code_noproto(), true);
+        imported.func_no_return = true;
+        imported.func_inject_id = 17;
+        let mut globals = query(vec![imported]);
+        globals.source_protos.insert((3, 0x100), Rc::clone(&source));
+        context.global_query = Some(Rc::new(globals));
+        for enabled in [false, true] {
+            context.peimportcall = enabled;
+            for function_first in [false, true] {
+                let (direct, resolved) = if function_first {
+                    let resolved = context.query_function(&at).unwrap().unwrap().2;
+                    (context.query_callee_proto(&at).unwrap().unwrap(), resolved)
+                } else {
+                    let direct = context.query_callee_proto(&at).unwrap().unwrap();
+                    (direct, context.query_function(&at).unwrap().unwrap().2)
+                };
+                for effective in [direct, resolved] {
+                    assert_eq!(effective.is_no_return(), enabled);
+                    assert!(effective.is_inline());
+                    assert_eq!(effective.get_inject_id(), 17);
+                    assert_eq!(effective.num_params(), 1);
+                    let parameter = effective.get_param(0).unwrap();
+                    assert_eq!(parameter.get_name(), "status");
+                    assert_eq!(parameter.get_address(), addr(&memory, 0x20));
+                    assert_eq!(parameter.get_type().unwrap().get_size(), 4);
+                    assert!(parameter.is_type_locked() && parameter.is_name_locked());
+                    assert!(effective.is_output_locked());
+                }
+                assert!(!source.is_no_return());
+                assert!(!source.is_inline());
+                assert_eq!(source.get_inject_id(), -1);
+            }
+        }
+        let mut globals = query(vec![typed_entry(
+            &memory, 0x100, 8, "known_exit", code_noproto(), true,
+        )]);
+        globals.source_protos.insert((3, 0x100), Rc::clone(&source));
+        context.global_query = Some(Rc::new(globals));
+        assert!(Rc::ptr_eq(&context.query_callee_proto(&at).unwrap().unwrap(), &source));
+        assert!(Rc::ptr_eq(&context.query_function(&at).unwrap().unwrap().2, &source));
     }
 }
 

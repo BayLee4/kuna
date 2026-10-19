@@ -300,7 +300,8 @@ pub fn run_request(req: &Request) -> Result<String, String> {
                 .map_err(|e| format!("could not read {binary}: {e}"))?;
             let file = kuna_analysis::loadimage_object::parse_object(&*bytes)
                 .map_err(|e| format!("could not parse {binary}: {e}"))?;
-            Ok(inspect::xrefs_json(binary, &prog, &file, &target, &prog.assertion_outcomes()))
+            inspect::xrefs_json(binary, &prog, &file, &target, &prog.assertion_outcomes())
+                .map_err(|e| e.to_string())
         }
         Cmd::Strings => {
             let bytes = kuna_analysis::loader::elf_shdr::read_image(binary)
@@ -310,7 +311,8 @@ pub fn run_request(req: &Request) -> Result<String, String> {
             let view = kuna_analysis::loader::kuna_relocrebase::rebased_view(&raw, &bytes);
             let (file, scanned) = kuna_analysis::loader::kuna_relocrebase::select(raw, &bytes, &view);
             let rebased = view.as_ref().filter(|v| v.bytes.as_ptr() == scanned.as_ptr());
-            Ok(inspect::strings_json(binary, &prog, &file, rebased, &prog.assertion_outcomes()))
+            inspect::strings_json(binary, &prog, &file, rebased, &prog.assertion_outcomes())
+                .map_err(|e| e.to_string())
         }
         Cmd::Inspect(ref selector) => {
             prog.arch_mut()
@@ -329,7 +331,8 @@ pub fn run_request(req: &Request) -> Result<String, String> {
                 single_target: true,
                 ..DecompileOptions::default()
             };
-            let out = decompile_targets_with(&mut prog, targets, &opts);
+            let out = decompile_targets_with(&mut prog, targets, &opts)
+                .map_err(|e| e.to_string())?;
             let f = out
                 .first()
                 .ok_or_else(|| format!("no function selected by {selector:?}"))?;
@@ -352,7 +355,8 @@ pub fn run_request(req: &Request) -> Result<String, String> {
                 single_target: targets.len() == 1,
                 ..DecompileOptions::default()
             };
-            let out = decompile_targets_with(&mut prog, targets, &opts);
+            let out = decompile_targets_with(&mut prog, targets, &opts)
+                .map_err(|e| e.to_string())?;
             let kinds: Vec<&'static str> =
                 out.iter()
                     .map(|f| classifier.kind(&prog, &f.name, f.byte_address))
@@ -404,7 +408,9 @@ fn project(binary: &str, prog: &mut ConsoleProgram, display: &str) -> Result<Str
         return Err(format!("no functions discovered in {binary}"));
     }
 
-    let mut results = decompile_export_targets(prog, targets);
+    kuna_console::project::prepare_export_callables(prog, &targets)
+        .map_err(|e| e.to_string())?;
+    let mut results = decompile_export_targets(prog, targets).map_err(|e| e.to_string())?;
     // Every artifact is address-ordered (the CLI's convention).
     results.sort_by(|a, b| a.address.cmp(&b.address).then_with(|| a.name.cmp(&b.name)));
 
@@ -905,6 +911,99 @@ mod tests {
             json.contains("return a1 * 7 + a0 * 3;"),
             "hidden direct callee has no real body: {json}"
         );
+    }
+
+    #[test]
+    fn native_project_preserves_physical_inputs_and_public_source_types() {
+        use std::process::Command;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
+            .canonicalize().unwrap();
+        let directory = std::env::temp_dir().join(format!("kuna-wasm-physical-{}-{}",
+            std::process::id(), std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir(&directory).unwrap();
+        let source = directory.join("original.c");
+        std::fs::write(&source, r#"
+__attribute__((noinline))
+unsigned long long subject(unsigned long long value, unsigned long long addend) {
+    return value + addend;
+}
+__attribute__((noinline))
+unsigned long long carry(unsigned long long raw, unsigned long long addend) {
+    return subject(raw, addend);
+}
+"#).unwrap();
+        let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+        let binary = directory.join("physical.o");
+        let built = Command::new(&compiler).args(["-std=c11", "-O2", "-fno-inline", "-c"])
+            .arg(&source).arg("-o").arg(&binary).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        // Mach-O loading does not apply a compiler object's branch relocations.
+        let binary = if cfg!(target_os = "macos") {
+            let image = directory.join("physical.dylib");
+            let linked = Command::new(&compiler).arg("-dynamiclib")
+                .arg(&binary).arg("-o").arg(&image).output().unwrap();
+            assert!(linked.status.success(), "{}", String::from_utf8_lossy(&linked.stderr));
+            image
+        } else {
+            binary
+        };
+        let specs = root.join("specs");
+        let listing: serde_json::Value = serde_json::from_str(&super::run_with_mode(
+            binary.to_str().unwrap(), specs.to_str().unwrap(), "list", None, Some("reliable"),
+        ).unwrap()).unwrap();
+        let name = |wanted: &str| listing["functions"].as_array().unwrap().iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .find(|name| name.trim_start_matches('_') == wanted).unwrap();
+        let carry = name("carry");
+        let subject = name("subject");
+        let assertions = [
+            format!("prototype {subject} unsigned long long subject(unsigned char value,unsigned long long addend)"),
+            format!("prototype {carry} unsigned long long carry(unsigned long long raw,unsigned long long addend)"),
+        ];
+        let args = ["physical".to_owned()];
+        let document: serde_json::Value = serde_json::from_str(&super::run_request(&super::Request {
+            binary: binary.to_str().unwrap(), spec_root: specs.to_str().unwrap(),
+            cmd: "project", args: &args, mode: Some("reliable"), language: None,
+            asserts: &assertions,
+        }).unwrap()).unwrap();
+        assert_eq!(document["failed"], 0, "{document}");
+        for name in ["physical.c", "physical.h"] {
+            std::fs::write(directory.join(name), document["files"][name].as_str().unwrap()).unwrap();
+        }
+        let original = directory.join("provider.o");
+        let built = Command::new(&compiler)
+            .args(["-std=c11", "-O2", "-fno-inline", "-c",
+                "-Dsubject=retained_subject", "-Dcarry=retained_carry"])
+            .arg(&source).arg("-o").arg(&original).output().unwrap();
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+        let driver = directory.join("driver.c");
+        std::fs::write(&driver, format!(r#"
+#include <stdint.h>
+#include "physical.h"
+extern unsigned long long retained_carry(unsigned long long,unsigned long long);
+_Static_assert(_Generic(&{subject},
+    unsigned long long (*)(unsigned char,unsigned long long): 1, default: 0),
+    "the public source declaration must not become its physical carrier");
+int main(void) {{
+    const unsigned long long inputs[] = {{ 0, 0xff, 0x100, UINT64_C(0x1234567800000101), UINT64_MAX }};
+    for (unsigned i = 0; i < sizeof(inputs) / sizeof(inputs[0]); ++i)
+        if ({carry}(inputs[i],7) != retained_carry(inputs[i],7)) return 1;
+    return 0;
+}}
+"#)).unwrap();
+        for optimization in ["-O0", "-O2"] {
+            let executable = directory.join(format!("consumer-{}", &optimization[1..]));
+            let built = Command::new(&compiler).args(["-std=c11", optimization])
+                .arg(directory.join("physical.c")).arg(&original).arg(&driver)
+                .arg("-o").arg(&executable).output().unwrap();
+            assert!(built.status.success(), "unchanged project providers:\n{}",
+                String::from_utf8_lossy(&built.stderr));
+            let ran = Command::new(&executable).output().unwrap();
+            assert!(ran.status.success(), "physical input behavior changed:\n{}",
+                String::from_utf8_lossy(&ran.stderr));
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Direct browser decompilation uses body-bearing selection too; inventory

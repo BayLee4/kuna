@@ -60,6 +60,7 @@
 //! integer conversions: Rust's `if c { a } else { b }` needs both arms of one
 //! type and gets nothing.
 
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{OpId, VarnodeId};
@@ -87,27 +88,29 @@ struct Arm {
 
 /// The conversions to leave out of the arms `arms` (the ops `iteregion` prints
 /// as the `?` and `:` values) of the conditional assigned to `dest`.
+/// Semantic refusals leave both arms alone; printed-form acquisition errors
+/// propagate to the printing root.
 pub(crate) fn arm_drops(
     implied: &ImpliedCasts,
     p: &dyn PrintedForms,
     fd: &Funcdata,
     arms: [OpId; 2],
     dest: VarnodeId,
-) -> Vec<OpId> {
+) -> KunaResult<Vec<OpId>> {
     if !implied.arms_enabled() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let integer_dest = match implied.explicit_type(p, fd, dest, arms[0]) {
         CType::Known(t) => int_range(&t).is_some() && !t.is_enum_type(),
         _ => false,
     };
     if !integer_dest {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let (Some(a), Some(b)) = (arm(implied, p, fd, arms[0]), arm(implied, p, fd, arms[1])) else {
-        return Vec::new();
+    let (Some(a), Some(b)) = (arm(implied, p, fd, arms[0])?, arm(implied, p, fd, arms[1])?) else {
+        return Ok(Vec::new());
     };
-    choose(a, b)
+    Ok(choose(a, b))
 }
 
 /// The conversions the pair `a`, `b` leaves out, both first.
@@ -192,16 +195,16 @@ fn value_set(c: &CType, ir: &Datatype) -> Option<u8> {
 }
 
 /// The C type of the literal the constant `vn` prints as where `op` reads it.
-fn literal(p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> Option<u8> {
-    let v = fd.vbank().get(vn)?;
+fn literal(p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> KunaResult<Option<u8>> {
+    let Some(v) = fd.vbank().get(vn) else { return Ok(None) };
     let ct = v.get_type_read_facing(op);
     if fd.vn_high_equate_symbol(vn).is_some() {
-        return None;
+        return Ok(None);
     }
     if ct.is_char_print() && !ct.is_enum_type() && v.get_size() == 1 {
-        return Some(INT);
+        return Ok(Some(INT));
     }
-    literal_type(&p.literal_token(vn, op)?, p.long_size())
+    Ok(p.literal_token(vn, op)?.and_then(|token| literal_type(&token, p.long_size())))
 }
 
 /// The type C gives the integer literal `tok` (C11 6.4.4.1) on a target whose
@@ -264,14 +267,14 @@ fn is_conversion(fd: &Funcdata, op: OpId) -> bool {
 
 /// The arm the op `op` prints (a `COPY` into the destination, or under
 /// `iteexpr` any op writing it).
-fn arm(implied: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, op: OpId) -> Option<Arm> {
-    let o = fd.obank().get(op)?;
+fn arm(implied: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, op: OpId) -> KunaResult<Option<Arm>> {
+    let Some(o) = fd.obank().get(op) else { return Ok(None) };
     match o.code() {
         OpCode::CPUI_COPY => {
-            let vn = o.get_in(0)?;
-            let v = fd.vbank().get(vn)?;
+            let Some(vn) = o.get_in(0) else { return Ok(None) };
+            let Some(v) = fd.vbank().get(vn) else { return Ok(None) };
             if v.is_constant() {
-                return Some(Arm { kept: literal(p, fd, vn, op)?, conv: None });
+                return Ok(literal(p, fd, vn, op)?.map(|kept| Arm { kept, conv: None }));
             }
             if !v.is_explicit() && !v.is_annotation() {
                 if let Some(def) = v.get_def().filter(|&d| is_conversion(fd, d)) {
@@ -279,16 +282,17 @@ fn arm(implied: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, op: OpId) ->
                 }
             }
             let t = v.get_type_read_facing(op).clone();
-            let kept = value_set(&implied.operand_type(p, fd, vn, op), &t)?;
-            Some(Arm { kept, conv: None })
+            Ok(value_set(&implied.operand_type(p, fd, vn, op)?, &t)
+                .map(|kept| Arm { kept, conv: None }))
         }
         OpCode::CPUI_CAST | OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT => {
             conversion_arm(implied, p, fd, op, None)
         }
         _ => {
-            let t = fd.vbank().get(o.get_out()?)?.get_type_def_facing().clone();
-            let kept = value_set(&implied.def_type(p, fd, op, t.clone(), None), &t)?;
-            Some(Arm { kept, conv: None })
+            let Some(out) = o.get_out().and_then(|vn| fd.vbank().get(vn)) else { return Ok(None) };
+            let t = out.get_type_def_facing().clone();
+            Ok(value_set(&implied.def_type(p, fd, op, t.clone(), None)?, &t)
+                .map(|kept| Arm { kept, conv: None }))
         }
     }
 }
@@ -300,38 +304,42 @@ fn conversion_arm(
     fd: &Funcdata,
     op: OpId,
     read_op: Option<OpId>,
-) -> Option<Arm> {
-    let o = fd.obank().get(op)?;
-    let invn = o.get_in(0)?;
-    let target = fd.vbank().get(o.get_out()?)?.get_type_def_facing().clone();
-    let ir_src = fd.vbank().get(invn)?.get_type_read_facing(op).clone();
-    let src = implied.operand_type(p, fd, invn, op);
+) -> KunaResult<Option<Arm>> {
+    let Some(o) = fd.obank().get(op) else { return Ok(None) };
+    let Some(invn) = o.get_in(0) else { return Ok(None) };
+    let Some(out) = o.get_out().and_then(|vn| fd.vbank().get(vn)) else { return Ok(None) };
+    let target = out.get_type_def_facing().clone();
+    let Some(input) = fd.vbank().get(invn) else { return Ok(None) };
+    let ir_src = input.get_type_read_facing(op).clone();
+    let src = implied.operand_type(p, fd, invn, op)?;
     let bare = || value_set(&src, &ir_src);
     match o.code() {
-        OpCode::CPUI_CAST if p.sign_dropped(op) => return Some(Arm { kept: promote(&target)?, conv: None }),
+        OpCode::CPUI_CAST if p.sign_dropped(op) => {
+            return Ok(promote(&target).map(|kept| Arm { kept, conv: None }));
+        }
         OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT => {
-            if !p.extension_is_cast(op) {
-                return None;
+            if !p.extension_is_cast(op)? {
+                return Ok(None);
             }
-            if p.extension_hidden(op, read_op) {
-                return Some(Arm { kept: bare()?, conv: None });
+            if p.extension_hidden(op, read_op)? {
+                return Ok(bare().map(|kept| Arm { kept, conv: None }));
             }
         }
         _ => {}
     }
-    if implied.drops(p, fd, op, read_op) {
-        return Some(Arm { kept: bare()?, conv: None });
+    if implied.drops(p, fd, op, read_op)? {
+        return Ok(bare().map(|kept| Arm { kept, conv: None }));
     }
-    let kept = promote(&target).filter(|_| is_int(&target))?;
+    let Some(kept) = promote(&target).filter(|_| is_int(&target)) else { return Ok(None) };
     let exact = matches!(target.get_size(), 4 | 8);
     let from = match &src {
         CType::Known(s) => s.clone(),
         CType::Unknown => ir_src.clone(),
-        CType::Opaque => return Some(Arm { kept, conv: None }),
+        CType::Opaque => return Ok(Some(Arm { kept, conv: None })),
     };
     let widening = exact && is_int(&ir_src) && is_int(&from) && preserves(&from, &target);
     let conv = if widening { bare().map(|operand| (op, kept, operand)) } else { None };
-    Some(Arm { kept, conv })
+    Ok(Some(Arm { kept, conv }))
 }
 
 /// An integer that is neither `bool` nor an enum.

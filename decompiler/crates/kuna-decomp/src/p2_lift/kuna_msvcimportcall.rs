@@ -32,7 +32,8 @@ pub fn locked_import_slot(
     data: &Funcdata,
     op: OpId,
     locked: &BTreeSet<(int4, uintb)>,
-) -> Option<Address> {
+) -> kuna_base::error::KunaResult<Option<Address>> {
+    let candidate = (|| {
     let call = data.obank().get(op)?;
     if call.code() != OpCode::CPUI_CALLIND {
         return None;
@@ -48,12 +49,17 @@ pub fn locked_import_slot(
     if !locked.contains(&(space.get_index(), slot.get_offset())) {
         return None;
     }
-    let props = data.get_arch().query_global_properties(&slot, size, &slot);
+    Some((slot, size))
+    })();
+    let Some((slot, size)) = candidate else { return Ok(None) };
+    let props = data.get_arch().query_global_properties(&slot, size, &slot)?;
     if props & crate::varnode::varnode_flags::externref == 0 {
-        return None;
+        return Ok(None);
     }
-    let (_, entry, proto) = data.get_arch().query_function(&slot)?;
-    (entry == slot && proto.is_input_locked()).then_some(slot)
+    let Some((_, entry, proto)) = data.get_arch().query_function(&slot)? else {
+        return Ok(None);
+    };
+    Ok((entry == slot && proto.is_input_locked()).then_some(slot))
 }
 
 /// The memory word the temporary `(addr, size)` that `op` reads was filled from,

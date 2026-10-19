@@ -83,24 +83,29 @@ pub fn crosses_global_write(data: &mut Funcdata, vn: VarnodeId, except: Option<H
         let (wlo, whi) = (w.get_offset(), w.get_offset().wrapping_add(w.get_size() as u64));
         wlo < hi && lo < whi
     };
-    writes.into_iter().any(|(w, high)| {
+    for (w, high) in writes {
         if except.is_some() && high == except {
-            return false;
+            continue;
         }
         if in_window(data, w) {
             return true;
         }
         let Some(h) = high else {
-            return false;
+            continue;
         };
         if !data.high_is_persist(h) {
-            return false;
+            continue;
         }
         let Some(hv) = data.high_bank().get(h) else {
-            return false;
+            continue;
         };
-        (0..hv.num_instances()).any(|i| in_window(data, hv.get_instance(i)))
-    })
+        for i in 0..hv.num_instances() {
+            if in_window(data, hv.get_instance(i)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The output of `op` and its HighVariable when `op` may write a global: a live,
@@ -143,5 +148,10 @@ pub fn keeps_apart(ctx: &mut dyn MergeContext, vn1: VarnodeId, vn2: VarnodeId) -
         .map(|i| ctx.high_get_instance(value, i))
         .filter(|&v| ctx.vn_def(v).is_some_and(|d| ctx.op_code(d) == OpCode::CPUI_LOAD))
         .collect();
-    loads.into_iter().any(|v| ctx.vn_load_crosses_global_write(v, global))
+    for v in loads {
+        if ctx.vn_load_crosses_global_write(v, global) {
+            return true;
+        }
+    }
+    false
 }

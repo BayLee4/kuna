@@ -107,26 +107,29 @@ fn named_entry(
 #[test]
 fn av1_smallest_containing_symbol_name_wins() {
     let ram = ram_space(3);
+    let mut narrow = named_entry(&ram, 0x301014, 0x301017, "glob1", 0);
+    narrow.symbol_id = 0x501;
+    let mut wide = named_entry(&ram, 0x301014, 0x30101b, "widepair", 0);
+    wide.symbol_id = 0x502;
     let gq = GlobalQuery::new(
-        vec![
-            named_entry(&ram, 0x301014, 0x301017, "glob1", 0),
-            named_entry(&ram, 0x301014, 0x30101b, "widepair", 0),
-        ],
+        vec![narrow, wide],
         RangeList::new(),
         PartMap::new(0u32),
     );
     let up = Address::new_invalid();
 
-    let (name4, off4, _t) = gq
+    let (name4, off4, _t, id4) = gq
         .name_for_varnode(&addr(&ram, 0x301014), 4, &up)
         .expect("4-byte query must name the 4-byte glob1");
     assert_eq!(name4, "glob1", "smallest entry containing 4 bytes is glob1");
     assert_eq!(off4, 0, "whole-symbol access has offset 0");
+    assert_eq!(id4, 0x501, "identity comes from the selected narrow entry");
 
-    let (name8, _off8, _t8) = gq
+    let (name8, _off8, _t8, id8) = gq
         .name_for_varnode(&addr(&ram, 0x301014), 8, &up)
         .expect("8-byte query must name the only 8-byte container");
     assert_eq!(name8, "widepair", "only the 8-byte entry contains all 8 bytes");
+    assert_eq!(id8, 0x502, "identity comes from the selected wide entry");
 }
 
 // ===========================================================================
@@ -152,13 +155,14 @@ fn av2_symbol_offset_is_access_minus_first_plus_entry_offset() {
     );
     let up = Address::new_invalid();
 
-    let (name, off, _t) = gq
+    let (name, off, _t, id) = gq
         .name_for_varnode(&addr(&ram, 0x408), 4, &up)
         .expect("0x408 is within arr [0x400,0x40f]");
     assert_eq!(name, "arr");
     assert_eq!(off, 8, "(0x408 - 0x400) + 0 == 8");
+    assert_eq!(id, 0, "a source without identity retains the unavailable marker");
 
-    let (pname, poff, _pt) = gq
+    let (pname, poff, _pt, _pid) = gq
         .name_for_varnode(&addr(&ram, 0x500), 4, &up)
         .expect("0x500 is the structpiece base");
     assert_eq!(pname, "structpiece");

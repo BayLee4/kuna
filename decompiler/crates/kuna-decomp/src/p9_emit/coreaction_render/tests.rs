@@ -29,6 +29,59 @@ use crate::fspec::{FuncCallSpecs, ParamEntry, ProtoModel, PrototypePieces};
 use crate::context::{OpId, TypeOp, VarnodeId};
 use kuna_num::opcodes::OpCode;
 
+#[test]
+fn shared_projection_policy_keeps_existing_ssa_bit_consumption() {
+    assert_eq!(projected_input_consumption(OpCode::CPUI_INT_ADD, 0x100, 0, 8, 0), Some(0x1ff));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_INT_SUB, 0x100, 1, 8, 0), Some(0x1ff));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_INT_MULT, 0x100, 0, 8, 0), Some(0x1ff));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_INT_MULT, 0x100, 1, 8, 0), Some(0x1ff));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_SUBPIECE, 0xffff_ffff, 0, 8, 4),
+        Some(0xffff_ffff_0000_0000));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_SUBPIECE, 0xffff_ffff, 0, 16, 8),
+        Some(0x8000_0000_0000_0000), "retain the established wide-varnode sentinel");
+    assert_eq!(projected_input_consumption(OpCode::CPUI_SUBPIECE, 0xffff_ffff, 0, 8, 8), Some(0));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_SUBPIECE, 0, 1, 4, 0), Some(0));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_SUBPIECE, 1, 1, 4, 0), Some(!0));
+    assert_eq!(projected_input_consumption(OpCode::CPUI_INT_OR, 0xffff, 0, 8, 0), None);
+
+    for opcode in [OpCode::CPUI_INT_ADD, OpCode::CPUI_INT_MULT] {
+    let mut data = build_fd();
+    let address = Address::new(ram_space(&data), 0x1000);
+    let input = data.new_varnode(8, &Address::new(ram_space(&data), 0x40), None).unwrap();
+    let constant = data.new_constant(8, 3);
+    let add = data.new_op(2, address.clone());
+    data.op_set_opcode_code(add, opcode);
+    data.op_set_input(add, input, 0).unwrap();
+    data.op_set_input(add, constant, 1).unwrap();
+    let wide = data.new_unique_out(8, add).unwrap();
+    let projection = data.new_op(2, address.clone());
+    data.op_set_opcode_code(projection, OpCode::CPUI_SUBPIECE);
+    let zero = data.new_constant(4, 0);
+    data.op_set_input(projection, wide, 0).unwrap();
+    data.op_set_input(projection, zero, 1).unwrap();
+    let low = data.new_unique_out(4, projection).unwrap();
+    let copy = data.new_op(1, address);
+    data.op_set_opcode_code(copy, OpCode::CPUI_COPY);
+    data.op_set_input(copy, low, 0).unwrap();
+    let result = data.new_unique_out(4, copy).unwrap();
+    for value in [input, constant, wide, zero, low, result] {
+        data.vbank_mut().get_mut(value).unwrap().set_consume(0);
+    }
+    let mut work = Vec::new();
+    dc_push_consumed(&mut data, 0xffff_ffff, result, &mut work);
+    while !work.is_empty() {
+        dc_propagate_consumed(&mut data, &mut work);
+    }
+    assert_eq!(data.vbank().get(input).unwrap().get_consume(), 0xffff_ffff);
+    dc_push_consumed(&mut data, !0, wide, &mut work);
+    while !work.is_empty() {
+        dc_propagate_consumed(&mut data, &mut work);
+    }
+    assert_eq!(data.vbank().get(input).unwrap().get_consume(), !0,
+        "a second whole-width use dominates the projected use");
+    }
+}
+
 mod config_ir_regressions {
     use super::{Address, Datatype, Funcdata, OpCode, Rc, VarnodeId, build_fd, ram_space, type_metatype};
 
@@ -37,7 +90,7 @@ mod config_ir_regressions {
             size,
             &Address::new(ram_space(fd), offset),
             Some(Rc::new(Datatype::new(size, type_metatype::TYPE_UNKNOWN))),
-        );
+        ).unwrap();
         fd.vbank_mut().set_input(vn, &mut |_, _, _| Ok(())).unwrap()
     }
 
@@ -90,14 +143,137 @@ mod config_ir_regressions {
             fd.op_insert_end(consumer, block);
             let mut action = crate::coreaction_render::ActionMultiCse::boxed("analysis");
             let mut context = crate::action::ActionContext::new();
-            action.apply(&mut fd, &mut context);
+            action.apply(&mut fd, &mut context).unwrap();
             let use_op = fd.obank().get(consumer).unwrap();
             assert_eq!(use_op.get_in(1), use_op.get_in(2));
             assert_ne!(use_op.get_in(1), use_op.get_in(3), "predecessor permutation is not equivalent");
             assert_eq!(action.base().count, 1);
-            action.apply(&mut fd, &mut context);
+            action.apply(&mut fd, &mut context).unwrap();
             assert_eq!(action.base().count, 1, "sharing reaches a fixed point");
         }
+
+    #[test]
+    fn phi_sharing_does_not_erase_copy_width_changes() {
+        // Malformed width-changing COPYs must not become equal merely because
+        // their sources match. Valid p-code represents such changes explicitly.
+        let mut fd = build_fd();
+        let root = fd.bblocks_root_pub();
+        let left = fd.bblocks_mut().new_block_basic(root);
+        let right = fd.bblocks_mut().new_block_basic(root);
+        let join = fd.bblocks_mut().new_block_basic(root);
+        fd.bblocks_mut().add_edge(left, join);
+        fd.bblocks_mut().add_edge(right, join);
+        let address = Address::new(ram_space(&fd), 0x1000);
+        let wide = input(&mut fd, 0x40, 8);
+        let b = input(&mut fd, 0x48, 4);
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let copy = fd.new_op(1, address.clone());
+            fd.op_set_opcode_code(copy, OpCode::CPUI_COPY);
+            let narrow = fd.new_unique_out(4, copy).unwrap();
+            fd.op_set_input(copy, wide, 0).unwrap();
+            fd.op_insert_end(copy, left);
+            let phi = fd.new_op(2, address.clone());
+            fd.op_set_opcode_code(phi, OpCode::CPUI_MULTIEQUAL);
+            outputs.push(fd.new_unique_out(4, phi).unwrap());
+            fd.op_set_input(phi, narrow, 0).unwrap();
+            fd.op_set_input(phi, b, 1).unwrap();
+            fd.op_insert_begin(phi, join);
+        }
+        let call = fd.new_op(3, address);
+        fd.op_set_opcode_code(call, OpCode::CPUI_CALL);
+        let target = fd.new_constant(8, 0x2000);
+        fd.op_set_input(call, target, 0).unwrap();
+        fd.op_set_input(call, outputs[0], 1).unwrap();
+        fd.op_set_input(call, outputs[1], 2).unwrap();
+        fd.op_insert_end(call, join);
+        let mut action = crate::coreaction_render::ActionMultiCse::boxed("analysis");
+        let mut context = crate::action::ActionContext::new();
+        action.apply(&mut fd, &mut context).unwrap();
+        let consumer = fd.obank().get(call).unwrap();
+        assert_eq!(consumer.get_in(1), Some(outputs[0]));
+        assert_eq!(consumer.get_in(2), Some(outputs[1]));
+        assert_eq!(action.base().count, 0);
+    }
+
+    #[test]
+    fn phi_sharing_keeps_distinct_tied_state_and_still_finds_same_address_match() {
+        use crate::varnode::varnode_flags;
+        use kuna_base::space::{IopSpace, SpacebaseSpace};
+
+        let mut manager = super::build_manager();
+        let ram = Rc::clone(manager.get_space_by_name("ram").unwrap());
+        let stack = Rc::new(SpacebaseSpace::new("stack", 3, 8, &ram, 1, true, false));
+        manager.insert_space(Rc::clone(&stack)).unwrap();
+        manager.insert_space(Rc::new(IopSpace::new(4))).unwrap();
+        let address = Address::new(Rc::clone(&ram), 0x1000);
+        let mut fd = Funcdata::new(
+            "branch", "branch", Rc::new(crate::context::ArchContext::new(manager)),
+            address.clone(), 0x1000_0000, 0x40,
+        ).unwrap();
+        let root = fd.bblocks_root_pub();
+        let left = fd.bblocks_mut().new_block_basic(root);
+        let right = fd.bblocks_mut().new_block_basic(root);
+        let join = fd.bblocks_mut().new_block_basic(root);
+        fd.bblocks_mut().add_edge(left, join);
+        fd.bblocks_mut().add_edge(right, join);
+        let a = input(&mut fd, 0x40, 8);
+        let b = input(&mut fd, 0x48, 8);
+        let pp = input(&mut fd, 0x50, 8);
+        let local_address = Address::new(stack, u64::MAX - 15);
+        let global_address = Address::new(Rc::clone(&ram), 0x405050);
+        let mut outputs = Vec::new();
+        let mut phis = Vec::new();
+        for (location, persistent) in [
+            (&local_address, false), (&global_address, true), (&global_address, true),
+        ] {
+            let phi = fd.new_op(2, address.clone());
+            fd.op_set_opcode_code(phi, OpCode::CPUI_MULTIEQUAL);
+            let out = fd.new_varnode_out(8, location, phi).unwrap();
+            fd.vbank_mut().get_mut(out).unwrap().set_flags_pub(
+                varnode_flags::addrtied | if persistent { varnode_flags::persist } else { 0 },
+            );
+            fd.op_set_input(phi, a, 0).unwrap();
+            fd.op_set_input(phi, b, 1).unwrap();
+            fd.op_insert_end(phi, join);
+            outputs.push(out);
+            phis.push(phi);
+        }
+
+        // A STORE through pp may change the global, but not the local pointer.
+        let space = fd.new_constant(8, ram.get_index() as u64);
+        let store = fd.new_op(3, address.clone());
+        fd.op_set_opcode_code(store, OpCode::CPUI_STORE);
+        fd.op_set_input(store, space, 0).unwrap();
+        fd.op_set_input(store, pp, 1).unwrap();
+        fd.op_set_input(store, a, 2).unwrap();
+        fd.op_insert_end(store, join);
+        let indirect = fd.new_indirect_op(store, &global_address, 8, 0).unwrap();
+        fd.op_set_input(indirect, outputs[1], 0).unwrap();
+        let consumer = fd.new_op(3, address);
+        fd.op_set_opcode_code(consumer, OpCode::CPUI_CALL);
+        let target = fd.new_constant(8, 0x2000);
+        fd.op_set_input(consumer, target, 0).unwrap();
+        fd.op_set_input(consumer, outputs[0], 1).unwrap();
+        fd.op_set_input(consumer, outputs[2], 2).unwrap();
+        fd.op_insert_end(consumer, join);
+
+        let mut action = crate::coreaction_render::ActionMultiCse::boxed("analysis");
+        let mut context = crate::action::ActionContext::new();
+        action.apply(&mut fd, &mut context).unwrap();
+        assert_eq!(fd.obank().get(indirect).unwrap().get_in(0), Some(outputs[1]),
+            "the aliasing STORE's marker must still read the global-state phi");
+        let call = fd.obank().get(consumer).unwrap();
+        assert_eq!(call.get_in(1), Some(outputs[0]), "the local pointer stays separate");
+        assert_eq!(call.get_in(2), Some(outputs[1]),
+            "skip the incompatible first candidate, but common the same-address phi");
+        assert!(!fd.obank().get(phis[0]).unwrap().is_dead());
+        assert!(!fd.obank().get(phis[1]).unwrap().is_dead());
+        assert!(fd.obank().get(phis[2]).is_none_or(|op| op.is_dead()));
+        assert_eq!(action.base().count, 1);
+        action.apply(&mut fd, &mut context).unwrap();
+        assert_eq!(action.base().count, 1, "sharing reaches a fixed point");
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -142,6 +318,13 @@ fn typed_call_fixture() -> (Funcdata, Rc<Datatype>, Rc<ProtoModel>) {
 fn typed_call_fixture_with_globals(
     configure: impl FnOnce(&mut ArchContext, &Rc<Datatype>),
 ) -> (Funcdata, Rc<Datatype>, Rc<ProtoModel>) {
+    typed_call_fixture_with_output_entry(4, configure)
+}
+
+fn typed_call_fixture_with_output_entry(
+    output_size: i32,
+    configure: impl FnOnce(&mut ArchContext, &Rc<Datatype>),
+) -> (Funcdata, Rc<Datatype>, Rc<ProtoModel>) {
     let mut manager = build_manager();
     let register = Rc::new(AddrSpace::new(
         spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3,
@@ -155,7 +338,8 @@ fn typed_call_fixture_with_globals(
     model.set_name("callback");
     for (input, offset) in [(true, 0x10), (false, 0x20)] {
         let entry = ParamEntry::seed(
-            0, type_class::TYPECLASS_GENERAL, register.clone(), offset, 4, 1, 0,
+            0, type_class::TYPECLASS_GENERAL, register.clone(), offset,
+            if input { 4 } else { output_size }, 1, 0,
             0, true, false, &[], &manager,
         ).unwrap();
         let list = if input { model.input_mut() } else { model.output_mut() };
@@ -200,9 +384,9 @@ fn add_typed_indirect_call(
     fd.op_set_opcode(call, TypeOp::new(
         OpCode::CPUI_CALLIND, crate::op::pcodeop_flags::call, "CALLIND",
     ));
-    let target = fd.new_varnode(8, &Address::new(register.clone(), 0x80), Some(pointer));
-    let discarded = fd.new_varnode(4, &Address::new(register.clone(), 0x30), Some(int_type.clone()));
-    let argument = fd.new_varnode(4, &Address::new(register.clone(), 0x10), Some(int_type));
+    let target = fd.new_varnode(8, &Address::new(register.clone(), 0x80), Some(pointer)).unwrap();
+    let discarded = fd.new_varnode(4, &Address::new(register.clone(), 0x30), Some(int_type.clone())).unwrap();
+    let argument = fd.new_varnode(4, &Address::new(register.clone(), 0x10), Some(int_type)).unwrap();
     fd.op_set_input(call, target, 0).unwrap();
     fd.op_set_input(call, discarded, 1).unwrap();
     fd.op_set_input(call, argument, 2).unwrap();
@@ -216,11 +400,76 @@ fn add_typed_indirect_call(
 }
 
 #[test]
+fn typed_callind_uses_settled_return_geometry_without_image_extension_facts() {
+    for (output_size, output_offset, pending, admitted) in [
+        (4, 0x20, false, true),
+        (8, 0x20, false, false),
+        (4, 0x24, false, false),
+        (4, 0x20, true, false),
+    ] {
+        let (mut fd, code, model) = typed_call_fixture_with_output_entry(8, |_, _| {});
+        assert_eq!(fd.get_arch().caller_extends_returns_from, i32::MAX);
+        let source = code.get_code_prototype().unwrap().clone();
+        assert_eq!(source.get_output().get_size(), 4);
+        let (call, argument, original_output) =
+            add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+        let output = if output_size == 4 && output_offset == 0x20 {
+            original_output
+        } else {
+            fd.op_unset_output(call).unwrap();
+            let register = fd.get_arch().manage().get_space_by_name("register").unwrap().clone();
+            fd.new_varnode_out(output_size, &Address::new(register, output_offset), call).unwrap()
+        };
+        if pending {
+            fd.get_call_specs_mut(0).init_active_output();
+        }
+        ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
+        assert_eq!(fd.get_call_specs(0).is_input_locked(), admitted);
+        let op = fd.obank().get(call).unwrap();
+        assert_eq!(op.num_input(), if admitted { 2 } else { 3 });
+        assert_eq!(op.get_out(), Some(output));
+        if admitted {
+            assert_eq!(op.get_in(1), Some(argument));
+        }
+        assert!(!fd.has_restart_pending());
+        assert_eq!(source.get_output().get_size(), 4);
+        assert_eq!(source.num_params(), 1);
+        assert!(!source.is_override());
+    }
+}
+
+#[test]
+fn typed_callind_retains_unconsolidated_live_return_trials() {
+    for used in [false, true] {
+        let (mut fd, code, model) = typed_call_fixture_with_output_entry(8, |_, _| {});
+        let (call, _, output) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
+        let register = fd.get_arch().manage().get_space_by_name("register").unwrap().clone();
+        let trials = fd.get_call_specs_mut(0).get_active_output();
+        for offset in [0x20, 0x28] {
+            trials.register_trial(&Address::new(register.clone(), offset), 4);
+        }
+        trials.get_trial_mut(0).mark_used();
+        if used {
+            trials.get_trial_mut(1).mark_used();
+        } else {
+            trials.get_trial_mut(1).mark_active();
+        }
+        assert!(!fd.get_call_specs(0).is_output_active());
+        ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
+        assert!(!fd.get_call_specs(0).is_input_locked());
+        assert_eq!(fd.get_call_specs(0).active_output().get_num_trials(), 2);
+        assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
+        assert_eq!(fd.obank().get(call).unwrap().get_out(), Some(output));
+        assert!(!fd.has_restart_pending());
+    }
+}
+
+#[test]
 fn typed_callind_commits_real_operands_and_preserves_shared_signature() {
     let (mut fd, code, model) = typed_call_fixture();
     let (call, argument, output) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
     let shared = code.get_code_prototype().unwrap().clone();
-    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
     assert!(!fd.has_restart_pending());
     let op = fd.obank().get(call).unwrap();
     assert_eq!(op.code(), OpCode::CPUI_CALLIND);
@@ -279,7 +528,7 @@ fn typed_callind_preserves_unlocked_site_pin_while_restricting_other_site() {
     proto.set_override(true);
     assert!(proto.has_custom_storage());
     assert!(!proto.is_input_locked());
-    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
     assert_eq!(fd.obank().get(first).unwrap().num_input(), 3);
     let pinned = fd.get_call_specs(0).proto();
     assert!(pinned.has_custom_storage());
@@ -298,7 +547,7 @@ fn typed_callind_failed_late_restriction_persists_only_in_same_analysis() {
     let (call, _, _) = add_typed_indirect_call(&mut fd, &code, model, 0x1010);
     fd.get_call_specs_mut(0).get_active_input().clear();
     let site = fd.obank().get(call).unwrap().get_addr().clone();
-    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
     assert!(fd.has_restart_pending());
     assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
     let stored = fd.get_override().find_proto_override(&site).unwrap()
@@ -322,7 +571,7 @@ fn generic_code_pointer_does_not_invent_a_callable_declaration() {
     let (mut fd, _, model) = typed_call_fixture();
     let generic_code = fd.get_arch().types().unwrap().get_type_code().unwrap();
     let (call, _, output) = add_typed_indirect_call(&mut fd, &generic_code, model, 0x1010);
-    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
+    ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
     assert!(!fd.has_restart_pending());
     assert!(!fd.get_call_specs(0).proto().is_override());
     assert_eq!(fd.obank().get(call).unwrap().num_input(), 3);
@@ -369,16 +618,16 @@ fn late_external_deindirection_preserves_resolved_function_authority() {
         let target_type = if callable_data {
             fd.get_arch().types().unwrap().get_type_pointer(8, code.clone(), 1).unwrap()
         } else { fd.get_arch().types().unwrap().get_base(8, type_metatype::TYPE_INT).unwrap() };
-        let target = fd.new_varnode(8, &slot, Some(target_type));
+        let target = fd.new_varnode(8, &slot, Some(target_type)).unwrap();
         fd.vbank_mut().get_mut(target).unwrap().set_flags_pub(varnode_flags::persist | varnode_flags::externref);
         fd.op_set_input(call, target, 0).unwrap();
-        ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new());
+        ActionDeindirect::boxed("g").apply(&mut fd, &mut ActionContext::new()).unwrap();
         assert_eq!(fd.get_call_specs(0).get_name(), "import_name");
         assert_eq!(fd.get_call_specs(0).get_entry_address(), &slot);
         assert_eq!(fd.obank().get(call).unwrap().code(), OpCode::CPUI_CALL);
         let site = fd.obank().get(call).unwrap().get_addr();
         assert_eq!(fd.get_override().find_indirect_override(site), Some(&slot));
-        let (_, entry, direct) = fd.get_arch().query_function(&slot).unwrap();
+        let (_, entry, direct) = fd.get_arch().query_function(&slot).unwrap().unwrap();
         assert_eq!(entry, slot);
         assert_eq!(direct.num_params(), if callable_data { 0 } else { 1 });
         if !fd.has_restart_pending() {
@@ -564,37 +813,71 @@ fn stackptrflow_no_stack_latches_finished() {
         analysis_finished: false,
     };
     // No stack space => analysis_finished set, no change.
-    assert_eq!(sp.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(sp.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(sp.analysis_finished, "no-stack path latches finished");
     assert_eq!(sp.base().count, 0);
     // Already-finished short-circuit.
-    assert_eq!(sp.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(sp.apply(&mut fd, &mut ctx).unwrap(), 0);
     // reset() clears the latch for a new function.
     sp.reset(&mut fd);
     assert!(!sp.analysis_finished, "reset clears analysis_finished");
 }
 
-/// `ActionStackPtrFlow` with a (here, spacebase-less) stack space runs the
-/// realized body: `check_clog` finds no clog (the space has no base register, so
-/// `getSpacebase` fails and the clog scan is empty) -> `numchange == 0` -> the
-/// C++ `analyzeExtraPop` branch runs and latches `analysis_finished`.  No change
-/// is applied (no spacebase refs to solve), so `count` stays 0.
+/// A mapped stack space runs the realized body: `check_clog` finds no clog,
+/// then `analyzeExtraPop` solves the unchanged input and latches finished.
+/// C++ `checkClog` requires `getSpacebase(0)` before scanning (coreaction.cc:436);
+/// ordinary processor RAM is not a supported substitute for the virtual stack.
 #[test]
 fn stackptrflow_with_stack_runs_and_latches() {
-    let mut fd = build_fd();
-    let ram = ram_space(&fd);
+    use kuna_base::space::{SpacebaseSpace, VarnodeStorage};
+    use crate::fspec::EXTRAPOP_UNKNOWN;
+
+    let mut manager = build_manager();
+    let ram = Rc::clone(manager.get_space_by_name("ram").unwrap());
+    let register = Rc::new(AddrSpace::new(
+        spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3,
+        addrspace_flags::hasphysical, 1, 1,
+    ));
+    manager.insert_space(Rc::clone(&register)).unwrap();
+    // Match Architecture::addSpacebase: RAM contains the virtual stack, while
+    // its pointer lives in the separate processor register space.
+    let stack = Rc::new(SpacebaseSpace::new("stack", 4, 8, &ram, 2, true, false));
+    manager.insert_space(Rc::clone(&stack)).unwrap();
+    let pointer = VarnodeStorage { space: Some(Rc::clone(&register)), offset: 0x20, size: 8 };
+    manager.add_spacebase_pointer(&stack, &pointer, 8, true).unwrap();
+    let mut arch = ArchContext::new(manager);
+    let mut model = ProtoModel::new(arch.manage());
+    model.set_extra_pop(EXTRAPOP_UNKNOWN);
+    arch.defaultfp = Some(Rc::new(model));
+    let entry = Address::new(ram, 0x1000);
+    let mut fd = Funcdata::new(
+        "func", "func", Rc::new(arch), entry.clone(), 0x10000000, 0x40,
+    ).unwrap();
+    let input = fd.new_varnode(8, &Address::new(register, pointer.offset), None).unwrap();
+    let input = fd.set_input_varnode(input).unwrap();
+    let root = fd.bblocks_root_pub();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let consumer = fd.new_op(1, entry);
+    fd.op_set_opcode_code(consumer, OpCode::CPUI_COPY);
+    fd.op_set_input(consumer, input, 0).unwrap();
+    fd.new_unique_out(8, consumer).unwrap();
+    fd.op_insert_end(consumer, block);
+
     let mut ctx = ActionContext::new();
     let mut sp = ActionStackPtrFlow {
         base: ActionBase::new(0, "stackptrflow", "g"),
-        stackspace: Some(ram),
+        stackspace: Some(stack),
         analysis_finished: false,
     };
-    assert_eq!(sp.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(sp.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(
         sp.analysis_finished,
         "no clog -> analyzeExtraPop runs and latches analysis_finished (C++ coreaction.cc:507)"
     );
     assert_eq!(sp.base().count, 0);
+    assert_eq!(fd.obank().get(consumer).unwrap().code(), OpCode::CPUI_COPY);
+    assert_eq!(fd.obank().get(consumer).unwrap().get_in(0), Some(input));
+    assert!(fd.vbank().get(input).unwrap().is_input());
 }
 
 /// The `reset` overrides zero the per-function counters
@@ -650,7 +933,7 @@ fn all_applies_report_no_change_on_empty_fd() {
     let mut fd = build_fd();
     let mut ctx = ActionContext::new();
     for mut a in render_actions("g") {
-        let r = a.apply(&mut fd, &mut ctx);
+        let r = a.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(r, 0, "{} apply must return 0", a.get_name());
         assert_eq!(a.base().count, 0, "{} apply must report no change", a.get_name());
     }

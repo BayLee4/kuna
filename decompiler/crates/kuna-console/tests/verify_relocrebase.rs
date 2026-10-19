@@ -92,7 +92,7 @@ fn dwarf_types_apply_to_the_rebased_functions() {
         /* no_vars= */ true,
         /* want_proto= */ false,
         /* want_provenance= */ false,
-    );
+    ).unwrap();
     let code = out.first().and_then(|f| f.code.clone()).unwrap_or_default();
     assert!(
         code.contains("char ch"),

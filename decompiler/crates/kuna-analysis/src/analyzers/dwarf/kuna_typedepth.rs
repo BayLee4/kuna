@@ -29,12 +29,12 @@ const MAX_TYPE_DEPTH: u32 = 3;
 /// The recursion guard threaded through [`super::build_datatype`].
 ///
 /// [`Guard`] is the guard proper; `active` is the (kuna `dwarfstructs`) set of
-/// aggregate names whose field population is on the current path, so a
+/// producer nominal identities whose field population is on the current path, so a
 /// self-referential member resolves to the interned shell instead of re-entering
 /// the populate — see [`super::kuna_dwarfstructs`].
 pub(super) struct TypeWalk {
     guard: Guard,
-    active: BTreeSet<String>,
+    active: BTreeSet<u64>,
 }
 
 /// The recursion-guard arms proper.
@@ -63,16 +63,16 @@ impl TypeWalk {
         TypeWalk { guard, active: BTreeSet::new() }
     }
 
-    /// (kuna `dwarfstructs`) Claim `name` for field population on this path.
+    /// Claim the exact producer identity for field population on this path.
     /// `false` => the aggregate is already being populated by an outer frame, so
     /// the caller must hand back the interned shell rather than recurse.
-    pub(super) fn begin_aggregate(&mut self, name: &str) -> bool {
-        self.active.insert(name.to_string())
+    pub(super) fn begin_aggregate(&mut self, identity: u64) -> bool {
+        self.active.insert(identity)
     }
 
-    /// (kuna `dwarfstructs`) Release a name claimed by [`Self::begin_aggregate`].
-    pub(super) fn end_aggregate(&mut self, name: &str) {
-        self.active.remove(name);
+    /// Release an identity claimed by [`Self::begin_aggregate`].
+    pub(super) fn end_aggregate(&mut self, identity: u64) {
+        self.active.remove(&identity);
     }
 
     /// Begin resolving the DIE at `off`; `false` => refuse (cycle, or a bound
@@ -170,11 +170,11 @@ mod tests {
     #[test]
     fn aggregate_claim_is_path_local() {
         let mut w = TypeWalk::with_gate(true);
-        assert!(w.begin_aggregate("node"));
-        assert!(!w.begin_aggregate("node"), "a re-entrant claim must be refused");
-        assert!(w.begin_aggregate("other"), "a different name is unaffected");
-        w.end_aggregate("node");
-        assert!(w.begin_aggregate("node"), "released names are claimable again");
+        assert!(w.begin_aggregate(1));
+        assert!(!w.begin_aggregate(1), "a re-entrant claim must be refused");
+        assert!(w.begin_aggregate(2), "a different identity is unaffected");
+        w.end_aggregate(1);
+        assert!(w.begin_aggregate(1), "released identities are claimable again");
     }
 
     /// The gate-off arm is the pre-fix budget: three hops, whatever they are.

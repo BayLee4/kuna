@@ -128,7 +128,7 @@ fn a_same_width_const_space_load_becomes_a_copy_of_the_pointer() {
     let (op, ptr) = build_load(&mut fd, CONST_SPACE_IDX, 16, 16, false);
 
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     let (code, in0, n) = shape(&fd, op);
     assert_eq!(code, OpCode::CPUI_COPY);
@@ -142,7 +142,7 @@ fn a_narrower_read_is_declined() {
     let (op, _ptr) = build_load(&mut fd, CONST_SPACE_IDX, 8, 4, false);
 
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0, "a width mismatch is not the identity");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0, "a width mismatch is not the identity");
 
     let (code, _, _) = shape(&fd, op);
     assert_eq!(code, OpCode::CPUI_LOAD);
@@ -154,7 +154,7 @@ fn a_wider_read_is_declined() {
     let (op, _ptr) = build_load(&mut fd, CONST_SPACE_IDX, 4, 8, false);
 
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0, "a width mismatch is not the identity");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0, "a width mismatch is not the identity");
 
     let (code, _, _) = shape(&fd, op);
     assert_eq!(code, OpCode::CPUI_LOAD);
@@ -165,7 +165,7 @@ fn a_real_memory_load_is_left_alone() {
     let mut fd = build_fd(true);
     let (op, _ptr) = build_load(&mut fd, RAM_SPACE_IDX, 8, 8, false);
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(shape(&fd, op).0, OpCode::CPUI_LOAD);
 }
 
@@ -176,7 +176,7 @@ fn a_constant_pointer_is_left_to_ruleloadvarnode() {
     let mut fd = build_fd(true);
     let (op, _ptr) = build_load(&mut fd, CONST_SPACE_IDX, 8, 8, true);
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(shape(&fd, op).0, OpCode::CPUI_LOAD);
 }
 
@@ -185,6 +185,6 @@ fn the_gate_off_leaves_the_load_alone() {
     let mut fd = build_fd(false);
     let (op, _ptr) = build_load(&mut fd, CONST_SPACE_IDX, 16, 16, false);
     let mut rule = RuleConstSpaceLoad::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(shape(&fd, op).0, OpCode::CPUI_LOAD);
 }

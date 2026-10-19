@@ -196,7 +196,8 @@ fn attribute(args: &CryptoArgs, file: &object::File, hits: Vec<Hit>) -> Result<V
         .map(|e| (e.addr.get_offset(), e.name))
         .collect();
     let seeds: Vec<u64> = inventory.keys().copied().collect();
-    let index = kuna_analysis::listing::xrefs::build(file, prog.arch(), prog.arch().translate(), &seeds);
+    let index = kuna_analysis::listing::xrefs::build(file, prog.arch(), prog.arch().translate(), &seeds)
+        .map_err(|e| e.to_string())?;
     let mut names: BTreeMap<u64, String> = BTreeMap::new();
     let mut name_of = |entry: u64| {
         names

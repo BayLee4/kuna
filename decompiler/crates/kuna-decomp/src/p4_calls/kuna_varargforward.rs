@@ -69,19 +69,20 @@ pub fn forwards_declared_value(
     slot: int4,
     addr: &Address,
     size: int4,
-) -> bool {
+    source_inputs: Option<&crate::fspec::FuncProto>,
+) -> KunaResult<bool> {
     let arch = data.get_arch();
     if !arch.vararg_forward {
-        return false;
+        return Ok(false);
     }
     let fc = data.get_call_specs(idx);
     if !fc.is_dotdotdot() || !fc.proto().has_model() {
-        return false;
+        return Ok(false);
     }
     let op = fc.get_op();
-    let Some(vn) = data.obank().get(op).and_then(|o| o.get_in(slot)) else { return false };
-    if !read_only_at(data, vn, op, slot, 0) || !declared_value(data, vn) {
-        return false;
+    let Some(vn) = data.obank().get(op).and_then(|o| o.get_in(slot)) else { return Ok(false) };
+    if !read_only_at(data, vn, op, slot, 0) || !declared_value(data, vn, source_inputs) {
+        return Ok(false);
     }
     let float = fc.proto().model().input().get_entry().iter().any(|e| {
         e.get_type() == type_class::TYPECLASS_FLOAT && e.justified_contain(addr, size) >= 0
@@ -89,9 +90,9 @@ pub fn forwards_declared_value(
     if float
         && (arch.vararg_floats == VarargFloats::Shadowed || float_register_count(data, op).is_some())
     {
-        return false;
+        return Ok(false);
     }
-    !format_stops_before(data, fc, addr, size, float)
+    Ok(!format_stops_before(data, fc, addr, size, float)?)
 }
 
 /// Narrow register trial `i` of variadic call spec `idx` to the int width when
@@ -101,7 +102,7 @@ pub fn forwards_declared_value(
 /// `int d4(const char *f, int a) { pr(f, a); return pr(f, a); }` hands `a` on
 /// in `esi`; the 8-byte `rsi` trial would otherwise print `CONCAT44(v1,a)` with
 /// `v1` never set.
-pub fn narrow_undeclared_upper(data: &mut Funcdata, idx: int4, i: int4) {
+pub fn narrow_undeclared_upper(data: &mut Funcdata, idx: int4, i: int4, source_inputs: Option<&crate::fspec::FuncProto>) {
     let arch = data.get_arch();
     if !arch.vararg_forward {
         return;
@@ -126,8 +127,8 @@ pub fn narrow_undeclared_upper(data: &mut Funcdata, idx: int4, i: int4) {
         return;
     }
     let Some(vn) = data.obank().get(fc.get_op()).and_then(|o| o.get_in(slot)) else { return };
-    if !undeclared_bytes(data, vn, width, size - width, &mut 64)
-        || !super::kuna_varargformat::defined_bytes(data, vn, 0, width, &mut 64)
+    if !undeclared_bytes(data, vn, width, size - width, &mut 64, source_inputs)
+        || !super::kuna_varargformat::defined_bytes(data, vn, 0, width, &mut 64, source_inputs)
     {
         return;
     }
@@ -143,6 +144,7 @@ fn undeclared_bytes(
     offset: int4,
     width: int4,
     budget: &mut u32,
+    source_inputs: Option<&crate::fspec::FuncProto>,
 ) -> bool {
     if *budget == 0 {
         return false;
@@ -154,7 +156,7 @@ fn undeclared_bytes(
         return false;
     }
     if v.is_input() {
-        let proto = data.get_func_proto();
+        let proto = source_inputs.unwrap_or_else(|| data.get_func_proto());
         let at = v.get_addr();
         return proto.is_input_locked()
             && at.get_space().is_some_and(|s| s.get_type() == spacetype::IPTR_PROCESSOR)
@@ -167,7 +169,7 @@ fn undeclared_bytes(
     }
     let Some(op) = v.get_def().and_then(|id| data.obank().get(id)) else { return false };
     let mut input = |slot, off, len| {
-        op.get_in(slot).is_some_and(|id| undeclared_bytes(data, id, off, len, budget))
+        op.get_in(slot).is_some_and(|id| undeclared_bytes(data, id, off, len, budget, source_inputs))
     };
     match op.code() {
         OpCode::CPUI_COPY => input(0, offset, width),
@@ -202,11 +204,11 @@ fn undeclared_bytes(
 
 /// Is `vn` the calling function's own input where it declares a parameter, or
 /// the output of a call whose declared return it is?
-pub(super) fn declared_value(data: &Funcdata, vn: VarnodeId) -> bool {
+pub(super) fn declared_value(data: &Funcdata, vn: VarnodeId, source_inputs: Option<&crate::fspec::FuncProto>) -> bool {
     let Some(v) = data.vbank().get(vn) else { return false };
     let (at, width) = (v.get_addr(), v.get_size());
     if v.is_input() {
-        let proto = data.get_func_proto();
+        let proto = source_inputs.unwrap_or_else(|| data.get_func_proto());
         return proto.is_input_locked()
             && (0..proto.num_params()).filter_map(|i| proto.get_param(i)).any(|p| {
                 let (pa, ps) = (p.get_address(), p.get_size());
@@ -253,63 +255,69 @@ fn format_stops_before(
     addr: &Address,
     size: int4,
     float: bool,
-) -> bool {
+) -> KunaResult<bool> {
     let fixed = fc.proto().num_params();
     let Some(format) = fixed.checked_sub(1).and_then(|i| fc.proto().get_param(i)) else {
-        return false;
+        return Ok(false);
     };
     let active = fc.active_input();
     let index = active.which_trial(&format.get_address(), format.get_size());
     if index < 0 {
-        return false;
+        return Ok(false);
     }
     let op = fc.get_op();
-    let Some(call) = data.obank().get(op) else { return false };
-    let Some(vn) = call.get_in(active.get_trial(index).get_slot()) else { return false };
-    let Some((value, width)) = constant_value(data, vn, 0) else { return false };
+    let Some(call) = data.obank().get(op) else { return Ok(false) };
+    let Some(vn) = call.get_in(active.get_trial(index).get_slot()) else { return Ok(false) };
+    let Some((value, width)) = constant_value(data, vn, 0)? else { return Ok(false) };
     let Some(count) =
-        crate::p4_calls::kuna_formatwitness::pointed_format_count(data, value, width, call.get_addr())
+        crate::p4_calls::kuna_formatwitness::pointed_format_count(data, value, width, call.get_addr())?
     else {
-        return false;
+        return Ok(false);
     };
-    vararg_position(data, fc, addr, size, float).is_some_and(|position| position > count)
+    Ok(vararg_position(data, fc, addr, size, float).is_some_and(|position| position > count))
 }
 
 /// The constant `vn` holds, with its size: through COPYs, an INT_ADD (an
 /// `adrp`/`add` pair, ARM's `add r0,pc,r0`) and a LOAD from read-only memory (a
 /// literal pool), before the simplification rules have folded them.
-pub(super) fn constant_value(data: &Funcdata, vn: VarnodeId, depth: u32) -> Option<(u64, int4)> {
-    let v = data.vbank().get(vn)?;
+pub(super) fn constant_value(data: &Funcdata, vn: VarnodeId, depth: u32) -> KunaResult<Option<(u64, int4)>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     let size = v.get_size();
     if v.is_constant() {
-        return Some((v.get_offset(), size));
+        return Ok(Some((v.get_offset(), size)));
     }
     if depth >= 6 {
-        return None;
+        return Ok(None);
     }
-    let def = data.obank().get(v.get_def()?)?;
-    let operand = |slot| constant_value(data, def.get_in(slot)?, depth + 1);
-    match def.code() {
-        OpCode::CPUI_COPY => operand(0).map(|(value, _)| (value, size)),
+    let Some(def) = v.get_def().and_then(|def| data.obank().get(def)) else { return Ok(None) };
+    let operand = |slot| match def.get_in(slot) {
+        Some(input) => constant_value(data, input, depth + 1),
+        None => Ok(None),
+    };
+    Ok(match def.code() {
+        OpCode::CPUI_COPY => operand(0)?.map(|(value, _)| (value, size)),
         OpCode::CPUI_INT_ADD => {
-            let (a, b) = (operand(0)?.0, operand(1)?.0);
+            let Some((a, _)) = operand(0)? else { return Ok(None) };
+            let Some((b, _)) = operand(1)? else { return Ok(None) };
             let mask = if size >= 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
             Some((a.wrapping_add(b) & mask, size))
         }
         OpCode::CPUI_LOAD => {
             let manage = data.get_arch().manage();
-            let index = data.vbank().get(def.get_in(0)?)?.get_offset();
+            let Some(space_id) = def.get_in(0).and_then(|input| data.vbank().get(input)) else { return Ok(None) };
+            let index = space_id.get_offset();
             if index >= manage.num_spaces() as u64 || !(1..=8).contains(&size) {
-                return None;
+                return Ok(None);
             }
-            let space = manage.get_space(index as i32)?.clone();
-            let at = Address::new(space.clone(), operand(1)?.0);
-            let flags = data.get_arch().query_global_properties(&at, size, def.get_addr());
+            let Some(space) = manage.get_space(index as i32).cloned() else { return Ok(None) };
+            let Some((offset, _)) = operand(1)? else { return Ok(None) };
+            let at = Address::new(space.clone(), offset);
+            let flags = data.get_arch().query_global_properties(&at, size, def.get_addr())?;
             if flags & crate::varnode::varnode_flags::readonly == 0 {
-                return None;
+                return Ok(None);
             }
             let mut bytes = [0u8; 8];
-            data.get_arch().loader_fill(&mut bytes[..size as usize], &at).ok()?;
+            data.get_arch().loader_fill(&mut bytes[..size as usize], &at)?;
             let bytes = &bytes[..size as usize];
             let fold = |acc: u64, b: &u8| (acc << 8) | *b as u64;
             let value = if space.is_big_endian() {
@@ -320,7 +328,7 @@ pub(super) fn constant_value(data: &Funcdata, vn: VarnodeId, depth: u32) -> Opti
             Some((value, size))
         }
         _ => None,
-    }
+    })
 }
 
 /// Which variadic argument of its class, counting from 1, the call's model puts

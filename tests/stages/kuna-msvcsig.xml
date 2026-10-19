@@ -74,6 +74,6 @@ c3
 <stringmatch name="MSVCSIG #4: on types the caller's parameter as the class pointer" min="1" max="1">int4 sub_401000\(Arr \*a0\)</stringmatch>
 <stringmatch name="MSVCSIG #5: on gives the copy constructor its slot and its source" min="1" max="1">Arr::Arr\(\(Arr \*\)&amp;v1,a2\);</stringmatch>
 <stringmatch name="MSVCSIG #6: the hidden return pointer is MakeStack's argument in both passes" min="2" max="2">MakeStack\(a1\);</stringmatch>
-<stringmatch name="MSVCSIG #7: on types the hidden return pointer" min="1" max="1">Arr \* sub_401020\(</stringmatch>
+<stringmatch name="MSVCSIG #7: on types the hidden return pointer" min="1" max="1">Arr \* __thiscall sub_401020\(</stringmatch>
 <stringmatch name="MSVCSIG #8: the cdecl import keeps its argument in both passes" min="2" max="2">Note\(v1\);</stringmatch>
 </decompilertest>

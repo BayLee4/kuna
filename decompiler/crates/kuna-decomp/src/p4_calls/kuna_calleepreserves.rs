@@ -140,11 +140,11 @@ impl OptionCalleePreserves {
 pub fn seed_callee_preserves(
     arch: &mut crate::architecture::Architecture,
     data: &mut Funcdata,
-) {
+) -> KunaResult<()> {
     if !arch.callee_preserves {
-        return;
+        return Ok(());
     }
-    crate::kuna_rustabi::seed_callee_write_probe(arch, data);
+    crate::kuna_rustabi::seed_callee_write_probe(arch, data)
 }
 
 /// Does the decoded body of `fc`'s callee prove it never writes
@@ -172,6 +172,14 @@ pub fn callee_preserves_range(
     // statement made about it.
     if fc.proto().has_effect_override() {
         return false;
+    }
+    // A raw write is not a clobber when every normal exit restores the same
+    // incoming register. This exact-width sibling proof also discharges the
+    // actual callsite's conditional private-spill alias obligations.
+    match crate::kuna_calleememory::register_entry_identity(data, fc, addr, size) {
+        crate::kuna_calleememory::EntryIdentity::Preserved => return true,
+        crate::kuna_calleememory::EntryIdentity::Changed => return false,
+        crate::kuna_calleememory::EntryIdentity::Unknown => {}
     }
     let entry = fc.get_entry_address();
     if entry.is_invalid() {

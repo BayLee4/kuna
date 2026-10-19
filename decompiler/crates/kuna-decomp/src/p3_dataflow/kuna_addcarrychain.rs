@@ -61,64 +61,64 @@ impl Rule for RuleAddCarryChain {
     }
 
     /// C++ `RuleAddCarryChain::applyOp` (`kuna_addcarrychain.cc:77`) — transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (kuna) gate (ArchContext-carried).
         if !self.enabled && !data.get_arch().add_carry_chain {
-            return 0;
+            return Ok(0);
         }
 
         let hivn = match op_in(data, op, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let lovn = match op_in(data, op, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_written(data, hivn) || !vn_is_written(data, lovn) {
-            return 0;
+            return Ok(0);
         }
         if vn_size(data, hivn) != 1 || vn_size(data, lovn) != 1 {
-            return 0;
+            return Ok(0);
         }
 
         let loadd = vn_def(data, lovn).expect("lovn written");
         if op_code(data, loadd) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         let a = match op_in(data, loadd, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let b = match op_in(data, loadd, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
 
         let hiadd = vn_def(data, hivn).expect("hivn written");
         if op_code(data, hiadd) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
 
         // One input of the high add is the carry; the other is the base high byte.
         let hi0 = match op_in(data, hiadd, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let hi1 = match op_in(data, hiadd, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let hipart = if kuna_is_carry_of(data, hi1, a, b) {
             hi0
         } else if kuna_is_carry_of(data, hi0, a, b) {
             hi1
         } else {
-            return 0;
+            return Ok(0);
         };
 
         if vn_size(data, hipart) != 1 {
-            return 0;
+            return Ok(0);
         }
 
         // Pick the index operand (a, zext'd) and the base-low operand (b).
@@ -127,7 +127,7 @@ impl Rule for RuleAddCarryChain {
 
         let out = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         let outsize: int4 = vn_size(data, out);
 
@@ -171,7 +171,7 @@ impl Rule for RuleAddCarryChain {
         let zext_out = data.obank().get(zextop).expect("zextop live").get_out().expect("zextop out");
         data.op_set_input(op, zext_out, 1)
             .expect("RuleAddCarryChain: opSetInput op.1");
-        1
+        Ok(1)
     }
 }
 

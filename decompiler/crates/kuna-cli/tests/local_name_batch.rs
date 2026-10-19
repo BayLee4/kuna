@@ -175,22 +175,21 @@ fn a_swap_exchanges_the_two_names() {
 #[test]
 fn a_renamed_local_answers_to_either_name() {
     for second in ["type v1 unsigned int", "type i unsigned int"] {
-        applies(
+        let code = applies(
             "two_locals",
             &["name v1 i", second],
-            &["uint4 i; // ebx", "i = 0;"],
+            &["i = 0;"],
         );
-        applies(
+        kuna_harness::c_behavior::assert_c_declaration(&code, "i", "unsigned int", "ebx");
+        let code = applies(
             "stack_pair",
             &["name v1 i", second],
-            &["uint4 i; // stack - 0x10", "fill(&i,"],
+            &["fill(&i,"],
         );
+        kuna_harness::c_behavior::assert_c_declaration(&code, "i", "unsigned int", "stack - 0x10");
     }
-    applies(
-        "two_locals",
-        &["type v1 unsigned int", "name v1 i"],
-        &["uint4 i; // ebx"],
-    );
+    let code = applies("two_locals", &["type v1 unsigned int", "name v1 i"], &[]);
+    kuna_harness::c_behavior::assert_c_declaration(&code, "i", "unsigned int", "ebx");
 }
 
 /// After `name v1 v2` the identifier `v2` names two locals: the one printed as
@@ -208,6 +207,8 @@ fn a_printed_name_given_to_another_local_is_ambiguous() {
         ("mixed_pair", "v1", "v2", "int4 v3; // stack - 0xc"),
     ] {
         let rename = format!("name {from} {to}");
+        let (unchanged, accepted) = decompile(function, &[&rename]);
+        assert!(accepted.is_empty(), "{accepted:?}");
         for second in [
             format!("type {to} unsigned int"),
             format!("name {to} foo"),
@@ -219,6 +220,7 @@ fn a_printed_name_given_to_another_local_is_ambiguous() {
                  local printed as {from} (now {to})\""
             );
             assert_eq!(rejected, [detail], "{function}:\n{code}");
+            assert_eq!(code, unchanged, "rejected directive changed a name, type, or lifetime");
             assert!(contains_declaration(&code, declared), "{function} {second}:\n{code}");
             assert!(!code.contains("uint4") && !code.contains("foo"), "{function}:\n{code}");
         }
@@ -231,15 +233,18 @@ fn a_printed_name_given_to_another_local_is_ambiguous() {
 /// used to be rejected as naming more than one symbol.
 #[test]
 fn a_later_directive_keeps_the_width_and_reads_the_shown_name() {
-    let (_, rejected) = decompile("two_locals", &["name v1 i", "type i char *"]);
+    let (unchanged, accepted) = decompile("two_locals", &["name v1 i"]);
+    assert!(accepted.is_empty(), "{accepted:?}");
+    let (code, rejected) = decompile("two_locals", &["name v1 i", "type i char *"]);
+    assert_eq!(code, unchanged, "width rejection changed the emitted variable");
     assert_eq!(
         rejected,
         ["\"type i char *\": \"Storage is 4 bytes, the stated type is 8\""]
     );
-    for (third, declared) in [("type x unsigned int", "uint4 x; // ebx"), ("type x_1 unsigned int", "uint4 x_1; // r12d")] {
+    for (third, name, home) in [("type x unsigned int", "x", "ebx"), ("type x_1 unsigned int", "x_1", "r12d")] {
         let (code, rejected) = decompile("two_locals", &["name v1 x", "name v2 x", third]);
         assert!(rejected.is_empty(), "{third}: {rejected:?}");
-        assert!(contains_declaration(&code, declared), "{third}:\n{code}");
+        kuna_harness::c_behavior::assert_c_declaration(&code, name, "unsigned int", home);
     }
 }
 
@@ -270,12 +275,18 @@ fn a_name_renamed_away_and_given_to_another_local_is_ambiguous() {
     let directives = ["name v2 tmp", "name v1 v2", "type v2 unsigned int"];
     let detail = "\"type v2 unsigned int\": \"Ambiguous name: v2 is both the local printed as v2 \
                   (now tmp) and the local printed as v1 (now v2)\"";
+    let (unchanged, accepted) = decompile("stack_pair", &directives[..2]);
+    assert!(accepted.is_empty(), "{accepted:?}");
     let (code, rejected) = decompile("stack_pair", &directives);
     assert_eq!(rejected, [detail], "{code}");
+    assert_eq!(code, unchanged, "ambiguity rejection changed the stack locals");
     assert!(contains_declaration(&code, "int4 v2; // stack - 0x10"), "{code}");
     assert!(contains_declaration(&code, "int4 tmp [3]; // stack - 0xc"), "{code}");
+    let (unchanged, accepted) = decompile("two_locals", &directives[..2]);
+    assert!(accepted.is_empty(), "{accepted:?}");
     let (code, rejected) = decompile("two_locals", &directives);
     assert_eq!(rejected, [detail], "{code}");
+    assert_eq!(code, unchanged, "ambiguity rejection changed the register locals");
     assert!(!code.contains("uint4"), "{code}");
 }
 

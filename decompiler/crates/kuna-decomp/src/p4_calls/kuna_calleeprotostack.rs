@@ -37,11 +37,11 @@
 //! this callee's stack* — and both are declined wherever that claim is not
 //! evidence.
 //!
-//! * **The pop.** Only for a prototype that is input-locked, and only where the
-//!   MODEL leaves its extrapop unknown. A spec that states its own extrapop
-//!   (`x86gcc.cspec`'s `__cdecl extrapop="4"`, x86-64, every RISC spec) already
-//!   has the exact answer and is left alone — recomputing it from the parameter
-//!   list there would claim a `__cdecl` callee cleans its own arguments.
+//! * **The pop.** Only for an input-locked prototype whose working extrapop is
+//!   unknown. A fixed model supplies that value directly (`x86gcc.cspec`'s
+//!   `__cdecl extrapop="4"`, x86-64, every RISC spec). Only a MODEL whose
+//!   extrapop is unknown enters the 32-bit parameter-list inference; applying
+//!   that inference to a fixed model would invent a different cleanup.
 //! * **The reach.** Only for an input-locked, non-variadic prototype whose
 //!   extrapop is known by the rule above; only for a stack range wholly at or
 //!   above that extrapop in the CALLEE's frame (the return-address slot and the
@@ -80,13 +80,23 @@ impl OptionCalleeProtoStack {
 /// Give a freshly seeded, locked callee prototype the extrapop its parameter
 /// list implies (`ActionDefaultParams`).
 ///
-/// A no-op unless the prototype is input-locked and its MODEL declines to state
-/// an extrapop; a model that states one already has the exact answer.
+/// A no-op unless the prototype is input-locked and its working extrapop is
+/// unknown. A fixed model supplies that value without argument inference; only
+/// an unknown model uses the 32-bit parameter-list inference. Logical inputs
+/// without storage must reach working ABI acquisition before that inference:
+/// an invalid address is not evidence that the parameter occupies no stack bytes.
 pub fn resolve_declared_extra_pop(on: bool, fp: &mut FuncProto) {
     if !on || !fp.is_input_locked() {
         return;
     }
     if fp.get_extra_pop() != EXTRAPOP_UNKNOWN {
+        return;
+    }
+    if fp.has_model() && fp.get_model_extra_pop() != EXTRAPOP_UNKNOWN {
+        fp.set_extra_pop(fp.get_model_extra_pop());
+        return;
+    }
+    if (0..fp.num_params()).any(|i| fp.get_param(i).is_some_and(|p| p.get_address().is_invalid())) {
         return;
     }
     fp.resolve_extra_pop();

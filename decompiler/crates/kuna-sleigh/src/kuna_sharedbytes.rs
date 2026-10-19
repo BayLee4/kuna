@@ -17,7 +17,6 @@ use std::sync::Arc;
 use kuna_base::address::Address;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::AddrSpace;
-use kuna_base::types::Wrap;
 
 use crate::loadimage::{ImageBytes, LoadImage, IMAGE_WINDOW_BYTES};
 
@@ -173,6 +172,13 @@ impl SharedBytesImage {
 }
 
 impl LoadImage for SharedBytesImage {
+    fn is_import_slot(&self, address: &Address) -> bool {
+        self.spaceid.as_ref().zip(address.get_space())
+            .is_some_and(|(mapped, requested)| Rc::ptr_eq(mapped, requested))
+            && self.bytes.import_slot_ranges().iter()
+                .any(|&(lo, hi)| address.get_offset() >= lo && address.get_offset() < hi)
+    }
+
     fn get_file_name(&self) -> &str {
         &self.filename
     }
@@ -239,6 +245,26 @@ mod tests {
             0
         }
         fn mapped_covers(&self, _lo: u64, _hi: u64) -> bool { true }
+        fn import_slot_ranges(&self) -> &[(u64, u64)] { &[(0x1000, 0x1008)] }
+    }
+
+    #[test]
+    fn import_metadata_requires_the_actual_attached_space() {
+        let space = || Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 1, addrspace_flags::hasphysical, 1, 1,
+        ));
+        let mapped = space();
+        let other_bank = space();
+        let mut image = SharedBytesImage::new("shared", Arc::new(AllMapped));
+        let at = |offset| Address::new(Rc::clone(&mapped), offset);
+        assert!(!image.is_import_slot(&at(0x1000)), "an unattached image owns no space");
+        image.attach_to_space(Rc::clone(&mapped));
+        assert!(image.is_import_slot(&at(0x1000)));
+        assert!(image.is_import_slot(&at(0x1007)));
+        assert!(!image.is_import_slot(&at(0x1008)));
+        assert!(!image.is_import_slot(&Address::new(other_bank, 0x1000)),
+            "equal indices and offsets from another bank are not mapped addresses");
+        assert!(!image.is_import_slot(&Address::default()));
     }
 
     #[test]

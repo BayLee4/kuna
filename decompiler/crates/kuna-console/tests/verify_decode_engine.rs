@@ -81,7 +81,7 @@ fn agree_everywhere(name: &str) -> usize {
         &[],
         &[],
         ListingDetail::FULL,
-    );
+    ).unwrap();
 
     let recipe = arch
         .decode_recipe()

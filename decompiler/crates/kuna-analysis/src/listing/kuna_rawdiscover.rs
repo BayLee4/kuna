@@ -35,6 +35,7 @@
 use std::rc::Rc;
 
 use kuna_base::space::AddrSpace;
+use kuna_base::error::KunaResult;
 use kuna_decomp::architecture::Architecture;
 use kuna_sleigh::translate::Translate;
 
@@ -52,15 +53,17 @@ use crate::listing::{Listing, ListingDetail};
 /// `exec_ranges` bounds every decode. An address outside it is not decoded and
 /// contributes no successor, so a call into unmapped space is dropped rather
 /// than walked into the void.
+/// Register acquisition errors abort discovery rather than returning a partial
+/// inventory.
 pub fn discover(
     arch: &Architecture,
     translate: &dyn Translate,
     code_space: &Rc<AddrSpace>,
     exec_ranges: &[(u64, u64)],
     seeds: &[u64],
-) -> Vec<u64> {
+) -> KunaResult<Vec<u64>> {
     if seeds.is_empty() || exec_ranges.is_empty() {
-        return seeds.to_vec();
+        return Ok(seeds.to_vec());
     }
     let mut roots: Vec<u64> = seeds.to_vec();
     roots.extend(sweep_call_targets(translate, code_space, exec_ranges));
@@ -77,13 +80,13 @@ pub fn discover(
         exec_ranges,
         &roots,
         ListingDetail::PARTITION_ONLY,
-    );
+    )?;
 
     let mut out: Vec<u64> = seeds.to_vec();
     out.extend(listing.functions().map(|(&vma, _)| vma));
     out.sort_unstable();
     out.dedup();
-    out
+    Ok(out)
 }
 
 /// Decode `exec_ranges` end to end and return the target of every direct call.

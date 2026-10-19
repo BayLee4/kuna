@@ -105,13 +105,13 @@ impl Action for ActionPresentCompareForm {
 
     /// C++ `ActionPresentCompareForm::apply` (`kuna_compareform.cc:67`) —
     /// transcribed.
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // `Funcdata::glb` is the real `Architecture` (`ArchHandle = Rc<Architecture>`),
         // which carries the `present_lessequal` P0 flag (DIV-2 default-on, GH-558).
         // The static `enabled` constructor arg is retained as an OR override for
         // unit tests that drive the action without a fully-reset Architecture.
         if !self.enabled && !data.get_arch().present_lessequal {
-            return 0;
+            return Ok(0);
         }
         // The C++ iterates the live `alivelist` while `restoreLessequal` mutates
         // ops in place (opcode + one input; never inserts/removes ops), so the
@@ -134,7 +134,7 @@ impl Action for ActionPresentCompareForm {
                 self.base.count += 1;
             }
         }
-        0
+        Ok(0)
     }
 }
 

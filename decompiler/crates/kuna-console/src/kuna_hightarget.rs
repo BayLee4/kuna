@@ -248,7 +248,10 @@ fn resolve_shown(
             h.set_kuna_name(name);
         }
     }
-    let print = print?;
+    let print = match print? {
+        Ok(print) => print,
+        Err(error) => return Some(Err(error.explain().to_string())),
+    };
     let mut found = print.declared_locals().iter().filter(|local| local.name == shown);
     let local = found.next()?.clone();
     if found.next().is_some() {

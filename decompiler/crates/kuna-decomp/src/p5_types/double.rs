@@ -295,10 +295,11 @@ fn vn_set_addr_force(data: &mut Funcdata, vn: VarnodeId) {
 fn vn_set_write_mask(data: &mut Funcdata, vn: VarnodeId) {
     data.vbank_mut().get_mut(vn).expect("double: stale vn").set_write_mask();
 }
-/// `data.opSetOutput(op,vn)` — the C++ never fails here on a well-formed graph.
+/// `data.opSetOutput(op,vn)`, including fallible storage-property acquisition.
 #[inline]
-fn op_set_output(data: &mut Funcdata, op: OpId, vn: VarnodeId) {
-    data.op_set_output(op, vn).expect("double: op_set_output");
+fn op_set_output(data: &mut Funcdata, op: OpId, vn: VarnodeId) -> kuna_base::error::KunaResult<()> {
+    data.op_set_output(op, vn)?;
+    Ok(())
 }
 /// `data.opSetInput(op,vn,slot)`.
 #[inline]
@@ -841,10 +842,10 @@ impl SplitVarnode {
 
     /// Create a whole Varnode for this if it doesn't already exist (C++
     /// `findCreateWhole`).
-    fn find_create_whole(&mut self, data: &mut Funcdata) {
+    fn find_create_whole(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         if self.is_constant() {
             self.whole = Some(data.new_constant(self.wholesize, self.val));
-            return;
+            return Ok(());
         }
         // Mark the pieces
         if let Some(lo) = self.lo {
@@ -855,7 +856,7 @@ impl SplitVarnode {
         }
 
         if self.whole.is_some() {
-            return; // Already found the whole
+            return Ok(()); // Already found the whole
         }
         let addr: Address;
         let mut topblock: Option<BlockId> = None;
@@ -875,7 +876,7 @@ impl SplitVarnode {
                 .expect("fcw: new_unique_out");
             self.whole = Some(whole);
             set_opcode_typed(data, concatop, OpCode::CPUI_PIECE);
-            op_set_output(data, concatop, whole);
+            op_set_output(data, concatop, whole)?;
             op_set_input(data, concatop, hi, 0);
             op_set_input(data, concatop, self.lo.expect("fcw: lo"), 1);
         } else {
@@ -885,7 +886,7 @@ impl SplitVarnode {
                 .expect("fcw: new_unique_out");
             self.whole = Some(whole);
             set_opcode_typed(data, concatop, OpCode::CPUI_INT_ZEXT);
-            op_set_output(data, concatop, whole);
+            op_set_output(data, concatop, whole)?;
             op_set_input(data, concatop, self.lo.expect("fcw: lo"), 0);
         }
 
@@ -901,6 +902,7 @@ impl SplitVarnode {
 
         self.defpoint = Some(concatop);
         self.defblock = op_get_parent(data, concatop);
+        Ok(())
     }
 
     /// Create a whole Varnode that will later be set as a PcodeOp output (C++
@@ -917,13 +919,13 @@ impl SplitVarnode {
 
     /// Create a whole Varnode from pieces, respecting piece storage (C++
     /// `createJoinedWhole`).
-    fn create_joined_whole(&mut self, data: &mut Funcdata) {
+    fn create_joined_whole(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         let lo = self.lo.expect("cjw: lo");
         let hi = self.hi.expect("cjw: hi");
         vn_set_precis_lo(data, lo);
         vn_set_precis_hi(data, hi);
         if self.whole.is_some() {
-            return;
+            return Ok(());
         }
         let newaddr = match is_addr_tied_contiguous(data, lo, hi) {
             Some(addr) => addr,
@@ -937,12 +939,13 @@ impl SplitVarnode {
                 // that reach createJoinedWhole on the non-contiguous path would
                 // panic on the subsequent unwrap, so the only reachable caller
                 // path is gated below in replaceIndirectOp.
-                return;
+                return Ok(());
             }
         };
-        let whole = data.new_varnode(self.wholesize, &newaddr, None);
+        let whole = data.new_varnode(self.wholesize, &newaddr, None)?;
         vn_set_write_mask(data, whole);
         self.whole = Some(whole);
+        Ok(())
     }
 
     /// Rebuild the least significant piece as a CPUI_SUBPIECE of the whole (C++
@@ -1370,16 +1373,16 @@ fn create_binary_op(
     in2: &mut SplitVarnode,
     existop: OpId,
     opc: OpCode,
-) {
+) -> kuna_base::error::KunaResult<()> {
     out.find_create_output_whole(data);
-    in1.find_create_whole(data);
-    in2.find_create_whole(data);
+    in1.find_create_whole(data)?;
+    in2.find_create_whole(data)?;
     if op_code(data, existop) != OpCode::CPUI_PIECE {
         // The output whole didn't previously exist
         let addr = op_get_addr(data, existop);
         let newop = data.new_op(2, addr);
         set_opcode_typed(data, newop, opc);
-        op_set_output(data, newop, out.get_whole().expect("cbo: out whole"));
+        op_set_output(data, newop, out.get_whole().expect("cbo: out whole"))?;
         op_set_input(data, newop, in1.get_whole().expect("cbo: in1 whole"), 0);
         op_set_input(data, newop, in2.get_whole().expect("cbo: in2 whole"), 1);
         data.op_insert_before(newop, existop);
@@ -1391,6 +1394,7 @@ fn create_binary_op(
         op_set_input(data, existop, in1.get_whole().expect("cbo: in1 whole"), 0);
         op_set_input(data, existop, in2.get_whole().expect("cbo: in2 whole"), 1);
     }
+    Ok(())
 }
 
 /// Check that a double-precision shift op's operands are compatible; return the
@@ -1412,9 +1416,9 @@ fn create_shift_op(
     mut sa: VarnodeId,
     existop: OpId,
     opc: OpCode,
-) {
+) -> kuna_base::error::KunaResult<()> {
     out.find_create_output_whole(data);
-    in_.find_create_whole(data);
+    in_.find_create_whole(data)?;
     if vn_is_constant(data, sa) {
         sa = data.new_constant(vn_get_size(data, sa), vn_get_offset(data, sa));
     }
@@ -1422,7 +1426,7 @@ fn create_shift_op(
         let addr = op_get_addr(data, existop);
         let newop = data.new_op(2, addr);
         set_opcode_typed(data, newop, opc);
-        op_set_output(data, newop, out.get_whole().expect("cso: out whole"));
+        op_set_output(data, newop, out.get_whole().expect("cso: out whole"))?;
         op_set_input(data, newop, in_.get_whole().expect("cso: in whole"), 0);
         op_set_input(data, newop, sa, 1);
         data.op_insert_before(newop, existop);
@@ -1433,6 +1437,7 @@ fn create_shift_op(
         op_set_input(data, existop, in_.get_whole().expect("cso: in whole"), 0);
         op_set_input(data, existop, sa, 1);
     }
+    Ok(())
 }
 
 /// Check that a double-precision compare op's inputs are compatible (C++
@@ -1460,12 +1465,13 @@ fn replace_bool_op(
     in1: &mut SplitVarnode,
     in2: &mut SplitVarnode,
     opc: OpCode,
-) {
-    in1.find_create_whole(data);
-    in2.find_create_whole(data);
+) -> kuna_base::error::KunaResult<()> {
+    in1.find_create_whole(data)?;
+    in2.find_create_whole(data)?;
     set_opcode_typed(data, boolop, opc);
     op_set_input(data, boolop, in1.get_whole().expect("rbo: in1 whole"), 0);
     op_set_input(data, boolop, in2.get_whole().expect("rbo: in2 whole"), 1);
+    Ok(())
 }
 
 /// Create a new compare PcodeOp feeding the given CBRANCH (C++ `createBoolOp`).
@@ -1475,15 +1481,15 @@ fn create_bool_op(
     in1: &mut SplitVarnode,
     in2: &mut SplitVarnode,
     opc: OpCode,
-) {
+) -> kuna_base::error::KunaResult<()> {
     let mut addrop = cbranch;
     let boolvn = op_get_in(data, cbranch, 1);
     if vn_is_written(data, boolvn) {
         // Use the address of the comparison operator
         addrop = vn_get_def(data, boolvn).expect("create_bool_op: boolvn def");
     }
-    in1.find_create_whole(data);
-    in2.find_create_whole(data);
+    in1.find_create_whole(data)?;
+    in2.find_create_whole(data)?;
     let addr = op_get_addr(data, addrop);
     let newop = data.new_op(2, addr);
     set_opcode_typed(data, newop, opc);
@@ -1492,6 +1498,7 @@ fn create_bool_op(
     op_set_input(data, newop, in2.get_whole().expect("cbo2: in2 whole"), 1);
     data.op_insert_before(newop, cbranch);
     op_set_input(data, cbranch, newbool, 1); // CBRANCH now determined by new compare
+    Ok(())
 }
 
 /// Check the logical MULTIEQUAL can be created; return the PcodeOp where the
@@ -1524,25 +1531,26 @@ fn create_phi_op(
     out: &mut SplitVarnode,
     inlist: &mut [SplitVarnode],
     existop: OpId,
-) {
+) -> kuna_base::error::KunaResult<()> {
     // We MUST create a newop even if the output whole already exists, because the
     // MULTIEQUAL has placement constraints.
     out.find_create_output_whole(data);
     let numin = inlist.len();
     for item in inlist.iter_mut().take(numin) {
-        item.find_create_whole(data);
+        item.find_create_whole(data)?;
     }
 
     let addr = op_get_addr(data, existop);
     let newop = data.new_op(numin as int4, addr);
     set_opcode_typed(data, newop, OpCode::CPUI_MULTIEQUAL);
-    op_set_output(data, newop, out.get_whole().expect("create_phi_op: out whole"));
+    op_set_output(data, newop, out.get_whole().expect("create_phi_op: out whole"))?;
     for (i, item) in inlist.iter().enumerate().take(numin) {
         op_set_input(data, newop, item.get_whole().expect("create_phi_op: in whole"), i as int4);
     }
     data.op_insert_before(newop, existop);
     out.build_lo_from_whole(data);
     out.build_hi_from_whole(data);
+    Ok(())
 }
 
 /// Check that the logical CPUI_INDIRECT can be created (C++ `prepareIndirectOp`).
@@ -1557,20 +1565,21 @@ fn replace_indirect_op(
     out: &mut SplitVarnode,
     in_: &mut SplitVarnode,
     affector: OpId,
-) {
-    out.create_joined_whole(data);
+) -> kuna_base::error::KunaResult<()> {
+    out.create_joined_whole(data)?;
 
-    in_.find_create_whole(data);
+    in_.find_create_whole(data)?;
     let addr = op_get_addr(data, affector);
     let newop = data.new_op(2, addr);
     set_opcode_typed(data, newop, OpCode::CPUI_INDIRECT);
-    op_set_output(data, newop, out.get_whole().expect("rio: out whole"));
+    op_set_output(data, newop, out.get_whole().expect("rio: out whole"))?;
     op_set_input(data, newop, in_.get_whole().expect("rio: in whole"), 0);
     let iopvn = data.new_varnode_iop(affector);
     op_set_input(data, newop, iopvn, 1);
     data.op_insert_before(newop, affector);
     out.build_lo_from_whole(data);
     out.build_hi_from_whole(data);
+    Ok(())
 }
 
 /// Rewrite a double-precision COPY to an address-forced Varnode (C++
@@ -1581,7 +1590,7 @@ fn replace_copy_force(
     in_: &SplitVarnode,
     copylo: OpId,
     copyhi: OpId,
-) {
+) -> kuna_base::error::KunaResult<()> {
     let mut in_vn = in_.get_whole().expect("rcf: in whole");
     let return_form = op_is_return_copy(data, copyhi);
     if return_form && vn_get_addr(data, in_vn) != *addr {
@@ -1596,8 +1605,7 @@ fn replace_copy_force(
         let other_copy = data.new_op(1, op_addr);
         set_opcode_typed(data, other_copy, OpCode::CPUI_COPY);
         let vn = data
-            .new_varnode_out(in_.get_size(), addr, other_copy)
-            .expect("rcf: new_varnode_out");
+            .new_varnode_out(in_.get_size(), addr, other_copy)?;
         op_set_input(data, other_copy, in_vn, 0);
         data.op_insert_before(other_copy, other_point1);
         in_vn = vn;
@@ -1606,22 +1614,22 @@ fn replace_copy_force(
     let whole_copy = data.new_op(1, copyhi_addr);
     set_opcode_typed(data, whole_copy, OpCode::CPUI_COPY);
     let out_vn = data
-        .new_varnode_out(in_.get_size(), addr, whole_copy)
-        .expect("rcf: new_varnode_out");
+        .new_varnode_out(in_.get_size(), addr, whole_copy)?;
     vn_set_addr_force(data, out_vn);
     if return_form {
         mark_return_copy(data, whole_copy);
     }
     op_set_input(data, whole_copy, in_vn, 0);
     data.op_insert_before(whole_copy, copyhi);
-    data.op_destroy(copyhi); // Destroy original COPYs.  Outputs have no descendants.
-    data.op_destroy(copylo);
+    data.op_destroy(copyhi)?; // Destroy original COPYs.  Outputs have no descendants.
+    data.op_destroy(copylo)?;
+    Ok(())
 }
 
 /// Try one transform on a logical double-precision op given a specific input
 /// (C++ `SplitVarnode::applyRuleIn`).  The forms are lined up against the input;
 /// the first match performs its transform and returns 1.
-fn apply_rule_in(in_: &SplitVarnode, data: &mut Funcdata) -> int4 {
+fn apply_rule_in(in_: &SplitVarnode, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
     for i in 0..2 {
         let vn = if i == 0 { in_.get_hi() } else { in_.get_lo() };
         let vn = match vn {
@@ -1643,114 +1651,114 @@ fn apply_rule_in(in_: &SplitVarnode, data: &mut Funcdata) -> int4 {
             match op_code(data, workop) {
                 OpCode::CPUI_INT_ADD => {
                     let mut addform = AddForm::new();
-                    if addform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if addform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                     let mut subform = SubForm::new();
-                    if subform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if subform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_AND => {
                     let mut equal3form = Equal3Form::new();
-                    if equal3form.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if equal3form.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                     let mut logicalform = LogicalForm::new();
-                    if logicalform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if logicalform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_OR => {
                     let mut logicalform = LogicalForm::new();
-                    if logicalform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if logicalform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_XOR => {
                     let mut logicalform = LogicalForm::new();
-                    if logicalform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if logicalform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_EQUAL | OpCode::CPUI_INT_NOTEQUAL => {
                     let mut lessthreeway = LessThreeWay::new();
-                    if lessthreeway.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if lessthreeway.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                     let mut equal1form = Equal1Form::new();
-                    if equal1form.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if equal1form.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                     let mut equal2form = Equal2Form::new();
-                    if equal2form.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if equal2form.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_LESS | OpCode::CPUI_INT_LESSEQUAL => {
                     let mut lessthreeway = LessThreeWay::new();
-                    if lessthreeway.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if lessthreeway.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                     let mut lessconstform = LessConstForm::new();
-                    if lessconstform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if lessconstform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_SLESS => {
                     let mut lessconstform = LessConstForm::new();
-                    if lessconstform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if lessconstform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_SLESSEQUAL => {
                     let mut lessconstform = LessConstForm::new();
-                    if lessconstform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if lessconstform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_LEFT => {
                     let mut shiftform = ShiftForm::new();
-                    if shiftform.apply_rule_left(in_, workop, workishi, data) {
-                        return 1;
+                    if shiftform.apply_rule_left(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_RIGHT => {
                     let mut shiftform = ShiftForm::new();
-                    if shiftform.apply_rule_right(in_, workop, workishi, data) {
-                        return 1;
+                    if shiftform.apply_rule_right(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_SRIGHT => {
                     let mut shiftform = ShiftForm::new();
-                    if shiftform.apply_rule_right(in_, workop, workishi, data) {
-                        return 1;
+                    if shiftform.apply_rule_right(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INT_MULT => {
                     let mut multform = MultForm::new();
-                    if multform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if multform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_MULTIEQUAL => {
                     let mut phiform = PhiForm::new();
-                    if phiform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if phiform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_INDIRECT => {
                     let mut indform = IndirectForm::new();
-                    if indform.apply_rule(in_, workop, workishi, data) {
-                        return 1;
+                    if indform.apply_rule(in_, workop, workishi, data)? {
+                        return Ok(1);
                     }
                 }
                 OpCode::CPUI_COPY => {
                     let out = op_get_out(data, workop);
                     if out.map(|o| vn_is_addr_force(data, o)).unwrap_or(false) {
                         let mut copyform = CopyForceForm::new();
-                        if copyform.apply_rule(in_, workop, workishi, data) {
-                            return 1;
+                        if copyform.apply_rule(in_, workop, workishi, data)? {
+                            return Ok(1);
                         }
                     }
                 }
@@ -1758,7 +1766,7 @@ fn apply_rule_in(in_: &SplitVarnode, data: &mut Funcdata) -> int4 {
             }
         }
     }
-    0
+    Ok(0)
 }
 
 // =============================================================================
@@ -2022,23 +2030,23 @@ impl AddForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("addrule: hi");
         let lo = self.in_.get_lo().expect("addrule: lo");
         if !self.verify(data, hi, lo, op) {
-            return false;
+            return Ok(false);
         }
 
         self.indoub.init_partial_pieces(data, self.in_.get_size(), self.lo2, self.hi2);
         if self.indoub.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
         self.outdoub.init_partial_pieces(
             data,
@@ -2048,12 +2056,12 @@ impl AddForm {
         );
         let existop = match prepare_binary_op(data, &mut self.outdoub, &mut self.in_, &mut self.indoub) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
         let (mut out, mut in1, mut in2) =
             (self.outdoub.clone(), self.in_.clone(), self.indoub.clone());
-        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_ADD);
-        true
+        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_ADD)?;
+        Ok(true)
     }
 }
 
@@ -2212,33 +2220,33 @@ impl SubForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("subrule: hi");
         let lo = self.in_.get_lo().expect("subrule: lo");
         if !self.verify(data, hi, lo, op) {
-            return false;
+            return Ok(false);
         }
 
         self.indoub.init_partial_pieces(data, self.in_.get_size(), self.lo2, self.hi2);
         if self.indoub.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
         self.outdoub.init_partial_pieces(data, self.in_.get_size(), self.reslo, self.reshi);
         let existop = match prepare_binary_op(data, &mut self.outdoub, &mut self.in_, &mut self.indoub) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
         let (mut out, mut in1, mut in2) =
             (self.outdoub.clone(), self.in_.clone(), self.indoub.clone());
-        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_SUB);
-        true
+        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_SUB)?;
+        Ok(true)
     }
 }
 
@@ -2371,18 +2379,18 @@ impl LogicalForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, lop: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, lop: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("logrule: hi");
         let lo = self.in_.get_lo().expect("logrule: lo");
         if !self.verify(data, hi, lo, lop) {
-            return false;
+            return Ok(false);
         }
 
         let loop_ = self.loop_.expect("logrule: loop");
@@ -2395,18 +2403,18 @@ impl LogicalForm {
         );
         self.indoub.init_partial_pieces(data, self.in_.get_size(), self.lo2, self.hi2);
         if self.indoub.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
         let existop = match prepare_binary_op(data, &mut self.outdoub, &mut self.in_, &mut self.indoub) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
 
         let opc = op_code(data, loop_);
         let (mut out, mut in1, mut in2) =
             (self.outdoub.clone(), self.in_.clone(), self.indoub.clone());
-        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, opc);
-        true
+        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, opc)?;
+        Ok(true)
     }
 }
 
@@ -2451,12 +2459,12 @@ impl Equal1Form {
         }
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, hop: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, hop: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in1 = i.clone();
 
@@ -2510,13 +2518,13 @@ impl Equal1Form {
                                 } else {
                                     OpCode::CPUI_INT_EQUAL
                                 };
-                                create_bool_op(data, hibool, &mut a, &mut b, opc);
+                                create_bool_op(data, hibool, &mut a, &mut b, opc)?;
                                 // Change lobool to always go to the original TRUE block
                                 let c = data.new_constant(1, if self.notequalformlo { 0 } else { 1 });
                                 op_set_input(data, lobool, c, 1);
                                 self.in1 = a;
                                 self.in2 = b;
-                                return true;
+                                return Ok(true);
                             }
                         } else if Some(lobooltrue) == op_get_parent(data, hibool)
                             && hiboolfalse == loboolfalse
@@ -2531,20 +2539,20 @@ impl Equal1Form {
                                 } else {
                                     OpCode::CPUI_INT_EQUAL
                                 };
-                                create_bool_op(data, lobool, &mut a, &mut b, opc);
+                                create_bool_op(data, lobool, &mut a, &mut b, opc)?;
                                 // Change hibool to always go to the original TRUE block
                                 let c = data.new_constant(1, if self.notequalformhi { 0 } else { 1 });
                                 op_set_input(data, hibool, c, 1);
                                 self.in1 = a;
                                 self.in2 = b;
-                                return true;
+                                return Ok(true);
                             }
                         }
                     }
                 }
             }
         }
-        false
+        Ok(false)
     }
 }
 
@@ -2577,7 +2585,7 @@ impl Equal2Form {
         }
     }
 
-    fn replace(&mut self, data: &Funcdata) -> bool {
+    fn replace(&mut self, data: &Funcdata) -> kuna_base::error::KunaResult<bool> {
         let hi2 = self.hi2.expect("eq2: hi2");
         let lo2 = self.lo2.expect("eq2: lo2");
         let lo1 = self.lo1.expect("eq2: lo1");
@@ -2594,11 +2602,11 @@ impl Equal2Form {
             let res = prepare_bool_op(data, &mut a, &mut b, boolandor);
             self.in_ = a;
             self.param2 = b;
-            return res;
+            return Ok(res);
         }
         if vn_is_constant(data, hi2) || vn_is_constant(data, lo2) {
             // Some kind of mixed form
-            return false;
+            return Ok(false);
         }
         self.param2.init_partial_pieces(data, self.in_.get_size(), self.lo2, self.hi2);
         // Same threading as the constant branch (C++ prepareBoolOp(in,param2,...); double.cc:1933).
@@ -2606,15 +2614,15 @@ impl Equal2Form {
         let res = prepare_bool_op(data, &mut a, &mut b, boolandor);
         self.in_ = a;
         self.param2 = b;
-        res
+        Ok(res)
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         self.hi1 = self.in_.get_hi();
@@ -2649,7 +2657,7 @@ impl Equal2Form {
             } else {
                 continue;
             }
-            if !self.replace(data) {
+            if !self.replace(data)? {
                 continue;
             }
             if self.param2.exceeds_const_precision() {
@@ -2659,12 +2667,12 @@ impl Equal2Form {
             // discovered) — C++ replaceBoolOp(in,param2,...) passes the same members
             // prepareBoolOp mutated (double.cc:1978).
             let (mut a, mut b) = (self.in_.clone(), self.param2.clone());
-            replace_bool_op(data, boolandor, &mut a, &mut b, eq_code);
+            replace_bool_op(data, boolandor, &mut a, &mut b, eq_code)?;
             self.in_ = a;
             self.param2 = b;
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -2728,34 +2736,34 @@ impl Equal3Form {
         true
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("eq3: hi");
         let lo = self.in_.get_lo().expect("eq3: lo");
         if !self.verify(data, hi, lo, op) {
-            return false;
+            return Ok(false);
         }
 
         // Create the -1 value
         let mut in2 = SplitVarnode::new_constant(self.in_.get_size(), calc_mask(self.in_.get_size()));
         if in2.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
         let compareop = self.compareop.expect("eq3: compareop");
         let mut in_ = self.in_.clone();
         if !prepare_bool_op(data, &mut in_, &mut in2, compareop) {
-            return false;
+            return Ok(false);
         }
         let opc = op_code(data, compareop);
-        replace_bool_op(data, compareop, &mut in_, &mut in2, opc);
+        replace_bool_op(data, compareop, &mut in_, &mut in2, opc)?;
         self.in_ = in_;
-        true
+        Ok(true)
     }
 }
 
@@ -3371,21 +3379,21 @@ impl LessThreeWay {
         true
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, loop_: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, loop_: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if workishi {
-            return false;
+            return Ok(false);
         }
         if i.get_lo().is_none() {
-            return false; // Doesn't necessarily need the hi
+            return Ok(false); // Doesn't necessarily need the hi
         }
         self.in_ = i.clone();
         if !self.map_from_low(data, loop_) {
-            return false;
+            return Ok(false);
         }
         let res = self.test_replace(data);
         if res {
             if self.in2.exceeds_const_precision() {
-                return false;
+                return Ok(false);
             }
             // Reuse the pair prepared by set_bool_op (whole/defblock/defpoint already
             // discovered) — C++ createBoolOp(in,in2,...) passes the same members
@@ -3393,12 +3401,12 @@ impl LessThreeWay {
             let hilessbool = self.hilessbool.expect("ltw: hilessbool");
             if self.hislot == 0 {
                 let (mut a, mut b) = (self.in_.clone(), self.in2.clone());
-                create_bool_op(data, hilessbool, &mut a, &mut b, self.finalopc);
+                create_bool_op(data, hilessbool, &mut a, &mut b, self.finalopc)?;
                 self.in_ = a;
                 self.in2 = b;
             } else {
                 let (mut a, mut b) = (self.in2.clone(), self.in_.clone());
-                create_bool_op(data, hilessbool, &mut a, &mut b, self.finalopc);
+                create_bool_op(data, hilessbool, &mut a, &mut b, self.finalopc)?;
                 self.in2 = a;
                 self.in_ = b;
             }
@@ -3407,7 +3415,7 @@ impl LessThreeWay {
             op_set_input(data, self.hieqbool.expect("ltw: hieqbool"), c, 1);
             // The lolessbool block now becomes unreachable and is eventually removed
         }
-        res
+        Ok(res)
     }
 }
 
@@ -3441,12 +3449,12 @@ impl LessConstForm {
         }
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, op: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if i.get_hi().is_none() {
-            return false; // We don't necessarily need the lo part
+            return Ok(false); // We don't necessarily need the lo part
         }
         self.in_ = i.clone();
         self.vn = self.in_.get_hi();
@@ -3457,7 +3465,7 @@ impl LessConstForm {
         let losize = self.in_.get_size() - vn_get_size(data, vn);
 
         if !vn_is_constant(data, cvn) {
-            return false;
+            return Ok(false);
         }
 
         let opc = op_code(data, op);
@@ -3473,36 +3481,36 @@ impl LessConstForm {
         // affects a branch.
         let desc = match lone_descend(data, op_get_out(data, op).expect("lcf: op out")) {
             Some(d) => d,
-            None => return false,
+            None => return Ok(false),
         };
         if op_code(data, desc) != OpCode::CPUI_CBRANCH {
-            return false;
+            return Ok(false);
         }
 
         self.constin.init_partial_const(self.in_.get_size(), val);
         if self.constin.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
 
         if self.inslot == 0 {
             let (mut a, mut b) = (self.in_.clone(), self.constin.clone());
             if prepare_bool_op(data, &mut a, &mut b, op) {
-                replace_bool_op(data, op, &mut a, &mut b, opc);
+                replace_bool_op(data, op, &mut a, &mut b, opc)?;
                 self.in_ = a;
                 self.constin = b;
-                return true;
+                return Ok(true);
             }
         } else {
             let (mut a, mut b) = (self.constin.clone(), self.in_.clone());
             if prepare_bool_op(data, &mut a, &mut b, op) {
-                replace_bool_op(data, op, &mut a, &mut b, opc);
+                replace_bool_op(data, op, &mut a, &mut b, opc)?;
                 self.constin = a;
                 self.in_ = b;
-                return true;
+                return Ok(true);
             }
         }
 
-        false
+        Ok(false)
     }
 }
 
@@ -3776,56 +3784,56 @@ impl ShiftForm {
         false
     }
 
-    fn apply_rule_left(&mut self, i: &SplitVarnode, loop_: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule_left(&mut self, i: &SplitVarnode, loop_: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
 
         let hi = self.in_.get_hi().expect("arl: hi");
         let lo = self.in_.get_lo().expect("arl: lo");
         if !self.verify_left(data, hi, lo, loop_) {
-            return false;
+            return Ok(false);
         }
 
         self.out.init_partial_pieces(data, self.in_.get_size(), self.reslo, self.reshi);
         let existop = match prepare_shift_op(data, &mut self.out, &mut self.in_) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
         let salo = self.salo.expect("arl: salo");
         let (mut out, mut in_) = (self.out.clone(), self.in_.clone());
-        create_shift_op(data, &mut out, &mut in_, salo, existop, self.opc);
-        true
+        create_shift_op(data, &mut out, &mut in_, salo, existop, self.opc)?;
+        Ok(true)
     }
 
-    fn apply_rule_right(&mut self, i: &SplitVarnode, hiop: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule_right(&mut self, i: &SplitVarnode, hiop: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
 
         let hi = self.in_.get_hi().expect("arr: hi");
         let lo = self.in_.get_lo().expect("arr: lo");
         if !self.verify_right(data, hi, lo, hiop) {
-            return false;
+            return Ok(false);
         }
 
         self.out.init_partial_pieces(data, self.in_.get_size(), self.reslo, self.reshi);
         let existop = match prepare_shift_op(data, &mut self.out, &mut self.in_) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
         let salo = self.salo.expect("arr: salo");
         let (mut out, mut in_) = (self.out.clone(), self.in_.clone());
-        create_shift_op(data, &mut out, &mut in_, salo, existop, self.opc);
-        true
+        create_shift_op(data, &mut out, &mut in_, salo, existop, self.opc)?;
+        Ok(true)
     }
 }
 
@@ -4189,20 +4197,20 @@ impl MultForm {
         true
     }
 
-    fn replace(&mut self, data: &mut Funcdata) -> bool {
+    fn replace(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         // We matched a double precision multiply, now transform to logical vars
         self.outdoub.init_partial_pieces(data, self.in_.get_size(), self.reslo, self.reshi);
         self.in2.init_partial_pieces(data, self.in_.get_size(), self.lo2, self.hi2);
         if self.in2.exceeds_const_precision() {
-            return false;
+            return Ok(false);
         }
         let existop = match prepare_binary_op(data, &mut self.outdoub, &mut self.in_, &mut self.in2) {
             Some(e) => e,
-            None => return false,
+            None => return Ok(false),
         };
         let (mut out, mut in1, mut in2) = (self.outdoub.clone(), self.in_.clone(), self.in2.clone());
-        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_MULT);
-        true
+        create_binary_op(data, &mut out, &mut in1, &mut in2, existop, OpCode::CPUI_INT_MULT)?;
+        Ok(true)
     }
 
     fn verify(&mut self, data: &Funcdata, h: VarnodeId, l: VarnodeId, hop: OpId) -> bool {
@@ -4234,22 +4242,22 @@ impl MultForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, hop: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, hop: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
 
         let hi = self.in_.get_hi().expect("multrule: hi");
         let lo = self.in_.get_lo().expect("multrule: lo");
         if !self.verify(data, hi, lo, hop) {
-            return false;
+            return Ok(false);
         }
 
-        self.replace(data)
+        Ok(self.replace(data)?)
     }
 }
 
@@ -4313,19 +4321,19 @@ impl PhiForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, hphi: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, hphi: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
 
         let hi = self.in_.get_hi().expect("phirule: hi");
         let lo = self.in_.get_lo().expect("phirule: lo");
         if !self.verify(data, hi, lo, hphi) {
-            return false;
+            return Ok(false);
         }
 
         let hiphi = self.hiphi.expect("phirule: hiphi");
@@ -4346,11 +4354,11 @@ impl PhiForm {
         let mut out = self.outvn.clone();
         let existop = prepare_phi_op(data, &mut out, &mut inlist);
         if let Some(existop) = existop {
-            create_phi_op(data, &mut out, &mut inlist, existop);
+            create_phi_op(data, &mut out, &mut inlist, existop)?;
             self.outvn = out;
-            return true;
+            return Ok(true);
         }
-        false
+        Ok(false)
     }
 }
 
@@ -4459,31 +4467,31 @@ impl IndirectForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, ind: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, ind: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("indrule: hi");
         let lo = self.in_.get_lo().expect("indrule: lo");
         if !self.verify(data, hi, lo, ind) {
-            return false;
+            return Ok(false);
         }
 
         self.outvn.init_partial_pieces(data, self.in_.get_size(), self.reslo, self.reshi);
 
         let affector = self.affector.expect("indrule: affector");
         if !prepare_indirect_op(data, &mut self.in_, affector) {
-            return false;
+            return Ok(false);
         }
         let (mut out, mut in_) = (self.outvn.clone(), self.in_.clone());
-        replace_indirect_op(data, &mut out, &mut in_, affector);
+        replace_indirect_op(data, &mut out, &mut in_, affector)?;
         self.outvn = out;
         self.in_ = in_;
-        true
+        Ok(true)
     }
 }
 
@@ -4583,26 +4591,26 @@ impl CopyForceForm {
         false
     }
 
-    fn apply_rule(&mut self, i: &SplitVarnode, cpy: OpId, workishi: bool, data: &mut Funcdata) -> bool {
+    fn apply_rule(&mut self, i: &SplitVarnode, cpy: OpId, workishi: bool, data: &mut Funcdata) -> kuna_base::error::KunaResult<bool> {
         if !workishi {
-            return false;
+            return Ok(false);
         }
         if !i.has_both_pieces() {
-            return false;
+            return Ok(false);
         }
         self.in_ = i.clone();
         let hi = self.in_.get_hi().expect("cffrule: hi");
         let lo = self.in_.get_lo().expect("cffrule: lo");
         let w = self.in_.get_whole();
         if !self.verify(data, hi, lo, w, cpy) {
-            return false;
+            return Ok(false);
         }
         let addr = self.addr_out.clone().expect("cffrule: addr_out");
         let copylo = self.copylo.expect("cffrule: copylo");
         let copyhi = self.copyhi.expect("cffrule: copyhi");
         let in_ = self.in_.clone();
-        replace_copy_force(data, &addr, &in_, copylo, copyhi);
-        true
+        replace_copy_force(data, &addr, &in_, copylo, copyhi)?;
+        Ok(true)
     }
 }
 
@@ -4723,33 +4731,33 @@ impl Rule for RuleDoubleIn {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = match op_get_out(data, op) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_precis_lo(data, outvn) {
             if vn_is_precis_hi(data, outvn) {
-                return 0;
+                return Ok(0);
             }
-            return self.attempt_marking(data, outvn, op);
+            return Ok(self.attempt_marking(data, outvn, op));
         }
         if data.has_unreachable_blocks() {
-            return 0;
+            return Ok(0);
         }
 
         let in0 = op_get_in(data, op, 0);
         let splitvec = whole_list(data, in0);
         if splitvec.is_empty() {
-            return 0;
+            return Ok(0);
         }
         for in_ in &splitvec {
-            let res = apply_rule_in(in_, data);
+            let res = apply_rule_in(in_, data)?;
             if res != 0 {
-                return res;
+                return Ok(res);
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -4765,12 +4773,11 @@ impl Rule for RuleDoubleIn {
 /// already established the contiguity precondition via `isAddrTiedContiguous`,
 /// matching the C++ ordering; the merge is unconditional there (C++ does not
 /// inspect a return value), so this returns `true`.  A `LowlevelError` from the
-/// merge (non-input or non-contiguous pieces) would be a real invariant
-/// violation; it is surfaced via `expect`, mirroring the C++ `throw`.
-fn combine_input_varnodes_checked(data: &mut Funcdata, vnhi: VarnodeId, vnlo: VarnodeId) -> bool {
-    data.combine_input_varnodes(vnhi, vnlo)
-        .expect("RuleDoubleOut: combineInputVarnodes on non-input/non-contiguous pieces");
-    true
+/// merge (non-input or non-contiguous pieces), or a storage-property acquisition
+/// failure, propagates through the rule's typed result.
+fn combine_input_varnodes_checked(data: &mut Funcdata, vnhi: VarnodeId, vnlo: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    data.combine_input_varnodes(vnhi, vnlo)?;
+    Ok(true)
 }
 
 /// Pull a double precision operation back one level, starting from inputs to a
@@ -4830,34 +4837,34 @@ impl Rule for RuleDoubleOut {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vnhi = op_get_in(data, op, 0);
         let vnlo = op_get_in(data, op, 1);
 
         // Currently this only implements collapsing input varnodes read by PIECE,
         // so we test for this particular case early.
         if !vn_is_input(data, vnhi) || !vn_is_input(data, vnlo) {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_persist(data, vnhi) || !vn_is_persist(data, vnlo) {
-            return 0;
+            return Ok(0);
         }
 
         if !vn_is_precis_hi(data, vnhi) || !vn_is_precis_lo(data, vnlo) {
-            return self.attempt_marking(data, vnhi, vnlo, op);
+            return Ok(self.attempt_marking(data, vnhi, vnlo, op));
         }
         if data.has_unreachable_blocks() {
-            return 0;
+            return Ok(0);
         }
 
         if is_addr_tied_contiguous(data, vnlo, vnhi).is_none() {
-            return 0;
+            return Ok(0);
         }
         // data.combineInputVarnodes(vnhi,vnlo);  return 1;  (double.cc:3353-3354)
-        if !combine_input_varnodes_checked(data, vnhi, vnlo) {
-            return 0;
+        if !combine_input_varnodes_checked(data, vnhi, vnlo)? {
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -4984,19 +4991,19 @@ impl Rule for RuleDoubleLoad {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let piece0 = op_get_in(data, op, 0);
         let piece1 = op_get_in(data, op, 1);
         if !vn_is_written(data, piece0) {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_written(data, piece1) {
-            return 0;
+            return Ok(0);
         }
         let load1 = vn_get_def(data, piece1).expect("dload: load1");
         if op_code(data, load1) != OpCode::CPUI_LOAD {
             // C++ `return false;` (0) here.
-            return 0;
+            return Ok(0);
         }
         let mut load0 = vn_get_def(data, piece0).expect("dload: load0");
         let mut opc = op_code(data, load0);
@@ -5004,31 +5011,31 @@ impl Rule for RuleDoubleLoad {
         if opc == OpCode::CPUI_SUBPIECE {
             // 2 LOADs but most significant part of most significant LOAD discarded
             if vn_get_offset(data, op_get_in(data, load0, 1)) != 0 {
-                return 0;
+                return Ok(0);
             }
             let vn0 = op_get_in(data, load0, 0);
             if !vn_is_written(data, vn0) {
-                return 0;
+                return Ok(0);
             }
             offset = vn_get_size(data, vn0) - vn_get_size(data, piece0);
             load0 = vn_get_def(data, vn0).expect("dload: load0 (sub)");
             opc = op_code(data, load0);
         }
         if opc != OpCode::CPUI_LOAD {
-            return 0;
+            return Ok(0);
         }
         let (loadlo, loadhi, spc) = match test_contiguous_pointers(data, load0, load1) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
 
         let size = vn_get_size(data, piece0) + vn_get_size(data, piece1);
         if data.is_stack_byte_copy_op(load0) || data.is_stack_byte_copy_op(load1) {
-            return 0;
+            return Ok(0);
         }
         let latest = match RuleDoubleLoad::no_write_conflict(data, loadlo, loadhi, spc, None) {
             Some(l) => l,
-            None => return 0, // There was a conflict
+            None => return Ok(0), // There was a conflict
         };
 
         // Create new load op that combines the two smaller loads
@@ -5063,7 +5070,7 @@ impl Rule for RuleDoubleLoad {
         set_opcode_typed(data, op, OpCode::CPUI_COPY);
         op_set_input(data, op, vnout, 0);
 
-        1
+        Ok(1)
     }
 }
 
@@ -5137,7 +5144,7 @@ impl RuleDoubleStore {
     }
 
     /// Reassign INDIRECTs to a new STORE (C++ `RuleDoubleStore::reassignIndirects`).
-    fn reassign_indirects(data: &mut Funcdata, new_store: OpId, indirects: &[OpId]) {
+    fn reassign_indirects(data: &mut Funcdata, new_store: OpId, indirects: &[OpId]) -> kuna_base::error::KunaResult<()> {
         // Search for INDIRECT pairs.  The earlier is deleted; the later gains the
         // earlier's input.
         for &op in indirects {
@@ -5151,7 +5158,7 @@ impl RuleDoubleStore {
                 // Grab the earlier op's input, replacing the use of its output
                 let early_in0 = op_get_in(data, earlyop, 0);
                 op_set_input(data, op, early_in0, 0);
-                data.op_destroy(earlyop);
+                data.op_destroy(earlyop)?;
             }
         }
         for &op in indirects {
@@ -5164,6 +5171,7 @@ impl RuleDoubleStore {
             let iopvn = data.new_varnode_iop(new_store);
             op_set_input(data, op, iopvn, 1); // Assign the INDIRECT to the new STORE
         }
+        Ok(())
     }
 }
 
@@ -5179,24 +5187,24 @@ impl Rule for RuleDoubleStore {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vnlo = op_get_in(data, op, 2);
         if !vn_is_precis_lo(data, vnlo) {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_written(data, vnlo) {
-            return 0;
+            return Ok(0);
         }
         let subpiece_op_lo = vn_get_def(data, vnlo).expect("dstore: sublo");
         if op_code(data, subpiece_op_lo) != OpCode::CPUI_SUBPIECE {
-            return 0;
+            return Ok(0);
         }
         if vn_get_offset(data, op_get_in(data, subpiece_op_lo, 1)) != 0 {
-            return 0;
+            return Ok(0);
         }
         let whole = op_get_in(data, subpiece_op_lo, 0);
         if vn_is_free(data, whole) {
-            return 0;
+            return Ok(0);
         }
         for subpiece_op_hi in descend_ops(data, whole) {
             if op_code(data, subpiece_op_hi) != OpCode::CPUI_SUBPIECE {
@@ -5255,14 +5263,14 @@ impl Rule for RuleDoubleStore {
                     op_set_input(data, newstore, whole, 2);
                     // Guarantee -newstore- reads -addrvn- after it is defined.
                     data.op_insert_after(newstore, latest);
-                    data.op_destroy(op); // Get rid of the original STOREs
-                    data.op_destroy(store_op2);
-                    RuleDoubleStore::reassign_indirects(data, newstore, &indirects);
-                    return 1;
+                    data.op_destroy(op)?; // Get rid of the original STOREs
+                    data.op_destroy(store_op2)?;
+                    RuleDoubleStore::reassign_indirects(data, newstore, &indirects)?;
+                    return Ok(1);
                 }
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -5743,7 +5751,7 @@ mod tests {
         assert!(s.is_whole_feasible(&fd, existop), "feasible: whole exists");
         assert_eq!(s.whole, Some(whole), "isWholeFeasible found the existing whole");
         // Threaded: find_create_whole on the SAME object reuses `whole`.
-        s.find_create_whole(&mut fd);
+        s.find_create_whole(&mut fd).unwrap();
         assert_eq!(s.get_whole(), Some(whole), "reused the existing whole");
         let pieces_after = fd.obank().iter_code(OpCode::CPUI_PIECE).count();
         assert_eq!(
@@ -5792,7 +5800,7 @@ mod tests {
 
         // ... then the rewrite step clones `s` AGAIN and creates the whole.
         let mut fresh = s.clone();
-        fresh.find_create_whole(&mut fd);
+        fresh.find_create_whole(&mut fd).unwrap();
         let ops_after = fd.obank().num_alive();
 
         // The faithful C++ would have reused `whole` (no new op); the discarded
@@ -5843,7 +5851,7 @@ mod tests {
         form.bool_and_or = Some(boolandor);
 
         let pieces_before = fd.obank().iter_code(OpCode::CPUI_PIECE).count();
-        assert!(form.replace(&fd), "replace must prepare both operands");
+        assert!(form.replace(&fd).unwrap(), "replace must prepare both operands");
         // The prepare-step discovery is PERSISTED, not discarded.
         assert_eq!(
             form.param2.get_whole(),
@@ -5853,7 +5861,7 @@ mod tests {
 
         // apply_rule's rewrite step reuses the persisted member -> no fabrication.
         let (mut a, mut b) = (form.in_.clone(), form.param2.clone());
-        replace_bool_op(&mut fd, boolandor, &mut a, &mut b, OpCode::CPUI_INT_EQUAL);
+        replace_bool_op(&mut fd, boolandor, &mut a, &mut b, OpCode::CPUI_INT_EQUAL).unwrap();
         assert_eq!(b.get_whole(), Some(whole), "rewrite reused the existing whole");
         let pieces_after = fd.obank().iter_code(OpCode::CPUI_PIECE).count();
         assert_eq!(
@@ -5900,7 +5908,7 @@ mod tests {
 
         // apply_rule's create step reuses the persisted member -> no fabrication.
         let (mut a, mut b) = (form.in_.clone(), form.in2.clone());
-        create_bool_op(&mut fd, hilessbool, &mut a, &mut b, OpCode::CPUI_INT_LESS);
+        create_bool_op(&mut fd, hilessbool, &mut a, &mut b, OpCode::CPUI_INT_LESS).unwrap();
         assert_eq!(b.get_whole(), Some(whole), "create reused the existing whole");
         let pieces_after = fd.obank().iter_code(OpCode::CPUI_PIECE).count();
         assert_eq!(

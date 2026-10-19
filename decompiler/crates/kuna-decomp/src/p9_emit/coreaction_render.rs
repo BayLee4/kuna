@@ -109,6 +109,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use kuna_base::address::{bit_transitions, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_base::types::uintb;
 
@@ -173,16 +174,16 @@ impl Action for ActionStackPtrFlow {
     fn reset(&mut self, _data: &mut Funcdata) {
         self.analysis_finished = false;
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:496 — ActionStackPtrFlow::apply
         if self.analysis_finished {
-            return 0;
+            return Ok(0);
         }
         let stackspace = match &self.stackspace {
             Some(ss) => Rc::clone(ss),
             None => {
                 self.analysis_finished = true; // No stack to do analysis on
-                return 0;
+                return Ok(0);
             }
         };
         // checkClog: stack-pointer clog repair (LOAD->COPY).  spcbase index 0.
@@ -193,10 +194,10 @@ impl Action for ActionStackPtrFlow {
         }
         if numchange == 0 {
             // analyzeExtraPop: full linear solve + INT_ADD rewrite of the solution.
-            crate::coreaction_stackptr::analyze_extra_pop(data, &stackspace, 0);
+            crate::coreaction_stackptr::analyze_extra_pop(data, &stackspace, 0)?;
             self.analysis_finished = true;
         }
-        count
+        Ok(count)
     }
 }
 
@@ -232,7 +233,7 @@ impl Action for ActionLaneDivide {
         }
         Some(Box::new(ActionLaneDivide { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:600 — ActionLaneDivide::apply
         let mut count = 0;
         data.set_laned_reg_generated();
@@ -273,7 +274,7 @@ impl Action for ActionLaneDivide {
             }
         }
         data.clear_laned_access_map();
-        count
+        Ok(count)
     }
 }
 
@@ -412,7 +413,7 @@ impl Action for ActionSegmentize {
     fn reset(&mut self, _data: &mut Funcdata) {
         self.localcount = 0;
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:639 — ActionSegmentize::apply
         //   numops = getArch()->userops.numSegmentOps();
         //   if (numops == 0) return 0;
@@ -444,7 +445,7 @@ impl Action for ActionSegmentize {
         // `SegmentOp::unify`, and the CALLOTHER->SEGMENTOP rewrite
         // (`opSetOpcode`/`opSetInput`/`newVarnodeSpace`/`opRemoveInput`) are not
         // present.  Body transcribed; no change applied (count stays 0).
-        0
+        Ok(0)
     }
 }
 
@@ -478,7 +479,7 @@ impl Action for ActionForceGoto {
         }
         Some(Box::new(ActionForceGoto { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:686 — ActionForceGoto::apply
         //   data.getOverride().applyForceGoto(data);
         //   return 0;
@@ -487,7 +488,7 @@ impl Action for ActionForceGoto {
         // `Override::applyForceGoto` (which rewrites flow per user goto overrides)
         // are not in the merged tree.  Body transcribed; no change applied
         // (count stays 0 — the C++ `return 0` never bumps count either).
-        0
+        Ok(0)
     }
 }
 
@@ -506,6 +507,99 @@ impl ActionMultiCse {
     pub fn boxed(g: impl Into<String>) -> Box<dyn Action> {
         Box::new(ActionMultiCse { base: ActionBase::new(0, "multicse", g) })
     }
+
+    /// Normalize exactly one COPY, as in coreaction.cc:778-852. This compares
+    /// values only: it never moves a definition to another incoming edge.
+    fn copied_input(data: &Funcdata, vn: VarnodeId) -> Option<VarnodeId> {
+        let value = data.vbank().get(vn).expect("multicse: stale input");
+        let Some(def) = value.get_def() else { return Some(vn) };
+        let op = data.obank().get(def).expect("multicse: stale definition");
+        if op.code() != OpCode::CPUI_COPY {
+            return Some(vn);
+        }
+        if op.num_input() != 1 {
+            return None;
+        }
+        let input = op.get_in(0)?;
+        (data.vbank().get(input).expect("multicse: stale copy input").get_size()
+            == value.get_size()).then_some(input)
+    }
+
+    fn preferred_output(data: &Funcdata, out1: VarnodeId, out2: VarnodeId) -> bool {
+        let v1 = data.vbank().get(out1).expect("multicse: stale output");
+        let v2 = data.vbank().get(out2).expect("multicse: stale output");
+        let used_by_return = |vn: &crate::varnode::Varnode| {
+            vn.descend_iter().any(|op| {
+                data.obank().get(op).expect("multicse: stale reader").code() == OpCode::CPUI_RETURN
+            })
+        };
+        if used_by_return(v1) {
+            return false;
+        }
+        if used_by_return(v2) {
+            return true;
+        }
+        !v1.is_addr_tied()
+            && (v2.is_addr_tied()
+                || (v1.get_space().get_type() == kuna_base::space::spacetype::IPTR_INTERNAL
+                    && v2.get_space().get_type() != kuna_base::space::spacetype::IPTR_INTERNAL))
+    }
+
+    fn find_match(
+        data: &Funcdata,
+        block: crate::context::BlockId,
+        target: OpId,
+        shared: VarnodeId,
+    ) -> Option<OpId> {
+        let target_op = data.obank().get(target).expect("multicse: stale target");
+        let target_output = data.vbank().get(target_op.get_out()?).expect("multicse: stale output");
+        let size = target_output.get_size();
+        let mut cursor = data.bb_op_head(block);
+        while let Some(candidate) = cursor {
+            if candidate == target {
+                break;
+            }
+            let op = data.obank().get(candidate).expect("multicse: stale candidate");
+            cursor = op.basic_neighbours().1;
+            if op.code() != OpCode::CPUI_MULTIEQUAL || op.num_input() != target_op.num_input() {
+                continue;
+            }
+            let Some(out) = op.get_out() else { continue };
+            let output = data.vbank().get(out).expect("multicse: stale output");
+            // Equal incoming values do not make two address-tied locations
+            // interchangeable. Their markers must keep each location's state,
+            // just as copy propagation and required High merges do.
+            // SPACEBASE markers also have a distinct pointee-propagation role.
+            if output.get_size() != size
+                || output.is_spacebase() != target_output.is_spacebase()
+                || (output.is_addr_tied()
+                    && target_output.is_addr_tied()
+                    && output.get_addr() != target_output.get_addr())
+                || !(0..op.num_input()).any(|i| {
+                    op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) == Some(shared)
+                })
+            {
+                continue;
+            }
+            // Both PHIs are in the same block: slot i denotes the same incoming
+            // edge for both. Do not sort operands or compare PHIs as expressions.
+            let equivalent = (0..op.num_input()).all(|i| {
+                let Some(in1) = op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) else {
+                    return false;
+                };
+                let Some(in2) = target_op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) else {
+                    return false;
+                };
+                data.vbank().get(in1).expect("multicse: stale input").get_size() == size
+                    && data.vbank().get(in2).expect("multicse: stale input").get_size() == size
+                    && crate::expression::functional_equality(in1, in2, data.vbank(), data.obank())
+            });
+            if equivalent {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 impl Action for ActionMultiCse {
@@ -521,22 +615,59 @@ impl Action for ActionMultiCse {
         }
         Some(Box::new(ActionMultiCse { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
-        // C++ coreaction.cc:894 — ActionMultiCse::apply
-        //   bblocks = data.getBasicBlocks(); sz = bblocks.getSize();
-        //   for (i = 0; i < sz; ++i):
-        //       bl = bblocks.getBlock(i);
-        //       while (processBlock(data, bl)) {}   // repeat until no change
-        //   return 0;
-        //
-        // `processBlock` (coreaction.cc:846-892) scans a block for equivalent
-        // MULTIEQUAL ops (via `findMatch`/`preferredOutput`) and folds the
-        // redundant one, bumping `count` through the Funcdata edit surface.
-        //
-        // STUB(W8-funcdata): the block graph (`getBasicBlocks`) and the
-        // MULTIEQUAL fold (`opSetOutput`/`totalReplace`/`opDestroy`) are not in the
-        // merged tree.  Body transcribed; no change applied (count stays 0).
-        0
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        // C++ coreaction.cc:823-897. Reuse the seen-input set across restarts;
+        // unlike temporary Varnode marks it cannot leak into another action.
+        let mut seen = HashSet::new();
+        for i in 0..data.bblocks_get_size() {
+            let block = data.bblocks_get_block(i);
+            loop {
+                seen.clear();
+                let mut cursor = data.bb_op_head(block);
+                let mut pair = None;
+                while let Some(target) = cursor {
+                    let op = data.obank().get(target).expect("multicse: stale op");
+                    cursor = op.basic_neighbours().1;
+                    if op.code() == OpCode::CPUI_COPY {
+                        continue;
+                    }
+                    if op.code() != OpCode::CPUI_MULTIEQUAL {
+                        break;
+                    }
+                    for slot in 0..op.num_input() {
+                        let Some(vn) = op.get_in(slot).and_then(|vn| Self::copied_input(data, vn)) else {
+                            continue;
+                        };
+                        if seen.contains(&vn) {
+                            if let Some(previous) = Self::find_match(data, block, target, vn) {
+                                pair = Some((previous, target));
+                                break;
+                            }
+                        }
+                    }
+                    if pair.is_some() {
+                        break;
+                    }
+                    for slot in 0..op.num_input() {
+                        if let Some(vn) = op.get_in(slot).and_then(|vn| Self::copied_input(data, vn)) {
+                            seen.insert(vn);
+                        }
+                    }
+                }
+                let Some((previous, target)) = pair else { break };
+                let out1 = data.obank().get(previous).expect("multicse: stale match").get_out().expect("multicse: no output");
+                let out2 = data.obank().get(target).expect("multicse: stale target").get_out().expect("multicse: no output");
+                if Self::preferred_output(data, out1, out2) {
+                    data.total_replace(out1, out2)?;
+                    data.op_destroy(previous)?;
+                } else {
+                    data.total_replace(out2, out1)?;
+                    data.op_destroy(target)?;
+                }
+                self.base.count += 1;
+            }
+        }
+        Ok(0)
     }
 }
 
@@ -570,7 +701,7 @@ impl Action for ActionShadowVar {
         }
         Some(Box::new(ActionShadowVar { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:907 — ActionShadowVar::apply
         //   for (i = 0; i < bblocks.getSize(); ++i):                    // gather shadows
         //       vnlist.clear(); bl = bblocks.getBlock(i);
@@ -597,7 +728,7 @@ impl Action for ActionShadowVar {
         // the Varnode mark bit, and the shadow->COPY collapse
         // (`opSetOpcode`/`opSetAllInput`) are not in the merged tree.  Body
         // transcribed; no change applied (count stays 0).
-        0
+        Ok(0)
     }
 }
 
@@ -643,14 +774,14 @@ impl Action for ActionConstantPtr {
         self.localcount = 0;
         data.kuna_global_array_anchor_passes = data.get_arch().global_array_anchor.then_some(0);
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:1183 — ActionConstantPtr::apply
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         if self.localcount >= 4 {
             // At most 4 passes (once type recovery starts)
-            return 0;
+            return Ok(0);
         }
         self.localcount += 1;
         if data.get_arch().global_array_anchor {
@@ -664,7 +795,7 @@ impl Action for ActionConstantPtr {
         // the faithful membership set.
         let cspc = match data.get_arch().manage().get_constant_space() {
             Some(s) => Rc::clone(s),
-            None => return 0,
+            None => return Ok(0),
         };
         let cspc_index = cspc.get_index();
         let constants: Vec<VarnodeId> = data
@@ -760,73 +891,18 @@ impl Action for ActionConstantPtr {
             }
 
             let mut full_encoding: uintb = 0;
-            let resolved = is_pointer(data, &rspc, vn, op, slot, &numeric, &mut full_encoding);
+            let resolved = is_pointer(data, &rspc, vn, op, slot, &numeric, &mut full_encoding)?;
             // Set check flag AFTER searching for the symbol.
             data.vbank_mut().get_mut(vn).expect("constantptr: stale vn").set_ptr_check();
             if let Some((entry, rampoint)) = resolved {
-                // (kuna) Mid-string char pointer. `is_pointer` admits a constant
-                // that lands in the MIDDLE of a read-only character array (it
-                // clears `needexacthit` for exactly that case), which is how a
-                // compiler shares one literal's tail: `"coreutils"` at 0x68d8 is
-                // the tail of `"GNU coreutils"` at 0x68d4, and `"%s"` at 0x6f0c the
-                // tail of `"%s: %s"`. The spacebase reference built below cannot
-                // survive for such a constant — it is `PTRSUB(spacebase, symaddr)`
-                // plus an INT_ADD of the residual, and constant folding collapses
-                // the pair straight back to the original bare constant, dropping
-                // the type with it. The constant then reaches the printer as
-                // `undefined8` and renders `bindtextdomain(0x68d8, ...)`.
-                //
-                // Upstream reaches the same end state by a different road: it keeps
-                // the reference and lets `RulePtrsubCharConstant` rewrite it into a
-                // constant carrying a char-pointer type, which the printer turns
-                // into the literal. That rule is an un-ported stub here, so type the
-                // constant directly — the same answer, one step earlier, and only
-                // for the interior case. An exact hit still takes the reference path
-                // below, unchanged.
-                //
-                // The type is the evidence: `push_ptr_char_constant_ir` re-proves
-                // the address is read-only and reads to the NUL itself, and falls
-                // back to the integer print if either fails. So the worst case is
-                // today's output.
-                if rampoint != entry.entry_addr {
-                    if let Some(elem) = entry
-                        .symbol_type
-                        .as_ref()
-                        .filter(|t| t.get_metatype() == type_metatype::TYPE_ARRAY)
-                        .and_then(|t| t.get_array_base())
-                        .filter(|e| e.is_char_print())
-                    {
-                        use crate::dtype::TypeFactory as _;
-                        let charptr = data
-                            .get_arch()
-                            .types_rc()
-                            .and_then(|t| t.get_type_pointer(size, elem, rspc.get_word_size()).ok());
-                        if let Some(charptr) = charptr {
-                            if let Some(v) = data.vbank_mut().get_mut(vn) {
-                                v.update_type_locked(charptr, true, true);
-                            }
-                            self.base.count += 1;
-                            continue;
-                        }
-                    }
-                }
-                // C++ `spacebaseConstant` never returns an error; the Rust signature
-                // is fallible only for the can't-happen missing-factory/entry-type
-                // paths (gated by is_pointer having returned a typed entry).  Skip
-                // defensively on the impossible error rather than abort the function.
-                if data
-                    .spacebase_constant(op, slot, &entry, &rampoint, full_encoding, size)
-                    .is_err()
-                {
-                    continue;
-                }
+                data.spacebase_constant(op, slot, &entry, &rampoint, full_encoding, size)?;
                 if opc == OpCode::CPUI_INT_ADD && slot == 1 {
                     data.op_swap_input(op, 0, 1);
                 }
                 self.base.count += 1;
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1012,29 +1088,31 @@ fn is_pointer(
     slot: int4,
     numeric: &HashSet<uintb>,
     full_encoding: &mut uintb,
-) -> Option<(GlobalContainer, Address)> {
+) -> KunaResult<Option<(GlobalContainer, Address)>> {
     let glb = Rc::clone(data.get_arch());
-    let vn_offset = data.vbank().get(vn)?.get_offset();
-    let vn_size = data.vbank().get(vn)?.get_size();
-    let op_addr = data.obank().get(op)?.get_addr().clone();
+    let Some(value) = data.vbank().get(vn) else { return Ok(None) };
+    let vn_offset = value.get_offset();
+    let vn_size = value.get_size();
+    let Some(operation) = data.obank().get(op) else { return Ok(None) };
+    let op_addr = operation.get_addr().clone();
 
     let mut needexacthit;
     let rampoint;
     // Are we explicitly marked as a pointer?
-    let read_facing_meta = data.vbank().get(vn)?.get_type_read_facing(op).get_metatype();
+    let read_facing_meta = value.get_type_read_facing(op).get_metatype();
     if read_facing_meta == type_metatype::TYPE_PTR {
-        rampoint = glb.resolve_constant(spc, vn_offset, vn_size, &op_addr, full_encoding).ok()?;
+        rampoint = glb.resolve_constant(spc, vn_offset, vn_size, &op_addr, full_encoding)?;
         needexacthit = false;
     } else {
-        if data.vbank().get(vn)?.is_type_lock() {
-            return None; // Locked as NOT a pointer
+        if value.is_type_lock() {
+            return Ok(None); // Locked as NOT a pointer
         }
         needexacthit = true;
-        let opc = data.obank().get(op)?.code();
+        let opc = operation.code();
         match opc {
             OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
                 if slot == 0 {
-                    return None;
+                    return Ok(None);
                 }
             }
             OpCode::CPUI_COPY => {}
@@ -1046,40 +1124,40 @@ fn is_pointer(
             | OpCode::CPUI_INT_LESS
             | OpCode::CPUI_INT_LESSEQUAL => {
                 if !glb.infer_pointers() {
-                    return None;
+                    return Ok(None);
                 }
             }
             OpCode::CPUI_INT_ADD => {
-                let outvn = data.obank().get(op)?.get_out()?;
-                if data.vbank().get(outvn)?.get_type_def_facing().get_metatype()
+                let Some(output) = operation.get_out().and_then(|id| data.vbank().get(id)) else { return Ok(None) };
+                if output.get_type_def_facing().get_metatype()
                     == type_metatype::TYPE_PTR
                 {
                     // Is there another pointer base in this expression?
-                    let other = data.obank().get(op)?.get_in(1 - slot)?;
-                    if data.vbank().get(other)?.get_type_read_facing(op).get_metatype()
+                    let Some(other) = operation.get_in(1 - slot).and_then(|id| data.vbank().get(id)) else { return Ok(None) };
+                    if other.get_type_read_facing(op).get_metatype()
                         == type_metatype::TYPE_PTR
                     {
-                        return None; // If so, we are not a pointer
+                        return Ok(None); // If so, we are not a pointer
                     }
                     // FIXME (upstream): need to fully explore additive tree.
                     needexacthit = false;
                 } else if !glb.infer_pointers() {
-                    return None;
+                    return Ok(None);
                 }
             }
             OpCode::CPUI_STORE => {
                 if slot != 2 {
-                    return None;
+                    return Ok(None);
                 }
             }
-            _ => return None,
+            _ => return Ok(None),
         }
         // Make sure the constant is in the expected range for a pointer.
         if spc.get_pointer_lower_bound() > vn_offset {
-            return None;
+            return Ok(None);
         }
         if spc.get_pointer_upper_bound() < vn_offset {
-            return None;
+            return Ok(None);
         }
         // Check if the constant looks like a single bit or mask.  The kuna GH-6930
         // divergence keeps single-bit values that are EXACT function entries; reuse
@@ -1088,9 +1166,9 @@ fn is_pointer(
             && !(crate::kuna_inferfuncentry::entry_escape_applies(
                 opc,
                 numeric.contains(&vn_offset),
-            ) && kuna_const_is_function_entry(data, spc, vn_offset, vn_size, &op_addr))
+            ) && kuna_const_is_function_entry(data, spc, vn_offset, vn_size, &op_addr)?)
         {
-            return None;
+            return Ok(None);
         }
         // The declared-slot checks run after the cheap range filters: the
         // call-input one scans the call specs.
@@ -1100,19 +1178,19 @@ fn is_pointer(
             _ => true,
         };
         if !declared_ok {
-            return None;
+            return Ok(None);
         }
-        rampoint = glb.resolve_constant(spc, vn_offset, vn_size, &op_addr, full_encoding).ok()?;
+        rampoint = glb.resolve_constant(spc, vn_offset, vn_size, &op_addr, full_encoding)?;
     }
 
     if rampoint.is_invalid() {
-        return None;
+        return Ok(None);
     }
     // Since we are looking for a global address, assume it is address-tied and use
     // an empty usepoint.  C++ `data.getScopeLocal()->getParent()->queryContainer(
     // rampoint, 1, Address())` — routed through `glb`'s frozen global-scope snapshot.
     let invalid = Address::new_invalid();
-    let entry = glb.query_container_global(&rampoint, 1, &invalid)?;
+    let Some(entry) = glb.query_container_global(&rampoint, 1, &invalid)? else { return Ok(None) };
     if let Some(ptr_type) = entry.symbol_type.as_ref() {
         if ptr_type.get_metatype() == type_metatype::TYPE_ARRAY {
             if let Some(base) = ptr_type.get_array_base() {
@@ -1125,9 +1203,9 @@ fn is_pointer(
         }
     }
     if needexacthit && entry.entry_addr != rampoint {
-        return None;
+        return Ok(None);
     }
-    Some((entry, rampoint))
+    Ok(Some((entry, rampoint)))
 }
 
 /// The `ActionConstantPtr::isPointer` `bit_transitions < 3` kuna GH-6930 escape
@@ -1144,22 +1222,19 @@ fn kuna_const_is_function_entry(
     vn_offset: uintb,
     vn_size: int4,
     op_addr: &Address,
-) -> bool {
+) -> KunaResult<bool> {
     let glb = data.get_arch();
     let gate = glb.infer_funcentry();
     if !gate {
-        return false;
+        return Ok(false);
     }
     let mut full_encoding: uintb = 0;
-    let rampoint = match glb.resolve_constant(spc, vn_offset, vn_size, op_addr, &mut full_encoding) {
-        Ok(r) => r,
-        Err(_) => return false,
-    };
+    let rampoint = glb.resolve_constant(spc, vn_offset, vn_size, op_addr, &mut full_encoding)?;
     // queryFunction(rampoint): a covering global function Symbol whose entry
     // address equals rampoint.  The frozen snapshot carries the Symbol type; a
     // function Symbol is TYPE_CODE.
     let invalid = Address::new_invalid();
-    let function_entry = glb.query_container_global(&rampoint, 1, &invalid).and_then(|e| {
+    let function_entry = glb.query_container_global(&rampoint, 1, &invalid)?.and_then(|e| {
         let is_code = e
             .symbol_type
             .as_ref()
@@ -1171,7 +1246,7 @@ fn kuna_const_is_function_entry(
             None
         }
     });
-    crate::kuna_inferfuncentry::kuna_is_function_entry(gate, Some(&rampoint), function_entry.as_ref())
+    Ok(crate::kuna_inferfuncentry::kuna_is_function_entry(gate, Some(&rampoint), function_entry.as_ref()))
 }
 
 // =============================================================================
@@ -1204,7 +1279,7 @@ impl Action for ActionDeindirect {
         }
         Some(Box::new(ActionDeindirect { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:1235 — ActionDeindirect::apply.  For each CALLIND whose
         // target Varnode resolves (through COPYs) to a known function — an external
         // reference or a constant code address — convert it to a direct CALL via
@@ -1255,7 +1330,7 @@ impl Action for ActionDeindirect {
             let resolved: Option<(String, Address, std::rc::Rc<crate::fspec::FuncProto>)> =
                 if v.is_persist() && v.is_external_ref() {
                     // Check for a possible external reference.
-                    glb.query_function(v.get_addr())
+                    glb.query_function(v.get_addr())?
                 } else if v.is_constant() {
                     // Assume the function is in the same space as the calling function;
                     // convert the constant to a byte address in that space.
@@ -1272,12 +1347,17 @@ impl Action for ActionDeindirect {
                         offset <<= align;
                     }
                     let codeaddr = Address::new(sp, offset);
-                    glb.query_function(&codeaddr)
+                    glb.query_function(&codeaddr)?
                 } else {
                     None
                 };
 
             if let Some((name, entry, proto)) = resolved {
+                let proto = glb.types_rc()
+                    .map(|types| types.apply_source_prototype(&proto))
+                    .transpose()?
+                    .map(std::rc::Rc::new)
+                    .unwrap_or(proto);
                 // fc->deindirect(data, newfd): splice the call spec out so it can be
                 // mutated alongside `&mut data` (the op rewrite + override + proto
                 // merge), then re-insert it at the same index to keep `qlst` ordering.
@@ -1288,7 +1368,7 @@ impl Action for ActionDeindirect {
                 let r =
                     fc.deindirect(data, entry, &name, &proto, no_return, inline, &mut restartlog);
                 data.restore_call_specs_at(i, fc);
-                r.expect("ActionDeindirect: deindirect failed");
+                r?;
                 count += 1;
                 continue;
             }
@@ -1302,20 +1382,34 @@ impl Action for ActionDeindirect {
                     .map(|target| target.get_type_read_facing(op))
                     .filter(|ty| ty.get_metatype() == type_metatype::TYPE_PTR)
                     .and_then(|ty| ty.get_ptr_to())
-                    .and_then(|ty| ty.get_code_prototype().cloned())
-                    .and_then(|proto| crate::kuna_typedcallabi::admit(data, proto));
+                    .and_then(|ty| ty.get_code_prototype().cloned());
                 if let Some(proto) = proto {
+                    let proto = data.get_arch().types_rc()
+                        .map(|types| types.acquire_working_proto(&proto))
+                        .transpose()?
+                        .map(std::rc::Rc::new)
+                        .unwrap_or(proto);
+                    let Some(proto) = crate::kuna_typedcallabi::admit(
+                        data, data.get_call_specs(i), proto,
+                    ) else {
+                        continue;
+                    };
+                    let point = data.obank().get(op).expect("typed indirect call").get_addr();
+                    let ordinal = (0..i).filter(|&index| {
+                        data.obank().get(data.get_call_specs(index).get_op())
+                            .is_some_and(|previous| previous.get_addr() == point)
+                    }).count() as u32;
                     let mut fc = data.replace_call_specs(i);
                     let mut restartlog = crate::kuna_restartlog::RestartLog::new();
-                    let result = fc.force_set(data, &proto, &mut restartlog);
+                    let result = fc.force_set(data, &proto, ordinal, &mut restartlog);
                     data.restore_call_specs_at(i, fc);
-                    result.expect("ActionDeindirect: forceSet failed");
+                    result?;
                     self.base.count += 1;
                 }
             }
         }
         let _ = count;
-        0
+        Ok(0)
     }
 }
 
@@ -1361,9 +1455,9 @@ impl Action for ActionDirectWrite {
             propagate_indirect: self.propagate_indirect,
         }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:1366 — ActionDirectWrite::apply, transcribed faithfully.
-        directwrite_apply(data, self.propagate_indirect)
+        Ok(directwrite_apply(data, self.propagate_indirect))
     }
 }
 
@@ -1545,7 +1639,7 @@ impl Action for ActionLikelyTrash {
         }
         Some(Box::new(ActionLikelyTrash { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:2198 — ActionLikelyTrash::apply
         //   for (vdata in proto.trashBegin()..trashEnd()):
         //       vn = data.findCoveredInput(vdata.size, vdata.getAddr());
@@ -1566,7 +1660,7 @@ impl Action for ActionLikelyTrash {
         // `findCoveredInput`, `traceTrash` (coreaction.cc:2147-2196, the
         // COPY/AND/INDIRECT trash-flow walk), and `markIndirectCreation` are not in
         // the merged tree.  Body transcribed; no change applied (count stays 0).
-        0
+        Ok(0)
     }
 }
 
@@ -1611,14 +1705,14 @@ impl Action for ActionRestructureVarnode {
     fn reset(&mut self, _data: &mut Funcdata) {
         self.numpass = 0;
     }
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:2332 — ActionRestructureVarnode::apply
         let mut count = 0;
         // aliases are unreliable on the first pass.
         let aliasyes = self.numpass != 0;
         // l1->restructureVarnode(aliasyes): re-derive the stack-frame layout from
         // the live (stack, off) Varnodes that RuleLoad/StoreVarnode produced.
-        count += data.restructure_varnode(aliasyes);
+        count += data.restructure_varnode(aliasyes)?;
         // (kuna `stackstoreguard`) The drive analyzes a function whose layout
         // spoiled the guard again without it, so this analysis stops here.
         if data.stack_store_guard_spoiled() && !data.is_jumptable_recovery_on() {
@@ -1639,7 +1733,7 @@ impl Action for ActionRestructureVarnode {
             data.protect_switch_paths();
         }
         self.numpass += 1;
-        count
+        Ok(count)
     }
 }
 
@@ -1676,7 +1770,7 @@ impl Action for ActionMappedLocalSync {
         }
         Some(Box::new(ActionMappedLocalSync { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:2355 — ActionMappedLocalSync::apply
         let mut count = 0;
         // Final sync: update datatypes (true) and run the unmapped-alias check.
@@ -1686,7 +1780,7 @@ impl Action for ActionMappedLocalSync {
         // STUB(W8-funcdata): the C++ `Funcdata::warningHeader("Could not reconcile
         // some variable overlaps")` on `hasOverlapProbems` is not modeled (a
         // diagnostic header, not output-determining).
-        count
+        Ok(count)
     }
 }
 
@@ -1723,7 +1817,7 @@ impl Action for ActionMapGlobals {
         }
         Some(Box::new(ActionMapGlobals { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:900 — ActionMapGlobals::apply (inline)
         //   data.mapGlobals(); return 0;
         //
@@ -1731,7 +1825,7 @@ impl Action for ActionMapGlobals {
         // global Varnodes into the global scope) is not on the merged `Funcdata`.
         // Body transcribed; no change applied (the C++ `return 0` never bumps
         // count either).
-        0
+        Ok(0)
     }
 }
 
@@ -1773,14 +1867,14 @@ impl Action for ActionDeadCode {
         }
         Some(Box::new(ActionDeadCode { base: self.base.clone(), narrow_inputs: self.narrow_inputs }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:4146 — ActionDeadCode::apply.
-        let res = deadcode_apply(data);
+        let res = deadcode_apply(data)?;
         if self.narrow_inputs {
-            self.base.count += crate::kuna_narrowargs::narrow_inputs(data);
+            self.base.count += crate::kuna_narrowargs::narrow_inputs(data)?;
             self.base.count += crate::kuna_regnarrow::narrow_locals(data);
         }
-        res
+        Ok(res)
     }
 }
 
@@ -1834,6 +1928,40 @@ fn dc_push_consumed(data: &mut Funcdata, val: u64, vn: VarnodeId, worklist: &mut
     }
 }
 
+/// The existing size-resolvable COPY/arithmetic/projection consumption policy.
+/// Shared with instruction-local raw dependency projection; callers still clip
+/// the resulting mask to the input's width. Other operations have no rule here.
+pub(crate) fn projected_input_consumption(
+    opcode: OpCode,
+    output_consumed: u64,
+    slot: int4,
+    input_size: int4,
+    byte_offset: u64,
+) -> Option<u64> {
+    match opcode {
+        OpCode::CPUI_COPY if slot == 0 => Some(output_consumed),
+        OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB | OpCode::CPUI_INT_MULT if slot <= 1 => {
+            Some(coveringmask(output_consumed))
+        }
+        OpCode::CPUI_SUBPIECE if slot == 0 => {
+            let skip = byte_offset as int4;
+            let mut mask = if skip >= std::mem::size_of::<u64>() as int4 {
+                0
+            } else {
+                output_consumed.wrapping_shl((skip * 8) as u32)
+            };
+            if mask == 0 && output_consumed != 0 && input_size > std::mem::size_of::<u64>() as int4 {
+                mask = !0u64 ^ (!0u64 >> 1);
+            }
+            Some(mask)
+        }
+        OpCode::CPUI_SUBPIECE if slot == 1 => {
+            Some(if output_consumed == 0 { 0 } else { !0u64 })
+        }
+        _ => None,
+    }
+}
+
 /// C++ `ActionDeadCode::propagateConsumed` (coreaction.cc:3734): pop the top of
 /// the worklist and propagate its consumed mask backward to the inputs of its
 /// defining op.
@@ -1866,7 +1994,8 @@ fn dc_propagate_consumed(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) {
 
     match opc {
         OpCode::CPUI_INT_MULT => {
-            let b = coveringmask(outc);
+            let b = projected_input_consumption(opc, outc, 1, in_size(data, 1), 0)
+                .expect("known multiply consumption policy");
             let a;
             if in_is_const(data, 1) {
                 let least_set = leastsigbit_set(in_off(data, 1));
@@ -1884,28 +2013,15 @@ fn dc_propagate_consumed(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) {
             dc_push_consumed(data, a, i0, worklist);
             dc_push_consumed(data, b, i1, worklist);
         }
-        OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB => {
-            let a = coveringmask(outc);
-            let (i0, i1) = (in_n(data, 0), in_n(data, 1));
-            dc_push_consumed(data, a, i0, worklist);
-            dc_push_consumed(data, a, i1, worklist);
-        }
-        OpCode::CPUI_SUBPIECE => {
-            let sz = in_off(data, 1) as i32;
-            let mut a = if sz >= usize_bits {
-                0
-            } else {
-                outc.wrapping_shl((sz * 8) as u32)
-            };
-            if a == 0 && outc != 0 && in_size(data, 0) > usize_bits {
-                let mut aa = !0u64;
-                aa ^= aa >> 1;
-                a = aa;
+        OpCode::CPUI_COPY | OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB | OpCode::CPUI_SUBPIECE => {
+            let offset = if opc == OpCode::CPUI_SUBPIECE { in_off(data, 1) } else { 0 };
+            let count = data.obank().get(opid).expect("stale op").num_input();
+            for slot in 0..count {
+                let mask = projected_input_consumption(opc, outc, slot, in_size(data, slot), offset)
+                    .expect("known consumed-input policy");
+                let input = in_n(data, slot);
+                dc_push_consumed(data, mask, input, worklist);
             }
-            let b = if outc == 0 { 0 } else { !0u64 };
-            let (i0, i1) = (in_n(data, 0), in_n(data, 1));
-            dc_push_consumed(data, a, i0, worklist);
-            dc_push_consumed(data, b, i1, worklist);
         }
         OpCode::CPUI_PIECE => {
             let sz = in_size(data, 1);
@@ -1947,7 +2063,7 @@ fn dc_propagate_consumed(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) {
                 // marking skipped (does not affect boolless / the consume fixpoint).
             }
         }
-        OpCode::CPUI_COPY | OpCode::CPUI_INT_NEGATE => {
+        OpCode::CPUI_INT_NEGATE => {
             let i0 = in_n(data, 0);
             dc_push_consumed(data, outc, i0, worklist);
         }
@@ -2104,9 +2220,9 @@ fn dc_propagate_consumed(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) {
 /// whose bits are consumed is eliminated — every reader's input is replaced
 /// with a zero constant, and its defining op is destroyed (calls keep the op
 /// but lose their output).  Returns true if the Varnode was eliminated.
-fn dc_never_consumed(data: &mut Funcdata, vn: VarnodeId) -> bool {
+fn dc_never_consumed(data: &mut Funcdata, vn: VarnodeId) -> KunaResult<bool> {
     if data.vbank().get(vn).expect("neverConsumed: stale vn").get_size() > std::mem::size_of::<u64>() as i32 {
-        return false; // Not enough precision to really tell
+        return Ok(false); // Not enough precision to really tell
     }
     let size = data.vbank().get(vn).expect("neverConsumed: stale vn").get_size();
     // Replace vn with 0 wherever it is read.
@@ -2122,11 +2238,11 @@ fn dc_never_consumed(data: &mut Funcdata, vn: VarnodeId) -> bool {
     }
     let op = data.vbank().get(vn).expect("neverConsumed: stale vn").get_def().expect("def");
     if data.obank().get(op).expect("neverConsumed: stale op").is_call() {
-        data.op_unset_output(op);
+        data.op_unset_output(op)?;
     } else {
-        data.op_destroy(op);
+        data.op_destroy(op)?;
     }
-    true
+    Ok(true)
 }
 
 /// C++ `ActionDeadCode::gatherConsumedReturn` (coreaction.cc:4033): the bit
@@ -2300,10 +2416,10 @@ fn dc_is_eventual_constant(data: &Funcdata, vn: VarnodeId, max_binary: i32, max_
 /// proven to read a volatile range is held on every pass, including one whose
 /// readers consume none of its bits (which the sweep would otherwise delete as
 /// never consumed), unless its instruction already reads that address.
-fn dc_last_chance_load(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) -> bool {
+fn dc_last_chance_load(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) -> KunaResult<bool> {
     use crate::p3_dataflow::kuna_volatileload;
     if data.is_jumptable_recovery_on() {
-        return false;
+        return Ok(false);
     }
     let consumed_load = |data: &Funcdata, load: OpId| {
         data.obank()
@@ -2332,8 +2448,8 @@ fn dc_last_chance_load(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) -> bo
             continue;
         }
         let ptr = o.get_in(1).expect("LOAD ptr");
-        let volatile = kuna_volatileload::is_volatile_with(data, op, &mut memo);
-        if volatile && kuna_volatileload::rereads(data, op, &mut memo, consumed_load) {
+        let volatile = kuna_volatileload::is_volatile_with(data, op, &mut memo)?;
+        if volatile && kuna_volatileload::rereads(data, op, &mut memo, consumed_load)? {
             continue;
         }
         let eventual = volatile
@@ -2346,11 +2462,11 @@ fn dc_last_chance_load(data: &mut Funcdata, worklist: &mut Vec<VarnodeId>) -> bo
             res = true;
         }
     }
-    res
+    Ok(res)
 }
 
 /// C++ `ActionDeadCode::apply` (coreaction.cc:4146).
-fn deadcode_apply(data: &mut Funcdata) -> ApplyResult {
+fn deadcode_apply(data: &mut Funcdata) -> KunaResult<ApplyResult> {
     let mut worklist: Vec<VarnodeId> = Vec::new();
 
     // The C++ `startProcessing` builds the per-space heritage info list before
@@ -2491,7 +2607,7 @@ fn deadcode_apply(data: &mut Funcdata) -> ApplyResult {
     while !worklist.is_empty() {
         dc_propagate_consumed(data, &mut worklist);
     }
-    if dc_last_chance_load(data, &mut worklist) {
+    if dc_last_chance_load(data, &mut worklist)? {
         while !worklist.is_empty() {
             dc_propagate_consumed(data, &mut worklist);
         }
@@ -2530,12 +2646,12 @@ fn deadcode_apply(data: &mut Funcdata) -> ApplyResult {
                 let op = data.vbank().get(vn).expect("sweep: stale vn").get_def().expect("def");
                 changecount += 1;
                 if data.obank().get(op).expect("sweep: stale op").is_call() {
-                    data.op_unset_output(op);
+                    data.op_unset_output(op)?;
                 } else {
-                    data.op_destroy(op);
+                    data.op_destroy(op)?;
                 }
             } else if data.vbank().get(vn).expect("sweep: stale vn").get_consume() == 0
-                && dc_never_consumed(data, vn)
+                && dc_never_consumed(data, vn)?
             {
                 changecount += 1;
             }
@@ -2549,7 +2665,7 @@ fn deadcode_apply(data: &mut Funcdata) -> ApplyResult {
     data.clear_dead_varnodes().expect("clearDeadVarnodes");
     data.clear_dead_ops();
     let _ = total_change; // C++ ActionDeadCode::apply returns 0 regardless.
-    0
+    Ok(0)
 }
 
 // =============================================================================
@@ -2583,13 +2699,13 @@ impl Action for ActionConditionalConst {
         }
         Some(Box::new(ActionConditionalConst { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:4748 — ActionConditionalConst::apply.  The full
         // algorithm (apply/findConstCompare/propagateConstant/handlePhiNodes/
         // placeCopy/collectReachable/flowTogether/pushConstant) lives in
         // [`crate::condconst`]; it returns the `count` delta this action records.
         self.base.count += crate::condconst::condconst_apply(data);
-        0
+        Ok(0)
     }
 }
 
@@ -2623,7 +2739,7 @@ impl Action for ActionSwitchNorm {
         }
         Some(Box::new(ActionSwitchNorm { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:4782 — ActionSwitchNorm::apply
         let n = data.num_jump_tables();
         for i in 0..n {
@@ -2667,7 +2783,7 @@ impl Action for ActionSwitchNorm {
                 self.base_mut().count += 1;
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -2702,7 +2818,7 @@ impl Action for ActionUnjustifiedParams {
         }
         Some(Box::new(ActionUnjustifiedParams { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:5018 — ActionUnjustifiedParams::apply
         //
         // (w10-mixfloatint) The input def-set iteration, `unjustifiedInputParam`,
@@ -2722,7 +2838,7 @@ impl Action for ActionUnjustifiedParams {
         // anyway.  A locked-input proto IS handled by the store path; defer it to
         // the W4 store wave (the recovery path that motivates this is unlocked).
         if !data.get_func_proto().has_model() || data.get_func_proto().is_input_locked() {
-            return 0;
+            return Ok(0);
         }
         let input_adjust = data.get_arch().input_varnode_adjust;
 
@@ -2823,7 +2939,7 @@ impl Action for ActionUnjustifiedParams {
                 break;
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -2858,7 +2974,7 @@ impl Action for ActionDynamicMapping {
         }
         Some(Box::new(ActionDynamicMapping { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:5106 — ActionDynamicMapping::apply
         let entries = match data.get_scope_local() {
             Some(lm) => lm.database().dynamic_entries(lm.scope_id()),
@@ -2871,7 +2987,7 @@ impl Action for ActionDynamicMapping {
                 Err(_) => {}
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -2908,7 +3024,7 @@ impl Action for ActionDynamicSymbols {
         }
         Some(Box::new(ActionDynamicSymbols { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:5123 — ActionDynamicSymbols::apply
         // (the harness's `count` is the per-apply work tally; the body always
         // returns 0 / the action never re-schedules — `rule_onceperfunc`.)
@@ -2923,7 +3039,7 @@ impl Action for ActionDynamicSymbols {
                 Err(_) => {} // a search/warning failure is non-fatal (C++ returns false)
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -2961,7 +3077,7 @@ impl Action for ActionInternalStorage {
         }
         Some(Box::new(ActionInternalStorage { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:5192 — ActionInternalStorage::apply (marking only, no
         // count bump).
         //
@@ -2977,7 +3093,7 @@ impl Action for ActionInternalStorage {
         // panic.  No model means no internal-storage list, so bail (matches an empty
         // `internalBegin()..internalEnd()` range).
         if !data.get_func_proto().has_model() {
-            return 0;
+            return Ok(0);
         }
         // Snapshot the internal-storage (size, addr) list before borrowing the
         // varnode/op banks (the proto borrow must not alias the bank reads).
@@ -3018,7 +3134,7 @@ impl Action for ActionInternalStorage {
                 o.set_store_unmapped();
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -3063,10 +3179,10 @@ impl Action for ActionInferTypes {
     fn reset(&mut self, _data: &mut Funcdata) {
         self.localcount = 0;
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:5630 — ActionInferTypes::apply
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         // The empirical settle ceiling is 7 passes.
         if self.localcount >= 7 {
@@ -3075,7 +3191,7 @@ impl Action for ActionInferTypes {
                 data.set_type_recovery_exceeded();
                 self.localcount += 1;
             }
-            return 0;
+            return Ok(0);
         }
         // Run the bounded bidirectional type lattice (the engine ported in
         // `coreaction_infertypes`): buildLocaltypes -> propagateOneType (DFS) ->
@@ -3088,13 +3204,13 @@ impl Action for ActionInferTypes {
         // a full pass has run and changed nothing.  A function whose first pass
         // is already at the fixpoint is settled too -- a lattice that never
         // needed to move is still decided.
-        if crate::kuna_floatreg::with_moved_memo(|| crate::coreaction_infertypes::run_infer_types(data)) {
+        if crate::kuna_floatreg::with_moved_memo(|| crate::coreaction_infertypes::run_infer_types(data))? {
             self.localcount += 1;
             data.set_kuna_infertypes_settled(false);
         } else {
             data.set_kuna_infertypes_settled(true);
         }
-        0
+        Ok(0)
     }
 }
 

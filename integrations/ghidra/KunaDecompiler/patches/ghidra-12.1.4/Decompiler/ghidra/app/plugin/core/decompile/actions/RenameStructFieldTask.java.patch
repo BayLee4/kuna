@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RenameStructFieldTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RenameStructFieldTask.java
+@@ -38,6 +38,7 @@
+ 
+ 	@Override
+ 	public void commit() throws DuplicateNameException, InvalidInputException {
++		requireSourceAuthority(structure);
+ 		// FIXME: How should an existing packed structure be handled? Growing and offset-based placement does not apply
+ 		int len = structure.isZeroLength() ? 0 : structure.getLength();
+ 		if (len < offset) {

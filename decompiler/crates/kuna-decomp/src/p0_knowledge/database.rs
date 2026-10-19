@@ -84,8 +84,8 @@ pub trait TypeFactoryAccess {
 /// register-backed storage by name.  W5 routes this onto the real `Translate`.
 pub trait TranslateAccess {
     /// C++ `Translate::getRegisterName(spc,off,sz)` — the register name covering
-    /// the given storage, or empty if none.
-    fn get_register_name(&self, space: &Rc<AddrSpace>, off: uintb, size: int4) -> String;
+    /// the given storage, or empty if none. Host query failures propagate.
+    fn get_register_name(&self, space: &Rc<AddrSpace>, off: uintb, size: int4) -> KunaResult<String>;
 }
 
 /// Access trait for the slice of `Architecture` (C++ `glb`) the symbol database needs.
@@ -585,6 +585,7 @@ pub enum SymbolKind {
         /// name+address) and re-seeded into a `FuncProto` on demand.  `None` = no
         /// source-declared prototype (the default-model recovery applies).
         proto_pieces: Option<Box<crate::fspec::PrototypePieces>>,
+        source_proto: Option<Rc<crate::fspec::FuncProto>>,
     },
     /// `EquateSymbol` — labels a constant (C++ `EquateSymbol`).
     Equate {
@@ -2140,6 +2141,87 @@ impl Database {
         Ok(sym)
     }
 
+    pub(crate) fn import_remote_symbol(
+        &mut self,
+        scope: ScopeId,
+        source: &crate::remote_provider::RemoteSymbolRecord,
+        working_slot: Option<int4>,
+        projection: Option<(&dyn crate::fspec::ProtoParameter, &Address, &Address)>,
+    ) -> KunaResult<SymbolId> {
+        let parameter = projection.map(|(parameter, _, _)| parameter);
+        let dtype = parameter.and_then(|parameter| parameter.get_type()).or(source.dtype.as_ref())
+            .ok_or_else(|| KunaError::lowlevel("Source symbol has no datatype"))?;
+        let mut symbol = Symbol::new(scope, &source.name, Some(Rc::clone(dtype)));
+        symbol.display_name = source.display_name.clone();
+        symbol.symbol_id = source.symbol_id;
+        symbol.flags = source.flags;
+        if parameter.is_some() {
+            symbol.flags &= !(varnode_flags::indirectstorage | varnode_flags::hiddenretparm);
+        }
+        let parameter_flags = parameter.map(|parameter| parameter.get_flags()).unwrap_or(source.parameter_flags);
+        if parameter_flags & crate::fspec::parameter_pieces_flags::ISTHIS != 0 {
+            symbol.dispflags |= symbol_dispflags::IS_THIS_PTR;
+        }
+        if parameter_flags & crate::fspec::parameter_pieces_flags::INDIRECTSTORAGE != 0 {
+            symbol.flags |= varnode_flags::indirectstorage;
+        }
+        if parameter.map(|parameter| parameter.is_hidden_return()).unwrap_or(source.hidden_return) {
+            symbol.flags |= varnode_flags::hiddenretparm;
+        }
+        symbol.check_size_type_lock();
+        symbol.category = int4::try_from(source.category)
+            .map_err(|_| KunaError::lowlevel("Source symbol category is out of range"))?;
+        symbol.catindex = match working_slot {
+            Some(slot) => u16::try_from(slot),
+            None => u16::try_from(source.cat_index),
+        }.map_err(|_| KunaError::lowlevel("Source parameter index is out of range"))?;
+        let sid = self.symbols.insert(symbol);
+        self.add_symbol_internal(scope, sid)?;
+        if let Some((_, address, usepoint)) = projection {
+            self.add_map_point(scope, sid, address, usepoint)?;
+        } else {
+            for mapping in &source.entries {
+                let mut entry = SymbolEntry::new_unintegrated(sid);
+                entry.addr = mapping.addr.clone();
+                entry.hash = mapping.hash;
+                entry.uselimit = mapping.uselimit.clone();
+                self.add_map(scope, entry)?;
+            }
+        }
+        Ok(sid)
+    }
+
+    pub(crate) fn remap_symbol_dynamic(
+        &mut self,
+        sym: SymbolId,
+        usepoint: &Address,
+        hash: uint8,
+    ) -> SymbolEntry {
+        let scope = self.symbols[sym].scope;
+        if let Some(entry) = self.symbols[sym].mapentry.first().copied() {
+            let entry = self.entry(scope, entry);
+            if entry.is_dynamic() && entry.get_hash() == hash
+                && entry.get_first_use_address() == *usepoint
+            {
+                return entry.clone();
+            }
+        }
+        let size = self.symbols[sym].get_bytes_consumed();
+        self.remove_symbol_mappings(sym);
+        let mut uselimit = RangeList::new();
+        if let Some(space) = usepoint.get_space() {
+            uselimit.insert_range(Rc::clone(space), usepoint.get_offset(), usepoint.get_offset());
+        }
+        let entry = self.add_dynamic_map_internal(
+            scope, sym, varnode_flags::mapped, hash, 0, size, &uselimit,
+        );
+        self.entry(scope, entry).clone()
+    }
+
+    pub(crate) fn parameter_symbol(&self, scope: ScopeId, index: int4) -> Option<SymbolId> {
+        self.scopes[scope].category.first()?.get(usize::try_from(index).ok()?)?.as_ref().copied()
+    }
+
     /// C++ `Scope::addSymbol(nm,ct,addr,usepoint)` (`database.cc:1535-1546`): add
     /// a Symbol with a single storage mapping.
     pub fn add_symbol_mapped(
@@ -2210,6 +2292,7 @@ impl Database {
             no_return: false,
             inject_id: -1,
             proto_pieces: None,
+            source_proto: None,
         };
         let sid = self.symbols.insert(sym);
         self.add_symbol_internal(scope, sid)?;
@@ -2811,8 +2894,8 @@ impl Database {
     /// replicate Ghidra's `getCallFixup()==null` guard — only auto-apply a fixup
     /// when none is already set (`CallFixupAnalyzer.java:89`).
     pub fn function_inject_id_for_symbol(&self, sid: SymbolId) -> int4 {
-        match self.symbols[sid].kind {
-            SymbolKind::Function { inject_id, .. } => inject_id,
+        match &self.symbols[sid].kind {
+            SymbolKind::Function { inject_id, source_proto, .. } => source_proto.as_ref().map(|p| p.get_inject_id()).filter(|id| *id >= 0).unwrap_or(*inject_id),
             _ => -1,
         }
     }
@@ -2827,8 +2910,25 @@ impl Database {
         pieces: crate::fspec::PrototypePieces,
     ) {
         self.kuna_gen += 1;
-        if let SymbolKind::Function { proto_pieces, .. } = &mut self.symbols[sid].kind {
+        if let SymbolKind::Function { proto_pieces, source_proto, .. } = &mut self.symbols[sid].kind {
             *proto_pieces = Some(Box::new(pieces));
+            *source_proto = None;
+        }
+    }
+
+    pub fn set_function_source_proto(&mut self, sid: SymbolId, proto: Rc<crate::fspec::FuncProto>) {
+        self.kuna_gen += 1;
+        if let SymbolKind::Function { source_proto, proto_pieces, .. } = &mut self.symbols[sid].kind {
+            *source_proto = Some(proto);
+            *proto_pieces = None;
+        }
+    }
+
+    pub fn function_source_proto_across_scopes(&self, addr: &Address) -> Option<&Rc<crate::fspec::FuncProto>> {
+        let (sid, _) = self.find_function_across_scopes(addr)?;
+        match &self.symbols[sid].kind {
+            SymbolKind::Function { source_proto, .. } => source_proto.as_ref(),
+            _ => None,
         }
     }
 
@@ -2843,6 +2943,7 @@ impl Database {
     ) -> Option<&crate::fspec::PrototypePieces> {
         let sid = self.find_function(scope, addr)?;
         match &self.symbols[sid].kind {
+            SymbolKind::Function { source_proto: Some(proto), .. } => proto.logical_pieces(),
             SymbolKind::Function { proto_pieces, .. } => proto_pieces.as_deref(),
             _ => None,
         }
@@ -2863,6 +2964,7 @@ impl Database {
     ) -> Option<&crate::fspec::PrototypePieces> {
         let (sid, _) = self.find_function_across_scopes(addr)?;
         match &self.symbols[sid].kind {
+            SymbolKind::Function { source_proto: Some(proto), .. } => proto.logical_pieces(),
             SymbolKind::Function { proto_pieces, .. } => proto_pieces.as_deref(),
             _ => None,
         }
@@ -2874,7 +2976,10 @@ impl Database {
     pub fn function_is_inline(&self, scope: ScopeId, addr: &Address) -> bool {
         match self.find_function(scope, addr) {
             Some(sid) => {
-                matches!(self.symbols[sid].kind, SymbolKind::Function { inline_func: true, .. })
+                match &self.symbols[sid].kind {
+                    SymbolKind::Function { inline_func, source_proto, .. } => *inline_func || source_proto.as_ref().is_some_and(|p| p.is_inline()),
+                    _ => false,
+                }
             }
             None => false,
         }
@@ -2886,10 +2991,7 @@ impl Database {
     /// time by `FlowInfo::queryCall` to route inline vs payload injection.
     pub fn function_inject_id(&self, scope: ScopeId, addr: &Address) -> int4 {
         match self.find_function(scope, addr) {
-            Some(sid) => match self.symbols[sid].kind {
-                SymbolKind::Function { inject_id, .. } => inject_id,
-                _ => -1,
-            },
+            Some(sid) => self.function_inject_id_for_symbol(sid),
             None => -1,
         }
     }
@@ -2900,7 +3002,10 @@ impl Database {
     pub fn function_is_no_return(&self, scope: ScopeId, addr: &Address) -> bool {
         match self.find_function(scope, addr) {
             Some(sid) => {
-                matches!(self.symbols[sid].kind, SymbolKind::Function { no_return: true, .. })
+                match &self.symbols[sid].kind {
+                    SymbolKind::Function { no_return, source_proto, .. } => *no_return || source_proto.as_ref().is_some_and(|p| p.is_no_return()),
+                    _ => false,
+                }
             }
             None => false,
         }
@@ -2956,7 +3061,10 @@ impl Database {
     pub fn function_is_no_return_across_scopes(&self, addr: &Address) -> bool {
         match self.find_function_across_scopes(addr) {
             Some((sid, _)) => {
-                matches!(self.symbols[sid].kind, SymbolKind::Function { no_return: true, .. })
+                match &self.symbols[sid].kind {
+                    SymbolKind::Function { no_return, source_proto, .. } => *no_return || source_proto.as_ref().is_some_and(|p| p.is_no_return()),
+                    _ => false,
+                }
             }
             None => false,
         }
@@ -2966,7 +3074,10 @@ impl Database {
     pub fn function_is_inline_across_scopes(&self, addr: &Address) -> bool {
         match self.find_function_across_scopes(addr) {
             Some((sid, _)) => {
-                matches!(self.symbols[sid].kind, SymbolKind::Function { inline_func: true, .. })
+                match &self.symbols[sid].kind {
+                    SymbolKind::Function { inline_func, source_proto, .. } => *inline_func || source_proto.as_ref().is_some_and(|p| p.is_inline()),
+                    _ => false,
+                }
             }
             None => false,
         }
@@ -2975,10 +3086,7 @@ impl Database {
     /// Cross-scope variant of [`Self::function_inject_id`].
     pub fn function_inject_id_across_scopes(&self, addr: &Address) -> int4 {
         match self.find_function_across_scopes(addr) {
-            Some((sid, _)) => match self.symbols[sid].kind {
-                SymbolKind::Function { inject_id, .. } => inject_id,
-                _ => -1,
-            },
+            Some((sid, _)) => self.function_inject_id_for_symbol(sid),
             None => -1,
         }
     }
@@ -3232,6 +3340,7 @@ impl Database {
             None => return GlobalQuery::default(),
         };
         let mut entries: Vec<GlobalEntry> = Vec::new();
+        let mut source_protos = std::collections::BTreeMap::new();
         // The C++ `getGlobalScope()->queryContainer` descends into namespace child
         // scopes via the `resolvemap` (`Scope::mapScope`), so a Symbol mapped inside
         // a namespace (`map addr ... a::spam`) is reachable through the global query.
@@ -3277,6 +3386,9 @@ impl Database {
                         continue;
                     }
                     let sym = &self.symbols[entry.symbol];
+                    if let SymbolKind::Function { source_proto: Some(proto), .. } = &sym.kind {
+                        source_protos.insert((space_index as int4, entry.get_first()), Rc::clone(proto));
+                    }
                     let sym_flags = sym.flags;
                     entries.push(GlobalEntry {
                         // cast: usize -> int4; `space_index` is a `maptable` slot index
@@ -3298,35 +3410,35 @@ impl Database {
                         symbol_id: sym.symbol_id,
                         scope_path: scope_path.clone(),
                         is_function: matches!(sym.kind, SymbolKind::Function { .. }),
-                        func_inject_id: match sym.kind {
-                            SymbolKind::Function { inject_id, .. } => inject_id,
-                            _ => -1,
-                        },
+                        func_inject_id: self.function_inject_id_for_symbol(entry.symbol),
                         // (kuna) The callee's no-return flow effect; see
                         // `GlobalEntry::func_no_return`.
-                        func_no_return: matches!(
-                            sym.kind,
-                            SymbolKind::Function { no_return: true, .. }
-                        ),
+                        func_no_return: match &sym.kind {
+                            SymbolKind::Function { no_return, source_proto, .. } => *no_return || source_proto.as_ref().is_some_and(|p| p.is_no_return()),
+                            _ => false,
+                        },
                     });
                 }
             }
         }
         let scope = &self.scopes[gid];
-        crate::context::GlobalQuery::new(
+        let mut query = crate::context::GlobalQuery::new(
             entries,
             scope.rangetree.clone(),
             self.flagbase.clone(),
-        )
+        );
+        query.source_protos = source_protos;
+        query
     }
 
     /// Snapshot every global FunctionSymbol's source-declared prototype, keyed by
     /// `(space_index, entry_offset)`, for the ArchContext (the kuna stand-in
     /// for the C++ callee `Funcdata`'s lazily-built locked `FuncProto`, read by
-    /// `ActionDefaultParams::apply`'s `fc->copy(otherfunc->getFuncProto())`).  Only
-    /// functions whose prototype was parked by `set_function_proto_pieces` (i.e.
-    /// declared via `parse line extern`) appear; the rest recover with the default
-    /// model.  Frozen at `build_arch_handle`, after every `parse line` has run.
+    /// `ActionDefaultParams::apply`'s `fc->copy(otherfunc->getFuncProto())`).
+    /// Like `function_proto_pieces`, this projects retained logical source facts
+    /// first, then legacy parked pieces; it never reconstructs declarations from
+    /// working physical storage. Frozen at `build_arch_handle`, after every
+    /// `parse line` has run.
     ///
     /// (kuna `cppproto`) Every scope is walked, not only the global one: a
     /// demangled C++ callee is filed under its namespace/class scope, so a
@@ -3349,10 +3461,13 @@ impl Database {
                     if entry.is_dynamic() {
                         continue;
                     }
-                    if let SymbolKind::Function { proto_pieces: Some(pieces), .. } =
-                        &self.symbols[entry.symbol].kind
-                    {
-                        out.push((space_index as int4, entry.get_first(), (**pieces).clone()));
+                    let pieces = match &self.symbols[entry.symbol].kind {
+                        SymbolKind::Function { source_proto: Some(proto), .. } => proto.logical_pieces(),
+                        SymbolKind::Function { proto_pieces, .. } => proto_pieces.as_deref(),
+                        _ => None,
+                    };
+                    if let Some(pieces) = pieces {
+                        out.push((space_index as int4, entry.get_first(), pieces.clone()));
                     }
                 }
             }
@@ -3584,7 +3699,7 @@ impl Database {
                 s.push_str("unaff_retaddr");
             } else {
                 let space = addr.get_space().expect("named varnode has a space");
-                let unaffname = arch.translate().get_register_name(space, addr.get_offset(), sz);
+                let unaffname = arch.translate().get_register_name(space, addr.get_offset(), sz)?;
                 if unaffname.is_empty() {
                     let _ = write!(s, "unaff_{:08x}", addr.get_offset());
                 } else {
@@ -3593,7 +3708,7 @@ impl Database {
             }
         } else if (flags & varnode_flags::persist) != 0 {
             let space = addr.get_space().expect("named varnode has a space");
-            let spacename = arch.translate().get_register_name(space, addr.get_offset(), sz);
+            let spacename = arch.translate().get_register_name(space, addr.get_offset(), sz)?;
             if !spacename.is_empty() {
                 s.push_str(&spacename);
             } else {
@@ -3613,7 +3728,7 @@ impl Database {
         } else if (flags & varnode_flags::input) != 0 && *index < 0 {
             // Irregular input.
             let space = addr.get_space().expect("named varnode has a space");
-            let regname = arch.translate().get_register_name(space, addr.get_offset(), sz);
+            let regname = arch.translate().get_register_name(space, addr.get_offset(), sz)?;
             if regname.is_empty() {
                 let _ = write!(s, "in_{}_{:08x}", space.get_name(), addr.get_offset());
             } else {
@@ -3635,7 +3750,7 @@ impl Database {
         } else if (flags & varnode_flags::indirect_creation) != 0 {
             s.push_str("extraout_");
             let space = addr.get_space().expect("named varnode has a space");
-            let regname = arch.translate().get_register_name(space, addr.get_offset(), sz);
+            let regname = arch.translate().get_register_name(space, addr.get_offset(), sz)?;
             if !regname.is_empty() {
                 s.push_str(&regname);
             } else {
@@ -3712,7 +3827,7 @@ impl Database {
                 let space = naddr.get_space().expect("persist addr has a space");
                 if arch
                     .translate()
-                    .get_register_name(space, naddr.get_offset(), sz)
+                    .get_register_name(space, naddr.get_offset(), sz)?
                     .is_empty()
                 {
                     // global data -> dat_<addr>
@@ -4690,10 +4805,11 @@ impl Database {
                 sym.encode(encoder)?;
                 for eref in &sym.mapentry {
                     let entry = self.entry(scope, *eref);
-                    if !entry.is_piece() && entry.get_addr().is_join() {
-                        let wrapped = super::kuna_wrappedstackmap::is_wrapped_address(entry.get_addr());
+                    if !entry.is_piece()
+                        && super::kuna_wrappedstackmap::is_wrapped_address(entry.get_addr())
+                    {
                         if let Some((addr, _)) = wrapped_storage.get(&sym.symbol_id).filter(|(_, size)|
-                            wrapped && *size == entry.get_size()) {
+                            *size == entry.get_size()) {
                             let mut wire_entry = entry.clone();
                             wire_entry.addr = addr.clone();
                             wire_entry.encode(encoder)?;
@@ -4780,11 +4896,11 @@ mod tests {
     }
 
     impl TranslateAccess for TestArch {
-        fn get_register_name(&self, sp: &Rc<AddrSpace>, off: uintb, size: int4) -> String {
-            self.regnames
+        fn get_register_name(&self, sp: &Rc<AddrSpace>, off: uintb, size: int4) -> KunaResult<String> {
+            Ok(self.regnames
                 .get(&(sp.get_index(), off, size))
                 .cloned()
-                .unwrap_or_default()
+                .unwrap_or_default())
         }
     }
 
@@ -5494,6 +5610,65 @@ mod tests {
         assert_eq!(*off, 0x2000);
         assert_eq!(snap_pieces.name, "declared_callee");
         assert_eq!(snap_pieces.intypes.len(), 1);
+    }
+
+    #[test]
+    fn callee_proto_pieces_projects_replacement_source_without_mutating_it() {
+        let m = build_manager();
+        let (mut db, g) = db_with_global(m.num_spaces());
+        let ram = space(&m, 2);
+        let register = space(&m, 3);
+        let addr = Address::new(Rc::clone(&ram), 0x2000);
+        let declared = db.add_function(g, &addr, "source_callee", 1, dt(1)).unwrap();
+        db.add_function(g, &Address::new(Rc::clone(&ram), 0x3000), "plain_callee", 1, dt(1)).unwrap();
+        db.set_function_proto_pieces(declared, crate::fspec::PrototypePieces {
+            name: "superseded".into(),
+            ..Default::default()
+        });
+        let input = dt(8);
+        let output = dt(24);
+        let storage = crate::fspec::ParameterPieces {
+            addr: Address::new(register, 0x40),
+            type_: Some(Rc::clone(&input)),
+            flags: crate::fspec::parameter_pieces_flags::TYPELOCK
+                | crate::fspec::parameter_pieces_flags::NAMELOCK
+                | crate::fspec::parameter_pieces_flags::ISTHIS,
+        };
+        let pieces = crate::fspec::PrototypePieces {
+            name: "source_callee".into(),
+            outtype: Some(Rc::clone(&output)),
+            intypes: vec![Rc::clone(&input)],
+            innames: vec!["source_value".into()],
+            first_var_arg_slot: 1,
+            input_storage: vec![(0, storage.clone())],
+            ..Default::default()
+        };
+        let types = crate::dtype::TypeFactoryImpl::new();
+        let mut model = crate::fspec::ProtoModel::new(&m);
+        model.build_param_list("standard").unwrap();
+        let source = Rc::new(crate::fspec::FuncProto::from_logical(&pieces, Rc::new(model), &types).unwrap());
+        db.set_function_source_proto(declared, Rc::clone(&source));
+        let generation = db.kuna_generation();
+        let mut snapshot = db.build_callee_proto_pieces();
+        assert_eq!(snapshot.len(), 1);
+        let (space_index, entry, projected) = &mut snapshot[0];
+        assert_eq!(*space_index, ram.get_index());
+        assert_eq!(*entry, addr.get_offset());
+        assert_eq!(projected.name, "source_callee");
+        assert!(Rc::ptr_eq(projected.outtype.as_ref().unwrap(), &output));
+        assert!(Rc::ptr_eq(&projected.intypes[0], &input));
+        assert_eq!(projected.innames, ["source_value"]);
+        assert_eq!(projected.first_var_arg_slot, 1);
+        assert_eq!(projected.input_storage[0].0, 0);
+        assert_eq!(projected.input_storage[0].1.addr, storage.addr);
+        assert_eq!(projected.input_storage[0].1.flags, storage.flags);
+        assert!(projected.output_storage.is_none());
+        projected.intypes.clear();
+        projected.innames.clear();
+        assert_eq!(source.logical_pieces().unwrap().intypes.len(), 1);
+        assert_eq!(source.logical_pieces().unwrap().innames, ["source_value"]);
+        assert!(Rc::ptr_eq(db.function_source_proto_across_scopes(&addr).unwrap(), &source));
+        assert_eq!(db.kuna_generation(), generation);
     }
 
     /// `Database::kuna_gen` is what `Architecture::build_arch_handle` keys its

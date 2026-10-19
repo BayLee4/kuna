@@ -7,7 +7,7 @@ import sys
 import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra, test_cores
 
 
 def contextual_source_cases(output):
@@ -191,7 +191,8 @@ def contextual_source_cases(output):
             finally:
                 assert snapshot() == before and int(program.getModificationNumber()) == revision, 'Consumer edited source'
 
-        for core, executable in [('stock', None), ('kuna', KUNA_GHIDRA)]:
+        for core in test_cores():
+            executable = KUNA_GHIDRA if core == 'kuna' else None
             organization.setCharIsSigned(original_sign)
             with selected_core(executable):
                 interface = DecompInterface()
@@ -229,7 +230,9 @@ def contextual_source_cases(output):
 def main():
     output = Path(os.environ.get("KUNA_SMOKE_OUT", "java-source-identity-proof"))
     output.mkdir(parents=True, exist_ok=True)
-    report = {"passed": False, "rows": []}
+    cores = test_cores()
+    report = {"passed": False, "group": "product" if "kuna" in cores else "stock-controls",
+              "selected_cores": cores, "rows": []}
     program = None
     try:
         start_ghidra()
@@ -275,7 +278,8 @@ def main():
             program.endTransaction(tx, True)
         ids = [int(manager.getID(record)) for record in records]
         assert ids[0] != ids[1]
-        for core, exe in (("stock", None), ("kuna", KUNA_GHIDRA)):
+        for core in cores:
+            exe = KUNA_GHIDRA if core == "kuna" else None
             tx = program.startTransaction("Restore independent core baseline")
             try:
                 records[0].getComponentAt(0).setFieldName("authored_0")

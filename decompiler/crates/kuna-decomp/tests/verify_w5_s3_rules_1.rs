@@ -89,7 +89,7 @@ fn make_op(fd: &mut Funcdata, off: u64, opc: OpCode) -> OpId {
 }
 
 fn make_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -102,7 +102,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
     let defop = fd.obank_mut().create_at(2, pc);
     fd.obank_mut().mark_alive(defop);
     fd.obank_mut().change_opcode(defop, TypeOp::new(defopc, 0, format!("{defopc:?}")));
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -111,7 +111,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
 }
 
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -167,7 +167,7 @@ fn w5s3_rightshiftand_large_shift_masks_count_and_applies() {
 
     // x86-masked: sa==64 -> count mod 64 == 0, so mask>>0 == full>>0 == u64::MAX,
     // full == mask passes, root is non-free -> rule applies and bypasses the AND.
-    assert_eq!(r.apply_op(op, &mut fd), 1, "rule applies (x86-masked shift, full==mask)");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "rule applies (x86-masked shift, full==mask)");
     assert_eq!(in_of(&fd, op, 0), Some(root), "AND bypassed, slot0 -> root");
 }
 
@@ -187,7 +187,7 @@ fn w5s3_rightshiftand_shift_63_in_range_applies() {
     wire_input(&mut fd, op, inv, 0);
     wire_input(&mut fd, op, sa, 1);
     let mut r = RuleRightShiftAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(in_of(&fd, op, 0), Some(root), "AND bypassed, slot0 -> root");
 }
 
@@ -216,7 +216,7 @@ fn w5s3_shiftbitops_mult_or_picks_one_minus_i_operand() {
     wire_input(&mut fd, op, coef, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // OR case, i==1 -> slot0 becomes bitop->getIn(1-1)=getIn(0)=keep.
     assert_eq!(in_of(&fd, op, 0), Some(keep));
 }
@@ -240,7 +240,7 @@ fn w5s3_shiftbitops_mult_odd_coeff_declines() {
     wire_input(&mut fd, op, coef, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // INT_MULT with coefficient 0: leastsigbit_set(0) == -1 -> rule returns 0 early.
@@ -258,7 +258,7 @@ fn w5s3_shiftbitops_mult_zero_coeff_declines() {
     wire_input(&mut fd, op, coef, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -283,7 +283,7 @@ fn w5s3_highorderand_val_zero_wraps_and_declines() {
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleHighOrderAnd::new("analysis");
     // No panic, and declines (0xffffffffffffffff != calc_mask(4)).
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // Form-check boundary: val == 0xfff0 IS a clean 1..10..0 mask, so
@@ -309,7 +309,7 @@ fn w5s3_highorderand_clean_submask_passes_form_then_nzmask_declines() {
     let _out = give_output(&mut fd, op, 0x80, 2);
     let mut r = RuleHighOrderAnd::new("analysis");
     // Form accepted; NZmask guard fires -> declines, op unchanged.
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
 }
 
@@ -330,7 +330,7 @@ fn w5s3_highorderand_dirty_mask_declines_at_form_check() {
     wire_input(&mut fd, op, cvn1, 1);
     let _out = give_output(&mut fd, op, 0x80, 2);
     let mut r = RuleHighOrderAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
 }
 
@@ -348,7 +348,7 @@ fn w5s3_lessone_less_val1_becomes_equal_zero() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, one, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     // val != 0 -> slot1 reset to a fresh const 0.
     let s1 = in_of(&fd, op, 1).unwrap();
@@ -365,7 +365,7 @@ fn w5s3_lessone_lessequal_val0_keeps_slot1() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, zero, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     // val == 0 -> slot1 unchanged (the original zero const).
     assert_eq!(in_of(&fd, op, 1), Some(zero));
@@ -380,7 +380,7 @@ fn w5s3_lessone_less_val2_declines() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, two, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
 }
 
@@ -413,7 +413,7 @@ fn w5s3_negateidentity_skips_nonmatching_then_collapses_match() {
     wire_input(&mut fd, xor_op, vn, 1);
 
     let mut r = RuleNegateIdentity::new("analysis");
-    assert_eq!(r.apply_op(neg, &mut fd), 1);
+    assert_eq!(r.apply_op(neg, &mut fd).unwrap(), 1);
     // The AND was skipped (still INT_AND, 2 inputs); the XOR collapsed to COPY.
     assert_eq!(code_of(&fd, and_op), OpCode::CPUI_INT_AND);
     assert_eq!(code_of(&fd, xor_op), OpCode::CPUI_COPY);
@@ -454,7 +454,7 @@ fn w5s3r2_rightshiftand_negative_sa_masks_like_x86() {
     wire_input(&mut fd, op, sa, 1);
     let mut r = RuleRightShiftAnd::new("analysis");
     // sa=-64 -> count mod 64 == 0 -> full>>0 == mask>>0 == u64::MAX -> applies.
-    assert_eq!(r.apply_op(op, &mut fd), 1, "negative sa, x86-masked to 0, full==mask -> applies");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "negative sa, x86-masked to 0, full==mask -> applies");
     assert_eq!(in_of(&fd, op, 0), Some(root), "AND bypassed, slot0 -> root");
 }
 
@@ -482,7 +482,7 @@ fn w5s3r2_rightshiftand_large_shift_full_mismatch_declines() {
     wire_input(&mut fd, op, sa, 1);
     let mut r = RuleRightShiftAnd::new("analysis");
     // 66 % 64 == 2; full>>2 (0x3FFF_FFFF) != mask>>2 (0x03FF_FFFF) -> decline.
-    assert_eq!(r.apply_op(op, &mut fd), 0, "masked nonzero count, full!=mask -> decline");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0, "masked nonzero count, full!=mask -> decline");
     // The AND must be left untouched (slot0 still the written AND output).
     assert_eq!(in_of(&fd, op, 0), Some(inv), "op slot0 unchanged on decline");
 }
@@ -517,7 +517,7 @@ fn w5s3r2_shiftbitops_left_shift_64_uses_pcode_left_returns_zero() {
     let _out = give_output(&mut fd, op, 0x80, 8);
     let mut r = RuleShiftBitops::new("analysis");
     // pcode_left(nzm, 64) == 0 -> break at i==0 -> AND branch -> const-0 rewire.
-    assert_eq!(r.apply_op(op, &mut fd), 1, "pcode_left(>=64)=0 -> nzm clears -> applies");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "pcode_left(>=64)=0 -> nzm clears -> applies");
     let s0 = in_of(&fd, op, 0).unwrap();
     assert!(is_const(&fd, s0), "INT_AND branch: slot0 becomes a fresh constant");
     assert_eq!(off_of(&fd, s0), 0, "the rewired constant is 0 (result is zero)");

@@ -238,6 +238,24 @@ fn parse_c_integer_prefix_edge_cases() {
     assert_eq!(parse_c_integer(b"-9223372036854775808") as i64, i64::MIN);
 }
 
+#[test]
+fn integer_tokens_retain_full_width_enum_values_before_legacy_saturation() {
+    for (literal, expected) in [
+        ("0x8000000000000000", 1u64 << 63),
+        ("18446744073709551615ULL", u64::MAX),
+        ("01777777777777777777777", u64::MAX),
+    ] {
+        let mut lexer = GrammarLexer::new(4096);
+        lexer.push_file("t", literal.as_bytes().to_vec());
+        let token = read_tok(&mut lexer);
+        assert_eq!(token.get_integer(), i64::MAX as u64);
+        let super::TokenValue::Integer { full_width, .. } = token.value else {
+            panic!("expected an integer token");
+        };
+        assert_eq!(full_width, i128::from(expected), "{literal}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // w9-con-grammar — parse_c_integer prefix-parse parity with C++
 // `istringstream >> intb` (grammar.cc:1796-1804).  REPAIR of LOSS-124.
@@ -1108,45 +1126,72 @@ fn factory_sized(long_size: i32) -> TypeFactoryImpl {
 #[test]
 fn scalar_keywords_resolve_to_core_types() {
     let f = factory_sized(8);
-    for (decl, want) in [
-        ("int x", "int4"),
-        ("signed x", "int4"),
-        ("signed int x", "int4"),
-        ("unsigned x", "uint4"),
-        ("unsigned int x", "uint4"),
-        ("short x", "int2"),
-        ("short int x", "int2"),
-        ("unsigned short x", "uint2"),
-        ("short unsigned int x", "uint2"),
-        ("long x", "int8"),
-        ("unsigned long x", "uint8"),
-        ("long long x", "int8"),
-        ("unsigned long long x", "uint8"),
-        ("signed char x", "int1"),
-        ("unsigned char x", "uint1"),
-        ("float x", "float4"),
-        ("double x", "float8"),
-        ("long double x", "float10"),
-        ("wchar_t x", "wchar2"),
-        ("_Bool x", "bool"),
+    for (decl, want, size, metatype) in [
+        ("int x", "int", 4, meta::TYPE_INT),
+        ("signed x", "int", 4, meta::TYPE_INT),
+        ("signed int x", "int", 4, meta::TYPE_INT),
+        ("unsigned x", "unsigned int", 4, meta::TYPE_UINT),
+        ("unsigned int x", "unsigned int", 4, meta::TYPE_UINT),
+        ("short x", "short", 2, meta::TYPE_INT),
+        ("short int x", "short", 2, meta::TYPE_INT),
+        ("unsigned short x", "unsigned short", 2, meta::TYPE_UINT),
+        ("short unsigned int x", "unsigned short", 2, meta::TYPE_UINT),
+        ("long x", "long", 8, meta::TYPE_INT),
+        ("unsigned long x", "unsigned long", 8, meta::TYPE_UINT),
+        ("long long x", "long long", 8, meta::TYPE_INT),
+        ("unsigned long long x", "unsigned long long", 8, meta::TYPE_UINT),
+        ("signed char x", "int1", 1, meta::TYPE_INT),
+        ("unsigned char x", "uint1", 1, meta::TYPE_UINT),
+        ("float x", "float4", 4, meta::TYPE_FLOAT),
+        ("double x", "float8", 8, meta::TYPE_FLOAT),
+        ("long double x", "float10", 10, meta::TYPE_FLOAT),
+        ("wchar_t x", "wchar2", 2, meta::TYPE_INT),
+        ("_Bool x", "bool", 1, meta::TYPE_BOOL),
     ] {
         let (ty, name) = parse_type(decl, &f, org()).unwrap_or_else(|e| {
             panic!("{decl:?} must parse: {}", e.explain());
         });
         assert_eq!(ty.get_name(), want, "{decl:?}");
+        assert_eq!((ty.get_size(), ty.get_metatype()), (size, metatype), "{decl:?}");
         assert_eq!(name, "x");
     }
 }
 
 #[test]
 fn scalar_long_follows_the_targets_declared_width() {
+    use std::rc::Rc;
     // The whole point of reading `<data_organization>`: `long` is 8 bytes on
     // LP64 and 4 on LLP64, and `long long` is 8 on both.
     let lp64 = factory_sized(8);
-    assert_eq!(parse_type("long x", &lp64, org()).unwrap().0.get_name(), "int8");
+    let long = parse_type("long x", &lp64, org()).unwrap().0;
+    let long_long = parse_type("long long x", &lp64, org()).unwrap().0;
+    assert_eq!((long.get_name(), long.get_size()), ("long", 8));
+    assert_eq!((long_long.get_name(), long_long.get_size()), ("long long", 8));
+    assert_ne!(long.get_id(), long_long.get_id(), "equal widths do not erase C rank");
+    assert!(!Rc::ptr_eq(&long, &long_long));
+    for (canonical, alternatives) in [
+        ("long long x", ["signed long long int x", "long signed int long x"]),
+        ("unsigned long long x", ["long unsigned long int x", "int long long unsigned x"]),
+        ("long x", ["signed long int x", "int long signed x"]),
+        ("unsigned long x", ["long unsigned int x", "int unsigned long x"]),
+        ("short x", ["signed short int x", "int short signed x"]),
+        ("unsigned short x", ["short unsigned int x", "int unsigned short x"]),
+        ("int x", ["signed int x", "signed x"]),
+        ("unsigned int x", ["int unsigned x", "unsigned x"]),
+    ] {
+        let expected = parse_type(canonical, &lp64, org()).unwrap().0;
+        for declaration in alternatives {
+            let actual = parse_type(declaration, &lp64, org()).unwrap().0;
+            assert!(Rc::ptr_eq(&actual, &expected), "{declaration}: same declared rank");
+        }
+    }
     let llp64 = factory_sized(4);
-    assert_eq!(parse_type("long x", &llp64, org()).unwrap().0.get_name(), "int4");
-    assert_eq!(parse_type("long long x", &llp64, org()).unwrap().0.get_name(), "int8");
+    let long = parse_type("long x", &llp64, org()).unwrap().0;
+    let long_long = parse_type("long long x", &llp64, org()).unwrap().0;
+    assert_eq!((long.get_name(), long.get_size()), ("long", 4));
+    assert_eq!((long_long.get_name(), long_long.get_size()), ("long long", 8));
+    assert_eq!(long.get_metatype(), meta::TYPE_INT);
+    assert_eq!(long_long.get_metatype(), meta::TYPE_INT);
 }
 
 #[test]
@@ -1175,7 +1220,8 @@ fn scalar_keywords_work_in_a_prototype() {
     assert_eq!(p.name, "VirtualAlloc");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_PTR);
     let names: Vec<&str> = p.intypes.iter().map(|t| t.get_name()).collect();
-    assert_eq!(names, vec!["", "uint4", "uint8", "float10"], "pointer, then the scalars");
+    assert_eq!(names, vec!["", "unsigned int", "unsigned long long", "float10"], "pointer, then the declared scalars");
+    assert_eq!(p.intypes.iter().map(|t|t.get_size()).collect::<Vec<_>>(), [org().addr_size, 4, 8, 10]);
 }
 
 #[test]
@@ -1225,7 +1271,9 @@ fn a_scalar_keyword_with_no_declared_width_is_a_parse_error() {
         "got: {}",
         err.explain()
     );
-    assert_eq!(parse_type("unsigned int x", &f, org()).unwrap().0.get_name(), "uint4");
+    let integer = parse_type("unsigned int x", &f, org()).unwrap().0;
+    assert_eq!(integer.get_name(), "unsigned int");
+    assert_eq!((integer.get_size(), integer.get_metatype()), (4, meta::TYPE_UINT));
 }
 
 // ===========================================================================
@@ -1364,7 +1412,7 @@ fn factory_with_model_resources(registered: &[&str], with_storage: bool) -> Type
         models.insert(name.to_string(), model(name));
     }
     f.set_proto_context(Rc::clone(&mgr));
-    f.set_proto_models(Some(dflt), models);
+    f.set_proto_models(Some(dflt), Rc::new(std::cell::RefCell::new(models)));
     f
 }
 
@@ -1452,7 +1500,8 @@ fn a_pointer_parameter_may_be_named_after_a_type() {
     assert_eq!(p.name, "vm");
     assert_eq!(p.innames, vec!["code", "index", "ctx"]);
     assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "uint1");
-    assert_eq!(p.intypes[1].get_name(), "uint4");
+    assert_eq!(p.intypes[1].get_name(), "unsigned int");
+    assert_eq!((p.intypes[1].get_size(), p.intypes[1].get_metatype()), (4, meta::TYPE_UINT));
     assert_eq!(p.intypes[2].get_metatype(), meta::TYPE_PTR);
 }
 
@@ -1883,6 +1932,38 @@ fn enum_declarations_preserve_full_width_values_and_signed_controls() {
     }
 }
 
+#[test]
+fn same_named_tag_typedefs_preserve_enum_values_and_union_fields() {
+    let f = factory();
+    f.setup_sizes(Some(4), 8, 8);
+    super::parse_c(
+        "typedef enum Flags { FLAG_A=0x1, FLAG_B=0x2, FLAG_C=0x4, FLAG_HIGH=0x80000000 } Flags;",
+        &f, org(), &[], |_, _| unreachable!(),
+    ).unwrap();
+    let flags = f.find_by_name("Flags").unwrap().unwrap();
+    assert_eq!(flags.get_size(), 4);
+    assert_eq!(flags.get_metatype(), meta::TYPE_UINT);
+    assert_eq!(flags.as_enum_namemap().unwrap()[&0x80000000], "FLAG_HIGH");
+    let param = parse_type("Flags value", &f, org()).unwrap().0;
+    assert!(std::rc::Rc::ptr_eq(&flags, &param));
+
+    super::parse_c(
+        "typedef union Value { uint4 word; int1 byte; } Value;",
+        &f, org(), &[], |_, _| unreachable!(),
+    ).unwrap();
+    let value = f.find_by_name("Value").unwrap().unwrap();
+    assert_eq!(value.get_metatype(), meta::TYPE_UNION);
+    assert_eq!(value.get_size(), 4);
+    assert_eq!(value.get_field(0).unwrap().name, "word");
+    assert_eq!(value.get_field(1).unwrap().name, "byte");
+    // Distinct aliases still require an actual typedef target, and the
+    // factory's incompatible-name rejection is not relaxed.
+    super::parse_c("typedef Flags Alias;", &f, org(), &[], |_, _| unreachable!()).unwrap();
+    let alias = f.find_by_name("Alias").unwrap().unwrap();
+    assert!(std::rc::Rc::ptr_eq(alias.get_typedef().unwrap(), &flags));
+    assert!(super::parse_c("typedef uint4 Flags;", &f, org(), &[], |_, _| unreachable!()).is_err());
+}
+
 fn callback_pieces(code: &kuna_decomp::dtype::Datatype) -> kuna_decomp::fspec::PrototypePieces {
     let mut pieces = kuna_decomp::fspec::PrototypePieces::default();
     code.get_code_prototype().expect("declared callback prototype").get_pieces(&mut pieces);
@@ -1928,9 +2009,9 @@ fn callback_void_is_closed_and_default_changes_are_future_only() {
     let declarations = parser.get_result_declarations().unwrap();
     let fast = declarations[0].build_type(&f, &org()).unwrap().get_ptr_to().unwrap();
     let model = fast.get_code_prototype().unwrap().model().clone();
-    f.set_proto_models(Some(Rc::clone(&model)), BTreeMap::from([
+    f.set_proto_models(Some(Rc::clone(&model)), Rc::new(std::cell::RefCell::new(BTreeMap::from([
         ("__fastcall".to_string(), model),
-    ]));
+    ]))));
     let new = parse_type("int4 (*cb)(void)", &f, org()).unwrap().0.get_ptr_to().unwrap();
     for (code, expected) in [(&old, "__cdecl"), (&new, "__fastcall")] {
         let prototype = code.get_code_prototype().unwrap();
@@ -1971,6 +2052,14 @@ fn typedef_void_parameter_is_closed_and_function_alias_parameters_decay() {
     assert_eq!(callback.get_output_type().unwrap().get_name(), "int4");
     assert_eq!(callback.get_param(0).unwrap().get_type().unwrap().get_name(), "int4");
     assert_eq!(pieces.intypes[1].get_name(), "int4");
+
+    let direct = parse_protopieces("extern int4 direct(int4 callback(int4));", &f, org()).unwrap();
+    assert_eq!(direct.innames, ["callback"]);
+    assert_eq!(direct.intypes[0].get_metatype(), meta::TYPE_PTR);
+    let target = direct.intypes[0].get_ptr_to().unwrap();
+    let callback = target.get_code_prototype().unwrap();
+    assert_eq!(callback.num_params(), 1);
+    assert_eq!(callback.get_param(0).unwrap().get_type().unwrap().get_name(), "int4");
 }
 
 #[test]

@@ -1,0 +1,212 @@
+--- a/ghidra/program/model/pcode/HighFunctionDBUtil.java
++++ b/ghidra/program/model/pcode/HighFunctionDBUtil.java
+@@ -41,6 +41,76 @@
+ 	public static final String AUTO_CAT = "/auto_proto"; // Category for auto generated prototypes
+ 
+ 	/**
++	 * Check result authority before entering a source-edit transaction.
++	 * Ordinary results retain their original edit policy.
++	 */
++	public static void requireSourceAuthority(HighFunction highFunction, DataType type)
++			throws InvalidInputException {
++		try {
++			highFunction.requireCurrentSourceAuthority();
++		}
++		catch (IllegalStateException e) {
++			throw new InvalidInputException(e.getMessage());
++		}
++		if (!highFunction.getDataTypeManager().isEnhancedResult()) {
++			return;
++		}
++		requireSourceDatatype(highFunction, type);
++	}
++
++	private static void requireSourceDatatype(HighFunction highFunction, DataType type)
++			throws InvalidInputException {
++		if (!highFunction.getDataTypeManager().isEnhancedResult() || type == null) {
++			return;
++		}
++		Set<DataType> visited = Collections.newSetFromMap(new IdentityHashMap<>());
++		if (containsResultLocal(highFunction.getDataTypeManager(), type, visited)) {
++			throw new InvalidInputException(
++				"Result-local inferred datatypes require explicit source authoring");
++		}
++	}
++
++	private static boolean containsResultLocal(PcodeDataTypeManager manager, DataType type,
++			Set<DataType> visited) {
++		if (type == null || !visited.add(type)) {
++			return false;
++		}
++		if (manager.isResultLocal(type)) {
++			return true;
++		}
++		if (type instanceof Pointer pointer) {
++			return containsResultLocal(manager, pointer.getDataType(), visited);
++		}
++		if (type instanceof Array array) {
++			return containsResultLocal(manager, array.getDataType(), visited);
++		}
++		if (type instanceof TypeDef alias) {
++			return containsResultLocal(manager, alias.getDataType(), visited);
++		}
++		if (type instanceof BitFieldDataType bitfield) {
++			return containsResultLocal(manager, bitfield.getBaseDataType(), visited);
++		}
++		if (type instanceof Composite composite) {
++			for (DataTypeComponent component : composite.getDefinedComponents()) {
++				if (containsResultLocal(manager, component.getDataType(), visited)) {
++					return true;
++				}
++			}
++		}
++		if (type instanceof FunctionDefinition callable) {
++			if (containsResultLocal(manager, callable.getReturnType(), visited)) {
++				return true;
++			}
++			for (ParameterDefinition parameter : callable.getArguments()) {
++				if (containsResultLocal(manager, parameter.getDataType(), visited)) {
++					return true;
++				}
++			}
++		}
++		return false;
++	}
++
++	/**
+ 	 * Return the appropriate model name for committing to the database with the given HighFunction.
+ 	 * Generally this just returns the model name attached to the HighFunction, but if the "unknown"
+ 	 * model is associated with the function, or if the model doesn't exist, the decompiler
+@@ -104,6 +174,28 @@
+ 	public static void commitParamsToDatabase(HighFunction highFunction, boolean useDataTypes,
+ 			ReturnCommitOption returnCommit, SourceType source)
+ 			throws DuplicateNameException, InvalidInputException {
++		requireSourceAuthority(highFunction, null);
++		requireParameterDatatypes(highFunction, useDataTypes, returnCommit);
++		commitParamsFromGrantedSource(highFunction, useDataTypes, returnCommit, source);
++	}
++
++	private static void requireParameterDatatypes(HighFunction highFunction, boolean useDataTypes,
++			ReturnCommitOption returnCommit) throws InvalidInputException {
++		if (useDataTypes) {
++			if (returnCommit != ReturnCommitOption.NO_COMMIT) {
++				requireSourceDatatype(highFunction,
++					highFunction.getFunctionPrototype().getReturnType());
++			}
++			LocalSymbolMap parameters = highFunction.getLocalSymbolMap();
++			for (int i = 0; i < parameters.getNumParams(); i++) {
++				requireSourceDatatype(highFunction, parameters.getParamSymbol(i).getDataType());
++			}
++		}
++	}
++
++	private static void commitParamsFromGrantedSource(HighFunction highFunction, boolean useDataTypes,
++			ReturnCommitOption returnCommit, SourceType source)
++			throws DuplicateNameException, InvalidInputException {
+ 		Function function = highFunction.getFunction();
+ 
+ 		Parameter returnParam;
+@@ -240,7 +332,7 @@
+ 	 * @param source is the desired SourceType for the commit
+ 	 */
+ 	public static void commitLocalNamesToDatabase(HighFunction highFunction, SourceType source) {
+-
++		highFunction.requireCurrentSourceAuthority();
+ 		Function function = highFunction.getFunction();
+ 
+ 		clearObsoleteDynamicLocalsFromDatabase(highFunction);
+@@ -253,7 +345,7 @@
+ 			}
+ 			String name = sym.getName();
+ 			try {
+-				HighFunctionDBUtil.updateDBVariable(sym, null, null, source);
++				updateDBVariableFromGrantedSource(sym, null, null, source);
+ 			}
+ 			catch (UsrException e) {
+ 				Msg.error(HighFunctionDBUtil.class, "Local variable commit failed for " +
+@@ -499,7 +591,8 @@
+ 		if (slot >= parameters.length ||
+ 			!parameters[slot].getVariableStorage().equals(param.getStorage())) {
+ 			try {
+-				commitParamsToDatabase(highFunction, true, ReturnCommitOption.NO_COMMIT,
++				requireParameterDatatypes(highFunction, true, ReturnCommitOption.NO_COMMIT);
++				commitParamsFromGrantedSource(highFunction, true, ReturnCommitOption.NO_COMMIT,
+ 					SourceType.ANALYSIS);
+ 			}
+ 			catch (DuplicateNameException e) {
+@@ -568,7 +661,75 @@
+ 	 */
+ 	public static void updateDBVariable(HighSymbol highSymbol, String name, DataType dataType,
+ 			SourceType source) throws InvalidInputException, DuplicateNameException {
++		requireSourceAuthority(highSymbol.getHighFunction(), dataType);
++		updateDBVariableFromGrantedSource(highSymbol, name, dataType, source);
++	}
+ 
++	/**
++	 * One variable edit that optionally commits its prerequisite parameters.
++	 * Authority is checked before resolution or mutation, not again after this
++	 * operation's own parameter commit has changed the Program revision.
++	 */
++	public static void updateDBVariableAndCommitParameters(HighSymbol highSymbol, String name,
++			DataType dataType, SourceType source, boolean commitParameters,
++			boolean useDataTypes, SourceType signatureSource)
++			throws InvalidInputException, DuplicateNameException {
++		HighFunction high = highSymbol.getHighFunction();
++		requireSourceAuthority(high, dataType);
++		if (commitParameters) {
++			requireParameterDatatypes(high, useDataTypes, ReturnCommitOption.NO_COMMIT);
++		}
++		boolean retype = dataType != null;
++		if (dataType != null) {
++			DataTypeManager manager = high.getFunction().getProgram().getDataTypeManager();
++			if (dataType.getDataTypeManager() != manager) {
++				dataType = manager.resolve(dataType, null);
++			}
++		}
++		if (commitParameters) {
++			if (retype) {
++				commitParametersForRetype(high, useDataTypes, signatureSource);
++			}
++			else {
++				commitParamsFromGrantedSource(high, useDataTypes, ReturnCommitOption.NO_COMMIT,
++					signatureSource);
++			}
++		}
++		updateDBVariableFromGrantedSource(highSymbol, name, dataType, source);
++	}
++
++	/** Retype a return and its required parameters as one source-edit operation. */
++	public static void retypeReturn(HighFunction high, DataType type, boolean commitParameters,
++			SourceType source) throws InvalidInputException, DuplicateNameException {
++		requireSourceAuthority(high, type);
++		if (commitParameters) {
++			requireParameterDatatypes(high, true, ReturnCommitOption.NO_COMMIT);
++		}
++		DataTypeManager manager = high.getFunction().getProgram().getDataTypeManager();
++		if (type.getDataTypeManager() != manager) {
++			type = manager.resolve(type, null);
++		}
++		if (commitParameters) {
++			commitParametersForRetype(high, true, source);
++		}
++		high.getFunction().setReturnType(type, source);
++	}
++
++	private static void commitParametersForRetype(HighFunction high, boolean useDataTypes,
++			SourceType source) throws DuplicateNameException {
++		try {
++			commitParamsFromGrantedSource(high, useDataTypes, ReturnCommitOption.NO_COMMIT, source);
++		}
++		catch (InvalidInputException e) {
++			// Preserve the original Retype Local/Return action policy: report
++			// a genuine parameter-commit failure, then attempt the selected edit.
++			Msg.showError(HighFunctionDBUtil.class, null, "Parameter Commit Failed", e.getMessage());
++		}
++	}
++
++	private static void updateDBVariableFromGrantedSource(HighSymbol highSymbol, String name,
++			DataType dataType, SourceType source)
++			throws InvalidInputException, DuplicateNameException {
+ 		HighFunction highFunction = highSymbol.getHighFunction();
+ 		Function function = highFunction.getFunction();
+ 		Program program = function.getProgram();

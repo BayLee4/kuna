@@ -26,7 +26,7 @@
   <com>print C</com>
   <com>quit</com>
 </script>
-<stringmatch name="PARAMETER-ALIAS #1: the input stays in the signature" min="1" max="1">^int4 probe\(void \*popup,int4 property\)$</stringmatch>
+<stringmatch name="PARAMETER-ALIAS #1: the input stays in the signature" min="1" max="1">^int4 MSABI probe\(void \*popup,int4 property\)$</stringmatch>
 <stringmatch name="PARAMETER-ALIAS #2: entry comparisons read the input" min="2" max="2">if \(property != (7|0xb)\)</stringmatch>
 <stringmatch name="PARAMETER-ALIAS #3: the later local retains both assigned values" min="2" max="2">cleared_property = (0x29|0x2a);</stringmatch>
 <stringmatch name="PARAMETER-ALIAS #4: the call reads the later local" min="1" max="1">return sink\(popup,cleared_property\);</stringmatch>

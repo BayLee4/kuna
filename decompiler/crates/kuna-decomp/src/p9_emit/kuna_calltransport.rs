@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::spacetype;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
@@ -72,41 +73,41 @@ impl Funcdata {
 
     /// A register copy is transport only when an earlier home exists and all
     /// remaining uses forward it through that register to ordinary call arguments.
-    pub fn kuna_is_call_transport(&self, vn: VarnodeId) -> bool {
+    pub fn kuna_is_call_transport(&self, vn: VarnodeId) -> KunaResult<bool> {
         if !self.get_arch().name_style_angr {
-            return false;
+            return Ok(false);
         }
         let Some(value) = self.vbank().get(vn) else {
-            return false;
+            return Ok(false);
         };
         if value.is_persist() || self.kuna_storage_write_has_local_use(vn, value.get_size()) {
-            return false;
+            return Ok(false);
         }
         if self.kuna_was_call_transport(vn) {
-            return value.has_no_descend()
-                || self.kuna_only_argument_uses(vn, value.get_addr(), value.get_size());
+            return Ok(value.has_no_descend()
+                || self.kuna_only_argument_uses(vn, value.get_addr(), value.get_size()));
         }
-        if !self.kuna_is_register_storage(value.get_addr(), value.get_size()) {
-            return false;
+        if !self.kuna_is_register_storage(value.get_addr(), value.get_size())? {
+            return Ok(false);
         }
         let Some(definition) = value.get_def().and_then(|id| self.obank().get(id)) else {
-            return false;
+            return Ok(false);
         };
         if definition.code() != OpCode::CPUI_COPY {
-            return false;
+            return Ok(false);
         }
         let Some(input) = definition.get_in(0) else {
-            return false;
+            return Ok(false);
         };
         if self
             .vbank()
             .get(input)
             .is_none_or(|v| v.get_size() != value.get_size())
-            || !self.kuna_has_prior_storage(input, value.get_addr(), definition.get_addr())
+            || !self.kuna_has_prior_storage(input, value.get_addr(), definition.get_addr())?
         {
-            return false;
+            return Ok(false);
         }
-        self.kuna_only_argument_uses(vn, value.get_addr(), value.get_size())
+        Ok(self.kuna_only_argument_uses(vn, value.get_addr(), value.get_size()))
     }
 
     pub(crate) fn kuna_is_call_transport_projection(
@@ -114,70 +115,63 @@ impl Funcdata {
         vn: VarnodeId,
         byte_offset: int4,
         byte_size: int4,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         if byte_offset != 0 {
-            return false;
+            return Ok(false);
         }
         let Some(value) = self.vbank().get(vn) else {
-            return false;
+            return Ok(false);
         };
         if value.is_persist() || self.kuna_storage_write_has_local_use(vn, byte_size) {
-            return false;
+            return Ok(false);
         }
         if !value.is_persist()
             && self
                 .kuna_call_transport_projection_size(vn)
                 .is_some_and(|size| byte_size <= size && byte_size < value.get_size())
         {
-            return value.has_no_descend()
-                || self.kuna_only_argument_uses(vn, value.get_addr(), byte_size);
+            return Ok(value.has_no_descend()
+                || self.kuna_only_argument_uses(vn, value.get_addr(), byte_size));
         }
         let Some(definition) = value.get_def().and_then(|id| self.obank().get(id)) else {
-            return false;
+            return Ok(false);
         };
         if !matches!(
             definition.code(),
             OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_SEXT
         ) {
-            return false;
+            return Ok(false);
         }
         let Some(input) = definition.get_in(0) else {
-            return false;
+            return Ok(false);
         };
-        self.vbank().get(input).is_some_and(|v| {
-            (v.get_size() == byte_size
+        let Some(v) = self.vbank().get(input) else { return Ok(false) };
+        Ok((v.get_size() == byte_size
                 && value.get_size() > byte_size
                 && v.get_addr() == value.get_addr()
-                && self.kuna_is_call_transport(input))
+                && self.kuna_is_call_transport(input)?)
                 || (v.get_size() >= byte_size
                     && value.get_size() > v.get_size()
                     && v.get_space().get_type() == spacetype::IPTR_SPACEBASE
                     && v.get_def().is_some()
-                    && self.kuna_is_register_storage(value.get_addr(), value.get_size())
-                    && self.kuna_only_argument_uses(vn, value.get_addr(), byte_size))
-        })
+                    && self.kuna_is_register_storage(value.get_addr(), value.get_size())?
+                    && self.kuna_only_argument_uses(vn, value.get_addr(), byte_size)))
     }
 
-    fn kuna_is_register_storage(&self, address: &Address, size: int4) -> bool {
+    fn kuna_is_register_storage(&self, address: &Address, size: int4) -> KunaResult<bool> {
         let Some(space) = address.get_space() else {
-            return false;
+            return Ok(false);
         };
-        self.get_arch()
-            .manage()
-            .register_lookup()
-            .is_some_and(|lookup| {
-                !lookup
-                    .get_register_name(space, address.get_offset(), size)
-                    .is_empty()
-            })
+        let Some(lookup) = self.get_arch().manage().register_lookup() else { return Ok(false) };
+        Ok(!lookup.get_register_name(space, address.get_offset(), size)?.is_empty())
     }
 
-    pub(crate) fn kuna_has_local_storage_use(&self, first: VarnodeId) -> bool {
+    pub(crate) fn kuna_has_local_storage_use(&self, first: VarnodeId) -> KunaResult<bool> {
         let Some(value) = self.vbank().get(first) else {
-            return false;
+            return Ok(false);
         };
-        if !self.kuna_is_register_storage(value.get_addr(), value.get_size()) {
-            return false;
+        if !self.kuna_is_register_storage(value.get_addr(), value.get_size())? {
+            return Ok(false);
         }
         let carrier = value.get_addr();
         let mut pending = vec![first];
@@ -199,7 +193,7 @@ impl Funcdata {
                     }
                     if matches!(operation.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) {
                         if slot == 0 {
-                            return true;
+                            return Ok(true);
                         }
                         continue;
                     }
@@ -231,7 +225,7 @@ impl Funcdata {
                         _ => false,
                     };
                     if !transparent {
-                        return true;
+                        return Ok(true);
                     }
                     if let Some(output) = operation
                         .get_out()
@@ -241,14 +235,14 @@ impl Funcdata {
                             || (output.1.get_space().get_type() != spacetype::IPTR_INTERNAL
                                 && output.1.get_addr() != carrier)
                         {
-                            return true;
+                            return Ok(true);
                         }
                         pending.push(output.0);
                     }
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     fn kuna_has_prior_storage(
@@ -256,9 +250,9 @@ impl Funcdata {
         first: VarnodeId,
         carrier: &Address,
         instruction: &Address,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         if self.kuna_materializes_computation(first, instruction) {
-            return false;
+            return Ok(false);
         }
         let mut pending = vec![first];
         let mut visited = HashSet::new();
@@ -267,7 +261,7 @@ impl Funcdata {
                 continue;
             }
             if visited.len() > 64 {
-                return false;
+                return Ok(false);
             }
             let Some(value) = self.vbank().get(id) else {
                 continue;
@@ -288,17 +282,17 @@ impl Funcdata {
             let address = value.get_addr();
             if address != carrier
                 && !self.kuna_was_call_transport(id)
-                && (self.kuna_is_register_storage(address, value.get_size())
+                && (self.kuna_is_register_storage(address, value.get_size())?
                     || value.get_space().get_type() == spacetype::IPTR_SPACEBASE)
             {
-                return true;
+                return Ok(true);
             }
             if self.kuna_storage_sources(id).iter().any(|source| {
                 source.address != *carrier
                     && source.size == value.get_size()
                     && source.write_address.as_ref() != Some(instruction)
             }) {
-                return true;
+                return Ok(true);
             }
             let Some(definition) = value.get_def().and_then(|op| self.obank().get(op)) else {
                 continue;
@@ -315,7 +309,7 @@ impl Funcdata {
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     fn kuna_materializes_computation(&self, first: VarnodeId, instruction: &Address) -> bool {
@@ -442,15 +436,33 @@ impl Funcdata {
         let Some(index) = self.get_call_specs_index(op) else {
             return false;
         };
+        if slot <= 0 {
+            return false;
+        }
         let call = self.get_call_specs(index);
         let parameter = (slot - 1) as usize;
-        if call.proto().is_input_locked() {
-            return call.proto().get_param(slot - 1).is_some_and(|param| {
+        let proto = call.proto();
+        // A call may have finalized physical operands without a recovered
+        // source prototype. Formal roles require a store; absence must not
+        // manufacture a default prototype or erase the physical bindings.
+        let formals = proto.has_store().then_some(proto);
+        let source_assembly = proto.has_custom_storage() || proto.is_inline()
+            || proto.get_inject_id() >= 0
+            || (proto.has_model() && (proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0))
+            || formals.is_some_and(|proto| (0..proto.num_params()).any(|i| proto.get_param(i).is_some_and(|param| {
+                param.is_hidden_return() || param.is_indirect_storage() || param.is_this_pointer()
+                    || param.get_address().get_space().is_some_and(|space| space.get_type() == spacetype::IPTR_JOIN)
+            })));
+        if proto.is_input_locked() && source_assembly {
+            return formals.and_then(|proto| proto.get_param(slot - 1)).is_some_and(|param| {
                 let home = param.get_address();
                 home.justified_contain(param.get_size(), address, size, false) == 0
                     || address.justified_contain(size, &home, param.get_size(), false) == 0
             });
         }
+        // A locked source formal may name only a slice of the actual physical
+        // carrier, and a proven disjoint input need not be a source formal.
+        // Complete slot-aligned finalized storage describes those real operands.
         if !call.final_input_storage().is_empty()
             && self.obank().get(op).is_some_and(|operation| {
                 operation.num_input() as usize == call.final_input_storage().len() + 1
@@ -464,10 +476,13 @@ impl Funcdata {
                         || address.justified_contain(size, home, *width, false) == 0
                 });
         }
-        if let Some(param) = call.proto().get_param(slot - 1) {
+        if let Some(param) = formals.and_then(|proto| proto.get_param(slot - 1)) {
             let home = param.get_address();
             return home.justified_contain(param.get_size(), address, size, false) == 0
                 || address.justified_contain(size, &home, param.get_size(), false) == 0;
+        }
+        if proto.is_input_locked() {
+            return false; // No finalized physical occurrence and no source slot.
         }
         call.proto().has_model()
             && matches!(
@@ -500,15 +515,15 @@ mod tests {
             Err(KunaError::lowlevel("test registers resolve by storage"))
         }
 
-        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: int4) -> String {
+        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: int4) -> KunaResult<String> {
             if base.get_name() == "register" && matches!(size, 1 | 2 | 4 | 8) {
-                format!("r{off}_{size}")
+                Ok(format!("r{off}_{size}"))
             } else {
-                String::new()
+                Ok(String::new())
             }
         }
 
-        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: int4) -> String {
+        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: int4) -> KunaResult<String> {
             self.get_register_name(base, off, size)
         }
     }
@@ -574,7 +589,7 @@ mod tests {
 
     fn input(fd: &mut Funcdata, offset: u64, size: int4) -> VarnodeId {
         let address = register(fd, offset);
-        let id = fd.new_varnode(size, &address, None);
+        let id = fd.new_varnode(size, &address, None).unwrap();
         fd.set_input_varnode(id).unwrap()
     }
 
@@ -593,8 +608,26 @@ mod tests {
             register(fd, abi_offset),
             fd.vbank().get(argument).unwrap().get_size(),
         )]);
+        assert!(!specs.proto().has_model() && !specs.proto().has_store(),
+            "finalized physical bindings do not fabricate a source prototype");
         fd.push_call_specs(specs);
         id
+    }
+
+    #[test]
+    fn absent_source_prototype_requires_actual_finalized_argument_geometry() {
+        let mut fd = function();
+        let source = input(&mut fd, 0x80, 4);
+        let carrier = copy(&mut fd, source, 0x10);
+        let op = call(&mut fd, OpCode::CPUI_CALL, carrier, 0x10);
+        assert!(fd.kuna_is_call_transport(carrier).unwrap());
+        let index = fd.get_call_specs_index(op).unwrap();
+        fd.get_call_specs_mut(index).set_final_input_storage(vec![]);
+        assert!(!fd.kuna_is_call_transport(carrier).unwrap(),
+            "neither a source formal nor a finalized physical slot authorizes transport");
+        let proto = fd.get_call_specs(index).proto();
+        assert!(!proto.has_model() && !proto.has_store(),
+            "receiving physical geometry must leave missing source information absent");
     }
 
     #[test]
@@ -604,13 +637,13 @@ mod tests {
             let source = input(&mut fd, 0x80, 4);
             let carrier = copy(&mut fd, source, 0x10);
             let call = call(&mut fd, opcode, carrier, 0x10);
-            assert!(fd.kuna_is_call_transport(carrier));
-            assert_eq!(RulePropagateCopy.apply_op(call, &mut fd), 1);
+            assert!(fd.kuna_is_call_transport(carrier).unwrap());
+            assert_eq!(RulePropagateCopy.apply_op(call, &mut fd).unwrap(), 1);
             assert_eq!(fd.obank().get(call).unwrap().get_in(1), Some(source));
             assert!(fd.kuna_storage_sources(source).is_empty());
-            assert!(fd.kuna_is_call_transport(carrier));
-            let cloned = fd.clone_varnode(carrier);
-            assert!(fd.kuna_is_call_transport(cloned));
+            assert!(fd.kuna_is_call_transport(carrier).unwrap());
+            let cloned = fd.clone_varnode(carrier).unwrap();
+            assert!(fd.kuna_is_call_transport(cloned).unwrap());
             fd.delete_varnode(cloned).unwrap();
             assert!(!fd.kuna_was_call_transport(cloned));
             fd.clear();
@@ -624,12 +657,54 @@ mod tests {
         let source = input(&mut fd, 0x80, 8);
         let durable = copy(&mut fd, source, 0x90);
         call(&mut fd, OpCode::CPUI_CALL, durable, 0x10);
-        assert!(!fd.kuna_is_call_transport(durable));
+        assert!(!fd.kuna_is_call_transport(durable).unwrap());
 
         let target = copy(&mut fd, source, 0x10);
         let indirect = call(&mut fd, OpCode::CPUI_CALLIND, target, 0x10);
         fd.op_set_input(indirect, target, 0).unwrap();
-        assert!(!fd.kuna_is_call_transport(target));
+        assert!(!fd.kuna_is_call_transport(target).unwrap());
+    }
+
+    #[test]
+    fn locked_source_slices_and_extra_physical_occurrences_use_finalized_bindings() {
+        use crate::dtype::{type_metatype, Datatype};
+        use crate::fspec::{FuncProto, ParameterPieces, ProtoModel};
+        let mut fd = function();
+        let first_source = input(&mut fd, 0x80, 4);
+        let second_source = input(&mut fd, 0x88, 4);
+        let first = copy(&mut fd, first_source, 0x10);
+        let second = copy(&mut fd, second_source, 0x18);
+        let op = call(&mut fd, OpCode::CPUI_CALL, first, 0x10);
+        fd.op_insert_input(op, second, 2).unwrap();
+        let mut proto = FuncProto::new();
+        proto.set_internal(Rc::new(ProtoModel::new(fd.get_arch().manage())),
+            Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+        let declared = register(&fd, 0x10);
+        proto.set_param(0, "flags", &ParameterPieces {
+            addr: declared.clone(), type_: Some(Rc::new(Datatype::new(1, type_metatype::TYPE_BOOL))),
+            flags: 0,
+        });
+        proto.set_input_lock(true);
+        let index = fd.get_call_specs_index(op).unwrap();
+        fd.get_call_specs_mut(index).proto_mut().copy(&proto);
+        let extra = register(&fd, 0x18);
+        fd.get_call_specs_mut(index).set_final_input_storage(vec![(declared.clone(), 4), (extra.clone(), 4)]);
+        assert!(fd.kuna_argument_storage_matches(op, 1, &declared, 4));
+        assert!(fd.kuna_argument_storage_matches(op, 2, &extra, 4));
+        assert!(!fd.kuna_argument_storage_matches(op, 2, &declared, 4));
+        assert!(fd.kuna_is_call_transport(first).unwrap());
+        assert!(fd.kuna_is_call_transport(second).unwrap());
+        assert_eq!(fd.get_call_specs(index).proto().num_params(), 1);
+        assert_eq!(fd.get_call_specs(index).proto().get_param(0).unwrap().get_size(), 1);
+        fd.get_call_specs_mut(index).proto_mut().set_override(true);
+        assert!(fd.kuna_argument_storage_matches(op, 2, &extra, 4), "logical site arity is not physical liveness");
+        assert_eq!(fd.get_call_specs(index).proto().num_params(), 1);
+        fd.get_call_specs_mut(index).proto_mut().set_inject_id(1);
+        assert!(!fd.kuna_argument_storage_matches(op, 2, &extra, 4), "injection assembly authority");
+        fd.get_call_specs_mut(index).proto_mut().cancel_inject_id();
+        fd.get_call_specs_mut(index).proto_mut().set_override(false);
+        fd.get_call_specs_mut(index).set_final_input_storage(vec![]);
+        assert!(!fd.kuna_argument_storage_matches(op, 2, &extra, 4), "no invented physical slot");
     }
 
     #[test]
@@ -645,8 +720,8 @@ mod tests {
             call(&mut fd, OpCode::CPUI_CALL, carrier, 0x10);
             let other = fd.new_constant(4, 1);
             operation(&mut fd, use_opcode, &[carrier, other]);
-            assert!(!fd.kuna_is_call_transport(carrier));
-            fd.kuna_inherit_storage(source, carrier);
+            assert!(!fd.kuna_is_call_transport(carrier).unwrap());
+            fd.kuna_inherit_storage(source, carrier).unwrap();
             assert_eq!(
                 fd.kuna_storage_sources(source)[0].address,
                 register(&fd, 0x10)
@@ -661,8 +736,8 @@ mod tests {
         let loaded = fd.new_unique_out(4, load).unwrap();
         let first_home = copy(&mut fd, loaded, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, first_home, 0x10);
-        assert!(!fd.kuna_is_call_transport(first_home));
-        fd.kuna_inherit_storage(loaded, first_home);
+        assert!(!fd.kuna_is_call_transport(first_home).unwrap());
+        fd.kuna_inherit_storage(loaded, first_home).unwrap();
         assert_eq!(
             fd.kuna_storage_sources(loaded)[0].address,
             register(&fd, 0x10)
@@ -678,11 +753,11 @@ mod tests {
         let address = register(&fd, 0x10);
         let wide = fd.new_varnode_out(8, &address, extension).unwrap();
         call(&mut fd, OpCode::CPUI_CALL, wide, 0x10);
-        assert!(fd.kuna_is_call_transport(carrier));
-        assert!(!fd.kuna_is_call_transport(wide));
-        fd.op_unset_output(extension);
+        assert!(fd.kuna_is_call_transport(carrier).unwrap());
+        assert!(!fd.kuna_is_call_transport(wide).unwrap());
+        fd.op_unset_output(extension).unwrap();
         assert!(fd.kuna_storage_sources(carrier).is_empty());
-        fd.kuna_inherit_storage(source, carrier);
+        fd.kuna_inherit_storage(source, carrier).unwrap();
         assert!(fd.kuna_storage_sources(source).is_empty());
 
         let mut fd = function();
@@ -691,7 +766,7 @@ mod tests {
         let address = register(&fd, 0x10);
         let computed = fd.new_varnode_out(4, &address, extension).unwrap();
         call(&mut fd, OpCode::CPUI_CALL, computed, 0x10);
-        fd.op_unset_output(extension);
+        fd.op_unset_output(extension).unwrap();
         assert_eq!(fd.kuna_storage_sources(source)[0].address, address);
     }
 
@@ -701,7 +776,7 @@ mod tests {
         let source = input(&mut fd, 0x80, 4);
         let genuine = input(&mut fd, 0x90, 4);
         let carrier = copy(&mut fd, source, 0x10);
-        fd.kuna_inherit_storage(carrier, genuine);
+        fd.kuna_inherit_storage(carrier, genuine).unwrap();
         call(&mut fd, OpCode::CPUI_CALL, carrier, 0x10);
         fd.total_replace(carrier, source).unwrap();
         assert_eq!(fd.kuna_storage_sources(source).len(), 1);
@@ -711,18 +786,18 @@ mod tests {
         );
 
         let no_uses = copy(&mut fd, source, 0x20);
-        assert!(!fd.kuna_is_call_transport(no_uses));
+        assert!(!fd.kuna_is_call_transport(no_uses).unwrap());
         let persistent = copy(&mut fd, source, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, persistent, 0x10);
         fd.vbank_mut()
             .get_mut(persistent)
             .unwrap()
             .set_flags_pub(crate::varnode::varnode_flags::persist);
-        assert!(!fd.kuna_is_call_transport(persistent));
+        assert!(!fd.kuna_is_call_transport(persistent).unwrap());
         let durable = copy(&mut fd, source, 0x30);
         let outgoing = copy(&mut fd, durable, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, outgoing, 0x10);
-        assert!(!fd.kuna_is_call_transport(durable));
+        assert!(!fd.kuna_is_call_transport(durable).unwrap());
     }
 
     #[test]
@@ -735,14 +810,14 @@ mod tests {
         let saved = copy(&mut fd, genuine, 0x80);
         let outgoing = copy(&mut fd, saved, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, outgoing, 0x10);
-        assert!(fd.kuna_is_call_transport(outgoing));
+        assert!(fd.kuna_is_call_transport(outgoing).unwrap());
         fd.total_replace(outgoing, genuine).unwrap();
-        assert!(!fd.kuna_is_call_transport(genuine));
+        assert!(!fd.kuna_is_call_transport(genuine).unwrap());
         assert!(!fd.kuna_was_call_transport(genuine));
 
         let second = copy(&mut fd, saved, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, second, 0x10);
-        fd.kuna_inherit_storage(saved, second);
+        fd.kuna_inherit_storage(saved, second).unwrap();
         assert!(fd.kuna_was_call_transport(second));
         let definition = fd.vbank().get(second).unwrap().get_def().unwrap();
         fd.op_set_opcode_code(definition, OpCode::CPUI_INT_ADD);
@@ -750,7 +825,7 @@ mod tests {
 
         let third = copy(&mut fd, saved, 0x10);
         call(&mut fd, OpCode::CPUI_CALL, third, 0x10);
-        fd.kuna_inherit_storage(saved, third);
+        fd.kuna_inherit_storage(saved, third).unwrap();
         assert!(fd.kuna_was_call_transport(third));
         let constant = fd.new_constant(4, 9);
         let compute = operation(&mut fd, OpCode::CPUI_INT_ADD, &[constant, constant]);
@@ -758,7 +833,7 @@ mod tests {
         let materialize = operation(&mut fd, OpCode::CPUI_COPY, &[unique]);
         fd.op_set_output(materialize, third).unwrap();
         assert!(!fd.kuna_was_call_transport(third));
-        assert!(!fd.kuna_is_call_transport(third));
+        assert!(!fd.kuna_is_call_transport(third).unwrap());
     }
 
     #[test]
@@ -770,10 +845,10 @@ mod tests {
         let address = register(&fd, 0x10);
         let genuine = fd.new_varnode_out(4, &address, computation).unwrap();
         let genuine_write = fd.obank().get(computation).unwrap().get_addr().clone();
-        fd.kuna_inherit_storage(source, genuine);
+        fd.kuna_inherit_storage(source, genuine).unwrap();
 
         let outgoing = copy(&mut fd, source, 0x10);
-        fd.kuna_inherit_storage(source, outgoing);
+        fd.kuna_inherit_storage(source, outgoing).unwrap();
         assert_eq!(fd.kuna_storage_sources(source).len(), 2);
         call(&mut fd, OpCode::CPUI_CALL, outgoing, 0x10);
         fd.total_replace(outgoing, source).unwrap();
@@ -789,9 +864,9 @@ mod tests {
         let pointer = input(&mut fd, 0x90, 8);
         let store = operation(&mut fd, OpCode::CPUI_STORE, &[space, pointer, meaningful]);
         call(&mut fd, OpCode::CPUI_CALL, meaningful, 0x10);
-        assert!(!fd.kuna_is_call_transport(meaningful));
-        assert_eq!(RulePropagateCopy.apply_op(store, &mut fd), 1);
-        assert!(!fd.kuna_is_call_transport(meaningful));
+        assert!(!fd.kuna_is_call_transport(meaningful).unwrap());
+        assert_eq!(RulePropagateCopy.apply_op(store, &mut fd).unwrap(), 1);
+        assert!(!fd.kuna_is_call_transport(meaningful).unwrap());
         let write = fd.vbank().get(meaningful).unwrap().get_def().unwrap();
         let instruction = fd.obank().get(write).unwrap().get_addr();
         assert!(fd
@@ -810,13 +885,13 @@ mod tests {
         let address = register(&fd, 0x10);
         let wide = fd.new_varnode_out(8, &address, piece).unwrap();
         call(&mut fd, OpCode::CPUI_CALL, wide, 0x10);
-        assert!(fd.kuna_is_call_transport(carrier));
-        assert_eq!(RulePropagateCopy.apply_op(piece, &mut fd), 1);
-        assert!(fd.kuna_is_call_transport_projection(wide, 0, 4));
-        assert!(!fd.kuna_is_call_transport(wide));
-        assert!(!fd.kuna_is_call_transport_projection(wide, 0, 8));
-        let cloned = fd.clone_varnode(wide);
-        assert!(fd.kuna_is_call_transport_projection(cloned, 0, 4));
+        assert!(fd.kuna_is_call_transport(carrier).unwrap());
+        assert_eq!(RulePropagateCopy.apply_op(piece, &mut fd).unwrap(), 1);
+        assert!(fd.kuna_is_call_transport_projection(wide, 0, 4).unwrap());
+        assert!(!fd.kuna_is_call_transport(wide).unwrap());
+        assert!(!fd.kuna_is_call_transport_projection(wide, 0, 8).unwrap());
+        let cloned = fd.clone_varnode(wide).unwrap();
+        assert!(fd.kuna_is_call_transport_projection(cloned, 0, 4).unwrap());
         fd.delete_varnode(cloned).unwrap();
         assert!(fd.kuna_call_transport_projection_size(cloned).is_none());
 
@@ -843,9 +918,9 @@ mod tests {
                 let first_home = fd.new_varnode_out(4, &address, materialize).unwrap();
                 call(&mut fd, OpCode::CPUI_CALL, first_home, 0x10);
                 let later_home = copy(&mut fd, first_home, 0x90);
-                fd.kuna_inherit_storage(value, later_home);
-                assert!(!fd.kuna_is_call_transport(first_home));
-                fd.kuna_inherit_storage(value, first_home);
+                fd.kuna_inherit_storage(value, later_home).unwrap();
+                assert!(!fd.kuna_is_call_transport(first_home).unwrap());
+                fd.kuna_inherit_storage(value, first_home).unwrap();
                 assert!(fd
                     .kuna_storage_sources(value)
                     .iter()

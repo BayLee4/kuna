@@ -153,7 +153,7 @@ fn fillin_instance_constant_little_endian() {
     // 8-byte constant 0x1122334455667788, split at offset 4 (lo = low 4 bytes).
     let cvn = fd.new_constant(8, 0x1122_3344_5566_7788);
     let mut inst = SplitInstance::new(Some(cvn), 4);
-    PreferSplitManager::fillin_instance(&mut fd, &mut inst, false, true, true);
+    PreferSplitManager::fillin_instance(&mut fd, &mut inst, false, true, true).unwrap();
     let lo = inst.lo.expect("lo");
     let hi = inst.hi.expect("hi");
     // little-endian: losize = splitoffset = 4; lo = low 4 bytes.
@@ -169,7 +169,7 @@ fn fillin_instance_constant_big_endian() {
     // big-endian: losize = size - splitoffset.  size 8, splitoffset 4 -> losize 4.
     let cvn = fd.new_constant(8, 0x1122_3344_5566_7788);
     let mut inst = SplitInstance::new(Some(cvn), 4);
-    PreferSplitManager::fillin_instance(&mut fd, &mut inst, true, true, true);
+    PreferSplitManager::fillin_instance(&mut fd, &mut inst, true, true, true).unwrap();
     let lo = inst.lo.expect("lo");
     let hi = inst.hi.expect("hi");
     assert_eq!(vn_get_size(&fd, lo), 4);
@@ -200,7 +200,7 @@ fn split_defining_copy_of_constant() {
     let mut mgr = PreferSplitManager::default();
     mgr.init(&recs);
 
-    mgr.split(&mut fd);
+    mgr.split(&mut fd).unwrap();
 
     // The original COPY (8-byte whole) is destroyed; two piece COPYs remain in
     // the block.  The whole varnode must now have no descendants/def.

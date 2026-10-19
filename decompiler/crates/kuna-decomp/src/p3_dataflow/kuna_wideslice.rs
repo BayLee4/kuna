@@ -83,20 +83,20 @@ impl Rule for RuleWideSlice {
             .then(|| Box::new(Self::new(self.group.clone())) as Box<dyn Rule>)
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> i32 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<i32> {
         if !data.get_arch().wide_slice_reduce {
-            return 0;
+            return Ok(0);
         }
         let Some(operation) = data.obank().get(op) else {
-            return 0;
+            return Ok(0);
         };
         let (Some(input), Some(offset), Some(output)) = (operation.get_in(0), operation.get_in(1), operation.get_out())
         else {
-            return 0;
+            return Ok(0);
         };
         let off = data.vbank().get(offset).unwrap();
         if !off.is_constant() || off.get_offset() > i32::MAX as u64 {
-            return 0;
+            return Ok(0);
         }
         let offset = off.get_offset() as i32;
         let node = data.vbank().get(input).unwrap();
@@ -116,25 +116,25 @@ impl Rule for RuleWideSlice {
                 Meta::TYPE_UNKNOWN | Meta::TYPE_INT | Meta::TYPE_UINT
             )
         {
-            return 0;
+            return Ok(0);
         }
         let Some(def) = node.get_def().and_then(|id| data.obank().get(id)) else {
-            return 0;
+            return Ok(0);
         };
         let code = def.code();
-        let Some(left) = def.get_in(0) else { return 0 };
-        let Some(right) = def.get_in(1) else { return 0 };
+        let Some(left) = def.get_in(0) else { return Ok(0) };
+        let Some(right) = def.get_in(1) else { return Ok(0) };
         // Do not move unheritaged register reads to a different instruction.
         if [left, right].iter().any(|&v| {
             let n = data.vbank().get(v).unwrap();
             n.is_free() && !n.is_constant()
         }) {
-            return 0;
+            return Ok(0);
         }
         if code == CPUI_PIECE {
             let low_size = size(data, right);
             if size(data, left).checked_add(low_size) != Some(input_size) {
-                return 0;
+                return Ok(0);
             }
             let result = if offset >= low_size {
                 slice(data, op, left, offset - low_size, width)
@@ -145,10 +145,10 @@ impl Rule for RuleWideSlice {
                 let lo = slice(data, op, right, offset, low_width);
                 let hi = slice(data, op, left, 0, width - low_width);
                 set_op(data, op, CPUI_PIECE, &[hi, lo]);
-                return 1;
+                return Ok(1);
             };
             set_op(data, op, CPUI_COPY, &[result]);
-            return 1;
+            return Ok(1);
         }
         if matches!(code, CPUI_INT_AND | CPUI_INT_OR | CPUI_INT_XOR)
             && size(data, left) == input_size
@@ -157,20 +157,20 @@ impl Rule for RuleWideSlice {
             let lhs = slice(data, op, left, offset, width);
             let rhs = slice(data, op, right, offset, width);
             set_op(data, op, code, &[lhs, rhs]);
-            return 1;
+            return Ok(1);
         }
         if !matches!(code, CPUI_INT_LEFT | CPUI_INT_RIGHT) || size(data, left) != input_size {
-            return 0;
+            return Ok(0);
         }
         let shift = data.vbank().get(right).unwrap();
         if !shift.is_constant() || shift.get_offset() % 8 != 0 {
-            return 0;
+            return Ok(0);
         }
         let shift = shift.get_offset() / 8;
         if shift >= input_size as u64 {
             let zero = data.new_constant(width, 0);
             set_op(data, op, CPUI_COPY, &[zero]);
-            return 1;
+            return Ok(1);
         }
         let start = if code == CPUI_INT_LEFT {
             offset as i64 - shift as i64
@@ -182,7 +182,7 @@ impl Rule for RuleWideSlice {
         if first >= end {
             let zero = data.new_constant(width, 0);
             set_op(data, op, CPUI_COPY, &[zero]);
-            return 1;
+            return Ok(1);
         }
         let mut result = slice(data, op, left, first as i32, (end - first) as i32);
         if end - first < width as i64 {
@@ -194,7 +194,7 @@ impl Rule for RuleWideSlice {
         } else {
             set_op(data, op, CPUI_COPY, &[result]);
         }
-        1
+        Ok(1)
     }
 }
 

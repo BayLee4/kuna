@@ -46,6 +46,10 @@
 //!     `TypeOp::getInputCast`/`PrintC` bodies can wire a real `Funcdata`-backed
 //!     `CastContext` without touching this logic.
 //!
+//! Facing-type acquisition and every IR-walking decision that depends on it
+//! return `KunaResult`; callers propagate acquisition failures independently of
+//! the successful decision that no cast is needed.
+//!
 //! ## W9 closure (the m1-bodies)
 //!
 //! `TypeOp::getInputCast`/`getOutputCast` per op-code (typeop.cc) and the
@@ -149,7 +153,7 @@ pub trait CastContext {
     fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype>;
     /// `vn->getHighTypeReadFacing(op)` — the read-facing HighVariable data-type
     /// (`getHigh()->getType()` resolved against the union read by `op`).
-    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> Rc<Datatype>;
+    fn vn_high_type_read_facing(&self, vn: VnRef, op: OpRef) -> KunaResult<Rc<Datatype>>;
 
     /// `op->getOpcode()->inheritsSign()` (the addlflags predicate of the op's
     /// op-code, `typeop::type_op_info(op->code()).inherits_sign()`).
@@ -191,20 +195,20 @@ pub trait CastStrategy {
         ctx: &dyn CastContext,
         vn: VnRef,
         op: Option<OpRef>,
-    ) -> IntPromotionCode;
+    ) -> KunaResult<IntPromotionCode>;
 
     /// C++ `intPromotionType` — the integer-promotion code of `vn`, recursing
     /// through its defining expression as needed.
-    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> IntPromotionCode;
+    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> KunaResult<IntPromotionCode>;
 
     /// C++ `checkIntPromotionForCompare` — does promotion force a cast before the
     /// comparison `op` makes sense for input `slot`?
     fn check_int_promotion_for_compare(&self, ctx: &dyn CastContext, op: OpRef, slot: int4)
-        -> bool;
+        -> KunaResult<bool>;
 
     /// C++ `checkIntPromotionForExtension` — does promotion force a cast before
     /// the extension `op` (ZEXT/SEXT) makes sense?
-    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> bool;
+    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> KunaResult<bool>;
 
     /// C++ `isExtensionCastImplied` — is the ZEXT/SEXT `op` (viewed as a cast)
     /// implied by the expression it sits in (so it need not be printed)?
@@ -213,7 +217,7 @@ pub trait CastStrategy {
         ctx: &dyn CastContext,
         op: OpRef,
         read_op: Option<OpRef>,
-    ) -> bool;
+    ) -> KunaResult<bool>;
 
     /// C++ `castStandard` — does an assignment from `curtype` to `reqtype` need a
     /// visible cast?  `None` for no cast, else the data-type to cast to.
@@ -258,58 +262,58 @@ pub trait CastStrategy {
     /// C++ `CastStrategy::markExplicitUnsigned` (cast.cc:38-71) — check if the
     /// constant in slot `slot` of `op` needs to be coerced (as a source token)
     /// into being `unsigned`, marking the Varnode for printing if so.
-    fn mark_explicit_unsigned(&self, ctx: &mut dyn CastContext, op: OpRef, slot: int4) -> bool {
+    fn mark_explicit_unsigned(&self, ctx: &mut dyn CastContext, op: OpRef, slot: int4) -> KunaResult<bool> {
         if !ctx.op_inherits_sign(op) {
-            return false;
+            return Ok(false);
         }
         let inherits_first_param_only = ctx.op_inherits_sign_first_param_only(op);
         if slot == 1 && inherits_first_param_only {
-            return false;
+            return Ok(false);
         }
         let vn = ctx.op_in(op, slot);
         if !ctx.vn_is_constant(vn) {
-            return false;
+            return Ok(false);
         }
-        let dt = ctx.vn_high_type_read_facing(vn, op);
+        let dt = ctx.vn_high_type_read_facing(vn, op)?;
         let meta = dt.get_metatype();
         if meta != type_metatype::TYPE_UINT
             && meta != type_metatype::TYPE_UNKNOWN
             && meta != type_metatype::TYPE_PARTIALSTRUCT
             && meta != type_metatype::TYPE_PARTIALUNION
         {
-            return false;
+            return Ok(false);
         }
         if dt.is_char_print() {
-            return false;
+            return Ok(false);
         }
         if dt.is_enum_type() {
-            return false;
+            return Ok(false);
         }
         if ctx.op_num_input(op) == 2 && !inherits_first_param_only {
             let firstvn = ctx.op_in(op, 1 - slot);
-            let meta = ctx.vn_high_type_read_facing(firstvn, op).get_metatype();
+            let meta = ctx.vn_high_type_read_facing(firstvn, op)?.get_metatype();
             if meta == type_metatype::TYPE_UINT
                 || meta == type_metatype::TYPE_UNKNOWN
                 || meta == type_metatype::TYPE_PARTIALSTRUCT
                 || meta == type_metatype::TYPE_PARTIALUNION
             {
-                return false; // Other side of the operation will force the unsigned
+                return Ok(false); // Other side of the operation will force the unsigned
             }
         }
         // Check if type is going to get forced anyway
         if let Some(outvn) = ctx.op_out(op) {
             if ctx.vn_is_explicit(outvn) {
-                return false;
+                return Ok(false);
             }
             if let Some(lone) = ctx.vn_lone_descend(outvn) {
                 if !ctx.op_inherits_sign(lone) {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
 
         ctx.vn_set_unsigned_print(vn);
-        true
+        Ok(true)
     }
 
     /// C++ `CastStrategy::markExplicitLongSize` (cast.cc:79-105) — check if the
@@ -400,52 +404,52 @@ impl CastStrategy for CastStrategyC {
         ctx: &dyn CastContext,
         op: OpRef,
         slot: int4,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         let vn = ctx.op_in(op, slot);
-        let exttype1 = self.int_promotion_type(ctx, vn);
+        let exttype1 = self.int_promotion_type(ctx, vn)?;
         if exttype1 == IntPromotionCode::NO_PROMOTION {
-            return false;
+            return Ok(false);
         }
         if exttype1 == IntPromotionCode::UNKNOWN_PROMOTION {
-            return true; // If there is promotion and we don't know type, we need a cast
+            return Ok(true); // If there is promotion and we don't know type, we need a cast
         }
 
-        let exttype2 = self.int_promotion_type(ctx, ctx.op_in(op, 1 - slot));
+        let exttype2 = self.int_promotion_type(ctx, ctx.op_in(op, 1 - slot))?;
         if (exttype1.as_i32() & exttype2.as_i32()) != 0 {
             // If both sides share a common extension, then these bits aren't determining factor
-            return false;
+            return Ok(false);
         }
         if exttype2 == IntPromotionCode::NO_PROMOTION {
             // other side would not have integer promotion, but our side is forcing it
             // but both sides get extended in the same way
-            return false;
+            return Ok(false);
         }
-        true
+        Ok(true)
     }
 
     // C++ CastStrategyC::checkIntPromotionForExtension (cast.cc:126-138).
-    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> bool {
+    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> KunaResult<bool> {
         let vn = ctx.op_in(op, 0);
-        let exttype = self.int_promotion_type(ctx, vn);
+        let exttype = self.int_promotion_type(ctx, vn)?;
         if exttype == IntPromotionCode::NO_PROMOTION {
-            return false;
+            return Ok(false);
         }
         if exttype == IntPromotionCode::UNKNOWN_PROMOTION {
-            return true; // If there is an extension and we don't know type, we need a cast
+            return Ok(true); // If there is an extension and we don't know type, we need a cast
         }
 
         // Test if the promotion extension matches the explicit extension
         if (exttype.as_i32() & IntPromotionCode::UNSIGNED_EXTENSION.as_i32()) != 0
             && ctx.op_code(op) == OpCode::CPUI_INT_ZEXT
         {
-            return false;
+            return Ok(false);
         }
         if (exttype.as_i32() & IntPromotionCode::SIGNED_EXTENSION.as_i32()) != 0
             && ctx.op_code(op) == OpCode::CPUI_INT_SEXT
         {
-            return false;
+            return Ok(false);
         }
-        true // Otherwise we need a cast before we extend
+        Ok(true) // Otherwise we need a cast before we extend
     }
 
     // C++ CastStrategyC::localExtensionType (cast.cc:140-176).
@@ -454,14 +458,14 @@ impl CastStrategy for CastStrategyC {
         ctx: &dyn CastContext,
         vn: VnRef,
         op: Option<OpRef>,
-    ) -> IntPromotionCode {
+    ) -> KunaResult<IntPromotionCode> {
         use IntPromotionCode::*;
         // C++ calls vn->getHighTypeReadFacing(op); op is always supplied at the
         // call sites that produce a meaningful read-facing type.  When vn is a
         // constant reached via loneDescend (int_promotion_type), op may be null;
         // the read-facing query then falls back to the plain HighVariable type.
         let meta = match op {
-            Some(o) => ctx.vn_high_type_read_facing(vn, o).get_metatype(),
+            Some(o) => ctx.vn_high_type_read_facing(vn, o)?.get_metatype(),
             None => ctx.vn_high_type(vn).get_metatype(),
         };
         let natural: IntPromotionCode = if meta == type_metatype::TYPE_UINT
@@ -474,89 +478,89 @@ impl CastStrategy for CastStrategyC {
         } else if meta == type_metatype::TYPE_INT {
             SIGNED_EXTENSION
         } else {
-            return UNKNOWN_PROMOTION;
+            return Ok(UNKNOWN_PROMOTION);
         };
         if ctx.vn_is_constant(vn) {
             if !signbit_negative(ctx.vn_offset(vn), ctx.vn_size(vn)) {
                 // If the high-bit is zero
-                return EITHER_EXTENSION; // Can be viewed as either extension
+                return Ok(EITHER_EXTENSION); // Can be viewed as either extension
             }
-            return natural;
+            return Ok(natural);
         }
         if ctx.vn_is_explicit(vn) {
-            return natural;
+            return Ok(natural);
         }
         if !ctx.vn_is_written(vn) {
-            return UNKNOWN_PROMOTION;
+            return Ok(UNKNOWN_PROMOTION);
         }
         let def_op = ctx.vn_def(vn).expect("written varnode has a def");
         if ctx.op_is_bool_output(def_op) {
-            return EITHER_EXTENSION;
+            return Ok(EITHER_EXTENSION);
         }
         let opc = ctx.op_code(def_op);
         if opc == OpCode::CPUI_CAST || opc == OpCode::CPUI_LOAD || ctx.op_is_call(def_op) {
-            return natural;
+            return Ok(natural);
         }
         if opc == OpCode::CPUI_INT_AND {
             // This is kind of recursing
             let tmpvn = ctx.op_in(def_op, 1);
             if ctx.vn_is_constant(tmpvn) {
                 if !signbit_negative(ctx.vn_offset(tmpvn), ctx.vn_size(tmpvn)) {
-                    return EITHER_EXTENSION;
+                    return Ok(EITHER_EXTENSION);
                 }
-                return natural;
+                return Ok(natural);
             }
         }
-        UNKNOWN_PROMOTION
+        Ok(UNKNOWN_PROMOTION)
     }
 
     // C++ CastStrategyC::intPromotionType (cast.cc:178-247).
-    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> IntPromotionCode {
+    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> KunaResult<IntPromotionCode> {
         use IntPromotionCode::*;
         if ctx.vn_size(vn) >= self.promote_size {
-            return NO_PROMOTION;
+            return Ok(NO_PROMOTION);
         }
         if ctx.vn_is_constant(vn) {
             return self.local_extension_type(ctx, vn, ctx.vn_lone_descend(vn));
         }
         if ctx.vn_is_explicit(vn) {
-            return NO_PROMOTION;
+            return Ok(NO_PROMOTION);
         }
         if !ctx.vn_is_written(vn) {
-            return UNKNOWN_PROMOTION;
+            return Ok(UNKNOWN_PROMOTION);
         }
         let op = ctx.vn_def(vn).expect("written varnode has a def");
         match ctx.op_code(op) {
             OpCode::CPUI_INT_AND => {
                 let othervn = ctx.op_in(op, 1);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & UNSIGNED_EXTENSION.as_i32())
                     != 0
                 {
-                    return UNSIGNED_EXTENSION;
+                    return Ok(UNSIGNED_EXTENSION);
                 }
                 let othervn = ctx.op_in(op, 0);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & UNSIGNED_EXTENSION.as_i32())
                     != 0
                 {
-                    return UNSIGNED_EXTENSION; // If either side has zero extension, result has zero extension
+                    return Ok(UNSIGNED_EXTENSION); // If either side has zero extension, result has zero extension
                 }
             }
             OpCode::CPUI_INT_RIGHT => {
                 let othervn = ctx.op_in(op, 0);
-                let val = self.local_extension_type(ctx, othervn, Some(op));
+                let val = self.local_extension_type(ctx, othervn, Some(op))?;
                 if (val.as_i32() & UNSIGNED_EXTENSION.as_i32()) != 0 {
                     // If the input provably zero extends
-                    return val; // then the result is a zero extension (plus possibly a sign extension)
+                    return Ok(val); // then the result is a zero extension (plus possibly a sign extension)
                 }
             }
             OpCode::CPUI_INT_SRIGHT => {
                 let othervn = ctx.op_in(op, 0);
-                let val = self.local_extension_type(ctx, othervn, Some(op));
+                let val = self.local_extension_type(ctx, othervn, Some(op))?;
                 if (val.as_i32() & SIGNED_EXTENSION.as_i32()) != 0 {
                     // If input can be construed as a sign-extension
-                    return val; // then the result is a sign extension (plus possibly a zero extension)
+                    return Ok(val); // then the result is a sign extension (plus possibly a zero extension)
                 }
             }
             OpCode::CPUI_INT_XOR
@@ -564,54 +568,54 @@ impl CastStrategy for CastStrategyC {
             | OpCode::CPUI_INT_DIV
             | OpCode::CPUI_INT_REM => {
                 let othervn = ctx.op_in(op, 0);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & UNSIGNED_EXTENSION.as_i32())
                     == 0
                 {
-                    return UNKNOWN_PROMOTION;
+                    return Ok(UNKNOWN_PROMOTION);
                 }
                 let othervn = ctx.op_in(op, 1);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & UNSIGNED_EXTENSION.as_i32())
                     == 0
                 {
-                    return UNKNOWN_PROMOTION;
+                    return Ok(UNKNOWN_PROMOTION);
                 }
-                return UNSIGNED_EXTENSION; // If both sides have zero extension, result has zero extension
+                return Ok(UNSIGNED_EXTENSION); // If both sides have zero extension, result has zero extension
             }
             OpCode::CPUI_INT_SDIV | OpCode::CPUI_INT_SREM => {
                 let othervn = ctx.op_in(op, 0);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & SIGNED_EXTENSION.as_i32())
                     == 0
                 {
-                    return UNKNOWN_PROMOTION;
+                    return Ok(UNKNOWN_PROMOTION);
                 }
                 let othervn = ctx.op_in(op, 1);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & SIGNED_EXTENSION.as_i32())
                     == 0
                 {
-                    return UNKNOWN_PROMOTION;
+                    return Ok(UNKNOWN_PROMOTION);
                 }
-                return SIGNED_EXTENSION; // If both sides have sign extension, result has sign extension
+                return Ok(SIGNED_EXTENSION); // If both sides have sign extension, result has sign extension
             }
             OpCode::CPUI_INT_NEGATE | OpCode::CPUI_INT_2COMP => {
                 let othervn = ctx.op_in(op, 0);
-                if (self.local_extension_type(ctx, othervn, Some(op)).as_i32()
+                if (self.local_extension_type(ctx, othervn, Some(op))?.as_i32()
                     & SIGNED_EXTENSION.as_i32())
                     != 0
                 {
-                    return SIGNED_EXTENSION;
+                    return Ok(SIGNED_EXTENSION);
                 }
             }
             OpCode::CPUI_INT_ADD
             | OpCode::CPUI_INT_SUB
             | OpCode::CPUI_INT_LEFT
             | OpCode::CPUI_INT_MULT => {}
-            _ => return NO_PROMOTION, // No integer promotion at all
+            _ => return Ok(NO_PROMOTION), // No integer promotion at all
         }
-        UNKNOWN_PROMOTION
+        Ok(UNKNOWN_PROMOTION)
     }
 
     // C++ CastStrategyC::isExtensionCastImplied (cast.cc:249-298).
@@ -620,16 +624,16 @@ impl CastStrategy for CastStrategyC {
         ctx: &dyn CastContext,
         op: OpRef,
         read_op: Option<OpRef>,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         let out_vn = ctx.op_out(op).expect("extension op has an output");
         if ctx.vn_is_explicit(out_vn) {
             // C++: empty `if` body — falls through to `return false` at the end.
         } else {
             let read_op = match read_op {
-                None => return false,
+                None => return Ok(false),
                 Some(r) => r,
             };
-            let metatype = ctx.vn_high_type_read_facing(out_vn, read_op).get_metatype();
+            let metatype = ctx.vn_high_type_read_facing(out_vn, read_op)?.get_metatype();
             let slot;
             let other_vn;
             match ctx.op_code(read_op) {
@@ -655,20 +659,20 @@ impl CastStrategy for CastStrategyC {
                         // integers that are bigger than the promotion size are NOT naturally extended.
                         if ctx.vn_size(other_vn) > self.promote_size {
                             // So if the integer is bigger than the promotion size
-                            return false; // The extension cast on the other side must be explicit
+                            return Ok(false); // The extension cast on the other side must be explicit
                         }
                     } else if !ctx.vn_is_explicit(other_vn) {
-                        return false;
+                        return Ok(false);
                     }
-                    if ctx.vn_high_type_read_facing(other_vn, read_op).get_metatype() != metatype {
-                        return false;
+                    if ctx.vn_high_type_read_facing(other_vn, read_op)?.get_metatype() != metatype {
+                        return Ok(false);
                     }
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
-            return true; // Everything is integer promotion
+            return Ok(true); // Everything is integer promotion
         }
-        false
+        Ok(false)
     }
 
     // C++ CastStrategyC::castStandard (cast.cc:300-392).
@@ -840,7 +844,7 @@ impl CastStrategy for CastStrategyC {
         ctx: &dyn CastContext,
         op: OpRef,
     ) -> KunaResult<Rc<Datatype>> {
-        let mut res1 = ctx.vn_high_type_read_facing(ctx.op_in(op, 0), op);
+        let mut res1 = ctx.vn_high_type_read_facing(ctx.op_in(op, 0), op)?;
         if res1.get_metatype() == type_metatype::TYPE_BOOL {
             // Treat boolean as if it is cast to an integer
             res1 = self.tlst.get_base(res1.get_size(), type_metatype::TYPE_INT)?;
@@ -849,7 +853,7 @@ impl CastStrategy for CastStrategyC {
         let num = ctx.op_num_input(op);
         let mut i = 1;
         while i < num {
-            let res2 = ctx.vn_high_type_read_facing(ctx.op_in(op, i), op);
+            let res2 = ctx.vn_high_type_read_facing(ctx.op_in(op, i), op)?;
             if res2.get_metatype() == type_metatype::TYPE_BOOL {
                 i += 1;
                 continue;
@@ -947,14 +951,44 @@ impl CastStrategy for CastStrategyC {
 
 /// Casting strategy specific to the Java language (C++ `CastStrategyJava`,
 /// cast.hh:198-202).  Nearly identical to C, but accounts for how object
-/// references are encoded as pointer data-types.  Shared with the (deferred)
-/// `printjava` back-end: `cast.cc` defines this class, and it is kept here so the
-/// Java cast surface is complete even though `PrintJava` itself is deferred.
+/// references are encoded as pointer data-types. Selected by the shared
+/// PrintC language plane and the analysis context at each cast pass boundary.
 ///
 /// Only `cast_standard` and `is_zext_cast` differ from C; the rest inherit
 /// `CastStrategyC` behavior (C++ `CastStrategyJava : public CastStrategyC`).
 pub struct CastStrategyJava {
     inner: CastStrategyC,
+}
+
+/// Stack-owned strategy for one analysis/printer pass; consumers borrow the
+/// existing strategy interface, never allocate a second language backend.
+pub(crate) enum LanguageCastStrategy {
+    C(CastStrategyC),
+    Java(CastStrategyJava),
+}
+
+impl LanguageCastStrategy {
+    pub(crate) fn new(
+        types: Rc<dyn TypeFactory>,
+        lang: crate::kuna_lang::OutLang,
+        record_identity: bool,
+    ) -> Self {
+        if lang == crate::kuna_lang::OutLang::Java {
+            Self::Java(CastStrategyJava::new(types))
+        } else {
+            Self::C(CastStrategyC::new(types).with_record_identity(record_identity))
+        }
+    }
+}
+
+impl std::ops::Deref for LanguageCastStrategy {
+    type Target = dyn CastStrategy;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::C(strategy) => strategy,
+            Self::Java(strategy) => strategy,
+        }
+    }
 }
 
 impl CastStrategyJava {
@@ -975,11 +1009,11 @@ impl CastStrategy for CastStrategyJava {
         ctx: &dyn CastContext,
         vn: VnRef,
         op: Option<OpRef>,
-    ) -> IntPromotionCode {
+    ) -> KunaResult<IntPromotionCode> {
         self.inner.local_extension_type(ctx, vn, op)
     }
 
-    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> IntPromotionCode {
+    fn int_promotion_type(&self, ctx: &dyn CastContext, vn: VnRef) -> KunaResult<IntPromotionCode> {
         self.inner.int_promotion_type(ctx, vn)
     }
 
@@ -988,11 +1022,11 @@ impl CastStrategy for CastStrategyJava {
         ctx: &dyn CastContext,
         op: OpRef,
         slot: int4,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         self.inner.check_int_promotion_for_compare(ctx, op, slot)
     }
 
-    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> bool {
+    fn check_int_promotion_for_extension(&self, ctx: &dyn CastContext, op: OpRef) -> KunaResult<bool> {
         self.inner.check_int_promotion_for_extension(ctx, op)
     }
 
@@ -1001,7 +1035,7 @@ impl CastStrategy for CastStrategyJava {
         ctx: &dyn CastContext,
         op: OpRef,
         read_op: Option<OpRef>,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         self.inner.is_extension_cast_implied(ctx, op, read_op)
     }
 

@@ -102,16 +102,16 @@ fn both_surfaces(extra: &[&str]) -> String {
 #[test]
 fn single_rename_keeps_the_other_lifetime_separate() {
     let number = both_surfaces(&["name register_names::number recovered_number"]);
-    assert!(number.contains("uint8 recovered_number;"), "{number}");
-    assert!(number.contains("int4 *pointer_00;"), "{number}");
+    kuna_harness::c_behavior::assert_c_declaration(&number, "recovered_number", "unsigned long long", "rax");
+    kuna_harness::c_behavior::assert_c_declaration(&number, "pointer_00", "int *", "rax");
     assert!(
         number.contains("observe_number(recovered_number)"),
         "{number}"
     );
     assert!(number.contains("observe_pointer(pointer_00)"), "{number}");
     let pointer = both_surfaces(&["name register_names::pointer_00 recovered_pointer"]);
-    assert!(pointer.contains("uint8 number;"), "{pointer}");
-    assert!(pointer.contains("int4 *recovered_pointer;"), "{pointer}");
+    kuna_harness::c_behavior::assert_c_declaration(&pointer, "number", "unsigned long long", "rax");
+    kuna_harness::c_behavior::assert_c_declaration(&pointer, "recovered_pointer", "int *", "rax");
     assert!(pointer.contains("observe_number(number)"), "{pointer}");
     assert!(
         pointer.contains("observe_pointer(recovered_pointer)"),
@@ -125,8 +125,8 @@ fn both_renames_apply_in_either_order() {
     let pointer = "name register_names::pointer_00 recovered_pointer";
     for order in [[number, pointer], [pointer, number]] {
         let code = both_surfaces(&order);
-        assert!(code.contains("uint8 recovered_number;"), "{code}");
-        assert!(code.contains("int4 *recovered_pointer;"), "{code}");
+        kuna_harness::c_behavior::assert_c_declaration(&code, "recovered_number", "unsigned long long", "rax");
+        kuna_harness::c_behavior::assert_c_declaration(&code, "recovered_pointer", "int *", "rax");
         assert_eq!(
             code.matches("observe_number(recovered_number)").count(),
             2,
@@ -146,8 +146,8 @@ fn retype_does_not_seed_the_other_register_lifetime() {
         "type register_names::number long long signed_number",
         "name register_names::pointer_00 recovered_pointer",
     ]);
-    assert!(code.contains("int8 signed_number;"), "{code}");
-    assert!(code.contains("int4 *recovered_pointer;"), "{code}");
+    kuna_harness::c_behavior::assert_c_declaration(&code, "signed_number", "long long", "rax");
+    kuna_harness::c_behavior::assert_c_declaration(&code, "recovered_pointer", "int *", "rax");
     assert_eq!(
         code.matches("observe_pointer(recovered_pointer)").count(),
         2,
@@ -188,8 +188,8 @@ fn copies_in_other_registers_do_not_block_storage_reuse() {
 fn branch_and_loop_replay_keep_definition_families() {
     for function in ["register_branch", "register_loop"] {
         let baseline = run_function(function, &[], true).0;
-        assert!(baseline.contains("uint8 number;"), "{baseline}");
-        assert!(baseline.contains("int4 *pointer_00;"), "{baseline}");
+        kuna_harness::c_behavior::assert_c_declaration(&baseline, "number", "unsigned long long", "rax");
+        kuna_harness::c_behavior::assert_c_declaration(&baseline, "pointer_00", "int *", "rax");
         let directives = [
             format!("name {function}::number recovered_number"),
             format!("name {function}::pointer_00 recovered_pointer"),
@@ -269,8 +269,10 @@ fn formal_parameter_name_survives_successive_console_rebuilds() {
         "lifetimes_parameter_variants_x86_64",
     );
     assert!(!transcript.contains("error:"), "{transcript}");
-    let start = transcript.rfind("\nint4 param_scalar_escaped(").unwrap();
+    let signature = transcript.rfind(" param_scalar_escaped(").unwrap();
+    let start = transcript[..signature].rfind('\n').unwrap();
     let code = &transcript[start..];
+    kuna_harness::c_behavior::assert_c_parameters(code, "param_scalar_escaped", &["a", "b", "c", "d", "e", "f", "source_flag"], "int (*)(int,int,int,int,int,int,bool)");
     assert!(code.contains("bool source_flag)"), "{transcript}");
     assert!(code.contains(".view_bool = source_flag;"), "{transcript}");
     assert!(!code.contains("bool prepare_only)"), "{transcript}");
@@ -379,14 +381,8 @@ fn equal_width_renames_survive_separate_decompiles() {
             declarations.join("\n")
         ), "lifetimes_x86_64");
             assert!(!transcript.contains("Execution error:"), "{transcript}");
-            assert!(
-                transcript.contains("uint8 recovered_number;"),
-                "{transcript}"
-            );
-            assert!(
-                transcript.contains("int4 *recovered_pointer;"),
-                "{transcript}"
-            );
+            kuna_harness::c_behavior::assert_c_declaration(&transcript, "recovered_number", "unsigned long long", "rax");
+            kuna_harness::c_behavior::assert_c_declaration(&transcript, "recovered_pointer", "int *", "rax");
             assert!(
                 transcript.contains("observe_number(recovered_number)"),
                 "{transcript}"
@@ -540,19 +536,34 @@ fn joined_register_asserted_body_matches_native_aggregate() {
     }
 }
 
+fn observed_arguments(code: &str, consumer: &str) -> Vec<String> {
+    let prefix = format!("{consumer}(");
+    code.lines().filter_map(|line| line.trim().strip_prefix(&prefix)
+        .and_then(|argument| argument.strip_suffix(");")).map(str::to_owned)).collect()
+}
+
 #[test]
 fn same_instruction_register_and_temporary_names_survive_replay() {
     let baseline = "lifetimes_temporaries_x86_64";
+    let (shown, rejected) = run_fixture_options("multiply_names", baseline, &[], true, &[("impliedrefs", "0")]);
+    assert!(rejected.is_empty(), "{rejected:?}");
+    let arguments = observed_arguments(&shown, "observe_number");
+    assert_eq!(arguments.len(), 4, "{shown}");
+    assert_eq!(arguments[0], arguments[2], "{shown}");
+    assert_eq!(arguments[1], arguments[3], "{shown}");
+    assert_ne!(arguments[0], arguments[1], "{shown}");
+    let low = format!("name {} low", arguments[0]);
+    let high = format!("name {} high", arguments[1]);
     for order in [
         [
             "name v1 operand",
             "name v2 multiplier",
-            "name input_00 low",
-            "name input_01 high",
+            &low,
+            &high,
         ],
         [
-            "name input_01 high",
-            "name input_00 low",
+            &high,
+            &low,
             "name v2 multiplier",
             "name v1 operand",
         ],
@@ -584,10 +595,15 @@ fn named_scalar_temporaries_execute_the_native_multiply() {
     common::process::required_output(&mut Command::new(common::fixture(
         "lifetimes_temporaries_x86_64",
     )));
-    for order in [
-        ["name v1 low", "name input_00 high"],
-        ["name input_00 high", "name v1 low"],
-    ] {
+    let (shown, rejected) = run_fixture_options("multiply_names32", "lifetimes_temporaries_x86_64", &[], true, &[("impliedrefs", "0")]);
+    assert!(rejected.is_empty(), "{rejected:?}");
+    let arguments = observed_arguments(&shown, "observe_number");
+    assert_eq!(arguments.len(), 4, "{shown}");
+    assert_eq!(arguments[0], arguments[2], "{shown}");
+    assert_eq!(arguments[1], arguments[3], "{shown}");
+    assert_ne!(arguments[0], arguments[1], "{shown}");
+    let high = format!("name {} high", arguments[1]);
+    for order in [["name v1 low", high.as_str()], [high.as_str(), "name v1 low"]] {
         let (code, rejected) = run_fixture_options(
             "multiply_names32",
             "lifetimes_temporaries_x86_64",

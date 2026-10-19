@@ -74,6 +74,9 @@ use kuna_base::types::{int4, int8, uint4, uint8};
 
 use crate::bitfield::BitRange;
 
+mod semantic;
+pub use semantic::CallableReader;
+
 // =============================================================================
 // type_metatype (type.hh:80-100) — verbatim, discriminants load-bearing
 // =============================================================================
@@ -279,8 +282,13 @@ pub fn base2sub(m: type_metatype) -> sub_metatype {
 /// Convert a type \b meta-type into the string name of the meta-type
 /// (C++ `metatype2string`, type.cc:242-303).
 pub fn metatype2string(metatype: type_metatype) -> KunaResult<String> {
+    Ok(metatype_name(metatype).to_owned())
+}
+
+/// The canonical wire spelling without allocating an owned string.
+pub fn metatype_name(metatype: type_metatype) -> &'static str {
     use type_metatype::*;
-    let res = match metatype {
+    match metatype {
         TYPE_VOID => "void",
         TYPE_PTR => "ptr",
         TYPE_PTRREL => "ptrrel",
@@ -299,8 +307,7 @@ pub fn metatype2string(metatype: type_metatype) -> KunaResult<String> {
         TYPE_BOOL => "bool",
         TYPE_CODE => "code",
         TYPE_FLOAT => "float",
-    };
-    Ok(res.to_string())
+    }
 }
 
 /// Given a string description of a type \b meta-type, return the meta-type
@@ -461,6 +468,9 @@ pub mod flags {
     pub const warning_issued: uint4 = 0x20000;
     /// Data-type contains bitfields
     pub const has_bitfields: uint4 = 0x40000;
+    /// Internal synthesis ownership, stamped before a fresh record is interned.
+    /// This is not a wire attribute or evidence supplied by a source datatype.
+    pub(crate) const kuna_synthesized: uint4 = 0x80000;
 }
 
 // =============================================================================
@@ -845,6 +855,7 @@ pub enum DatatypeKind {
     /// `Datatype` view via the parallel `Pointer` accessors, with the relative
     /// extras here.
     PointerRel {
+        spaceid: Option<Rc<AddrSpace>>,
         /// Type being pointed to (C++ `TypePointer::ptrto`)
         ptrto: Rc<Datatype>,
         /// What size unit does the pointer address (C++ `TypePointer::wordsize`)
@@ -907,6 +918,7 @@ pub struct Datatype {
     record_completion: Option<Rc<RefCell<std::rc::Weak<Datatype>>>>,
     pub(crate) qualified_base: Option<Rc<Datatype>>,
     pub(crate) qualifiers: u8,
+    host_type: Cell<bool>,
 }
 
 impl Datatype {
@@ -934,6 +946,7 @@ impl Datatype {
             record_completion: None,
             qualified_base: None,
             qualifiers: 0,
+            host_type: Cell::new(false),
         }
     }
 
@@ -1117,11 +1130,17 @@ impl Datatype {
     /// Get the type name (C++ `getName`).
     #[inline]
     pub fn get_name(&self) -> &str {
+        if self.name.is_empty() {
+            if let Some(base) = &self.qualified_base { return base.get_name(); }
+        }
         &self.name
     }
     /// Get string to use in display (C++ `getDisplayName`).
     #[inline]
     pub fn get_display_name(&self) -> &str {
+        if self.display_name.is_empty() {
+            if let Some(base) = &self.qualified_base { return base.get_display_name(); }
+        }
         &self.display_name
     }
     /// Get the data-type immediately typedefed by this (or `None`) (C++
@@ -1151,6 +1170,7 @@ impl Datatype {
     /// id; feeding it back through the reversible [`Datatype::hash_size`]
     /// recovers the size-independent base id.
     pub fn get_unsized_id(&self) -> KunaResult<uint8> {
+        if self.id == 0 { return Ok(0); }
         if (self.flags & flags::variable_length) != 0 {
             Ok(Datatype::hash_size(self.id, self.size))
         } else {
@@ -1325,7 +1345,13 @@ impl Datatype {
     }
 
     /// Resolve a record stub without changing its immutable interning key.
-    fn completed_record(ct: &Rc<Datatype>) -> Rc<Datatype> {
+    pub fn completed_record(ct: &Rc<Datatype>) -> Rc<Datatype> {
+        if let Some(base) = &ct.qualified_base {
+            let completed = Self::completed_record(base);
+            return if Rc::ptr_eq(base, &completed) { Rc::clone(ct) } else {
+                crate::kuna_typequal::qualified_type(completed, ct.qualifiers)
+            };
+        }
         ct.record_completion
             .as_ref()
             .and_then(|link| link.borrow().upgrade())
@@ -1338,8 +1364,11 @@ impl Datatype {
     /// `None` if this is not a pointer kind.
     pub fn get_ptr_to(&self) -> Option<Rc<Datatype>> {
         match &self.kind {
-            DatatypeKind::Pointer { ptrto, .. } => Some(Self::completed_record(ptrto)),
-            DatatypeKind::PointerRel { ptrto, .. } => Some(Self::completed_record(ptrto)),
+            DatatypeKind::Pointer { ptrto, .. } | DatatypeKind::PointerRel { ptrto, .. } => {
+                if ptrto.is_host_type() && ptrto.is_incomplete() && matches!(&ptrto.kind, DatatypeKind::Struct { .. } | DatatypeKind::Union { .. }) {
+                    Some(Rc::clone(ptrto))
+                } else { Some(Self::completed_record(ptrto)) }
+            }
             _ => None,
         }
     }
@@ -1374,6 +1403,7 @@ impl Datatype {
     pub fn get_pointer_space(&self) -> Option<Rc<AddrSpace>> {
         match &self.kind {
             DatatypeKind::Pointer { spaceid, .. } => spaceid.clone(),
+            DatatypeKind::PointerRel { spaceid, .. } => spaceid.clone(),
             _ => None,
         }
     }
@@ -1583,8 +1613,8 @@ impl Datatype {
             }
             // TypePointerRel::compare (type.cc:3072-3090): compare as plain
             // pointers first, then the formal-vs-ephemeral tie-break on `stripped`.
-            DatatypeKind::PointerRel { ptrto, wordsize, stripped, .. } => {
-                let res = self.compare_pointer_body(op, level, ptrto, None, *wordsize)?;
+            DatatypeKind::PointerRel { ptrto, wordsize, stripped, spaceid, .. } => {
+                let res = self.compare_pointer_body(op, level, ptrto, spaceid.as_ref(), *wordsize)?;
                 if res != 0 {
                     return Ok(res);
                 }
@@ -1832,15 +1862,14 @@ impl Datatype {
     /// (`ptrto`, `spaceid`, `wordsize`) for *either* a plain
     /// [`DatatypeKind::Pointer`] **or** a [`DatatypeKind::PointerRel`].  A
     /// `TypePointerRel` *is-a* `TypePointer` in C++, so its inherited
-    /// `TypePointer::compare`/`compareDependency` read these same members; a
-    /// relative pointer never carries a bound address space, so `spaceid` is
-    /// always `None` for the `PointerRel` arm.  `None` for non-pointers.
+    /// `TypePointer::compare`/`compareDependency` read these same members,
+    /// including the relative pointer's retained address bank. `None` for non-pointers.
     fn as_any_pointer(&self) -> Option<PlainPointerView<'_>> {
         match &self.kind {
             DatatypeKind::Pointer { ptrto, spaceid, wordsize, .. } => {
                 Some((ptrto, spaceid.as_ref(), *wordsize))
             }
-            DatatypeKind::PointerRel { ptrto, wordsize, .. } => Some((ptrto, None, *wordsize)),
+            DatatypeKind::PointerRel { ptrto, wordsize, spaceid, .. } => Some((ptrto, spaceid.as_ref(), *wordsize)),
             _ => None,
         }
     }
@@ -1853,7 +1882,7 @@ impl Datatype {
         &self,
     ) -> Option<(&Rc<Datatype>, uint4, Option<&Rc<Datatype>>, &Rc<Datatype>, int4)> {
         match &self.kind {
-            DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset } => {
+            DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset, .. } => {
                 Some((ptrto, *wordsize, stripped.as_ref(), parent, *offset))
             }
             _ => None,
@@ -1937,9 +1966,9 @@ impl Datatype {
     }
 
     /// Borrow a `TypeEnum`'s `namemap`, used where the C++ casts `&op` to
-    /// `TypeEnum *`.  `None` if not an enum.  `pub(crate)` for the enum body
-    /// rendering in [`crate::printc`] (`doc_type_definitions`).
-    pub(crate) fn as_enum_namemap(&self) -> Option<&std::collections::BTreeMap<u64, String>> {
+    /// `TypeEnum *`. `None` if not an enum. Shared read-only access for enum
+    /// rendering and invocation-wide source identifier reservations.
+    pub fn as_enum_namemap(&self) -> Option<&std::collections::BTreeMap<u64, String>> {
         match &self.kind {
             DatatypeKind::Enum { namemap } => Some(namemap),
             _ => None,
@@ -2142,6 +2171,16 @@ impl Datatype {
     /// instance (it is rebuilt per run, exactly as in C++).  The Rust analogue
     /// of the object address is [`Rc::as_ptr`].
     fn compare_dependency_ptr(a: &Rc<Datatype>, b: &Rc<Datatype>) -> int4 {
+        if a.qualified_base.is_some() || b.qualified_base.is_some() {
+            let qualifiers = a.qualifiers as int4 - b.qualifiers as int4;
+            if qualifiers != 0 { return qualifiers; }
+            return match (&a.qualified_base, &b.qualified_base) {
+                (Some(left), Some(right)) => Self::compare_dependency_ptr(left, right),
+                (Some(_), None) => 1,
+                (None, Some(_)) => -1,
+                _ => 0,
+            };
+        }
         if Rc::ptr_eq(a, b) {
             return 0;
         }
@@ -2285,13 +2324,16 @@ impl Datatype {
             // then ptrto-identity, offset, parent-identity, wordsize, then
             // (op.size - size).  ptrto/parent are compared by object identity
             // exactly as in C++ (raw-pointer `<`), via Rc::as_ptr.
-            DatatypeKind::PointerRel { ptrto, wordsize, parent, offset, .. } => {
+            DatatypeKind::PointerRel { ptrto, wordsize, parent, offset, spaceid, .. } => {
                 if self.submeta != op.get_sub_meta() {
                     return Ok(if self.submeta < op.get_sub_meta() { -1 } else { 1 });
                 }
                 let (op_ptrto, op_wordsize, _, op_parent, op_offset) = op
                     .as_pointer_rel()
                     .ok_or_else(|| Datatype::pointer_invariant_err("compareDependency(ptrrel)"))?;
+                if let Some(order) = Self::compare_pointer_space(spaceid.as_ref(), op.as_any_pointer().and_then(|(_, space, _)| space)) {
+                    return Ok(order);
+                }
                 let ptr_cmp = Datatype::compare_dependency_ptr(ptrto, op_ptrto);
                 if ptr_cmp != 0 {
                     return Ok(ptr_cmp); // Compare absolute pointers
@@ -3060,7 +3102,7 @@ impl Datatype {
             // TypePointerRel::isPtrsubMatching (type.cc:3138-3147): if a stripped
             // (formal) form exists, defer to the inherited TypePointer body;
             // otherwise the relative-pointer bound check against the parent.
-            DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset } => {
+            DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset, .. } => {
                 if stripped.is_some() {
                     return Datatype::is_ptrsub_matching_pointer(
                         &Self::completed_record(ptrto), *wordsize, off, extra, multiplier,
@@ -3881,6 +3923,21 @@ pub struct EnumRepresentation {
 /// `getTypeCode`/`getExactPiece`/`getBaseNoChar`/`getTypeVoid`/`getTypePointerRel`/
 /// `getSizeOfPointer`/`getSizeOfInt`/`getArch` calls catalogued from those files).
 pub trait TypeFactory {
+    fn reserve_record(&self, _name: &str, _id: u64, _is_union: bool) -> KunaResult<Rc<Datatype>> {
+        Err(KunaError::lowlevel("Exact nominal reservation unsupported"))
+    }
+    fn reserve_code(&self, _name: &str, _id: u64) -> KunaResult<Rc<Datatype>> {
+        Err(KunaError::lowlevel("Exact callable reservation unsupported"))
+    }
+    fn reserve_enum(&self, _name: &str, _id: u64, _size: int4, _meta: type_metatype) -> KunaResult<Rc<Datatype>> {
+        Err(KunaError::lowlevel("Exact enum reservation unsupported"))
+    }
+    fn complete_code(&self, _shell: &Rc<Datatype>, _proto: Rc<crate::fspec::FuncProto>) -> KunaResult<Rc<Datatype>> {
+        Err(KunaError::lowlevel("Exact callable completion unsupported"))
+    }
+    fn logical_proto(&self, _pieces: &crate::fspec::PrototypePieces, _model: &str, _input_locked: bool, _no_return: bool) -> KunaResult<Rc<crate::fspec::FuncProto>> {
+        Err(KunaError::lowlevel("Logical callable construction unsupported"))
+    }
     // -- Size queries (type.hh:880-885) -------------------------------------
 
     /// Get the size of the default "int" (C++ `getSizeOfInt`).
@@ -4072,6 +4129,9 @@ pub trait TypeFactory {
     fn get_type_array(&self, as_: int4, ao: Rc<Datatype>) -> KunaResult<Rc<Datatype>>;
     /// Create an (empty) structure (C++ `getTypeStruct`).
     fn get_type_struct(&self, n: &str) -> KunaResult<Rc<Datatype>>;
+    /// Reserve a fresh inferred record shell. An already held name is an error;
+    /// unlike the ordinary raw getter, this constructor never reuses a source type.
+    fn kuna_synthesized_record(&self, n: &str) -> KunaResult<Rc<Datatype>>;
     /// Create a partial structure (C++ `getTypePartialStruct`).
     fn get_type_partial_struct(
         &self,
@@ -4448,7 +4508,7 @@ impl Datatype {
             .expect("encode_typedef called without typedefImm");
         encoder.open_element(&ELEM_DEF);
         encoder.write_string(&ATTRIB_NAME, self.name.as_bytes());
-        encoder.write_unsigned_integer(&ATTRIB_ID, self.id);
+        encoder.write_unsigned_integer(&ATTRIB_ID, self.get_unsized_id()?);
         let format = self.get_display_format();
         if format != 0 {
             encoder.write_string(
@@ -4466,6 +4526,31 @@ impl Datatype {
     /// Falls back to the full [`Datatype::encode`] for id-less or void types.
     pub fn encode_ref(&self, encoder: &mut dyn kuna_base::marshal::Encoder) -> KunaResult<()> {
         use kuna_base::marshal::{ATTRIB_ID, ATTRIB_NAME, ATTRIB_SIZE};
+        if let Some(completed) = self.record_completion.as_ref().filter(|_| self.qualified_base.is_none()).and_then(|link| link.borrow().upgrade()) {
+            if !std::ptr::eq(self, completed.as_ref()) {
+                return completed.encode_ref(encoder);
+            }
+        }
+        if encoder.admits_result_types() && !self.is_host_type() {
+            let meta = crate::resulttypes::result_metatype(self);
+            let handle = encoder.register_result_type(
+                self as *const Self as usize,
+                &self.name,
+                self.id,
+                self.size,
+                meta,
+                &mut |encoder| self.encode(encoder),
+            )?;
+            if let Some(handle) = handle {
+                encoder.open_element(&ELEM_TYPEREF);
+                encoder.write_unsigned_integer(&crate::resulttypes::ATTRIB_KUNA_LOCAL, handle);
+                encoder.write_string(&ATTRIB_NAME, self.name.as_bytes());
+                encoder.write_unsigned_integer(&ATTRIB_ID, self.id);
+                encoder.write_signed_integer(&ATTRIB_SIZE, self.size as i64);
+                encoder.close_element(&ELEM_TYPEREF);
+                return Ok(());
+            }
+        }
         if self.id != 0 && self.metatype != type_metatype::TYPE_VOID {
             encoder.open_element(&ELEM_TYPEREF);
             encoder.write_string(&ATTRIB_NAME, self.name.as_bytes());
@@ -4609,7 +4694,7 @@ impl Datatype {
                 encoder.open_element(elem_type);
                 self.encode_basic(self.metatype, -1, encoder)?;
                 if let Some(p) = proto {
-                    p.encode(encoder)?;
+                    p.encode_with_context(encoder, crate::fspec::PrototypeEncoding::LogicalCallable)?;
                 }
                 encoder.close_element(elem_type);
             }
@@ -4625,9 +4710,13 @@ impl Datatype {
             }
             // TypePartialStruct: no C++ override — the base Datatype::encode
             // basic form (type.cc:462).
-            DatatypeKind::PartialStruct { .. } => {
+            DatatypeKind::PartialStruct { container, offset, .. } => {
                 encoder.open_element(elem_type);
                 self.encode_basic(self.metatype, -1, encoder)?;
+                if encoder.admits_result_types() {
+                    encoder.write_signed_integer(&ATTRIB_OFFSET, *offset as i64);
+                    container.encode_ref(encoder)?;
+                }
                 encoder.close_element(elem_type);
             }
             // TypePartialUnion::encode (type.cc:2948).
@@ -4649,13 +4738,18 @@ impl Datatype {
             // TypePointerRel::encode (type.cc:3125): metatype re-spelled as
             // ptrrel, the pointed-to type in FULL form, the parent by ref, and
             // the byte offset as an <off> child.
-            DatatypeKind::PointerRel { ptrto, wordsize, parent, offset, .. } => {
+            DatatypeKind::PointerRel { ptrto, wordsize, parent, offset, spaceid, .. } => {
                 encoder.open_element(elem_type);
                 self.encode_basic(type_metatype::TYPE_PTRREL, -1, encoder)?;
+                if let Some(space) = spaceid { encoder.write_space(&kuna_base::marshal::ATTRIB_SPACE, space); }
                 if *wordsize != 1 {
                     encoder.write_unsigned_integer(&ATTRIB_WORDSIZE, *wordsize as u64);
                 }
-                ptrto.encode(encoder)?;
+                if encoder.admits_result_types() {
+                    ptrto.encode_ref(encoder)?;
+                } else {
+                    ptrto.encode(encoder)?;
+                }
                 parent.encode_ref(encoder)?;
                 encoder.open_element(&ELEM_OFF);
                 encoder.write_signed_integer(&ATTRIB_CONTENT, *offset as i64);
@@ -4722,6 +4816,8 @@ pub trait RemoteTypeFetch {
 /// The union of every wire type element's attributes, gathered by one scan
 /// (see [`TypeFactoryImpl::decode_wire_type_attribs`]).
 struct WireTypeAttribs {
+    spaceid: Option<Rc<AddrSpace>>,
+    incomplete: bool,
     name: String,
     display: String,
     id: uint8,
@@ -4744,6 +4840,8 @@ impl Default for WireTypeAttribs {
     /// throw).
     fn default() -> Self {
         WireTypeAttribs {
+            spaceid: None,
+            incomplete: false,
             name: String::new(),
             display: String::new(),
             id: 0,
@@ -4803,6 +4901,8 @@ fn wire_integer_format(s: &str) -> uint4 {
 }
 
 struct FactoryStore {
+    callable_readers: Vec<std::rc::Weak<semantic::CallableReaderState>>,
+    decoding_code: BTreeSet<(String, u64)>,
     /// Datatypes within this factory, sorted by `compareDependency` (C++ `tree`).
     tree: BTreeSet<TreeKey>,
     /// Cross-reference by (name, id) for named look-ups (C++ `nametree`, a
@@ -4825,6 +4925,8 @@ struct FactoryStore {
 impl FactoryStore {
     fn new() -> FactoryStore {
         FactoryStore {
+            callable_readers: Vec::new(),
+            decoding_code: BTreeSet::new(),
             tree: BTreeSet::new(),
             nametree: Vec::new(),
             typecache: std::array::from_fn(|_| std::array::from_fn(|_| None)),
@@ -4905,7 +5007,9 @@ pub struct TypeFactoryImpl {
     defaultfp: RefCell<Option<Rc<crate::fspec::ProtoModel>>>,
     /// The architecture's named prototype models, for a declarator that names
     /// one (`void (__stdcall *)(int4)`).  Empty until init.
-    proto_models: RefCell<BTreeMap<String, Rc<crate::fspec::ProtoModel>>>,
+    proto_models: RefCell<Rc<RefCell<BTreeMap<String, Rc<crate::fspec::ProtoModel>>>>>,
+    /// Shared live call-fixup authority, never a copied name-to-id registry.
+    injection_library: RefCell<Option<Rc<RefCell<crate::inject_sleigh::PcodeInjectLibrarySleigh>>>>,
     /// The engine's address-space manager (C++ `glb` is itself the
     /// `AddrSpaceManager`), shared from the owning architecture.  `None` until
     /// init.  `getTypeCode(PrototypePieces)` needs it for
@@ -4952,7 +5056,8 @@ impl TypeFactoryImpl {
             truncate_big_endian: Cell::new(false),
             store: RefCell::new(FactoryStore::new()),
             defaultfp: RefCell::new(None),
-            proto_models: RefCell::new(BTreeMap::new()),
+            proto_models: RefCell::new(Rc::new(RefCell::new(BTreeMap::new()))),
+            injection_library: RefCell::new(None),
             manager: RefCell::new(None),
             remote_types: RefCell::new(None),
             variant_layouts: RefCell::new(BTreeMap::new()),
@@ -4966,7 +5071,7 @@ impl TypeFactoryImpl {
     pub fn set_proto_models(
         &self,
         defaultfp: Option<Rc<crate::fspec::ProtoModel>>,
-        models: BTreeMap<String, Rc<crate::fspec::ProtoModel>>,
+        models: Rc<RefCell<BTreeMap<String, Rc<crate::fspec::ProtoModel>>>>,
     ) {
         *self.defaultfp.borrow_mut() = defaultfp;
         *self.proto_models.borrow_mut() = models;
@@ -4979,6 +5084,26 @@ impl TypeFactoryImpl {
     /// standalone object, so the owning architecture wires it in during `init`.
     pub fn set_proto_context(&self, manager: Rc<kuna_base::space::AddrSpaceManager>) {
         *self.manager.borrow_mut() = Some(manager);
+    }
+
+    /// Share the architecture's injection authority for nested source prototypes.
+    pub fn set_injection_library(
+        &self,
+        library: Rc<RefCell<crate::inject_sleigh::PcodeInjectLibrarySleigh>>,
+    ) {
+        *self.injection_library.borrow_mut() = Some(library);
+    }
+
+    /// Resolve a decoded name only after recursive prototype decoding has
+    /// released all library borrows. Unknown names remain source declarations.
+    pub fn bind_prototype_injection(&self, proto: &mut crate::fspec::FuncProto) -> KunaResult<()> {
+        let Some(name) = proto.injection_name()? else { return Ok(()) };
+        let Some(library) = self.injection_library.borrow().clone() else { return Ok(()) };
+        let id = library.borrow().base.get_payload_id(crate::pcodeinject::CALLFIXUP_TYPE, name.as_bytes());
+        if id >= 0 {
+            proto.set_injection(id, library);
+        }
+        Ok(())
     }
 
     // -- Size configuration --------------------------------------------------
@@ -5261,7 +5386,7 @@ impl TypeFactoryImpl {
     /// are matched by the functional comparator.  A newly added type with
     /// unassigned alignment (`alignment < 0`) gets its primitive alignment
     /// computed from the alignment map.
-    fn find_add(&self, mut ct: Datatype) -> KunaResult<Rc<Datatype>> {
+    fn find_add(&self, ct: Datatype) -> KunaResult<Rc<Datatype>> {
         if !ct.name.is_empty() {
             // If there is a name there must be an id.
             if ct.id == 0 {
@@ -5285,7 +5410,12 @@ impl TypeFactoryImpl {
                 return Ok(res); // Found it
             }
         }
-        // Add the new type to the trees (C++ clones; here `ct` is already owned).
+        self.insert_new(ct)
+    }
+
+    /// Normalize and intern a new owned type after its caller has resolved
+    /// whether an existing type may be reused.
+    fn insert_new(&self, mut ct: Datatype) -> KunaResult<Rc<Datatype>> {
         if ct.alignment < 0 {
             ct.align_size = self.primitive_align_size(ct.size as uint4)?;
             ct.alignment = self.alignment(ct.align_size as uint4)?;
@@ -5316,8 +5446,7 @@ impl TypeFactoryImpl {
 
     /// Remove an interned data-type from the trees by its current key (the
     /// `tree.erase(ct)` + optional `nametree.erase(ct)` the in-place mutators run
-    /// before re-inserting).  `also_name` removes the name cross-reference too
-    /// (only [`Self::set_name`] / [`Self::destroy_type`] re-key the name).
+    /// before re-inserting). `also_name` removes the name cross-reference too.
     fn erase_interned(&self, ct: &Rc<Datatype>, also_name: bool) {
         let mut store = self.store.borrow_mut();
         store.tree.remove(&TreeKey(Rc::clone(ct)));
@@ -5476,7 +5605,7 @@ impl TypeFactoryImpl {
     /// the completion from then on; any other stub keeps the upstream re-keying.
     fn publish_completed_record(&self, ct: &Rc<Datatype>, newrc: &Rc<Datatype>) -> KunaResult<()> {
         let Some(link) = &ct.record_completion else {
-            self.erase_interned(ct, false);
+            self.erase_interned(ct, true);
             return self.insert(Rc::clone(newrc));
         };
         self.erase_interned(ct, true);
@@ -5485,7 +5614,9 @@ impl TypeFactoryImpl {
             return Err(err);
         }
         *link.borrow_mut() = Rc::downgrade(newrc);
-        self.complete_record_typedefs(newrc)
+        self.complete_record_typedefs(newrc)?;
+        self.refresh_callable_readers();
+        Ok(())
     }
 
     /// C++ `TypeFactory::setEnumValues` (type.cc:4013-4019): install the
@@ -5496,11 +5627,17 @@ impl TypeFactoryImpl {
         ct: &Rc<Datatype>,
         nmap: std::collections::BTreeMap<u64, String>,
     ) -> KunaResult<Rc<Datatype>> {
-        self.erase_interned(ct, false);
+        if matches!(&ct.kind, DatatypeKind::Enum { namemap } if namemap == &nmap) {
+            return Ok(Rc::clone(ct));
+        }
         let mut newct = (**ct).clone();
         newct.set_name_map(nmap);
         let newrc = Rc::new(newct);
-        self.insert(Rc::clone(&newrc))?;
+        self.erase_interned(ct, true);
+        if let Err(err) = self.insert(Rc::clone(&newrc)) {
+            self.insert(Rc::clone(ct))?;
+            return Err(err);
+        }
         Ok(newrc)
     }
 
@@ -5515,6 +5652,7 @@ impl TypeFactoryImpl {
         format: uint4,
     ) -> KunaResult<Rc<Datatype>> {
         let id = if id == 0 { Datatype::hash_name(name) } else { id };
+        let id = if ct.is_variable_length() { Datatype::hash_size(id, ct.size) } else { id };
         if let Some(res) = self.find_by_id_local(name, id) {
             // C++ `if (ct != res->getTypedef())` throws.
             let same = matches!(res.get_typedef(), Some(t) if Rc::ptr_eq(t, ct));
@@ -5731,11 +5869,8 @@ impl TypeFactoryImpl {
     // registerProgram <coretypes> document, and the type elements embedded in
     // <mapsym> symbol answers all decode through here.  A faithful port of
     // `TypeFactory::decodeType`/`decodeTypeNoRef`/`decodeCoreTypes` with two
-    // deliberate reductions, both documented at their arms: a `metatype="code"`
-    // element's embedded <prototype> is skipped (the signature of a
-    // function-DEFINITION type; callee signatures travel on the <mapsym>
-    // <prototype> instead, decoded by `remote_provider`), and the C++-only
-    // partial metatypes fall back to an unknown base of the right size.
+    // Embedded callable prototypes use the same contextual codec as supplied
+    // entries. C++-internal partial metatypes retain their unknown-base fallback.
 
     /// Decode a data-type element — a `<typeref>` resolved against the container
     /// (querying the remote host on a miss, `TypeFactoryGhidra::findById`) or a
@@ -5772,6 +5907,7 @@ impl TypeFactoryImpl {
                 .ok_or_else(|| {
                     KunaError::lowlevel(format!("Unable to resolve type: {newname}"))
                 })?;
+            ct.host_type.set(true);
             decoder.close_element(elem_id)?;
             return Ok(ct);
         }
@@ -5791,7 +5927,10 @@ impl TypeFactoryImpl {
         sz: int4,
     ) -> KunaResult<Option<Rc<Datatype>>> {
         if let Some(ct) = self.find_by_id(n, id, sz) {
-            return Ok(Some(ct));
+            let failed_callable = ct.get_metatype() == type_metatype::TYPE_CODE
+                && ct.is_incomplete() && ct.get_code_prototype().is_none()
+                && !self.store.borrow().decoding_code.contains(&(ct.name.clone(), ct.id));
+            if !failed_callable || self.remote_types.borrow().is_none() { return Ok(Some(ct)); }
         }
         let remote = match self.remote_types.borrow().clone() {
             Some(r) => r,
@@ -5838,6 +5977,7 @@ impl TypeFactoryImpl {
         let elem_id = decoder.open_element()?;
         if elem_id == kuna_base::marshal::ELEM_VOID.get_id() {
             let ct = self.get_type_void_impl()?;
+            ct.host_type.set(true);
             decoder.close_element(elem_id)?;
             return Ok(ct);
         }
@@ -5848,10 +5988,13 @@ impl TypeFactoryImpl {
             }
             let base = self.decode_type(decoder)?;
             decoder.close_element(elem_id)?;
-            return self.get_qualified_type(base, qualifiers as u8);
+            let ct = self.get_qualified_type(base, qualifiers as u8)?;
+            ct.host_type.set(true);
+            return Ok(ct);
         }
         if elem_id == ELEM_DEF.get_id() {
             let ct = self.decode_typedef(decoder)?;
+            ct.host_type.set(true);
             decoder.close_element(elem_id)?;
             return Ok(ct);
         }
@@ -5862,7 +6005,12 @@ impl TypeFactoryImpl {
         let ct = match meta {
             TYPE_PTR => {
                 let ptrto = self.decode_type(decoder)?;
-                self.get_type_pointer(b.size, ptrto, b.wordsize.max(1) as uint4)?
+                let mut pointer = self.build_pointer(b.size, ptrto, b.wordsize.max(1) as uint4);
+                if let DatatypeKind::Pointer { spaceid, .. } = &mut pointer.kind { *spaceid = b.spaceid.clone(); }
+                b.apply_names(&mut pointer);
+                pointer.flags |= b.extra_flags(forcecore);
+                let pointer = self.find_add(pointer)?;
+                self.calc_truncate(pointer)?
             }
             TYPE_PTRREL => {
                 // Three children: ptrto, parent, <off> (type.cc:3024-3053).
@@ -5873,14 +6021,11 @@ impl TypeFactoryImpl {
                     .read_signed_integer_id(&kuna_base::marshal::ATTRIB_CONTENT)?
                     as int4;
                 decoder.close_element(off_el)?;
-                self.get_type_pointer_rel_full(
-                    b.size,
-                    parent,
-                    ptrto,
-                    b.wordsize.max(1) as int4,
-                    off,
-                    &b.name,
-                )?
+                let mut pointer = self.build_pointer_rel(b.size, ptrto, b.wordsize.max(1) as uint4, parent, off);
+                if let DatatypeKind::PointerRel { spaceid, .. } = &mut pointer.kind { *spaceid = b.spaceid.clone(); }
+                b.apply_names(&mut pointer);
+                pointer.flags |= b.extra_flags(forcecore);
+                self.find_add(pointer)?
             }
             TYPE_ARRAY => {
                 let arrayof = self.decode_type(decoder)?;
@@ -5924,26 +6069,53 @@ impl TypeFactoryImpl {
             TYPE_STRUCT => self.decode_composite(decoder, &b, forcecore, false)?,
             TYPE_UNION => self.decode_composite(decoder, &b, forcecore, true)?,
             TYPE_CODE => {
-                // decodeCode (type.cc:4941-4969).  An embedded <prototype> is the
-                // signature of a function-DEFINITION data-type; decoding it needs
-                // the (unported) FuncProto::decode, so it is SKIPPED here and the
-                // element yields the code type.  Callee/current-function
-                // signatures travel on the <mapsym> <prototype> (remote_provider),
-                // so nothing the Phase-3 pipeline consumes is lost.
-                while decoder.peek_element()? != 0 {
-                    let sub = decoder.open_element()?;
-                    decoder.close_element_skipping(sub)?;
-                }
-                if b.name.is_empty() {
-                    self.get_type_code()?
-                } else {
-                    // A named code type (the core "code" / a FunctionDefinition
-                    // shell), interned with the wire id.
+                let has_proto = decoder.peek_element()? == crate::remote_provider::ELEM_PROTOTYPE.get_id();
+                let identity = if has_proto && !b.varlength { Datatype::hash_size(b.id, b.size) } else { b.id };
+                let shell = if b.name.is_empty() {
                     let mut tc = Datatype::new_with_align(b.size.max(1), 1, TYPE_CODE);
                     tc.kind = DatatypeKind::Code { proto: None };
-                    tc.flags |= b.extra_flags(forcecore);
-                    b.apply_names(&mut tc);
-                    self.find_add(tc)?
+                    Rc::new(tc)
+                } else {
+                    match self.find_by_id_local(&b.name, identity) {
+                        Some(existing) => existing,
+                        None => {
+                            let mut tc = Datatype::new_with_align(b.size.max(1), 1, TYPE_CODE);
+                            b.apply_names(&mut tc);
+                            tc.id = identity;
+                            tc.flags |= b.extra_flags(forcecore);
+                            tc.kind = DatatypeKind::Code { proto: None };
+                            if has_proto {
+                                tc.flags |= flags::type_incomplete | flags::variable_length;
+                                tc.record_completion = Some(Rc::new(RefCell::new(std::rc::Weak::new())));
+                            }
+                            let tc = Rc::new(tc);
+                            self.insert(Rc::clone(&tc))?;
+                            tc
+                        }
+                    }
+                };
+                if has_proto {
+                    let _reservation = self.begin_code_decode(&shell);
+                    let proto = self.decode_proto(decoder, crate::fspec::PrototypeDecoding::LogicalCallable)?;
+                    let proto = if proto.logical_pieces().is_some_and(|p| self.logical_types_ready(p)) {
+                        match self.acquire_working_proto(&proto) {
+                            Ok(working) => working,
+                            Err(KunaError::ParamUnassigned { .. }) => proto,
+                            Err(error) => return Err(error),
+                        }
+                    } else { proto };
+                    proto.clear_reader_dependencies();
+                    let proto = Rc::new(proto);
+                    if b.name.is_empty() {
+                        let mut tc = (*shell).clone();
+                        tc.flags |= flags::variable_length | b.extra_flags(forcecore);
+                        tc.kind = DatatypeKind::Code { proto: Some(proto) };
+                        self.find_add(tc)?
+                    } else {
+                        self.complete_code(&shell, proto)?
+                    }
+                } else {
+                    shell
                 }
             }
             TYPE_VOID => self.get_type_void_impl()?,
@@ -5992,6 +6164,7 @@ impl TypeFactoryImpl {
                 }
             }
         };
+        ct.host_type.set(true);
         decoder.close_element(elem_id)?;
         Ok(ct)
     }
@@ -6045,6 +6218,9 @@ impl TypeFactoryImpl {
             meta,
         );
         stub.flags |= flags::type_incomplete | b.extra_flags(forcecore);
+        if is_union { stub.flags |= flags::needs_resolution; }
+        stub.host_type.set(true);
+        stub.record_completion = Some(Rc::new(RefCell::new(std::rc::Weak::new())));
         stub.kind = if is_union {
             DatatypeKind::Union { field: Vec::new() }
         } else {
@@ -6054,7 +6230,17 @@ impl TypeFactoryImpl {
             }
         };
         b.apply_names(&mut stub);
-        let stub = self.find_add(stub)?;
+        let stub = match self.find_by_id_local(&b.name, b.id) {
+            Some(existing) => existing,
+            None => self.find_add(stub)?,
+        };
+        if b.incomplete {
+            while decoder.peek_element()? != 0 {
+                let sub = decoder.open_element()?;
+                decoder.close_element_skipping(sub)?;
+            }
+            return Ok(stub);
+        }
         if !stub.is_incomplete() {
             // A complete definition with this (name,id) already exists — the
             // wire fields are redundant; consume them.
@@ -6094,6 +6280,16 @@ impl TypeFactoryImpl {
             let fct = self.decode_type(decoder)?;
             if sub == crate::prettyprint::ids::ELEM_BITFIELD.get_id() {
                 // <bitfield name id offset size=numbits first=lsb> (type.cc:864-894).
+                // The wire range is already placed, unlike the unplaced
+                // TypeBitField constructor. Include FIRST when recovering its
+                // byte span: BE translation depends on the container's end.
+                let bit_end = ffirst.checked_add(fsize)
+                    .filter(|_| ffirst >= 0 && fsize >= 0)
+                    .ok_or_else(|| KunaError::lowlevel("Invalid bitfield bit range"))?;
+                let byte_size = bit_end / 8 + int4::from(bit_end % 8 != 0);
+                if foffset < 0 || foffset > b.size || byte_size > b.size - foffset {
+                    return Err(KunaError::lowlevel("Bitfield exceeds its structure"));
+                }
                 let mut bf = TypeBitField::new(
                     if fid == int4::MIN { foffset } else { fid },
                     fsize,
@@ -6102,6 +6298,7 @@ impl TypeFactoryImpl {
                     fct,
                 );
                 bf.byte_offset = foffset;
+                bf.byte_size = byte_size;
                 bf.least_sig_bit = ffirst;
                 bit.push(bf);
             } else {
@@ -6117,7 +6314,15 @@ impl TypeFactoryImpl {
         if is_union {
             self.set_fields_union(&stub, fd, stub.size, stub.alignment, 0)
         } else {
-            self.set_fields_struct(&stub, fd, bit, stub.size, stub.alignment, 0)
+            // TypeStruct::decodeFields derives this property from both direct
+            // bitfields and nested field types before completing the record.
+            // The materialization rules consult it before tracing any access.
+            let extra_flags = if !bit.is_empty() || fd.iter().any(|field| field.field_type.has_bitfields()) {
+                flags::has_bitfields
+            } else {
+                0
+            };
+            self.set_fields_struct(&stub, fd, bit, stub.size, stub.alignment, extra_flags)
         }
     }
 
@@ -6150,6 +6355,8 @@ impl TypeFactoryImpl {
                 b.core = decoder.read_bool()?;
             } else if aid == ATTRIB_VARLENGTH.get_id() {
                 b.varlength = decoder.read_bool()?;
+            } else if aid == ATTRIB_INCOMPLETE.get_id() {
+                b.incomplete = decoder.read_bool()?;
             } else if aid == ATTRIB_ALIGNMENT.get_id() {
                 b.alignment = decoder.read_signed_integer()? as int4;
             } else if aid == ATTRIB_OPAQUESTRING.get_id() {
@@ -6163,9 +6370,7 @@ impl TypeFactoryImpl {
             } else if aid == kuna_base::marshal::ATTRIB_WORDSIZE.get_id() {
                 b.wordsize = decoder.read_unsigned_integer()?;
             } else if aid == kuna_base::marshal::ATTRIB_SPACE.get_id() {
-                // Pointer address-space hint; consume (the kuna pointer build
-                // resolves spaces downstream).
-                let _ = decoder.read_space();
+                b.spaceid = Some(decoder.read_space()?);
             }
         }
         if b.size < 0 {
@@ -6226,6 +6431,30 @@ impl TypeFactoryImpl {
         if let Some(td) = ct.get_typedef() {
             let td = Rc::clone(td);
             Self::order_recurse(deporder, mark, &td);
+        }
+        // Native C exports spell callable declarations, unlike upstream's
+        // TypeCode dependency walk. Their source return/formal types must be
+        // defined before a typedef that names them.
+        if let Some(proto) = ct.get_code_prototype() {
+            if let Some(source) = proto.logical_pieces() {
+                if let Some(output) = source.outtype.as_ref()
+                    .or_else(|| source.output_storage.as_ref().and_then(|p| p.type_.as_ref()))
+                {
+                    Self::order_recurse(deporder, mark, output);
+                }
+                for input in &source.intypes {
+                    Self::order_recurse(deporder, mark, input);
+                }
+            } else if proto.has_store() {
+                if let Some(output) = proto.get_output_type() {
+                    Self::order_recurse(deporder, mark, output);
+                }
+                for slot in 0..proto.num_params() {
+                    if let Some(input) = proto.get_param(slot).and_then(|p| p.get_type()) {
+                        Self::order_recurse(deporder, mark, input);
+                    }
+                }
+            }
         }
         let size = ct.num_depend();
         for i in 0..size {
@@ -6421,7 +6650,7 @@ impl TypeFactoryImpl {
                  not run)",
             )
         })?;
-        self.make_type_code_proto_with_model(proto, model)
+        self.make_type_code_proto_with_model(proto, model, false)
     }
 
     /// (kuna, Phase 3) `getTypeCode(PrototypePieces)` with an EXPLICIT
@@ -6434,22 +6663,15 @@ impl TypeFactoryImpl {
         proto: &crate::fspec::PrototypePieces,
         model: Rc<crate::fspec::ProtoModel>,
     ) -> KunaResult<Rc<Datatype>> {
-        self.make_type_code_proto_with_model(proto, model)
+        self.make_type_code_proto_with_model(proto, model, false)
     }
 
     fn make_type_code_proto_with_model(
         &self,
         proto: &crate::fspec::PrototypePieces,
         model: Rc<crate::fspec::ProtoModel>,
+        allow_pending_source: bool,
     ) -> KunaResult<Rc<Datatype>> {
-        let manager_rc = self.manager.borrow().clone().ok_or_else(|| {
-            KunaError::lowlevel(
-                "getTypeCode(PrototypePieces): no address-space manager (set_proto_context \
-                 not run)",
-            )
-        })?;
-        let voidtype = self.get_type_void_impl()?;
-
         // TypeCode(): Datatype(1,1,TYPE_CODE), flags |= type_incomplete.
         let mut tc = Datatype::new_with_align(1, 1, type_metatype::TYPE_CODE);
         tc.flags |= flags::type_incomplete;
@@ -6457,8 +6679,17 @@ impl TypeFactoryImpl {
         // setPrototype(this, proto, voidtype):
         //   flags |= variable_length;
         tc.flags |= flags::variable_length;
-        let mut fp = crate::fspec::FuncProto::new();
-        fp.seed_locked_from_pieces(proto, model, voidtype, self, &manager_rc)?;
+        let fp = crate::fspec::FuncProto::from_logical(proto, model, self)?;
+        let fp = if allow_pending_source && !self.logical_types_ready(proto) {
+            fp
+        } else {
+            match self.acquire_working_proto(&fp) {
+                Ok(working) => working,
+                Err(KunaError::ParamUnassigned { .. }) if allow_pending_source => fp,
+                Err(error) => return Err(error),
+            }
+        };
+        fp.clear_reader_dependencies();
         tc.kind = DatatypeKind::Code { proto: Some(Rc::new(fp)) };
 
         // markComplete(): clear type_incomplete.
@@ -6520,7 +6751,7 @@ impl TypeFactoryImpl {
     fn calc_truncate(&self, res: Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
         let alt = self.size_of_alt_pointer.get();
         let has_truncate = matches!(&res.kind, DatatypeKind::Pointer { truncate: Some(_), .. });
-        if has_truncate || res.size != alt {
+        if alt <= 0 || has_truncate || res.size != alt {
             return Ok(res);
         }
         let smaller = self.resize_pointer_impl(&res, self.size_of_pointer.get())?;
@@ -6578,13 +6809,19 @@ impl TypeFactoryImpl {
 
     /// Construct an absolute pointer (C++ `getTypePointer`, type.cc:4341-4350).
     fn get_type_pointer_impl(&self, s: int4, pt: Rc<Datatype>, ws: uint4) -> KunaResult<Rc<Datatype>> {
+        self.get_type_pointer_bank_impl(s, pt, ws, None)
+    }
+
+    fn get_type_pointer_bank_impl(&self, s: int4, pt: Rc<Datatype>, ws: uint4, bank: Option<Rc<AddrSpace>>) -> KunaResult<Rc<Datatype>> {
         let mut pt = pt;
         if pt.has_stripped() {
             if let Some(st) = pt.get_stripped() {
                 pt = st;
             }
         }
-        let res = self.find_add(self.build_pointer(s, pt, ws))?;
+        let mut pointer = self.build_pointer(s, pt, ws);
+        if let DatatypeKind::Pointer { spaceid, .. } = &mut pointer.kind { *spaceid = bank; }
+        let res = self.find_add(pointer)?;
         self.calc_truncate(res)
     }
 
@@ -6621,7 +6858,10 @@ impl TypeFactoryImpl {
             }
         }
         let ws = ptr.get_word_size().unwrap_or(1);
-        self.find_add(self.build_pointer(new_size, pt, ws))
+        let mut pointer = self.build_pointer(new_size, pt, ws);
+        if let DatatypeKind::Pointer { spaceid, .. } = &mut pointer.kind { *spaceid = ptr.get_pointer_space(); }
+        let pointer = self.find_add(pointer)?;
+        self.calc_truncate(pointer)
     }
 
     /// Build a [`DatatypeKind::Array`] value (C++ `TypeArray(n,ao)`,
@@ -6651,16 +6891,22 @@ impl TypeFactoryImpl {
 
     /// Create an (empty) incomplete structure (C++ `getTypeStruct`,
     /// type.cc:4388-4396).
-    fn get_type_struct_impl(&self, n: &str, declared: bool) -> KunaResult<Rc<Datatype>> {
+    fn get_type_struct_impl(&self, n: &str, declared: bool, synthesized: bool) -> KunaResult<Rc<Datatype>> {
+        if synthesized && self.find_by_name_impl(n).is_some() {
+            return Err(KunaError::lowlevel(format!("Synthesized record name is already held: {n}")));
+        }
         // TypeStruct(): incomplete, no fields.
         let mut tmp = Datatype::new_with_align(0, -1, type_metatype::TYPE_STRUCT);
         tmp.flags |= flags::type_incomplete;
+        if synthesized {
+            tmp.flags |= flags::kuna_synthesized;
+        }
         tmp.record_completion = declared.then(|| Rc::new(RefCell::new(std::rc::Weak::new())));
         tmp.kind = DatatypeKind::Struct { field: Vec::new(), bitfield: Vec::new() };
         tmp.name = n.to_string();
         tmp.display_name = n.to_string();
         tmp.id = Datatype::hash_name(n);
-        self.find_add(tmp)
+        if synthesized { self.insert_new(tmp) } else { self.find_add(tmp) }
     }
 
     /// Create a partial structure (C++ `getTypePartialStruct`,
@@ -6811,6 +7057,7 @@ impl TypeFactoryImpl {
             .get_ptr_to()
             .ok_or_else(|| KunaError::lowlevel("getTypePointerRel: parentPtr is not a pointer"))?;
         let mut tp = self.build_pointer_rel(size, ptr_to, ws, parent, off);
+        if let DatatypeKind::PointerRel { spaceid, .. } = &mut tp.kind { *spaceid = parent_ptr.get_pointer_space(); }
         // markEphemeral(typegrp): stripped = getTypePointer(size,ptrto,wordsize),
         // flags|=has_stripped, submeta=SUB_PTRREL_UNK if ptrto is TYPE_UNKNOWN.
         self.mark_ephemeral(&mut tp)?;
@@ -6862,6 +7109,7 @@ impl TypeFactoryImpl {
         // relative pointer (markEphemeral lowers it to SUB_PTRREL_UNK).
         tp.submeta = sub_metatype::SUB_PTRREL;
         tp.kind = DatatypeKind::PointerRel {
+            spaceid: None,
             ptrto: ptr_to,
             wordsize: ws,
             stripped: None,
@@ -6879,7 +7127,7 @@ impl TypeFactoryImpl {
             DatatypeKind::PointerRel { ptrto, wordsize, .. } => (Rc::clone(ptrto), *wordsize),
             _ => return Err(KunaError::lowlevel("markEphemeral: not a relative pointer")),
         };
-        let stripped = self.get_type_pointer_impl(tp.size, Rc::clone(&ptrto), ws)?;
+        let stripped = self.get_type_pointer_bank_impl(tp.size, Rc::clone(&ptrto), ws, tp.get_pointer_space())?;
         if let DatatypeKind::PointerRel { stripped: slot, .. } = &mut tp.kind {
             *slot = Some(stripped);
         }
@@ -7090,7 +7338,7 @@ impl TypeFactoryImpl {
                     return Ok((None, off, None, 0)); // Don't shift beyond container
                 }
                 let orig_pointer =
-                    self.get_type_pointer_impl(ptr.size, Rc::clone(&parent), *wordsize)?;
+                    self.get_type_pointer_bank_impl(ptr.size, Rc::clone(&parent), *wordsize, ptr.get_pointer_space())?;
                 let off = rel_off;
                 if rel_off == 0 && *offset != 0 {
                     // Recovering the start of the parent is still downchaining.
@@ -7137,7 +7385,7 @@ impl TypeFactoryImpl {
         if ptrto.is_enum_type() {
             // Go "into" the enumeration.
             let tmp = self.get_base_impl(1, type_metatype::TYPE_UINT)?;
-            let result = self.get_type_pointer_impl(ptr.size, tmp, wordsize)?;
+            let result = self.get_type_pointer_bank_impl(ptr.size, tmp, wordsize, ptr.get_pointer_space())?;
             return Ok((Some(result), 0, None, 0));
         }
         let meta = ptrto.get_metatype();
@@ -7154,16 +7402,55 @@ impl TypeFactoryImpl {
             Some(p) => p,
             None => return Ok((None, off, par, par_off)),
         };
-        let result = if !is_array {
-            self.get_type_pointer_strip_array_impl(ptr.size, pt, wordsize)?
-        } else {
-            self.get_type_pointer_impl(ptr.size, pt, wordsize)?
-        };
+        let pt = if !is_array { pt.get_array_base().unwrap_or(pt) } else { pt };
+        let result = self.get_type_pointer_bank_impl(ptr.size, pt, wordsize, ptr.get_pointer_space())?;
         Ok((Some(result), off, par, par_off))
     }
 }
 
 impl TypeFactory for TypeFactoryImpl {
+    fn reserve_enum(&self, name: &str, id: u64, size: int4, meta: type_metatype) -> KunaResult<Rc<Datatype>> {
+        if let Some(existing) = self.find_by_id_local(name, id) { return Ok(existing); }
+        let mut ty = Datatype::new(size, meta);
+        ty.name = name.to_owned(); ty.display_name = name.to_owned(); ty.id = id;
+        ty.flags |= flags::enumtype;
+        ty.metatype = if meta == type_metatype::TYPE_ENUM_INT { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
+        ty.kind = DatatypeKind::Enum { namemap: BTreeMap::new() };
+        let ty = Rc::new(ty);
+        self.insert(Rc::clone(&ty))?;
+        Ok(ty)
+    }
+    fn reserve_record(&self, name: &str, id: u64, is_union: bool) -> KunaResult<Rc<Datatype>> {
+        self.reserve_nominal(name, id, if is_union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT })
+    }
+    fn reserve_code(&self, name: &str, id: u64) -> KunaResult<Rc<Datatype>> {
+        self.reserve_nominal(name, id, type_metatype::TYPE_CODE)
+    }
+    fn complete_code(&self, shell: &Rc<Datatype>, proto: Rc<crate::fspec::FuncProto>) -> KunaResult<Rc<Datatype>> {
+        let mut canonical = crate::fspec::FuncProto::new();
+        canonical.copy(&proto);
+        canonical.clear_reader_dependencies();
+        let mut completed = (**shell).clone();
+        completed.flags &= !flags::type_incomplete;
+        completed.flags |= flags::variable_length;
+        completed.kind = DatatypeKind::Code { proto: Some(Rc::new(canonical)) };
+        if !shell.is_incomplete() {
+            if shell.compare_dependency(&completed)? != 0 {
+                return Err(KunaError::lowlevel(format!("Trying to alter definition of type: {}", shell.get_name())));
+            }
+            return Ok(Rc::clone(shell));
+        }
+        let completed = Rc::new(completed);
+        self.publish_completed_record(shell, &completed)?;
+        Ok(completed)
+    }
+    fn logical_proto(&self, pieces: &crate::fspec::PrototypePieces, model: &str, input_locked: bool, no_return: bool) -> KunaResult<Rc<crate::fspec::FuncProto>> {
+        let mut proto = crate::fspec::FuncProto::from_logical(pieces, self.resolve_proto_model(model)?, self)?;
+        proto.set_input_lock(input_locked);
+        proto.set_model_lock(!model.is_empty() && model != "default");
+        proto.set_no_return(no_return);
+        Ok(self.retain_source_proto(Rc::new(proto)))
+    }
     fn get_size_of_int(&self) -> int4 {
         self.size_of_int.get()
     }
@@ -7249,11 +7536,20 @@ impl TypeFactory for TypeFactoryImpl {
         proto: &crate::fspec::PrototypePieces,
         model: &str,
     ) -> KunaResult<Rc<Datatype>> {
-        let named = self.proto_models.borrow().get(model).cloned();
-        match named {
-            Some(model) => self.get_type_code_proto_model(proto, model),
-            None => self.make_type_code_proto(proto),
-        }
+        // This is the C-declarator entry: TypeDeclarator::getModel uses the
+        // actual default when a recognized convention has no registered model.
+        // Keep strict model queries and supplied host-unknown models separate.
+        let named = if model.is_empty() || model == "default" {
+            None
+        } else {
+            self.proto_models.borrow().borrow().get(model).cloned()
+        };
+        let model = named.or_else(|| self.defaultfp.borrow().clone()).ok_or_else(|| {
+            KunaError::lowlevel(
+                "TypeFactory::getTypeCode(PrototypePieces) requires a default prototype model",
+            )
+        })?;
+        self.make_type_code_proto_with_model(proto, model, true)
     }
 
     fn get_type_pointer_strip_array(
@@ -7325,7 +7621,10 @@ impl TypeFactory for TypeFactoryImpl {
         self.get_type_array_impl(as_, ao)
     }
     fn get_type_struct(&self, n: &str) -> KunaResult<Rc<Datatype>> {
-        self.get_type_struct_impl(n, false)
+        self.get_type_struct_impl(n, false, false)
+    }
+    fn kuna_synthesized_record(&self, n: &str) -> KunaResult<Rc<Datatype>> {
+        self.get_type_struct_impl(n, false, true)
     }
     fn get_type_partial_struct(
         &self,
@@ -7342,7 +7641,7 @@ impl TypeFactory for TypeFactoryImpl {
         if is_union {
             self.get_type_union_impl(n, true)
         } else {
-            self.get_type_struct_impl(n, true)
+            self.get_type_struct_impl(n, true, false)
         }
     }
     fn get_type_partial_union(
@@ -8189,7 +8488,7 @@ mod tests {
     ) -> Datatype {
         let mut pr = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTRREL);
         pr.submeta = sub_metatype::SUB_PTRREL;
-        pr.kind = DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset };
+        pr.kind = DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset, spaceid: None };
         pr
     }
 
@@ -8643,6 +8942,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dependent_order_callable_source_signature() {
+        use crate::fspec::{FuncProto, ProtoModel, PrototypePieces};
+        let f = factory();
+        let byte = f.get_base(1, type_metatype::TYPE_UINT).unwrap();
+        let flags = f.get_typedef(&byte, "Flags", 0, 0).unwrap();
+        let integer = f.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let result = f.get_typedef(&integer, "Result", 0, 0).unwrap();
+        let pieces = PrototypePieces {
+            outtype: Some(Rc::clone(&result)),
+            intypes: vec![Rc::clone(&flags)],
+            innames: vec!["value".into()],
+            ..PrototypePieces::default()
+        };
+        let model = Rc::new(ProtoModel::new(&kuna_base::space::AddrSpaceManager::new()));
+        let proto = FuncProto::from_logical(&pieces, model, &f).unwrap();
+        let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+        code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+        let code = f.find_add(code).unwrap();
+        let pointer = f.get_type_pointer(8, code, 1).unwrap();
+        let callback = f.get_typedef(&pointer, "Callback", 0, 0).unwrap();
+        let order = f.dependent_order();
+        let position = |ty: &Rc<Datatype>| order.iter().position(|item| Rc::ptr_eq(item, ty)).unwrap();
+        assert!(position(&flags) < position(&callback));
+        assert!(position(&result) < position(&callback));
+        let text = crate::printc::render_type_definitions(&order, &crate::printc::RealTypeCtx::OFF);
+        assert!(text.find(" Flags;").unwrap() < text.find("(*Callback)").unwrap(), "{text}");
+        assert!(text.find(" Result;").unwrap() < text.find("(*Callback)").unwrap(), "{text}");
+    }
+
     /// `dependentOrder` on a POINTER CYCLE (`struct A { B *pb; }; struct B
     /// { A *pa; };`, built through the real incomplete-struct + assignRawFields
     /// flow) terminates — the `Rc::as_ptr` mark set breaks the cycle — and each
@@ -8989,7 +9318,7 @@ mod tests {
         model.output_mut().finish_decode();
         let model = Rc::new(model);
         f.set_proto_context(Rc::clone(&manager));
-        f.set_proto_models(Some(Rc::clone(&model)), std::collections::BTreeMap::from([("__stdcall".into(), model)]));
+        f.set_proto_models(Some(Rc::clone(&model)), Rc::new(RefCell::new(std::collections::BTreeMap::from([("__stdcall".into(), model)]))));
         let outer = r#"<def name="Outer" id="0x500000000000001"><def name="Alias" id="0x500000000000000"><typeref name="Callback" id="0x600000000000000" size="1"/></def></def>"#;
         let other = r#"<type name="Other" id="0x600000000000001" metatype="code" size="1"><prototype extrapop="0" model="__stdcall" modellock="true" dotdotdot="true" voidlock="true"><returnsym typelock="true"><addr/><type name="int" id="0xc000000000000095" metatype="int" size="4"/></returnsym><internallist/></prototype></type>"#;
         for nullary in [false, true] {
@@ -9059,6 +9388,7 @@ mod tests {
                     assert!(decoded.is_err(), "cross-byte field exceeds its structure");
                 } else {
                     let record = decoded.unwrap();
+                    assert!(record.has_bitfields(), "decoded field must admit bitfield recovery");
                     let DatatypeKind::Struct { bitfield, .. } = &record.kind else { panic!("structure") };
                     let bits = bitfield[0].bits();
                     assert_eq!((bits.byte_offset, bits.byte_size, bits.least_sig_bit, bits.num_bits), (0, 2, 3, 8));
@@ -9067,6 +9397,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn wire_nested_bitfield_marks_the_containing_record() {
+        let manager = kuna_base::space::AddrSpaceManager::new();
+        let f = factory();
+        let outer = decode_regression_type(&f, &manager,
+            r#"<type name="OuterBits" size="8" metatype="struct"><field name="inner" id="4" offset="4"><type name="InnerBits" size="4" metatype="struct"><bitfield name="middle" id="0" offset="0" first="3" size="8"><type name="" metatype="uint" size="4"/></bitfield></type></field></type>"#).unwrap();
+        assert!(outer.has_bitfields());
+        let DatatypeKind::Struct { field, bitfield } = &outer.kind else { panic!("structure") };
+        assert!(bitfield.is_empty(), "outer record has only a nested bitfield");
+        assert_eq!(field[0].offset, 4);
+        assert!(field[0].field_type.has_bitfields());
+    }
+
+    #[test]
+    fn wire_bitfield_short_placement_at_second_half_retains_container_end() {
+        let manager = kuna_base::space::AddrSpaceManager::new();
+        let f = factory();
+        f.set_truncate_big_endian(true);
+        let record = decode_regression_type(&f, &manager,
+            r#"<type name="BitsOff2" size="4" metatype="struct"><bitfield name="middle" id="0" offset="2" first="3" size="8"><type name="" metatype="uint" size="4"/></bitfield></type>"#).unwrap();
+        let DatatypeKind::Struct { bitfield, .. } = &record.kind else { panic!("structure") };
+        let bits = bitfield[0].bits();
+        assert_eq!((bits.byte_offset, bits.byte_size, bits.least_sig_bit, bits.num_bits), (2, 2, 3, 8));
+        let container = crate::bitfield::BitRange::new(0, 4, 0, 32, true);
+        assert_eq!(container.translate_lsb(&bits), 3);
     }
 
     #[test]
@@ -9115,6 +9472,19 @@ mod tests {
             assert_eq!(field.get_id(), complete.get_field(0).unwrap().field_type.get_id());
             assert_eq!((field.get_metatype(), field.get_size()), (type_metatype::TYPE_INT, 4));
         }
+    }
+
+    #[test]
+    fn decoded_union_and_its_alias_require_value_resolution() {
+        let f = factory();
+        let manager = kuna_base::space::AddrSpaceManager::new();
+        let union = decode_regression_type(&f, &manager,
+            r#"<type name="SourceUnion" id="311" size="4" alignment="4" metatype="union"><field name="signed_value" offset="0"><type name="" size="4" metatype="int"/></field><field name="unsigned_value" offset="0"><type name="" size="4" metatype="uint"/></field></type>"#).unwrap();
+        assert!(union.needs_resolution());
+        let alias = f.get_typedef(&union, "SourceUnionAlias", 312, 0).unwrap();
+        assert!(alias.needs_resolution());
+        let pointer = f.get_type_pointer(8, alias, 1).unwrap();
+        assert!(pointer.needs_resolution());
     }
 
     #[test]
@@ -9206,6 +9576,18 @@ mod tests {
     }
 
     #[test]
+    fn unconfigured_alternate_pointer_width_does_not_enable_truncation() {
+        let f = factory();
+        let value = f.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let pointer = f.get_type_pointer(0, value, 1).unwrap();
+        let DatatypeKind::Pointer { truncate, .. } = &pointer.kind else {
+            panic!("expected pointer");
+        };
+        assert_eq!(pointer.get_size(), 0);
+        assert!(truncate.is_none(), "zero alternate width disables truncation");
+    }
+
+    #[test]
     fn wire_pointer_banks_remain_distinct_through_interning_and_encoding() {
         use kuna_base::marshal::{Decoder, PackedDecode, PackedEncode};
         use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
@@ -9265,8 +9647,13 @@ mod tests {
         for relative in [false, true] {
             let ram = decode("INTMEM", relative).unwrap();
             let sfr = decode("SFR", relative).unwrap();
+            assert!(Rc::ptr_eq(&ram, &decode("INTMEM", relative).unwrap()));
+            assert!(Rc::ptr_eq(&sfr, &decode("SFR", relative).unwrap()));
+            assert_eq!(ram.compare_dependency(&ram).unwrap(), 0);
+            assert_eq!(sfr.compare_dependency(&sfr).unwrap(), 0);
             assert_ne!(ram.compare(&sfr, 10).unwrap(), 0);
             assert_ne!(ram.compare_dependency(&sfr).unwrap(), 0);
+            assert_eq!(ram.compare_dependency(&sfr).unwrap(), -sfr.compare_dependency(&ram).unwrap());
             for (pointer, bank) in [(ram, "INTMEM"), (sfr, "SFR")] {
                 assert_eq!(pointer.get_pointer_space().unwrap().get_name(), bank);
                 assert_eq!((pointer.get_size(), pointer.get_word_size()), (1, Some(1)));
@@ -9280,6 +9667,14 @@ mod tests {
                 assert_eq!(restored.is_pointer_rel(), relative);
             }
         }
+        let named = r#"<type name="BankRelative" id="0x42" size="1" metatype="ptrrel" space="INTMEM"><type name="" size="1" metatype="uint"/><type name="" size="4" metatype="array" arraysize="4"><type name="" size="1" metatype="uint"/></type><off>1</off></type>"#;
+        let original = decode_regression_type(&f, &manager, named).unwrap();
+        let repeated = decode_regression_type(&f, &manager, named).unwrap();
+        assert!(Rc::ptr_eq(&original, &repeated));
+        assert_eq!(original.get_name(), "BankRelative");
+        assert_eq!(original.get_pointer_space().unwrap().get_name(), "INTMEM");
+        assert!(original.is_pointer_rel());
+        assert_eq!(original.compare_dependency(&original).unwrap(), 0);
         assert!(decode("missing", false).is_err());
     }
 
@@ -9336,7 +9731,7 @@ mod tests {
         let retry = f.get_type_struct("Retry").unwrap();
         let value = f.get_base(4, type_metatype::TYPE_INT).unwrap();
         let completed = f.assign_raw_fields_struct(
-            &retry, vec![TypeField::new(0, 0, "value", value)], vec![],
+            &retry, vec![TypeField::new(0, -1, "value", value)], vec![],
         ).unwrap();
         let found = f.find_by_name("Retry").unwrap().unwrap();
         assert_eq!((found.get_size(), found.is_incomplete()), (4, false));
@@ -9377,6 +9772,57 @@ mod tests {
         assert_eq!(identity(&anonymous), (crate::prettyprint::ids::ELEM_TYPE.get_id(), None, Some(1)));
     }
 
+    #[test]
+    fn held_callable_reader_owns_same_code_completion_without_recursive_backedge() {
+        for hold_before_completion in [false, true] {
+            let (reader, weak_node, weak_code, weak_proto, weak_factory) = {
+                let f = Rc::new(factory());
+                let manager = Rc::new(kuna_base::space::AddrSpaceManager::new());
+                let model = Rc::new(crate::fspec::ProtoModel::new(&manager));
+                let node = f.reserve_record("HeldNode", 701, false).unwrap();
+                let node_ptr = f.get_type_pointer(8, Rc::clone(&node), 1).unwrap();
+                let pieces = crate::fspec::PrototypePieces {
+                    outtype: Some(f.get_type_void().unwrap()),
+                    intypes: vec![Rc::clone(&node_ptr)],
+                    innames: vec!["node".to_owned()],
+                    first_var_arg_slot: -1,
+                    ..Default::default()
+                };
+                let proto = Rc::new(crate::fspec::FuncProto::from_logical(&pieces, model, f.as_ref()).unwrap());
+                let code_shell = f.reserve_code("HeldCallback", 702).unwrap();
+                let code = f.complete_code(&code_shell, proto).unwrap();
+                let weak_proto = Rc::downgrade(code.get_code_prototype().unwrap());
+                let weak_code = Rc::downgrade(&code);
+                let alias = f.get_typedef(&code, "HeldCallbackAlias", 703, 0).unwrap();
+                let early = hold_before_completion.then(|| f.hold_callable(Rc::clone(&alias)).unwrap());
+                let callback_ptr = f.get_type_pointer(8, Rc::clone(&alias), 1).unwrap();
+                let full_node = f.set_fields_struct_raw(&node, vec![
+                    TypeField::new(0, 0, "next", node_ptr),
+                    TypeField::new(1, 8, "callback", callback_ptr),
+                ], vec![], 16, 8, 0).unwrap();
+                let weak_node = Rc::downgrade(&full_node);
+                let reader = early.unwrap_or_else(|| f.hold_callable(Rc::clone(&alias)).unwrap());
+                assert!(Rc::ptr_eq(reader.datatype(), &alias));
+                let weak_factory = Rc::downgrade(&f);
+                f.clear_noncore();
+                (reader, weak_node, weak_code, weak_proto, weak_factory)
+            };
+            assert!(weak_factory.upgrade().is_none());
+            let prototype = reader.prototype().unwrap();
+            let parameter = prototype.get_param(0).unwrap();
+            let node = parameter.get_type().unwrap().get_ptr_to().unwrap();
+            assert_eq!(node.get_size(), 16);
+            assert_eq!(node.get_field(1).unwrap().name, "callback");
+            assert!(weak_code.upgrade().is_some());
+            drop(node);
+            drop(prototype);
+            drop(reader);
+            assert!(weak_node.upgrade().is_none());
+            assert!(weak_code.upgrade().is_none());
+            assert!(weak_proto.upgrade().is_none());
+        }
+    }
+
 
     #[test]
     fn source_edit_flush_refreshes_nested_layouts_without_mutating_old_values() {
@@ -9411,6 +9857,205 @@ mod tests {
         }
     }
 
+
+    fn declaration_application_fixture() -> (TypeFactoryImpl, Rc<crate::fspec::ProtoModel>, Rc<AddrSpace>) {
+        let f = factory();
+        let mut manager = kuna_base::space::AddrSpaceManager::new();
+        manager.insert_space(Rc::new(kuna_base::space::ConstantSpace::new())).unwrap();
+        let register = Rc::new(AddrSpace::new(
+            kuna_base::space::spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 1, 0, 1, 1,
+        ));
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.set_default_code_space(1).unwrap();
+        manager.set_default_data_space(1).unwrap();
+        let manager = Rc::new(manager);
+        f.set_proto_context(Rc::clone(&manager));
+        let mut model = crate::fspec::ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        (f, Rc::new(model), register)
+    }
+
+    #[test]
+    fn source_application_records_only_ready_unassigned_declaration_diagnostics() {
+        use crate::fspec::{FuncProto, PrototypePieces};
+        use kuna_base::error::KunaError;
+        let (f, model, _) = declaration_application_fixture();
+        let pieces = PrototypePieces {
+            outtype: Some(f.get_type_void().unwrap()),
+            intypes: vec![f.get_base(4, type_metatype::TYPE_INT).unwrap()],
+            innames: vec!["value".into()],
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let mut source = FuncProto::from_logical(&pieces, model, &f).unwrap();
+        source.set_model_lock(false);
+        source.set_extra_pop(12);
+        source.set_no_return(true);
+        source.set_inject_id(7);
+        assert!(matches!(f.acquire_working_proto(&source), Err(KunaError::ParamUnassigned { .. })));
+        for output_locked in [false, true] {
+            source.set_output_lock(output_locked);
+            source.set_model_lock(false);
+            assert!(!source.is_model_locked());
+            let working = f.apply_source_prototype(&source).unwrap();
+            assert!(working.has_input_errors());
+            assert_eq!(working.num_params(), 0);
+            assert_eq!(working.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+            assert!(working.logical_pieces().is_none());
+            assert!(!working.is_input_locked());
+            assert_eq!(working.is_output_locked(), output_locked);
+            assert!(!working.is_model_locked());
+            assert_eq!(working.get_extra_pop(), 12);
+            assert!(working.is_no_return() && working.is_inline());
+            assert_eq!(working.get_inject_id(), 7);
+        }
+        assert!(!source.has_input_errors());
+        assert_eq!(source.num_params(), 1);
+        assert_eq!(source.get_param(0).unwrap().get_name(), "value");
+        assert!(source.get_param(0).unwrap().get_address().is_invalid());
+        assert!(source.logical_pieces().is_some());
+    }
+
+    #[test]
+    fn source_output_refusal_keeps_physical_recovery_open_without_mutating_the_declaration() {
+        use crate::fspec::{FuncProto, PrototypePieces};
+        let (f, model, _) = declaration_application_fixture();
+        let word = f.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let shell = f.get_type_struct("UnassignedReturn").unwrap();
+        let output = f.set_fields_struct_raw(&shell,
+            vec![TypeField::new(0, 0, "word", word)], vec![], 8, 8, 0).unwrap();
+        for first_var_arg_slot in [-1, 0] {
+            let pieces = PrototypePieces {
+                outtype: Some(Rc::clone(&output)),
+                first_var_arg_slot,
+                ..Default::default()
+            };
+            let mut source = FuncProto::from_logical(&pieces, Rc::clone(&model), &f).unwrap();
+            source.set_extra_pop(12);
+            source.set_no_return(true);
+            source.set_inject_id(7);
+            assert!(source.is_input_locked() && source.is_output_locked());
+            assert!(matches!(f.acquire_working_proto(&source), Err(KunaError::ParamUnassigned { .. })));
+            let working = f.apply_source_prototype(&source).unwrap();
+            assert!(working.has_input_errors());
+            assert!(!working.is_input_locked() && !working.is_output_locked());
+            assert_eq!(working.num_params(), 0);
+            assert_eq!(working.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+            assert_eq!(working.is_dotdotdot(), first_var_arg_slot >= 0);
+            assert_eq!(working.get_first_var_arg_slot(), first_var_arg_slot);
+            assert!(working.is_model_locked() && working.has_matching_model(&model));
+            assert_eq!(working.get_extra_pop(), 12);
+            assert!(working.is_no_return() && working.is_inline());
+            assert_eq!(working.get_inject_id(), 7);
+            assert!(Rc::ptr_eq(source.get_output_type().unwrap(), &output));
+            assert!(source.is_input_locked() && source.is_output_locked() && source.is_model_locked());
+            assert_eq!(source.num_params(), 0);
+            assert!(!source.has_input_errors());
+            assert!(source.logical_pieces().is_some());
+        }
+        let pieces = PrototypePieces {
+            outtype: Some(f.get_type_void().unwrap()),
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let source = FuncProto::from_logical(&pieces, model, &f).unwrap();
+        let working = f.apply_source_prototype(&source).unwrap();
+        assert!(!working.has_input_errors());
+        assert!(working.is_input_locked() && working.is_output_locked() && working.is_model_locked());
+    }
+
+    #[test]
+    fn source_application_does_not_relax_pending_physical_or_explicit_storage() {
+        use crate::fspec::{FuncProto, ParameterPieces, PrototypePieces, parameter_pieces_flags};
+        use kuna_base::error::KunaError;
+        let (f, model, register) = declaration_application_fixture();
+        let pending = f.get_type_struct("PendingEntry").unwrap();
+        let mut pieces = PrototypePieces {
+            outtype: Some(f.get_type_void().unwrap()),
+            intypes: vec![Rc::clone(&pending)],
+            innames: vec!["value".into()],
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let source = FuncProto::from_logical(&pieces, Rc::clone(&model), &f).unwrap();
+        assert!(matches!(f.apply_source_prototype(&source), Err(KunaError::Lowlevel { .. })));
+        assert!(pending.is_incomplete());
+        let integer = f.get_base(4, type_metatype::TYPE_INT).unwrap();
+        pieces.intypes[0] = Rc::clone(&integer);
+        pieces.input_storage.push((0, ParameterPieces {
+            addr: kuna_base::address::Address::new(register, 0x20),
+            type_: Some(Rc::clone(&integer)), flags: parameter_pieces_flags::TYPELOCK,
+        }));
+        let placed = FuncProto::from_logical(&pieces, Rc::clone(&model), &f).unwrap();
+        assert!(matches!(f.apply_source_prototype(&placed), Err(KunaError::ParamUnassigned { .. })));
+        pieces.input_storage[0].1.addr = kuna_base::address::Address::new_invalid();
+        pieces.input_storage[0].1.flags |= parameter_pieces_flags::CUSTOM_STORAGE;
+        let custom = FuncProto::from_logical(&pieces, Rc::clone(&model), &f).unwrap();
+        assert!(matches!(f.apply_source_prototype(&custom), Err(KunaError::ParamUnassigned { .. })));
+        let mut physical = FuncProto::new();
+        physical.set_internal(model, f.get_type_void().unwrap());
+        physical.set_param(0, "value", &ParameterPieces {
+            addr: kuna_base::address::Address::new_invalid(),
+            type_: Some(integer), flags: parameter_pieces_flags::TYPELOCK,
+        });
+        assert!(matches!(f.apply_source_prototype(&physical), Err(KunaError::ParamUnassigned { .. })));
+    }
+
+    #[test]
+    fn source_application_discards_successful_assignment_with_missing_required_storage() {
+        use crate::fspec::{FuncProto, ParamEntry, ParameterPieces, PrototypePieces};
+        use crate::modelrules::{AssignAction, DatatypeFilter, ModelRule, SizeRestriction};
+        let (f, model, register) = declaration_application_fixture();
+        let manager = f.manager.borrow().clone().unwrap();
+        let mut model = Rc::try_unwrap(model).unwrap();
+        model.input_mut().push_entry(ParamEntry::seed(
+            0, type_class::TYPECLASS_GENERAL, Rc::clone(&register),
+            0x20, 16, 1, 4, 0, true, false, &[], &manager,
+        ).unwrap());
+        model.input_mut().push_model_rule(ModelRule::from_components(
+            DatatypeFilter::MetaType {
+                meta_type: type_metatype::TYPE_STRUCT, size: SizeRestriction::new(0, 0),
+            },
+            AssignAction::GotoStack { stack_entry: Some(0) },
+        ));
+        let model = Rc::new(model);
+        let shell = f.reserve_record("OpaqueEntry", 0xd130, false).unwrap();
+        let opaque = f.set_fields_struct_raw(&shell, Vec::new(), Vec::new(), 0, 1, 0).unwrap();
+        assert!(!opaque.is_incomplete(), "the source view is terminal, not pending completion");
+        let mut pieces = PrototypePieces {
+            outtype: Some(f.get_type_void().unwrap()),
+            intypes: vec![Rc::clone(&opaque), f.get_base(4, type_metatype::TYPE_INT).unwrap()],
+            innames: vec!["opaque".into(), "value".into()],
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let source = FuncProto::from_logical(&pieces, Rc::clone(&model), &f).unwrap();
+        let mut assigned = Vec::new();
+        model.assign_parameter_storage(&pieces, &mut assigned, false, &f, &manager).unwrap();
+        assert!(assigned[1].addr.is_invalid());
+        assert!(!assigned[2].addr.is_invalid(), "the allocator made a partial assignment");
+        let error = f.acquire_working_proto(&source).unwrap_err();
+        assert_eq!(error.to_string(), "Callable input storage unavailable");
+        let working = f.apply_source_prototype(&source).unwrap();
+        assert!(working.has_input_errors());
+        assert_eq!(working.num_params(), 0, "discard even the successfully placed later input");
+        assert!(working.logical_pieces().is_none());
+        assert!(!source.has_input_errors());
+        assert_eq!(source.num_params(), 2);
+        assert!(Rc::ptr_eq(source.get_param(0).unwrap().get_type().unwrap(), &opaque));
+        assert!(source.get_param(1).unwrap().get_address().is_invalid());
+
+        pieces.input_storage.push((0, ParameterPieces {
+            addr: kuna_base::address::Address::new_invalid(),
+            type_: Some(opaque), flags: 0,
+        }));
+        let supplied = FuncProto::from_logical(&pieces, model, &f).unwrap();
+        assert_eq!(
+            f.apply_source_prototype(&supplied).unwrap_err().to_string(),
+            "Callable input storage unavailable",
+            "an explicit storage record never enters source refusal recovery",
+        );
+    }
 
     #[test]
     fn configured_factory_preserves_scalar_limit_and_unknown_array_extent() {

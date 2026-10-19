@@ -32,6 +32,7 @@ use kuna_console::project::{
 // section/segment walks the zero-discovery diagnosis reads.
 use object::{Object, ObjectSection, ObjectSegment};
 use kuna_decomp::decompile_drive::{print_c_types, LineMapping, TypeInfo, VarInfo};
+use kuna_decomp::kuna_exportcall::ExportSpec;
 use kuna_decomp::kuna_structsynth::shard::{self, ShardHook};
 use kuna_decomp::options::{OptionDatabase, KUNA_OPTION_NAMES};
 
@@ -670,8 +671,18 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
         kuna_decomp::kuna_elemptr::without_objects(prog.arch_mut());
     }
     let inventory = dir.join(jobs::INVENTORY_FILE);
-    if !args.jobs_full_load && inventory.is_file() {
-        seed_worker_inventory(&mut prog, &inventory.to_string_lossy())?;
+    if inventory.is_file() {
+        let inventory = jobs::read_spec(&inventory.to_string_lossy())?;
+        receive_worker_inventory(&mut prog, inventory, args.jobs_full_load)?;
+    }
+    // Even a worker retired before its first chunk may publish a type block.
+    // Reserve the parent's complete source inventory before any such render.
+    kuna_console::project::prepare_type_names(&mut prog);
+    let export_spec = dir.join(jobs::EXPORT_SPEC_FILE);
+    if export_spec.is_file() {
+        let spec = jobs::read_export_spec(&export_spec)?;
+        kuna_console::project::install_export_callables(&mut prog, &spec)
+            .map_err(|e| e.to_string())?;
     }
     faults.after_load(dir);
     arm_fn_budgets(&mut prog, args);
@@ -784,12 +795,13 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
                         }
                     }
                 },
-            );
+            ).map_err(|e| e.to_string())?;
             if let Some(e) = write_error.into_inner() {
                 return Err(e);
             }
             if converge {
-                converge_synthesized_structs(&mut prog, &opts, &replay, &mut held);
+                converge_synthesized_structs(&mut prog, &opts, &replay, &mut held)
+                    .map_err(|e| e.to_string())?;
                 for r in &held {
                     out.push(r)?;
                 }
@@ -846,12 +858,24 @@ fn rehydrate_entries(
         .collect()
 }
 
-/// Replay the parent's discovered function inventory into a worker that ran the
-/// cheap, discovery-free load, through the very seam the loader's own symbols
-/// arrive on — so `FlowInfo::queryCall` resolves exactly what the serial run
-/// resolved, which is what decides whether a direct call to another function
-/// renders as its name or as a raw address constant.
-fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), String> {
+/// Reserve every parent spelling independently from additive symbol seeding:
+/// an existing worker symbol must not hide a parent's canonical name or alias.
+/// Only cheap, discovery-free loads need the loader-symbol replay that lets
+/// `FlowInfo::queryCall` resolve discovered direct callees by name.
+fn receive_worker_inventory(
+    prog: &mut ConsoleProgram,
+    inventory: Vec<jobs::TargetSpec>,
+    full_load: bool,
+) -> Result<(), String> {
+    kuna_console::project::reserve_source_identifiers(
+        prog,
+        inventory.iter().flat_map(|target| {
+            std::iter::once(target.name.as_str()).chain(target.aliases.iter().map(String::as_str))
+        }),
+    );
+    if full_load {
+        return Ok(());
+    }
     let code_space = prog
         .arch()
         .manage()
@@ -859,7 +883,7 @@ fn seed_worker_inventory(prog: &mut ConsoleProgram, path: &str) -> Result<(), St
         .map(std::rc::Rc::clone)
         .ok_or("no default code space")?;
     let manage = prog.arch().manage();
-    let entries: Vec<(String, Address)> = jobs::read_spec(path)?
+    let entries: Vec<(String, Address)> = inventory
         .into_iter()
         .map(|t| {
             let space = manage
@@ -894,6 +918,28 @@ pub(crate) fn decompile_targets_pooled(
     serial_callee_first: bool,
     arm_frames: Option<String>,
 ) -> Result<jobs::PoolOutput, String> {
+    decompile_targets_pooled_with_export(
+        args, targets, inventory, want_proto, want_provenance, want_types,
+        load_seconds, synth_base, serial_callee_first, arm_frames, None,
+    )
+}
+
+/// Project and whole-binary C exports carry the complete prepared invocation;
+/// ordinary callers retain their existing pool behavior without a binding.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decompile_targets_pooled_with_export(
+    args: &Args,
+    targets: &[FunctionEntry],
+    inventory: &[FunctionEntry],
+    want_proto: bool,
+    want_provenance: bool,
+    want_types: bool,
+    load_seconds: f64,
+    synth_base: Option<shard::Replay>,
+    serial_callee_first: bool,
+    arm_frames: Option<String>,
+    export_spec: Option<&ExportSpec>,
+) -> Result<jobs::PoolOutput, String> {
     let specs = flatten_targets(targets);
     let inventory = flatten_targets(inventory);
     let mut cfg = pool_config(
@@ -909,6 +955,7 @@ pub(crate) fn decompile_targets_pooled(
     cfg.arm_frames = arm_frames;
     cfg.elem_objects = targets.len() <= 1;
     cfg.want_pointer_arguments = true;
+    cfg.export_spec = export_spec.cloned();
     let mut pooled = jobs::run_pool(&cfg, &specs, &inventory)?;
     kuna_console::project::reconcile_pointer_arguments(&mut pooled.results);
     Ok(pooled)
@@ -999,6 +1046,7 @@ pub(crate) fn pool_config<'a>(
         serial_callee_first: false,
         elem_objects: false,
         arm_frames: None,
+        export_spec: None,
     }
 }
 
@@ -1248,6 +1296,14 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
         targets
     };
     let interior = crate::interior::selections(&prog, args, &targets);
+    if prog.arch().print().get_name() == "c-language" {
+        arm_fn_budgets(&mut prog, args);
+        kuna_console::project::prepare_type_names(&mut prog);
+        if !args.json {
+            kuna_console::project::prepare_export_callables(&mut prog, &targets)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     let whole = targets.len() == discovered && args.addrs.is_empty() && args.names.is_none();
     let (callee_first, explicit) = callee_first_decision(&prog, args, targets.len(), whole);
     // `--jobs N`: hand the targets to the worker pool and release the parent's
@@ -1267,8 +1323,9 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
         let assertions = prog.assertion_outcomes();
         let synth = synth_base(&prog);
         let arm_frames = worker_arm_frames(&prog);
+        let export_spec = kuna_console::project::export_callables_spec(&prog);
         drop(prog);
-        let pooled = decompile_targets_pooled(
+        let pooled = decompile_targets_pooled_with_export(
             args,
             &targets,
             &inventory,
@@ -1279,6 +1336,7 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
             synth,
             callee_first,
             arm_frames,
+            export_spec.as_ref(),
         )?;
         return Ok(AllRun { funcs: pooled.results, discovered, assertions, interior });
     }
@@ -1291,8 +1349,10 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
     }
     let funcs = if callee_first {
         decompile_entries_callee_first(&mut prog, args, targets, explicit)
+            .map_err(|error| error.to_string())?
     } else {
         decompile_entries(&mut prog, args, targets, /* pointer_arguments= */ true)
+            .map_err(|e| e.to_string())?
     };
     Ok(AllRun { funcs, discovered, assertions: prog.assertion_outcomes(), interior })
 }
@@ -1347,7 +1407,7 @@ pub(crate) fn decompile_entries(
     args: &Args,
     targets: Vec<FunctionEntry>,
     pointer_arguments: bool,
-) -> Vec<FuncResult> {
+) -> kuna_base::error::KunaResult<Vec<FuncResult>> {
     arm_fn_budgets(prog, args);
     let opts = DecompileOptions {
         no_vars: args.no_vars,
@@ -2347,6 +2407,7 @@ mod provenance_json_tests {
     #[test]
     fn result_schema_adds_line_and_variable_provenance() {
         let function = FuncResult {
+            type_bindings: Vec::new(),
             name: "f".into(),
             address: 0x401000,
             byte_address: 0x401000,
@@ -2966,6 +3027,49 @@ mod discovery_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn worker_inventory_reserves_parent_names_and_aliases_when_symbol_seed_skips_them() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest.join("../kuna-analysis/tests/fixtures/fauxware");
+        let specs = vec![manifest.join("../../../specs").to_string_lossy().into_owned()];
+        for full_load in [false, true] {
+            let mut prog = kuna_console::engine::bootstrap_from_object(
+                fixture.to_str().unwrap(), "", &specs,
+            ).unwrap();
+            prog.commit_pending_analysis().unwrap();
+            let main = prog.function_entries_canonical().into_iter()
+                .find(|entry| entry.name == "main").unwrap();
+            let mut inventory = flatten_targets(std::slice::from_ref(&main));
+            inventory[0].name = "Parent.Name".into();
+            inventory[0].aliases = vec!["ParentAlias.1".into(), "ParentAlias_1".into()];
+            let mut absent = inventory[0].clone();
+            absent.addr = 0x7777_0000;
+            absent.name = "ParentOnly".into();
+            absent.aliases.clear();
+            inventory.push(absent);
+
+            receive_worker_inventory(&mut prog, inventory, full_load).unwrap();
+            assert_eq!(
+                prog.arch().symboltab.function_display_name_across_scopes(&main.addr).as_deref(),
+                Some("main"),
+                "reservation must not replace the worker's existing source symbol",
+            );
+            assert_eq!(
+                prog.function_entries_canonical().iter().any(|entry| entry.name == "ParentOnly"),
+                !full_load,
+                "only a cheap worker may replay missing source symbols",
+            );
+            kuna_console::project::prepare_type_names(&mut prog);
+            let reserved = prog.arch().print().reserved_identifiers().unwrap();
+            for name in ["Parent.Name", "Parent_Name", "ParentAlias.1", "ParentAlias_1", "ParentOnly"] {
+                assert!(reserved.contains(name), "missing {name} (full_load={full_load})");
+            }
+            assert!(!prog.function_entries_canonical().iter().any(|entry| {
+                entry.name == "Parent.Name" || entry.aliases.iter().any(|alias| alias == "ParentAlias.1")
+            }), "reservation must not replay skipped parent names or aliases");
+        }
+    }
 
     /// A minimal ELF64 executable: one `PF_X` `PT_LOAD` and NO section table —
     /// the section-header-stripped PIE shape of the witness binary, where the

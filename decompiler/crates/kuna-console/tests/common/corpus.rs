@@ -112,7 +112,7 @@ impl Corpus {
         kuna_decomp::decompile_drive::print_c(
             data.conf.as_mut().expect("loaded program").arch_mut(),
             data.fd.as_ref().expect("decompiled function"),
-        )
+        ).unwrap()
     }
 
     /// Dispatch one additional command without replacing the program or the

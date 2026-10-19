@@ -8,10 +8,11 @@
 #![allow(clippy::needless_range_loop)] // C++ indexes by edge/path slot; preserve it
 
 use kuna_base::error::{KunaError, KunaResult};
+use kuna_base::marshal::{Decoder, Encoder};
 use kuna_base::types::{int4, uint4};
 use kuna_num::opcodes::OpCode;
 
-use crate::block::{BlockGraph, BlockKind, BlockType};
+use crate::block::{BlockGraph, BlockKind, BlockType, FlowBlock};
 use crate::context::BlockId;
 
 // ===========================================================================
@@ -1351,20 +1352,40 @@ impl<'a> TraceDAG<'a> {
 // realized against the obank by `ActionBlockStructure::apply` after the collapse.
 
 
-/// Surface the unported `BlockGraph::newBlockSwitch` (C++ `block.cc:1907`).
+/// Structure an independent native graph using the canonical block codec.
 ///
-/// STUB(W7/W4): the switch *factory* needs `FlowBlock::getExitLeaf` and
-/// `BlockSwitch::grabCaseBasic` (the latter reads `JumpTable` labels, W4) — both
-/// left unported in `block.rs`, and the `BlockGraph` switch factory is not yet
-/// public.  [`CollapseStructure::rule_block_switch`] performs the full match /
-/// exit-block / skip-edge decision (the structuring novelty) but cannot build
-/// the node here; this returns an `Err` so the stub is visible.  See losses.
-fn new_block_switch_stub(_has_exit: bool) -> KunaResult<()> {
-    Err(KunaError::lowlevel(
-        "kuna rust port: BlockGraph::newBlockSwitch needs getExitLeaf + grabCaseBasic \
-         (JumpTable labels, W4) which block.rs leaves as STUB(W7); not available at this \
-         item's boundary",
-    ))
+/// Mirrors `StructureGraph::rawAction` in `ghidra_process.cc`. Input and copied
+/// blocks share an arena so each output copy's `altindex` continues to name its
+/// original input component, even after reverse-postorder renumbers the copies.
+/// There is no function IR or recovered jump table in this command.
+pub fn structure_graph(decoder: &mut dyn Decoder, encoder: &mut dyn Encoder) -> KunaResult<()> {
+    let mut graph = BlockGraph::new();
+    let input = graph.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    graph.decode_top(input, decoder)?;
+    let output = graph.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    graph.root = Some(output);
+    let mut switch_case_edges = std::collections::BTreeMap::new();
+    for &source in graph.block(input).get_list() {
+        let block = graph.block(source);
+        if block.size_out() <= 2 {
+            continue;
+        }
+        for slot in 0..block.size_out() {
+            switch_case_edges.entry((source, block.get_out(slot)))
+                .or_insert((slot, block.is_default_branch(slot)));
+        }
+    }
+    graph.build_copy(output, input);
+    let mut roots = Vec::new();
+    graph.structure_loops(output, &mut roots);
+    graph.calc_forward_dominator(output, &roots);
+    let mut collapse = CollapseStructure::new(&mut graph, output)
+        .with_switch_case_edges(switch_case_edges);
+    collapse.graph_only = true;
+    collapse.collapse_all()?;
+    graph.order_blocks(output, &std::collections::BTreeSet::new());
+    graph.encode(output, encoder);
+    Ok(())
 }
 
 // ===========================================================================
@@ -1418,6 +1439,9 @@ pub struct CollapseStructure<'a> {
     /// `new_block_switch` can attach the table to the `BlockSwitch` without a
     /// Funcdata back-pointer (C++ `BlockSwitch(ind)` does `ind->getJumptable()`).
     switch_blocks: std::collections::BTreeMap<BlockId, usize>,
+    /// The independent structureGraph command has no function IR or jump tables.
+    /// Ordinary function structuring must still resolve every switch table.
+    graph_only: bool,
     /// Per-switch case-edge topology resolved against the **bblocks** graph (the
     /// underlying basic blocks, whose in/out edges are never severed by the
     /// sblocks structuring).  Keyed by `(switch_bblocks_block, case_bblocks_block)`
@@ -1479,6 +1503,7 @@ impl<'a> CollapseStructure<'a> {
             pending_flips: Vec::new(),
             complex_blocks: std::collections::BTreeSet::new(),
             switch_blocks: std::collections::BTreeMap::new(),
+            graph_only: false,
             switch_case_edges: std::collections::BTreeMap::new(),
             condfold_sets: Default::default(),
             condfolded: std::collections::BTreeSet::new(),
@@ -1599,10 +1624,14 @@ impl<'a> CollapseStructure<'a> {
             // BlockCopy::negateCondition: `copy` is the bblocks BlockBasic — record
             // its op-flag flip, then swap.
             BlockType::Copy => {
-                if let Some(copy) = self.graph.block(bl).get_copy() {
-                    self.pending_flips.push(copy);
+                if self.graph_only {
+                    false // Original graph leaves have no p-code to negate.
+                } else {
+                    if let Some(copy) = self.graph.block(bl).get_copy() {
+                        self.pending_flips.push(copy);
+                    }
+                    true
                 }
-                true
             }
             // BlockList::negateCondition: negate the last block, then swap this
             // node's edges.
@@ -2911,17 +2940,9 @@ impl<'a> CollapseStructure<'a> {
             .get_exit_leaf(bl)
             .and_then(|leaf| self.graph.block(leaf).get_copy())
             .and_then(|bb| self.switch_blocks.get(&bb).copied());
-        let jt_index = match jt_index {
-            Some(j) => j,
-            None => {
-                // No recovered table for this switch (e.g. an override-only or
-                // unrecovered BRANCHIND): leave it unstructured rather than
-                // fabricating a table.  Matches C++ when getJumptable()==0 would
-                // make BlockSwitch construction meaningless; honest partial.
-                new_block_switch_stub(exitblock.is_some())?;
-                return Ok(true);
-            }
-        };
+        if jt_index.is_none() && !self.graph_only {
+            return Err(KunaError::lowlevel("Switch has no recovered jump table"));
+        }
         self.graph.new_block_switch(
             self.graph_id,
             &cases,
@@ -3444,7 +3465,7 @@ impl ConditionalJoin {
 
     /// Remove the other CBRANCH, moving the surviving one into the join block
     /// (C++ `ConditionalJoin::moveCbranch`, `blockaction.cc:2043`).
-    fn move_cbranch(&mut self, data: &mut Funcdata) {
+    fn move_cbranch(&mut self, data: &mut Funcdata) -> KunaResult<()> {
         let joinblock = self.joinblock.expect("moveCbranch: joinblock");
         let cbranch1 = self.cbranch1.expect("moveCbranch: cbranch1");
         let cbranch2 = self.cbranch2.expect("moveCbranch: cbranch2");
@@ -3459,7 +3480,8 @@ impl ConditionalJoin {
             vn1
         };
         data.op_set_input(cbranch1, vn, 1).expect("moveCbranch: opSetInput");
-        data.op_destroy(cbranch2);
+        data.op_destroy(cbranch2)?;
+        Ok(())
     }
 
     /// Substitute the new joined Varnode in the given exit block
@@ -3520,7 +3542,7 @@ impl ConditionalJoin {
         );
         self.joinblock = Some(joinblock);
         self.setup_multiequals(data);
-        self.move_cbranch(data);
+        self.move_cbranch(data)?;
         self.cut_down_multiequals(exita, self.a_in1, self.a_in2, data);
         self.cut_down_multiequals(exitb, self.b_in1, self.b_in2, data);
         Ok(())
@@ -3575,11 +3597,11 @@ impl Action for ActionStructureTransform {
             allow_op_moves: self.allow_op_moves,
         }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // Drives BlockWhileDo::finalTransform — the whiledo->for reroll setup
         // (find loop variable / iterator / initializer over BlockWhileDo nodes).
         data.finalize_forloop_transform(self.allow_op_moves);
-        0
+        Ok(0)
     }
 }
 
@@ -3610,11 +3632,11 @@ impl Action for ActionNormalizeBranches {
         }
         Some(Box::new(ActionNormalizeBranches { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let graph = data.bblocks_ref();
         let root = graph.root.expect("ActionNormalizeBranches: bblocks root");
         graph.block(root);
-        0
+        Ok(0)
     }
 }
 
@@ -3653,7 +3675,7 @@ impl Action for ActionPreferComplement {
             allow_op_mods: self.allow_op_mods,
         }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ walks the structured-block tree and calls
         // curbl->preferComplement(data,allowOpMods) on each BlockGraph node
         // (blockaction.cc:2140); only BlockIf rearranges (the if/else complement
@@ -3668,7 +3690,7 @@ impl Action for ActionPreferComplement {
                 // bare-int4 apply — the honest-partial-parity stance.
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -3715,12 +3737,12 @@ impl Action for ActionBranchFlip {
             allow_op_mods: self.allow_op_mods,
         }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // Gate: per-function `branch_flip` flag (option `branchflip`, default-off).
         // Carried into the `ArchContext` by `build_arch_handle`; absent => no-op so
         // the 675-datatest parity and the default rendering are untouched.
         if !data.get_arch().branch_flip {
-            return 0;
+            return Ok(0);
         }
         match data.branch_flip_complement(self.allow_op_mods) {
             Ok(count) => {
@@ -3732,7 +3754,7 @@ impl Action for ActionBranchFlip {
                 // `ActionPreferComplement`).
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -3762,11 +3784,11 @@ impl Action for ActionBlockStructure {
         }
         Some(Box::new(ActionBlockStructure { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ blockaction.cc:2170.
         if data.sblocks_get_size() != 0 {
             crate::p8_structure::kuna_condstmts::record_hits(data);
-            return 0; // Already structured
+            return Ok(0); // Already structured
         }
         data.install_switch_defaults();
         // Cross-arena copy: mirror every bblocks BlockBasic into sblocks as a
@@ -3796,11 +3818,11 @@ impl Action for ActionBlockStructure {
                     // Structured by the region structurer; report a single change so
                     // the ActionPool sees progress (spirit of `getChangeCount() > 0`).
                     self.base_mut().count += 1;
-                    return 0;
+                    return Ok(0);
                 }
                 Ok((false, _)) | Err(_) => {
                     if ctx.deadline_expired() {
-                        return 0;
+                        return Ok(0);
                     }
                     // Could not converge: discard the partially-structured sblocks
                     // and re-seed a clean BlockCopy mirror for the CollapseStructure
@@ -3923,10 +3945,10 @@ impl Action for ActionBlockStructure {
             // surface it as "no change made" rather than taking down the run, the
             // documented honest-partial-parity degradation.  See losses.
             let _ = e;
-            return 0;
+            return Ok(0);
         }
         self.base_mut().count += cc;
-        0
+        Ok(0)
     }
 }
 
@@ -3957,7 +3979,7 @@ impl Action for ActionFinalStructure {
         }
         Some(Box::new(ActionFinalStructure { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // graph.orderBlocks(): put the residual top-level components in final
         // printing order — the entry component first, RETURN-terminated components
         // last, the rest by reverse-post-order index.  Without it a function whose
@@ -4000,7 +4022,7 @@ impl Action for ActionFinalStructure {
         // Must run AFTER markUnstructured (it reads the f_unstructured_targ marks
         // via the printer's emitAnyLabelStatement).  (port of blockaction.cc:2196)
         data.sblocks_mut().mark_label_bump_up(sroot, false);
-        0
+        Ok(0)
     }
 }
 
@@ -4030,18 +4052,18 @@ impl Action for ActionNodeJoin {
         }
         Some(Box::new(ActionNodeJoin { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ (blockaction.cc:2327): iterate the basic blocks; for each 2-out
         // block bb, pick the out block with the fewer in-edges (`leastout`), and
         // if it has >1 in-edge, try ConditionalJoin::match(bb, sibling) for every
         // other in-edge.  On a match: count+=1; execute(); clear().
         let graph = data.bblocks_ref();
         if graph.root.is_none() {
-            return 0;
+            return Ok(0);
         }
         let root = graph.root.unwrap();
         if graph.block(root).get_size() == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut condjoin = ConditionalJoin::new();
         let n = data.bblocks_ref().block(root).get_size();
@@ -4078,7 +4100,7 @@ impl Action for ActionNodeJoin {
                 }
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -4109,14 +4131,14 @@ impl Action for ActionReturnSplit {
         }
         Some(Box::new(ActionReturnSplit { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ (blockaction.cc:2265): iterate `data.beginOp(CPUI_RETURN)`, gather
         // goto-return blocks (`gatherReturnGotos`), pick splittable RETURN blocks
         // (`isSplittable`), and `data.nodeSplit(retnode[i],splitedge[i])`.  The
         // driver lives on Funcdata (it needs op + block + cloner access).
         let changes = data.return_split_apply();
         self.base_mut().count += changes;
-        0
+        Ok(0)
     }
 }
 

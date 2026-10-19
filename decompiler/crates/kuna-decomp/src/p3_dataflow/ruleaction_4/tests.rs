@@ -38,7 +38,7 @@ mod config_ir_regressions {
             fd.op_set_input(crossing, offset, 1).unwrap();
             fd.new_unique_out(4, crossing).unwrap();
             fd.op_insert_end(crossing, bl);
-            assert_eq!(RuleSubExtComm::new().apply_op(crossing, &mut fd), 1);
+            assert_eq!(RuleSubExtComm::new().apply_op(crossing, &mut fd).unwrap(), 1);
             let operation = fd.obank().get(crossing).unwrap();
             assert_eq!(operation.code(), extension, "crossing an input boundary cannot cancel extension bits");
             assert_eq!(operation.num_input(), 1);
@@ -58,7 +58,7 @@ mod config_ir_regressions {
             fd.op_set_input(cut, zero, 1).unwrap();
             fd.new_unique_out(4, cut).unwrap();
             fd.op_insert_end(cut, bl);
-            assert_eq!(RuleSubExtComm::new().apply_op(cut, &mut fd), 0);
+            assert_eq!(RuleSubExtComm::new().apply_op(cut, &mut fd).unwrap(), 0);
             assert_eq!(fd.obank().get(cut).unwrap().code(), OpCode::CPUI_SUBPIECE);
             assert_eq!(fd.obank().get(cut).unwrap().get_in(0), Some(masked), "partly zero mask must not be bypassed");
         }
@@ -232,7 +232,7 @@ fn shorten_extension_keeps_high_without_recording_lanes() {
                 fd.set_laned_reg_generated();
             }
 
-            let output = RuleSubCommute::shorten_extension(&mut fd, op, 4);
+            let output = RuleSubCommute::shorten_extension(&mut fd, op, 4).unwrap();
             let vn = fd.vbank().get(output).unwrap();
             assert_eq!(vn.get_addr(), &address);
             assert_eq!(vn.get_size(), 4);
@@ -405,7 +405,7 @@ fn build_divrem_subpiece(fd: &mut Funcdata, opcode: OpCode) -> (OpId, OpId, Varn
 fn divrem_commute_fingerprint(gate: bool, opcode: OpCode) -> (int4, OpCode, bool, Vec<OpCode>) {
     let mut fd = build_fd_with_cancel_byte_arithmetic(gate);
     let (subpiece, divrem, out) = build_divrem_subpiece(&mut fd, opcode);
-    let changed = RuleSubCommute::new().apply_op(subpiece, &mut fd);
+    let changed = RuleSubCommute::new().apply_op(subpiece, &mut fd).unwrap();
     let op = fd.obank().get(divrem).unwrap();
     let input_defs = (0..op.num_input())
         .map(|slot| {
@@ -424,7 +424,7 @@ fn cancelbytearithmetic_folds_all_shift_and_operand_permutations() {
             let mut fd = build_fd_with_cancel_byte_arithmetic(true);
             let fixture =
                 build_byte_cancellation(&mut fd, Some(amount), 0, 0, 1, None, permutation);
-            assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 1);
+            assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 1);
             let root = fd.obank().get(fixture.root).unwrap();
             assert_eq!(root.code(), OpCode::CPUI_COPY);
             assert_eq!(root.num_input(), 1);
@@ -440,7 +440,7 @@ fn cancelbytearithmetic_folds_all_shift_and_operand_permutations() {
 fn cancelbytearithmetic_off_restores_the_upstream_decline() {
     let mut fd = build_fd_with_cancel_byte_arithmetic(false);
     let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
-    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
     assert_eq!(
         fd.obank().get(fixture.root).unwrap().code(),
         OpCode::CPUI_INT_ADD
@@ -460,7 +460,7 @@ fn cancelbytearithmetic_declines_shift_and_width_bounds() {
         let mut fd = build_fd_with_cancel_byte_arithmetic(true);
         let fixture = build_byte_cancellation(&mut fd, amount, offset, 0, width, None, 0);
         assert_eq!(
-            RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd),
+            RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(),
             0,
             "amount={amount:?}, offset={offset}, width={width}"
         );
@@ -485,7 +485,7 @@ fn cancelbytearithmetic_declines_wrong_coefficient_source_and_plain_offset() {
             fd.op_set_input(fixture.plain_low_op, other_source, 0)
                 .unwrap();
         }
-        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
         assert_eq!(
             fd.obank().get(fixture.root).unwrap().code(),
             OpCode::CPUI_INT_ADD
@@ -512,7 +512,7 @@ fn cancelbytearithmetic_declines_constant_and_call_or_load_producers() {
                 },
             );
         }
-        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
         assert_eq!(
             fd.obank().get(fixture.root).unwrap().code(),
             OpCode::CPUI_INT_ADD
@@ -537,7 +537,7 @@ fn cancelbytearithmetic_preserves_both_precision_guards() {
                 .unwrap()
                 .set_precis_lo();
         }
-        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
     }
 }
 
@@ -554,7 +554,7 @@ fn cancelbytearithmetic_preserves_every_single_descendant_guard() {
             _ => fixture.inner_out,
         };
         attach_copy(&mut fd, observed, 0x70 + case as u64);
-        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+        assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
     }
 }
 
@@ -569,7 +569,7 @@ fn cancelbytearithmetic_requires_exact_modulo_256_coefficient() {
             let mut fd = build_fd_with_cancel_byte_arithmetic(true);
             let fixture =
                 build_byte_cancellation(&mut fd, Some(amount), 0, 0, 1, Some(coefficient), 0);
-            assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+            assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
         }
     }
 }
@@ -580,7 +580,7 @@ fn cancelbytearithmetic_does_not_gate_legacy_zext_or_piece_paths() {
         let mut fd = build_fd_with_cancel_byte_arithmetic(false);
         let (subpiece, _shift) = build_extension_shift_subpiece(&mut fd, extension);
         assert_eq!(
-            RuleSubCommute::new().apply_op(subpiece, &mut fd),
+            RuleSubCommute::new().apply_op(subpiece, &mut fd).unwrap(),
             1,
             "legacy {extension:?} path"
         );
@@ -604,8 +604,8 @@ fn cancelbytearithmetic_does_not_change_unsigned_division_or_remainder_arms() {
 fn cancelbytearithmetic_reaches_a_one_step_fixed_point() {
     let mut fd = build_fd_with_cancel_byte_arithmetic(true);
     let fixture = build_byte_cancellation(&mut fd, Some(1), 0, 0, 1, None, 0);
-    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 1);
-    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd), 0);
+    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 1);
+    assert_eq!(RuleSubCommute::new().apply_op(fixture.subpiece, &mut fd).unwrap(), 0);
     assert_eq!(
         fd.obank().get(fixture.root).unwrap().code(),
         OpCode::CPUI_COPY
@@ -638,7 +638,7 @@ fn shiftand_int_left_bypasses_and() {
     fd.op_set_input(shop, sa, 1).unwrap();
     fd.op_insert(shop, bl, None);
 
-    let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
+    let res = RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap();
     assert_eq!(res, 1);
     // slot 0 of the shift now reads invn directly (AND bypassed).
     assert_eq!(fd.obank().get(shop).unwrap().get_in(0), Some(invn));
@@ -658,7 +658,7 @@ fn shiftand_rejects_nonconstant_shift() {
     fd.op_set_input(shop, andout, 0).unwrap();
     fd.op_set_input(shop, sa, 1).unwrap();
     fd.op_insert(shop, bl, None);
-    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd), 0);
+    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap(), 0);
 }
 
 // Early-out: slot-0 def is not an INT_AND.
@@ -674,7 +674,7 @@ fn shiftand_rejects_non_and_def() {
     fd.op_set_input(shop, addout, 0).unwrap();
     fd.op_set_input(shop, sa, 1).unwrap();
     fd.op_insert(shop, bl, None);
-    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd), 0);
+    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -698,7 +698,7 @@ fn subcancel_and_total_cancel() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(2, subop).expect("newUniqueOut");
 
-    let res = RuleSubCancel::new().apply_op(subop, &mut fd);
+    let res = RuleSubCancel::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     // slot 0 now reads V (the AND's thruvn); opcode unchanged (still SUBPIECE).
     assert_eq!(fd.obank().get(subop).unwrap().get_in(0), Some(v));
@@ -720,7 +720,7 @@ fn subcancel_zext_total_elimination_to_copy() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
 
-    let res = RuleSubCancel::new().apply_op(subop, &mut fd);
+    let res = RuleSubCancel::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(subop).unwrap().num_input(), 1);
@@ -742,7 +742,7 @@ fn subcancel_zext_offset_past_input_yields_zero() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(2, subop).expect("newUniqueOut");
 
-    let res = RuleSubCancel::new().apply_op(subop, &mut fd);
+    let res = RuleSubCancel::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(subop).unwrap().num_input(), 1);
@@ -765,7 +765,7 @@ fn subcancel_rejects_other_def() {
     fd.op_set_input(subop, off0, 1).unwrap();
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
-    assert_eq!(RuleSubCancel::new().apply_op(subop, &mut fd), 0);
+    assert_eq!(RuleSubCancel::new().apply_op(subop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -787,7 +787,7 @@ fn shiftsub_rewrites_offset() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut"); // outsize 4; c+out=1+4=5<=8 ok
 
-    let res = RuleShiftSub::new().apply_op(subop, &mut fd);
+    let res = RuleShiftSub::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().get_in(0), Some(v));
     let newc = fd.obank().get(subop).unwrap().get_in(1).unwrap();
@@ -809,7 +809,7 @@ fn shiftsub_rejects_non_byte_shift() {
     fd.op_set_input(subop, c, 1).unwrap();
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
-    assert_eq!(RuleShiftSub::new().apply_op(subop, &mut fd), 0);
+    assert_eq!(RuleShiftSub::new().apply_op(subop, &mut fd).unwrap(), 0);
 }
 
 // Early-out: would not be a natural truncation (c - n/8 < 0).
@@ -826,7 +826,7 @@ fn shiftsub_rejects_negative_offset() {
     fd.op_set_input(subop, c, 1).unwrap();
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
-    assert_eq!(RuleShiftSub::new().apply_op(subop, &mut fd), 0);
+    assert_eq!(RuleShiftSub::new().apply_op(subop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -852,7 +852,7 @@ fn humptydumpty_whole_to_copy() {
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(8, cat).expect("newUniqueOut");
 
-    let res = RuleHumptyDumpty::new().apply_op(cat, &mut fd);
+    let res = RuleHumptyDumpty::new().apply_op(cat, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(cat).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(cat).unwrap().num_input(), 1);
@@ -876,7 +876,7 @@ fn humptydumpty_partial_to_subpiece() {
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(6, cat).expect("newUniqueOut");
 
-    let res = RuleHumptyDumpty::new().apply_op(cat, &mut fd);
+    let res = RuleHumptyDumpty::new().apply_op(cat, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(cat).unwrap().code(), OpCode::CPUI_SUBPIECE);
     assert_eq!(fd.obank().get(cat).unwrap().get_in(0), Some(root));
@@ -900,7 +900,7 @@ fn humptydumpty_rejects_different_roots() {
     fd.op_set_input(cat, sub2out, 1).unwrap();
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(8, cat).expect("newUniqueOut");
-    assert_eq!(RuleHumptyDumpty::new().apply_op(cat, &mut fd), 0);
+    assert_eq!(RuleHumptyDumpty::new().apply_op(cat, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -922,7 +922,7 @@ fn dumptyhump_offset0_eliminates() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut"); // out size == vn2 size
 
-    let res = RuleDumptyHump::new().apply_op(subop, &mut fd);
+    let res = RuleDumptyHump::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(subop).unwrap().num_input(), 1);
@@ -944,7 +944,7 @@ fn dumptyhump_offset_into_vn1() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut"); // out size == vn1 size -> COPY
 
-    let res = RuleDumptyHump::new().apply_op(subop, &mut fd);
+    let res = RuleDumptyHump::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(subop).unwrap().get_in(0), Some(v));
@@ -964,7 +964,7 @@ fn dumptyhump_rejects_straddle() {
     fd.op_set_input(subop, off2, 1).unwrap();
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
-    assert_eq!(RuleDumptyHump::new().apply_op(subop, &mut fd), 0);
+    assert_eq!(RuleDumptyHump::new().apply_op(subop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,7 +987,7 @@ fn humptyor_constants_cover_all_to_copy() {
     fd.op_insert(orop, bl, None);
     let _orout = fd.new_unique_out(2, orop).expect("newUniqueOut");
 
-    let res = RuleHumptyOr::new().apply_op(orop, &mut fd);
+    let res = RuleHumptyOr::new().apply_op(orop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(orop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(orop).unwrap().num_input(), 1);
@@ -1010,7 +1010,7 @@ fn humptyor_partial_to_and() {
     fd.op_insert(orop, bl, None);
     let _orout = fd.new_unique_out(2, orop).expect("newUniqueOut");
 
-    let res = RuleHumptyOr::new().apply_op(orop, &mut fd);
+    let res = RuleHumptyOr::new().apply_op(orop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(orop).unwrap().code(), OpCode::CPUI_INT_AND);
     assert_eq!(fd.obank().get(orop).unwrap().get_in(0), Some(a));
@@ -1034,7 +1034,7 @@ fn humptyor_rejects_no_shared_operand() {
     fd.op_set_input(orop, and2out, 1).unwrap();
     fd.op_insert(orop, bl, None);
     let _orout = fd.new_unique_out(2, orop).expect("newUniqueOut");
-    assert_eq!(RuleHumptyOr::new().apply_op(orop, &mut fd), 0);
+    assert_eq!(RuleHumptyOr::new().apply_op(orop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1060,7 +1060,7 @@ fn subextcomm_commutes_to_zext() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut"); // out size 4
 
-    let res = RuleSubExtComm::new().apply_op(subop, &mut fd);
+    let res = RuleSubExtComm::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     // subcut==0 path: op opcode becomes INT_ZEXT, slot 0 = V, input 1 removed.
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_INT_ZEXT);
@@ -1083,7 +1083,7 @@ fn subextcomm_misses_extbits_to_copy() {
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut"); // out(4)+0 <= invn(4) -> misses ext bits
 
-    let res = RuleSubExtComm::new().apply_op(subop, &mut fd);
+    let res = RuleSubExtComm::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(subop).unwrap().num_input(), 1);
@@ -1104,7 +1104,7 @@ fn subextcomm_rejects_non_extension() {
     fd.op_set_input(subop, off0, 1).unwrap();
     fd.op_insert(subop, bl, None);
     let _subout = fd.new_unique_out(4, subop).expect("newUniqueOut");
-    assert_eq!(RuleSubExtComm::new().apply_op(subop, &mut fd), 0);
+    assert_eq!(RuleSubExtComm::new().apply_op(subop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,7 +1125,7 @@ fn concatzext_commutes() {
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(8, cat).expect("newUniqueOut");
 
-    let res = RuleConcatZext::new().apply_op(cat, &mut fd);
+    let res = RuleConcatZext::new().apply_op(cat, &mut fd).unwrap();
     assert_eq!(res, 1);
     // op is now INT_ZEXT with one input = the new PIECE's output.
     assert_eq!(fd.obank().get(cat).unwrap().code(), OpCode::CPUI_INT_ZEXT);
@@ -1153,7 +1153,7 @@ fn concatzext_rejects_non_zext() {
     fd.op_set_input(cat, w, 1).unwrap();
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(8, cat).expect("newUniqueOut");
-    assert_eq!(RuleConcatZext::new().apply_op(cat, &mut fd), 0);
+    assert_eq!(RuleConcatZext::new().apply_op(cat, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,7 +1177,7 @@ fn concatzero_to_zext_shift() {
             fd.set_high_level();
         }
 
-        let res = RuleConcatZero::new().apply_op(cat, &mut fd);
+        let res = RuleConcatZero::new().apply_op(cat, &mut fd).unwrap();
         assert_eq!(res, 1);
         assert_eq!(fd.obank().get(cat).unwrap().code(), OpCode::CPUI_INT_LEFT);
         let saconst = fd.obank().get(cat).unwrap().get_in(1).unwrap();
@@ -1202,7 +1202,7 @@ fn concatzero_rejects_nonzero_const() {
     fd.op_set_input(cat, lo, 1).unwrap();
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(6, cat).expect("newUniqueOut");
-    assert_eq!(RuleConcatZero::new().apply_op(cat, &mut fd), 0);
+    assert_eq!(RuleConcatZero::new().apply_op(cat, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1223,7 +1223,7 @@ fn zextcommute_pushes_shift_inside() {
     fd.op_insert(shr, bl, None);
     let _shrout = fd.new_unique_out(8, shr).expect("newUniqueOut");
 
-    let res = RuleZextCommute::new().apply_op(shr, &mut fd);
+    let res = RuleZextCommute::new().apply_op(shr, &mut fd).unwrap();
     assert_eq!(res, 1);
     // op is now INT_ZEXT, single input = new INT_RIGHT output (sized like zextin).
     assert_eq!(fd.obank().get(shr).unwrap().code(), OpCode::CPUI_INT_ZEXT);
@@ -1256,7 +1256,7 @@ fn zextcommute_preserves_wide_shifts_unless_the_count_fits() {
                         vn
                     };
                     let (shift, _) = mk_def(&mut fd, bl, OpCode::CPUI_INT_RIGHT, 8, 0x30, &[extended, amount]);
-                    let applied = RuleZextCommute::new().apply_op(shift, &mut fd);
+                    let applied = RuleZextCommute::new().apply_op(shift, &mut fd).unwrap();
                     assert_eq!(
                         applied,
                         (bound < limit) as int4,
@@ -1302,7 +1302,7 @@ fn subzext_offset0_to_and_mask() {
     fd.op_insert(zop, bl, None);
     let _zout = fd.new_unique_out(4, zop).expect("newUniqueOut");
 
-    let res = RuleSubZext::new().apply_op(zop, &mut fd);
+    let res = RuleSubZext::new().apply_op(zop, &mut fd).unwrap();
     assert_eq!(res, 1);
     // op becomes INT_AND; slot 0 bypasses to base, slot 1 = mask = calc_mask(2).
     assert_eq!(fd.obank().get(zop).unwrap().code(), OpCode::CPUI_INT_AND);
@@ -1331,7 +1331,7 @@ fn subzext_reassigned_output_keeps_cover() {
                 fd.set_high_level();
             }
 
-            assert_eq!(RuleSubZext::new().apply_op(zop, &mut fd), 1);
+            assert_eq!(RuleSubZext::new().apply_op(zop, &mut fd).unwrap(), 1);
             let op = fd.obank().get(zop).unwrap();
             assert_eq!(op.code(), OpCode::CPUI_INT_AND);
             let output = op.get_in(0).unwrap();
@@ -1363,7 +1363,7 @@ fn subzext_rejects_size_mismatch() {
     fd.op_set_input(zop, subout, 0).unwrap();
     fd.op_insert(zop, bl, None);
     let _zout = fd.new_unique_out(4, zop).expect("newUniqueOut"); // out 4 != base 8
-    assert_eq!(RuleSubZext::new().apply_op(zop, &mut fd), 0);
+    assert_eq!(RuleSubZext::new().apply_op(zop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1388,7 +1388,7 @@ fn concatleftshift_rejoins() {
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(4, cat).expect("newUniqueOut"); // out size 4
 
-    let res = RuleConcatLeftShift::new().apply_op(cat, &mut fd);
+    let res = RuleConcatLeftShift::new().apply_op(cat, &mut fd).unwrap();
     assert_eq!(res, 1);
     // op stays PIECE; slot0 = new concat(V,W) (size 3), slot1 = const 0 size 1.
     assert_eq!(fd.obank().get(cat).unwrap().code(), OpCode::CPUI_PIECE);
@@ -1420,7 +1420,7 @@ fn zextshiftzext_collapses_double_zext() {
     fd.op_insert(outer, bl, None);
     let _outerout = fd.new_unique_out(8, outer).expect("newUniqueOut");
 
-    let res = RuleZextShiftZext::new().apply_op(outer, &mut fd);
+    let res = RuleZextShiftZext::new().apply_op(outer, &mut fd).unwrap();
     assert_eq!(res, 1);
     // op stays INT_ZEXT but now reads `a` directly.
     assert_eq!(fd.obank().get(outer).unwrap().code(), OpCode::CPUI_INT_ZEXT);
@@ -1439,7 +1439,7 @@ fn zextshiftzext_rejects_other_inner() {
     fd.op_set_input(outer, addout, 0).unwrap();
     fd.op_insert(outer, bl, None);
     let _outerout = fd.new_unique_out(8, outer).expect("newUniqueOut");
-    assert_eq!(RuleZextShiftZext::new().apply_op(outer, &mut fd), 0);
+    assert_eq!(RuleZextShiftZext::new().apply_op(outer, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1461,7 +1461,7 @@ fn concatcommute_or_lower() {
     fd.op_insert(cat, bl, None);
     let _catout = fd.new_unique_out(4, cat).expect("newUniqueOut");
 
-    let res = RuleConcatCommute::new().apply_op(cat, &mut fd);
+    let res = RuleConcatCommute::new().apply_op(cat, &mut fd).unwrap();
     assert_eq!(res, 1);
     // i==0 (V) is not written so skipped; i==1 fires.  op becomes INT_OR with
     // slot0 = new concat(V,W) and slot1 = const c (unshifted for the i==1 case).
@@ -1496,7 +1496,7 @@ fn loadvarnode_stub_noop() {
     fd.op_set_input(load, ptr, 1).unwrap();
     fd.op_insert(load, bl, None);
     let _out = fd.new_unique_out(4, load).expect("newUniqueOut");
-    assert_eq!(RuleLoadVarnode::new().apply_op(load, &mut fd), 0);
+    assert_eq!(RuleLoadVarnode::new().apply_op(load, &mut fd).unwrap(), 0);
 }
 
 // RuleSwitchSingle: a BRANCHIND whose block has != 1 out-edge early-outs (0).
@@ -1509,7 +1509,7 @@ fn switchsingle_rejects_multi_out_block() {
     let v = mk_vn(&mut fd, 8, 0x10);
     fd.op_set_input(br, v, 0).unwrap();
     fd.op_insert(br, bl, None);
-    assert_eq!(RuleSwitchSingle::new().apply_op(br, &mut fd), 0);
+    assert_eq!(RuleSwitchSingle::new().apply_op(br, &mut fd).unwrap(), 0);
 }
 
 // RuleCondNegate: a CBRANCH without the boolean_flip flag early-outs (0).
@@ -1524,5 +1524,5 @@ fn condnegate_rejects_unflipped() {
     fd.op_set_input(cb, cond, 1).unwrap();
     fd.op_insert(cb, bl, None);
     // boolean_flip not set -> early-out.
-    assert_eq!(RuleCondNegate::new().apply_op(cb, &mut fd), 0);
+    assert_eq!(RuleCondNegate::new().apply_op(cb, &mut fd).unwrap(), 0);
 }

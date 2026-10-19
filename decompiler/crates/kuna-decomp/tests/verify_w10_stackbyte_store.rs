@@ -127,7 +127,7 @@ fn fixture(
     fd.op_set_input(call, target, 0).unwrap();
     fd.op_insert(call, call_block, None);
     if with_write_guard {
-        fd.new_indirect_op(call, &object, write_width, 0);
+        fd.new_indirect_op(call, &object, write_width, 0).unwrap();
     }
     fd.set_high_level();
 
@@ -140,7 +140,7 @@ fn fixture(
 fn a_later_call_guard_keeps_a_stackview_store_explicit() {
     let (mut fd, backing, value) = fixture(true, false, 1, 8);
     assert!(
-        !Merge::merge_test_required(&mut fd, backing, value),
+        !Merge::merge_test_required(&mut fd, backing, value).unwrap(),
         "a register value must not merge into frame bytes guarded across a writing call"
     );
 }
@@ -149,7 +149,7 @@ fn a_later_call_guard_keeps_a_stackview_store_explicit() {
 fn a_read_only_call_does_not_change_the_store_merge() {
     let (mut fd, backing, value) = fixture(false, false, 1, 8);
     assert!(
-        Merge::merge_test_required(&mut fd, backing, value),
+        Merge::merge_test_required(&mut fd, backing, value).unwrap(),
         "without a write-effect INDIRECT, the existing adjacent-store merge remains allowed"
     );
 }
@@ -158,7 +158,7 @@ fn a_read_only_call_does_not_change_the_store_merge() {
 fn a_joined_call_guard_keeps_a_predecessor_stackview_store_explicit() {
     let (mut fd, backing, value) = fixture(true, true, 1, 8);
     assert!(
-        !Merge::merge_test_required(&mut fd, backing, value),
+        !Merge::merge_test_required(&mut fd, backing, value).unwrap(),
         "a reachable join-block call must keep its predecessor's frame store explicit"
     );
 }
@@ -167,7 +167,7 @@ fn a_joined_call_guard_keeps_a_predecessor_stackview_store_explicit() {
 fn a_store_as_wide_as_a_sixteen_bit_pointer_is_not_split() {
     let (mut fd, backing, value) = fixture(true, false, 2, 2);
     assert!(
-        Merge::merge_test_required(&mut fd, backing, value),
+        Merge::merge_test_required(&mut fd, backing, value).unwrap(),
         "a full-width pointer-sized stack write keeps the prior merge policy"
     );
 }
@@ -176,7 +176,7 @@ fn a_store_as_wide_as_a_sixteen_bit_pointer_is_not_split() {
 fn a_byte_store_on_a_sixteen_bit_stack_keeps_the_write_guard() {
     let (mut fd, backing, value) = fixture(true, false, 1, 2);
     assert!(
-        !Merge::merge_test_required(&mut fd, backing, value),
+        !Merge::merge_test_required(&mut fd, backing, value).unwrap(),
         "a one-byte store narrower than the pointer width remains guarded"
     );
 }

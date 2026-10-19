@@ -496,7 +496,7 @@ fn raw_load_in_spine(fd: &mut Funcdata, body_writes_first: bool) -> (BlockId, Ve
         }
     }
     let at = ram(fd, 0x40);
-    let esi = fd.new_varnode(4, &at, None);
+    let esi = fd.new_varnode(4, &at, None).unwrap();
     write_ram(fd, t, 0x2104, OpCode::CPUI_COPY, &[esi], 0x38, 4);
     (b0, vec![a, t, d])
 }

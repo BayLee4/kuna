@@ -272,15 +272,16 @@ pub fn read_json(binary: &str, prog: &ConsoleProgram, addr: u64, len: u64, asser
 /// callees:[{name, address, address_hex, at, at_hex, kind, instruction}],
 /// data_refs:[…same as callees…], assertions}`. A caller's `address` is the
 /// calling function's entry and `from` the calling instruction.
+/// Acquisition errors propagate before a document is published.
 pub fn xrefs_json(
     binary: &str,
     prog: &ConsoleProgram,
     file: &object::File,
     target: &FunctionEntry,
     assertions: &[Outcome],
-) -> String {
+) -> kuna_base::error::KunaResult<String> {
     let entry = target.addr.get_offset();
-    let refs = function_xrefs(prog, file, entry);
+    let refs = function_xrefs(prog, file, entry)?;
     let rows = |rows: &[XrefRow], site: &str| {
         arr(rows.iter().map(|r| {
             Obj::new()
@@ -292,7 +293,7 @@ pub fn xrefs_json(
                 .end()
         }))
     };
-    Obj::new()
+    Ok(Obj::new()
         .str("binary", binary)
         .raw(
             "function",
@@ -305,7 +306,7 @@ pub fn xrefs_json(
         .raw("callees", &rows(&refs.callees, "at"))
         .raw("data_refs", &rows(&refs.data_refs, "at"))
         .raw("assertions", &assertions_json(assertions))
-        .end()
+        .end())
 }
 
 /// The `strings` document: `{binary, scanned, count, strings:[{address,
@@ -315,13 +316,14 @@ pub fn xrefs_json(
 /// marks a row inside an executable section, and a use's `via` is
 /// `{name, address, address_hex}` of the data word it reads the string's address
 /// from, else null.
+/// Acquisition errors propagate before a document is published.
 pub fn strings_json(
     binary: &str,
     prog: &ConsoleProgram,
     file: &object::File,
     rebased: Option<&RebasedView>,
     assertions: &[Outcome],
-) -> String {
+) -> kuna_base::error::KunaResult<String> {
     use object::{Object, ObjectSection, SectionKind};
     let query = kuna_stringinv::Query {
         min_len: 5,
@@ -342,7 +344,7 @@ pub fn strings_json(
         .collect();
     let extents: Vec<(u64, u64)> =
         inv.strings.iter().map(|s| (s.addr, u64::from(s.byte_len))).collect();
-    let uses = string_uses(prog, file, &extents);
+    let uses = string_uses(prog, file, &extents)?;
     let rows = arr(inv.strings.iter().zip(&uses).map(|(s, uses)| {
         let uses = arr(uses.iter().map(|u| {
             let via = u.via.as_ref().map_or_else(
@@ -368,13 +370,13 @@ pub fn strings_json(
             .raw("uses", &uses)
             .end()
     }));
-    Obj::new()
+    Ok(Obj::new()
         .str("binary", binary)
         .str("scanned", if inv.from_segments { "segments" } else { "sections" })
         .num("count", inv.strings.len())
         .raw("strings", &rows)
         .raw("assertions", &assertions_json(assertions))
-        .end()
+        .end())
 }
 
 #[cfg(test)]

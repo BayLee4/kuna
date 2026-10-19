@@ -232,7 +232,8 @@ pub fn char_pointer_from_evidence(
     vn: VarnodeId,
     cur: &Rc<Datatype>,
     enabled: bool,
-) -> Option<Rc<Datatype>> {
+) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     if !enabled {
         return None;
     }
@@ -250,9 +251,12 @@ pub fn char_pointer_from_evidence(
     if ptrsize != spc.get_addr_size() as int4 {
         return None;
     }
-    let ev = walk_is_char(data, vn);
+    Some((ptrsize, arch, spc))
+    })();
+    let Some((ptrsize, arch, spc)) = candidate else { return Ok(None) };
+    let ev = walk_is_char(data, vn)?;
     if census_on() {
-        let v = data.vbank().get(vn)?;
+        let Some(v) = data.vbank().get(vn) else { return Ok(None) };
         eprintln!(
             "CHARPTR fn={:#x} {} size={} cur={} ev={}",
             data.get_address().get_offset(),
@@ -267,19 +271,21 @@ pub fn char_pointer_from_evidence(
         );
     }
     if !ev.commits() {
-        return None;
+        return Ok(None);
     }
+    Ok((|| {
     let tlst = arch.types()?;
     let ch = tlst.get_base(1, type_metatype::TYPE_INT).ok()?;
     if !is_char(&ch) {
         return None;
     }
     tlst.get_type_pointer(ptrsize, ch, spc.get_word_size()).ok()
+    })())
 }
 
 /// Bounded breadth-first walk over the transitive descendants of `start`,
 /// collecting what every use says about the element type.
-fn walk_is_char(data: &Funcdata, start: VarnodeId) -> Evidence {
+fn walk_is_char(data: &Funcdata, start: VarnodeId) -> kuna_base::error::KunaResult<Evidence> {
     let mut ev = Evidence::default();
     let mut seen: HashSet<VarnodeId> = HashSet::new();
     // The third component is "this Varnode is the base plus a fixed offset".  A
@@ -290,7 +296,7 @@ fn walk_is_char(data: &Funcdata, start: VarnodeId) -> Evidence {
     work.push_back((start, 0, false));
     seen.insert(start);
     while let Some((vn, hops, offsetted)) = work.pop_front() {
-        if defined_by_string_constant(data, vn) {
+        if defined_by_string_constant(data, vn)? {
             ev.strconst += 1;
         }
         let descend: Vec<OpId> = match data.vbank().get(vn) {
@@ -299,11 +305,11 @@ fn walk_is_char(data: &Funcdata, start: VarnodeId) -> Evidence {
         };
         for op in descend {
             let mut forward = None;
-            match classify_use(data, op, vn, offsetted) {
+            match classify_use(data, op, vn, offsetted)? {
                 Use::Refuse(why) => {
                     ev.refused = Some(why);
                     if !census_on() {
-                        return ev;
+                        return Ok(ev);
                     }
                 }
                 Use::Char(kind) => count(&mut ev, kind, data, op),
@@ -322,7 +328,7 @@ fn walk_is_char(data: &Funcdata, start: VarnodeId) -> Evidence {
             }
         }
     }
-    ev
+    Ok(ev)
 }
 
 /// Which use said "characters".
@@ -364,19 +370,19 @@ fn is_format_site(data: &Funcdata, op: OpId) -> bool {
 }
 
 /// Classify what `op` does with `vn`.
-fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Use {
+fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> kuna_base::error::KunaResult<Use> {
     let Some(o) = data.obank().get(op) else {
-        return Use::Neutral;
+        return Ok(Use::Neutral);
     };
     let opcode = o.code();
     let slot = o.get_slot(vn);
     let out = o.get_out();
-    match opcode {
+    Ok(match opcode {
         // A dereference through this value.  One byte is the accept condition;
         // anything wider is a different element and refuses the candidate.
         OpCode::CPUI_LOAD => {
             if slot != 1 {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
             match out.and_then(|o| data.vbank().get(o)).map(|v| v.get_size()) {
                 Some(1) if offsetted => Use::Neutral,
@@ -388,7 +394,7 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
         OpCode::CPUI_STORE => {
             if slot != 1 {
                 // The stored VALUE being this pointer says nothing about it.
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
             match o
                 .get_in(2)
@@ -410,7 +416,7 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
         }
         OpCode::CPUI_PTRADD => {
             if slot != 0 {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
             let constant_in = |i: int4| {
                 o.get_in(i)
@@ -445,7 +451,7 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
         OpCode::CPUI_INT_ADD => {
             let other = if slot == 0 { 1 } else { 0 };
             let Some(other_vn) = o.get_in(other) else {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             };
             let is_const = data
                 .vbank()
@@ -453,10 +459,10 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
                 .map(|v| v.is_constant())
                 .unwrap_or(false);
             if !is_const {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
-            if crate::kuna_ptrfromuse::constant_is_global_base(data, op, other_vn) {
-                return Use::Refuse("global-base");
+            if crate::kuna_ptrfromuse::constant_is_global_base(data, op, other_vn)? {
+                return Ok(Use::Refuse("global-base"));
             }
             let zero = data
                 .vbank()
@@ -474,9 +480,9 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
         // contradicts it.
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
             if slot <= 0 {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
-            let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot);
+            let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot)?;
             if is_char_pointer(&declared) {
                 // At a fixed non-zero offset the callee is being told about a
                 // FIELD, exactly as a one-byte load there is about a field:
@@ -484,21 +490,21 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
                 // reads `d_name` out of a `struct dirent`, and says nothing
                 // about the base.  Same guard, same reason as the byte arm.
                 return if offsetted {
-                    Use::Neutral
+                    Ok(Use::Neutral)
                 } else {
-                    Use::Char(CharKind::Declared)
+                    Ok(Use::Char(CharKind::Declared))
                 };
             }
             let meta = declared.get_metatype();
             if meta == type_metatype::TYPE_PTR {
                 return if points_at_nothing(&declared) {
-                    Use::Neutral
+                    Ok(Use::Neutral)
                 } else {
-                    Use::Refuse("callee-other-pointer")
+                    Ok(Use::Refuse("callee-other-pointer"))
                 };
             }
             if meta == type_metatype::TYPE_UNKNOWN {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
             Use::Refuse("callee-scalar")
         }
@@ -523,19 +529,19 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
         | OpCode::CPUI_INT_SLESSEQUAL => {
             let other = if slot == 0 { 1 } else { 0 };
             let Some(other_vn) = o.get_in(other) else {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             };
             let Some(ov) = data.vbank().get(other_vn) else {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             };
             if !ov.is_constant() {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
             if ov.get_offset() == 0 {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
-            if constant_is_string(data, op, other_vn) {
-                return Use::Char(CharKind::Str);
+            if constant_is_string(data, op, other_vn)? {
+                return Ok(Use::Char(CharKind::Str));
             }
             Use::Refuse("compare-literal")
         }
@@ -546,7 +552,7 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId, offsetted: bool) -> Us
                 Use::Neutral
             }
         }
-    }
+    })
 }
 
 /// What a `PTRADD(base, index, elemsize)` step on the walked value says.
@@ -597,63 +603,63 @@ fn o_const_is_zero(data: &Funcdata, op: OpId, slot: int4) -> bool {
 /// Is `vn` written by a COPY or MULTIEQUAL whose source is a constant that
 /// resolves to a character array in the image?  `char *p = "literal";` is the
 /// plainest statement a program makes about a pointer's element type.
-fn defined_by_string_constant(data: &Funcdata, vn: VarnodeId) -> bool {
+fn defined_by_string_constant(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let Some(v) = data.vbank().get(vn) else {
-        return false;
+        return Ok(false);
     };
     if !v.is_written() {
-        return false;
+        return Ok(false);
     }
-    let Some(def) = v.get_def() else { return false };
+    let Some(def) = v.get_def() else { return Ok(false) };
     let Some(o) = data.obank().get(def) else {
-        return false;
+        return Ok(false);
     };
     if !matches!(o.code(), OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL) {
-        return false;
+        return Ok(false);
     }
-    (0..o.num_input()).any(|i| {
-        o.get_in(i)
-            .and_then(|iv| data.vbank().get(iv))
-            .map(|c| c.is_constant())
-            .unwrap_or(false)
-            && o.get_in(i)
-                .is_some_and(|iv| constant_is_string(data, def, iv))
-    })
+    for i in 0..o.num_input() {
+        let Some(input) = o.get_in(i) else { continue };
+        if data.vbank().get(input).is_some_and(|value| value.is_constant())
+            && constant_is_string(data, def, input)?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Does the constant `cvn` resolve to a NUL-terminated character array kuna has
 /// already recovered at that address?  The resolution is
 /// `ActionConstantPtr::isPointer`'s (`coreaction.cc:1167`), and the answer is
 /// the covering global symbol's own data-type.
-pub(crate) fn constant_is_string(data: &Funcdata, op: OpId, cvn: VarnodeId) -> bool {
+/// Constant resolution and global-symbol query errors propagate to the caller.
+pub(crate) fn constant_is_string(data: &Funcdata, op: OpId, cvn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let Some(v) = data.vbank().get(cvn) else {
-        return false;
+        return Ok(false);
     };
     value_is_string(data, op, v.get_offset(), v.get_size())
 }
 
 /// [`constant_is_string`] for a constant value `off` of `size` bytes read at
 /// `op` rather than a constant Varnode.
-pub(crate) fn value_is_string(data: &Funcdata, op: OpId, off: uintb, size: int4) -> bool {
+pub(crate) fn value_is_string(data: &Funcdata, op: OpId, off: uintb, size: int4) -> kuna_base::error::KunaResult<bool> {
     let glb = data.get_arch();
     let Some(spc) = glb.manage().get_default_data_space().map(Rc::clone) else {
-        return false;
+        return Ok(false);
     };
     if spc.get_pointer_lower_bound() > off || spc.get_pointer_upper_bound() < off {
-        return false;
+        return Ok(false);
     }
     let Some(point) = data.obank().get(op).map(|o| o.get_addr().clone()) else {
-        return false;
+        return Ok(false);
     };
     let mut full_encoding: uintb = 0;
-    let Ok(rampoint) = glb.resolve_constant(&spc, off, size, &point, &mut full_encoding) else {
-        return false;
-    };
+    let rampoint = glb.resolve_constant(&spc, off, size, &point, &mut full_encoding)?;
     if rampoint.is_invalid() {
-        return false;
+        return Ok(false);
     }
     let invalid = Address::new_invalid();
-    match glb.query_container_global(&rampoint, 1, &invalid) {
+    Ok(match glb.query_container_global(&rampoint, 1, &invalid)? {
         Some(entry) => {
             if census_on() {
                 eprintln!(
@@ -680,7 +686,7 @@ pub(crate) fn value_is_string(data: &Funcdata, op: OpId, off: uintb, size: int4)
                 .is_some_and(|e| e.get_size() == 1 && e.is_ascii())
         }
         None => false,
-    }
+    })
 }
 
 /// Is `cand` more specific than `cur` in the `getLocalType` fold?

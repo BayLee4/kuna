@@ -138,7 +138,7 @@ fn writable_memory_source_declines() {
     let bl = mk_block(&mut fd);
     let op = mk_copy(&mut fd, bl, 0);
     let r = ram(&fd);
-    let vn = fd.new_varnode(8, &Address::new(r, 0x2000), None);
+    let vn = fd.new_varnode(8, &Address::new(r, 0x2000), None).unwrap();
     fd.op_set_input(op, vn, 0).unwrap();
     assert!(readonly_source(&fd, op).is_none());
 }
@@ -150,7 +150,7 @@ fn readonly_memory_source_is_accepted() {
     let bl = mk_block(&mut fd);
     let op = mk_copy(&mut fd, bl, 0);
     let r = ram(&fd);
-    let vn = fd.new_varnode(8, &Address::new(r, 0x2000), None);
+    let vn = fd.new_varnode(8, &Address::new(r, 0x2000), None).unwrap();
     fd.vbank_mut().get_mut(vn).unwrap().set_flags_pub(varnode_flags::readonly);
     fd.op_set_input(op, vn, 0).unwrap();
     assert_eq!(readonly_source(&fd, op), Some(vn));
@@ -168,7 +168,7 @@ fn cast_between_read_and_copy_is_looked_through() {
         TypeOp::new(OpCode::CPUI_CAST, 0, format!("{:?}", OpCode::CPUI_CAST)),
     );
     fd.op_insert_end(cast, bl);
-    let src = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x2000), None);
+    let src = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x2000), None).unwrap();
     fd.vbank_mut().get_mut(src).unwrap().set_flags_pub(varnode_flags::readonly);
     fd.op_set_input(cast, src, 0).unwrap();
     let casted = fd.new_unique_out(8, cast).unwrap();
@@ -188,7 +188,7 @@ fn rule_gate_off_is_noop() {
     let c = fd.new_constant(8, 0);
     fd.op_set_input(op, c, 0).unwrap();
     let mut rule = RuleRodataStringCopy::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 /// Gate on but no covering string symbol: still declines, leaving the op alone.
@@ -200,7 +200,7 @@ fn rule_gate_on_without_symbol_declines() {
     let c = fd.new_constant(8, 0);
     fd.op_set_input(op, c, 0).unwrap();
     let mut rule = RuleRodataStringCopy::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 /// The rule matches on CPUI_COPY and clone-filters by group.

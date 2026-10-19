@@ -237,10 +237,10 @@ pub trait MergeContext: HighContext {
     fn bank_clear_copy_ins(&mut self, high: HighVariableId);
 
     // --- Symbol reads on a HighVariable (W4 surface; hooks) ----------------
-    /// `high->getSymbol()` identity, if any.  STUB(W4-symbol).
-    fn bank_symbol(&self, high: HighVariableId) -> Option<u64>;
-    /// `high->getSymbolOffset()`.  STUB(W4-symbol).
-    fn bank_symbol_offset(&self, high: HighVariableId) -> int4;
+    /// `high->getSymbol()` identity, propagating mapped-symbol query errors.
+    fn bank_symbol(&self, high: HighVariableId) -> KunaResult<Option<u64>>;
+    /// `high->getSymbolOffset()`, propagating mapped-symbol query errors.
+    fn bank_symbol_offset(&self, high: HighVariableId) -> KunaResult<int4>;
     /// `high->getSymbol()->isIsolated()`.  STUB(W4-symbol).
     fn bank_symbol_isolated(&self, high: HighVariableId) -> bool;
     /// `high->getTiedVarnode()->getAddr()` (the addr-tied address compare).
@@ -356,7 +356,7 @@ pub trait MergeContext: HighContext {
     /// `op->previousOp()`.
     fn op_previous(&self, op: OpId) -> Option<OpId>;
     /// `op->outputTypeLocal()`.
-    fn op_output_type_local(&self, op: OpId) -> std::rc::Rc<crate::dtype::Datatype>;
+    fn op_output_type_local(&self, op: OpId) -> KunaResult<std::rc::Rc<crate::dtype::Datatype>>;
     /// `op->inputTypeLocal(slot)`.
     fn op_input_type_local(&self, op: OpId, slot: int4) -> std::rc::Rc<crate::dtype::Datatype>;
     /// The `(block_index, CoverPoint)` of `op` (for `range.contain(op,1)`).
@@ -412,9 +412,11 @@ pub trait MergeContext: HighContext {
         false
     }
     /// (kuna) [`crate::p6_variables::kuna_loadorder::crosses_global_write`].
+    /// Reads established heritage guard ranges; no live host query.
     fn vn_load_crosses_global_write(&mut self, _vn: VarnodeId, _except: HighVariableId) -> bool {
         false
     }
+    /// Reads established heritage guard ranges; no live host query.
     fn global_copy_moves_write(&self, _global: HighVariableId, _value: HighVariableId) -> bool {
         false
     }
@@ -542,20 +544,22 @@ impl Merge {
     ///
     /// Short-circuits when properties preclude merging (locked to different types,
     /// mapped to different addresses, input-vs-global, separate overlap groups,
-    /// different symbols).  Returns `true` if the merge is *not forbidden*.
+    /// different symbols). Returns `true` if the merge is *not forbidden*.
+    /// A mapped-symbol query error aborts the caller rather than treating the
+    /// high as unbound or recording a negative merge/intersection decision.
     pub fn merge_test_required(
         ctx: &mut dyn MergeContext,
         high_out: HighVariableId,
         high_in: HighVariableId,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         if high_in == high_out {
-            return true; // Already merged
+            return Ok(true); // Already merged
         }
 
         if ctx.stack_copy_moves_write(high_out, high_in)
             || ctx.stack_copy_moves_write(high_in, high_out)
         {
-            return false;
+            return Ok(false);
         }
 
         // If types are locked don't merge unless both types are the same.
@@ -563,7 +567,7 @@ impl Merge {
             let t_in = ctx.high_get_type(high_in);
             let t_out = ctx.high_get_type(high_out);
             if !std::rc::Rc::ptr_eq(&t_in, &t_out) {
-                return false;
+                return Ok(false);
             }
         }
 
@@ -573,7 +577,7 @@ impl Merge {
             let tied_in = ctx.bank_tied_addr(high_in);
             let tied_out = ctx.bank_tied_addr(high_out);
             if tied_in != tied_out {
-                return false;
+                return Ok(false);
             }
         }
 
@@ -581,48 +585,48 @@ impl Merge {
             // Input and persist must be different vars (persists have their own
             // input); also keep inputs from merging into internal stack parts.
             if ctx.high_is_persist(high_out) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_addr_tied(high_out) && !ctx.high_is_addr_tied(high_in) {
-                return false;
+                return Ok(false);
             }
         } else if ctx.high_is_extra_out(high_in) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_input(high_out) {
             if ctx.high_is_persist(high_in) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_addr_tied(high_in) && !ctx.high_is_addr_tied(high_out) {
-                return false;
+                return Ok(false);
             }
         } else if ctx.high_is_extra_out(high_out) {
-            return false;
+            return Ok(false);
         }
 
         if ctx.high_is_proto_partial(high_in) {
             if ctx.high_is_proto_partial(high_out) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_input(high_out) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_addr_tied(high_out) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_persist(high_out) {
-                return false;
+                return Ok(false);
             }
         }
         if ctx.high_is_proto_partial(high_out) {
             if ctx.high_is_input(high_in) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_addr_tied(high_in) {
-                return false;
+                return Ok(false);
             }
             if ctx.high_is_persist(high_in) {
-                return false;
+                return Ok(false);
             }
         }
 
@@ -632,25 +636,25 @@ impl Merge {
         let group_out = ctx.high_group_info(high_out);
         if let (Some(gi), Some(go)) = (group_in, group_out) {
             if gi.group == go.group {
-                return false;
+                return Ok(false);
             }
             if gi.piece_size != gi.group_size && go.piece_size != go.group_size {
-                return false;
+                return Ok(false);
             }
         }
 
         // Map to different symbols / different parts of the same symbol.
-        let sym_in = ctx.bank_symbol(high_in);
-        let sym_out = ctx.bank_symbol(high_out);
+        let sym_in = ctx.bank_symbol(high_in)?;
+        let sym_out = ctx.bank_symbol(high_out)?;
         if let (Some(si), Some(so)) = (sym_in, sym_out) {
             if si != so {
-                return false;
+                return Ok(false);
             }
-            if ctx.bank_symbol_offset(high_in) != ctx.bank_symbol_offset(high_out) {
-                return false;
+            if ctx.bank_symbol_offset(high_in)? != ctx.bank_symbol_offset(high_out)? {
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Adjacency tests for input/output of the same op (C++
@@ -660,24 +664,24 @@ impl Merge {
         ctx: &mut dyn MergeContext,
         high_out: HighVariableId,
         high_in: HighVariableId,
-    ) -> bool {
-        if !Self::merge_test_required(ctx, high_out, high_in) {
-            return false;
+    ) -> KunaResult<bool> {
+        if !Self::merge_test_required(ctx, high_out, high_in)? {
+            return Ok(false);
         }
 
         if ctx.high_is_name_lock(high_in) && ctx.high_is_name_lock(high_out) {
-            return false;
+            return Ok(false);
         }
 
         let prior = ctx.kuna_same_prior_variable(high_out, high_in);
         if prior == Some(false) {
-            return false;
+            return Ok(false);
         }
         // Make sure variables have the same type.
         let t_out = ctx.high_get_type(high_out);
         let t_in = ctx.high_get_type(high_in);
         if !std::rc::Rc::ptr_eq(&t_out, &t_in) && prior.is_none() {
-            return false;
+            return Ok(false);
         }
 
         // Isolate the use of illegal inputs: no speculative merges with them
@@ -685,30 +689,30 @@ impl Merge {
         if ctx.high_is_input(high_out) {
             if let Some(vn) = ctx.bank_input_varnode(high_out) {
                 if ctx.vn_is_illegal_input(vn) && !ctx.vn_is_indirect_only(vn) {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
         if ctx.high_is_input(high_in) {
             if let Some(vn) = ctx.bank_input_varnode(high_in) {
                 if ctx.vn_is_illegal_input(vn) && !ctx.vn_is_indirect_only(vn) {
-                    return false;
+                    return Ok(false);
                 }
             }
         }
         if ctx.bank_symbol_isolated(high_in) {
-            return false;
+            return Ok(false);
         }
         if ctx.bank_symbol_isolated(high_out) {
-            return false;
+            return Ok(false);
         }
 
         // Currently don't allow speculative merging across separate overlapping
         // collections.
         if ctx.high_piece(high_out).is_some() && ctx.high_piece(high_in).is_some() {
-            return false;
+            return Ok(false);
         }
-        true
+        Ok(true)
     }
 
     /// Speculative tests (C++ `Merge::mergeTestSpeculative`, `merge.cc:220-235`):
@@ -717,29 +721,29 @@ impl Merge {
         ctx: &mut dyn MergeContext,
         high_out: HighVariableId,
         high_in: HighVariableId,
-    ) -> bool {
-        if !Self::merge_test_adjacent(ctx, high_out, high_in) {
-            return false;
+    ) -> KunaResult<bool> {
+        if !Self::merge_test_adjacent(ctx, high_out, high_in)? {
+            return Ok(false);
         }
         if ctx.high_is_persist(high_out) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_persist(high_in) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_input(high_out) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_input(high_in) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_addr_tied(high_out) {
-            return false;
+            return Ok(false);
         }
         if ctx.high_is_addr_tied(high_in) {
-            return false;
+            return Ok(false);
         }
-        true
+        Ok(true)
     }
 
     /// Test that a Varnode that *must* merge *can* merge (C++
@@ -1210,7 +1214,7 @@ impl Merge {
         for high in order {
             let mut merged_into = false;
             for &out in &highstack {
-                let spec_ok = Self::merge_test_speculative(ctx, out, high)
+                let spec_ok = Self::merge_test_speculative(ctx, out, high)?
                     && !crate::kuna_fputruncviews::keeps_highs_apart(ctx, out, high)
                     && !crate::kuna_fputruncviews::keeps_root_alone(ctx, out, high);
                 if spec_ok && self.merge(ctx, out, high, true)? {
@@ -1342,7 +1346,7 @@ impl Merge {
                     }
                     let h1 = ctx.vn_high(vn1).expect("merge_opcode: vn1 no high");
                     let h2 = ctx.vn_high(vn2).expect("merge_opcode: vn2 no high");
-                    if Self::merge_test_required(ctx, h1, h2)
+                    if Self::merge_test_required(ctx, h1, h2)?
                         && !crate::kuna_fputruncviews::keeps_highs_apart(ctx, h1, h2)
                         && !crate::p6_variables::kuna_globalvalue::keeps_apart(ctx, h1, h2)
                     {
@@ -1423,7 +1427,7 @@ impl Merge {
             }
             let vn1 = vn1.unwrap();
             let high_out = ctx.vn_high(vn1).expect("merge_adjacent: vn1 no high");
-            let ct = ctx.op_output_type_local(op);
+            let ct = ctx.op_output_type_local(op)?;
             let ni = ctx.op_num_input(op);
             for i in 0..ni {
                 let vn2 = ctx.op_in(op, i);
@@ -1449,7 +1453,7 @@ impl Merge {
                     continue;
                 }
                 let high_in = ctx.vn_high(vn2).expect("merge_adjacent: vn2 no high");
-                if !Self::merge_test_adjacent(ctx, high_out, high_in)
+                if !Self::merge_test_adjacent(ctx, high_out, high_in)?
                     || crate::kuna_fputruncviews::keeps_highs_apart(ctx, high_out, high_in)
                     || crate::p6_variables::kuna_globalvalue::keeps_apart(ctx, high_out, high_in)
                 {
@@ -1543,14 +1547,14 @@ impl Merge {
         for i in 0..max {
             let in_vn = ctx.op_in(op, i).expect("mergeOp: null input");
             let high_in = ctx.vn_high(in_vn).expect("mergeOp: in no high");
-            if !Self::merge_test_required(ctx, high_out, high_in) {
+            if !Self::merge_test_required(ctx, high_out, high_in)? {
                 self.trim_op_input(ctx, op, i)?;
                 continue;
             }
             for j in 0..i {
                 let jvn = ctx.op_in(op, j).expect("mergeOp: null input j");
                 let jhigh = ctx.vn_high(jvn).expect("mergeOp: in j no high");
-                if !Self::merge_test_required(ctx, jhigh, high_in) {
+                if !Self::merge_test_required(ctx, jhigh, high_in)? {
                     self.trim_op_input(ctx, op, i)?;
                     break;
                 }
@@ -1605,7 +1609,7 @@ impl Merge {
         for i in 0..max {
             let out_h = ctx.vn_high(ctx.op_out(op).unwrap()).unwrap();
             let in_h = ctx.vn_high(ctx.op_in(op, i).unwrap()).unwrap();
-            if !Self::merge_test_required(ctx, out_h, in_h) {
+            if !Self::merge_test_required(ctx, out_h, in_h)? {
                 return Err(KunaError::lowlevel(
                     "Non-cover related merge restriction violated, despite trims",
                 ));
@@ -1628,7 +1632,7 @@ impl Merge {
         let invn0 = ctx.op_in(indop, 0).expect("mergeIndirect: no in0");
         let out_h = ctx.vn_high(outvn).unwrap();
         let in_h = ctx.vn_high(invn0).unwrap();
-        if Self::merge_test_required(ctx, out_h, in_h) && self.merge(ctx, in_h, out_h, false)? {
+        if Self::merge_test_required(ctx, out_h, in_h)? && self.merge(ctx, in_h, out_h, false)? {
             return Ok(());
         }
         // The only failure mode from an input trim is if the INDIRECT output is in
@@ -1636,7 +1640,7 @@ impl Merge {
         if self.snip_output_interference(ctx, indop)? {
             let out_h = ctx.vn_high(outvn).unwrap();
             let in_h = ctx.vn_high(invn0).unwrap();
-            if Self::merge_test_required(ctx, out_h, in_h) && self.merge(ctx, in_h, out_h, false)? {
+            if Self::merge_test_required(ctx, out_h, in_h)? && self.merge(ctx, in_h, out_h, false)? {
                 return Ok(());
             }
         }
@@ -1649,7 +1653,7 @@ impl Merge {
         ctx.op_insert_before(newop, indop);
         let new_in_h = ctx.vn_high(ctx.op_in(indop, 0).unwrap()).unwrap();
         let out_h = ctx.vn_high(outvn).unwrap();
-        if !Self::merge_test_required(ctx, out_h, new_in_h) || !self.merge(ctx, new_in_h, out_h, false)? {
+        if !Self::merge_test_required(ctx, out_h, new_in_h)? || !self.merge(ctx, new_in_h, out_h, false)? {
             return Err(KunaError::lowlevel("Unable to merge address forced indirect"));
         }
         Ok(())
@@ -2391,7 +2395,7 @@ impl Merge {
                     continue;
                 }
                 MergeIntersect::update_high(ctx, &mut self.test_cache, new_high);
-                if !Self::merge_test_required(ctx, high, new_high) {
+                if !Self::merge_test_required(ctx, high, new_high)? {
                     ctx.symbol_set_merge_problems(sym);
                     ctx.bank_set_unmerged(new_high);
                     conflict_count += 1;
@@ -2513,6 +2517,8 @@ mod tests {
         unmerged: bool,
         symbol: Option<u64>,
         symbol_offset: int4,
+        symbol_query_error: bool,
+        symbol_offset_query_error: bool,
         instances: Vec<VarnodeId>,
         cover: Cover,
         tied_addr: Address,
@@ -2725,11 +2731,17 @@ mod tests {
             s.copy_in1 = false;
             s.copy_in2 = false;
         }
-        fn bank_symbol(&self, h: HighVariableId) -> Option<u64> {
-            self.hs(h).symbol
+        fn bank_symbol(&self, h: HighVariableId) -> KunaResult<Option<u64>> {
+            if self.hs(h).symbol_query_error {
+                return Err(KunaError::lowlevel("mapped symbol query failed"));
+            }
+            Ok(self.hs(h).symbol)
         }
-        fn bank_symbol_offset(&self, h: HighVariableId) -> int4 {
-            self.hs(h).symbol_offset
+        fn bank_symbol_offset(&self, h: HighVariableId) -> KunaResult<int4> {
+            if self.hs(h).symbol_offset_query_error {
+                return Err(KunaError::lowlevel("mapped symbol offset query failed"));
+            }
+            Ok(self.hs(h).symbol_offset)
         }
         fn bank_symbol_isolated(&self, _h: HighVariableId) -> bool {
             false
@@ -2877,8 +2889,8 @@ mod tests {
         fn op_previous(&self, _op: OpId) -> Option<OpId> {
             None
         }
-        fn op_output_type_local(&self, _op: OpId) -> Rc<Datatype> {
-            dt(1, type_metatype::TYPE_UNKNOWN)
+        fn op_output_type_local(&self, _op: OpId) -> KunaResult<Rc<Datatype>> {
+            Ok(dt(1, type_metatype::TYPE_UNKNOWN))
         }
         fn op_input_type_local(&self, _op: OpId, _slot: int4) -> Rc<Datatype> {
             dt(1, type_metatype::TYPE_UNKNOWN)
@@ -3130,7 +3142,7 @@ mod tests {
     fn merge_test_required_same_high_is_true() {
         let mut m = Mock::new();
         add_high(&mut m, 1, HighState::default());
-        assert!(Merge::merge_test_required(&mut m, hid(1), hid(1)));
+        assert!(Merge::merge_test_required(&mut m, hid(1), hid(1)).unwrap());
     }
 
     #[test]
@@ -3144,7 +3156,7 @@ mod tests {
         b.type_ = Some(dt(4, type_metatype::TYPE_UINT)); // different Rc
         add_high(&mut m, 1, a);
         add_high(&mut m, 2, b);
-        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
     }
 
     #[test]
@@ -3157,7 +3169,7 @@ mod tests {
         add_high(&mut m, 1, persist); // high_out persist
         add_high(&mut m, 2, input); // high_in input
         // high_in input && high_out persist -> false
-        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
     }
 
     #[test]
@@ -3169,7 +3181,7 @@ mod tests {
         add_high(&mut m, 1, a.clone());
         add_high(&mut m, 2, b);
         // high_in not input, is extraOut -> false
-        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
         a.extra_out = false;
     }
 
@@ -3182,7 +3194,7 @@ mod tests {
         b.symbol = Some(9);
         add_high(&mut m, 1, a);
         add_high(&mut m, 2, b);
-        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
     }
 
     #[test]
@@ -3196,7 +3208,7 @@ mod tests {
         b.symbol_offset = 4;
         add_high(&mut m, 1, a);
         add_high(&mut m, 2, b);
-        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
     }
 
     #[test]
@@ -3204,7 +3216,7 @@ mod tests {
         let mut m = Mock::new();
         add_high(&mut m, 1, HighState::default());
         add_high(&mut m, 2, HighState::default());
-        assert!(Merge::merge_test_required(&mut m, hid(1), hid(2)));
+        assert!(Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap());
     }
 
     // --- mergeTestSpeculative (merge.cc:220-235) ---------------------------
@@ -3217,17 +3229,41 @@ mod tests {
         tied.addr_tied = true;
         add_high(&mut m, 2, tied);
         // adjacency passes (same type), but speculative rejects addr-tied
-        assert!(!Merge::merge_test_speculative(&mut m, hid(1), hid(2)));
+        assert!(!Merge::merge_test_speculative(&mut m, hid(1), hid(2)).unwrap());
 
         let mut m2 = Mock::new();
         add_high(&mut m2, 1, HighState::default());
         let mut inp = HighState::default();
         inp.input = true;
         add_high(&mut m2, 2, inp);
-        assert!(!Merge::merge_test_speculative(&mut m2, hid(1), hid(2)));
+        assert!(!Merge::merge_test_speculative(&mut m2, hid(1), hid(2)).unwrap());
     }
 
     // --- mergeTestMust / mergeTestBasic (merge.cc:241-264) -----------------
+
+    #[test]
+    fn mapped_symbol_query_errors_reach_all_merge_tests() {
+        let mut m = Mock::new();
+        add_high(&mut m, 1, HighState::default());
+        add_high(&mut m, 2, HighState::default());
+        m.hs_mut(hid(2)).symbol_query_error = true;
+        for result in [
+            Merge::merge_test_required(&mut m, hid(1), hid(2)),
+            Merge::merge_test_adjacent(&mut m, hid(1), hid(2)),
+            Merge::merge_test_speculative(&mut m, hid(1), hid(2)),
+        ] {
+            assert_eq!(result.unwrap_err().to_string(), "mapped symbol query failed");
+        }
+        m.hs_mut(hid(2)).symbol_query_error = false;
+        m.hs_mut(hid(1)).symbol = Some(7);
+        m.hs_mut(hid(2)).symbol = Some(7);
+        m.hs_mut(hid(2)).symbol_offset_query_error = true;
+        assert_eq!(
+            Merge::merge_test_required(&mut m, hid(1), hid(2)).unwrap_err().to_string(),
+            "mapped symbol offset query failed",
+        );
+        assert!(m.merged.is_empty());
+    }
 
     #[test]
     fn merge_test_basic_rejects_no_cover() {
@@ -3359,6 +3395,30 @@ mod tests {
     }
 
     // --- Merge::clear resets the cache + trim/partial lists ----------------
+
+    #[test]
+    fn merge_linear_stops_before_merging_on_mapped_query_error() {
+        let mut m = Mock::new();
+        let shared = dt(4, type_metatype::TYPE_INT);
+        for n in 1..=3u32 {
+            let mut s = HighState::default();
+            s.has_cover = true;
+            s.type_ = Some(shared.clone());
+            s.cover = cover_block(n as int4 - 1, 0, 5);
+            s.instances = vec![vid(n as u64)];
+            s.symbol_query_error = n == 2;
+            add_high(&mut m, n, s);
+            m.vn_addr.insert(vkey(vid(n as u64)), Address::new_invalid());
+        }
+        let mut merge = Merge::new(HighIntersectTest::new(PcodeOpSet::new(
+            Box::new(Vec::new),
+            Box::new(|_, _| true),
+        )));
+        let result = merge.merge_linear(&mut m, &mut [hid(1), hid(2), hid(3)]);
+        assert_eq!(result.unwrap_err().to_string(), "mapped symbol query failed");
+        assert!(m.merged.is_empty(), "query failure must stop the hot loop");
+        assert_eq!(merge.test_cache.cached(hid(1), hid(2)), None);
+    }
 
     #[test]
     fn merge_clear_empties_state() {

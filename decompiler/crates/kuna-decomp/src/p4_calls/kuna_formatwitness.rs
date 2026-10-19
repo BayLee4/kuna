@@ -19,10 +19,13 @@
 //! call to the same entry with exactly that many arguments is an arity witness.
 //! The parser accepts a conservative printf subset and declines positional or
 //! malformed formats.
+//! Unavailable format bytes provide no optional witness; other acquisition
+//! failures retain their error category and stop the caller.
 
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaError;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
@@ -32,26 +35,25 @@ use crate::p4_calls::kuna_calleearity::witness_storage;
 
 const MAX_FORMAT: usize = 256;
 
-fn constant_pointer(data: &Funcdata, op: OpId) -> Option<Address> {
-    let call = data.obank().get(op)?;
-    let vn = data.vbank().get(call.get_in(1)?)?;
+fn constant_pointer(data: &Funcdata, op: OpId) -> kuna_base::error::KunaResult<Option<Address>> {
+    let Some(call) = data.obank().get(op) else { return Ok(None) };
+    let Some(vn) = call.get_in(1).and_then(|vn| data.vbank().get(vn)) else { return Ok(None) };
     if !vn.is_constant() {
-        return None;
+        return Ok(None);
     }
     pointer_target(data, vn.get_offset(), vn.get_size(), call.get_addr())
 }
 
-fn pointer_target(data: &Funcdata, value: u64, size: int4, point: &Address) -> Option<Address> {
+fn pointer_target(data: &Funcdata, value: u64, size: int4, point: &Address) -> kuna_base::error::KunaResult<Option<Address>> {
     if value == 0 {
-        return None;
+        return Ok(None);
     }
     let glb = data.get_arch();
-    let space = Rc::clone(glb.manage().get_default_data_space()?);
+    let Some(space) = glb.manage().get_default_data_space().cloned() else { return Ok(None) };
     let mut full_encoding = 0;
     let resolved = glb
-        .resolve_constant(&space, value, size, point, &mut full_encoding)
-        .ok()?;
-    (!resolved.is_invalid()).then_some(resolved)
+        .resolve_constant(&space, value, size, point, &mut full_encoding)?;
+    Ok((!resolved.is_invalid()).then_some(resolved))
 }
 
 /// How many arguments the printf format that the pointer `value` (a `size`-byte
@@ -62,49 +64,57 @@ pub(crate) fn pointed_format_count(
     value: u64,
     size: int4,
     point: &Address,
-) -> Option<usize> {
-    let bytes = read_format(data, &pointer_target(data, value, size, point)?)?;
+) -> kuna_base::error::KunaResult<Option<usize>> {
+    let Some(addr) = pointer_target(data, value, size, point)? else { return Ok(None) };
+    let Some(bytes) = read_format(data, &addr)? else { return Ok(None) };
     if !bytes.contains(&b'%') {
-        return Some(0);
+        return Ok(Some(0));
     }
-    printf_argument_count(&bytes)
+    Ok(printf_argument_count(&bytes))
 }
 
 /// A constant format whose complete bytes, including the terminator, are
 /// immutable in this image. Positive argument evidence requires immutability.
 pub(super) fn pointed_readonly_format(
     data: &Funcdata, value: u64, size: int4, point: &Address,
-) -> Option<Vec<u8>> {
-    let addr = pointer_target(data, value, size, point)?;
-    let bytes = read_format(data, &addr)?;
+) -> kuna_base::error::KunaResult<Option<Vec<u8>>> {
+    let Some(addr) = pointer_target(data, value, size, point)? else { return Ok(None) };
+    let Some(bytes) = read_format(data, &addr)? else { return Ok(None) };
     for offset in 0..=bytes.len() {
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        let Some(offset) = addr.get_offset().checked_add(offset as u64) else { return Ok(None) };
         let at = Address::new(
-            Rc::clone(addr.get_space()?), addr.get_offset().checked_add(offset as u64)?,
+            Rc::clone(space), offset,
         );
-        let flags = data.get_arch().query_global_range_properties(&at);
+        let flags = data.get_arch().query_global_range_properties(&at)?;
         if flags & crate::varnode::varnode_flags::readonly == 0 {
-            return None;
+            return Ok(None);
         }
     }
-    Some(bytes)
+    Ok(Some(bytes))
 }
 
-fn read_format(data: &Funcdata, addr: &Address) -> Option<Vec<u8>> {
+fn read_format(data: &Funcdata, addr: &Address) -> kuna_base::error::KunaResult<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     for offset in 0..MAX_FORMAT {
         let mut byte = [0u8; 1];
-        let at_offset = addr.get_offset().checked_add(offset as u64)?;
-        let at = Address::new(Rc::clone(addr.get_space()?), at_offset);
-        data.get_arch().loader_fill(&mut byte, &at).ok()?;
+        let Some(at_offset) = addr.get_offset().checked_add(offset as u64) else { return Ok(None) };
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        let at = Address::new(Rc::clone(space), at_offset);
+        match data.get_arch().loader_fill(&mut byte, &at) {
+            Ok(()) => {}
+            Err(KunaError::DataUnavail { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
         if byte[0] == 0 {
-            return (!bytes.is_empty()).then_some(bytes);
+            return Ok((!bytes.is_empty()).then_some(bytes));
         }
         if !(byte[0].is_ascii_graphic() || byte[0].is_ascii_whitespace()) {
-            return None;
+            return Ok(None);
         }
         bytes.push(byte[0]);
     }
-    None
+    Ok(None)
 }
 
 fn take_digits(bytes: &[u8], mut i: usize) -> usize {
@@ -182,15 +192,15 @@ pub(crate) fn printf_argument_count(bytes: &[u8]) -> Option<usize> {
     saw_conversion.then_some(count)
 }
 
-pub(crate) fn best_witness(entry: &Address, op: OpId, data: &Funcdata) -> Vec<(Address, int4)> {
-    let Some(format_addr) = constant_pointer(data, op) else {
-        return Vec::new();
+pub(crate) fn best_witness(entry: &Address, op: OpId, data: &Funcdata) -> kuna_base::error::KunaResult<Vec<(Address, int4)>> {
+    let Some(format_addr) = constant_pointer(data, op)? else {
+        return Ok(Vec::new());
     };
-    let Some(format) = read_format(data, &format_addr) else {
-        return Vec::new();
+    let Some(format) = read_format(data, &format_addr)? else {
+        return Ok(Vec::new());
     };
     let Some(varargs) = printf_argument_count(&format) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let expected = varargs + 1;
     let mut best = Vec::new();
@@ -204,7 +214,7 @@ pub(crate) fn best_witness(entry: &Address, op: OpId, data: &Funcdata) -> Vec<(A
         }
         let sibling_op = sibling.get_op();
         if data.obank().get(sibling_op).map(|o| o.code()) != Some(OpCode::CPUI_CALL)
-            || constant_pointer(data, sibling_op).as_ref() != Some(&format_addr)
+            || constant_pointer(data, sibling_op)?.as_ref() != Some(&format_addr)
         {
             continue;
         }
@@ -215,12 +225,119 @@ pub(crate) fn best_witness(entry: &Address, op: OpId, data: &Funcdata) -> Vec<(A
             best = storage;
         }
     }
-    best
+    Ok(best)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::printf_argument_count;
+    use super::{printf_argument_count, read_format};
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+
+    use kuna_base::address::Address;
+    use kuna_base::error::{KunaError, KunaResult};
+    use kuna_base::space::{
+        addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, ConstantSpace, FspecSpace,
+        IopSpace, UniqueSpace,
+    };
+    use kuna_sleigh::loadimage::LoadImage;
+
+    use crate::context::ArchContext;
+    use crate::funcdata::Funcdata;
+
+    struct FormatImage {
+        bytes: Vec<u8>,
+        failure: KunaError,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl LoadImage for FormatImage {
+        fn get_file_name(&self) -> &str {
+            "optional-format"
+        }
+
+        fn load_fill(&mut self, ptr: &mut [u8], addr: &Address) -> KunaResult<()> {
+            self.reads.set(self.reads.get() + 1);
+            let Some(start) = addr.get_offset().checked_sub(0x2004) else {
+                return Err(self.failure.clone());
+            };
+            let Some(bytes) = self.bytes.get(start as usize..start as usize + ptr.len()) else {
+                return Err(self.failure.clone());
+            };
+            ptr.copy_from_slice(bytes);
+            Ok(())
+        }
+
+        fn get_arch_type(&self) -> Vec<u8> {
+            b"optional-format".to_vec()
+        }
+
+        fn adjust_vma(&mut self, _adjust: i64) {}
+    }
+
+    fn format_fixture(bytes: &[u8], failure: KunaError) -> (Funcdata, Address, Rc<Cell<usize>>) {
+        let mut manager = AddrSpaceManager::new();
+        manager.insert_space(Rc::new(ConstantSpace::new())).unwrap();
+        manager.insert_space(Rc::new(UniqueSpace::new(1, 0, false))).unwrap();
+        manager.insert_space(Rc::new(IopSpace::new(2))).unwrap();
+        manager.insert_space(Rc::new(FspecSpace::new(3))).unwrap();
+        let ram = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 4,
+            addrspace_flags::hasphysical, 1, 1,
+        ));
+        manager.insert_space(Rc::clone(&ram)).unwrap();
+        let reads = Rc::new(Cell::new(0));
+        let mut context = ArchContext::new(manager);
+        context.loader = Some(Rc::new(RefCell::new(Box::new(FormatImage {
+            bytes: bytes.to_vec(),
+            failure,
+            reads: Rc::clone(&reads),
+        }) as Box<dyn LoadImage>)));
+        let function = Funcdata::new(
+            "format", "format", Rc::new(context), Address::new(Rc::clone(&ram), 0x1000),
+            0x10000000, 0,
+        ).unwrap();
+        (function, Address::new(ram, 0x2004), reads)
+    }
+
+    #[test]
+    fn unavailable_format_is_absence_even_after_a_readable_prefix() {
+        for prefix in [b"".as_slice(), b"%d".as_slice()] {
+            let (function, address, reads) = format_fixture(
+                prefix, KunaError::data_unavail("format bytes are not mapped"),
+            );
+            assert_eq!(read_format(&function, &address).unwrap(), None);
+            assert_eq!(reads.get(), prefix.len() + 1);
+        }
+    }
+
+    #[test]
+    fn format_query_failures_preserve_category_and_stop_at_the_failed_read() {
+        for failure in [
+            KunaError::transport("host closed while reading format"),
+            KunaError::java("java.lang.IllegalStateException", "format query failed"),
+            KunaError::decoder("malformed format response"),
+            KunaError::lowlevel("format image failed"),
+        ] {
+            let (function, address, reads) = format_fixture(b"%d", failure.clone());
+            assert_eq!(read_format(&function, &address).unwrap_err(), failure);
+            assert_eq!(reads.get(), 3, "no read may follow the failed acquisition");
+        }
+    }
+
+    #[test]
+    fn complete_format_and_empty_string_keep_their_original_meaning() {
+        let (function, address, reads) = format_fixture(
+            b"%d\0", KunaError::data_unavail("past terminator"),
+        );
+        assert_eq!(read_format(&function, &address).unwrap(), Some(b"%d".to_vec()));
+        assert_eq!(reads.get(), 3);
+        let (function, address, reads) = format_fixture(
+            b"\0", KunaError::data_unavail("past terminator"),
+        );
+        assert_eq!(read_format(&function, &address).unwrap(), None);
+        assert_eq!(reads.get(), 1);
+    }
 
     #[test]
     fn counts_conversions_and_star_operands() {

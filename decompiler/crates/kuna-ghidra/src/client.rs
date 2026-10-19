@@ -384,13 +384,10 @@ impl<R: Read, W: Write> GhidraClient<R, W> {
 
         read_to_response(&mut self.sin)?;
         let t = read_to_any_burst(&mut self.sin)?;
-        if t == BURST_BYTES_OPEN {
+        let data = if t == BURST_BYTES_OPEN {
             let mut dblbuf = vec![0u8; size * 2];
-            self.sin.read_exact(&mut dblbuf).map_err(|_| {
-                // C++ checks gcount and throws the alignment JavaError
-                java_alignment("Could not read expected number of bytes")
-            })?;
-            buf.copy_from_slice(&nibble_condense(&dblbuf));
+            self.sin.read_exact(&mut dblbuf).map_err(crate::protocol::read_err)?;
+            dblbuf
         } else if (t & 1) == 1 {
             let mut errmsg = String::from("GHIDRA has no data in the loadimage at ");
             if let Some(spc) = inaddr.get_space() {
@@ -400,12 +397,14 @@ impl<R: Read, W: Write> GhidraClient<R, W> {
             return Err(WireError::Kuna(KunaError::data_unavail(errmsg)));
         } else {
             return Err(java_alignment("Expecting bytes or end of query response"));
-        }
+        };
         let t = read_to_any_burst(&mut self.sin)?;
         if t != BURST_BYTES_CLOSE {
             return Err(java_alignment("Expecting byte alignment end"));
         }
-        read_response_end(&mut self.sin)
+        read_response_end(&mut self.sin)?;
+        buf.copy_from_slice(&nibble_condense(&data));
+        Ok(())
     }
 
     /// Query string data at an address, pre-translated to UTF-8 by the
@@ -436,6 +435,7 @@ impl<R: Read, W: Write> GhidraClient<R, W> {
 
         read_to_response(&mut self.sin)?;
         let mut is_trunc = false;
+        let mut data = Vec::new();
         let mut t = read_to_any_burst(&mut self.sin)?;
         if t == BURST_BYTES_OPEN {
             // two raw size-header bytes, one raw truncation-flag byte
@@ -444,14 +444,14 @@ impl<R: Read, W: Write> GhidraClient<R, W> {
             let mut header = [0u8; 3];
             self.sin
                 .read_exact(&mut header)
-                .map_err(|_| WireError::PipeClosed)?;
+                .map_err(crate::protocol::read_err)?;
             let size = string_data_size(header[0], header[1]) as usize;
             is_trunc = header[2] != 0;
             let mut dblbuf = vec![0u8; size * 2];
             self.sin
                 .read_exact(&mut dblbuf)
-                .map_err(|_| WireError::PipeClosed)?;
-            *buffer = nibble_condense(&dblbuf);
+                .map_err(crate::protocol::read_err)?;
+            data = nibble_condense(&dblbuf);
             t = read_to_any_burst(&mut self.sin)?;
             if t != BURST_BYTES_CLOSE {
                 return Err(java_alignment("Expecting byte alignment end"));
@@ -459,7 +459,8 @@ impl<R: Read, W: Write> GhidraClient<R, W> {
             t = read_to_any_burst(&mut self.sin)?;
         }
         if (t & 1) == 1 {
-            // response end consumed (or empty response: leave buffer empty)
+            // Commit only the completed response, including ordinary absence.
+            *buffer = data;
             Ok(is_trunc)
         } else {
             Err(java_alignment("Expecting end of query response"))

@@ -108,46 +108,46 @@ impl Rule for RuleEarlyRemoval {
 
     // This rule applies to all ops (default get_op_list).
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Functions automatically consumed
         if data.obank().get(op).expect("RuleEarlyRemoval: stale op").is_call() {
-            return 0;
+            return Ok(0);
         }
         if data.obank().get(op).expect("RuleEarlyRemoval: stale op").is_indirect_source() {
-            return 0;
+            return Ok(0);
         }
         let vn = match data.obank().get(op).expect("RuleEarlyRemoval: stale op").get_out() {
-            None => return 0,
+            None => return Ok(0),
             Some(v) => v,
         };
         if !data.vbank().get(vn).expect("RuleEarlyRemoval: stale vn").has_no_descend() {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(vn).expect("RuleEarlyRemoval: stale vn").is_auto_live() {
-            return 0;
+            return Ok(0);
         }
         let spc = data.vbank().get(vn).expect("RuleEarlyRemoval: stale vn").get_space().clone();
         if spc.does_deadcode() {
             if !data.dead_removal_allowed_seen(&spc) {
-                return 0;
+                return Ok(0);
             }
         }
 
         let mut memo = kuna_volatileload::Memo::new();
-        if kuna_volatileload::is_volatile_with(data, op, &mut memo)
+        if kuna_volatileload::is_volatile_with(data, op, &mut memo)?
             && !kuna_volatileload::rereads(data, op, &mut memo, |data, load| {
                 data.obank()
                     .get(load)
                     .and_then(|o| o.get_out())
                     .and_then(|v| data.vbank().get(v))
                     .is_some_and(|v| !v.has_no_descend() || v.is_auto_live())
-            })
+            })?
         {
-            return 0;
+            return Ok(0);
         }
         // Get rid of unused op
-        data.op_destroy(op);
-        1
+        data.op_destroy(op)?;
+        Ok(1)
     }
 }
 
@@ -218,7 +218,7 @@ impl Rule for RuleCollectTerms {
         vec![OpCode::CPUI_INT_ADD]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleCollectTerms: stale op").get_out().expect(
             "RuleCollectTerms: INT_ADD has no output",
         );
@@ -228,7 +228,7 @@ impl Rule for RuleCollectTerms {
             if data.obank().get(no).expect("RuleCollectTerms: stale nextop").code()
                 == OpCode::CPUI_INT_ADD
             {
-                return 0;
+                return Ok(0);
             }
         }
 
@@ -253,24 +253,24 @@ impl Rule for RuleCollectTerms {
                 vn2 = RuleCollectTerms::get_mult_coeff(data, vn2, &mut coef2);
                 if vn1 == vn2 {
                     if let Some(m) = termorder.term(order[i - 1]).get_multiplier() {
-                        return if data
+                        return Ok(if data
                             .distribute_int_mult_add(m)
                             .expect("RuleCollectTerms: distribute (i-1)")
                         {
                             1
                         } else {
                             0
-                        };
+                        });
                     }
                     if let Some(m) = termorder.term(order[i]).get_multiplier() {
-                        return if data
+                        return Ok(if data
                             .distribute_int_mult_add(m)
                             .expect("RuleCollectTerms: distribute (i)")
                         {
                             1
                         } else {
                             0
-                        };
+                        });
                     }
                     // new coefficient
                     let vn1sz = data.vbank().get(vn1).expect("RuleCollectTerms: stale vn1").get_size();
@@ -303,7 +303,7 @@ impl Rule for RuleCollectTerms {
                         data.op_set_input(op_i, new_out, slot_i)
                             .expect("RuleCollectTerms: op_set_input new_out");
                     }
-                    return 1;
+                    return Ok(1);
                 }
                 i += 1;
             }
@@ -327,10 +327,10 @@ impl Rule for RuleCollectTerms {
         }
         // Must sum at least two things
         if nonzerocount <= 1 {
-            return 0;
+            return Ok(0);
         }
-        if crate::kuna_globalarrayanchor::preserve_array_base(data, op) {
-            return 0;
+        if crate::kuna_globalarrayanchor::preserve_array_base(data, op)? {
+            return Ok(0);
         }
         let vn1 = termorder.term(order[lastconst]).get_varnode();
         let vn1sz = data.vbank().get(vn1).expect("RuleCollectTerms: stale lastconst vn").get_size();
@@ -353,7 +353,7 @@ impl Rule for RuleCollectTerms {
         };
         data.op_set_input(op_lc, lumped, slot_lc).expect("RuleCollectTerms: lumped constant");
 
-        1
+        Ok(1)
     }
 }
 
@@ -387,7 +387,7 @@ impl Rule for RuleSelectCse {
         vec![OpCode::CPUI_SUBPIECE, OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = data.obank().get(op).expect("RuleSelectCse: stale op").get_in(0).expect(
             "RuleSelectCse: op has no in0",
         );
@@ -417,7 +417,7 @@ impl Rule for RuleSelectCse {
             list.push((hash, otherop));
         }
         if list.len() <= 1 {
-            return 0;
+            return Ok(0);
         }
         let mut vlist: Vec<VarnodeId> = Vec::new();
         data.cse_eliminate_list(&mut list, &mut vlist, |fd, v| {
@@ -427,9 +427,9 @@ impl Rule for RuleSelectCse {
         })
         .expect("RuleSelectCse: cseEliminateList");
         if vlist.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -462,7 +462,7 @@ impl Rule for RulePiece2Zext {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Constant must be most significant bits
         let constvn = data.obank().get(op).expect("RulePiece2Zext: stale op").get_in(0).expect(
             "RulePiece2Zext: PIECE has no in0",
@@ -470,16 +470,16 @@ impl Rule for RulePiece2Zext {
         let cv = data.vbank().get(constvn).expect("RulePiece2Zext: stale constvn");
         // Must append with constant
         if !cv.is_constant() {
-            return 0;
+            return Ok(0);
         }
         // of value 0
         if cv.get_offset() != 0 {
-            return 0;
+            return Ok(0);
         }
         // Remove the constant
         data.op_remove_input(op, 0);
         set_opcode_typed(data, op, OpCode::CPUI_INT_ZEXT);
-        1
+        Ok(1)
     }
 }
 
@@ -512,12 +512,12 @@ impl Rule for RulePiece2Sext {
         vec![OpCode::CPUI_PIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let shiftout = data.obank().get(op).expect("RulePiece2Sext: stale op").get_in(0).expect(
             "RulePiece2Sext: PIECE has no in0",
         );
         if !data.vbank().get(shiftout).expect("RulePiece2Sext: stale shiftout").is_written() {
-            return 0;
+            return Ok(0);
         }
         let shiftop = data
             .vbank()
@@ -528,12 +528,12 @@ impl Rule for RulePiece2Sext {
         if data.obank().get(shiftop).expect("RulePiece2Sext: stale shiftop").code()
             != OpCode::CPUI_INT_SRIGHT
         {
-            return 0;
+            return Ok(0);
         }
         let sh_in1 = data.obank().get(shiftop).expect("RulePiece2Sext: stale shiftop").get_in(1)
             .expect("RulePiece2Sext: SRIGHT has no in1");
         if !data.vbank().get(sh_in1).expect("RulePiece2Sext: stale sh_in1").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let n = data.vbank().get(sh_in1).expect("RulePiece2Sext: stale sh_in1").get_offset() as int4;
         let x = data.obank().get(shiftop).expect("RulePiece2Sext: stale shiftop").get_in(0).expect(
@@ -543,16 +543,16 @@ impl Rule for RulePiece2Sext {
             "RulePiece2Sext: PIECE has no in1",
         );
         if x != op_in1 {
-            return 0;
+            return Ok(0);
         }
         let xsize = data.vbank().get(x).expect("RulePiece2Sext: stale x").get_size();
         if n != 8 * xsize - 1 {
-            return 0;
+            return Ok(0);
         }
 
         data.op_remove_input(op, 0);
         set_opcode_typed(data, op, OpCode::CPUI_INT_SEXT);
-        1
+        Ok(1)
     }
 }
 
@@ -584,9 +584,9 @@ impl Rule for RuleBxor2NotEqual {
         vec![OpCode::CPUI_BOOL_XOR]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         set_opcode_typed(data, op, OpCode::CPUI_INT_NOTEQUAL);
-        1
+        Ok(1)
     }
 }
 
@@ -618,30 +618,30 @@ impl Rule for RuleOrMask {
         vec![OpCode::CPUI_INT_OR]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleOrMask: stale op").get_out().expect(
             "RuleOrMask: INT_OR has no output",
         );
         let size = data.vbank().get(outvn).expect("RuleOrMask: stale outvn").get_size();
         // FIXME: uintb should be arbitrary precision
         if size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let constvn = data.obank().get(op).expect("RuleOrMask: stale op").get_in(1).expect(
             "RuleOrMask: INT_OR has no in1",
         );
         if !data.vbank().get(constvn).expect("RuleOrMask: stale constvn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let val = data.vbank().get(constvn).expect("RuleOrMask: stale constvn").get_offset();
         let mask = calc_mask(size);
         if (val & mask) != mask {
-            return 0;
+            return Ok(0);
         }
         set_opcode_typed(data, op, OpCode::CPUI_COPY);
         data.op_set_input(op, constvn, 0).expect("RuleOrMask: op_set_input");
         data.op_remove_input(op, 1);
-        1
+        Ok(1)
     }
 }
 
@@ -673,7 +673,7 @@ impl Rule for RuleAndMask {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleAndMask: stale op").get_out().expect(
             "RuleAndMask: INT_AND has no output",
         );
@@ -681,7 +681,7 @@ impl Rule for RuleAndMask {
 
         // FIXME: uintb should be arbitrary precision
         if size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let in0 = data.obank().get(op).expect("RuleAndMask: stale op").get_in(0).expect(
             "RuleAndMask: INT_AND has no in0",
@@ -709,7 +709,7 @@ impl Rule for RuleAndMask {
                 "RuleAndMask: INT_AND has no in1",
             );
             if !data.vbank().get(in1).expect("RuleAndMask: stale in1").is_constant() {
-                return 0;
+                return Ok(0);
             }
             // Result of AND is equal to input(0)
             vn = data.obank().get(op).expect("RuleAndMask: stale op").get_in(0).expect(
@@ -717,16 +717,16 @@ impl Rule for RuleAndMask {
             );
         } else {
             // else return 0;
-            return 0;
+            return Ok(0);
         }
         if !data.vbank().get(vn).expect("RuleAndMask: stale vn").is_heritage_known() {
-            return 0;
+            return Ok(0);
         }
 
         set_opcode_typed(data, op, OpCode::CPUI_COPY);
         data.op_remove_input(op, 1);
         data.op_set_input(op, vn, 0).expect("RuleAndMask: op_set_input");
-        1
+        Ok(1)
     }
 }
 
@@ -759,14 +759,14 @@ impl Rule for RuleOrConsume {
         vec![OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleOrConsume: stale op").get_out().expect(
             "RuleOrConsume: op has no output",
         );
         let size = data.vbank().get(outvn).expect("RuleOrConsume: stale outvn").get_size();
         // FIXME: uintb should be arbitrary precision
         if size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let consume = data.vbank().get(outvn).expect("RuleOrConsume: stale outvn").get_consume();
         let in0 = data.obank().get(op).expect("RuleOrConsume: stale op").get_in(0).expect(
@@ -776,7 +776,7 @@ impl Rule for RuleOrConsume {
         if (consume & nzm0) == 0 {
             data.op_remove_input(op, 0);
             set_opcode_typed(data, op, OpCode::CPUI_COPY);
-            return 1;
+            return Ok(1);
         }
         let in1 = data.obank().get(op).expect("RuleOrConsume: stale op").get_in(1).expect(
             "RuleOrConsume: op has no in1",
@@ -785,9 +785,9 @@ impl Rule for RuleOrConsume {
         if (consume & nzm1) == 0 {
             data.op_remove_input(op, 1);
             set_opcode_typed(data, op, OpCode::CPUI_COPY);
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -820,7 +820,7 @@ impl Rule for RuleOrCollapse {
         vec![OpCode::CPUI_INT_OR]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleOrCollapse: stale op").get_out().expect(
             "RuleOrCollapse: INT_OR has no output",
         );
@@ -830,11 +830,11 @@ impl Rule for RuleOrCollapse {
             "RuleOrCollapse: INT_OR has no in1",
         );
         if !data.vbank().get(vn).expect("RuleOrCollapse: stale vn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         // FIXME: uintb should be arbitrary precision
         if size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let in0 = data.obank().get(op).expect("RuleOrCollapse: stale op").get_in(0).expect(
             "RuleOrCollapse: INT_OR has no in0",
@@ -843,12 +843,12 @@ impl Rule for RuleOrCollapse {
         let val = data.vbank().get(vn).expect("RuleOrCollapse: stale vn").get_offset();
         // first param may turn on other bits
         if (mask | val) != val {
-            return 0;
+            return Ok(0);
         }
 
         set_opcode_typed(data, op, OpCode::CPUI_COPY);
         data.op_remove_input(op, 0);
-        1
+        Ok(1)
     }
 }
 
@@ -881,38 +881,38 @@ impl Rule for RuleAndOrLump {
         vec![OpCode::CPUI_INT_AND, OpCode::CPUI_INT_OR, OpCode::CPUI_INT_XOR]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = data.obank().get(op).expect("RuleAndOrLump: stale op").code();
         let op_in1 = data.obank().get(op).expect("RuleAndOrLump: stale op").get_in(1).expect(
             "RuleAndOrLump: op has no in1",
         );
         if !data.vbank().get(op_in1).expect("RuleAndOrLump: stale op_in1").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let vn1 = data.obank().get(op).expect("RuleAndOrLump: stale op").get_in(0).expect(
             "RuleAndOrLump: op has no in0",
         );
         if !data.vbank().get(vn1).expect("RuleAndOrLump: stale vn1").is_written() {
-            return 0;
+            return Ok(0);
         }
         let op2 = data.vbank().get(vn1).expect("RuleAndOrLump: stale vn1").get_def().expect(
             "RuleAndOrLump: written vn1 has no def",
         );
         // Must be same op
         if data.obank().get(op2).expect("RuleAndOrLump: stale op2").code() != opc {
-            return 0;
+            return Ok(0);
         }
         let op2_in1 = data.obank().get(op2).expect("RuleAndOrLump: stale op2").get_in(1).expect(
             "RuleAndOrLump: op2 has no in1",
         );
         if !data.vbank().get(op2_in1).expect("RuleAndOrLump: stale op2_in1").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let basevn = data.obank().get(op2).expect("RuleAndOrLump: stale op2").get_in(0).expect(
             "RuleAndOrLump: op2 has no in0",
         );
         if data.vbank().get(basevn).expect("RuleAndOrLump: stale basevn").is_free() {
-            return 0;
+            return Ok(0);
         }
 
         let mut val = data.vbank().get(op_in1).expect("RuleAndOrLump: stale op_in1").get_offset();
@@ -929,7 +929,7 @@ impl Rule for RuleAndOrLump {
         let basevn_size = data.vbank().get(basevn).expect("RuleAndOrLump: stale basevn").get_size();
         let newc = data.new_constant(basevn_size, val);
         data.op_set_input(op, newc, 1).expect("RuleAndOrLump: op_set_input newc");
-        1
+        Ok(1)
     }
 }
 
@@ -962,7 +962,7 @@ impl Rule for RuleNegateIdentity {
         vec![OpCode::CPUI_INT_NEGATE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = data.obank().get(op).expect("RuleNegateIdentity: stale op").get_in(0).expect(
             "RuleNegateIdentity: NEGATE has no in0",
         );
@@ -990,9 +990,9 @@ impl Rule for RuleNegateIdentity {
             data.op_set_input(logic_op, newc, 0).expect("RuleNegateIdentity: op_set_input");
             data.op_remove_input(logic_op, 1);
             set_opcode_typed(data, logic_op, OpCode::CPUI_COPY);
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1031,24 +1031,24 @@ impl Rule for RuleShiftBitops {
         ]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let constvn = data.obank().get(op).expect("RuleShiftBitops: stale op").get_in(1).expect(
             "RuleShiftBitops: op has no in1",
         );
         // Must be a constant shift
         if !data.vbank().get(constvn).expect("RuleShiftBitops: stale constvn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let mut vn = data.obank().get(op).expect("RuleShiftBitops: stale op").get_in(0).expect(
             "RuleShiftBitops: op has no in0",
         );
         if !data.vbank().get(vn).expect("RuleShiftBitops: stale vn").is_written() {
-            return 0;
+            return Ok(0);
         }
         // FIXME: Can't exceed uintb precision
         let vn_size = data.vbank().get(vn).expect("RuleShiftBitops: stale vn").get_size();
         if vn_size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let sa: int4;
         let leftshift: bool;
@@ -1071,12 +1071,12 @@ impl Rule for RuleShiftBitops {
             OpCode::CPUI_INT_MULT => {
                 sa = leastsigbit_set(const_off);
                 if sa == -1 {
-                    return 0;
+                    return Ok(0);
                 }
                 leftshift = true;
             }
             // default: return 0;			// Never reaches here
-            _ => return 0,
+            _ => return Ok(0),
         }
 
         let bitop = data.vbank().get(vn).expect("RuleShiftBitops: stale vn").get_def().expect(
@@ -1088,11 +1088,11 @@ impl Rule for RuleShiftBitops {
             OpCode::CPUI_INT_AND | OpCode::CPUI_INT_OR | OpCode::CPUI_INT_XOR => {}
             OpCode::CPUI_INT_MULT | OpCode::CPUI_INT_ADD => {
                 if !leftshift {
-                    return 0;
+                    return Ok(0);
                 }
             }
             // default: return 0;
-            _ => return 0,
+            _ => return Ok(0),
         }
 
         let outvn = data.obank().get(op).expect("RuleShiftBitops: stale op").get_out().expect(
@@ -1117,7 +1117,7 @@ impl Rule for RuleShiftBitops {
             i += 1;
         }
         if i == numinput {
-            return 0;
+            return Ok(0);
         }
         match bitop_code {
             // case CPUI_INT_MULT: case CPUI_INT_AND:
@@ -1131,13 +1131,13 @@ impl Rule for RuleShiftBitops {
                 vn = data.obank().get(bitop).expect("RuleShiftBitops: stale bitop").get_in(1 - i)
                     .expect("RuleShiftBitops: bitop in (1-i) null");
                 if !data.vbank().get(vn).expect("RuleShiftBitops: stale vn").is_heritage_known() {
-                    return 0;
+                    return Ok(0);
                 }
                 data.op_set_input(op, vn, 0).expect("RuleShiftBitops: op_set_input vn");
             }
             _ => {}
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1170,18 +1170,18 @@ impl Rule for RuleRightShiftAnd {
         vec![OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = data.obank().get(op).expect("RuleRightShiftAnd: stale op").get_in(1).expect(
             "RuleRightShiftAnd: op has no in1",
         );
         if !data.vbank().get(const_vn).expect("RuleRightShiftAnd: stale constVn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let in_vn = data.obank().get(op).expect("RuleRightShiftAnd: stale op").get_in(0).expect(
             "RuleRightShiftAnd: op has no in0",
         );
         if !data.vbank().get(in_vn).expect("RuleRightShiftAnd: stale inVn").is_written() {
-            return 0;
+            return Ok(0);
         }
         let and_op = data.vbank().get(in_vn).expect("RuleRightShiftAnd: stale inVn").get_def().expect(
             "RuleRightShiftAnd: written inVn has no def",
@@ -1189,13 +1189,13 @@ impl Rule for RuleRightShiftAnd {
         if data.obank().get(and_op).expect("RuleRightShiftAnd: stale andOp").code()
             != OpCode::CPUI_INT_AND
         {
-            return 0;
+            return Ok(0);
         }
         let mask_vn = data.obank().get(and_op).expect("RuleRightShiftAnd: stale andOp").get_in(1).expect(
             "RuleRightShiftAnd: andOp has no in1",
         );
         if !data.vbank().get(mask_vn).expect("RuleRightShiftAnd: stale maskVn").is_constant() {
-            return 0;
+            return Ok(0);
         }
 
         let sa = data.vbank().get(const_vn).expect("RuleRightShiftAnd: stale constVn").get_offset() as int4;
@@ -1210,14 +1210,14 @@ impl Rule for RuleRightShiftAnd {
         let root_size = data.vbank().get(root_vn).expect("RuleRightShiftAnd: stale rootVn").get_size();
         let full = calc_mask(root_size).wshr(sa as u32);
         if full != mask {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(root_vn).expect("RuleRightShiftAnd: stale rootVn").is_free() {
-            return 0;
+            return Ok(0);
         }
         // Bypass the INT_AND
         data.op_set_input(op, root_vn, 0).expect("RuleRightShiftAnd: op_set_input");
-        1
+        Ok(1)
     }
 }
 
@@ -1249,12 +1249,12 @@ impl Rule for RuleIntLessEqual {
         vec![OpCode::CPUI_INT_LESSEQUAL, OpCode::CPUI_INT_SLESSEQUAL]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
-        if data.replace_lessequal(op).expect("RuleIntLessEqual: replace_lessequal") {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        Ok(if data.replace_lessequal(op).expect("RuleIntLessEqual: replace_lessequal") {
             1
         } else {
             0
-        }
+        })
     }
 }
 
@@ -1287,13 +1287,13 @@ impl Rule for RuleEquality {
         vec![OpCode::CPUI_INT_EQUAL, OpCode::CPUI_INT_NOTEQUAL]
     }
 
-    fn apply_op(&mut self, op: OpId, _data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, _data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         //   ... opSetOpcode(COPY); opRemoveInput(1); newConstant; opSetInput ...
         // STUB(expression): `functionalEquality` lives in expression.cc (not yet
         // ported), so the gating predicate is unavailable and the rule defers
         // before any mutation.  No change.
         let _ = op;
-        0
+        Ok(0)
     }
 }
 
@@ -1348,7 +1348,7 @@ impl Rule for RuleTermOrder {
         ]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = data.obank().get(op).expect("RuleTermOrder: stale op").get_in(0).expect(
             "RuleTermOrder: op has no in0",
         );
@@ -1360,9 +1360,9 @@ impl Rule for RuleTermOrder {
         if vn1_const && !vn2_const {
             // Reverse the order of the terms
             data.op_swap_input(op, 0, 1);
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1649,7 +1649,7 @@ impl Rule for RulePullsubMulti {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut max_byte: int4 = 0;
         let mut min_byte: int4 = 0;
 
@@ -1657,7 +1657,7 @@ impl Rule for RulePullsubMulti {
             "RulePullsubMulti: SUBPIECE has no in0",
         );
         if !data.vbank().get(vn).expect("RulePullsubMulti: stale vn").is_written() {
-            return 0;
+            return Ok(0);
         }
         let mult = data.vbank().get(vn).expect("RulePullsubMulti: stale vn").get_def().expect(
             "RulePullsubMulti: written vn has no def",
@@ -1665,24 +1665,24 @@ impl Rule for RulePullsubMulti {
         if data.obank().get(mult).expect("RulePullsubMulti: stale mult").code()
             != OpCode::CPUI_MULTIEQUAL
         {
-            return 0;
+            return Ok(0);
         }
         // We only pull up, do not pull "down" to bottom of loop
         let parent = data.obank().get(mult).expect("RulePullsubMulti: stale mult").get_parent().expect(
             "RulePullsubMulti: mult has no parent",
         );
         if data.bblocks_ref().block(parent).has_loop_in() {
-            return 0;
+            return Ok(0);
         }
         // Figure out what part of -vn- is used
         RulePullsubMulti::min_max_use(data, vn, &mut max_byte, &mut min_byte);
         let new_size = max_byte - min_byte + 1;
         let vn_size = data.vbank().get(vn).expect("RulePullsubMulti: stale vn").get_size();
         if max_byte < min_byte || new_size >= vn_size {
-            return 0;
+            return Ok(0);
         }
         if !RulePullsubMulti::acceptable_size(new_size) {
-            return 0;
+            return Ok(0);
         }
         let outvn = data.obank().get(op).expect("RulePullsubMulti: stale op").get_out().expect(
             "RulePullsubMulti: SUBPIECE has no output",
@@ -1690,12 +1690,12 @@ impl Rule for RulePullsubMulti {
         // Don't pull apart double precision
         let ov = data.vbank().get(outvn).expect("RulePullsubMulti: stale outvn");
         if ov.is_precis_lo() || ov.is_precis_hi() {
-            return 0;
+            return Ok(0);
         }
 
         // Make sure we don't add new SUBPIECE ops that aren't going to cancel in some way
         if min_byte > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let mut consume: uintb = if min_byte < SIZEOF_UINTB {
             calc_mask(new_size) << (8 * min_byte)
@@ -1728,7 +1728,7 @@ impl Rule for RulePullsubMulti {
                         }
                     }
                 }
-                return 0;
+                return Ok(0);
             }
         }
 
@@ -1772,15 +1772,14 @@ impl Rule for RulePullsubMulti {
             .renormalize(new_size, data.get_arch().manage())
             .expect("RulePullsubMulti: renormalize");
         let new_vn = data
-            .new_varnode_out(new_size, &smalladdr2, new_multi)
-            .expect("RulePullsubMulti: newVarnodeOut");
+            .new_varnode_out(new_size, &smalladdr2, new_multi)?;
         data.op_set_opcode_code(new_multi, OpCode::CPUI_MULTIEQUAL);
         data.op_set_all_input(new_multi, &params).expect("RulePullsubMulti: opSetAllInput");
         data.op_insert_begin(new_multi, mult_parent);
 
         RulePullsubMulti::replace_descendants(data, vn, new_vn, max_byte, min_byte)
             .expect("RulePullsubMulti: replaceDescendants");
-        1
+        Ok(1)
     }
 }
 
@@ -1816,16 +1815,16 @@ impl Rule for RulePullsubIndirect {
         vec![OpCode::CPUI_SUBPIECE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = data.obank().get(op).expect("RulePullsubIndirect: stale op").get_in(0).expect(
             "RulePullsubIndirect: SUBPIECE has no in0",
         );
         if !data.vbank().get(vn).expect("RulePullsubIndirect: stale vn").is_written() {
-            return 0;
+            return Ok(0);
         }
         let vn_size = data.vbank().get(vn).expect("RulePullsubIndirect: stale vn").get_size();
         if vn_size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let indir = data.vbank().get(vn).expect("RulePullsubIndirect: stale vn").get_def().expect(
             "RulePullsubIndirect: written vn has no def",
@@ -1833,7 +1832,7 @@ impl Rule for RulePullsubIndirect {
         if data.obank().get(indir).expect("RulePullsubIndirect: stale indir").code()
             != OpCode::CPUI_INDIRECT
         {
-            return 0;
+            return Ok(0);
         }
         let indir_in1 = data.obank().get(indir).expect("RulePullsubIndirect: stale indir").get_in(1).expect(
             "RulePullsubIndirect: INDIRECT has no in1",
@@ -1845,7 +1844,7 @@ impl Rule for RulePullsubIndirect {
             .get_space()
             .get_type();
         if in1_space_type != kuna_base::space::spacetype::IPTR_IOP {
-            return 0;
+            return Ok(0);
         }
 
         // The iop-space second input encodes the affected PcodeOp (the same
@@ -1859,10 +1858,10 @@ impl Rule for RulePullsubIndirect {
             .get_offset();
         let targ_op = crate::funcdata_varnode::op_iop_decode(iop_off);
         if data.obank().get(targ_op).map(|o| o.is_dead()).unwrap_or(true) {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(vn).expect("RulePullsubIndirect: stale vn").is_addr_force() {
-            return 0;
+            return Ok(0);
         }
 
         let mut max_byte: int4 = 0;
@@ -1870,13 +1869,13 @@ impl Rule for RulePullsubIndirect {
         RulePullsubMulti::min_max_use(data, vn, &mut max_byte, &mut min_byte);
         let new_size = max_byte - min_byte + 1;
         if max_byte < min_byte || new_size >= vn_size {
-            return 0;
+            return Ok(0);
         }
         if !RulePullsubMulti::acceptable_size(new_size) {
-            return 0;
+            return Ok(0);
         }
         if super::kuna_stackstoreguard::keeps_store_indirect_whole(data, vn, targ_op) {
-            return 0;
+            return Ok(0);
         }
         let outvn = data.obank().get(op).expect("RulePullsubIndirect: stale op").get_out().expect(
             "RulePullsubIndirect: SUBPIECE has no output",
@@ -1885,7 +1884,7 @@ impl Rule for RulePullsubIndirect {
         {
             let ov = data.vbank().get(outvn).expect("RulePullsubIndirect: stale outvn");
             if ov.is_precis_lo() || ov.is_precis_hi() {
-                return 0;
+                return Ok(0);
             }
         }
 
@@ -1896,7 +1895,7 @@ impl Rule for RulePullsubIndirect {
         let in0_consume =
             data.vbank().get(indir_in0).expect("RulePullsubIndirect: stale indir_in0").get_consume();
         if (consume & in0_consume) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         // Compute the truncated-piece address (smalladdr2).
@@ -1913,7 +1912,7 @@ impl Rule for RulePullsubIndirect {
         if data.obank().get(indir).expect("RulePullsubIndirect: stale indir").is_indirect_creation() {
             let possibleout =
                 !data.vbank().get(indir_in0).expect("RulePullsubIndirect: stale indir_in0").is_indirect_zero();
-            let new_ind = data.new_indirect_creation(targ_op, &smalladdr2, new_size, possibleout);
+            let new_ind = data.new_indirect_creation(targ_op, &smalladdr2, new_size, possibleout)?;
             small2 = data.obank().get(new_ind).expect("RulePullsubIndirect: stale new_ind").get_out().expect(
                 "RulePullsubIndirect: newIndirectCreation has no out",
             );
@@ -1935,8 +1934,7 @@ impl Rule for RulePullsubIndirect {
             let new_ind = data.new_op(2, indir_addr);
             data.op_set_opcode_code(new_ind, OpCode::CPUI_INDIRECT);
             small2 = data
-                .new_varnode_out(new_size, &smalladdr2, new_ind)
-                .expect("RulePullsubIndirect: newVarnodeOut");
+                .new_varnode_out(new_size, &smalladdr2, new_ind)?;
             data.op_set_input(new_ind, small1, 0).expect("RulePullsubIndirect: opSetInput 0");
             let iop = data.new_varnode_iop(targ_op);
             data.op_set_input(new_ind, iop, 1).expect("RulePullsubIndirect: opSetInput 1");
@@ -1945,7 +1943,7 @@ impl Rule for RulePullsubIndirect {
 
         RulePullsubMulti::replace_descendants(data, vn, small2, max_byte, min_byte)
             .expect("RulePullsubIndirect: replaceDescendants");
-        1
+        Ok(1)
     }
 }
 
@@ -2047,9 +2045,9 @@ impl Rule for RulePushMulti {
         vec![OpCode::CPUI_MULTIEQUAL]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if data.obank().get(op).expect("RulePushMulti: stale op").num_input() != 2 {
-            return 0;
+            return Ok(0);
         }
         let in1 = data.obank().get(op).expect("RulePushMulti: stale op").get_in(0).expect(
             "RulePushMulti: MULTIEQUAL has no in0",
@@ -2058,16 +2056,16 @@ impl Rule for RulePushMulti {
             "RulePushMulti: MULTIEQUAL has no in1",
         );
         if !data.vbank().get(in1).expect("RulePushMulti: stale in1").is_written() {
-            return 0;
+            return Ok(0);
         }
         if !data.vbank().get(in2).expect("RulePushMulti: stale in2").is_written() {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(in1).expect("RulePushMulti: stale in1").is_spacebase() {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(in2).expect("RulePushMulti: stale in2").is_spacebase() {
-            return 0;
+            return Ok(0);
         }
 
         let mut buf1 = [in1, in1];
@@ -2081,17 +2079,17 @@ impl Rule for RulePushMulti {
             data.obank(),
         );
         if res < 0 {
-            return 0;
+            return Ok(0);
         }
         if res > 1 {
-            return 0;
+            return Ok(0);
         }
         let op1 = data.vbank().get(in1).expect("RulePushMulti: stale in1").get_def().expect(
             "RulePushMulti: in1 written but no def",
         );
         // SUBPIECE is pulled not pushed
         if data.obank().get(op1).expect("RulePushMulti: stale op1").code() == OpCode::CPUI_SUBPIECE {
-            return 0;
+            return Ok(0);
         }
 
         let bl = data
@@ -2111,16 +2109,16 @@ impl Rule for RulePushMulti {
         let op1_code = data.obank().get(op1).expect("RulePushMulti: stale op1").code();
         if op1_code == OpCode::CPUI_COPY {
             if res == 0 {
-                return 0;
+                return Ok(0);
             }
             // (kuna) a global's join of stores kept for its loads stays; see
             // [`crate::p3_dataflow::kuna_pointeestorekeep::keeps_join`].
             if crate::p3_dataflow::kuna_pointeestorekeep::keeps_join(data, op) {
-                return 0;
+                return Ok(0);
             }
             let substitute = match RulePushMulti::find_substitute(data, buf1[0], buf2[0], bl, earliest)
             {
-                None => return 0,
+                None => return Ok(0),
                 Some(s) => s,
             };
             // Eliminate this op in favor of the shadowed merge
@@ -2130,25 +2128,25 @@ impl Rule for RulePushMulti {
                 .expect("RulePushMulti: stale substitute")
                 .get_out()
                 .expect("RulePushMulti: substitute has no output");
-            data.total_replace(outvn, subout).expect("RulePushMulti: totalReplace (COPY case)");
-            data.op_destroy(op);
-            return 1;
+            data.total_replace(outvn, subout)?;
+            data.op_destroy(op)?;
+            return Ok(1);
         }
 
         let op2 = data.vbank().get(in2).expect("RulePushMulti: stale in2").get_def().expect(
             "RulePushMulti: in2 written but no def",
         );
         if data.lone_descend(in1) != Some(op) {
-            return 0;
+            return Ok(0);
         }
         if data.lone_descend(in2) != Some(op) {
-            return 0;
+            return Ok(0);
         }
 
         // C++ binds outvn here; already bound above.
 
         // Move MULTIEQUAL output to op1
-        data.op_set_output(op1, outvn).expect("RulePushMulti: opSetOutput");
+        data.op_set_output(op1, outvn)?;
         // Move the unified op
         data.op_uninsert(op1);
         if res == 1 {
@@ -2172,8 +2170,7 @@ impl Rule for RulePushMulti {
                         let b1_addrtied =
                             data.vbank().get(buf1[0]).expect("RulePushMulti: stale buf1").is_addr_tied();
                         if b1_addr == b2_addr && !b1_addrtied {
-                            data.new_varnode_out(b1_size, &b1_addr, substitute)
-                                .expect("RulePushMulti: newVarnodeOut");
+                            data.new_varnode_out(b1_size, &b1_addr, substitute)?;
                         } else {
                             data.new_unique_out(b1_size, substitute)
                                 .expect("RulePushMulti: newUniqueOut");
@@ -2200,10 +2197,10 @@ impl Rule for RulePushMulti {
             data.op_insert_begin(op1, bl);
         }
         // Destroy the MULTIEQUAL
-        data.op_destroy(op);
+        data.op_destroy(op)?;
         // Remove the duplicate (in favor of the unified)
-        data.op_destroy(op2);
-        1
+        data.op_destroy(op2)?;
+        Ok(1)
     }
 }
 
@@ -2235,13 +2232,13 @@ impl Rule for RuleNotDistribute {
         vec![OpCode::CPUI_BOOL_NEGATE]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in0 = data.obank().get(op).expect("RuleNotDistribute: stale op").get_in(0).expect(
             "RuleNotDistribute: NEGATE has no in0",
         );
         let compop = data.vbank().get(in0).expect("RuleNotDistribute: stale in0").get_def();
         let compop = match compop {
-            None => return 0,
+            None => return Ok(0),
             Some(c) => c,
         };
         //   default: return 0; }
@@ -2249,7 +2246,7 @@ impl Rule for RuleNotDistribute {
         let opc = match comp_code {
             OpCode::CPUI_BOOL_AND => OpCode::CPUI_BOOL_OR,
             OpCode::CPUI_BOOL_OR => OpCode::CPUI_BOOL_AND,
-            _ => return 0,
+            _ => return Ok(0),
         };
 
         let comp_in0 = data
@@ -2281,7 +2278,7 @@ impl Rule for RuleNotDistribute {
         set_opcode_typed(data, op, opc);
         data.op_set_input(op, newout1, 0).expect("RuleNotDistribute: op in0");
         data.op_insert_input(op, newout2, 1).expect("RuleNotDistribute: op insert in1");
-        1
+        Ok(1)
     }
 }
 
@@ -2314,18 +2311,18 @@ impl Rule for RuleHighOrderAnd {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let cvn1 = data.obank().get(op).expect("RuleHighOrderAnd: stale op").get_in(1).expect(
             "RuleHighOrderAnd: INT_AND has no in1",
         );
         if !data.vbank().get(cvn1).expect("RuleHighOrderAnd: stale cvn1").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let op_in0 = data.obank().get(op).expect("RuleHighOrderAnd: stale op").get_in(0).expect(
             "RuleHighOrderAnd: INT_AND has no in0",
         );
         if !data.vbank().get(op_in0).expect("RuleHighOrderAnd: stale op_in0").is_written() {
-            return 0;
+            return Ok(0);
         }
         let addop = data.vbank().get(op_in0).expect("RuleHighOrderAnd: stale op_in0").get_def().expect(
             "RuleHighOrderAnd: written in0 has no def",
@@ -2333,30 +2330,30 @@ impl Rule for RuleHighOrderAnd {
         if data.obank().get(addop).expect("RuleHighOrderAnd: stale addop").code()
             != OpCode::CPUI_INT_ADD
         {
-            return 0;
+            return Ok(0);
         }
 
         let mut val = data.vbank().get(cvn1).expect("RuleHighOrderAnd: stale cvn1").get_offset();
         let size = data.vbank().get(cvn1).expect("RuleHighOrderAnd: stale cvn1").get_size();
         // Check that cvn1 is of the form    11110000
         if (val.wsub(1) | val) != calc_mask(size) {
-            return 0;
+            return Ok(0);
         }
 
         let cvn2 = data.obank().get(addop).expect("RuleHighOrderAnd: stale addop").get_in(1).expect(
             "RuleHighOrderAnd: INT_ADD has no in1",
         );
-        if data.vbank().get(cvn2).expect("RuleHighOrderAnd: stale cvn2").is_constant() {
+        Ok(if data.vbank().get(cvn2).expect("RuleHighOrderAnd: stale cvn2").is_constant() {
             let xalign = data.obank().get(addop).expect("RuleHighOrderAnd: stale addop").get_in(0).expect(
                 "RuleHighOrderAnd: INT_ADD has no in0",
             );
             if data.vbank().get(xalign).expect("RuleHighOrderAnd: stale xalign").is_free() {
-                return 0;
+                return Ok(0);
             }
             let mask1 = data.vbank().get(xalign).expect("RuleHighOrderAnd: stale xalign").get_nz_mask();
             // addop->Input(0) must be unaffected by the AND
             if (mask1 & val) != mask1 {
-                return 0;
+                return Ok(0);
             }
 
             set_opcode_typed(data, op, OpCode::CPUI_INT_ADD);
@@ -2371,7 +2368,7 @@ impl Rule for RuleHighOrderAnd {
                 "RuleHighOrderAnd: INT_ADD has no output",
             );
             if data.lone_descend(addop_out) != Some(op) {
-                return 0;
+                return Ok(0);
             }
             for i in 0..2 {
                 let zerovn = data.obank().get(addop).expect("RuleHighOrderAnd: stale addop").get_in(i).expect(
@@ -2418,10 +2415,10 @@ impl Rule for RuleHighOrderAnd {
                 // Convert the AND to a COPY
                 data.op_remove_input(op, 1);
                 set_opcode_typed(data, op, OpCode::CPUI_COPY);
-                return 1;
+                return Ok(1);
             }
             0
-        }
+        })
     }
 }
 
@@ -2454,14 +2451,14 @@ impl Rule for RuleAndDistribute {
         vec![OpCode::CPUI_INT_AND]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let outvn = data.obank().get(op).expect("RuleAndDistribute: stale op").get_out().expect(
             "RuleAndDistribute: INT_AND has no output",
         );
         let size = data.vbank().get(outvn).expect("RuleAndDistribute: stale outvn").get_size();
         // FIXME: uintb should be arbitrary precision
         if size > SIZEOF_UINTB {
-            return 0;
+            return Ok(0);
         }
         let fullmask = calc_mask(size);
         let mut i = 0;
@@ -2537,14 +2534,14 @@ impl Rule for RuleAndDistribute {
             i += 1;
         }
         if i == 2 {
-            return 0;
+            return Ok(0);
         }
         // Do distribution -- builds two new INT_AND ops with newUniqueOut, then
         // rewires op into an INT_OR of their outputs.
         // STUB(W3): the two distributed INT_AND ops need `newUniqueOut` (the W3
         // output-creation stub).  Every match/early-out guard above is ported; the
         // distribution body defers here.  No change.
-        0
+        Ok(0)
     }
 }
 
@@ -2577,20 +2574,20 @@ impl Rule for RuleLessOne {
         vec![OpCode::CPUI_INT_LESS, OpCode::CPUI_INT_LESSEQUAL]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let constvn = data.obank().get(op).expect("RuleLessOne: stale op").get_in(1).expect(
             "RuleLessOne: op has no in1",
         );
         if !data.vbank().get(constvn).expect("RuleLessOne: stale constvn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let val = data.vbank().get(constvn).expect("RuleLessOne: stale constvn").get_offset();
         let op_code = data.obank().get(op).expect("RuleLessOne: stale op").code();
         if op_code == OpCode::CPUI_INT_LESS && val != 1 {
-            return 0;
+            return Ok(0);
         }
         if op_code == OpCode::CPUI_INT_LESSEQUAL && val != 0 {
-            return 0;
+            return Ok(0);
         }
 
         set_opcode_typed(data, op, OpCode::CPUI_INT_EQUAL);
@@ -2599,7 +2596,7 @@ impl Rule for RuleLessOne {
             let newc = data.new_constant(constvn_size, 0);
             data.op_set_input(op, newc, 1).expect("RuleLessOne: op_set_input");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -2632,60 +2629,60 @@ impl Rule for RuleRangeMeld {
         vec![OpCode::CPUI_BOOL_OR, OpCode::CPUI_BOOL_AND]
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = data.obank().get(op).expect("RuleRangeMeld: stale op").get_in(0).expect(
             "RuleRangeMeld: op has no in0",
         );
         if !data.vbank().get(vn1).expect("RuleRangeMeld: stale vn1").is_written() {
-            return 0;
+            return Ok(0);
         }
         let vn2 = data.obank().get(op).expect("RuleRangeMeld: stale op").get_in(1).expect(
             "RuleRangeMeld: op has no in1",
         );
         if !data.vbank().get(vn2).expect("RuleRangeMeld: stale vn2").is_written() {
-            return 0;
+            return Ok(0);
         }
         let sub1 = data.vbank().get(vn1).expect("RuleRangeMeld: stale vn1").get_def().expect(
             "RuleRangeMeld: written vn1 has no def",
         );
         if !data.obank().get(sub1).expect("RuleRangeMeld: stale sub1").is_bool_output() {
-            return 0;
+            return Ok(0);
         }
         let sub2 = data.vbank().get(vn2).expect("RuleRangeMeld: stale vn2").get_def().expect(
             "RuleRangeMeld: written vn2 has no def",
         );
         if !data.obank().get(sub2).expect("RuleRangeMeld: stale sub2").is_bool_output() {
-            return 0;
+            return Ok(0);
         }
 
         let mut range1 = crate::rangeutil::CircleRange::new_bool(true);
         let mut a1 = match crate::jumptable::circlerange_pull_back(data, &mut range1, sub1, false) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let mut range2 = crate::rangeutil::CircleRange::new_bool(true);
         let mut a2 = match crate::jumptable::circlerange_pull_back(data, &mut range2, sub2, false) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if data.obank().get(sub1).unwrap().code() == OpCode::CPUI_BOOL_NEGATE {
             if !data.vbank().get(a1).unwrap().is_written() {
-                return 0;
+                return Ok(0);
             }
             let def = data.vbank().get(a1).unwrap().get_def().unwrap();
             a1 = match crate::jumptable::circlerange_pull_back(data, &mut range1, def, false) {
                 Some(v) => v,
-                None => return 0,
+                None => return Ok(0),
             };
         }
         if data.obank().get(sub2).unwrap().code() == OpCode::CPUI_BOOL_NEGATE {
             if !data.vbank().get(a2).unwrap().is_written() {
-                return 0;
+                return Ok(0);
             }
             let def = data.vbank().get(a2).unwrap().get_def().unwrap();
             a2 = match crate::jumptable::circlerange_pull_back(data, &mut range2, def, false) {
                 Some(v) => v,
-                None => return 0,
+                None => return Ok(0),
             };
         }
         // pull-back on the side with the smaller varnode.
@@ -2693,27 +2690,27 @@ impl Rule for RuleRangeMeld {
             let sz1 = data.vbank().get(a1).unwrap().get_size();
             let sz2 = data.vbank().get(a2).unwrap().get_size();
             if sz2 == sz1 {
-                return 0;
+                return Ok(0);
             }
             if sz1 < sz2 && data.vbank().get(a2).unwrap().is_written() {
                 let def = data.vbank().get(a2).unwrap().get_def().unwrap();
                 a2 = match crate::jumptable::circlerange_pull_back(data, &mut range2, def, false) {
                     Some(v) => v,
-                    None => return 0,
+                    None => return Ok(0),
                 };
             } else if data.vbank().get(a1).unwrap().is_written() {
                 let def = data.vbank().get(a1).unwrap().get_def().unwrap();
                 a1 = match crate::jumptable::circlerange_pull_back(data, &mut range1, def, false) {
                     Some(v) => v,
-                    None => return 0,
+                    None => return Ok(0),
                 };
             }
             if a1 != a2 {
-                return 0;
+                return Ok(0);
             }
         }
         if !data.vbank().get(a1).unwrap().is_heritage_known() {
-            return 0;
+            return Ok(0);
         }
 
         let opc_in = data.obank().get(op).unwrap().code();
@@ -2737,12 +2734,12 @@ impl Rule for RuleRangeMeld {
                 set_opcode_typed(data, op, opc);
                 let _ = data.op_set_input(op, a1, 1 - resslot);
                 let _ = data.op_set_input(op, new_const, resslot);
-                return 1;
+                return Ok(1);
             }
         }
 
         if restype == 2 {
-            return 0; // Cannot represent
+            return Ok(0); // Cannot represent
         }
         if restype == 1 {
             // Pieces cover everything, condition is always true.
@@ -2757,7 +2754,7 @@ impl Rule for RuleRangeMeld {
             let zero = data.new_constant(1, 0);
             let _ = data.op_set_input(op, zero, 0);
         }
-        1
+        Ok(1)
     }
 }
 

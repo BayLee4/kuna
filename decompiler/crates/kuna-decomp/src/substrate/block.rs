@@ -361,8 +361,9 @@ pub enum BlockKind {
     /// recovered from (C++ `BlockSwitch::jump` is the pointer; the rust port
     /// keeps the owning function's slot index so the printer can reach the
     /// table's labels via `Funcdata::get_jump_table`).  The case structure is
-    /// carried in `caseblocks`.
-    Switch { caseblocks: Vec<CaseOrder>, jt_index: usize },
+    /// carried in `caseblocks`. Graph-only structuring has no function or
+    /// recovered jump table, so its association is `None`.
+    Switch { caseblocks: Vec<CaseOrder>, jt_index: Option<usize> },
 }
 
 /// The BlockBasic-specific data (C++ `BlockBasic` non-edge members).
@@ -902,10 +903,10 @@ impl FlowBlock {
     }
 
     /// The `Funcdata::jumpvec` slot of this switch's [`JumpTable`](crate::jumptable::JumpTable)
-    /// (C++ `BlockSwitch::jump`); `None` for non-switch blocks.
+    /// (C++ `BlockSwitch::jump`); `None` for graph-only switches and non-switch blocks.
     pub fn switch_jt_index(&self) -> Option<usize> {
         match &self.kind {
-            BlockKind::Switch { jt_index, .. } => Some(*jt_index),
+            BlockKind::Switch { jt_index, .. } => *jt_index,
             _ => None,
         }
     }
@@ -2875,12 +2876,13 @@ impl BlockGraph {
     /// recovered [`JumpTable`](crate::jumptable::JumpTable) (C++ resolves this via
     /// `rootbl->getExitLeaf()`'s BRANCHIND → `findJumpTable`; the Rust port passes
     /// the precomputed slot since the structuring graph has no Funcdata pointer).
+    /// Only graph-only structuring supplies `None`.
     pub fn new_block_switch(
         &mut self,
         graph_id: BlockId,
         cs: &[BlockId],
         has_exit: bool,
-        jt_index: usize,
+        jt_index: Option<usize>,
         switch_case_edges: &std::collections::BTreeMap<(BlockId, BlockId), (int4, bool)>,
     ) -> KunaResult<BlockId> {
         let rootbl = cs[0];
@@ -2947,15 +2949,21 @@ impl BlockGraph {
                 if let Some(targetbl) = self.arena[casebl].get_goto_target() {
                     if let Some(front) = self.get_front_leaf(targetbl) {
                         if let Some(basicbl) = self.sub_block(front, 0) {
-                            // inindex of the switch into the target's front leaf.
-                            let inindex = self.arena[front].get_in_index(switch_root);
-                            if inindex != -1 {
-                                let oidx = self.arena[front].get_in_rev_index(inindex);
+                            let switch_basic = self.get_exit_leaf(switch_root)
+                                .and_then(|leaf| self.arena[leaf].get_copy());
+                            let outindex = switch_basic
+                                .and_then(|switch| switch_case_edges.get(&(switch, basicbl)))
+                                .map(|&(outindex, _)| outindex)
+                                .or_else(|| {
+                                    let inindex = self.arena[front].get_in_index(switch_root);
+                                    (inindex != -1)
+                                        .then(|| self.arena[front].get_in_rev_index(inindex))
+                                });
+                            if let Some(oidx) = outindex {
                                 if (oidx as usize) < casemap.len() {
                                     caseblocks[i].chain = casemap[oidx as usize];
                                 }
                             }
-                            let _ = basicbl;
                         }
                     }
                 }
@@ -3729,15 +3737,15 @@ impl BlockGraph {
             return;
         }
         // BlockGraph and subtypes: bhead headers then recursive encode
-        let list = self.arena[this_id].list.clone();
-        for &bl in &list {
+        let list = &self.arena[this_id].list;
+        for &bl in list {
             encoder.open_element(&ELEM_BHEAD);
             encoder.write_signed_integer(&ATTRIB_INDEX, self.arena[bl].get_index() as i64);
             let nm = self.body_type_name(bl);
             encoder.write_string(&ATTRIB_TYPE, nm.as_bytes());
             encoder.close_element(&ELEM_BHEAD);
         }
-        for &bl in &list {
+        for &bl in list {
             self.encode(bl, encoder);
         }
         // Subtype-specific trailing <target> elements
@@ -3746,19 +3754,19 @@ impl BlockGraph {
 
     /// The `<bhead>` type name for a component (C++ `BlockGraph::encodeBody`'s
     /// inner naming, with the BlockIf `ifgoto`/`properif`/`ifelse` distinction).
-    fn body_type_name(&self, bl: BlockId) -> String {
+    fn body_type_name(&self, bl: BlockId) -> &'static str {
         let bt = self.arena[bl].get_type();
         if bt == BlockType::If {
             let sz = self.arena[bl].get_size();
             if sz == 1 {
-                "ifgoto".to_string()
+                "ifgoto"
             } else if sz == 2 {
-                "properif".to_string()
+                "properif"
             } else {
-                "ifelse".to_string()
+                "ifelse"
             }
         } else {
-            type_to_name(bt).to_string()
+            type_to_name(bt)
         }
     }
 

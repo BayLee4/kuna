@@ -8,6 +8,7 @@ use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::kuna_stackobjects::{ByteSource, SourcePoint, StackObject};
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
 pub(crate) fn can_map_backing(fd: &Funcdata, start: u64, size: i32) -> bool {
@@ -86,8 +87,10 @@ fn initialize_parameters(
     fd: &mut Funcdata,
     info: &crate::varmap::LinkEntryInfo,
     factory: &dyn TypeFactory,
-) -> Option<()> {
-    let backing = info.sym_type.as_ref()?;
+) -> KunaResult<Option<()>> {
+    let Some(backing) = info.sym_type.as_ref() else {
+        return Ok(None);
+    };
     let parameters: Vec<_> = (0..fd.get_func_proto().num_params())
         .filter_map(|index| {
             let parameter = fd.get_func_proto().get_param(index)?;
@@ -123,7 +126,7 @@ fn initialize_parameters(
         })
         .collect();
     for (name, address, offset, datatype, parameter_symbol) in parameters {
-        let member = (0..backing.num_depend()).find(|&index| {
+        let Some(member) = (0..backing.num_depend()).find(|&index| {
             backing.get_field(index).is_some_and(|field| {
                 (offset == 0 && Rc::ptr_eq(&field.field_type, &datatype))
                     || (field.field_type.get_name().starts_with("stack_slice_")
@@ -131,10 +134,12 @@ fn initialize_parameters(
                             piece.offset == offset && Rc::ptr_eq(&piece.field_type, &datatype)
                         }))
             })
-        })?;
-        let source = fd.new_varnode(datatype.get_size(), &address, Some(Rc::clone(&datatype)));
-        let source = fd.set_input_varnode(source).ok()?;
-        let mut high = fd.vbank().get(source)?.get_high()?;
+        }) else { return Ok(None) };
+        let source = fd.new_varnode(datatype.get_size(), &address, Some(Rc::clone(&datatype)))?;
+        let source = fd.set_input_varnode(source)?;
+        let Some(mut high) = fd.vbank().get(source).and_then(|v| v.get_high()) else {
+            return Ok(None);
+        };
         let shared = fd.high_bank().get(high).is_some_and(|h| {
             (0..h.num_instances()).any(|index| {
                 fd.vbank().get(h.get_instance(index)).is_some_and(|value| {
@@ -146,9 +151,10 @@ fn initialize_parameters(
         });
         if shared {
             fd.high_remove_member(high, source);
-            high = fd.assign_high_var(source)?;
+            let Some(assigned) = fd.assign_high_var(source) else { return Ok(None) };
+            high = assigned;
         }
-        let h = fd.high_bank_mut().get_mut(high)?;
+        let Some(h) = fd.high_bank_mut().get_mut(high) else { return Ok(None) };
         h.set_kuna_name(name);
         h.set_symbol_offset(-1);
         h.set_symbol_type(Rc::clone(&datatype));
@@ -157,18 +163,22 @@ fn initialize_parameters(
         let point = fd.bblocks_block_start(block);
         let op = fd.new_op(1, point);
         fd.op_set_opcode_code(op, OpCode::CPUI_COPY);
-        let out = fd.new_varnode_out(datatype.get_size(), &address, op).ok()?;
+        let out = fd.new_varnode_out(datatype.get_size(), &address, op)?;
         fd.vn_update_type(out, datatype);
-        fd.vbank_mut().get_mut(out)?.set_explicit();
-        let high = fd.vbank().get(out)?.get_high()?;
-        let h = fd.high_bank_mut().get_mut(high)?;
+        let Some(value) = fd.vbank_mut().get_mut(out) else { return Ok(None) };
+        value.set_explicit();
+        let Some(high) = fd.vbank().get(out).and_then(|v| v.get_high()) else { return Ok(None) };
+        let Some(h) = fd.high_bank_mut().get_mut(high) else { return Ok(None) };
         h.set_kuna_name(info.display_name.clone());
         h.set_symbol_offset(offset);
         h.set_symbol_type(Rc::clone(backing));
         h.set_kuna_link_symbol(info.symbol);
-        let mut resolution =
+        let mut resolution = match
             crate::unionresolve::ResolvedUnion::new_field(Rc::clone(backing), member, factory)
-                .ok()?;
+        {
+            Ok(resolution) => resolution,
+            Err(_) => return Ok(None),
+        };
         resolution.set_lock(true);
         fd.set_union_field(backing, op, -1, resolution);
         fd.stack_write_views.insert(
@@ -178,15 +188,15 @@ fn initialize_parameters(
                 offset,
             },
         );
-        fd.op_set_input(op, source, 0).ok()?;
+        fd.op_set_input(op, source, 0)?;
         fd.op_insert_begin(op, block);
     }
     bind_values(fd, info);
-    Some(())
+    Ok(Some(()))
 }
 
 /// Scalar slots also need backing when their addresses have wider observers.
-pub(crate) fn needs_backing(fd: &Funcdata, start: u64, size: i32) -> bool {
+pub(crate) fn needs_backing(fd: &Funcdata, start: u64, size: i32) -> KunaResult<bool> {
     let aliases = |input| crate::kuna_stackranges::may_alias(fd, input, start, size);
     for id in fd.obank().iter_alive() {
         let Some(op) = fd.obank().get(id) else {
@@ -199,17 +209,17 @@ pub(crate) fn needs_backing(fd: &Funcdata, start: u64, size: i32) -> bool {
                         continue;
                     };
                     let Some(address) = crate::kuna_stackranges::frame_address(fd, input) else {
-                        return true;
+                        return Ok(true);
                     };
                     if address.first != address.last
                         || !address.terms.is_empty()
                         || fd.get_arch().manage().get_stack_space().is_none_or(|space| {
                             space.wrap_offset(address.first as u64) != start
                         })
-                        || crate::kuna_stackviews::declared_view(fd, id, slot)
+                        || crate::kuna_stackviews::declared_view(fd, id, slot)?
                             .is_none_or(|ty| ty.get_size() != size)
                     {
-                        return true;
+                        return Ok(true);
                     }
                 }
             }
@@ -223,7 +233,7 @@ pub(crate) fn needs_backing(fd: &Funcdata, start: u64, size: i32) -> bool {
                     .is_some_and(|value| value.is_persist() || value.is_stack_store())
                     && (0..op.num_input()).any(|slot| op.get_in(slot).is_some_and(aliases))
                 {
-                    return true;
+                    return Ok(true);
                 }
             }
             OpCode::CPUI_STORE
@@ -231,13 +241,13 @@ pub(crate) fn needs_backing(fd: &Funcdata, start: u64, size: i32) -> bool {
             | OpCode::CPUI_RETURN
             | OpCode::CPUI_CALLOTHER => {
                 if (1..op.num_input()).any(|slot| op.get_in(slot).is_some_and(aliases)) {
-                    return true;
+                    return Ok(true);
                 }
             }
             _ => {}
         }
     }
-    false
+    Ok(false)
 }
 
 fn bind_values(fd: &mut Funcdata, info: &crate::varmap::LinkEntryInfo) {
@@ -507,16 +517,16 @@ fn storage(fd: &Funcdata, object: &StackObject) -> Option<VarnodeId> {
     Some(id)
 }
 
-pub(crate) fn prepare_casts(fd: &mut Funcdata) {
+pub(crate) fn prepare_casts(fd: &mut Funcdata) -> KunaResult<()> {
     let Some(factory) = fd.get_arch().types_rc() else {
-        return;
+        return Ok(());
     };
     let objects = fd.stack_objects.clone();
     let mut initialized = BTreeSet::new();
     for object in objects {
         if let Some(backing) = shared_backing(fd, &object) {
             if initialized.insert(backing.entry_addr.get_offset()) {
-                initialize_parameters(fd, &backing, factory.as_ref());
+                initialize_parameters(fd, &backing, factory.as_ref())?;
             }
             bind_uses(
                 fd,
@@ -526,7 +536,7 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata) {
                 backing.symbol,
                 backing.sym_off,
                 factory.as_ref(),
-            );
+            )?;
             continue;
         }
         let Some(storage) = storage(fd, &object) else {
@@ -573,8 +583,9 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata) {
         h.set_symbol_offset(-1);
         h.set_symbol_type(Rc::clone(&datatype));
         h.set_kuna_link_symbol(symbol);
-        bind_uses(fd, &object, &datatype, &name, symbol, 0, factory.as_ref());
+        bind_uses(fd, &object, &datatype, &name, symbol, 0, factory.as_ref())?;
     }
+    Ok(())
 }
 
 fn bind_uses(
@@ -585,9 +596,9 @@ fn bind_uses(
     symbol: crate::database::SymbolId,
     symbol_offset: i32,
     factory: &dyn TypeFactory,
-) {
+) -> KunaResult<()> {
     let Some(space) = object.address.get_space() else {
-        return;
+        return Ok(());
     };
     for use_ in &object.uses {
         let call = use_.op;
@@ -638,9 +649,7 @@ fn bind_uses(
         else {
             continue;
         };
-        let Ok(base) = fd.construct_spacebase_input(space) else {
-            continue;
-        };
+        let base = fd.construct_spacebase_input(space)?;
         let point = fd.obank().get(call).unwrap().get_addr().clone();
         let op = fd.new_op(2, point);
         fd.op_set_opcode_code(op, OpCode::CPUI_PTRSUB);
@@ -664,6 +673,7 @@ fn bind_uses(
         fd.op_insert_before(op, call);
         let _ = fd.op_set_input(call, out, use_.slot);
     }
+    Ok(())
 }
 
 #[cfg(test)]

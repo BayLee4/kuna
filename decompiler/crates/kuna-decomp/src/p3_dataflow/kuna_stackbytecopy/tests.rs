@@ -30,7 +30,7 @@ fn emit(
 }
 
 fn free_register(fd: &mut Funcdata, size: i32, offset: u64) -> VarnodeId {
-    fd.new_varnode(size, &reg_addr(fd, offset), None)
+    fd.new_varnode(size, &reg_addr(fd, offset), None).unwrap()
 }
 
 #[test]
@@ -146,7 +146,7 @@ fn loop_rewrite_reports_a_change_and_preserves_per_iteration_dataflow() {
 
     assert_eq!(trip_count(&fd, body), Some(2));
     let mut action = ActionStackByteCopy::boxed();
-    assert_eq!(action.perform(&mut fd, &mut ActionContext::default()), 1);
+    assert_eq!(action.perform(&mut fd, &mut ActionContext::default()).unwrap(), 1);
     assert_eq!(fd.bblocks_ref().block(body).size_in(), 1);
     assert_eq!(fd.bblocks_ref().block(body).size_out(), 1);
     assert_eq!(fd.bblocks_ref().block(body).get_out(0), exit);
@@ -167,5 +167,5 @@ fn loop_rewrite_reports_a_change_and_preserves_per_iteration_dataflow() {
         fd.obank().get(final_use).unwrap().get_in(0),
         final_decrement
     );
-    assert_eq!(action.perform(&mut fd, &mut ActionContext::default()), 0);
+    assert_eq!(action.perform(&mut fd, &mut ActionContext::default()).unwrap(), 0);
 }

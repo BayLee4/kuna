@@ -1,6 +1,7 @@
 //! Fold a negated ordered comparison only when its NaN guards exclude unordered inputs.
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
 use crate::context::{OpId, VarnodeId};
@@ -231,9 +232,10 @@ fn reads_memory(data: &Funcdata, vn: VarnodeId) -> bool {
 }
 
 /// A second reader of an unheritaged memory read needs its own varnode.
-fn operand_copy(data: &mut Funcdata, vn: VarnodeId) -> VarnodeId {
+/// Storage-property query failures propagate to the invoking rule.
+fn operand_copy(data: &mut Funcdata, vn: VarnodeId) -> KunaResult<VarnodeId> {
     if !reads_memory(data, vn) {
-        return vn;
+        return Ok(vn);
     }
     let v = data.vbank().get(vn).unwrap();
     let (size, addr) = (v.get_size(), v.get_addr().clone());
@@ -242,17 +244,17 @@ fn operand_copy(data: &mut Funcdata, vn: VarnodeId) -> VarnodeId {
 
 /// The complement, issued right after the guarded comparison so a memory operand is read
 /// by the same instruction.
-fn complement_at_leaf(data: &mut Funcdata, c: &Complement) -> VarnodeId {
+fn complement_at_leaf(data: &mut Funcdata, c: &Complement) -> KunaResult<VarnodeId> {
     let addr = data.obank().get(c.leaf).unwrap().get_addr().clone();
     let op = data.new_op(2, addr);
     data.op_set_opcode(op, crate::typeop::seam_type_op_for(c.code));
     let result = data.new_unique_out(1, op).expect("guarded complement output");
-    let inputs = [operand_copy(data, c.lhs), operand_copy(data, c.rhs)];
+    let inputs = [operand_copy(data, c.lhs)?, operand_copy(data, c.rhs)?];
     data.op_set_all_input(op, &inputs)
         .expect("guarded complement inputs");
     data.op_insert_after(op, c.leaf);
     mark_exact(data, op);
-    result
+    Ok(result)
 }
 
 fn combines(code: OpCode) -> bool {
@@ -302,43 +304,43 @@ fn consumed_directly(data: &Funcdata, vn: VarnodeId) -> bool {
 }
 
 /// `!(NAN(a) || NAN(b) || a <= b)` is exactly `b < a`, including NaNs.
-pub(crate) fn fold_guarded_negate(data: &mut Funcdata, negate: OpId) -> bool {
+pub(crate) fn fold_guarded_negate(data: &mut Funcdata, negate: OpId) -> KunaResult<bool> {
     let Some(op) = data.obank().get(negate) else {
-        return false;
+        return Ok(false);
     };
     if op.code() != OpCode::CPUI_BOOL_NEGATE {
-        return false;
+        return Ok(false);
     }
     let Some(root) = op.get_in(0) else {
-        return false;
+        return Ok(false);
     };
     let Some(c) = guarded_complement(data, root) else {
-        return false;
+        return Ok(false);
     };
     if reads_memory(data, c.lhs) || reads_memory(data, c.rhs) {
-        let result = complement_at_leaf(data, &c);
+        let result = complement_at_leaf(data, &c)?;
         data.op_set_opcode(negate, crate::typeop::seam_type_op_for(OpCode::CPUI_COPY));
         data.op_set_all_input(negate, &[result])
             .expect("guarded float complement copy");
-        return true;
+        return Ok(true);
     }
     data.op_set_opcode(negate, crate::typeop::seam_type_op_for(c.code));
     data.op_set_all_input(negate, &[c.lhs, c.rhs])
         .expect("guarded float complement inputs");
     mark_exact(data, negate);
-    true
+    Ok(true)
 }
 
-fn fold_guarded_branch(data: &mut Funcdata, branch: OpId) -> bool {
+fn fold_guarded_branch(data: &mut Funcdata, branch: OpId) -> KunaResult<bool> {
     let op = data.obank().get(branch).unwrap();
     let Some(root) = op.get_in(1) else {
-        return false;
+        return Ok(false);
     };
     let Some(c) = guarded_complement(data, root) else {
-        return false;
+        return Ok(false);
     };
     let result = if reads_memory(data, c.lhs) || reads_memory(data, c.rhs) {
-        complement_at_leaf(data, &c)
+        complement_at_leaf(data, &c)?
     } else {
         let addr = data.obank().get(branch).unwrap().get_addr().clone();
         let comparison = data.new_op(2, addr);
@@ -355,34 +357,34 @@ fn fold_guarded_branch(data: &mut Funcdata, branch: OpId) -> bool {
     data.op_set_input(branch, result, 1)
         .expect("guarded branch condition");
     data.op_flip_condition(branch);
-    true
+    Ok(true)
 }
 
 /// `NAN(a) || NAN(b) || a <= b` is exactly `!(b < a)`: rewrite the root in place when its
 /// readers consume it directly.
-fn fold_guarded_root(data: &mut Funcdata, root: VarnodeId) -> bool {
+fn fold_guarded_root(data: &mut Funcdata, root: VarnodeId) -> KunaResult<bool> {
     if !consumed_directly(data, root) {
-        return false;
+        return Ok(false);
     }
     let Some(def) = data.vbank().get(root).and_then(|v| v.get_def()) else {
-        return false;
+        return Ok(false);
     };
     let Some(c) = guarded_complement(data, root) else {
-        return false;
+        return Ok(false);
     };
-    let result = complement_at_leaf(data, &c);
+    let result = complement_at_leaf(data, &c)?;
     data.op_set_opcode(def, crate::typeop::seam_type_op_for(OpCode::CPUI_BOOL_NEGATE));
     data.op_set_all_input(def, &[result])
         .expect("guarded root negation");
-    true
+    Ok(true)
 }
 
 /// Preserve the exact guarded complement before `nanignore` discards its guards.
 ///
 /// Roots are visited outermost first, so `CF || ZF` folds before the `CF` it reads.
-pub(crate) fn fold_nan_consumers(data: &mut Funcdata, nan: OpId) -> bool {
+pub(crate) fn fold_nan_consumers(data: &mut Funcdata, nan: OpId) -> KunaResult<bool> {
     let Some(out) = data.obank().get(nan).and_then(|op| op.get_out()) else {
-        return false;
+        return Ok(false);
     };
     let mut roots: Vec<(VarnodeId, usize)> = Vec::new();
     let mut pending = vec![(out, 0)];
@@ -418,12 +420,12 @@ pub(crate) fn fold_nan_consumers(data: &mut Funcdata, nan: OpId) -> bool {
         }
         for reader in data.descend_snapshot(root) {
             match data.obank().get(reader).unwrap().code() {
-                OpCode::CPUI_BOOL_NEGATE => changed |= fold_guarded_negate(data, reader),
-                OpCode::CPUI_CBRANCH => changed |= fold_guarded_branch(data, reader),
+                OpCode::CPUI_BOOL_NEGATE => changed |= fold_guarded_negate(data, reader)?,
+                OpCode::CPUI_CBRANCH => changed |= fold_guarded_branch(data, reader)?,
                 _ => {}
             }
         }
-        changed |= fold_guarded_root(data, root);
+        changed |= fold_guarded_root(data, root)?;
     }
-    changed
+    Ok(changed)
 }

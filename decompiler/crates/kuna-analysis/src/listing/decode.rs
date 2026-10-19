@@ -427,11 +427,11 @@ mod tests {
             self.inner.get_register(name)
         }
 
-        fn get_register_name(&self, base: &Rc<AddrSpace>, offset: u64, size: i32) -> String {
+        fn get_register_name(&self, base: &Rc<AddrSpace>, offset: u64, size: i32) -> KunaResult<String> {
             self.inner.get_register_name(base, offset, size)
         }
 
-        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, offset: u64, size: i32) -> String {
+        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, offset: u64, size: i32) -> KunaResult<String> {
             self.inner.get_exact_register_name(base, offset, size)
         }
     }
@@ -456,8 +456,8 @@ mod tests {
             self.inner.get_all_registers(registers);
         }
 
-        fn get_user_op_names(&self, names: &mut Vec<String>) {
-            self.inner.get_user_op_names(names);
+        fn get_user_op_names(&self, names: &mut Vec<String>) -> KunaResult<()> {
+            self.inner.get_user_op_names(names)
         }
 
         fn instruction_length(&self, addr: &Address) -> KunaResult<i32> {

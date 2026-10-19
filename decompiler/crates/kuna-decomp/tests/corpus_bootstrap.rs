@@ -450,7 +450,7 @@ impl kuna_sleigh::translate::PcodeEmit for BootstrapEmit<'_> {
             s.push(' ');
             s.push_str(&self.render_varnode(vd, false));
             let space = vd.space.as_ref().expect("code-ref varnode has a space").clone();
-            let vn = self.fd.new_varnode_space_off(vd.size as int4, space, vd.offset);
+            let vn = self.fd.new_varnode_space_off(vd.size as int4, space, vd.offset).unwrap();
             let _ = self.fd.op_set_input(op, vn, 0);
             i += 1;
         }
@@ -462,7 +462,7 @@ impl kuna_sleigh::translate::PcodeEmit for BootstrapEmit<'_> {
             let spaceid = i == 0 && (opc == OpCode::CPUI_LOAD || opc == OpCode::CPUI_STORE);
             s.push_str(&self.render_varnode(vd, spaceid));
             let space = vd.space.as_ref().expect("input varnode has a space").clone();
-            let vn = self.fd.new_varnode_space_off(vd.size as int4, space, vd.offset);
+            let vn = self.fd.new_varnode_space_off(vd.size as int4, space, vd.offset).unwrap();
             let _ = self.fd.op_set_input(op, vn, i as int4);
             i += 1;
         }

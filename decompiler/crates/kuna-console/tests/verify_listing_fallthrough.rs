@@ -19,7 +19,7 @@ fn fallthrough_references_and_selected_and_whole_program_output() {
         let file = object::File::parse(&*bytes).unwrap();
         let image = ObjectLoadImage::from_bytes(path, &bytes).unwrap();
         let arch = prog.arch();
-        let listing = Listing::build(&file, &image, arch, arch.translate(), &[0x401000, 0x401010]);
+        let listing = Listing::build(&file, &image, arch, arch.translate(), &[0x401000, 0x401010]).unwrap();
         assert_eq!(listing.num_instructions(), 2052);
         assert_eq!(listing.function_count(), 2);
         assert_eq!(listing.ref_source_iter().count(), 2050);
@@ -48,11 +48,11 @@ fn fallthrough_references_and_selected_and_whole_program_output() {
             .filter(|f| f.name == "_start")
             .cloned()
             .collect();
-        let selected = decompile_targets(&mut prog, selected, false, false, true);
+        let selected = decompile_targets(&mut prog, selected, false, false, true).unwrap();
         assert_eq!(selected.len(), 1);
         assert!(selected[0].error.is_none());
         assert!(selected[0].code.as_ref().unwrap().contains("return 7;"));
-        let whole = decompile_targets(&mut prog, targets, false, false, true);
+        let whole = decompile_targets(&mut prog, targets, false, false, true).unwrap();
         assert_eq!(whole.len(), 2);
         for function in &whole {
             assert!(function.error.is_none(), "{:?}", function.error);

@@ -131,21 +131,21 @@ impl Action for ActionParamCopyHoist {
         }
         Some(Box::new(ActionParamCopyHoist { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option paramcopyhoist on|off`, carried on the Architecture
         // boundary.  Off => nothing moves => byte-identical output.
         if !data.get_arch().param_copy_hoist {
-            return 0;
+            return Ok(0);
         }
         if data.bblocks_get_size() < 2 {
-            return 0;
+            return Ok(0);
         }
         let entry = data.bblocks_get_block(0);
         let candidates: Vec<OpId> =
             data.obank().iter_alive().filter(|&op| is_hoistable(data, op, entry)).collect();
         let candidates = one_per_high(data, candidates);
         if candidates.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let count = candidates.len() as int4;
         for op in candidates {
@@ -157,7 +157,7 @@ impl Action for ActionParamCopyHoist {
             "paramcopyhoist: anchored {count} parameter copy-shadow(s) in the entry block of {name}"
         ));
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 

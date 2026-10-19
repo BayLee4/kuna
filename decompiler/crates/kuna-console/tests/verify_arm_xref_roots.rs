@@ -62,7 +62,7 @@ fn frame_roots_preserve_owners_without_interior_or_invalid_entries() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             let index =
-                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             let loop_site = if isa == "thumb" { 0x1414 } else { 0x1418 };
             let load_site = if isa == "thumb" { 0x1504 } else { 0x1508 };
             assert_eq!(
@@ -162,7 +162,7 @@ fn be8_frames_use_little_endian_instructions_in_a_big_endian_elf() {
         );
         let bytes = std::fs::read(&path).unwrap();
         let file = object::File::parse(&*bytes).unwrap();
-        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
         let site = if isa == "thumb" { 0x1504 } else { 0x1508 };
         assert_eq!(index.function_containing(site), Some(0x1500));
         assert!(index
@@ -256,7 +256,7 @@ fn distant_body_ownership_agrees_for_direct_indirect_and_branch_queries() {
     prog.arch_mut().set_kuna_option("aif", "off").unwrap();
     let bytes = std::fs::read(&path).unwrap();
     let file = object::File::parse(&*bytes).unwrap();
-    let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+    let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
     assert!(index.is_function_entry(0x1600));
     assert_eq!(
         index.function_instruction_counts(&[0x1500, 0x1600], 100),
@@ -297,7 +297,7 @@ fn a_late_discovered_callee_owns_its_previously_decoded_body() {
         .unwrap();
     prog.arch_mut().set_kuna_option("aif", "off").unwrap();
     let file = object::File::parse(&*bytes).unwrap();
-    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
     assert!(index.is_function_entry(0x1750));
     assert_eq!(index.function_containing(0x1754), Some(0x1750));
     assert!(index.has_indirect_calls(0x1750));
@@ -347,7 +347,7 @@ fn a_predicated_return_keeps_the_nonreturning_path_in_the_same_frame() {
         assert!(!entries.iter().any(|e| e.addr.get_offset() == 0x140c));
         let bytes = std::fs::read(&path).unwrap();
         let file = object::File::parse(&*bytes).unwrap();
-        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
         assert!(!index.is_function_entry(0x140c));
         assert_eq!(index.function_containing(0x1410), Some(0x1400));
         assert_eq!(index.function_instruction_counts(&[0x1400], 100), vec![7]);
@@ -389,7 +389,7 @@ fn a_call_that_never_returns_ends_the_frame_without_absorbing_the_next_one() {
         }
         let bytes = std::fs::read(&path).unwrap();
         let file = object::File::parse(&*bytes).unwrap();
-        let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+        let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
         for (frame, call, callee) in [
             (0x1400, 0x140c, 0x14c0),
             (0x1418, 0x1420, 0x1100),
@@ -499,7 +499,7 @@ fn a_conditional_return_does_not_hide_an_invalid_successor() {
         .iter()
         .any(|e| e.addr.get_offset() == 0x1400));
     let file = object::File::parse(&*bytes).unwrap();
-    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
     assert!(!index.is_function_entry(0x1400));
     assert!(index.refs_from_function(0x1400).is_empty());
     std::fs::remove_file(path).unwrap();
@@ -537,7 +537,7 @@ fn explicit_focus_contributes_to_the_prefix_fingerprint_corpus() {
         .unwrap();
     prog.arch_mut().set_kuna_option("aif", "on").unwrap();
     let file = object::File::parse(&*bytes).unwrap();
-    let unfocused = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+    let unfocused = xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
     assert_eq!(unfocused.function_containing(0x1508), Some(0x1500));
     let focused = xrefs::build_with_focus(
         &file,
@@ -545,7 +545,7 @@ fn explicit_focus_contributes_to_the_prefix_fingerprint_corpus() {
         prog.arch().translate(),
         &[0x1000],
         &[0x1700],
-    );
+    ).unwrap();
     assert_eq!(focused.function_containing(0x1508), Some(0x14fc));
     assert!(!focused.is_function_entry(0x1500));
     assert!(focused.is_function_entry(0x1700));
@@ -569,7 +569,7 @@ fn replaced_frames_leave_no_decoded_body_or_discovered_callees() {
         }
         let bytes = std::fs::read(&path).unwrap();
         let file = object::File::parse(&*bytes).unwrap();
-        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
         assert!(index.is_function_entry(0x1500));
         assert!(
             index.refs_to(0x1700).is_empty(),
@@ -602,7 +602,7 @@ fn replaced_frames_leave_no_decoded_body_or_discovered_callees() {
             prog.arch().translate(),
             &[0x1000],
             &[0x1700],
-        );
+        ).unwrap();
         assert!(focused.is_function_entry(0x1700));
         assert_eq!(focused.function_containing(0x1704), Some(0x1700));
         assert!(focused.refs_to(0x1700).is_empty());
@@ -611,7 +611,7 @@ fn replaced_frames_leave_no_decoded_body_or_discovered_callees() {
             prog.arch(),
             prog.arch().translate(),
             &[0x1000, 0x1700],
-        );
+        ).unwrap();
         assert_eq!(seeded.function_containing(0x1704), Some(0x1700));
         assert!(seeded.refs_to(0x1700).is_empty());
         std::fs::remove_file(path).unwrap();
@@ -670,7 +670,7 @@ fn accepted_frames_keep_it_successors_and_real_blx_mode_changes() {
             prog.arch_mut().set_kuna_option(name, value).unwrap();
         }
         let file = object::File::parse(&*bytes).unwrap();
-        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+        let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
         assert!(index
             .refs_from_function(0x1500)
             .iter()
@@ -756,7 +756,7 @@ fn listing_rebuild_restores_context_from_discarded_blx_frames() {
             prog.arch().translate(),
             &[0x1000],
             &[0x1700],
-        );
+        ).unwrap();
         let calls: Vec<_> = index
             .refs_from_function(0x1700)
             .into_iter()
@@ -822,7 +822,7 @@ fn repeated_reconciliation_cleans_inventory_and_bodies() {
                         prog.arch(),
                         prog.arch().translate(),
                         &[0x1000],
-                    );
+                    ).unwrap();
                     assert!(
                         index.refs_to(0x1700).is_empty(),
                         "{variant}: {:?}",
@@ -862,7 +862,7 @@ fn repeated_reconciliation_cleans_inventory_and_bodies() {
                     prog.arch().translate(),
                     &[0x1000],
                     &[0x1700],
-                );
+                ).unwrap();
                 let calls: Vec<_> = focused
                     .refs_from_function(0x1700)
                     .into_iter()
@@ -937,7 +937,7 @@ fn cyclic_frame_support_requires_a_reachable_independent_caller() {
                         prog.arch(),
                         prog.arch().translate(),
                         &[0x1000],
-                    );
+                    ).unwrap();
                     let calls: Vec<_> = index
                         .refs_to(0x1100)
                         .iter()
@@ -1020,7 +1020,7 @@ fn provisional_prefix_callees_do_not_leave_inventory_entries_or_bodies() {
                         prog.arch(),
                         prog.arch().translate(),
                         &[0x1000],
-                    );
+                    ).unwrap();
                     assert_eq!(
                         index.function_instruction_counts(prefixes, 100),
                         vec![4; prefixes.len()]
@@ -1063,7 +1063,7 @@ fn fingerprint_rendering_retains_live_interworking_and_body_records() {
             }
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
-            let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+            let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             assert_eq!(
                 index.function_instruction_counts(&[0x1500, 0x1600, 0x1700], 100),
                 vec![4, 4, 4]
@@ -1115,7 +1115,7 @@ fn later_interworking_replaces_provisional_frames_in_the_wrong_mode() {
                     prog.arch().translate(),
                     &[0x1000],
                     &[0x1650],
-                );
+                ).unwrap();
                 let calls: Vec<_> = index
                     .refs_from_function(0x1500)
                     .into_iter()
@@ -1171,7 +1171,7 @@ fn gap_discovered_interworking_rebuilds_obsolete_frame_bodies() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             let index =
-                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             assert!(index.refs_to(0x1700).is_empty(), "{endian}/{patterns}");
             assert!(!index.is_function_entry(0x1700), "obsolete callee survived");
             let caller: Vec<_> = index
@@ -1222,7 +1222,7 @@ fn interior_interworking_replaces_overlapping_provisional_instructions() {
                     prog.arch().translate(),
                     &[0x1000],
                     &[0x1650],
-                );
+                ).unwrap();
                 let calls: Vec<_> = index
                     .refs_from_function(0x1500)
                     .into_iter()
@@ -1373,7 +1373,7 @@ fn interworking_invalidates_a_caller_after_its_prefix_was_extended() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             let index =
-                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             assert!(index.refs_to(0x1700).is_empty(), "{endian}/{patterns}");
             assert!(!index.is_function_entry(0x1700), "obsolete callee survived");
             let caller: Vec<_> = index
@@ -1422,7 +1422,7 @@ fn an_unfocused_frame_can_invalidate_a_prior_decode_through_an_interior_call() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             let index =
-                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             assert!(index.refs_to(0x1700).is_empty(), "{endian}/{aif}");
             assert!(!index.is_function_entry(0x1700), "obsolete callee survived");
             let callee = if endian == "little" { 0x1502 } else { 0x1504 };
@@ -1465,7 +1465,7 @@ fn an_extended_prefix_recomputes_the_bodys_pc_relative_references() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             let index =
-                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
             let refs: Vec<_> = index
                 .refs_to(0x1780)
                 .into_iter()
@@ -1571,7 +1571,7 @@ fn recovered_interworking_preserves_interior_focus_modes() {
                     prog.arch().translate(),
                     &[0x1000],
                     focus,
-                );
+                ).unwrap();
                 let calls: Vec<_> = index
                     .refs_to(0x1300)
                     .into_iter()
@@ -1624,7 +1624,7 @@ fn repeated_xrefs_preserve_recovered_body_modes() {
         for iteration in 0..3 {
             let index = xrefs::build_with_focus(
                 &file, prog.arch(), prog.arch().translate(), &[0x1000], &[0x1600],
-            );
+            ).unwrap();
             for (root, at, to) in [(0x1600, 0x1750, 0x1100), (0x1680, 0x1684, 0x1300)] {
                 let calls: Vec<_> = index.refs_from_function(root).into_iter()
                     .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
@@ -1661,12 +1661,12 @@ fn recovered_xref_publication_preserves_later_decompilation() {
             let file = object::File::parse(&*bytes).unwrap();
             let index = xrefs::build_with_focus(
                 &file, prog.arch(), prog.arch().translate(), &[0x1000], &[0x1600],
-            );
+            ).unwrap();
             assert!(index.refs_from_function(0x1600).iter()
                 .any(|r| r.kind == XrefKind::Call && r.from == 0x1750 && r.to == 0x1100));
             let space = prog.arch().manage().get_default_code_space().unwrap().clone();
             let entry = prog.resolve_address(&Address::new(space, 0x1600)).unwrap();
-            let result = decompile_entry(&mut prog, entry, &DecompileOptions::default());
+            let result = decompile_entry(&mut prog, entry, &DecompileOptions::default()).unwrap();
             assert!(result.error.is_none(), "{endian}/{patterns}: {:?}", result.error);
             let code = result.code.unwrap();
             assert!(code.contains("sub_1100(") && !code.contains("halt_"),
@@ -1693,7 +1693,7 @@ fn xref_publication_preserves_established_blocks_and_thumb_callees() {
         let file = object::File::parse(&*bytes).unwrap();
         let index = xrefs::build_with_focus(
             &file, prog.arch(), prog.arch().translate(), &[0x1000], &[],
-        );
+        ).unwrap();
         assert!(index.refs_from_function(0x1500).iter()
             .any(|r| r.kind == XrefKind::Call && r.from == 0x1750 && r.to == 0x1100));
         let space = prog.arch().manage().get_default_code_space().unwrap().clone();
@@ -1781,7 +1781,7 @@ fn an_unframed_focus_preserves_its_blocks_and_an_interior_callee_focus() {
             let file = object::File::parse(&*bytes).unwrap();
             let index = xrefs::build_with_focus(
                 &file, prog.arch(), prog.arch().translate(), &[0x1000], &[0x1500, 0x1684],
-            );
+            ).unwrap();
             for (root, at, callee) in [(0x1500, 0x1750, 0x1100), (0x1680, 0x1684, 0x1300)] {
                 let calls: Vec<_> = index.refs_from_function(root).into_iter()
                     .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
@@ -1819,7 +1819,7 @@ fn inventory_retains_discontiguous_frame_and_intervening_callee_modes() {
                     .map(|entry| entry.addr.get_offset()).collect();
                 let bytes = std::fs::read(&path).unwrap();
                 let file = object::File::parse(&*bytes).unwrap();
-                let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &seeds);
+                let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap();
                 assert_eq!(index.function_instruction_counts(&[0x1600, 0x1680], 100), vec![4, 4]);
                 for (root, at, target) in [(0x1600, 0x1750, 0x1100), (0x1680, 0x1684, 0x1300)] {
                     let calls: Vec<_> = index.refs_from_function(root).into_iter()
@@ -1861,7 +1861,7 @@ fn inventory_admits_frames_with_independent_or_directly_called_modes() {
                 assert!(!seeds.contains(&0x1700), "obsolete ARM call must not publish a callee");
                 let bytes = std::fs::read(&path).unwrap();
                 let file = object::File::parse(&*bytes).unwrap();
-                let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &seeds);
+                let index = xrefs::build_measured(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap();
                 let calls: Vec<_> = index.refs_from_function(0x1500).into_iter()
                     .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
                 if expected_mode == 0 {
@@ -1905,7 +1905,7 @@ fn inventory_publishes_frame_modes_for_seeded_xrefs() {
                 assert!(seeds.contains(&0x1580));
                 let bytes = std::fs::read(&path).unwrap();
                 let file = object::File::parse(&*bytes).unwrap();
-                let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds);
+                let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap();
                 for (entry, site, callee) in [(0x1600, 0x1604, 0x1200), (0x1580, 0x1584, 0x1300)] {
                     let calls: Vec<_> = index.refs_from_function(entry).into_iter()
                         .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
@@ -1957,7 +1957,7 @@ fn inventory_frame_rebuild_preserves_established_isa_modes() {
                     let bytes = std::fs::read(&path).unwrap();
                     let file = object::File::parse(&*bytes).unwrap();
                     let index =
-                        xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]);
+                        xrefs::build(&file, prog.arch(), prog.arch().translate(), &[0x1000]).unwrap();
                     let calls: Vec<_> = index
                         .refs_to(0x1200)
                         .iter()
@@ -2014,7 +2014,7 @@ fn replacement_prefix_roots_retain_original_isa_modes() {
                 prog.arch().translate(),
                 &[0x1000],
                 focus,
-            );
+            ).unwrap();
             let calls: Vec<_> = index
                 .refs_from_function(0x1600)
                 .into_iter()

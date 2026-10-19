@@ -1,0 +1,49 @@
+--- a/ghidra/app/decompiler/DecompileOptions.java
++++ b/ghidra/app/decompiler/DecompileOptions.java
+@@ -490,6 +490,18 @@
+ 	private NameTransformer nameTransformer;	// Transformer applied to data-type/function names
+ 
+ 	private String protoEvalModel; // Name of the prototype evaluation model
++	private static final ElementId EXPORT_INLINE = new ElementId("exportinline", 4010);
++	// Unspecified preserves the ordinary options grammar; explicit false also replays a reset.
++	private Boolean exportInline;
++
++	/**
++	 * Selects the enhanced export's native pre-flow inline policy. The ordinary default is off
++	 * and sends no extension option. Use this only on explicitly enhanced interfaces; the
++	 * receiving native peer must acknowledge enhanced result support during real acquisition.
++	 */
++	public void setExportInline(boolean enabled) {
++		exportInline = enabled;
++	}
+ 
+ 	public DecompileOptions() {
+ 		predicate = PREDICATE_OPTIONDEFAULT;
+@@ -857,17 +869,25 @@
+ 	 * @throws IOException for errors writing to the underlying stream
+ 	 */
+ 	public void encode(Encoder encoder, DecompInterface iface) throws IOException {
++		encodeForAction(encoder, iface == null ? null : iface.getSimplificationStyle());
++	}
++
++	/** The same effective wire values, without retaining a live interface in held results. */
++	void encodeForAction(Encoder encoder, String action) throws IOException {
+ 		encoder.openElement(ELEM_OPTIONSLIST);
++		if (exportInline != null) {
++			appendOption(encoder, EXPORT_INLINE, exportInline ? "on" : "off", "", "");
++		}
+ 		if (predicate != PREDICATE_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_CURRENTACTION, "conditionalexe", predicate ? "on" : "off",
+ 				"");
+ 		}
+ 		if (eliminateUnreachable != ELIMINATE_UNREACHABLE_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_CURRENTACTION, iface.getSimplificationStyle(), "unreachable",
++			appendOption(encoder, ELEM_CURRENTACTION, action, "unreachable",
+ 				eliminateUnreachable ? "on" : "off");
+ 		}
+ 		if (simplifyDoublePrecision != SIMPLIFY_DOUBLEPRECISION_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_CURRENTACTION, iface.getSimplificationStyle(),
++			appendOption(encoder, ELEM_CURRENTACTION, action,
+ 				"doubleprecis", simplifyDoublePrecision ? "on" : "off");
+ 		}
+ 		if (splitStructures != SPLITSTRUCTURES_OPTIONDEFAULT ||

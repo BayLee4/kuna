@@ -1,0 +1,690 @@
+--- a/ghidra/app/util/exporter/CppExporter.java
++++ b/ghidra/app/util/exporter/CppExporter.java
+@@ -18,6 +18,7 @@
+ 
+ import java.io.*;
+ import java.util.*;
++import java.util.function.Consumer;
+ 
+ import org.apache.commons.lang3.StringUtils;
+ 
+@@ -27,6 +28,7 @@
+ import ghidra.app.decompiler.DecompileOptions.CommentStyleEnum;
+ import ghidra.app.decompiler.component.DecompilerUtils;
+ import ghidra.app.decompiler.parallel.ChunkingParallelDecompiler;
++import ghidra.app.decompiler.parallel.DecompileConfigurer;
+ import ghidra.app.decompiler.parallel.ParallelDecompiler;
+ import ghidra.app.util.*;
+ import ghidra.framework.model.DomainObject;
+@@ -35,6 +37,7 @@
+ import ghidra.program.model.data.*;
+ import ghidra.program.model.listing.*;
+ import ghidra.program.model.symbol.Equate;
++import ghidra.program.model.symbol.IllegalCharCppTransformer;
+ import ghidra.util.HelpLocation;
+ import ghidra.util.Msg;
+ import ghidra.util.exception.CancelledException;
+@@ -65,6 +68,7 @@
+ 
+ 	private DecompileOptions options;
+ 	private boolean userSuppliedOptions = false;
++	private DecompileConfigurer configurer;
+ 
+ 	public CppExporter() {
+ 		super("C/C++", "c", new HelpLocation("ExporterPlugin", "c_cpp"));
+@@ -87,6 +91,43 @@
+ 		}
+ 	}
+ 
++	/**
++	 * Sets the configuration for this exporter's fresh interfaces. The callback runs after
++	 * ordinary defaults are installed and before openProgram, just as in the parallel
++	 * decompiler's existing configuration seam. Null preserves ordinary stock configuration.
++	 */
++	public void setConfigurer(DecompileConfigurer configurer) {
++		this.configurer = configurer;
++	}
++
++	/**
++	 * Acquires exactly the explicit roots before an enhanced caller discovers derived providers.
++	 * The returned results retain their typed views. The same invocation configuration is used
++	 * by export's pooled interfaces; this method does not widen selection or modify source facts.
++	 */
++	public List<DecompileResults> prepareSelectedRoots(Program program,
++			Collection<Function> roots, TaskMonitor monitor) throws IOException, CancelledException {
++		monitor.checkCancelled();
++		configureOptions(program);
++		DecompilerFactory factory = new DecompilerFactory(program, configurer, true, null);
++		DecompInterface decompiler = factory.doCreate(0);
++		try {
++			List<DecompileResults> results = new ArrayList<>();
++			for (Function function : roots) {
++				monitor.checkCancelled();
++				if (function.getProgram() != program) {
++					throw new IllegalArgumentException("Export root belongs to another program");
++				}
++				results.add(decompiler.decompileFunction(function, options.getDefaultTimeout(),
++					monitor));
++			}
++			return results;
++		}
++		finally {
++			factory.doDispose(decompiler);
++		}
++	}
++
+ 	@Override
+ 	public boolean export(File file, DomainObject domainObj, AddressSetView addrSet,
+ 			TaskMonitor monitor) throws IOException, ExporterException {
+@@ -118,24 +159,54 @@
+ 			cFileWriter = new PrintWriter(file);
+ 		}
+ 
+-		CachingPool<DecompInterface> decompilerPool =
+-			new CachingPool<>(new DecompilerFactory(program));
+-		ParallelDecompilerCallback callback = new ParallelDecompilerCallback(decompilerPool);
+-		ChunkingTaskMonitor chunkingMonitor = new ChunkingTaskMonitor(monitor);
+-		ChunkingParallelDecompiler<CPPResult> parallelDecompiler =
+-			ParallelDecompiler.createChunkingParallelDecompiler(callback, chunkingMonitor);
++		CachingPool<DecompInterface> decompilerPool = null;
++		ChunkingParallelDecompiler<CPPResult> parallelDecompiler = null;
+ 
+ 		try {
++			// As in the ordinary exporter, open destinations before cancellable preparation.
++			ExportDataTypeNames typeNames = new ExportDataTypeNames(program,
++				emitDataTypeDefinitions && (headerWriter != null || cFileWriter != null));
++			String fakeCDefinitions = emitDataTypeDefinitions && headerWriter != null
++					? getFakeCTypeDefinitions(program.getDataTypeManager().getDataOrganization(),
++						typeNames::reserveIdentifier) : null;
++			List<Function> actualFunctions = new ArrayList<>();
++			FunctionIterator iterator = program.getListing().getFunctions(addrSet, true);
++			while (iterator.hasNext()) {
++				monitor.checkCancelled();
++				Function function = iterator.next();
++				if (!excludeFunction(function)) {
++					actualFunctions.add(function);
++				}
++			}
++			typeNames.reserveProgramSourceNames(monitor);
++			DecompInterface.ExportScope exportScope =
++				DecompInterface.createExportScope(program, actualFunctions,
++					Set.copyOf(typeNames.getReservedIdentifiers()));
++			decompilerPool = new CachingPool<>(
++				new DecompilerFactory(program, configurer, configurer != null, exportScope));
++			ParallelDecompilerCallback callback =
++				new ParallelDecompilerCallback(decompilerPool, exportScope);
++			ChunkingTaskMonitor chunkingMonitor = new ChunkingTaskMonitor(monitor);
++			parallelDecompiler =
++				ParallelDecompiler.createChunkingParallelDecompiler(callback, chunkingMonitor);
++
++			DataTypeWriter typeWriter = null;
+ 			if (emitDataTypeDefinitions) {
+ 				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
+-				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
++				typeWriter = writeProgramDataTypes(program, header, headerWriter, cFileWriter,
++					chunkingMonitor, typeNames, fakeCDefinitions);
+ 			}
++			DataTypeWriter declarations =
++				new DataTypeWriter(null, Writer.nullWriter(), isUseCppStyleComments, typeNames);
++			declarations.setCallingConventionContext(program.getCompilerSpec(),
++				options.isConventionPrint());
+ 			chunkingMonitor.checkCancelled();
+ 
+-			decompileAndExport(addrSet, program, headerWriter, cFileWriter, parallelDecompiler,
+-				chunkingMonitor);
++			decompileAndExport(actualFunctions, program, headerWriter, cFileWriter, parallelDecompiler,
++				chunkingMonitor, typeNames, typeWriter, declarations);
+ 
+-			return true;
++			return (headerWriter == null || !headerWriter.checkError()) &&
++				(cFileWriter == null || !cFileWriter.checkError());
+ 		}
+ 		catch (CancelledException e) {
+ 			return false;
+@@ -145,8 +216,12 @@
+ 			return false;
+ 		}
+ 		finally {
+-			decompilerPool.dispose();
+-			parallelDecompiler.dispose();
++			if (decompilerPool != null) {
++				decompilerPool.dispose();
++			}
++			if (parallelDecompiler != null) {
++				parallelDecompiler.dispose();
++			}
+ 
+ 			if (headerWriter != null) {
+ 				headerWriter.close();
+@@ -158,42 +233,138 @@
+ 
+ 	}
+ 
+-	private void decompileAndExport(AddressSetView addrSet, Program program,
++	private void decompileAndExport(List<Function> actualFunctions, Program program,
+ 			PrintWriter headerWriter, PrintWriter cFileWriter,
+ 			ChunkingParallelDecompiler<CPPResult> parallelDecompiler,
+-			ChunkingTaskMonitor chunkingMonitor)
++			ChunkingTaskMonitor chunkingMonitor, ExportDataTypeNames typeNames,
++			DataTypeWriter typeWriter, DataTypeWriter declarations)
+ 			throws InterruptedException, Exception, CancelledException {
+ 
+ 		int functionCount = program.getFunctionManager().getFunctionCount();
+ 		chunkingMonitor.doInitialize(functionCount);
+ 
+-		Listing listing = program.getListing();
+-		FunctionIterator iterator = listing.getFunctions(addrSet, true);
+ 		List<Function> functions = new ArrayList<>();
+ 		Set<String> processedGlobals = new HashSet<>();
+-		for (int i = 0; iterator.hasNext(); i++) {
++		List<CPPResult> retained = null;
++		for (int i = 0; i < actualFunctions.size(); i++) {
+ 			//
+ 			// Write results every so many items so that we don't blow out memory
+ 			//
+ 			if (i % 10000 == 0) {
+ 				List<CPPResult> results = parallelDecompiler.decompileFunctions(functions);
+-				writeResults(results, processedGlobals, headerWriter, cFileWriter, chunkingMonitor);
++				results.sort(Comparator.nullsLast(Comparator.naturalOrder()));
++				if (retained != null) {
++					retained.addAll(results);
++				}
++				else if (hasEnhancedResults(results)) {
++					retained = new ArrayList<>(results);
++				}
++				else {
++					reserveSourceNames(results, typeNames, chunkingMonitor);
++					writeResults(results, processedGlobals, headerWriter, cFileWriter,
++						chunkingMonitor, typeNames, typeWriter, declarations);
++				}
+ 				functions.clear();
+ 			}
+ 
+-			Function currentFunction = iterator.next();
+-			if (excludeFunction(currentFunction)) {
+-				continue;
+-			}
+-
+-			functions.add(currentFunction);
++			functions.add(actualFunctions.get(i));
+ 		}
+ 
+ 		// handle any remaining functions
+ 		List<CPPResult> results = parallelDecompiler.decompileFunctions(functions);
+-		writeResults(results, processedGlobals, headerWriter, cFileWriter, chunkingMonitor);
++		results.sort(Comparator.nullsLast(Comparator.naturalOrder()));
++		if (retained != null) {
++			retained.addAll(results);
++		}
++		else if (hasEnhancedResults(results)) {
++			retained = new ArrayList<>(results);
++		}
++		else {
++			reserveSourceNames(results, typeNames, chunkingMonitor);
++			writeResults(results, processedGlobals, headerWriter, cFileWriter, chunkingMonitor,
++				typeNames, typeWriter, declarations);
++			return;
++		}
++
++		// Enhanced views must all be known before assigning any local name: a later result may
++		// use an authored NONDB source object absent from the program's datatype enumeration.
++		reserveSourceNames(retained, typeNames, chunkingMonitor);
++		for (CPPResult result : retained) {
++			chunkingMonitor.checkCancelled();
++			if (result != null && result.result() != null) {
++				typeNames.add(result.result());
++			}
++		}
++		for (CPPResult result : retained) {
++			chunkingMonitor.checkCancelled();
++			if (result != null && result.result() != null && result.result().isEnhancedResult()) {
++				result.result().requireCurrentExportAuthority();
++			}
++		}
++		// Keep the existing bounded flatten/write buffers. Once rendered, release High/markup
++		// result owners; only the invocation's datatype presentation identities remain.
++		for (int start = 0; start < retained.size(); start += 10000) {
++			int end = Math.min(start + 10000, retained.size());
++			writeResults(retained.subList(start, end), processedGlobals, headerWriter, cFileWriter,
++				chunkingMonitor, typeNames, typeWriter, declarations);
++			for (int i = start; i < end; i++) {
++				retained.set(i, null);
++			}
++		}
+ 	}
+ 
++	private void writeExternalDeclarations(ExportDataTypeNames typeNames,
++			DataTypeWriter typeWriter, DataTypeWriter declarations, PrintWriter writer,
++			Set<String> processedGlobals, TaskMonitor monitor) throws IOException, CancelledException {
++		for (var external : typeNames.externalFunctions()) {
++			monitor.checkCancelled();
++			if (writer != null) {
++				String label = external.importedName();
++				StringBuilder escaped = new StringBuilder();
++				for (int i = 0; i < label.length(); i++) {
++					char ch = label.charAt(i);
++					if (ch == '\\' || ch == '"') {
++						escaped.append('\\');
++					}
++					escaped.append(ch);
++				}
++				String declaration = "extern " +
++					(external.signature().hasNoReturn() ? "_Noreturn " : "") +
++					declarations.getDeclaration(external.name(),
++					external.signature(), -1, monitor) + " __asm__(\"" + escaped + "\");";
++				if (processedGlobals.add(declaration)) {
++					if (typeWriter != null) {
++						typeWriter.setTypeNames(typeNames);
++						typeWriter.write(List.of(external.signature()), monitor, true);
++					}
++					writer.println(declaration);
++				}
++			}
++		}
++	}
++
++	private static boolean hasEnhancedResults(List<CPPResult> results) {
++		for (CPPResult result : results) {
++			if (result != null && result.result() != null && result.result().isEnhancedResult()) {
++				return true;
++			}
++		}
++		return false;
++	}
++
++	private static void reserveSourceNames(List<CPPResult> results, ExportDataTypeNames typeNames,
++			TaskMonitor monitor) throws CancelledException {
++		for (CPPResult result : results) {
++			monitor.checkCancelled();
++			if (result != null && result.result() != null) {
++				if (result.result().isEnhancedResult()) {
++					result.result().requireCurrentExportAuthority();
++				}
++				typeNames.reserveSources(result.result(), monitor);
++			}
++		}
++	}
++
+ 	private boolean excludeFunction(Function currentFunction) {
+ 
+ 		if (functionTagSet.isEmpty()) {
+@@ -213,11 +384,37 @@
+ 	}
+ 
+ 	private void writeResults(List<CPPResult> results, Set<String> processedGlobals,
+-			PrintWriter headerWriter, PrintWriter cFileWriter, TaskMonitor monitor)
+-			throws CancelledException {
++			PrintWriter headerWriter, PrintWriter cFileWriter, TaskMonitor monitor,
++			ExportDataTypeNames typeNames, DataTypeWriter typeWriter, DataTypeWriter declarations)
++			throws CancelledException, IOException {
+ 		monitor.checkCancelled();
+ 
+-		Collections.sort(results);
++		// Recheck enhanced authority at the actual rendering boundary. Ordinary held bodies do
++		// not acquire this enhanced refusal policy.
++		for (CPPResult result : results) {
++			monitor.checkCancelled();
++			if (result != null && result.result() != null && result.result().isEnhancedResult()) {
++				result.result().requireCurrentExportAuthority();
++			}
++		}
++		if (typeWriter != null) {
++			for (CPPResult result : results) {
++				monitor.checkCancelled();
++				if (result == null || result.result() == null) {
++					continue;
++				}
++				var view = result.result().getDataTypeManager();
++				if (view != null) {
++					// Used NONDB source types are not part of the initial program traversal.
++					typeWriter.write(view.getRetainedSourceDataTypes(), monitor, false);
++				}
++				if (result.result().isEnhancedResult()) {
++					typeWriter.write(result.result().getResultDataTypes(), monitor, true);
++				}
++			}
++		}
++		writeExternalDeclarations(typeNames, typeWriter, declarations,
++			headerWriter != null ? headerWriter : cFileWriter, processedGlobals, monitor);
+ 
+ 		StringBuilder globalDecls = new StringBuilder();
+ 		StringBuilder headers = new StringBuilder();
+@@ -228,21 +425,50 @@
+ 			if (result == null) {
+ 				continue;
+ 			}
+-			if (emitReferencedGlobals) {
+-				for (String global : result.globals()) {
++			DecompileResults dr = result.result();
++			boolean enhanced = dr != null && dr.isEnhancedResult();
++			DecompiledFunction rendered = null;
++			PrettyPrinter mappedPrinter = null;
++			if (dr != null && dr.getCCodeMarkup() != null) {
++				if (enhanced || typeNames.hasSourceFunctionAliases()) {
++					mappedPrinter = new PrettyPrinter(result.function(), dr.getCCodeMarkup(),
++						new IllegalCharCppTransformer(), typeNames);
++					rendered = mappedPrinter.print();
++				}
++				else {
++					rendered = dr.getDecompiledFunction();
++				}
++			}
++			if (emitReferencedGlobals && dr != null && dr.getHighFunction() != null) {
++				for (var symbols = dr.getHighFunction().getGlobalSymbolMap().getSymbols();
++					symbols.hasNext();) {
++					var symbol = symbols.next();
++					String global;
++					if (enhanced || typeNames.hasSourceFunctionAliases()) {
++						global = declarations.getDeclaration(symbol.getName(), symbol.getDataType(),
++							symbol.getDataType().getLength(), monitor) + ";";
++					}
++					else {
++						String dt = symbol.getDataType().getDisplayName();
++						global = dt + (dt.endsWith("*") ? "" : " ") + symbol.getName() + ";";
++					}
+ 					if (processedGlobals.add(global)) {
+ 						globalDecls.append(global);
+ 						globalDecls.append(EOL);
+ 					}
+ 				}
+ 			}
+-			String headerCode = result.headerCode();
++			String headerCode = rendered == null ? result.headerCode() : rendered.getSignature();
++			if (mappedPrinter != null && dr.getExportBinding() != null) {
++				ClangFuncProto prototype = dr.getExportBinding().getPublicPrototype();
++				headerCode = prototype == null ? null : mappedPrinter.printSignature(prototype);
++			}
+ 			if (headerCode != null) {
+ 				headers.append(headerCode);
+ 				headers.append(EOL);
+ 			}
+ 
+-			String bodyCode = result.bodyCode();
++			String bodyCode = rendered == null ? result.bodyCode() : rendered.getC();
+ 			if (bodyCode != null) {
+ 				bodies.append(bodyCode);
+ 				bodies.append(EOL);
+@@ -291,12 +517,17 @@
+ 		}
+ 	}
+ 
+-	private void writeProgramDataTypes(Program program, File header, PrintWriter headerWriter,
+-			PrintWriter cFileWriter, TaskMonitor monitor) throws IOException, CancelledException {
++	private DataTypeWriter writeProgramDataTypes(Program program, File header, PrintWriter headerWriter,
++			PrintWriter cFileWriter, TaskMonitor monitor, ExportDataTypeNames typeNames,
++			String fakeCDefinitions)
++			throws IOException, CancelledException {
++		DataTypeWriter dataTypeWriter = null;
+ 		if (headerWriter != null) {
+ 			DataTypeManager dtm = program.getDataTypeManager();
+-			DataTypeWriter dataTypeWriter =
+-				new DataTypeWriter(dtm, headerWriter, isUseCppStyleComments);
++			dataTypeWriter =
++				new DataTypeWriter(dtm, headerWriter, isUseCppStyleComments, typeNames);
++			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(),
++				options.isConventionPrint());
+-			headerWriter.write(getFakeCTypeDefinitions(dtm.getDataOrganization()));
++			headerWriter.write(fakeCDefinitions);
+ 			dataTypeWriter.write(dtm, monitor);
+ 
+@@ -309,8 +540,10 @@
+ 		}
+ 		else if (cFileWriter != null) {
+ 			DataTypeManager dtm = program.getDataTypeManager();
+-			DataTypeWriter dataTypeWriter =
+-				new DataTypeWriter(dtm, cFileWriter, isUseCppStyleComments);
++			dataTypeWriter =
++				new DataTypeWriter(dtm, cFileWriter, isUseCppStyleComments, typeNames);
++			dataTypeWriter.setCallingConventionContext(program.getCompilerSpec(),
++				options.isConventionPrint());
+ 			dataTypeWriter.write(dtm, monitor);
+ 		}
+ 
+@@ -319,6 +552,7 @@
+ 			cFileWriter.println("");
+ 		}
+ 
++		return dataTypeWriter;
+ 	}
+ 
+ 	private void writeEquates(Program program, File header, PrintWriter headerWriter,
+@@ -405,68 +639,72 @@
+ 		}
+ 	}
+ 
+-	private static String getBuiltInDeclaration(String typeName, String ctypeName) {
++	private static String getBuiltInDeclaration(String typeName, String ctypeName,
++			Consumer<String> identifiers) {
++		identifiers.accept(typeName);
+ 		return "#define " + typeName + "   " + ctypeName + EOL;
+ 	}
+ 
+ 	private static String getBuiltInDeclaration(String typeName, int typeLen, boolean signed,
+-			DataOrganization dataOrganization) {
++			DataOrganization dataOrganization, Consumer<String> identifiers) {
+ 		return getBuiltInDeclaration(typeName,
+-			dataOrganization.getIntegerCTypeApproximation(typeLen, signed));
++			dataOrganization.getIntegerCTypeApproximation(typeLen, signed), identifiers);
+ 	}
+ 
+ 	/**
+ 	 * Generate suitable C-style definition statements (#define) for any fake data-type names
+ 	 * which may be produced by the decompiler (e.g., unkint, unkuint, etc.).
+ 	 * @param dataOrganization is the data organization to result the size of core types.
++	 * @param identifiers receives each actual generated macro name before presentation naming
+ 	 * @return multi-line string containing C-style declarations of fake decompiler types.
+ 	 */
+-	private static String getFakeCTypeDefinitions(DataOrganization dataOrganization) {
++	private static String getFakeCTypeDefinitions(DataOrganization dataOrganization,
++			Consumer<String> identifiers) {
+ 
+ 		StringWriter writer = new StringWriter();
+ 
+ 		// unkbyte - decompiler fabricated unknown types - need only cover sizes larger than the max Undefined size
+ 		for (int n = 9; n <= 16; n++) {
+-			writer.write(getBuiltInDeclaration("unkbyte" + n, n, false, dataOrganization));
++			writer.write(getBuiltInDeclaration("unkbyte" + n, n, false, dataOrganization, identifiers));
+ 		}
+ 		writer.write(EOL);
+ 
+ 		// unkuint - decompiler fabricated unsigned integer types
+ 		// need only cover sizes larger than the max integer size (i.e., AbstractIntegerDataType)
+ 		for (int n = 9; n <= 16; n++) {
+-			writer.write(getBuiltInDeclaration("unkuint" + n, n, false, dataOrganization));
++			writer.write(getBuiltInDeclaration("unkuint" + n, n, false, dataOrganization, identifiers));
+ 		}
+ 		writer.write(EOL);
+ 
+ 		// unkint - decompiler fabricated signed integer types
+ 		// need only cover sizes larger than the max integer size (i.e., AbstractIntegerDataType)
+ 		for (int n = 9; n <= 16; n++) {
+-			writer.write(getBuiltInDeclaration("unkint" + n, n, true, dataOrganization));
++			writer.write(getBuiltInDeclaration("unkint" + n, n, true, dataOrganization, identifiers));
+ 		}
+ 		writer.write(EOL);
+ 
+ 		// unkfloat - decompiler fabricated floating point types
+-		writer.write(getBuiltInDeclaration("unkfloat1", "float"));
+-		writer.write(getBuiltInDeclaration("unkfloat2", "float"));
+-		writer.write(getBuiltInDeclaration("unkfloat3", "float"));
++		writer.write(getBuiltInDeclaration("unkfloat1", "float", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat2", "float", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat3", "float", identifiers));
+ 		//writer.write(getBuiltInDeclaration("unkfloat4", "float")); // covered by fixed-size built-in float
+-		writer.write(getBuiltInDeclaration("unkfloat5", "double"));
+-		writer.write(getBuiltInDeclaration("unkfloat6", "double"));
+-		writer.write(getBuiltInDeclaration("unkfloat7", "double"));
++		writer.write(getBuiltInDeclaration("unkfloat5", "double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat6", "double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat7", "double", identifiers));
+ 		//writer.write(getBuiltInDeclaration("unkfloat8", "double")); // covered by fixed-size built-in double
+-		writer.write(getBuiltInDeclaration("unkfloat9", "long double"));
++		writer.write(getBuiltInDeclaration("unkfloat9", "long double", identifiers));
+ 		//writer.write(getBuiltInDeclaration("unkfloat10", "long double")); // covered by fixed-size built-in longdouble
+-		writer.write(getBuiltInDeclaration("unkfloat11", "long double"));
+-		writer.write(getBuiltInDeclaration("unkfloat12", "long double"));
+-		writer.write(getBuiltInDeclaration("unkfloat13", "long double"));
+-		writer.write(getBuiltInDeclaration("unkfloat14", "long double"));
+-		writer.write(getBuiltInDeclaration("unkfloat15", "long double"));
+-		writer.write(getBuiltInDeclaration("unkfloat16", "long double"));
++		writer.write(getBuiltInDeclaration("unkfloat11", "long double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat12", "long double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat13", "long double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat14", "long double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat15", "long double", identifiers));
++		writer.write(getBuiltInDeclaration("unkfloat16", "long double", identifiers));
+ 		writer.write(EOL);
+ 
+-		writer.write(getBuiltInDeclaration("BADSPACEBASE", "void"));
+-		writer.write(getBuiltInDeclaration("code", "void"));
++		writer.write(getBuiltInDeclaration("BADSPACEBASE", "void", identifiers));
++		writer.write(getBuiltInDeclaration("code", "void", identifiers));
+ 		writer.write(EOL);
+ 
+ 		return writer.toString();
+ 	}
+@@ -475,8 +713,8 @@
+ // Inner Classes
+ //==================================================================================================
+ 
+-	private record CPPResult(Address address, String headerCode, String bodyCode,
+-			List<String> globals) implements Comparable<CPPResult> {
++	private record CPPResult(Address address, Function function, DecompileResults result,
++			String headerCode, String bodyCode) implements Comparable<CPPResult> {
+ 		@Override
+ 		public int compareTo(CPPResult other) {
+ 			return address.compareTo(other.address);
+@@ -486,32 +724,63 @@
+ 	private class DecompilerFactory extends CountingBasicFactory<DecompInterface> {
+ 
+ 		private Program program;
++		private DecompileConfigurer invocationConfigurer;
++		private boolean requireOpen;
++		private final DecompInterface.ExportScope exportScope;
+ 
+-		DecompilerFactory(Program program) {
++		DecompilerFactory(Program program, DecompileConfigurer configurer, boolean requireOpen,
++				DecompInterface.ExportScope exportScope) {
+ 			this.program = program;
++			this.invocationConfigurer = configurer;
++			this.requireOpen = requireOpen;
++			this.exportScope = exportScope;
+ 		}
+ 
+ 		@Override
+ 		public DecompInterface doCreate(int itemNumber) throws IOException {
+ 			DecompInterface decompiler = new DecompInterface();
+-			decompiler.setOptions(options);
+-			decompiler.openProgram(program);
+-			decompiler.toggleSyntaxTree(true);
+-			return decompiler;
++			try {
++				decompiler.setOptions(options);
++				decompiler.toggleSyntaxTree(true);
++				if (invocationConfigurer != null) {
++					invocationConfigurer.configure(decompiler);
++				}
++				boolean opened = decompiler.openProgram(program);
++				if (!opened && requireOpen) {
++					throw new IOException("Unable to configure export decompiler: " +
++						decompiler.getLastMessage());
++				}
++				if (exportScope != null) {
++					decompiler.setExportScope(exportScope);
++				}
++				return decompiler;
++			}
++			catch (IOException | RuntimeException e) {
++				doDispose(decompiler);
++				throw e;
++			}
+ 		}
+ 
+ 		@Override
+ 		public void doDispose(DecompInterface decompiler) {
+-			decompiler.dispose();
++			try {
++				decompiler.endExportScope();
++			}
++			finally {
++				decompiler.dispose();
++			}
+ 		}
+ 	}
+ 
+ 	private class ParallelDecompilerCallback implements QCallback<Function, CPPResult> {
+ 
+ 		private CachingPool<DecompInterface> pool;
++		private final DecompInterface.ExportScope exportScope;
+ 
+-		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool) {
++		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool,
++				DecompInterface.ExportScope exportScope) {
+ 			this.pool = decompilerPool;
++			this.exportScope = exportScope;
+ 		}
+ 
+ 		@Override
+@@ -531,43 +800,41 @@
+ 		}
+ 
+ 		private CPPResult doWork(Function function, DecompInterface decompiler,
+-				TaskMonitor monitor) {
++				TaskMonitor monitor) throws IOException {
+ 			Address entryPoint = function.getEntryPoint();
+ 			CodeUnit codeUnitAt = function.getProgram().getListing().getCodeUnitAt(entryPoint);
+ 			if (codeUnitAt == null || !(codeUnitAt instanceof Instruction)) {
+-				return new CPPResult(entryPoint, function.getPrototypeString(false, false) + ';',
+-					null, List.of());
++				return new CPPResult(entryPoint, function, null,
++					function.getPrototypeString(false, false) + ';', null);
+ 			}
+ 
+ 			monitor.setMessage("Decompiling " + function.getName());
+ 
+-			DecompileResults dr =
+-				decompiler.decompileFunction(function, options.getDefaultTimeout(), monitor);
++			if (exportScope != null) {
++				decompiler.setExportScope(exportScope);
++			}
++			DecompileResults dr = exportScope == null
++					? decompiler.decompileFunction(function, options.getDefaultTimeout(), monitor)
++					: decompiler.decompileFunctionForExport(function, options.getDefaultTimeout(),
++						monitor);
+ 			String errorMessage = dr.getErrorMessage();
+-			if (!"".equals(errorMessage)) {
++			if (errorMessage != null && !errorMessage.isEmpty()) {
+ 				Msg.warn(CppExporter.this, "Error decompiling: " + errorMessage);
++			}
++			// Keep the exporter's existing diagnostic outcome policy. Absent optional
++			// enhanced metadata alone does not enter this warning/failure branch.
++			if (dr.getCCodeMarkup() == null || !"".equals(errorMessage)) {
+ 				if (options.isWARNCommentIncluded()) {
+ 					monitor.incrementProgress(1);
+-					return new CPPResult(entryPoint, null,
++					return new CPPResult(entryPoint, function, null,
++						null,
+ 						"/*" + EOL + "Unable to decompile '" + function.getName() + "'" + EOL +
+-							"Cause: " + errorMessage + EOL + "*/" + EOL,
+-						List.of());
++							"Cause: " + errorMessage + EOL + "*/" + EOL);
+ 				}
+ 				return null;
+ 			}
+ 
+-			DecompiledFunction decompiledFunction = dr.getDecompiledFunction();
+-			List<String> globals =
+-				CollectionUtils.asStream(dr.getHighFunction().getGlobalSymbolMap().getSymbols())
+-						.map(hsym -> {
+-							String dt = hsym.getDataType().getDisplayName();
+-							String name = hsym.getName();
+-							String space = dt.endsWith("*") ? "" : " ";
+-							return "%s%s%s;".formatted(dt, space, name);
+-						})
+-						.toList();
+-			return new CPPResult(entryPoint, decompiledFunction.getSignature(),
+-				decompiledFunction.getC(), globals);
++			return new CPPResult(entryPoint, function, dr, null, null);
+ 		}
+ 	}
+ 

@@ -85,7 +85,7 @@ fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaRes
 
 fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), None);
+    let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -104,7 +104,7 @@ fn make_op(
     let pc = Address::new(Rc::clone(&r), off);
     let op = fd.obank_mut().create_at(num_in, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, 0, format!("{opc:?}")));
-    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize)));
+    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();
@@ -168,7 +168,7 @@ fn w5s3_divchain_right_small_shift_is_faithful() {
     let mut fd = build_fd();
     let root = build_divchain_right(&mut fd, 2, 3);
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "small-shift divchain must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "small-shift divchain must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_DIV, "root stays INT_DIV");
     assert_eq!(in_off(&fd, root, 1), 12, "collapsed constant = (1<<2)*3 = 12");
 }
@@ -183,7 +183,7 @@ fn w5s3_divchain_right_shift64_wraps_like_cpp() {
     let mut fd = build_fd();
     let root = build_divchain_right(&mut fd, 64, 3);
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "shift-64 divchain fires (wrapped val1=1)");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "shift-64 divchain fires (wrapped val1=1)");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_DIV, "root stays INT_DIV");
     assert_eq!(in_off(&fd, root, 1), 3, "collapsed constant = (1<<64 wrapped to 1)*3 = 3");
 }
@@ -234,7 +234,7 @@ fn w5s3_signmod2nopt_in_range_is_faithful() {
     wire(&mut fd, c1, root, 1);
 
     let mut rule = RuleSignMod2nOpt::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "no INT_MULT descend -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "no INT_MULT descend -> no fire");
 }
 
 #[test]
@@ -246,7 +246,7 @@ fn w5s3_signmod2nopt_shiftamt0_returns_zero_like_cpp() {
     let mut fd = build_fd();
     let root = build_signmod2nopt_shiftamt0(&mut fd);
     let mut rule = RuleSignMod2nOpt::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "n==64 wraps mask to 0 -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "n==64 wraps mask to 0 -> no fire");
 }
 
 // ===========================================================================
@@ -284,12 +284,12 @@ fn w5s3_divchain_div_at_limit_fires_sdiv_rejects() {
     let mut fd = build_fd();
     let root_div = build_divchain_same(&mut fd, OpCode::CPUI_INT_DIV, 0x4000_0000, 1);
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root_div, &mut fd), 1, "DIV at limit fires");
+    assert_eq!(rule.apply_op(root_div, &mut fd).unwrap(), 1, "DIV at limit fires");
 
     let mut fd2 = build_fd();
     let root_sdiv = build_divchain_same(&mut fd2, OpCode::CPUI_INT_SDIV, 0x4000_0000, 1);
     let mut rule2 = RuleDivChain::new();
-    assert_eq!(rule2.apply_op(root_sdiv, &mut fd2), 0, "SDIV at same bitcount rejects");
+    assert_eq!(rule2.apply_op(root_sdiv, &mut fd2).unwrap(), 0, "SDIV at same bitcount rejects");
 }
 
 // ===========================================================================
@@ -306,7 +306,7 @@ fn w5s3_divchain_resval_zero_rejects() {
     let mut fd = build_fd();
     let root = build_divchain_same(&mut fd, OpCode::CPUI_INT_DIV, 0x1_0000, 0x1_0000);
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "resval masks to 0 -> reject");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "resval masks to 0 -> reject");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_DIV, "unchanged");
     // calc_mask sanity (mask of 4 bytes = 0xffffffff).
     assert_eq!(calc_mask(4), 0xffff_ffff);
@@ -395,7 +395,7 @@ fn w5s3_signmod2nopt_positive_nontrunc_fires_to_srem() {
     wire(&mut fd, andout, base, 1);
 
     let mut rule = RuleSignMod2nOpt::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "non-trunc SREM form must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "non-trunc SREM form must fire");
     // baseOp rewritten to  a s% 4
     assert_eq!(op_of(&fd, base), OpCode::CPUI_INT_SREM, "baseOp -> INT_SREM");
     assert_eq!(in_vn(&fd, base, 0), a, "SREM in0 == a");
@@ -436,7 +436,7 @@ fn w5s3_signmod2nopt_rejects_when_mask_constant_wrong() {
     wire(&mut fd, andout, base, 1);
 
     let mut rule = RuleSignMod2nOpt::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "wrong AND mask -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "wrong AND mask -> no fire");
     assert_eq!(op_of(&fd, base), OpCode::CPUI_INT_ADD, "baseOp unchanged");
 }
 
@@ -482,7 +482,7 @@ fn w5s3_signform2_matches_but_returns_zero_and_rewires_in0() {
 
     let mut rule = RuleSignForm2::new();
     // Faithful: matches, performs opSetInput(op, a, 0), but returns 0.
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "C++ returns 0 despite matching");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "C++ returns 0 despite matching");
     // The input rewrite DID happen (C++ ruleaction.cc:8562 opSetInput(op,a,0)).
     assert_eq!(in_vn(&fd, root, 0), a, "input0 rewired to a even though return 0");
     // Opcode is NOT changed (only opSetInput was called, no opSetOpcode).
@@ -512,7 +512,7 @@ fn w5s3_signform2_rejects_when_const_too_large() {
     wire(&mut fd, c31, root, 1);
 
     let mut rule = RuleSignForm2::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "oversized multiplier -> reject");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "oversized multiplier -> reject");
     // input0 must still be the SUBPIECE output (NOT rewired to a).
     assert_eq!(in_vn(&fd, root, 0), subout, "input0 untouched on reject");
 }
@@ -569,7 +569,7 @@ fn w5s3_signmod2opt_positive_nontrunc_fires_to_srem2() {
     wire(&mut fd, sgn2out, root, 1);
 
     let mut rule = RuleSignMod2Opt::new();
-    assert_eq!(rule.apply_op(andop, &mut fd), 1, "mod-2 SREM form must fire");
+    assert_eq!(rule.apply_op(andop, &mut fd).unwrap(), 1, "mod-2 SREM form must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_SREM, "rootOp -> INT_SREM");
     assert_eq!(in_vn(&fd, root, 0), a, "SREM in0 == base == a");
     assert_eq!(in_off(&fd, root, 1), 2, "SREM in1 == 2");

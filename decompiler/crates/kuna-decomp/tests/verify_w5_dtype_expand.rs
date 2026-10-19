@@ -311,6 +311,7 @@ fn w5r2_pointer_rel_inherits_pointer_depend_and_ptrsub_stubs() {
     let parent = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
     let mut pr = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTRREL);
     pr.kind = DatatypeKind::PointerRel {
+        spaceid: None,
         ptrto: Rc::clone(&ptrto),
         wordsize: 1,
         stripped: None,
@@ -335,6 +336,7 @@ fn w5r2_pointer_rel_inherits_pointer_depend_and_ptrsub_stubs() {
     let struct_to = Rc::new(Datatype::new(16, type_metatype::TYPE_STRUCT));
     let mut pr_struct = Datatype::new_with_align(8, -1, type_metatype::TYPE_PTRREL);
     pr_struct.kind = DatatypeKind::PointerRel {
+        spaceid: None,
         ptrto: Rc::clone(&struct_to),
         wordsize: 1,
         stripped: None,

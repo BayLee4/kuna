@@ -12,7 +12,7 @@ import tempfile
 import sys
 import traceback
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from kuna_vs_stock import export_program, start_ghidra, KUNA_GHIDRA, selected_core
+from kuna_vs_stock import export_program, start_ghidra, KUNA_GHIDRA, selected_core, test_cores
 import pyghidra
 
 SOURCE = r'''#include <stdio.h>
@@ -37,7 +37,9 @@ def main():
     assert host in ("Darwin", "Linux"), "This probe requires a native Darwin or Linux SDK/libc"
     output = Path(os.environ["KUNA_SMOKE_OUT"]).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    report = {"scope": "Actual SDK/libc imports, unchanged source metadata, stock/Kuna C/High and genuine libc consumers",
+    cores = test_cores()
+    report = {"scope": "Actual SDK/libc imports, unchanged source metadata, selected-core C/High and genuine libc consumers",
+              "group": "product" if "kuna" in cores else "stock-controls", "selected_cores": cores,
               "host": platform.platform(), "commands": []}
 
     def run(command, **kwargs):
@@ -155,19 +157,45 @@ def main():
                     row = {"function": function(fn), "calls": []}
                     for instruction in program.getListing().getInstructions(fn.getBody(), True):
                         if instruction.getFlowType().isCall():
+                            references = []
+                            for ref in instruction.getReferencesFrom():
+                                reference = {"to": str(ref.getToAddress()),
+                                             "type": str(ref.getReferenceType())}
+                                target = program.getFunctionManager().getFunctionAt(ref.getToAddress())
+                                if target is not None and target.isThunk():
+                                    target = target.getThunkedFunction(True)
+                                if target is not None and target.isExternal():
+                                    reference["external_symbol_id"] = int(target.getSymbol().getID())
+                                references.append(reference)
                             row["calls"].append({"site": str(instruction.getAddress()),
                                                  "instruction": str(instruction),
-                                                 "references": [{"to": str(ref.getToAddress()),
-                                                                  "type": str(ref.getReferenceType())}
-                                                                 for ref in instruction.getReferencesFrom()]})
+                                                 "references": references})
                     report["callers"].append(row)
                 assert len(report["callers"]) == 2, report["callers"]
+                assert {row["function"]["name"].lstrip("_") for row in report["callers"]} == {
+                    "call_printf", "call_scanf"}, report["callers"]
                 report["metadata_captured"] = True
                 before = {str(fn.getEntryPoint()): function(fn)
                           for fn in program.getFunctionManager().getFunctions(True)}
                 from ghidra.app.decompiler import DecompInterface, DecompileOptions
+                from ghidra.program.model.data import FunctionDefinition
                 from ghidra.program.model.pcode import PcodeOp
                 from ghidra.util.task import ConsoleTaskMonitor
+                def function_data_types():
+                    manager = program.getDataTypeManager()
+                    return sorted([
+                        {**datatype(value), "name": str(value.getName()),
+                         "managed_id": int(manager.getID(value)),
+                         "signature": str(value.getPrototypeString(True)),
+                         "return": datatype(value.getReturnType()),
+                         "parameters": [datatype(parameter.getDataType())
+                                        for parameter in value.getArguments()],
+                         "parents": sorted(str(parent.getPathName()) for parent in value.getParents())}
+                        for value in manager.getAllDataTypes()
+                        if isinstance(value, FunctionDefinition)
+                    ], key=lambda value: (value["path"], value["managed_id"]))
+                source_function_types = function_data_types()
+                report["function_data_types_before"] = source_function_types
                 monitor = ConsoleTaskMonitor()
                 report["decompilations"] = []
                 def consume_core(core, executable):
@@ -176,6 +204,7 @@ def main():
                         try:
                             assert interface.openProgram(program), str(interface.getLastMessage())
                             fragments = []
+                            enhanced_results = []
                             selected = {}
                             from ghidra.program.model.address import AddressSet
                             selection = AddressSet()
@@ -188,6 +217,8 @@ def main():
                                 assert result.decompileCompleted(), str(result.getErrorMessage())
                                 high = result.getHighFunction()
                                 assert high is not None and result.getCCodeMarkup() is not None
+                                enhanced_results.append(hasattr(result, "isEnhancedResult") and
+                                                        bool(result.isEnhancedResult()))
                                 calls = [op for op in high.getPcodeOps()
                                          if op.getOpcode() in (PcodeOp.CALL, PcodeOp.CALLIND)]
                                 assert calls, "Imported source caller lost its call effect"
@@ -201,6 +232,32 @@ def main():
                             assert export_program(program, unit, monitor, selection=selection)
                             header = unit.with_suffix(".h")
                             assert header.is_file()
+                            # The enhanced Java exporter has source import facts even when
+                            # the selected native core returns no enhanced result metadata.
+                            if all(enhanced_results) or hasattr(result, "getDataTypeManager"):
+                                declarations = header.read_text()
+                                locations = {location["symbol_id"]: location
+                                             for location in report["external_locations"]}
+                                for caller in report["callers"]:
+                                    imported_ids = {
+                                        reference["external_symbol_id"]
+                                        for call in caller["calls"] for reference in call["references"]
+                                        if "external_symbol_id" in reference}
+                                    assert len(imported_ids) == 1, caller
+                                    location = locations[next(iter(imported_ids))]
+                                    assert location["function"] is not None, location
+                                    identifier = location["function"]["name"]
+                                    imported_name = location["original_imported_name"]
+                                    if imported_name is None:
+                                        assert location["source"] == "IMPORTED", location
+                                        imported_name = location["label"]
+                                    assert identifier and imported_name, location
+                                    assert f"({identifier})(" in declarations, declarations
+                                    assert f'__asm__("{imported_name}")' in declarations, declarations
+                                report.setdefault("enhanced_external_declarations", []).append({
+                                    "core": core, "source_identifiers_preserved": True,
+                                    "actual_import_labels_bound": True,
+                                    "selected_bodies": sorted(selected)})
                             driver = output / (core + "-import-driver.c")
                             stdio = output / (core + "-stdio-provider.c")
                             stdio.write_text('#include <stdio.h>\n'
@@ -223,7 +280,8 @@ def main():
                             interface.dispose()
                 report["core_failures"] = []
                 report["core_source_checks"] = []
-                for core, executable in (("stock", None), ("kuna", KUNA_GHIDRA)):
+                for core in cores:
+                    executable = KUNA_GHIDRA if core == "kuna" else None
                     try:
                         consume_core(core, executable)
                     except Exception:
@@ -232,11 +290,15 @@ def main():
                     finally:
                         observed = {str(fn.getEntryPoint()): function(fn)
                                     for fn in program.getFunctionManager().getFunctions(True)}
+                        observed_function_types = function_data_types()
                         report["core_source_checks"].append({
                             "core": core, "source_after": observed,
-                            "unchanged": observed == before})
+                            "unchanged": observed == before,
+                            "function_data_types_after": observed_function_types,
+                            "function_data_types_unchanged": observed_function_types == source_function_types})
                         try:
                             assert observed == before, "Decompilation altered imported source/types/storage"
+                            assert observed_function_types == source_function_types, "Export altered managed callable source datatypes"
                         except AssertionError:
                             report["core_failures"].append({
                                 "core": core, "failure": traceback.format_exc()})

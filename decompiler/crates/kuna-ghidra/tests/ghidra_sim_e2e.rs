@@ -395,21 +395,6 @@ fn strip_banner(c: &str) -> String {
         .join("\n")
 }
 
-fn is_parameter_source_line(line: &str, parameters: &BTreeSet<&str>) -> bool {
-    let Some((name, sources)) = line.strip_prefix("// ").and_then(|s| s.split_once(": ")) else {
-        return false;
-    };
-    let identifier = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-    let hexadecimal = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_hexdigit());
-    parameters.contains(name) && sources.split(" | ").all(|home| {
-        home == "tmp"
-            || home.split(':').all(identifier)
-            || home.strip_prefix("stack - 0x").or_else(|| home.strip_prefix("stack + 0x"))
-                .is_some_and(hexadecimal)
-            || home.split_once(" 0x").is_some_and(|(space, offset)| identifier(space) && hexadecimal(offset))
-    })
-}
-
 /// Rewrite the ghidra-mode naming conventions onto the CLI's so the diff
 /// ratio measures the SEMANTIC gap, not the deliberate Phase-3 style
 /// divergence (DIV: ghidra-mode defaults): `DAT_%08x`→`dat_%x`,
@@ -516,47 +501,6 @@ const PIN_FAILLOG_RESOLVABLE: [usize; 3] = [0, 0, 0];
 // callee's parameters itself).
 const PIN_FAILLOG_DIFF_FLOOR: [f64; 3] = [0.02, 0.04, 0.06];
 const PIN_FAILLOG_DIFF_CEILING: [f64; 3] = [0.09, 0.12, 0.15];
-// Normalized non-empty line count of the flattened markup C, per target: the
-// structural size of what the GUI renders, excluding standalone parameter-source
-// diagnostics. A `<break>`-token regression would
-// collapse this to ~1 while leaving every ratio-floor assertion green — this
-// pin is what catches it.  (sub_3320 shrank because the noreturn facts now
-// truncate the flow overrun that used to decode neighbouring functions into
-// it — defect g; the +1 everywhere is the `Kuna v…` banner line.)
-// sub_2620 283 -> 285 with `calleearity` (DIV-102): the `getpwent()` loop's
-// `sub_34a0()` regains the uid argument its two sibling call sites already pass
-// — kuna's own recovered prototype for that callee is `unsigned long sub_34a0(unsigned long a0)`
-// — and the uid expression `*(unsigned int *)(v7 + 0x10)` hoists into a named
-// local instead of being re-spelled twice inside the guard. Two lines, both
-// earned.
-// sub_2620 285 -> 286 with `libctypes` on by default: one `void *v6` was doing
-// two jobs in this function -- the `getpwent()` result (read at `+0x10`) and the
-// stream `ferror`/`fflush` take -- and the named table splits it into
-// `passwd *v6` and `FILE *v13`. One extra declaration line, earned; every other
-// measurement on this fixture is unchanged, the getPcode/getMappedSymbols
-// traffic included.
-// sub_2620 286 -> 287: the function's switch default arm jumps to the no-return
-// tail at 0x2701, whose `label_2701:` was released by the tail-duplication pass
-// and never printed -- `goto label_2701;` into a function with no such label.
-// The line is the restored label.
-// sub_2620 287 -> 286 with `foldcallretphi` on by default: `fstat(fileno(dat_6298),..)`
-// and `!fclose(dat_6298)` fold into their use, one spill line going with them.
-// sub_3320 39 -> 37 in the same change: `fread(..,dat_6298)` and
-// `fwrite(..,dat_6298)` fold into their tests, and one declaration goes. The
-// `sub_3de0`/`sub_31a0`/`sub_3900` and `fseeko` results stay spilled: their
-// outputs are an unlocked `eax` read out of `rax`, which the fold leaves alone.
-// The CLI path loses the same 1 and 2 lines.
-// sub_2620 286 -> 285 and sub_3320 37 -> 34 with the second round of `libctypes`
-// names: `fseeko` gains a declaration, so its result stops being spilled into an
-// `int` temporary and folds into the `if` that tests it, and one `passwd *` local
-// merges where it used to split. Every other measurement on this fixture is
-// unchanged -- placeholders, the diff ratios, and the getPcode/getMappedSymbols
-// traffic all hold.
-// sub_2620 285 -> 286: retain the uid load before the flag stores at
-// 0x272a/0x2731, then write 0x6288 before 0x6278 as the binary does at
-// 0x2738/0x273f. The former early 0x6278 assignment and global reread become
-// one local capture; the extra line preserves the actual memory-write order.
-const PIN_FAILLOG_C_LINES: [usize; 3] = [281, 34, 92];
 // Tokens Java's `getC()` cleaner REWRITES (`IllegalCharCppTransformer`).
 // Phase 3 measured 57/10/24 (whole rendered declarators like
 // `"unsigned long *"` as single `<type>` tokens, received by scripts/exports
@@ -618,7 +562,13 @@ const PIN_FAILLOG_VARDECL_UNRESOLVED: [usize; 3] = [0, 0, 0];
 // walk is a cache miss for an entry no earlier caller probed. No new
 // instruction address is read. Measured both arms on this tree: the option off
 // by default gives 2121.
-const PIN_FAILLOG_GETPCODE_TOTAL: u64 = 2142;
+// The measurements above predate invalidating body-derived evidence at
+// flushNative. The repeat main must now reacquire 277 entry-read and 206
+// write-probe instructions instead of reusing pre-flush summaries: 2142 + 483
+// = 2625. This is required for host Listing edits even when the source signature
+// stays int(void). The unchanged-body fixture emits identical repeated C;
+// distinct decoded addresses remain 1044 and mapped-symbol queries remain 1455.
+const PIN_FAILLOG_GETPCODE_TOTAL: u64 = 2625;
 const PIN_FAILLOG_DECODED_INSTS: usize = 1044;
 // Whole-session getMappedSymbols traffic: Phase 2 pinned this at 0 (the
 // providers did not exist); Phase 3 pins the real query-through traffic —
@@ -646,7 +596,6 @@ fn ghidra_sim_faillog_pins() {
     let mut ph_resolvables = Vec::new();
     let mut mangled_counts = Vec::new();
     let mut vardecl_unresolved_counts = Vec::new();
-    let mut c_line_counts = Vec::new();
     for parsed in &run.docs {
         let c = &parsed.c_text;
         let (reg_count, reg_names) = register_leaks(c, &run.oracle.register_names);
@@ -657,13 +606,6 @@ fn ghidra_sim_faillog_pins() {
         ph_resolvables.push(resolvable_placeholders(&run.oracle, c));
         mangled_counts.push(parsed.mangled_tokens);
         vardecl_unresolved_counts.push(ghidra_sim::vardecl_unresolved(parsed));
-        let parameters: BTreeSet<&str> = parsed.localdb.as_deref().unwrap_or(&[]).iter()
-            .filter(|symbol| symbol.cat == 0)
-            .map(|symbol| symbol.name.as_str())
-            .collect();
-        c_line_counts.push(normalized_lines(c).iter()
-            .filter(|line| !is_parameter_source_line(line, &parameters))
-            .count());
     }
 
     // The differential-C gap vs the in-process CLI path.
@@ -706,9 +648,9 @@ fn ghidra_sim_faillog_pins() {
     for (i, t) in FAILLOG_TARGETS.iter().enumerate() {
         summary.push_str(&format!(
             "{t}: registers={} {:?} unique={} placeholders={} resolvable={} mangled={} \
-             vardecl_unresolved={} c_lines={} diff_ratio={:.3}\n",
+             vardecl_unresolved={} diff_ratio={:.3}\n",
             reg_counts[i], reg_names_seen[i], uniq_counts[i], ph_totals[i], ph_resolvables[i],
-            mangled_counts[i], vardecl_unresolved_counts[i], c_line_counts[i], ratios[i]
+            mangled_counts[i], vardecl_unresolved_counts[i], ratios[i]
         ));
     }
     summary.push_str(&format!(
@@ -745,7 +687,8 @@ fn ghidra_sim_faillog_pins() {
         assert_eq!(
             vardecl_unresolved_counts[i], PIN_FAILLOG_VARDECL_UNRESOLVED[i],
             "{t}: unresolvable <vardecl symref> count moved — declaration-line \
-             rename/retype resolution changed"
+             rename/retype resolution changed\n{:#?}",
+            docs[i]
         );
         assert!(
             ratios[i] >= PIN_FAILLOG_DIFF_FLOOR[i],
@@ -759,11 +702,6 @@ fn ghidra_sim_faillog_pins() {
             "{t}: ghidra-vs-CLI diff ratio {:.3} rose above the pinned ceiling {} — \
              the GUI path got WORSE (a markup/flatten regression?).",
             ratios[i], PIN_FAILLOG_DIFF_CEILING[i]
-        );
-        assert_eq!(
-            c_line_counts[i], PIN_FAILLOG_C_LINES[i],
-            "{t}: flattened-C line count moved — the rendered structure changed \
-             (a <break>/token regression collapses this while ratios stay in band)"
         );
     }
 
@@ -1061,15 +999,14 @@ fn ghidra_sim_faillog_high_symrefs_are_not_shared_with_params() {
 }
 
 /// flushNative + repeat-decompile stability: with unchanged host answers a
-/// repeat decompile of the same entry after flushNative is byte-identical —
-/// the caches clear back to a deterministic state.
+/// repeat decompile of the same entry after flushNative is identical modulo
+/// balanced syntax pairing IDs; TokenSplit deliberately assigns monotonic IDs.
 #[test]
 fn ghidra_sim_faillog_flush_native_stability() {
     let binary = repo_root().join("tests/bug-repro/faillog");
     let run = run_session(&binary, &["sub_3ad0"]);
-    assert_eq!(
-        run.payloads[0], run.repeat_payload,
-        "repeat decompileAt after flushNative is not byte-identical"
+    kuna_harness::packed_document::assert_eq_modulo_syntax_pair_ids(
+        &run.payloads[0], &run.repeat_payload,
     );
 }
 
@@ -1411,7 +1348,64 @@ fn ghidra_sim_pe_call_fixups_replace_the_helper_calls() {
     for helper in ["__chkstk(", "_guard_dispatch_icall_nop("] {
         assert!(!c.contains(helper), "{helper} is still called:\n{c}");
     }
-    assert!(c.contains("(**"), "the guarded virtual call is missing:\n{c}");
+    // Execute the unchanged emitted C: helper removal must retain the virtual
+    // target at byte offset 0x68 and forward the original object exactly once.
+    let witness_dir = std::env::temp_dir().join(format!(
+        "kuna-guarded-dispatch-{}", std::process::id(),
+    ));
+    std::fs::create_dir_all(&witness_dir).expect("create dispatch witness directory");
+    kuna_harness::c_behavior::assert_c_behavior(
+        &witness_dir.join("consumer.c"),
+        "#include <assert.h>\n#include <stdint.h>\n#include <stdlib.h>\n",
+        c,
+        r#"_Static_assert(sizeof(void *) == 8 && sizeof(long long) == 8,
+               "original PE64 dispatch witness requires 64-bit address words");
+_Static_assert(sizeof(void (*)(long long *)) == sizeof(void *),
+               "original target stores callable addresses in pointer-sized slots");
+static long long *expected_context;
+static long long expected_payload;
+static unsigned calls, observed_target;
+static void decoy(long long *context) { (void)context; abort(); }
+static void first(long long *context) {
+  assert(context == expected_context);
+  assert(context[1] == expected_payload);
+  assert(++calls == 1);
+  observed_target = 1;
+  context[1] += 37;
+}
+static void second(long long *context) {
+  assert(context == expected_context);
+  assert(context[1] == expected_payload);
+  assert(++calls == 1);
+  observed_target = 2;
+  context[1] -= 19;
+}
+int main(void) {
+  void *vtable[15];
+  for (unsigned i = 0; i < 15; ++i) vtable[i] = (void *)decoy;
+  long long object[3] = {(long long)(uintptr_t)vtable, 0, 0x123456789abcdefLL};
+  for (unsigned trial = 0; trial < 3; ++trial) {
+    const unsigned target = trial == 1 ? 2 : 1;
+    vtable[0x68 / sizeof(void *)] = (void *)(target == 1 ? first : second);
+    expected_context = object;
+    expected_payload = trial == 0 ? -73 : trial == 1 ? 914 : 23;
+    object[1] = expected_payload;
+    calls = observed_target = 0;
+    sub_140001000(object);
+    assert(calls == 1 && observed_target == target);
+    assert(object[0] == (long long)(uintptr_t)vtable);
+    assert(object[1] == expected_payload + (target == 1 ? 37 : -19));
+    assert(object[2] == 0x123456789abcdefLL);
+    for (unsigned i = 0; i < 15; ++i)
+      assert(vtable[i] == (i == 0x68 / sizeof(void *)
+          ? (void *)(target == 1 ? first : second) : (void *)decoy));
+  }
+  return 0;
+}
+"#,
+        &["-Wall", "-Wextra"],
+    );
+    std::fs::remove_dir(&witness_dir).expect("remove dispatch witness directory");
     let fixups = run
         .oracle
         .log

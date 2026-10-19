@@ -24,6 +24,7 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use kuna_base::address::Address;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_decomp::decompile_drive::{
     extract_type_definitions, extract_variables, print_c, print_c_prototype,
     print_c_with_provenance, print_c_with_srcmap, GlobalInfo, LineMapping, TypeInfo, VarInfo,
@@ -54,10 +55,375 @@ pub fn default_fn_budget_seconds(mode: &str, whole_binary: bool) -> u64 {
     }
 }
 
+/// A nominal retained after its result leaves the engine-owning thread.
+/// `id` is the original producer/factory identity within the containing result,
+/// not a hash of the printed layout or a process-global nominal key.
+/// Synthesized `struct_N` identities remain owned by the existing shard ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultTypeBinding {
+    pub id: u64,
+    pub name: String,
+    pub presentation: String,
+    pub size: i64,
+}
+
+/// Select source type and global spellings once, while the invocation still owns
+/// the loaded factory. Workers rebind the same source inventory before rendering.
+/// Native synthesized structures are subsequently named by the shard ledger.
+pub fn prepare_type_names(prog: &mut ConsoleProgram) {
+    if prog.arch().print().type_names_initialized() {
+        return;
+    }
+    let types = prog.arch().types_impl().dependent_order();
+    let globals = invocation_globals(prog);
+    let mut reserved = invocation_identifiers(prog, &types, &globals);
+    let names = nominal_type_names(&types, &mut reserved);
+    let global_names = global_presentation_names(&globals, &mut reserved);
+    let print = prog.arch_mut().print_mut();
+    print.set_type_names((!names.is_empty()).then(|| std::rc::Rc::new(names)));
+    print.set_global_names((!global_names.is_empty()).then(|| {
+        std::rc::Rc::new(kuna_decomp::printc::GlobalPresentationNames::new(global_names))
+    }));
+    print.set_reserved_identifiers(std::rc::Rc::new(reserved));
+}
+
+/// Freeze source/physical callable identities for the complete selected
+/// invocation before a body is rendered, streamed, or assigned to a worker.
+pub fn prepare_export_callables(prog: &mut ConsoleProgram, targets: &[FunctionEntry]) -> KunaResult<()> {
+    prepare_type_names(prog);
+    let selected = targets.iter().map(|target| {
+        export_entry(prog,target.addr.clone(),target.name.clone(),targets.len() == 1)
+    }).collect::<Vec<_>>();
+    // Preparation itself always acquires ordinary canonical source/value facts.
+    // Replacing an invocation cannot accidentally consume a previous binding.
+    prog.arch_mut().print_mut().set_export_binding(None);
+    let binding = kuna_decomp::kuna_exportcall::prepare(prog.arch_mut(), &selected)?;
+    prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
+    // Only private physical implementations can lose a post-decompile formal
+    // edit at publication. Resolve those bounded batches before any worker or
+    // renderer can acquire the invocation binding.
+    let mut edits = Vec::new();
+    for selected in &selected {
+        let binding = prog.arch().print().export_binding().expect("installed export binding").clone();
+        if !binding.function(&selected.entry).is_some_and(|function| function.spec.private)
+            || !crate::assertions::has_symbol_scoped(prog, &selected.name, targets.len() == 1)
+        {
+            continue;
+        }
+        let source = binding.source_seed(&selected.entry).expect("selected export source seed");
+        let byte_address = selected.entry.get_offset();
+        if !prog.is_body_entry(byte_address) || !prog.entry_bytes_mapped(&selected.entry) {
+            continue;
+        }
+        let mapped = prog.dwarf_locals_for(byte_address);
+        let mut flow_overrides = selected.entry.get_space().map(|space| {
+            prog.arch().error_noreturn_callsites.iter().map(|&offset| (
+                Address::new(std::rc::Rc::clone(space), offset),
+                kuna_decomp::overrides::flow_type::CALL_RETURN,
+            )).collect::<Vec<_>>()
+        }).unwrap_or_default();
+        flow_overrides.extend(source.flow_overrides.iter().cloned());
+        let record_names = prog.arch().kuna_record_names;
+        prog.arch_mut().kuna_record_names = true;
+        let step = crate::decompile_step::decompile_one(
+            prog.arch_mut(), &selected.name, selected.entry.clone(), selected.size,
+            &crate::decompile_step::DecompileSeed {
+                mapped_symbols: &mapped, usepoint_symbols: &[], dynamic_symbols: &[],
+                object_assertions: &[], pending_proto: source.pending_proto.as_ref(),
+                flow_overrides: &flow_overrides, mapped_params: &source.mapped_params,
+            }, &[],
+        );
+        prog.arch_mut().kuna_record_names = record_names;
+        match step.result {
+            Ok(mut fd) => edits.extend(crate::assertions::acquire_parameter_edits(
+                prog, &mut fd, &selected.name, targets.len() == 1,
+            )?),
+            Err(error @ KunaError::Transport { .. }) => return Err(error),
+            // Ordinary decompilation retains its per-function failure reporting.
+            Err(_) => {}
+        }
+    }
+    if !edits.is_empty() {
+        let binding = prog.arch().print().export_binding().expect("installed export binding").clone();
+        let binding = binding.with_parameter_edits(prog.arch_mut(), &edits)?;
+        prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
+    }
+    Ok(())
+}
+
+pub fn export_callables_spec(prog: &ConsoleProgram) -> Option<kuna_decomp::kuna_exportcall::ExportSpec> {
+    prog.arch().print().export_binding().map(|binding| binding.spec())
+}
+
+pub fn install_export_callables(
+    prog: &mut ConsoleProgram,
+    spec: &kuna_decomp::kuna_exportcall::ExportSpec,
+) -> KunaResult<()> {
+    prog.arch_mut().print_mut().set_export_binding(None);
+    let mut entries = Vec::with_capacity(spec.selected.len());
+    for selected in &spec.selected {
+        let address = selected.address(prog.arch())?;
+        let name = prog.arch().symboltab.find_function_across_scopes(&address)
+            .map(|(id,_)| prog.arch().symboltab.symbol(id).get_name().to_owned())
+            .unwrap_or_else(|| format!("sub_{:x}",address.get_offset()));
+        entries.push(export_entry(prog,address,name,spec.selected.len() == 1));
+    }
+    let binding = kuna_decomp::kuna_exportcall::ExportBinding::from_spec_with_entries(prog.arch_mut(),spec,&entries)?;
+    let edits = crate::assertions::rebind_parameter_edits(prog, &binding, &spec.parameter_edits)?;
+    let binding = if edits.is_empty() { binding } else {
+        binding.with_parameter_edits(prog.arch_mut(), &edits)?
+    };
+    prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
+    Ok(())
+}
+
+fn export_entry(prog:&mut ConsoleProgram,entry:kuna_base::address::Address,name:String,single:bool)
+    -> kuna_decomp::kuna_exportcall::ExportEntry
+{
+    let seed = crate::assertions::function_seed(prog,&name,&entry,single);
+    kuna_decomp::kuna_exportcall::ExportEntry {
+        size:prog.declared_extent(entry.get_offset()),entry,name,
+        seed:kuna_decomp::kuna_exportcall::ExportSourceSeed {
+            model:prog.arch().kuna_pending_proto_model.clone(),
+            pending_proto:seed.pending_proto,mapped_params:seed.mapped_params,
+            flow_overrides:seed.flow_overrides,
+        },
+    }
+}
+
+/// Reserve source spellings before preparing invocation presentation names.
+/// Parent inventory names and aliases remain reservations even when additive
+/// worker symbol seeding leaves an already-resolved address unchanged.
+pub fn reserve_source_identifiers<'a>(
+    prog: &mut ConsoleProgram,
+    names: impl IntoIterator<Item = &'a str>,
+) {
+    let reserved = std::rc::Rc::make_mut(prog.arch_mut().print_mut().reserved_identifiers_mut());
+    for name in names {
+        reserve_identifier(reserved, name);
+    }
+}
+
+fn reserve_identifier(reserved: &mut BTreeSet<String>, name: &str) {
+    if name.is_empty() {
+        return;
+    }
+    let spelling = identifier_spelling(name);
+    if spelling != name {
+        reserved.insert(name.to_owned());
+    }
+    reserved.insert(spelling);
+}
+
+fn reserve_prototype_parameters(
+    reserved: &mut BTreeSet<String>,
+    proto: &kuna_decomp::fspec::FuncProto,
+) {
+    if !proto.has_store() {
+        return;
+    }
+    for index in 0..proto.num_params() {
+        if let Some(param) = proto.get_param(index) {
+            reserve_identifier(reserved, param.get_name());
+        }
+    }
+}
+
+fn invocation_identifiers(
+    prog: &ConsoleProgram,
+    types: &[std::rc::Rc<kuna_decomp::dtype::Datatype>],
+    globals: &[(u64, String, Address)],
+) -> BTreeSet<String> {
+    let mut reserved = prog.arch().print().reserved_identifiers()
+        .map(|held| held.as_ref().clone()).unwrap_or_default();
+    for ty in types {
+        reserve_identifier(&mut reserved, ty.get_name());
+        if let Some(members) = ty.as_enum_namemap() {
+            for name in members.values() {
+                reserve_identifier(&mut reserved, name);
+            }
+        }
+        if let Some(proto) = ty.get_code_prototype() {
+            reserve_prototype_parameters(&mut reserved, proto);
+        }
+    }
+    for entry in prog.function_entries_canonical() {
+        reserve_identifier(&mut reserved, &entry.name);
+        for alias in &entry.aliases {
+            reserve_identifier(&mut reserved, alias);
+        }
+        if let Some(proto) = prog.arch().symboltab.function_source_proto_across_scopes(&entry.addr) {
+            reserve_prototype_parameters(&mut reserved, proto);
+        }
+        if let Some(pieces) = prog.arch().symboltab.function_proto_pieces_across_scopes(&entry.addr) {
+            for name in &pieces.innames {
+                reserve_identifier(&mut reserved, name);
+            }
+        }
+        if let Some(pieces) = prog.pending_prototype(&entry.name) {
+            for name in &pieces.innames {
+                reserve_identifier(&mut reserved, name);
+            }
+        }
+    }
+    for (_, name, _) in globals {
+        reserve_identifier(&mut reserved, name);
+    }
+    for directive in prog.assertions() {
+        if let crate::assertions::Body::Name { newname, .. } = &directive.body {
+            reserve_identifier(&mut reserved,newname);
+        }
+    }
+    reserved
+}
+
+fn identifier_spelling(raw: &str) -> String {
+    let mut spelling = String::with_capacity(raw.len() + 1);
+    if raw.starts_with(|c: char| c.is_ascii_digit()) {
+        spelling.push('_');
+    }
+    spelling.extend(raw.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' }));
+    spelling
+}
+
+/// The same non-functional namespace domain as Database::build_global_query,
+/// retaining real Symbol ids and whole-object storage across all data spaces.
+fn invocation_globals(prog: &ConsoleProgram) -> Vec<(u64, String, Address)> {
+    let database = &prog.arch().symboltab;
+    let mut pending: Vec<_> = database.get_global_scope().into_iter().collect();
+    let mut globals = Vec::new();
+    while let Some(scope) = pending.pop() {
+        let source_scope = database.scope(scope);
+        pending.extend(source_scope.children.values().copied());
+        if source_scope.is_functional {
+            continue;
+        }
+        let namespace = database.get_full_name(scope);
+        for (id, address, _, name) in database.scope_symbol_storage(scope) {
+            let symbol = database.symbol(id);
+            let Some(datatype) = symbol.dtype.as_ref() else { continue };
+            if datatype.get_metatype() == kuna_decomp::dtype::type_metatype::TYPE_CODE {
+                continue;
+            }
+            let display = symbol.get_display_name();
+            if display.is_empty() {
+                continue;
+            }
+            let name = if namespace.is_empty() {
+                if display == name { name } else { display.to_owned() }
+            } else {
+                format!("{namespace}::{display}")
+            };
+            let Some(space) = address.get_space() else { continue };
+            let entry = database.entry(scope, symbol.mapentry[0]);
+            let base = address.get_offset().wrapping_sub(entry.get_offset().max(0) as u64);
+            globals.push((symbol.get_id(), name, Address::new(std::rc::Rc::clone(space), base)));
+        }
+    }
+    globals.sort_by(|a, b| (&a.1, &a.2, a.0).cmp(&(&b.1, &b.2, b.0)));
+    globals
+}
+
+fn fresh_presentation_name(spelling: &str, reserved: &mut BTreeSet<String>) -> String {
+    let mut suffix = 2;
+    loop {
+        let candidate = format!("{spelling}__kuna_{suffix}");
+        if reserved.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn global_presentation_names(
+    globals: &[(u64, String, Address)],
+    reserved: &mut BTreeSet<String>,
+) -> BTreeMap<u64, String> {
+    globals.iter().filter_map(|(symbol, name, _)| {
+        // Valid authored root identifiers stay unchanged. Qualified namespace
+        // names and punctuation-bearing object-file labels need presentation.
+        if *symbol == 0 || (!name.starts_with(|c: char| c.is_ascii_digit())
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'))
+        {
+            return None;
+        }
+        let spelling = identifier_spelling(name);
+        Some((*symbol, fresh_presentation_name(&spelling, reserved)))
+    }).collect()
+}
+
+fn nominal_type_names(
+    types: &[std::rc::Rc<kuna_decomp::dtype::Datatype>],
+    reserved: &mut BTreeSet<String>,
+) -> BTreeMap<usize, String> {
+    // All authored spellings are reserved before assigning any suffix. A
+    // producer's explicit identity groups a declaration and its completion,
+    // but never two unrelated same-sized/same-layout records.
+    let mut groups: BTreeMap<String, BTreeMap<(bool, u64, String), Vec<usize>>> = BTreeMap::new();
+    for ct in types {
+        if ct.qualified_base().is_some() || ct.get_name().is_empty() {
+            // Qualified views delegate their spelling to the source base. They
+            // are not competing fixed scalar identifiers or fresh nominals.
+            continue;
+        }
+        let raw = ct.get_name();
+        let nominal = kuna_decomp::kuna_structdefs::is_definable(ct);
+        if !nominal && (!raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || raw.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            // Scalar vocabulary such as `unsigned long` is C syntax, not a
+            // nominal identifier. It must never become `unsigned_long`.
+            continue;
+        }
+        let spelling = identifier_spelling(raw);
+        let pointers = groups.entry(spelling).or_default()
+            // Fixed scalar/core identifiers take priority and do not acquire
+            // nominal identities merely because two producer views exist.
+            .entry((nominal, if nominal { ct.get_id() } else { 0 }, raw.to_owned())).or_default();
+        if nominal {
+            pointers.push(std::rc::Rc::as_ptr(ct) as usize);
+        }
+    }
+    reserved.extend(groups.keys().cloned());
+    let mut names = BTreeMap::new();
+    for (spelling, identities) in groups {
+        if identities.len() < 2 {
+            continue;
+        }
+        for (index, ((nominal, _, _), pointers)) in identities.into_iter().enumerate() {
+            if !nominal {
+                continue;
+            }
+            let output = if index == 0 {
+                spelling.clone()
+            } else {
+                fresh_presentation_name(&spelling, reserved)
+            };
+            for pointer in pointers {
+                names.insert(pointer, output.clone());
+            }
+        }
+    }
+    names
+}
+
+fn result_type_bindings(prog: &ConsoleProgram, fd: &Funcdata) -> Vec<ResultTypeBinding> {
+    let names = prog.arch().print().type_names();
+    prog.arch().print().referenced_types(fd).into_iter().map(|ct| {
+        let name = ct.get_name().to_owned();
+        let presentation = names.and_then(|names| names.get(&(std::rc::Rc::as_ptr(&ct) as usize)))
+            .cloned().unwrap_or_else(|| name.clone());
+        ResultTypeBinding { id: ct.get_id(), name, presentation, size: i64::from(ct.get_size()) }
+    }).collect()
+}
+
 /// One decompiled function's result (success carries `code`; failure carries
 /// `error`).
 #[derive(Clone)]
 pub struct FuncResult {
+    /// Retained typed identities and selected spellings, independent of optional
+    /// layout/provenance output and safe across subprocess/thread boundaries.
+    pub type_bindings: Vec<ResultTypeBinding>,
     pub stack_objects: Vec<kuna_decomp::kuna_stackobjectinfo::StackObjectInfo>,
     pub name: String,
     /// User-facing address, in the target's address units for a raw image.
@@ -85,8 +451,8 @@ pub struct FuncResult {
     /// function's C names, in definition-before-use order. Empty unless the
     /// option is on — the same decision that prints them above the body.
     pub types: Vec<TypeInfo>,
-    /// (kuna `globalref`) The globals the C names by address (`&dat_2b080`),
-    /// with the declaration the project header gives each. Never serialized
+    /// The named source globals and synthesized globals (`&dat_2b080`) the C
+    /// uses, with the declaration the project header gives each. Never serialized
     /// into `decompile-all --json`; the `decompile-project` header declares them.
     pub globals: Vec<GlobalInfo>,
     /// (kuna `calltargettype`) The calls through fields of synthesized records,
@@ -253,7 +619,8 @@ pub struct DecompileOptions {
 
 /// Decompile each `(name, entry)` target in turn against the already-loaded
 /// program, returning one [`FuncResult`] per target (success or per-function
-/// `error` — a bad function never aborts the batch).  `want_proto`
+/// `error` — an ordinary bad function never aborts the batch). Terminal
+/// acquisition failures stop traversal and retain their typed error. `want_proto`
 /// additionally captures the function's prototype line
 /// ([`print_c_prototype`]) inside the same panic guard as the C render — for
 /// the `decompile-project` `.h` and for `decompile-graph`'s rows.
@@ -268,7 +635,7 @@ pub fn decompile_targets(
     no_vars: bool,
     want_proto: bool,
     want_provenance: bool,
-) -> Vec<FuncResult> {
+) -> KunaResult<Vec<FuncResult>> {
     let opts = DecompileOptions {
         no_vars,
         want_proto,
@@ -290,7 +657,7 @@ pub fn decompile_targets_with(
     prog: &mut ConsoleProgram,
     targets: Vec<FunctionEntry>,
     opts: &DecompileOptions,
-) -> Vec<FuncResult> {
+) -> KunaResult<Vec<FuncResult>> {
     decompile_batch(prog, targets, opts)
 }
 
@@ -304,7 +671,7 @@ pub fn decompile_targets_with(
 pub fn decompile_export_targets(
     prog: &mut ConsoleProgram,
     targets: Vec<FunctionEntry>,
-) -> Vec<FuncResult> {
+) -> KunaResult<Vec<FuncResult>> {
     let opts = export_options(targets.len() == 1);
     decompile_batch(prog, targets, &opts)
 }
@@ -329,7 +696,7 @@ fn decompile_batch(
     prog: &mut ConsoleProgram,
     targets: Vec<FunctionEntry>,
     opts: &DecompileOptions,
-) -> Vec<FuncResult> {
+) -> KunaResult<Vec<FuncResult>> {
     let mut out = Vec::with_capacity(targets.len());
     // Only the surfaces that can decide a function again pay for the replay list.
     let replay = if prog.arch().struct_synth.fires() || prog.arch().elem_ptr {
@@ -339,14 +706,17 @@ fn decompile_batch(
     };
     kuna_decomp::kuna_elemptr::start(prog.arch_mut(), targets.len() <= 1);
     let mut pending = targets.into_iter();
-    decompile_pulled(prog, opts, &mut || pending.next(), &mut |r| out.push(r));
-    converge_synthesized_structs(prog, opts, &replay, &mut out);
-    converge_element_globals(prog, opts, &replay, &mut out);
+    let result = (|| {
+        decompile_pulled(prog, opts, &mut || pending.next(), &mut |r| out.push(r))?;
+        converge_synthesized_structs(prog, opts, &replay, &mut out)?;
+        converge_element_globals(prog, opts, &replay, &mut out)
+    })();
     kuna_decomp::kuna_elemptr::stop(prog.arch_mut());
+    result?;
     if opts.want_pointer_arguments {
         reconcile_pointer_arguments(&mut out);
     }
-    out
+    Ok(out)
 }
 
 /// (kuna `elemptr`) Decide again the functions that typed a global some other
@@ -355,28 +725,29 @@ fn decompile_batch(
 /// about it agrees. Two rounds at most: a redo that blocks a global can only
 /// withdraw a type, so a second round is needed only where one function typed
 /// two globals and the first redo moved the other. A redo that fails keeps the
-/// first body.
+/// first body unless acquisition failed, which stops the batch.
 pub fn converge_element_globals(
     prog: &mut ConsoleProgram,
     opts: &DecompileOptions,
     targets: &[FunctionEntry],
     out: &mut [FuncResult],
-) {
+) -> KunaResult<()> {
     for _ in 0..2 {
         let redo = kuna_decomp::kuna_elemptr::disagreements(prog.arch_mut());
         if redo.is_empty() {
-            return;
+            return Ok(());
         }
         for (i, t) in targets.iter().enumerate() {
             if i >= out.len() || !redo.contains(&t.addr.get_offset()) {
                 continue;
             }
-            let again = decompile_entry(prog, t.clone(), opts);
+            let again = decompile_entry(prog, t.clone(), opts)?;
             if redo_replaces(&out[i], &again) {
                 out[i] = again;
             }
         }
     }
+    Ok(())
 }
 
 /// (kuna `structsynth`) Decide again the functions that named a synthesized
@@ -399,7 +770,8 @@ pub fn converge_element_globals(
 /// time, because the structure it was given first still answers for it.
 ///
 /// A redo that fails where the first pass succeeded -- a watchdog budget spent
-/// the second time round -- keeps the first body.
+/// the second time round -- keeps the first body. Acquisition failures instead
+/// stop the batch and preserve their typed error.
 ///
 /// A batch that synthesized nothing pays one ledger probe for the whole run.
 pub fn converge_synthesized_structs(
@@ -407,10 +779,10 @@ pub fn converge_synthesized_structs(
     opts: &DecompileOptions,
     targets: &[FunctionEntry],
     out: &mut [FuncResult],
-) {
+) -> KunaResult<()> {
     let stale = superseded_struct_names(prog);
     if stale.is_empty() {
-        return;
+        return Ok(());
     }
     let redo: Vec<usize> = out
         .iter()
@@ -419,11 +791,12 @@ pub fn converge_synthesized_structs(
         .map(|(i, _)| i)
         .collect();
     for i in redo {
-        let again = decompile_entry(prog, targets[i].clone(), opts);
+        let again = decompile_entry(prog, targets[i].clone(), opts)?;
         if redo_replaces(&out[i], &again) {
             out[i] = again;
         }
     }
+    Ok(())
 }
 
 /// (kuna `structsynth`) The synthesized structures a later, larger one has
@@ -443,12 +816,12 @@ pub fn redo_replaces(first: &FuncResult, again: &FuncResult) -> bool {
 
 /// Does this result spell any of `names` as a type name?
 ///
-/// The C text, the `.h` prototype line and the exported variable rows are every
-/// surface a type name reaches. The match is on whole identifiers, so `struct_1`
-/// does not answer for `struct_10`.
+/// Retained typed bindings remain available after a streamed body is appended
+/// and released. Text matching supports older synthetic records without them.
 pub fn names_any_type(r: &FuncResult, names: &[String]) -> bool {
     let mut hit = |hay: &str| names.iter().any(|n| contains_identifier(hay, n));
-    r.code.as_deref().is_some_and(&mut hit)
+    r.type_bindings.iter().any(|binding| names.contains(&binding.presentation))
+        || r.code.as_deref().is_some_and(&mut hit)
         || r.proto.as_deref().is_some_and(&mut hit)
         || r.variables.iter().any(|v| hit(&v.type_name))
         || r.types.iter().any(|t| hit(&t.name))
@@ -477,21 +850,23 @@ pub fn decompile_entry(
     prog: &mut ConsoleProgram,
     target: FunctionEntry,
     opts: &DecompileOptions,
-) -> FuncResult {
+) -> KunaResult<FuncResult> {
     let mut pending = Some(target);
     let mut out = None;
-    decompile_pulled(prog, opts, &mut || pending.take(), &mut |r| out = Some(r));
-    out.expect("decompile_pulled emits exactly one result per target")
+    decompile_pulled(prog, opts, &mut || pending.take(), &mut |r| out = Some(r))?;
+    Ok(out.expect("decompile_pulled emits exactly one result per target"))
 }
 
 /// The pull/push form of [`decompile_targets`]: take targets from `next` until
 /// it returns `None`, handing each finished [`FuncResult`] to `sink` before the
 /// next target is decompiled.
 ///
-/// Exactly one result per target, in the order `next` produced them — the
+/// Exactly one result per completed target, in the order `next` produced them — the
 /// streaming project export consumes results as they land instead of waiting for
 /// the whole batch, and feeds `next` from a scheduler that the results
 /// themselves steer ([`FuncResult::callee_hints`]).
+/// Terminal acquisition errors stop before publishing the affected target or
+/// asking for another; previously emitted records remain with the sink.
 ///
 /// The callee-hint context (the program's function-entry set and its code
 /// ranges) is built once per call, on the first target, and only when
@@ -501,18 +876,10 @@ pub fn decompile_pulled(
     opts: &DecompileOptions,
     next: &mut dyn FnMut() -> Option<FunctionEntry>,
     sink: &mut dyn FnMut(FuncResult),
-) {
-    let DecompileOptions {
-        no_vars,
-        want_proto,
-        want_provenance,
-        header_carries_types,
-        single_target,
-        want_tokens,
-        want_pointer_arguments,
-        ..
-    } = *opts;
-    prog.arch_mut().kuna_float_scan_batch = !single_target;
+) -> KunaResult<()> {
+    prepare_type_names(prog);
+    let float_scan_batch = prog.arch().kuna_float_scan_batch;
+    prog.arch_mut().kuna_float_scan_batch = !opts.single_target;
     // (kuna `structdefs`) A project export's bodies do NOT carry the
     // type-definition preamble: they `#include` the generated header, and
     // `build_header` renders every one of those definitions into it from the
@@ -523,9 +890,30 @@ pub fn decompile_pulled(
     // else that carries a definition. Restored on the way out so one program
     // can drive both surfaces.
     let preamble = prog.arch().print().options.struct_defs();
-    if header_carries_types && preamble {
+    if opts.header_carries_types && preamble {
         prog.arch_mut().print_mut().options.set_struct_defs(false);
     }
+    let result = decompile_pulled_inner(prog, opts, next, sink);
+    prog.arch_mut().print_mut().options.set_struct_defs(preamble);
+    prog.arch_mut().kuna_float_scan_batch = float_scan_batch;
+    result
+}
+
+fn decompile_pulled_inner(
+    prog: &mut ConsoleProgram,
+    opts: &DecompileOptions,
+    next: &mut dyn FnMut() -> Option<FunctionEntry>,
+    sink: &mut dyn FnMut(FuncResult),
+) -> KunaResult<()> {
+    let DecompileOptions {
+        no_vars,
+        want_proto,
+        want_provenance,
+        single_target,
+        want_tokens,
+        want_pointer_arguments,
+        ..
+    } = *opts;
     let mut hints: Option<CalleeHintContext> = None;
     while let Some(FunctionEntry {
         name,
@@ -550,6 +938,7 @@ pub fn decompile_pulled(
             }
             .to_string();
             sink(FuncResult {
+                type_bindings: Vec::new(),
                 code: None,
                 name,
                 address,
@@ -584,6 +973,7 @@ pub fn decompile_pulled(
         // `ConsoleProgram::entry_bytes_mapped`.
         if !prog.entry_bytes_mapped(&entry) && provenance == EntryProvenance::UndefinedExternal {
             sink(FuncResult {
+                type_bindings: Vec::new(),
                 code: Some(format!(
                     "// {name}: external symbol -- no code at this address in this module\n"
                 )),
@@ -610,6 +1000,7 @@ pub fn decompile_pulled(
         }
         if !prog.entry_bytes_mapped(&entry) {
             sink(FuncResult {
+                type_bindings: Vec::new(),
                 name,
                 address,
                 byte_address,
@@ -676,7 +1067,15 @@ pub fn decompile_pulled(
         // time, so it has to be seeded here rather than applied afterwards. Every
         // field is empty for a run that passed no directive, which is what makes
         // the plane free (`crate::assertions`).
-        let seed = crate::assertions::function_seed(prog, &name, &entry, single_target);
+        let prepared_seed = prog.arch().print().export_binding()
+            .and_then(|binding| binding.source_seed(&entry)).cloned();
+        let seed = match prepared_seed {
+            Some(seed) => crate::assertions::FunctionSeed {
+                pending_proto:seed.pending_proto,mapped_params:seed.mapped_params,
+                flow_overrides:seed.flow_overrides,
+            },
+            None => crate::assertions::function_seed(prog, &name, &entry, single_target),
+        };
         // (kuna `protoorder`) `entry` is consumed by the symbol-scoped second
         // decompile below; the park needs the address afterwards.
         let park_entry = entry.clone();
@@ -687,6 +1086,7 @@ pub fn decompile_pulled(
         let mut flow_ovr = flow_ovr;
         flow_ovr.extend(seed.flow_overrides.iter().cloned());
         let replay = crate::assertions::has_symbol_scoped(prog, &name, single_target);
+        let record_names = prog.arch().kuna_record_names;
         prog.arch_mut().kuna_record_names = replay;
         let step = crate::decompile_step::decompile_one(
             prog.arch_mut(),
@@ -704,7 +1104,7 @@ pub fn decompile_pulled(
             },
             &[],
         );
-        prog.arch_mut().kuna_record_names = false;
+        prog.arch_mut().kuna_record_names = record_names;
         // (kuna `--assert`) The symbol-scoped second pass. `name`/`type` name a
         // LOCAL, and a local does not exist until a decompile has produced it --
         // so the only order in which they can work is decompile, mutate the local
@@ -721,6 +1121,7 @@ pub fn decompile_pulled(
                     let carried_dynamic = crate::assertions::carried_dynamic_symbols(&fd);
                     let carried_objects = kuna_decomp::kuna_stackobjectasserts::specs(&fd).to_vec();
                     let carried_params = crate::kuna_paramasserts::carried(&fd, &seed.mapped_params);
+                    let prior_names = std::mem::take(&mut prog.arch_mut().kuna_prior_names);
                     prog.arch_mut().kuna_prior_names = kuna_decomp::kuna_stablenames::carry(&fd);
                     let second = crate::decompile_step::decompile_one(
                         prog.arch_mut(),
@@ -739,7 +1140,7 @@ pub fn decompile_pulled(
                         &[],
                     )
                     .result;
-                    prog.arch_mut().kuna_prior_names = Default::default();
+                    prog.arch_mut().kuna_prior_names = prior_names;
                     replayed = expected;
                     second
                 } else {
@@ -750,20 +1151,6 @@ pub fn decompile_pulled(
         };
         match result {
             Ok(mut fd) => {
-                // (kuna `--assert`) The flow overrides the follower REFUSED are only
-                // known now: `function_seed` recorded `applied` when it seeded them.
-                crate::assertions::record_rejected_flow_overrides(
-                    prog,
-                    &name,
-                    single_target,
-                    &fd,
-                );
-                // Render + extract under `catch_unwind`: the decompile drive only
-                // guards the pipeline (decompile_drive.rs), so a fail-fast invariant
-                // in the printer / type declarator on an exotic recovered function
-                // would otherwise abort the WHOLE binary and discard every function
-                // already decompiled. Containing it here honors the per-function
-                // isolation contract (one bad function → one `error` record).
                 // (kuna `protoorder`) State what this function's recovery found for its callers.
                 if opts.park_recovered_proto {
                     let mode = prog.arch().protoorder;
@@ -774,7 +1161,7 @@ pub fn decompile_pulled(
                         &fd,
                         fd.get_func_proto(),
                         mode,
-                    );
+                    )?;
                     if protoorder_trace() {
                         match &outcome {
                             Ok(r) => eprintln!(
@@ -789,6 +1176,14 @@ pub fn decompile_pulled(
                         }
                     }
                 }
+                // (kuna `--assert`) The flow overrides the follower REFUSED are only
+                // known now: `function_seed` recorded `applied` when it seeded them.
+                crate::assertions::record_rejected_flow_overrides(
+                    prog,
+                    &name,
+                    single_target,
+                    &fd,
+                );
                 // (kuna `callrettype`) State what this function returns for its callers.
                 if opts.park_recovered_proto {
                     kuna_decomp::kuna_callrettype::record(prog.arch_mut(), &park_entry, &fd);
@@ -801,34 +1196,53 @@ pub fn decompile_pulled(
                 }
                 // (kuna `calleevote`) Record what this function passes at each call.
                 if prog.arch().kuna_calleevote.recording {
-                    kuna_decomp::kuna_calleevote::record(prog.arch_mut(), &park_entry, &mut fd);
+                    kuna_decomp::kuna_calleevote::record(prog.arch_mut(), &park_entry, &mut fd)?;
                 }
                 // (kuna `callbacktype`) Record every constant it hands to a
                 // declared callback slot.
                 if prog.arch().kuna_callbacktype.recording {
-                    kuna_decomp::kuna_callbacktype::record(prog.arch_mut(), &park_entry, &fd);
+                    kuna_decomp::kuna_callbacktype::record(prog.arch_mut(), &park_entry, &fd)?;
                 }
                 // (kuna `elemptr`) Record what this function said about each global.
                 kuna_decomp::kuna_elemptr::record(prog.arch_mut(), &fd);
+                // Render + extract under `catch_unwind`: the decompile drive only
+                // guards the pipeline (decompile_drive.rs), so a fail-fast invariant
+                // in the printer / type declarator on an exotic recovered function
+                // would otherwise abort the WHOLE binary and discard every function
+                // already decompiled. Containing it here honors the per-function
+                // isolation contract (one bad function → one `error` record).
                 prog.arch_mut().print_mut().set_record_pointer_arguments(want_pointer_arguments);
-                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> kuna_base::error::KunaResult<_> {
                     // Trim the surrounding newlines the same way `kuna decompile`
                     // does (`decompile.rs::trim_newlines`), so the per-function
                     // `code` is byte-identical to the single-shot path.
                     let (untrimmed, provenance, raw_tokens) = if want_tokens {
-                        print_c_with_srcmap(prog.arch_mut(), &fd)
+                        print_c_with_srcmap(prog.arch_mut(), &fd)?
                     } else if want_provenance {
-                        let (text, provenance) = print_c_with_provenance(prog.arch_mut(), &fd);
+                        let (text, provenance) = print_c_with_provenance(prog.arch_mut(), &fd)?;
                         (text, provenance, Vec::new())
                     } else {
-                        (print_c(prog.arch_mut(), &fd), Default::default(), Vec::new())
+                        (print_c(prog.arch_mut(), &fd)?, Default::default(), Vec::new())
                     };
                     let pointerargs = prog.arch_mut().print_mut().take_pointer_arguments(&untrimmed);
                     let code = untrimmed.trim_matches('\n').to_string();
-                    let globals = kuna_decomp::decompile_drive::extract_global_objects(prog.arch());
+                    let globals = kuna_decomp::decompile_drive::extract_global_objects(prog.arch(), &fd)?;
+                    let type_bindings = result_type_bindings(prog, &fd);
                     let field_calls = kuna_decomp::kuna_calltargettype::field_declarations(prog.arch(), &fd);
-                    let mut variables =
-                        if no_vars { Vec::new() } else { extract_variables(prog.arch(), &fd) };
+                    let mut variables = if no_vars {
+                        Vec::new()
+                    } else if opts.header_carries_types {
+                        match prog.arch().print().export_binding()
+                            .and_then(|binding| binding.function(fd.get_address()))
+                        {
+                            Some(function) => kuna_decomp::decompile_drive::extract_variables_with_proto(
+                                prog.arch(),&fd,&function.source,
+                            )?,
+                            None => extract_variables(prog.arch(),&fd)?,
+                        }
+                    } else {
+                        extract_variables(prog.arch(),&fd)?
+                    };
                     // (kuna `structdefs`) The layout side of the same function:
                     // the definitions the preamble just printed above the body,
                     // as records. Empty unless the option is on.
@@ -856,7 +1270,7 @@ pub fn decompile_pulled(
                     // end of the iteration) and inside the same guard (the
                     // declarator walk shares the printer's fail-fast invariants).
                     let proto = if want_proto {
-                        Some(print_c_prototype(prog.arch_mut(), &fd))
+                        Some(print_c_prototype(prog.arch_mut(), &fd)?)
                     } else {
                         None
                     };
@@ -870,12 +1284,19 @@ pub fn decompile_pulled(
                         .as_ref()
                         .map(|ctx| ctx.scan(&fd, byte_address))
                         .unwrap_or_default();
-                    (code, variables, types, (globals, field_calls), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects)
+                    Ok((code, variables, types, (globals, field_calls), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects, type_bindings))
                 }));
+                prog.arch_mut().print_mut().set_record_pointer_arguments(false);
+                let rendered = rendered.unwrap_or_else(|_| {
+                    Err(kuna_base::error::KunaError::lowlevel(
+                        "panic while rendering C / extracting variables",
+                    ))
+                });
                 match rendered {
-                    Ok((code, variables, types, (globals, field_calls), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects)) => {
+                    Ok((code, variables, types, (globals, field_calls), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects, type_bindings)) => {
                     crate::assertions::verify_printed(prog, &fd, &code, &replayed);
                     sink(FuncResult {
+                        type_bindings,
                         name,
                         address,
                         byte_address,
@@ -897,13 +1318,15 @@ pub fn decompile_pulled(
                         detail,
                     })
                     }
-                    Err(_) => sink(FuncResult {
+                    Err(error @ KunaError::Transport { .. }) => return Err(error),
+                    Err(error) => sink(FuncResult {
+                        type_bindings: Vec::new(),
                         name,
                         address,
                         byte_address,
                         size: size as i64,
                         code: None,
-                        error: Some("panic while rendering C / extracting variables".into()),
+                        error: Some(error.explain().to_string()),
                         proto: None,
                         variables: Vec::new(),
                         types: Vec::new(),
@@ -920,7 +1343,9 @@ pub fn decompile_pulled(
                     }),
                 }
             }
+            Err(error @ KunaError::Transport { .. }) => return Err(error),
             Err(e) => sink(FuncResult {
+                type_bindings: Vec::new(),
                 name,
                 address,
                 byte_address,
@@ -943,9 +1368,7 @@ pub fn decompile_pulled(
             }),
         }
     }
-    if header_carries_types && preamble {
-        prog.arch_mut().print_mut().options.set_struct_defs(true);
-    }
+    Ok(())
 }
 
 /// (kuna `protoorder`) Is the park/decline trace on (`KUNA_PROTOORDER_TRACE=1`)?
@@ -1272,24 +1695,36 @@ pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[Func
 ///
 /// Every other type is listed in a comment on the line.
 fn global_declarations(results: &[FuncResult]) -> String {
-    let mut by_addr: BTreeMap<u64, (Vec<&GlobalInfo>, Vec<&GlobalInfo>)> = BTreeMap::new();
+    let mut by_addr: BTreeMap<(i32, u64), (Vec<&GlobalInfo>, Vec<&GlobalInfo>)> = BTreeMap::new();
     for g in results.iter().flat_map(|r| r.globals.iter()) {
-        let e = by_addr.entry(g.address).or_default();
+        let e = by_addr.entry((g.space_index, g.address)).or_default();
         if g.direct { e.1.push(g) } else { e.0.push(g) }
     }
     let quote = |d: &str| d.replace("/*", "/ *").replace("*/", "* /");
     let mut out = String::new();
-    let mut reach: Option<(u64, &str)> = None;
-    for (&address, (taken, direct)) in &by_addr {
+    let mut reach: Option<(i32, u64, &str)> = None;
+    for (&(space, address), (taken, direct)) in &by_addr {
         let name = taken.iter().chain(direct.iter()).next().map_or("", |g| g.name.as_str());
         let end = taken.iter().chain(direct.iter()).map(|g| address.saturating_add(g.size.max(1) as u64)).max();
         let end = end.unwrap_or(address).max(address.saturating_add(1));
-        let overlap = reach.filter(|&(r, _)| r > address).map(|(_, n)| n).or_else(|| {
-            let (t, d) = by_addr.range(address.saturating_add(1)..end).next()?.1;
+        let overlap = reach.filter(|&(s, r, _)| s == space && r > address).map(|(_, _, n)| n).or_else(|| {
+            let (t, d) = by_addr.range((space, address.saturating_add(1))..(space, end)).next()?.1;
             t.iter().chain(d.iter()).next().map(|g| g.name.as_str())
         });
-        if reach.map_or(true, |(r, _)| end > r) {
-            reach = Some((end, name));
+        if reach.map_or(true, |(s, r, _)| s != space || end > r) {
+            reach = Some((space, end, name));
+        }
+        // A live source Symbol supplies the whole object's declaration.
+        // Access-width votes must not substitute another type for that authority,
+        // even when only one field or the pointer stored in it was referenced.
+        let mut source = BTreeSet::new();
+        for g in taken.iter().chain(direct.iter()).filter(|g| g.source_symbol.is_some()) {
+            if source.insert((g.source_symbol, g.name.as_str(), g.declaration.as_str())) {
+                let _ = writeln!(out, "extern {};", g.declaration);
+            }
+        }
+        if !source.is_empty() {
+            continue;
         }
         let mut decls: Vec<(&GlobalInfo, usize)> = Vec::new();
         for g in taken.iter().chain(direct.iter()) {
@@ -1650,6 +2085,8 @@ pub fn build_asm(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
         contains_identifier, prune_unreferenced_synth_types, redo_replaces, AssemblyScratch,
         FuncResult,
@@ -1659,6 +2096,8 @@ mod tests {
     fn scalar_global_declarations_keep_conflicting_direct_types_diagnostic() {
         let mut result = streamed("void sample(void)", "int");
         let direct = |ty: &str| super::GlobalInfo {
+            space_index: 0,
+            source_symbol: None,
             address: 0x5000,
             name: "dat_5000".into(),
             declaration: format!("{ty} dat_5000"),
@@ -1681,6 +2120,8 @@ mod tests {
     #[test]
     fn overlapping_direct_globals_are_not_split_into_two_objects() {
         let global = |address: u64, ty: &str, size: i64, direct: bool| super::GlobalInfo {
+            space_index: 0,
+            source_symbol: None,
             address,
             name: format!("dat_{address:x}"),
             declaration: format!("{ty} dat_{address:x}"),
@@ -1700,15 +2141,124 @@ mod tests {
         assert!(split.contains("dat_5000 is overlapped by dat_5004"), "{split}");
         assert!(split.contains("dat_5004 is overlapped by dat_5000"), "{split}");
         result.globals = vec![global(0x5000, "long", 8, false), global(0x5004, "int", 4, true)];
-        let taken = super::global_declarations(&[result]);
+        let taken = super::global_declarations(std::slice::from_ref(&result));
         assert!(taken.starts_with("extern long dat_5000;\n"), "{taken}");
         assert!(taken.contains("dat_5004 is overlapped by dat_5000"), "{taken}");
         assert!(!taken.contains("extern int dat_5004"), "{taken}");
+        let mut other_bank = global(0x5000, "float", 4, true);
+        other_bank.space_index = 1;
+        other_bank.name = "banked_5000".into();
+        other_bank.declaration = "float banked_5000".into();
+        result.globals = vec![global(0x5000, "unsigned int", 4, true), other_bank];
+        assert_eq!(super::global_declarations(&[result]),
+            "extern unsigned int dat_5000;\nextern float banked_5000;\n");
+    }
+
+    #[test]
+    fn nominal_names_follow_identity_not_layout_or_visit_order() {
+        use std::rc::Rc;
+        use kuna_decomp::dtype::{type_metatype, Datatype, DatatypeKind};
+        let nominal = |name: &str, id| {
+            let mut ty = Datatype::new_with_align(4, 4, type_metatype::TYPE_STRUCT);
+            ty.name = name.into();
+            ty.display_name = name.into();
+            ty.id = id;
+            ty.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![] };
+            Rc::new(ty)
+        };
+        let first = nominal("Record", 11);
+        let second = nominal("Record", 22);
+        let authored_suffix = nominal("Record__kuna_2", 33);
+        let types = vec![Rc::clone(&second), Rc::clone(&authored_suffix), Rc::clone(&first)];
+        let names = super::nominal_type_names(&types, &mut BTreeSet::new());
+        assert_eq!(names[&(Rc::as_ptr(&first) as usize)], "Record");
+        assert_eq!(names[&(Rc::as_ptr(&second) as usize)], "Record__kuna_3");
+        assert!(!names.contains_key(&(Rc::as_ptr(&authored_suffix) as usize)));
+        let mut ordinary = BTreeSet::from(["Record__kuna_3".into()]);
+        let names_with_function = super::nominal_type_names(&types, &mut ordinary);
+        assert_eq!(names_with_function[&(Rc::as_ptr(&second) as usize)], "Record__kuna_4");
+        assert!(ordinary.contains("Record__kuna_4"));
+        let mut reversed = types.clone();
+        reversed.reverse();
+        assert_eq!(names, super::nominal_type_names(&reversed, &mut BTreeSet::new()));
+        assert_eq!(first.get_name(), "Record");
+        assert_eq!(second.get_name(), "Record");
+        // Distinct Rc views of one explicit producer identity spell alike.
+        let completion = nominal("Record", 11);
+        let names = super::nominal_type_names(&[Rc::clone(&first), Rc::clone(&completion), second], &mut BTreeSet::new());
+        assert_eq!(names[&(Rc::as_ptr(&first) as usize)], names[&(Rc::as_ptr(&completion) as usize)]);
+        let mut core = (*nominal("Record", 99)).clone();
+        core.flags |= kuna_decomp::dtype::flags::coretype;
+        let core = Rc::new(core);
+        let names = super::nominal_type_names(&[Rc::clone(&first), Rc::clone(&core)], &mut BTreeSet::new());
+        assert!(!names.contains_key(&(Rc::as_ptr(&core) as usize)));
+        assert_eq!(names[&(Rc::as_ptr(&first) as usize)], "Record__kuna_2");
+    }
+
+    #[test]
+    fn qualified_source_alias_views_do_not_compete_for_the_base_identifier() {
+        use std::rc::Rc;
+        use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+        let factory = TypeFactoryImpl::new();
+        factory.set_default_alignment_map();
+        factory.set_max_basetype_size(8);
+        let integer = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let source = factory.get_typedef(&integer, "AuthoredAlias", 0, 0).unwrap();
+        let qualified = factory.get_qualified_type(
+            source.clone(), kuna_decomp::kuna_typequal::VOLATILE,
+        ).unwrap();
+        let inventory = factory.dependent_order();
+        assert!(inventory.iter().any(|ty| Rc::ptr_eq(ty, &source)));
+        assert!(inventory.iter().any(|ty| Rc::ptr_eq(ty, &qualified)));
+        let mut reserved = BTreeSet::new();
+        assert!(super::nominal_type_names(&inventory, &mut reserved).is_empty());
+        assert!(reserved.contains("AuthoredAlias"));
+        assert!(Rc::ptr_eq(qualified.qualified_base().unwrap(), &source));
+        assert!(!kuna_decomp::kuna_typequal::is_volatile(&source));
+        assert!(kuna_decomp::kuna_typequal::is_volatile(&qualified));
+    }
+
+    #[test]
+    fn primitive_c_vocabulary_is_not_a_nominal_presentation_name() {
+        use std::rc::Rc;
+        use kuna_decomp::dtype::{type_metatype, Datatype};
+        let scalar = |name: &str, id| {
+            let mut ty = Datatype::new_with_align(8, 8, type_metatype::TYPE_INT);
+            ty.name = name.into();
+            ty.display_name = name.into();
+            ty.id = id;
+            Rc::new(ty)
+        };
+        let types = [
+            scalar("long", 1), scalar("long", 2),
+            scalar("long long", 3), scalar("long long", 4),
+            scalar("unsigned long", 5), scalar("unsigned long", 6),
+        ];
+        assert!(super::nominal_type_names(&types, &mut BTreeSet::new()).is_empty());
+        assert_eq!(types[2].get_name(), "long long");
+        assert_eq!(types[4].get_name(), "unsigned long");
+    }
+
+    #[test]
+    fn streamed_type_bindings_survive_without_optional_metadata_or_body() {
+        let mut result = streamed("void f(void);", "int");
+        result.type_bindings.push(super::ResultTypeBinding {
+            id: 91,
+            name: "struct_7".into(),
+            presentation: "struct_7".into(),
+            size: 16,
+        });
+        assert!(result.code.is_none() && result.types.is_empty());
+        assert!(super::names_any_type(&result, &["struct_7".into()]));
+        assert!(!super::names_any_type(&result, &["struct_70".into()]));
+        let types = "struct struct_7 {\n    int value;\n};\n";
+        assert_eq!(prune_unreferenced_synth_types(types, &[result]), types);
     }
 
     /// A result carrying only what the streaming export keeps.
     fn streamed(proto: &str, param_type: &str) -> FuncResult {
         FuncResult {
+            type_bindings: Vec::new(),
             name: "sub_1000".into(),
             address: 0x1000,
             byte_address: 0x1000,

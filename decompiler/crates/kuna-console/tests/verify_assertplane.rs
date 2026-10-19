@@ -74,8 +74,8 @@ fn mapped_callee_output_preserves_authored_inputs_in_caller_queries() {
     let caller = build_and_follow_flow(arch, "caller", Address::new(memory, 0x1000), 0).unwrap();
     let context = caller.get_arch();
     for prototype in [
-        context.query_callee_proto(&entry).unwrap(),
-        context.query_function(&entry).unwrap().2,
+        context.query_callee_proto(&entry).unwrap().unwrap(),
+        context.query_function(&entry).unwrap().unwrap().2,
     ] {
         assert!(prototype.is_output_locked());
         assert!(prototype.is_input_locked());
@@ -128,14 +128,14 @@ fn parsed_callee_cleanup_is_consumed_by_direct_callers_only_when_enabled() {
             program.arch_mut().set_kuna_option("calleeprotostack", if enabled { "on" } else { "off" }).unwrap();
             let arch = program.arch();
             let (addr_size, word_size) = arch.data_org();
-            let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+            let models = arch.proto_model_names().collect::<Vec<_>>();
             let mut parsed = None;
             parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models, |pieces, name| {
                 parsed = Some((pieces, name.to_owned())); Ok(())
             }).unwrap();
             let (pieces, selected) = parsed.unwrap();
             assert_eq!(selected, model);
-            let model = arch.get_model(&selected).unwrap().clone();
+            let model = arch.get_model(&selected).unwrap();
             let code = arch.manage().get_default_code_space().unwrap().clone();
             let entry = Address::new(code.clone(), 0x2000);
             let mut fd = arch.new_funcdata(&pieces.name, entry.clone(), 0).unwrap();
@@ -159,7 +159,7 @@ fn parsed_callee_cleanup_is_consumed_by_direct_callers_only_when_enabled() {
                 let mut caller_fd = build_and_follow_flow(program.arch_mut(), name,
                     Address::new(code.clone(), offset), 0).unwrap();
                 assert_eq!(caller_fd.num_calls(), 1);
-                let source = caller_fd.get_arch().query_callee_proto(&entry).unwrap();
+                let source = caller_fd.get_arch().query_callee_proto(&entry).unwrap().unwrap();
                 if let Some(previous) = &source_seed {
                     assert!(Rc::ptr_eq(previous, &source));
                 } else {
@@ -167,7 +167,12 @@ fn parsed_callee_cleanup_is_consumed_by_direct_callers_only_when_enabled() {
                 }
                 assert!(Rc::ptr_eq(source.model(), &model));
                 assert_eq!(source.get_extra_pop(), source_cleanup);
-                assert_eq!(source.get_param(0).unwrap().get_address(),
+                assert!(source.is_input_locked() && source.is_model_locked());
+                let source_storage: Vec<_> = (0..source.num_params())
+                    .map(|slot| source.get_param(slot).unwrap().get_address()).collect();
+                let source_output_storage = source.get_output().get_address();
+                let working_source = program.arch().types_impl().acquire_working_proto(&source).unwrap();
+                assert_eq!(working_source.get_param(0).unwrap().get_address(),
                     fd.get_func_proto().get_param(0).unwrap().get_address());
                 let call = caller_fd.get_call_specs(0);
                 assert_eq!(call.get_entry_address(), &entry);
@@ -176,20 +181,25 @@ fn parsed_callee_cleanup_is_consumed_by_direct_callers_only_when_enabled() {
                 assert!(call.proto().is_input_locked());
                 assert_eq!(call.proto().get_param(0).unwrap().get_address(),
                     source.get_param(0).unwrap().get_address());
-                ActionDefaultParams::boxed("base").apply(&mut caller_fd, &mut context);
+                ActionDefaultParams::boxed("base").apply(&mut caller_fd, &mut context).unwrap();
+                assert_eq!(caller_fd.get_call_specs(0).proto().get_param(0).unwrap().get_address(),
+                    working_source.get_param(0).unwrap().get_address());
                 let stack = program.arch().manage().get_space_by_name("stack").unwrap().get_index();
-                ActionExtraPopSetup::boxed("base", Some(stack)).apply(&mut caller_fd, &mut context);
+                ActionExtraPopSetup::boxed("base", Some(stack)).apply(&mut caller_fd, &mut context).unwrap();
                 let call = caller_fd.get_call_specs(0);
                 observed.push((enabled, pieces.name.clone(), name,
                     call.get_extra_pop(), call.get_effective_extra_pop()));
                 let working_cleanup = if enabled || selected == "__cdecl" { cleanup } else { EXTRAPOP_UNKNOWN };
                 expected.push((enabled, pieces.name.clone(), name, working_cleanup, working_cleanup));
-                let cached = caller_fd.get_arch().query_callee_proto(&entry).unwrap();
+                let cached = caller_fd.get_arch().query_callee_proto(&entry).unwrap().unwrap();
                 assert!(Rc::ptr_eq(&source, &cached));
                 assert_eq!(cached.get_extra_pop(), source_cleanup);
                 assert!(Rc::ptr_eq(cached.model(), &model));
-                assert_eq!(cached.get_param(0).unwrap().get_address(),
-                    fd.get_func_proto().get_param(0).unwrap().get_address());
+                assert!(cached.is_input_locked() && cached.is_model_locked());
+                assert_eq!((0..cached.num_params())
+                    .map(|slot| cached.get_param(slot).unwrap().get_address()).collect::<Vec<_>>(),
+                    source_storage);
+                assert_eq!(cached.get_output().get_address(), source_output_storage);
                 let pending = program.pending_prototype(&pieces.name).unwrap();
                 assert_eq!(pending.name, pieces.name);
                 assert_eq!(pending.intypes.len(), pieces.intypes.len());
@@ -216,7 +226,7 @@ fn parsed_large_result_and_input_only_edit_preserve_independent_locks() {
         &[repo_root().join("specs").to_str().unwrap().to_owned()]).unwrap();
     let arch = program.arch();
     let (addr_size, word_size) = arch.data_org();
-    let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+    let models = arch.proto_model_names().collect::<Vec<_>>();
     parse_c("typedef struct SourceBig { unsigned long long a; unsigned long long b; unsigned long long c; } SourceBig;",
         arch.types(), DataOrg { addr_size, word_size }, &models, |_, _| unreachable!()).unwrap();
     for declaration in ["extern SourceBig __cdecl source_big(int tag);", "extern SourceBig __cdecl source_big_var(int tag, ...);"] {
@@ -228,7 +238,7 @@ fn parsed_large_result_and_input_only_edit_preserve_independent_locks() {
         let (pieces, selected) = parsed.unwrap();
         assert_eq!(pieces.outtype.as_ref().unwrap().get_size(), 24);
         assert_eq!(pieces.intypes.len(), 1);
-        let model = arch.get_model(&selected).unwrap().clone();
+        let model = arch.get_model(&selected).unwrap();
         let entry = Address::new(arch.manage().get_default_code_space().unwrap().clone(), 0x1000);
         let mut fd = arch.new_funcdata(&pieces.name, entry, 0).unwrap();
         fd.apply_locked_prototype_with_model(&pieces, Some(model.clone())).unwrap();
@@ -252,7 +262,7 @@ fn decompile_with(directives: Vec<Directive>) -> (String, Vec<Outcome>) {
     let entry = prog
         .resolve_entry(&EntrySelector::Name(TARGET.to_string()))
         .expect("fauxware has an `authenticate`");
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     (code, prog.assertion_outcomes())
 }
@@ -274,6 +284,105 @@ fn load_fixture(fixture: &str, disabled_option: &str) -> ConsoleProgram {
     prog
 }
 
+#[test]
+fn explicit_parameter_edits_reach_fresh_working_queries_before_reanalysis() {
+    use std::rc::Rc;
+    use kuna_decomp::dtype::type_metatype;
+
+    // Reuse the original machine-code fixture and its declared entry parameter;
+    // its later EDI definitions are not additional source formals.
+    let program = load_fixture("lifetimes_x86_64", "foldcallretphi");
+    let mut corpus = corpus::Corpus::from_program("immediate-parameter-reader", program, Vec::new());
+    for command in [
+        "parse line extern int consume_key(int key);",
+        "parse line extern int register_parameter_reuse(int property);",
+        "load function register_parameter_reuse",
+        "decompile",
+    ] {
+        corpus.command(command).unwrap();
+    }
+    let data = corpus.data();
+    let fd = data.fd.as_ref().unwrap();
+    let entry = fd.get_address().clone();
+    let canonical = data.conf.as_ref().unwrap().arch().symboltab
+        .function_source_proto_across_scopes(&entry).unwrap().clone();
+    let canonical_type = canonical.get_param(0).unwrap().get_type().unwrap().clone();
+    assert_eq!(canonical.num_params(), 1);
+    assert_eq!(canonical.get_param(0).unwrap().get_name(), "property");
+    assert_eq!((canonical_type.get_metatype(), canonical_type.get_size()),
+        (type_metatype::TYPE_INT, 4));
+    let canonical_locks = (canonical.is_input_locked(), canonical.is_output_locked(), canonical.is_model_locked());
+    let original = fd.get_func_proto();
+    assert_eq!(original.num_params(), 1);
+    let address = original.get_param(0).unwrap().get_address();
+    let flags = original.get_param(0).unwrap().get_flags();
+    let model = original.model().clone();
+    let output = (original.get_output().get_address(), original.get_output_type().unwrap().clone());
+    let locks = (original.is_input_locked(), original.is_output_locked(), original.is_model_locked());
+
+    let source_model = canonical.model().clone();
+    let source_output = canonical.get_output_type().unwrap().clone();
+    let source_snapshot = |source: &kuna_decomp::fspec::FuncProto| {
+        let mut physical = Vec::new();
+        source.encode(&mut kuna_base::marshal::XmlEncode::new(&mut physical)).unwrap();
+        let mut logical = Vec::new();
+        source.encode_with_context(&mut kuna_base::marshal::XmlEncode::new(&mut logical),
+            kuna_decomp::fspec::PrototypeEncoding::LogicalCallable).unwrap();
+        let parameter = source.get_param(0).unwrap();
+        (physical, logical, source.num_params(), parameter.get_flags(), parameter.get_usepoint(),
+            source.get_output().get_flags(),
+            (source.is_input_locked(), source.is_output_locked(), source.is_model_locked()))
+    };
+    let canonical_snapshot = source_snapshot(&canonical);
+
+    for (command, expected_metatype) in [
+        ("rename property incoming_property", type_metatype::TYPE_INT),
+        ("retype incoming_property unsigned int", type_metatype::TYPE_UINT),
+        ("decompile", type_metatype::TYPE_UINT),
+        ("decompile", type_metatype::TYPE_UINT),
+    ] {
+        corpus.command(command).unwrap();
+        let data = corpus.data();
+        let fd = data.fd.as_ref().unwrap();
+        let working = fd.get_arch().types_impl().unwrap()
+            .acquire_working_proto(fd.get_func_proto()).unwrap();
+        for current in [fd.get_func_proto(), &working] {
+            assert_eq!(current.num_params(), 1, "invented a later local as an entry formal after {command}");
+            let parameter = current.get_param(0).unwrap();
+            assert_eq!(parameter.get_name(), "incoming_property", "{command}");
+            assert_eq!(parameter.get_address(), address, "{command}");
+            assert_eq!(parameter.get_flags(), flags, "{command}");
+            let datatype = parameter.get_type().unwrap();
+            assert_eq!((datatype.get_metatype(), datatype.get_size()), (expected_metatype, 4), "{command}");
+            assert!(Rc::ptr_eq(current.model(), &model), "{command}");
+            assert_eq!(current.get_output().get_address(), output.0, "{command}");
+            assert!(Rc::ptr_eq(current.get_output_type().unwrap(), &output.1), "{command}");
+            assert_eq!((current.is_input_locked(), current.is_output_locked(), current.is_model_locked()), locks, "{command}");
+        }
+        let retained = data.conf.as_ref().unwrap().arch().symboltab
+            .function_source_proto_across_scopes(&entry).unwrap();
+        // A fresh decompile explicitly republishes every pending declaration.
+        // Edits alone retain its Rc; republication must retain both source states.
+        if command != "decompile" {
+            assert!(Rc::ptr_eq(retained, &canonical), "{command}");
+        }
+        for source in [canonical.as_ref(), retained.as_ref()] {
+            assert_eq!(source_snapshot(source), canonical_snapshot, "{command}");
+            assert!(Rc::ptr_eq(source.model(), &source_model), "{command}");
+            assert!(Rc::ptr_eq(source.get_param(0).unwrap().get_type().unwrap(), &canonical_type), "{command}");
+            assert!(Rc::ptr_eq(source.get_output_type().unwrap(), &source_output), "{command}");
+        }
+        assert_eq!(canonical.get_param(0).unwrap().get_name(), "property", "{command}");
+        assert!(Rc::ptr_eq(canonical.get_param(0).unwrap().get_type().unwrap(), &canonical_type), "{command}");
+        assert_eq!((canonical.is_input_locked(), canonical.is_output_locked(), canonical.is_model_locked()), canonical_locks, "{command}");
+    }
+    let code = corpus.render_c();
+    kuna_harness::c_behavior::assert_c_parameters(&code, "register_parameter_reuse",
+        &["incoming_property"], "int (*)(unsigned int)");
+    assert!(code.contains("if (incoming_property != 200)"), "{code}");
+    assert!(code.contains("return incoming_property;"), "{code}");
+}
+
 fn decompile_fixture_with_prototype(
     fixture: &str,
     disabled_option: &str,
@@ -289,7 +398,7 @@ fn decompile_fixture_with_prototype(
     assertions::apply_program_scoped(&mut prog);
     let entry = prog.resolve_entry(&EntrySelector::Numeric(caller))
         .unwrap_or_else(|e| panic!("fixture caller at 0x{caller:x}: {e}"));
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     (funcs[0].code.clone().unwrap_or_default(), prog.assertion_outcomes())
 }
 
@@ -537,7 +646,7 @@ fn function_declares_a_bounded_entry() {
         .resolve_entry(&EntrySelector::Name("authstub".to_string()))
         .expect("the declared name resolves");
     assert_eq!(entry.addr.get_offset(), 0x400664);
-    let funcs = decompile_targets(&mut prog, vec![entry], true, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], true, false, false).unwrap();
     assert_eq!(funcs[0].name, "authstub");
     assert_eq!(funcs[0].size, 0x1c, "the declared extent is what the record reports");
 }
@@ -568,7 +677,7 @@ fn a_multi_function_run_needs_the_directive_to_name_its_function() {
         .iter()
         .map(|n| prog.resolve_entry(&EntrySelector::Name(n.to_string())).expect("resolves"))
         .collect();
-    let funcs = decompile_targets(&mut prog, targets, true, false, false);
+    let funcs = decompile_targets(&mut prog, targets, true, false, false).unwrap();
     let report = prog.assertion_outcomes();
     assert_eq!(report[0].status, "rejected", "an unqualified directive bound anyway");
     assert!(
@@ -995,7 +1104,7 @@ fn a_type_on_a_register_local_reaches_the_declaration() {
         Body::Type { func: None, symbol: "v1".into(), decl: "unsigned int".into() },
     )]);
     all_applied(&report);
-    assert!(code.contains("uint4 v1; // eax"), "the retype did not land:\n{code}");
+    kuna_harness::c_behavior::assert_c_declaration(&code, "v1", "unsigned int", "eax");
 }
 
 /// And a name: the body reads the caller's identifier, not `v1`.
@@ -1110,7 +1219,7 @@ fn a_one_formal_custom_input_carries_the_getter_result() {
     let entry = prog
         .resolve_entry(&EntrySelector::Name("probe".into()))
         .unwrap();
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     all_applied(&prog.assertion_outcomes());
     let code = funcs[0].code.as_deref().unwrap_or_default();
     let forwards_getter = code.contains("mapper(getter(object))")
@@ -1131,7 +1240,7 @@ fn callable_types_keep_distinct_explicit_input_and_output_storage() {
     let prog = load();
     let arch = prog.arch();
     let (addr_size, word_size) = arch.data_org();
-    let model = arch.get_model("MSABI").cloned().expect("x86 MSABI model");
+    let model = arch.get_model("MSABI").expect("x86 MSABI model");
     let mut pieces = parse_protopieces(
         "int4 mapper(int4 raw_type);",
         arch.types(),
@@ -1245,7 +1354,7 @@ fn check_callable_return_lock(declaration: &str, unknown_first: bool) {
     .unwrap();
     let mut unknown = known.clone();
     unknown.outtype = None;
-    let model = arch.get_model("MSABI").cloned().unwrap();
+    let model = arch.get_model("MSABI").unwrap();
     let intern = |pieces| {
         arch.types_impl()
             .get_type_code_proto_model(pieces, Rc::clone(&model))

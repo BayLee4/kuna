@@ -10,7 +10,7 @@ use crate::funcdata::Funcdata;
 use crate::kuna_stackobjects::{ByteSource, SourcePoint};
 use crate::unionresolve::{ResolveEdge, ResolvedUnion};
 use kuna_base::address::Address;
-use kuna_base::error::KunaResult;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_num::opcodes::OpCode;
 
 #[derive(Clone)]
@@ -167,10 +167,10 @@ pub fn apply(
     Ok(true)
 }
 
-pub(crate) fn validate(fd: &Funcdata) -> Result<(), String> {
+pub(crate) fn validate(fd: &Funcdata) -> KunaResult<()> {
     for assertion in specs(fd) {
         if !fd.get_arch().stack_views {
-            return Err("Logical stack object assertions require stackviews on".to_string());
+            return Err(KunaError::lowlevel("Logical stack object assertions require stackviews on"));
         }
         let found = crate::kuna_stackobjects::objects(fd).iter().any(|object| {
             object.address == assertion.address
@@ -184,26 +184,30 @@ pub(crate) fn validate(fd: &Funcdata) -> Result<(), String> {
                 })
         });
         if !found {
-            return Err(format!(
+            return Err(KunaError::lowlevel(format!(
                 "Stack object {} no longer matches its native uses",
                 assertion.selector
-            ));
+            )));
         }
         for use_ in &assertion.uses {
-            let calls: Vec<_> = fd.obank().iter_alive()
-                .filter(|&op| SourcePoint::op(fd, op) == Some(use_.point))
-                .filter(|&op| crate::kuna_stackviews::declared_view(fd, op, use_.slot).is_some())
-                .collect();
+            let mut calls = Vec::new();
+            for op in fd.obank().iter_alive() {
+                if SourcePoint::op(fd, op) == Some(use_.point)
+                    && crate::kuna_stackviews::declared_view(fd, op, use_.slot)?.is_some()
+                {
+                    calls.push(op);
+                }
+            }
             if !fd
                 .stack_object_bound_uses
                 .contains(&(use_.point, use_.slot))
                 || calls.len() != 1
                 || !selected_view(fd, calls[0], use_, assertion)
             {
-                return Err(format!(
+                return Err(KunaError::lowlevel(format!(
                     "Cannot bind stack object {} at {:#x}:{} to shared storage",
                     assertion.selector, use_.point.address, use_.slot
-                ));
+                )));
             }
         }
     }
@@ -381,7 +385,7 @@ pub(crate) fn backing_view(
     Some(value)
 }
 
-pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
+pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) -> KunaResult<()> {
     let assertions = specs(fd).to_vec();
     let mut aliases = BTreeMap::new();
     for assertion in assertions {
@@ -392,10 +396,14 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
             {
                 continue;
             }
-            let calls: Vec<_> = fd.obank().iter_alive()
-                .filter(|&op| crate::kuna_stackobjects::SourcePoint::op(fd, op) == Some(use_.point))
-                .filter(|&op| crate::kuna_stackviews::declared_view(fd, op, use_.slot).is_some())
-                .collect();
+            let mut calls = Vec::new();
+            for op in fd.obank().iter_alive() {
+                if SourcePoint::op(fd, op) == Some(use_.point)
+                    && crate::kuna_stackviews::declared_view(fd, op, use_.slot)?.is_some()
+                {
+                    calls.push(op);
+                }
+            }
             if calls.len() == 1
                 && bind_use(fd, &assertion, use_, calls[0], factory, &mut aliases).is_some()
             {
@@ -403,6 +411,7 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
             }
         }
     }
+    Ok(())
 }
 
 pub(crate) fn seed_writes(
@@ -410,12 +419,12 @@ pub(crate) fn seed_writes(
     start: u64,
     backing: &Rc<Datatype>,
     factory: &dyn TypeFactory,
-) {
+) -> KunaResult<()> {
     let Some(space) = fd
         .get_scope_local()
         .map(|scope| scope.get_space_id().clone())
     else {
-        return;
+        return Ok(());
     };
     let assertions = specs(fd).to_vec();
     let mut edges = Vec::new();
@@ -457,6 +466,7 @@ pub(crate) fn seed_writes(
             .unwrap_or(&assertion.uses[0].datatype);
         let name = assertion.view_name(ty);
         let offset = space.wrap_offset(v.get_offset().wrapping_sub(start)) as i32;
+        let pointer_origin = crate::kuna_stackviews::pointer_origin(fd, id)?;
         let member = (0..backing.num_depend()).find(|&i| {
             backing.get_field(i).is_some_and(|field| {
                 if field.name != name {
@@ -472,7 +482,7 @@ pub(crate) fn seed_writes(
                 };
                 match piece.get_metatype() {
                     type_metatype::TYPE_INT | type_metatype::TYPE_UINT => {
-                        !crate::kuna_stackviews::pointer_origin(fd, id)
+                        !pointer_origin
                             && op
                                 .get_in(0)
                                 .and_then(|id| fd.vbank().get(id))
@@ -485,7 +495,7 @@ pub(crate) fn seed_writes(
                                     )
                                 })
                     }
-                    type_metatype::TYPE_PTR => crate::kuna_stackviews::pointer_origin(fd, id),
+                    type_metatype::TYPE_PTR => pointer_origin,
                     type_metatype::TYPE_FLOAT => op
                         .get_in(0)
                         .and_then(|id| fd.vbank().get(id))
@@ -515,4 +525,5 @@ pub(crate) fn seed_writes(
             },
         );
     }
+    Ok(())
 }

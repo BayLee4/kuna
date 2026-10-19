@@ -22,5 +22,5 @@
 <stringmatch name="64-bit unsigned merge retains signed conversion" min="1" max="1">fallback = \(uint8\)\(int8\)x;</stringmatch>
 <stringmatch name="64-bit logical shift retains unsigned destination" min="1" max="1">return fallback &gt;&gt; 3;</stringmatch>
 <stringmatch name="widened result retains 32-bit signed conversion" min="1" max="1">prior = \(uint4\)\(int4\)value;</stringmatch>
-<stringmatch name="widened return preserves logical shift" min="1" max="1">return prior &gt;&gt; 3;</stringmatch>
+<stringmatch name="widened return preserves logical shift" min="1" max="1">return (?:prior &gt;&gt; 3|\(uint8\)\(prior &gt;&gt; 3\));</stringmatch>
 </decompilertest>

@@ -50,7 +50,7 @@ fn function() -> (Funcdata, Rc<AddrSpace>, VarnodeId) {
     .unwrap();
     let root = data.bblocks_ref().root.unwrap();
     data.bblocks_mut().new_block_basic(root);
-    let argument = data.new_varnode(4, &Address::new(register, 4), None);
+    let argument = data.new_varnode(4, &Address::new(register, 4), None).unwrap();
     let argument = data.set_input_varnode(argument).unwrap();
     (data, stack, argument)
 }
@@ -88,7 +88,7 @@ fn provisional_effects_do_not_supply_unknown_stack_pointer_provenance() {
         &HashMap::new(),
         &mut guards,
         &mut writes,
-    );
+    ).unwrap();
     assert_eq!(guards.len(), 1);
     let indirect = guards[0].0;
     let pointer = writes[0];
@@ -108,7 +108,7 @@ fn provisional_effects_do_not_supply_unknown_stack_pointer_provenance() {
         .get_space()
         .unwrap()
         .clone();
-    let base = data.new_varnode(4, &Address::new(register, 0), None);
+    let base = data.new_varnode(4, &Address::new(register, 0), None).unwrap();
     let base = data.set_input_varnode(base).unwrap();
     data.vbank_mut().get_mut(base).unwrap().set_spacebase();
     data.op_set_input(indirect, base, 0).unwrap();
@@ -129,10 +129,10 @@ fn data_inputs_include_stack_arguments_but_exclude_spacebases() {
         .unwrap()
         .clone();
     let base_addr = Address::new(register, 0);
-    let base = data.new_varnode(4, &base_addr, None);
+    let base = data.new_varnode(4, &base_addr, None).unwrap();
     let base = data.set_input_varnode(base).unwrap();
     data.vbank_mut().get_mut(base).unwrap().set_spacebase();
-    let stack_argument = data.new_varnode(4, &Address::new(stack, 8), None);
+    let stack_argument = data.new_varnode(4, &Address::new(stack, 8), None).unwrap();
     let stack_argument = data.set_input_varnode(stack_argument).unwrap();
     let offset = data.new_constant(4, 8);
     let frame_pointer = operation(&mut data, OpCode::CPUI_INT_ADD, &[base, offset]).1;

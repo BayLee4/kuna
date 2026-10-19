@@ -150,6 +150,11 @@ try:
             elif name in ("carry_ambient", "carry_bool"):
                 params = [("bits", UnsignedLongLongDataType.dataType)]
             variables = JArray(Variable)([ParameterImpl(n, t, program) for n, t in params])
+            if name in ("carry_dispatch", "carry_invoke", "carry_ambient", "carry_bool"):
+                # createFunction recognizes these unchanged tail jumps as thunks.
+                # Their independently authored wide signatures must not update
+                # the narrow target through FunctionDB's thunk delegation.
+                function.setThunkedFunction(None)
             function.updateFunction(convention, ReturnParameterImpl(result, program), Function.FunctionUpdateType.DYNAMIC_STORAGE_ALL_PARAMS, False, SourceType.USER_DEFINED, variables)
             functions[name] = function
     finally:
@@ -160,6 +165,27 @@ try:
 
     before = source_snapshot()
     report["source_before"] = before
+    expected_source_parameters = {
+        "dispatch": [("value", flags), ("which", UnsignedIntegerDataType.dataType)],
+        "invoke": [("value", flags), ("callback", callback)],
+        "ambient": [],
+        "bool_byte": [("value", BooleanDataType.dataType)],
+        "carry_dispatch": [("bits", UnsignedLongLongDataType.dataType),
+                           ("which", UnsignedIntegerDataType.dataType)],
+        "carry_invoke": [("bits", UnsignedLongLongDataType.dataType), ("callback", callback)],
+        "carry_ambient": [("bits", UnsignedLongLongDataType.dataType)],
+        "carry_bool": [("bits", UnsignedLongLongDataType.dataType)],
+    }
+    for name, expected in expected_source_parameters.items():
+        actual = list(functions[name].getParameters())
+        assert [(str(p.getName()), int(p.getDataType().getLength())) for p in actual] == [
+            (parameter_name, int(data_type.getLength())) for parameter_name, data_type in expected
+        ], (name, before[name])
+        for parameter, (_, data_type) in zip(actual, expected):
+            assert parameter.getDataType().isEquivalent(data_type), (name, before[name])
+    for name in ("carry_dispatch", "carry_invoke", "carry_ambient", "carry_bool"):
+        assert not functions[name].isThunk(), (name, before[name])
+        assert functions[name].getThunkedFunction(True) is None, (name, before[name])
     before_revision = int(program.getModificationNumber())
     options = DecompileOptions()
     interface = DecompInterface()

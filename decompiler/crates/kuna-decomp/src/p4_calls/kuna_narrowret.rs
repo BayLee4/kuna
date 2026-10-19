@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use kuna_base::address::{calc_mask, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::space::spacetype;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
@@ -337,13 +338,13 @@ fn holds_low_part(data: &Funcdata, out: VarnodeId, stated: &NarrowReturn) -> boo
 /// specifications are out of `data`); one already that narrow is left as it
 /// is.  A stated truth value marks the CALL a calculated boolean, as a callee
 /// declared `bool` does.
-pub fn narrow_call_output(data: &mut Funcdata, fc: &FuncCallSpecs, callees: &[(OpId, (int4, uintb))]) {
+pub fn narrow_call_output(data: &mut Funcdata, fc: &FuncCallSpecs, callees: &[(OpId, (int4, uintb))]) -> KunaResult<()> {
     if !data.get_arch().narrow_ret {
-        return;
+        return Ok(());
     }
-    let Some(k) = key(fc.get_entry_address()) else { return };
+    let Some(k) = key(fc.get_entry_address()) else { return Ok(()) };
     let Some(stated) = data.kuna_narrowret(k).cloned() else {
-        return;
+        return Ok(());
     };
     let op = fc.get_op();
     let Some(out) = data
@@ -352,48 +353,37 @@ pub fn narrow_call_output(data: &mut Funcdata, fc: &FuncCallSpecs, callees: &[(O
         .filter(|o| o.code() == OpCode::CPUI_CALL)
         .and_then(|o| o.get_out())
     else {
-        return;
+        return Ok(());
     };
     let callee = |c: OpId| callees.iter().find(|(o, _)| *o == c).map(|(_, k)| *k);
     if !holds_low_part(data, out, &stated)
         || !sole_value(data, out, &stated, &callee)
         || !sole_tail(data, op, &stated, &callee)
     {
-        return;
+        return Ok(());
     }
     let size = data.vbank().get(out).map(|v| v.get_size()).unwrap_or(0);
     if size > stated.size {
         let Some(at) = data.obank().get(op).map(|o| o.get_addr().clone()) else {
-            return;
+            return Ok(());
         };
         let before = ReadBefore {
             used: crate::kuna_voidret::used_storage(data, out),
             read: data.vbank().get(out).and_then(crate::kuna_voidret::read_storage),
         };
         data.kuna_note_narrowret_read(op, before);
-        data.op_unset_output(op);
+        data.op_unset_output(op)?;
         let ext = data.new_op(1, at);
         data.op_set_opcode_code(ext, OpCode::CPUI_INT_ZEXT);
         if let Some(e) = data.obank_mut().get_mut(ext) {
             e.set_additional_flag(kuna_narrowret);
         }
-        if data.op_set_output(ext, out).is_err() {
-            let _ = data.op_destroy_raw(ext);
-            let _ = data.op_set_output(op, out);
-            return;
-        }
-        let Ok(narrow) = data.new_varnode_out(stated.size, &stated.addr, op) else {
-            data.op_unset_output(ext);
-            let _ = data.op_destroy_raw(ext);
-            let _ = data.op_set_output(op, out);
-            return;
-        };
+        data.op_set_output(ext, out)?;
+        let narrow = data.new_varnode_out(stated.size, &stated.addr, op)?;
         if let Some(n) = data.vbank_mut().get_mut(narrow) {
             n.set_write_mask();
         }
-        if data.op_set_input(ext, narrow, 0).is_err() {
-            return;
-        }
+        data.op_set_input(ext, narrow, 0)?;
         data.op_insert_after(ext, op);
         if trace() {
             eprintln!(
@@ -407,6 +397,7 @@ pub fn narrow_call_output(data: &mut Funcdata, fc: &FuncCallSpecs, callees: &[(O
     if stated.truth() {
         data.op_mark_calculated_bool(op);
     }
+    Ok(())
 }
 
 /// The `unsigned char` or `bool` the callee of the CALL `op` (spec `fc`)

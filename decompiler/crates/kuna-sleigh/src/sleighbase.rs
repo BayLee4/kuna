@@ -718,13 +718,13 @@ impl RegisterLookup for SnapshotRegisterLookup {
             .ok_or_else(|| KunaError::sleigh(format!("Unknown register name: {nm}")))
     }
 
-    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
-        String::from_utf8_lossy(register_name_from_xref(&self.xref, base, off, size)).into_owned()
+    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
+        Ok(String::from_utf8_lossy(register_name_from_xref(&self.xref, base, off, size)).into_owned())
     }
 
-    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
-        String::from_utf8_lossy(exact_register_name_from_xref(&self.xref, base, off, size))
-            .into_owned()
+    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
+        Ok(String::from_utf8_lossy(exact_register_name_from_xref(&self.xref, base, off, size))
+            .into_owned())
     }
 }
 

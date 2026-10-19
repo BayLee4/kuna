@@ -34,6 +34,16 @@ is created, and every phase from lift to emission reads it. What lives in
 `p5_types` is the *inference* — the passes that decide which type a Varnode
 carries.
 
+At architecture registration, an explicit `<data_organization>` is a sparse
+override of Ghidra's `DataOrganizationImpl` defaults: char 1, wchar/short 2,
+int/long 4, long long 8, and float/double/long double 4/8/8 bytes. Pointer
+width starts from the target address space and an explicit `pointer_size`
+overrides it. Supplied widths and size/alignment entries override those
+defaults; omitted `long_size` does not imply an eight-byte long on ILP32.
+When no organization document exists, the standalone `setup_sizes` heuristic
+is unchanged. Option resets and model publication do not rewrite the
+registered organization or held source types.
+
 The qualifier representation in
 `decompiler/crates/kuna-decomp/src/p5_types/kuna_typequal.rs` distinguishes a
 volatile pointee from a volatile pointer object. Type ordering prefers the
@@ -190,15 +200,26 @@ pointer. The reference is weak, so a record that points at itself is not an
 owning cycle. Renaming a completed record (`typedef struct Node { ... }
 Renamed;`) moves the cell to the renamed copy. A record held by value while it
 is still incomplete, directly or as an array element, is rejected
-(`TypeFactoryImpl::assign_raw_fields_struct`). Only a grammar-declared record
-carries the cell: a stub from `get_type_struct` or `get_type_union` (the DWARF,
-library-prototype and Objective-C importers, a decoded type, a synthesized
-structure's shell) is completed with upstream's re-keying alone, so a DWARF
-`struct node { struct node *next; }` keeps the shell one level down (chapter 01)
-and a synthesized structure keeps `resolve_self_pointer` (§5.2). Extending the
-link to DWARF needs the importer's merge-by-name fixed first: it completes one
-unit's forward declaration with another unit's definition of the same tag, so a
-link would read an opaque pointer in a third unit as the wrong layout.
+(`TypeFactoryImpl::assign_raw_fields_struct`). Producer-authorized DWARF records
+and decoded records now reserve the exact `(name,id)` identity before descent
+and share the same weak completion mechanism. DWARF identity carries object,
+debug section, compilation unit and DIE coordinates; a same-spelled record in
+another unit cannot complete an unrelated forward declaration. Parsed and
+decoded callable definitions likewise reserve before recursive decoding.
+Plain `get_type_struct`/`get_type_union` shells keep their original raw re-keying
+contract, including synthesis's `resolve_self_pointer` (§5.2). Canonical Code
+prototypes never own completion-retention backedges: independent working
+prototypes and per-entry source readers retain their resolved dependencies
+alongside their original roots.
+Decoded incomplete record shells also remain immutable through the raw
+`get_ptr_to` accessor; semantic factory descent resolves their exact completion.
+Wire pointer address spaces are retained through interning, relative-pointer
+comparison, resizing, truncation, descent and encoding; a missing named space
+is an error, not an unbanked pointer. An alternate pointer width of zero means
+truncation is disabled, including before target widths have been configured.
+Relative-pointer dependency comparison reads both operands' banks, so identical
+banked construction and repeated full definitions reuse the canonical type,
+while distinct banks remain distinct.
 
 **The data organization.** The factory also carries the target's C scalar
 widths, decoded from the compiler spec's `<data_organization>` by
@@ -1443,6 +1464,19 @@ address computed from a base (`&v4`, `&a1[2]`, a `PTRSUB` or `PTRADD`), whose C
 type is the base's rather than its own, which takes `void *`. A call any of
 whose types has no C spelling (a partial or union-resolving type, an array, a
 `TYPE_SPACEBASE`, a scalar of a width C has no type for) is skipped.
+
+The receiver's derived `CallTargetPublication` selects the publication, not
+the proof. `Full` is the CLI default and the enhanced Ghidra policy; the existing
+High, implied-load, public parameter/global and synthesized-field behavior below
+remains unchanged. An ordinary Ghidra receiver uses `PerCallOnly`: the same
+original-phase action acquires the existing per-op callable receipt and returns
+before any High or field publication. Authored/source signatures, locked or
+variadic calls, custom/hidden roles, injection and incomplete prototypes retain
+their existing owners. The ordinary receipt is unavailable through the type
+requirement/CAST getter; only structural C rendering borrows it. It never enters
+the inference lattice, raw call prototype, public High, or native type codec.
+Acquisition is not moved after `ActionSetCasts`: that action can interpose CASTs
+between a call and the INDIRECT clobbers used by the admission below.
 
 The type must also be one a C compiler would pass the same way. Laid out under
 the default model, each parameter of the built prototype has to fall inside the

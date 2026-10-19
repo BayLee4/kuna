@@ -480,44 +480,44 @@ impl Action for ActionStripMsvcStackGuard {
         }))
     }
 
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let strip = self.enabled || data.get_arch().strip_msvc_stack_guard;
         // `calleeretpreserves` also consumes the exact cookie mark for a locked
         // void declaration. It preserves the caller's ABI return storage but
         // leaves the check and all cookie algebra intact.
         if !strip && !data.get_arch().callee_ret_preserves {
-            return 0;
+            return Ok(0);
         }
         if data.num_calls() == 0 {
-            return 0;
+            return Ok(0);
         }
-        let Some(sp) = stack_pointer_storage(data) else { return 0 };
+        let Some(sp) = stack_pointer_storage(data) else { return Ok(0) };
         let calls = cookie_check_calls(data, &sp, !strip, !strip);
         if !strip {
             if calls.is_empty() {
-                return 0;
+                return Ok(0);
             }
             for (op, _) in calls {
                 let site = data.obank().get(op).expect("cookie checker op").get_addr().clone();
                 data.get_override_mut().insert_msvc_cookie_call(site);
             }
             data.set_restart_pending(true);
-            return 0;
+            return Ok(0);
         }
-        let Some((op, inits)) = calls.into_iter().next() else { return 0 };
+        let Some((op, inits)) = calls.into_iter().next() else { return Ok(0) };
         let site = data.obank().get(op).expect("cookie checker op").get_addr().clone();
         if !data.get_override().is_msvc_cookie_call(&site) {
             data.get_override_mut().insert_msvc_cookie_call(site);
             data.set_restart_pending(true);
-            return 0;
+            return Ok(0);
         }
         if !strip {
-            return 0;
+            return Ok(0);
         }
         let mut slots: Vec<(Address, int4)> = Vec::new();
         collect_value_slots(&inits, data, &mut slots);
         data.delete_call_specs(op);
-        data.op_destroy(op);
+        data.op_destroy(op)?;
         // The check is gone; release the entry-side scramble's frame slot so the
         // following ActionDeadCode collects the store, the cookie read and the
         // scramble itself instead of leaving a dead `v = cookie ^ SP`.
@@ -525,7 +525,7 @@ impl Action for ActionStripMsvcStackGuard {
         self.base.count += 1;
         // One check per apply; the fullloop re-invokes and self-gates (this
         // call and its argument chain are gone on the next pass).
-        1
+        Ok(1)
     }
 }
 

@@ -7,8 +7,8 @@ name: Release binaries
 # version scheme -- VERSION file = MAJOR, commits since it last changed = MINOR
 # -- lives in scripts/version.sh and docs/release.md.
 #
-# The release also ships a ready-to-install KunaDecompiler Ghidra extension
-# zip with prebuilt kuna_ghidra backends for every platform (the ghidra-ext
+# The release also ships one full KunaDecompiler Ghidra extension zip, with Java
+# owners/helpers and prebuilt kuna_ghidra backends for every platform (the ghidra-ext
 # job), so airgapped users can install without cargo or network access.
 #
 # Cadence: ONE release a night, batching whatever landed that day, not one per
@@ -40,13 +40,13 @@ concurrency:
   group: release
   cancel-in-progress: false
 
-# The Ghidra release the extension zip is built against (and version-locked to;
-# other 12.x installs need "Install Anyway" at the version-mismatch dialog).
+# The Ghidra release the extension is strictly qualified against, under Java 21.
+# "Install Anyway" is not compatibility qualification.
 # The asset filename embeds a build date not derivable from the version, so the
 # full URL is pinned alongside it -- bump both together to retarget.
 env:
-  GHIDRA_VERSION: "12.1.2"
-  GHIDRA_ZIP_URL: "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.2_build/ghidra_12.1.2_PUBLIC_20260605.zip"
+  GHIDRA_VERSION: "12.1.4"
+  GHIDRA_ZIP_URL: "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip"
 
 jobs:
   # Compute MAJOR.MINOR once; everything downstream consumes it.
@@ -244,8 +244,9 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
-  # The ready-to-install KunaDecompiler Ghidra extension: one fat zip carrying
-  # prebuilt kuna_ghidra backends for all five platforms, built with Ghidra's
+  # The ready-to-install KunaDecompiler Ghidra extension carries compiled Java
+  # owners/helpers and current prebuilt kuna_ghidra backends for all five
+  # platforms, built with Ghidra's
   # own support/buildExtension.gradle against the pinned Ghidra release (which
   # stamps the extension version so the installer's version gate matches).
   # The zip must carry unix modes with 0755 on the four unix binaries --
@@ -303,7 +304,7 @@ jobs:
       # required and the runner's preinstalled Gradle satisfies it (verified
       # against 9.7.0 and 8.5). GHIDRA_INSTALL_DIR is passed as an env var
       # because build.gradle gives it precedence over the -P property.
-      - name: Build the extension zip
+      - name: Build the full extension zip
         working-directory: integrations/ghidra/KunaDecompiler
         run: |
           export JAVA_HOME="$JAVA_HOME_21_X64"
@@ -312,19 +313,50 @@ jobs:
 
       # Install-correctness gate: all five os/ binaries present, the four unix
       # ones mode 0755 (Ghidra's installer re-applies exactly these bits), the
-      # version gate satisfied. Then rename so the asset states both versions.
+      # version gate satisfied, native bytes match the current matrix products,
+      # and the mandatory Java owners/helpers and complete compiled closure are present.
       - name: Verify the zip and stage it for release
         run: |
-          zip="$(ls integrations/ghidra/KunaDecompiler/dist/ghidra_*_KunaDecompiler.zip)"
+          ext=integrations/ghidra/KunaDecompiler
+          mkdir -p dist
+          zips=("$ext"/dist/*.zip)
+          [ "${#zips[@]}" -eq 1 ]
+          zip="${zips[0]}"
           zipinfo "$zip"
           listing="$(zipinfo "$zip")"
           for p in linux_x86_64 linux_arm_64 mac_x86_64 mac_arm_64; do
             echo "$listing" | grep -E "^-rwxr-xr-x .* KunaDecompiler/os/$p/kuna_ghidra$"
+            cmp "$ext/os/$p/kuna_ghidra" <(unzip -p "$zip" "KunaDecompiler/os/$p/kuna_ghidra")
           done
           echo "$listing" | grep -E " KunaDecompiler/os/win_x86_64/kuna_ghidra\.exe$"
+          cmp "$ext/os/win_x86_64/kuna_ghidra.exe" <(unzip -p "$zip" KunaDecompiler/os/win_x86_64/kuna_ghidra.exe)
           [ "$(zipinfo -1 "$zip" | cut -d/ -f1 | sort -u)" = "KunaDecompiler" ]
           unzip -p "$zip" KunaDecompiler/extension.properties | grep -qx "version=$GHIDRA_VERSION"
-          mkdir -p dist
+          python3 - "$ext" "$zip" <<'PY'
+          from pathlib import Path
+          import sys
+          import zipfile
+
+          ext, archive = map(Path, sys.argv[1:])
+          patches = ext / "patches/ghidra-12.1.4"
+          helpers = ext / "src/enhanced/java"
+          classes = ext / "build/enhanced/classes"
+          owners = [p.relative_to(patches).as_posix().split("/", 1)[1].removesuffix(".java.patch")
+                    for p in patches.rglob("*.java.patch")]
+          owners += [p.relative_to(helpers).as_posix().removesuffix(".java")
+                     for p in helpers.rglob("*.java")]
+          assert owners, "No mandatory Java owners/helpers"
+          compiled = list(classes.rglob("*.class"))
+          assert compiled, "No compiled Java closure"
+          with zipfile.ZipFile(archive) as package:
+              for owner in owners:
+                  assert package.read(f"KunaDecompiler/bin/main/{owner}.class"), owner
+              for path in compiled:
+                  member = "KunaDecompiler/bin/main/" + path.relative_to(classes).as_posix()
+                  assert package.read(member) == path.read_bytes(), member
+              assert package.read("KunaDecompiler/lib/KunaDecompiler.jar"), "Missing plugin JAR"
+              assert package.read("KunaDecompiler/lib/KunaDecompiler-src.zip"), "Missing source archive"
+          PY
           cp "$zip" "dist/kuna-v${{ needs.version.outputs.version }}-KunaDecompiler-ghidra_${GHIDRA_VERSION}.zip"
 
       - uses: actions/upload-artifact@v4
@@ -357,5 +389,5 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "kuna v$ver" \
             --generate-notes \
-            --notes "$(printf 'Each archive ships `kuna`, one self-contained binary: the decompiler console and the SLEIGH compiler are built in, and so are the compiled SLEIGH specs (unpacked once into the user cache directory on first use). `kuna-v%s-specs.tar.gz` is the same spec tree, for `KUNA_SPECS`. See docs/release.md.\n\n`kuna-v%s-KunaDecompiler-ghidra_%s.zip` is the ready-to-install KunaDecompiler extension for **Ghidra %s** (in Ghidra: File -> Install Extensions... -> `+` -> pick the zip -> restart -> enable KunaDecompilerPlugin). It bundles prebuilt `kuna_ghidra` backends for Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64, so it installs fully airgapped: the Ghidra release zip plus this zip are the only two files needed -- no network, no Rust toolchain. The zip is version-locked to Ghidra %s; other Ghidra 12.x versions can choose "Install Anyway" at the version-mismatch dialog (compatibility unverified).' "$ver" "$ver" "$GHIDRA_VERSION" "$GHIDRA_VERSION" "$GHIDRA_VERSION")" \
+            --notes "$(printf 'Each archive ships `kuna`, one self-contained binary: the decompiler console and the SLEIGH compiler are built in, and so are the compiled SLEIGH specs (unpacked once into the user cache directory on first use). `kuna-v%s-specs.tar.gz` is the same spec tree, for `KUNA_SPECS`. See docs/release.md.\n\nThe full Ghidra extension is `kuna-v%s-KunaDecompiler-ghidra_%s.zip`, strictly qualified for **Ghidra %s with Java 21**. It includes matching Java owners/helpers and prebuilt `kuna_ghidra` backends for Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64. It installs fully airgapped (no network or Rust toolchain). In Ghidra: File -> Install Extensions... -> `+` -> select the zip -> restart -> enable KunaDecompilerPlugin. Uninstall the previous KunaDecompiler extension and restart before replacing it. The native-core diagnostic toggle does not unload Java classes; uninstall and restart to remove them. Do not bypass the version gate with "Install Anyway".' "$ver" "$ver" "$GHIDRA_VERSION" "$GHIDRA_VERSION")" \
             dist/*

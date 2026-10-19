@@ -1,0 +1,62 @@
+// Version-qualified Java owners included in the KunaDecompiler extension.
+
+final String supportedGhidra = '12.1.4'
+final File install = new File(kunaGhidraInstallDir).canonicalFile
+final File applicationProperties = new File(install, 'Ghidra/application.properties')
+final File ownerPatches = file('patches/ghidra-12.1.4')
+final File newSources = file('src/enhanced/java')
+final File enhancedSources = layout.buildDirectory.dir('enhanced/sources').get().asFile
+final File enhancedClasses = layout.buildDirectory.dir('enhanced/classes').get().asFile
+
+tasks.register('checkEnhancedGhidraVersion') {
+    inputs.file(applicationProperties)
+    doLast {
+        Properties application = new Properties()
+        applicationProperties.withInputStream { application.load(it) }
+        if (application.getProperty('application.version') != supportedGhidra) {
+            throw new GradleException('KunaDecompiler requires Ghidra ' + supportedGhidra)
+        }
+    }
+}
+
+tasks.register('prepareEnhancedIntegrationSources', Exec) {
+    dependsOn 'checkEnhancedGhidraVersion'
+    inputs.files(fileTree(ownerPatches) { include '**/*.patch' })
+    inputs.files(fileTree(newSources) { include '**/*.java' })
+    inputs.file('prepare_enhanced.py')
+    inputs.files(
+        new File(install, 'Ghidra/Features/Decompiler/lib/Decompiler-src.zip'),
+        new File(install, 'Ghidra/Framework/SoftwareModeling/lib/SoftwareModeling-src.zip'),
+        new File(install, 'Ghidra/Features/Base/lib/Base-src.zip'))
+    outputs.dir(enhancedSources)
+    doFirst { delete enhancedSources }
+    commandLine(System.env.PYTHON ?: 'python3', file('prepare_enhanced.py'),
+        '--ghidra-install', install, '--patches', ownerPatches, '--new-sources', newSources,
+        '--output', enhancedSources, '--version', supportedGhidra)
+}
+
+tasks.register('compileEnhancedIntegration', JavaCompile) {
+    dependsOn 'prepareEnhancedIntegrationSources'
+    source = fileTree(enhancedSources) { include '**/*.java' }
+    classpath = files(fileTree(install) { include '**/*.jar' })
+    destinationDirectory = enhancedClasses
+    options.release = 21
+    options.encoding = 'UTF-8'
+}
+
+tasks.named('buildExtension', Zip) {
+    dependsOn 'compileEnhancedIntegration'
+    from(enhancedClasses) {
+        into project.name + '/bin/main'
+    }
+    doFirst {
+        def platform = providers.gradleProperty('kunaPlatform').orNull
+        def nativeRoot = platform == null ? file('os') : file('os/' + platform)
+        if (fileTree(nativeRoot).matching {
+            include '**/kuna_ghidra', '**/kuna_ghidra.exe'
+        }.isEmpty()) {
+            throw new GradleException('Stage a matching kuna_ghidra native executable before ' +
+                'packaging KunaDecompiler, or use ./build.sh')
+        }
+    }
+}

@@ -38,7 +38,30 @@ impl Fx {
         Self::with_return_address(Some((0, 8)))
     }
 
+    pub(crate) fn with_stack_views() -> Self {
+        Self::with_return_address_and_views(Some((0, 8)), true)
+    }
+
+    pub(crate) fn with_stack_views_and_join() -> Self {
+        Self::with_layout(Some((0, 8)), true, true)
+    }
+
     fn with_return_address(return_address: Option<(u64, u32)>) -> Self {
+        Self::with_return_address_and_views(return_address, false)
+    }
+
+    fn with_return_address_and_views(
+        return_address: Option<(u64, u32)>,
+        stack_views: bool,
+    ) -> Self {
+        Self::with_layout(return_address, stack_views, false)
+    }
+
+    fn with_layout(
+        return_address: Option<(u64, u32)>,
+        stack_views: bool,
+        join: bool,
+    ) -> Self {
         let original = build_fd();
         let mut manager = Rc::clone(&original.get_arch().manage);
         let entry = original.get_address().clone();
@@ -56,6 +79,9 @@ impl Fx {
             0,
         ));
         manager_mut.insert_space(Rc::clone(&ram)).unwrap();
+        if join {
+            manager_mut.insert_space(Rc::new(kuna_base::space::JoinSpace::new(5, false))).unwrap();
+        }
         let code_index = manager_mut
             .get_space_by_name("register")
             .unwrap()
@@ -64,6 +90,8 @@ impl Fx {
         manager_mut.set_default_data_space(ram.get_index()).unwrap();
         let stack = Rc::clone(manager.get_stack_space().unwrap());
         let mut arch = ArchContext::new_shared(Rc::clone(&manager));
+        arch.stack_views = stack_views;
+        arch.callee_preserves = true;
         arch.default_return_addr =
             return_address.map(|(offset, size)| kuna_num::pcoderaw::VarnodeData {
                 space: Some(Rc::clone(&stack)),
@@ -73,7 +101,7 @@ impl Fx {
         let fd = Funcdata::new("func", "func", Rc::new(arch), entry, 0x1000_0000, 0x40).unwrap();
         let mut fd = fd;
         let sp = make_sp_in(&mut fd);
-        fd.spacebase();
+        fd.spacebase().unwrap();
         let reg = Rc::clone(
             fd.get_arch()
                 .manage()
@@ -239,7 +267,7 @@ pub(crate) fn call_with_r8_argument(
         8,
         &Address::new(Rc::clone(&fx.stack), (-56i64) as u64),
         None,
-    );
+    ).unwrap();
     let (_, placeholder) = fx.emit(OpCode::CPUI_COPY, &[stack_ref], Some(Out::Unique(8)));
     let placeholder = placeholder.unwrap();
     let target = fx.constant(8, 0x2000);
@@ -321,7 +349,7 @@ fn home_gap_requires_a_declared_eight_byte_return_slot_before_it() {
 }
 
 #[test]
-fn home_gap_requires_a_stored_locked_resolved_known_model() {
+fn home_gap_requires_locked_inputs_and_a_stored_concrete_model_not_an_authored_convention() {
     let mut fx = Fx::new();
 
     let no_model = FuncProto::new();
@@ -366,7 +394,8 @@ fn home_gap_requires_a_stored_locked_resolved_known_model() {
     let call = call_with_proto(&mut fx, &unlocked_model);
     assert!(call.proto().is_input_locked());
     assert!(!call.proto().is_model_locked());
-    assert!(verified_home_gap(&fx.fd, &call).is_none());
+    assert!(verified_home_gap(&fx.fd, &call).is_some(),
+        "identical concrete geometry does not depend on an authored convention lock");
 
     let mut unresolved = FuncProto::new();
     unresolved.set_internal(
@@ -427,7 +456,7 @@ fn caller_stack_reads_and_direct_stack_variables_observe_home_cells() {
     let marker = fx.marker();
     let stack_var = fx
         .fd
-        .new_varnode(8, &Address::new(Rc::clone(&fx.stack), HOME as u64), None);
+        .new_varnode(8, &Address::new(Rc::clone(&fx.stack), HOME as u64), None).unwrap();
     fx.emit(OpCode::CPUI_COPY, &[stack_var], Some(Out::Unique(8)));
     assert!(!caller_home_unobserved(&fx.fd, marker, HOME as u64, 8));
 }
@@ -453,7 +482,7 @@ fn unresolved_caller_memory_accesses_block_even_without_stack_ancestry() {
                     .unwrap()
             } else {
                 fx.fd
-                    .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x80), None)
+                    .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x80), None).unwrap()
             };
             assert!(!super::stack_derived(&fx.fd, pointer));
             assert!(super::frame_range(&fx.fd, pointer, 8).is_none());

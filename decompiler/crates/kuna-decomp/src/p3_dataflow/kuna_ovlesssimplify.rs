@@ -72,49 +72,49 @@ impl Rule for RuleOvLessSimplify {
 
     /// C++ `RuleOvLessSimplify::applyOp` (`kuna_ovlesssimplify.cc:48`) —
     /// transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (kuna) gate (ArchContext-carried).
         if !self.enabled && !data.get_arch().ov_less_simplify {
-            return 0;
+            return Ok(0);
         }
 
         // Match  NE( SLESS(V+K,0) , BOOL_AND( signTest , SLESS(-1, V+K) ) )
         let in0 = match op_in(data, op, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let in1 = match op_in(data, op, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
 
         // in0 = INT_SLESS(R1, 0)
         if !vn_is_written(data, in0) {
-            return 0;
+            return Ok(0);
         }
         let sless0 = vn_def(data, in0).expect("in0 written");
         if op_code(data, sless0) != OpCode::CPUI_INT_SLESS {
-            return 0;
+            return Ok(0);
         }
         let r1 = match op_in(data, sless0, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let zero = match op_in(data, sless0, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, zero) || vn_offset(data, zero) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         // in1 = BOOL_AND(signTest, SLESS(-1, R2))
         if !vn_is_written(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let andop = vn_def(data, in1).expect("in1 written");
         if op_code(data, andop) != OpCode::CPUI_BOOL_AND {
-            return 0;
+            return Ok(0);
         }
 
         // Locate the SLESS(-1, R2) limb of the AND; the other limb is the sign
@@ -148,37 +148,37 @@ impl Rule for RuleOvLessSimplify {
         }
         let sless_hi = match sless_hi {
             Some(c) => c,
-            None => return 0,
+            None => return Ok(0),
         };
         let r2 = match op_in(data, sless_hi, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
 
         // R1 and R2 must both be `V + K` with the same V and same K.
         let (base1, k1) = match match_add_const(data, r1) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         let (base2, k2) = match match_add_const(data, r2) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         if base1 != base2 {
-            return 0;
+            return Ok(0);
         }
         if k1 != k2 {
-            return 0;
+            return Ok(0);
         }
         if vn_size(data, r1) != vn_size(data, r2) {
-            return 0;
+            return Ok(0);
         }
 
         // Collapse:  V s< -K   (negate K within V's size)
         let sz: int4 = vn_size(data, base1);
         // The ADD width must match V's width.
         if vn_size(data, r1) != sz {
-            return 0;
+            return Ok(0);
         }
         let ksigned: intb = sign_extend(k1 as intb, sz * 8 - 1);
         let negk: uintb = (ksigned.wrapping_neg() as uintb) & calc_mask(sz);
@@ -190,7 +190,7 @@ impl Rule for RuleOvLessSimplify {
         let negk_vn = data.new_constant(sz, negk);
         data.op_set_input(op, negk_vn, 1)
             .expect("RuleOvLessSimplify: opSetInput const (internal invariant)");
-        1
+        Ok(1)
     }
 }
 

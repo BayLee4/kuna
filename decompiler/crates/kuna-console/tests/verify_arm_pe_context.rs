@@ -41,7 +41,7 @@ fn thumb_machine_pe_normalizes_entry_and_decompiles() {
     assert_eq!(odd.addr.get_offset(), 0x401000);
     assert_eq!(even.addr.get_offset(), 0x401000);
 
-    let result = decompile_targets(&mut program, vec![odd], true, false, false);
+    let result = decompile_targets(&mut program, vec![odd], true, false, false).unwrap();
     assert_eq!(result.len(), 1);
     assert!(result[0].error.is_none(), "{:?}", result[0].error);
     let code = result[0].code.as_deref().unwrap();
@@ -61,7 +61,7 @@ fn explicit_thumb_mode_uses_container_mapping() {
     ).expect("bootstrap fixture with built processor specs");
     program.commit_pending_analysis().unwrap();
     let entry = program.find_entry_at(0x401001).unwrap();
-    let result = decompile_targets(&mut program, vec![entry], true, false, false);
+    let result = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
     assert!(result[0].code.as_deref().unwrap().contains("return 7;"));
 }
 
@@ -83,7 +83,7 @@ fn unmarked_a32_return_remains_successful() {
     .unwrap();
     arm.commit_pending_analysis().unwrap();
     let entry = arm.find_entry_at(0x401000).unwrap();
-    let result = decompile_targets(&mut arm, vec![entry], true, false, false);
+    let result = decompile_targets(&mut arm, vec![entry], true, false, false).unwrap();
     assert!(result[0].error.is_none(), "genuine A32 return was rejected");
     assert!(result[0].code.as_deref().unwrap().contains("return;"));
 
@@ -117,7 +117,7 @@ fn unmarked_a32_branch_to_return_is_not_ambiguous() {
     .unwrap();
     program.commit_pending_analysis().unwrap();
     let entry = program.find_entry_at(0x401000).unwrap();
-    let results = decompile_targets(&mut program, vec![entry], true, false, false);
+    let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(results[0].code.as_deref().unwrap().contains("return;"));
     std::fs::remove_file(path).unwrap();

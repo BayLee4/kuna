@@ -64,24 +64,24 @@ impl FloatScan {
 /// Does the program only move the `size`-byte global at `addr` through float
 /// registers?  `false` while the answer is not known yet, and the function is
 /// marked so the console takes the scan and decides it again.
-pub(crate) fn float_only(data: &Funcdata, addr: &Address, size: int4) -> bool {
+pub(crate) fn float_only(data: &Funcdata, addr: &Address, size: int4) -> kuna_base::error::KunaResult<bool> {
     let glb = data.get_arch();
     if !matches!(size, 4 | 8) {
-        return false;
+        return Ok(false);
     }
     let data_space = glb.manage().get_default_data_space();
     if !addr.get_space().zip(data_space).is_some_and(|(s, d)| Rc::ptr_eq(s, d)) {
-        return false;
+        return Ok(false);
     }
-    match &glb.float_globals {
+    Ok(match &glb.float_globals {
         Some(found) => {
-            found.get(&addr.get_offset()) == Some(&(size as u8)) && crate::kuna_floatreg::moved_as_a_float_here(data, addr, size)
+            found.get(&addr.get_offset()) == Some(&(size as u8)) && crate::kuna_floatreg::moved_as_a_float_here(data, addr, size)?
         }
         None => {
-            if glb.float_globals_pending && crate::kuna_floatreg::moved_as_a_float_here(data, addr, size) {
+            if glb.float_globals_pending && crate::kuna_floatreg::moved_as_a_float_here(data, addr, size)? {
                 glb.float_globals_wanted.set(true);
             }
             false
         }
-    }
+    })
 }

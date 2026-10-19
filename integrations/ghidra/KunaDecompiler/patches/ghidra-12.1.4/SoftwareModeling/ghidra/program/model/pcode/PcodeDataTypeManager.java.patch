@@ -1,0 +1,734 @@
+--- a/ghidra/program/model/pcode/PcodeDataTypeManager.java
++++ b/ghidra/program/model/pcode/PcodeDataTypeManager.java
+@@ -19,8 +19,8 @@
+ import static ghidra.program.model.pcode.ElementId.*;
+ 
+ import java.io.IOException;
+-import java.util.HashMap;
+-import java.util.Map;
++import java.util.*;
++import java.util.function.BooleanSupplier;
+ 
+ import ghidra.app.plugin.processors.sleigh.SleighLanguage;
+ import ghidra.docking.settings.FormatSettingsDefinition;
+@@ -42,6 +42,577 @@
+  *
+  */
+ public class PcodeDataTypeManager {
++	public static final int RESULT_VERSION = 1;
++	public static final ElementId ELEM_KUNA_RESULT = new ElementId("kuna_result", 4000);
++	public static final ElementId ELEM_KUNA_TYPE = new ElementId("kuna_type", 4003);
++	public static final ElementId ELEM_KUNA_DEFINITION = new ElementId("kuna_definition", 4002);
++	public static final AttributeId ATTRIB_KUNA_RESULT_VERSION =
++		new AttributeId("kuna_result_version", 4003);
++	public static final AttributeId ATTRIB_KUNA_LOCAL = new AttributeId("kuna_local", 4004);
++	public static final ElementId ELEM_QUALIFIED = new ElementId("qualified", 4094);
++
++	/** Result-only layered C qualification; it is not an authored typedef declaration. */
++	public static class ResultQualifiedDataType extends TypedefDataType {
++		public static final int CONST = 1;
++		public static final int RESTRICT = 2;
++		public static final int VOLATILE = 4;
++		private final int qualifiers;
++
++		private ResultQualifiedDataType(String name, DataType base, int qualifiers,
++				DataTypeManager manager) {
++			super(CategoryPath.ROOT, name, base, manager);
++			this.qualifiers = qualifiers;
++		}
++
++		public int getQualifiers() {
++			return qualifiers;
++		}
++
++		@Override
++		public TypedefDataType clone(DataTypeManager manager) {
++			return manager == getDataTypeManager() ? this :
++				new ResultQualifiedDataType(getName(), getDataType(), qualifiers, manager);
++		}
++	}
++
++	/** A lossless internal slice; formal consumers use the stock stripped-type projection. */
++	public static final class ResultPartialDataType extends PartialUnion {
++		private final String kind;
++
++		private ResultPartialDataType(DataTypeManager manager, DataType parent, int offset,
++				int size, String kind) {
++			super(manager, parent, offset, size);
++			this.kind = kind;
++		}
++
++		public String getKind() {
++			return kind;
++		}
++
++		public DataType getParentDataType() {
++			return getParent();
++		}
++
++		@Override
++		public String getDescription() {
++			return kind + " (internal)";
++		}
++
++		@Override
++		public DataType clone(DataTypeManager manager) {
++			return manager == getDataTypeManager() ? this : copy(manager);
++		}
++
++		@Override
++		public DataType copy(DataTypeManager manager) {
++			return new ResultPartialDataType(manager, getParent(), getOffset(), getLength(), kind);
++		}
++	}
++
++	// A result view shares source/core objects, but owns its local namespace and used temporary IDs.
++	private PcodeDataTypeManager captureSource;
++	private boolean resultView;
++	private boolean enhancedResult;
++	private long sourceRevision;
++	private BooleanSupplier registrationAuthority;
++	private BooleanSupplier exportAuthority;
++	private Map<Long, DataType> resultTypes;
++	private Collection<DataType> resultDataTypes = Collections.emptyList();
++	private Collection<DataType> retainedSourceDataTypes = Collections.emptyList();
++	private IdentityHashMap<DataType, ResultTypeNode> resultReservations;
++	private IdentityHashMap<DataType, Long> retainedTemporaryIds;
++
++	private PcodeDataTypeManager(PcodeDataTypeManager source, BooleanSupplier exportAuthority,
++			long sourceRevision) {
++		program = source.program;
++		progDataTypes = source.progDataTypes;
++		builtInDataTypes = source.builtInDataTypes;
++		dataOrganization = source.dataOrganization;
++		nameTransformer = source.nameTransformer;
++		displayLanguage = source.displayLanguage;
++		voidInputIsVarargs = source.voidInputIsVarargs;
++		coreBuiltin = source.coreBuiltin;
++		voidDt = source.voidDt;
++		charMap = source.charMap;
++		wCharMap = source.wCharMap;
++		wChar16Map = source.wChar16Map;
++		wChar32Map = source.wChar32Map;
++		byteMap = source.byteMap;
++		pointerWordSize = source.pointerWordSize;
++		tempIDCounter = source.tempIDCounter;
++		captureSource = source;
++		resultView = true;
++		this.sourceRevision = sourceRevision;
++		registrationAuthority = source.registrationAuthority;
++		this.exportAuthority = exportAuthority;
++	}
++
++	public PcodeDataTypeManager createResultView() {
++		return createResultView(program.getModificationNumber());
++	}
++
++	/** Retain the source basis captured before acquiring the complete native document. */
++	public PcodeDataTypeManager createResultView(long sourceRevision) {
++		return new PcodeDataTypeManager(this, null, sourceRevision);
++	}
++
++	/** A readable export result never grants authority to edit the source Program. */
++	public PcodeDataTypeManager createExportResultView(BooleanSupplier exportAuthority) {
++		return createExportResultView(exportAuthority, program.getModificationNumber());
++	}
++
++	public PcodeDataTypeManager createExportResultView(BooleanSupplier exportAuthority,
++			long sourceRevision) {
++		return new PcodeDataTypeManager(this, Objects.requireNonNull(exportAuthority),
++			sourceRevision);
++	}
++
++	/** End capture only after High, parameter measurements, and C markup have all decoded. */
++	public void finishResultDecode() {
++		if (captureSource != null) {
++			tempIDCounter = Math.max(tempIDCounter, captureSource.tempIDCounter);
++			retainedSourceDataTypes = retainedTemporaryIds == null ? Collections.emptyList() :
++				List.copyOf(retainedTemporaryIds.keySet());
++			captureSource = null;
++		}
++	}
++
++	/** Exact NONDB host objects used during complete DOC decoding, excluding later allocations. */
++	public Collection<DataType> getRetainedSourceDataTypes() {
++		return retainedSourceDataTypes;
++	}
++
++	public boolean isEnhancedResult() {
++		return enhancedResult;
++	}
++
++	public boolean isExportResult() {
++		return exportAuthority != null;
++	}
++
++	public boolean hasCurrentExportAuthority() {
++		return hasCurrentResultBasis() &&
++			(exportAuthority == null || exportAuthority.getAsBoolean());
++	}
++
++	public void requireCurrentExportAuthority() {
++		if (!hasCurrentExportAuthority()) {
++			throw new IllegalStateException("Decompiler result export context is stale");
++		}
++	}
++
++	public boolean hasCurrentSourceAuthority() {
++		return !isExportResult() && hasCurrentResultBasis();
++	}
++
++	private boolean hasCurrentResultBasis() {
++		return (!enhancedResult && !isExportResult()) ||
++			(sourceRevision == program.getModificationNumber() &&
++				(registrationAuthority == null || registrationAuthority.getAsBoolean()));
++	}
++
++	/** Install the immutable registration-basis comparison without depending on a UI module. */
++	public void setRegistrationAuthority(BooleanSupplier authority) {
++		registrationAuthority = authority;
++	}
++
++	public void requireCurrentSourceAuthority() {
++		if (!hasCurrentSourceAuthority()) {
++			if (isExportResult()) {
++				throw new IllegalStateException("Export decompiler results cannot edit the source Program");
++			}
++			throw new IllegalStateException("Decompiler result source context is stale");
++		}
++	}
++
++	public boolean isResultLocal(DataType type) {
++		return resultReservations != null && resultReservations.containsKey(type);
++	}
++
++	/** True only when the retained wire reservation supplied a nominal datatype name. */
++	public boolean hasResultTypeName(DataType type) {
++		ResultTypeNode reservation =
++			resultReservations == null ? null : resultReservations.get(type);
++		return reservation != null && !reservation.name.isEmpty();
++	}
++
++	public Collection<DataType> getResultDataTypes() {
++		return resultDataTypes;
++	}
++
++	/** Resolve an explicitly discriminated local reference; never infer ownership from an ID. */
++	public DataType findResultType(String name, long id, long local) throws DecoderException {
++		if (local == 0) {
++			return findBaseType(name, id);
++		}
++		DataType type = resultTypes == null ? null : resultTypes.get(local);
++		if (!enhancedResult || type == null) {
++			throw new DecoderException("Unreserved result-local datatype " + local);
++		}
++		return type;
++	}
++
++	/** A transient wire record, discarded after completing the result-local objects. */
++	private static class ResultTypeNode {
++		int element;
++		String name = "";
++		String meta = "";
++		String model = "";
++		long id;
++		long local;
++		long value;
++		int size;
++		int count;
++		int offset;
++		int first;
++		boolean varargs;
++		boolean noreturn;
++		final List<ResultTypeNode> children = new ArrayList<>();
++
++		ResultTypeNode child(int elementId) {
++			for (ResultTypeNode child : children) {
++				if (child.element == elementId) {
++					return child;
++				}
++			}
++			return null;
++		}
++
++		ResultTypeNode typeChild() throws DecoderException {
++			for (ResultTypeNode child : children) {
++				if (child.element == ELEM_TYPE.id() || child.element == ELEM_TYPEREF.id() ||
++					child.element == ELEM_DEF.id() || child.element == ELEM_VOID.id() ||
++					child.element == ELEM_QUALIFIED.id()) {
++					return child;
++				}
++			}
++			throw new DecoderException("Missing result datatype record");
++		}
++	}
++
++	private static ResultTypeNode readResultTypeNode(Decoder decoder) throws DecoderException {
++		ResultTypeNode node = new ResultTypeNode();
++		node.element = decoder.openElement();
++		for (int attr; (attr = decoder.getNextAttributeId()) != 0;) {
++			if (attr == ATTRIB_NAME.id()) {
++				node.name = decoder.readString();
++			}
++			else if (attr == ATTRIB_METATYPE.id()) {
++				node.meta = decoder.readString();
++			}
++			else if (attr == ATTRIB_MODEL.id()) {
++				node.model = decoder.readString();
++			}
++			else if (attr == ATTRIB_ID.id()) {
++				if (node.element == ELEM_TYPE.id() || node.element == ELEM_TYPEREF.id() ||
++					node.element == ELEM_DEF.id() || node.element == ELEM_KUNA_TYPE.id()) {
++					node.id = decoder.readUnsignedInteger();
++				}
++			}
++			else if (attr == ATTRIB_KUNA_LOCAL.id()) {
++				node.local = decoder.readUnsignedInteger();
++			}
++			else if (attr == ATTRIB_SIZE.id()) {
++				node.size = Math.toIntExact(decoder.readSignedInteger());
++			}
++			else if (attr == ATTRIB_ARRAYSIZE.id()) {
++				node.count = Math.toIntExact(decoder.readSignedInteger());
++			}
++			else if (attr == ATTRIB_OFFSET.id() && node.element != ELEM_ADDR.id()) {
++				node.offset = Math.toIntExact(decoder.readSignedInteger());
++			}
++			else if (attr == ATTRIB_FIRST.id()) {
++				node.first = Math.toIntExact(decoder.readSignedInteger());
++			}
++			else if (attr == ATTRIB_VALUE.id()) {
++				node.value = node.element == ELEM_QUALIFIED.id() ?
++					decoder.readUnsignedInteger() : decoder.readSignedInteger();
++			}
++			else if (attr == ATTRIB_CONTENT.id() && node.element == ELEM_OFF.id()) {
++				node.value = decoder.readSignedInteger();
++			}
++			else if (attr == ATTRIB_DOTDOTDOT.id()) {
++				node.varargs = decoder.readBool();
++			}
++			else if (attr == ATTRIB_NORETURN.id()) {
++				node.noreturn = decoder.readBool();
++			}
++		}
++		while (decoder.peekElement() != 0) {
++			node.children.add(readResultTypeNode(decoder));
++		}
++		decoder.closeElement(node.element);
++		return node;
++	}
++
++	private static class ResultTypeDefinition {
++		ResultTypeNode reservation;
++		ResultTypeNode body;
++		DataType type;
++		boolean resolving;
++		boolean complete;
++	}
++
++	/**
++	 * Admit version 1 only at the DOC boundary. Reservations and definitions are separate so
++	 * every recursive composite, alias, and callable has its final Java identity before descent.
++	 */
++	public void decodeResultPrelude(Decoder decoder) throws DecoderException {
++		if (!resultView || enhancedResult || resultTypes != null) {
++			throw new DecoderException("Unexpected result datatype prelude");
++		}
++		int root = decoder.openElement(ELEM_KUNA_RESULT);
++		if (decoder.readUnsignedInteger(ATTRIB_KUNA_RESULT_VERSION) != RESULT_VERSION) {
++			throw new DecoderException("Unsupported result datatype version");
++		}
++		Map<Long, ResultTypeDefinition> definitions = new LinkedHashMap<>();
++		boolean defining = false;
++		while (decoder.peekElement() != 0) {
++			if (decoder.peekElement() == ELEM_KUNA_TYPE.id() && !defining) {
++				ResultTypeNode reservation = readResultTypeNode(decoder);
++				ResultTypeDefinition definition = new ResultTypeDefinition();
++				definition.reservation = reservation;
++				if (reservation.local == 0 ||
++					definitions.putIfAbsent(reservation.local, definition) != null) {
++					throw new DecoderException("Duplicate or zero result datatype reservation");
++				}
++			}
++			else if (decoder.peekElement() == ELEM_KUNA_DEFINITION.id()) {
++				defining = true;
++				int element = decoder.openElement(ELEM_KUNA_DEFINITION);
++				long handle = decoder.readUnsignedInteger(ATTRIB_KUNA_LOCAL);
++				ResultTypeDefinition definition = definitions.get(handle);
++				if (definition == null || definition.body != null) {
++					throw new DecoderException("Unreserved or duplicate result datatype definition");
++				}
++				definition.body = readResultTypeNode(decoder);
++				decoder.closeElement(element);
++			}
++			else {
++				throw new DecoderException("Unexpected result datatype prelude element");
++			}
++		}
++		decoder.closeElement(root);
++		for (ResultTypeDefinition definition : definitions.values()) {
++			if (definition.body == null) {
++				throw new DecoderException("Missing result datatype definition");
++			}
++			ResultTypeNode reservation = definition.reservation;
++			String meta = definition.body.meta.isEmpty() ? reservation.meta : definition.body.meta;
++			String name = reservation.name.isEmpty() ? "kuna_type_" + reservation.local :
++				reservation.name;
++			if (definition.body.element == ELEM_QUALIFIED.id()) {
++				int qualifiers = Math.toIntExact(definition.body.value);
++				if (qualifiers == 0 || (qualifiers & ~7) != 0) {
++					throw new DecoderException("Invalid result datatype qualifiers");
++				}
++				definition.type = new ResultQualifiedDataType(name,
++					Undefined1DataType.dataType, qualifiers, progDataTypes);
++			}
++			else if (definition.body.element == ELEM_DEF.id()) {
++				definition.type = new TypedefDataType(CategoryPath.ROOT, name,
++					Undefined1DataType.dataType, progDataTypes);
++			}
++			else if (meta.equals("struct")) {
++				definition.type = new StructureDataType(CategoryPath.ROOT, name,
++					reservation.size, progDataTypes);
++			}
++			else if (meta.equals("union")) {
++				definition.type = new UnionDataType(CategoryPath.ROOT, name, progDataTypes);
++			}
++			else if (meta.equals("code") && definition.body.child(ELEM_PROTOTYPE.id()) != null) {
++				definition.type = new FunctionDefinitionDataType(CategoryPath.ROOT, name,
++					progDataTypes);
++			}
++			else if (meta.startsWith("enum_")) {
++				definition.type = new EnumDataType(CategoryPath.ROOT, name,
++					reservation.size, progDataTypes);
++			}
++		}
++		for (ResultTypeDefinition definition : definitions.values()) {
++			completeResultType(definition, definitions);
++		}
++		resultTypes = new LinkedHashMap<>();
++		resultReservations = new IdentityHashMap<>();
++		for (Map.Entry<Long, ResultTypeDefinition> entry : definitions.entrySet()) {
++			DataType type = entry.getValue().type;
++			resultTypes.put(entry.getKey(), type);
++			resultReservations.put(type, entry.getValue().reservation);
++		}
++		resultDataTypes = Collections.unmodifiableCollection(resultTypes.values());
++		enhancedResult = true; // An empty, versioned prelude also acknowledges admission.
++	}
++
++	private DataType resolveResultType(ResultTypeNode node,
++			Map<Long, ResultTypeDefinition> definitions) throws DecoderException {
++		if (node.local != 0) {
++			ResultTypeDefinition definition = definitions.get(node.local);
++			if (definition == null) {
++				throw new DecoderException("Unreserved result datatype reference " + node.local);
++			}
++			return completeResultType(definition, definitions);
++		}
++		if (node.element == ELEM_VOID.id()) {
++			return voidDt;
++		}
++		if (node.element == ELEM_QUALIFIED.id()) {
++			return new ResultQualifiedDataType("qualified",
++				resolveResultType(node.typeChild(), definitions),
++				Math.toIntExact(node.value), progDataTypes);
++		}
++		if (!node.name.isEmpty() || node.element == ELEM_TYPEREF.id()) {
++			DataType type = findBaseType(node.name, node.id);
++			if (type == null) {
++				throw new DecoderException("Unresolved host datatype " + node.name);
++			}
++			return type;
++		}
++		return createResultLeaf(node, definitions);
++	}
++
++	private DataType createResultLeaf(ResultTypeNode node,
++			Map<Long, ResultTypeDefinition> definitions) throws DecoderException {
++		switch (node.meta) {
++			case "ptr":
++				boolean useDefaultSize = (node.size == dataOrganization.getPointerSize() ||
++					node.size > PointerDataType.MAX_POINTER_SIZE_BYTES);
++				return new PointerDataType(resolveResultType(node.typeChild(), definitions),
++					useDefaultSize ? -1 : node.size, progDataTypes);
++			case "ptrrel":
++				if (node.children.size() != 3 || node.child(ELEM_OFF.id()) == null) {
++					throw new DecoderException("Invalid result relative pointer");
++				}
++				return new PointerTypedef(node.name.isEmpty() ? null : node.name,
++					resolveResultType(node.children.get(1), definitions), node.size,
++					progDataTypes, node.child(ELEM_OFF.id()).value);
++			case "array":
++				DataType element = resolveResultType(node.typeChild(), definitions);
++				return new ArrayDataType(element, node.count, element.getLength(), progDataTypes);
++			case "int":
++				return AbstractIntegerDataType.getSignedDataType(node.size, progDataTypes)
++						.copy(progDataTypes);
++			case "uint":
++				return AbstractIntegerDataType.getUnsignedDataType(node.size, progDataTypes)
++						.copy(progDataTypes);
++			case "float":
++				return AbstractFloatDataType.getFloatDataType(node.size, progDataTypes)
++						.copy(progDataTypes);
++			case "bool":
++				return BooleanDataType.dataType.copy(progDataTypes);
++			case "code":
++				// A genuinely unknown executable type has no callable facts to invent.
++				DataType unknownCode = new Undefined1DataType(progDataTypes);
++				return node.name.isEmpty() ? unknownCode :
++					new TypedefDataType(CategoryPath.ROOT, node.name, unknownCode, progDataTypes);
++			case "void":
++			case "spacebase":
++				return new VoidDataType(progDataTypes);
++			case "partunion":
++				return new PartialUnion(progDataTypes,
++					resolveResultType(node.typeChild(), definitions), node.offset, node.size);
++			case "partstruct":
++			case "partenum":
++				return new ResultPartialDataType(progDataTypes,
++					resolveResultType(node.typeChild(), definitions), node.offset, node.size, node.meta);
++			case "unknown":
++				return Undefined.getUndefinedDataType(node.size).copy(progDataTypes);
++			default:
++				throw new DecoderException("Unsupported result datatype metatype " + node.meta);
++		}
++	}
++
++	private DataType completeResultType(ResultTypeDefinition definition,
++			Map<Long, ResultTypeDefinition> definitions) throws DecoderException {
++		if (definition.complete || definition.resolving) {
++			if (definition.type == null) {
++				throw new DecoderException("Result datatype cycle has no nominal owner");
++			}
++			return definition.type;
++		}
++		definition.resolving = true;
++		ResultTypeNode body = definition.body;
++		DataType type = definition.type;
++		try {
++			if (type instanceof TypeDef) {
++				TypeDef alias = (TypeDef) type;
++				type.dataTypeReplaced(alias.getDataType(),
++					resolveResultType(body.typeChild(), definitions));
++			}
++			else if (type instanceof Composite) {
++				for (ResultTypeNode field : body.children) {
++					if (field.element != ELEM_FIELD.id() && field.element != ELEM_BITFIELD.id()) {
++						throw new DecoderException("Unexpected result composite member");
++					}
++					ResultTypeNode memberRecord = field.typeChild();
++					DataType member = resolveResultType(memberRecord, definitions);
++					int memberLength = memberRecord.size > 0 ? memberRecord.size : member.getLength();
++					if (type instanceof Structure) {
++						Structure structure = (Structure) type;
++						if (field.element == ELEM_BITFIELD.id()) {
++							structure.insertBitFieldAt(field.offset, member.getLength(), field.first,
++								member, field.size, field.name, null);
++						}
++						else {
++							structure.replaceAtOffset(field.offset, member, memberLength,
++								field.name, null);
++						}
++					}
++					else if (field.element == ELEM_BITFIELD.id()) {
++						((Union) type).addBitField(member, field.size, field.name, null);
++					}
++					else {
++						((Union) type).add(member, memberLength, field.name, null);
++					}
++				}
++			}
++			else if (type instanceof Enum) {
++				for (ResultTypeNode value : body.children) {
++					if (value.element != ELEM_VAL.id()) {
++						throw new DecoderException("Unexpected result enumeration member");
++					}
++					((Enum) type).add(value.name, value.value);
++				}
++			}
++			else if (type instanceof FunctionDefinition) {
++				ResultTypeNode prototype = body.child(ELEM_PROTOTYPE.id());
++				if (prototype == null || prototype.child(ELEM_RETURNSYM.id()) == null) {
++					throw new DecoderException("Missing result callable prototype");
++				}
++				FunctionDefinition function = (FunctionDefinition) type;
++				function.setReturnType(resolveResultType(
++					prototype.child(ELEM_RETURNSYM.id()).typeChild(), definitions));
++				List<ParameterDefinition> parameters = new ArrayList<>();
++				ResultTypeNode inputs = prototype.child(ELEM_INTERNALLIST.id());
++				if (inputs != null) {
++					for (ResultTypeNode parameter : inputs.children) {
++						if (parameter.element == ELEM_RETPARAM.id()) {
++							continue; // The canonical codec repeats the result in its internal store.
++						}
++						if (parameter.element != ELEM_PARAM.id()) {
++							throw new DecoderException("Unexpected result callable parameter");
++						}
++						parameters.add(new ParameterDefinitionImpl(parameter.name,
++							resolveResultType(parameter.typeChild(), definitions), null));
++					}
++				}
++				function.setArguments(parameters.toArray(new ParameterDefinition[0]));
++				function.setVarArgs(prototype.varargs);
++				function.setNoReturn(prototype.noreturn);
++				function.setCallingConvention(prototype.model);
++			}
++			else {
++				type = body.element == ELEM_VOID.id() ? new VoidDataType(progDataTypes) :
++					createResultLeaf(body, definitions);
++			}
++		}
++		catch (ghidra.util.exception.InvalidInputException | InvalidDataTypeException e) {
++			throw new DecoderException("Invalid result datatype: " + e.getMessage());
++		}
++		definition.type = type;
++		definition.complete = true;
++		definition.resolving = false;
++		return type;
++	}
+ 
+ 	// Mask for routing bits at head of a data-type's temporary id
+ 	private static final long TEMP_ID_MASK = 0xC000000000000000L;
+@@ -201,6 +772,19 @@
+ 		else if ((id & TEMP_ID_MASK) == NONDB_ID_HEADER && mapIDToNonDBDataType != null) {
+ 			dt = mapIDToNonDBDataType.get(id);
+ 		}
++		if (dt == null && captureSource != null) {
++			dt = captureSource.findBaseType(nm, id);
++			if (dt != null && (id & TEMP_ID_MASK) == NONDB_ID_HEADER) {
++				if (mapIDToNonDBDataType == null) {
++					mapIDToNonDBDataType = new HashMap<>();
++				}
++				mapIDToNonDBDataType.put(id, dt);
++				if (retainedTemporaryIds == null) {
++					retainedTemporaryIds = new IdentityHashMap<>();
++				}
++				retainedTemporaryIds.put(dt, id);
++			}
++		}
+ 		return dt;
+ 	}
+ 
+@@ -218,6 +802,7 @@
+ 		}
+ 		String name = "";
+ 		long id = 0;
++		long local = 0;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+ 			if (attribId == 0) {
+@@ -229,6 +814,14 @@
+ 			else if (attribId == ATTRIB_ID.id()) {
+ 				id = decoder.readUnsignedInteger();
+ 			}
++			else if (attribId == ATTRIB_KUNA_LOCAL.id()) {
++				local = decoder.readUnsignedInteger();
++			}
++		}
++		if (local != 0) {
++			DataType type = findResultType(name, id, local);
++			decoder.closeElementSkipping(el);
++			return type;
+ 		}
+ 		if (el == ELEM_TYPEREF.id()) {
+ 			decoder.closeElement(el);
+@@ -938,6 +1531,12 @@
+ 	 * @throws IOException for errors in the underlying stream
+ 	 */
+ 	public void encodeTypeRef(Encoder encoder, DataType type, int size) throws IOException {
++		if (isResultLocal(type)) {
++			encoder.openElement(ELEM_TYPEREF);
++			encodeNameIdAttributes(encoder, type);
++			encoder.closeElement(ELEM_TYPEREF);
++			return;
++		}
+ 		if (type != null && type.getDataTypeManager() != progDataTypes) {
+ 			type = type.clone(progDataTypes);
+ 		}
+@@ -999,6 +1598,26 @@
+ 	 * @return the temporary id
+ 	 */
+ 	private long assignTemporaryId(DataType type) {
++		if (resultView) {
++			if (retainedTemporaryIds == null) {
++				retainedTemporaryIds = new IdentityHashMap<>();
++			}
++			Long retained = retainedTemporaryIds.get(type);
++			if (retained != null) {
++				return retained;
++			}
++			if (mapIDToNonDBDataType == null) {
++				mapIDToNonDBDataType = new HashMap<>();
++			}
++			long id;
++			do {
++				id = (++tempIDCounter) | NONDB_ID_HEADER;
++			}
++			while (mapIDToNonDBDataType.containsKey(id));
++			mapIDToNonDBDataType.put(id, type);
++			retainedTemporaryIds.put(type, id);
++			return id;
++		}
+ 		Long tempId;
+ 		if (mapNonDBDataTypeToID == null || mapIDToNonDBDataType == null) {
+ 			mapNonDBDataTypeToID = new HashMap<>();
+@@ -1022,6 +1641,9 @@
+ 	 * reset the counter.
+ 	 */
+ 	public void clearTemporaryIds() {
++		if (resultView) {
++			throw new IllegalStateException("Result-owned datatype bindings cannot be cleared");
++		}
+ 		mapNonDBDataTypeToID = null;
+ 		mapIDToNonDBDataType = null;
+ 		tempIDCounter = 0;
+@@ -1035,6 +1657,20 @@
+ 	 * @throws IOException for errors in the underlying stream
+ 	 */
+ 	private void encodeNameIdAttributes(Encoder encoder, DataType type) throws IOException {
++		ResultTypeNode reservation = resultReservations == null ? null :
++			resultReservations.get(type);
++		if (reservation != null) {
++			encoder.writeUnsignedInteger(ATTRIB_KUNA_LOCAL, reservation.local);
++			encoder.writeString(ATTRIB_NAME, reservation.name);
++			encoder.writeUnsignedInteger(ATTRIB_ID, reservation.id);
++			return;
++		}
++		Long retained = retainedTemporaryIds == null ? null : retainedTemporaryIds.get(type);
++		if (retained != null) {
++			encoder.writeString(ATTRIB_NAME, type.getName());
++			encoder.writeUnsignedInteger(ATTRIB_ID, retained);
++			return;
++		}
+ 		long id;
+ 		if (type instanceof BuiltIn) {
+ 			String nm = ((BuiltIn) type).getDecompilerDisplayName(displayLanguage);
+@@ -1117,7 +1753,19 @@
+ 		if (type != null && type.getDataTypeManager() != progDataTypes) {
+ 			type = type.clone(progDataTypes);
+ 		}
+-		if ((type instanceof VoidDataType) || (type == null)) {
++		if (type instanceof ResultQualifiedDataType) {
++			ResultQualifiedDataType qualified = (ResultQualifiedDataType) type;
++			encoder.openElement(ELEM_QUALIFIED);
++			ResultTypeNode reservation = resultReservations == null ? null :
++				resultReservations.get(type);
++			if (reservation != null) {
++				encoder.writeUnsignedInteger(ATTRIB_KUNA_LOCAL, reservation.local);
++			}
++			encoder.writeUnsignedInteger(ATTRIB_VALUE, qualified.getQualifiers());
++			encodeTypeRef(encoder, qualified.getDataType(), size);
++			encoder.closeElement(ELEM_QUALIFIED);
++		}
++		else if ((type instanceof VoidDataType) || (type == null)) {
+ 			encodeVoid(encoder);
+ 		}
+ 		else if (type instanceof TypeDef) {
+@@ -1273,6 +1921,7 @@
+ 	 */
+ 	public void encodeCoreTypes(Encoder encoder) throws IOException {
+ 		encoder.openElement(ELEM_CORETYPES);
++		encoder.writeUnsignedInteger(ATTRIB_KUNA_RESULT_VERSION, RESULT_VERSION);
+ 
+ 		for (TypeMap typeMap : coreBuiltin.values()) {
+ 			encoder.openElement(ELEM_TYPE);

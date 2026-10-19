@@ -1439,7 +1439,7 @@ impl Heritage {
         add_indirects: bool,
         read: &mut [crate::context::VarnodeId],
         write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let guard_stack_bytes = add_indirects
             && super::kuna_stackstoreguard::enabled(fd, addr, write)
             && self.store_frame_resolves(fd, addr);
@@ -1478,7 +1478,7 @@ impl Heritage {
                 .next()
                 .expect("guard: read vn has a descendant");
             if fd.vbank().get(vn).expect("guard: stale read vn").get_size() < size {
-                let newvn = self.normalize_read_size(fd, vn, op, addr, size);
+                let newvn = self.normalize_read_size(fd, vn, op, addr, size)?;
                 read[slot] = newvn;
                 fd.vbank_mut().get_mut(newvn).expect("guard: new read vn").set_active_heritage();
             } else {
@@ -1493,7 +1493,7 @@ impl Heritage {
         for slot in 0..write.len() {
             let vn = write[slot];
             if fd.vbank().get(vn).expect("guard: stale write vn").get_size() < size {
-                let newvn = self.normalize_write_size(fd, vn, addr, size);
+                let newvn = self.normalize_write_size(fd, vn, addr, size)?;
                 write[slot] = newvn;
                 fd.vbank_mut().get_mut(newvn).expect("guard: new write vn").set_active_heritage();
             } else {
@@ -1537,7 +1537,7 @@ impl Heritage {
             // forwarded/collapsed (dupptr "Intermediate pointers #3/#5"). Wire this
             // OR once the store-cross-merge + pointer-forwarding gaps close.
             let usepoint = Address::new_invalid();
-            let mut fl: uint4 = fd.get_arch().query_global_properties(addr, size, &usepoint);
+            let mut fl: uint4 = fd.get_arch().query_global_properties(addr, size, &usepoint)?;
             // (kuna w10-chainb-gap1) WIRED: the local-scope OR — the faithful
             // `localmap->queryProperties` half of `Heritage::guard`'s
             // `queryProperties` (heritage.cc:1192).  This gives a `map addr`-mapped
@@ -1554,10 +1554,10 @@ impl Heritage {
             // `local_array[10]`.  Net +7 (Partial splitting #15-19, Wayoff array
             // #1, No-for-loop alias #3), regressed-set empty.
             fl |= fd.query_local_properties(addr, size, &usepoint);
-            self.guard_calls(fd, fl, addr, size, write);
-            crate::kuna_syscallregs::guard_memory(fd, fl, addr, size, write);
-            crate::kuna_x64syscall::guard_memory(fd, fl, addr, size, write);
-            self.guard_returns(fd, fl, addr, size, write);
+            self.guard_calls(fd, fl, addr, size, write)?;
+            crate::kuna_syscallregs::guard_memory(fd, fl, addr, size, write)?;
+            crate::kuna_x64syscall::guard_memory(fd, fl, addr, size, write)?;
+            self.guard_returns(fd, fl, addr, size, write)?;
             // (kuna `indexaliasguard`) `Architecture::highPtrPossible`
             // (architecture.hh:408) is `space type != IPTR_INTERNAL &&
             // !nohighptr.inRange(loc,size)`.  kuna does not read the cspec
@@ -1572,34 +1572,35 @@ impl Heritage {
                     .unwrap_or(false);
             let stack_effects = crate::kuna_stackeffects::enabled_for(fd, addr);
             let mut guarded_stores = if (high_ptr_possible && level >= LEVEL_FULL) || stack_effects {
-                self.guard_stores(fd, addr, size, write, false)
+                self.guard_stores(fd, addr, size, write, false)?
             } else if high_ptr_possible && guard_stack_bytes {
-                self.guard_stores(fd, addr, size, write, true)
+                self.guard_stores(fd, addr, size, write, true)?
             } else {
                 if high_ptr_possible && level == LEVEL_GLOBAL && (fl & varnode_flags::readonly) == 0 {
-                    self.guard_global_stores(fd, fl, addr, size, write);
+                    self.guard_global_stores(fd, fl, addr, size, write)?;
                 }
                 Vec::new()
             };
             if high_ptr_possible && level < LEVEL_FULL && guard_stack_indexed && !stack_effects {
-                self.guard_indexed_stores(fd, addr, size, write, &mut guarded_stores);
+                self.guard_indexed_stores(fd, addr, size, write, &mut guarded_stores)?;
             }
             if high_ptr_possible {
                 if level < LEVEL_FULL && self.spill_store_budget_ok {
                     super::kuna_spillstoreguard::build(
                         fd, addr, size, &self.spill_stores, &guarded_stores, &self.spill_store_bounds,
                         &mut self.spill_store_guards, write,
-                    );
+                    )?;
                 }
                 if level >= LEVEL_GLOBAL
                     && (fl & varnode_flags::persist) != 0
                     && (fl & varnode_flags::readonly) == 0
                 {
-                    self.guard_global_loads(fd, addr, size, write, partial_writes.as_deref());
+                    self.guard_global_loads(fd, addr, size, write, partial_writes.as_deref())?;
                 }
-                self.guard_loads(fd, fl, addr, size, write);
+                self.guard_loads(fd, fl, addr, size, write)?;
             }
         }
+        Ok(())
     }
 
     /// (kuna `calleeprotostack`) Can a pointer in this function reach the stack
@@ -1656,7 +1657,7 @@ impl Heritage {
         addr: &Address,
         size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use crate::fspec::{effect_type, Containment, OFFSET_UNKNOWN};
         use kuna_base::space::spacetype;
 
@@ -1671,7 +1672,7 @@ impl Heritage {
             Some(s) => s.clone(),
             None => {
                 fd.restore_call_specs(qlst);
-                return;
+                return Ok(());
             }
         };
         // (kuna) `msvcbyval`: the stack ranges a constructor call builds as a
@@ -1681,6 +1682,7 @@ impl Heritage {
         } else {
             crate::p4_calls::kuna_msvcbyval::constructed_ranges(fd, &qlst, &spc)
         };
+        let result = (|| {
         for fc in qlst.iter_mut() {
             let op = fc.get_op();
             let own_output = fd
@@ -1705,7 +1707,7 @@ impl Heritage {
                     && tryregister
                     && crate::kuna_varargretreg::argument_in_own_output(fd, fc, &trans_addr, size)
                 {
-                    Self::guard_call_input(fd, fc, addr, &trans_addr, size, overlap_level);
+                    Self::guard_call_input(fd, fc, addr, &trans_addr, size, overlap_level)?;
                 }
                 continue;
             }
@@ -1716,6 +1718,25 @@ impl Heritage {
             // heritage.cc:1468) because the output-active branch can promote it to
             // `killedbycall`.
             let mut effecttype = fc.proto().has_effect(&trans_addr, size);
+            if matches!(effecttype, effect_type::UNAFFECTED | effect_type::UNKNOWN_EFFECT) {
+                match crate::kuna_calleememory::register_entry_identity(fd, fc, &trans_addr, size) {
+                    crate::kuna_calleememory::EntryIdentity::Changed
+                        if effecttype == effect_type::UNAFFECTED =>
+                    {
+                        // A complete normal-return snapshot contradicts only the
+                        // default convention, not an authored effect or output.
+                        // Keep a real call-effect dependency, not a fabricated
+                        // replacement value or a claim of preservation.
+                        effecttype = effect_type::UNKNOWN_EFFECT;
+                    }
+                    crate::kuna_calleememory::EntryIdentity::Preserved
+                        if effecttype == effect_type::UNKNOWN_EFFECT =>
+                    {
+                        effecttype = effect_type::UNAFFECTED;
+                    }
+                    _ => {}
+                }
+            }
             if effecttype == effect_type::UNKNOWN_EFFECT
                 && crate::kuna_calleememory::preserves(fd, fc, addr, size)
             {
@@ -1840,7 +1861,7 @@ impl Heritage {
                         &output_addr,
                         output.size as int4,
                         write,
-                    ) {
+                    )? {
                         preserved = true;
                     }
                 }
@@ -1874,7 +1895,7 @@ impl Heritage {
                         // are PIECEd back on.  Gated by `option calloverlap full`.
                         if overlap_level >= crate::p3_dataflow::kuna_calloverlap::LEVEL_FULL
                             && self
-                                .try_output_overlap_guard(fd, fc, addr, &trans_addr, size, write)
+                                .try_output_overlap_guard(fd, fc, addr, &trans_addr, size, write)?
                         {
                             // Range is handled, don't do additional guarding.
                             effecttype = effect_type::UNAFFECTED;
@@ -1901,7 +1922,7 @@ impl Heritage {
                     effecttype = effect_type::UNKNOWN_EFFECT;
                     if self.try_output_stack_guard(
                         fd, fc, addr, &trans_addr, size, output_character, write,
-                    ) {
+                    )? {
                         // Range is handled, don't do additional guarding.
                         effecttype = effect_type::UNAFFECTED;
                     }
@@ -1914,9 +1935,9 @@ impl Heritage {
             // the `func(args)` rendering this wave targets.
             if fc.is_input_active()
                 && tryregister
-                && !self.guard_counted_float_input(fd, fc, addr, size)
+                && !self.guard_counted_float_input(fd, fc, addr, size)?
             {
-                Self::guard_call_input(fd, fc, addr, &trans_addr, size, overlap_level);
+                Self::guard_call_input(fd, fc, addr, &trans_addr, size, overlap_level)?;
             }
 
             // The `unknown_effect`/`return_address` INDIRECT-*op* (heritage.cc:1512-
@@ -1929,7 +1950,7 @@ impl Heritage {
             if effecttype == effect_type::UNKNOWN_EFFECT
                 || effecttype == effect_type::RETURN_ADDRESS
             {
-                let indop = fd.new_indirect_op(op, addr, size, 0);
+                let indop = fd.new_indirect_op(op, addr, size, 0)?;
                 if let Some(in0) = fd.obank().get(indop).and_then(|o| o.get_in(0)) {
                     if let Some(v) = fd.vbank_mut().get_mut(in0) {
                         v.set_active_heritage();
@@ -1955,7 +1976,7 @@ impl Heritage {
             // collectOutputTrialVarnodes/buildOutputFromTrials promotes to the CALL's
             // output (heritage.cc:1522-1526).
             else if effecttype == effect_type::KILLEDBYCALL {
-                let indop = fd.new_indirect_creation(op, addr, size, possibleoutput);
+                let indop = fd.new_indirect_creation(op, addr, size, possibleoutput)?;
                 if let Some(out) = fd.obank().get(indop).and_then(|o| o.get_out()) {
                     if let Some(v) = fd.vbank_mut().get_mut(out) {
                         v.set_active_heritage();
@@ -1964,7 +1985,10 @@ impl Heritage {
                 }
             }
         }
+        Ok(())
+        })();
         fd.restore_call_specs(qlst);
+        result
     }
 
     /// Register an input trial for the heritaged range at a call still recovering
@@ -1981,23 +2005,23 @@ impl Heritage {
         trans_addr: &Address,
         size: int4,
         overlap_level: int4,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use crate::fspec::Containment;
         if !crate::kuna_armfloatreturn::call_input_allowed(fd, fc, trans_addr, size) {
             for piece in crate::kuna_armfloatargs::stated_singles(fd, fc, trans_addr, size) {
                 let diff = piece.get_offset().wrapping_sub(trans_addr.get_offset());
                 let trunc_addr = addr + diff as i64;
                 if fc.get_active_input().which_trial(&trunc_addr, 4) < 0 {
-                    Self::truncated_input_trial(fd, fc, addr, size, &trunc_addr, 4);
+                    Self::truncated_input_trial(fd, fc, addr, size, &trunc_addr, 4)?;
                 }
             }
-            return;
+            return Ok(());
         }
         let ic = fc.proto().characterize_as_input_param(trans_addr, size);
         if ic == Containment::ContainsJustified {
             if fc.get_active_input().which_trial(trans_addr, size) < 0 {
                 fc.get_active_input().register_trial(trans_addr, size);
-                let vn = fd.new_varnode(size, addr, None);
+                let vn = fd.new_varnode(size, addr, None)?;
                 fd.vbank_mut()
                     .get_mut(vn)
                     .expect("guardCalls: new arg vn")
@@ -2021,16 +2045,17 @@ impl Heritage {
                     for piece in pieces {
                         let piece_addr = piece.get_addr();
                         if fc.get_active_input().which_trial(&piece_addr, piece.size as int4) < 0 {
-                            Self::truncated_input_trial(fd, fc, addr, size, &piece_addr, piece.size as int4);
+                            Self::truncated_input_trial(fd, fc, addr, size, &piece_addr, piece.size as int4)?;
                         }
                     }
-                    return;
+                    return Ok(());
                 }
             }
             if overlap_level >= crate::p3_dataflow::kuna_calloverlap::LEVEL_IN {
-                Self::guard_call_overlapping_input(fd, fc, addr, trans_addr, size);
+                Self::guard_call_overlapping_input(fd, fc, addr, trans_addr, size)?;
             }
         }
+        Ok(())
     }
 
     /// (kuna) Register the 8-byte input trial of a floating-point register the
@@ -2047,27 +2072,27 @@ impl Heritage {
         fc: &mut crate::fspec::FuncCallSpecs,
         addr: &Address,
         size: int4,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use kuna_num::opcodes::OpCode;
         let Some(entry) = crate::kuna_varargretreg::counted_float_entry(fd, fc, addr, size) else {
-            return false;
+            return Ok(false);
         };
         if fc.get_active_input().which_trial(&entry, 8) >= 0 {
-            return false;
+            return Ok(false);
         }
         let start = addr.get_offset();
         let (estart, eend) = (entry.get_offset(), entry.get_offset() + 8);
         if start <= estart && eend <= start + size as u64 {
-            Self::truncated_input_trial(fd, fc, addr, size, &entry, 8);
-            return true;
+            Self::truncated_input_trial(fd, fc, addr, size, &entry, 8)?;
+            return Ok(true);
         }
         if start != estart {
-            return false;
+            return Ok(false);
         }
         let Some(pos) = (0..self.disjoint.len())
             .find(|&i| self.disjoint.get(i).addr == *addr && self.disjoint.get(i).size == size)
         else {
-            return false;
+            return Ok(false);
         };
         let mut tiles = vec![(addr.clone(), size)];
         let mut cur = start + size as u64;
@@ -2080,20 +2105,20 @@ impl Heritage {
                 || r.addr.get_offset() != cur
                 || !r.new_addresses()
             {
-                return false;
+                return Ok(false);
             }
             tiles.push((r.addr.clone(), r.size));
             cur += r.size as u64;
         }
         if cur < eend {
-            return false;
+            return Ok(false);
         }
         let op = fc.get_op();
         let call_addr = fd.obank().get(op).expect("guardCountedFloatInput: stale call").get_addr().clone();
         let big = addr.is_big_endian();
         let mut parts = Vec::with_capacity(tiles.len());
         for (taddr, tsize) in tiles {
-            let read = fd.new_varnode(tsize, &taddr, None);
+            let read = fd.new_varnode(tsize, &taddr, None)?;
             fd.vbank_mut().get_mut(read).expect("guardCountedFloatInput: read").set_active_heritage();
             let keep = tsize.min((eend - taddr.get_offset()) as int4);
             if keep == tsize {
@@ -2126,7 +2151,7 @@ impl Heritage {
         fc.get_active_input().register_trial(&entry, 8);
         let nin = fd.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
         let _ = fd.op_insert_input(op, acc, nin);
-        true
+        Ok(true)
     }
 
     /// Append a truncated \e input Varnode for a call whose parameter storage is
@@ -2142,14 +2167,14 @@ impl Heritage {
         addr: &Address,
         trans_addr: &Address,
         size: int4,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::pcoderaw::VarnodeData;
         let mut vdata = VarnodeData::default();
         if !fc
             .proto()
             .get_biggest_contained_input_param(trans_addr, size, &mut vdata)
         {
-            return;
+            return Ok(());
         }
         // truncAddr (callee perspective) -> caller perspective, exactly as
         // try_output_stack_guard converts the output side.
@@ -2158,13 +2183,13 @@ impl Heritage {
         // C++ dedupes with the WHOLE range `size` and then registers `vData.size`;
         // the asymmetry is deliberately over-broad overlap, not a typo.
         if fc.get_active_input().which_trial(&trunc_addr, size) >= 0 {
-            return;
+            return Ok(());
         }
         let trunc_size = vdata.size as int4;
         if !crate::kuna_armfloatreturn::call_input_allowed(fd, fc, &trunc_addr, trunc_size) {
-            return;
+            return Ok(());
         }
-        Self::truncated_input_trial(fd, fc, addr, size, &trunc_addr, trunc_size);
+        Self::truncated_input_trial(fd, fc, addr, size, &trunc_addr, trunc_size)
     }
 
     /// Append a SUBPIECE of the heritaged range `[addr, size)` to the call as the
@@ -2176,7 +2201,7 @@ impl Heritage {
         size: int4,
         trunc_addr: &Address,
         trunc_size: int4,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let truncate_amount = addr.justified_contain(size, trunc_addr, trunc_size, false);
         debug_assert!(
@@ -2192,7 +2217,7 @@ impl Heritage {
             .clone();
         let subpiece_op = fd.new_op(2, call_addr);
         fd.op_set_opcode(subpiece_op, typeop_skeleton(OpCode::CPUI_SUBPIECE));
-        let whole_vn = fd.new_varnode(size, addr, None);
+        let whole_vn = fd.new_varnode(size, addr, None)?;
         fd.vbank_mut()
             .get_mut(whole_vn)
             .expect("guardCallOverlappingInput: wholeVn")
@@ -2201,12 +2226,12 @@ impl Heritage {
         let c = fd.new_constant(4, truncate_amount as i64 as u64);
         let _ = fd.op_set_input(subpiece_op, c, 1);
         let vn = fd
-            .new_varnode_out(trunc_size, trunc_addr, subpiece_op)
-            .expect("guardCallOverlappingInput: subpiece out");
+            .new_varnode_out(trunc_size, trunc_addr, subpiece_op)?;
         fd.op_insert_before(subpiece_op, op);
         fc.get_active_input().register_trial(trunc_addr, trunc_size);
         let nin = fd.obank().get(op).map(|o| o.num_input()).unwrap_or(0);
         let _ = fd.op_insert_input(op, vn, nin);
+        Ok(())
     }
 
     /// Guard a range that properly contains an active call's return storage (C++
@@ -2223,26 +2248,26 @@ impl Heritage {
         trans_addr: &Address,
         size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use kuna_num::pcoderaw::VarnodeData;
         let mut vdata = VarnodeData::default();
         if !fc
             .proto()
             .get_biggest_contained_output(trans_addr, size, &mut vdata)
         {
-            return false;
+            return Ok(false);
         }
         let diff = vdata.offset.wrapping_sub(trans_addr.get_offset());
         let trunc_addr = addr + diff as i64;
         // As on the input side, C++ dedupes with the whole range `size`.
         if fc.get_active_output().which_trial(&trunc_addr, size) >= 0 {
-            return false; // Trial already exists
+            return Ok(false); // Trial already exists
         }
         let call_op = fc.get_op();
         let trunc_size = vdata.size as int4;
-        self.guard_output_overlap(fd, call_op, addr, size, &trunc_addr, trunc_size, write);
+        self.guard_output_overlap(fd, call_op, addr, size, &trunc_addr, trunc_size, write)?;
         fc.get_active_output().register_trial(&trunc_addr, trunc_size);
-        true
+        Ok(true)
     }
 
     /// Piece the recovered return storage back into the larger heritaged range
@@ -2261,11 +2286,11 @@ impl Heritage {
         ret_addr: &Address,
         ret_size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let size_front = (ret_addr.get_offset().wrapping_sub(addr.get_offset())) as i64 as int4;
         let size_back = size - ret_size - size_front;
-        let ind_op = fd.new_indirect_creation(call_op, ret_addr, ret_size, true);
+        let ind_op = fd.new_indirect_creation(call_op, ret_addr, ret_size, true)?;
         let ind_addr = fd
             .obank()
             .get(ind_op)
@@ -2280,7 +2305,7 @@ impl Heritage {
         let mut insert_point = call_op;
         if size_front != 0 {
             // C++ passes indOp (not callOp) as the front piece's indirect effect.
-            let ind_front = fd.new_indirect_creation(ind_op, addr, size_front, false);
+            let ind_front = fd.new_indirect_creation(ind_op, addr, size_front, false)?;
             let new_front = fd
                 .obank()
                 .get(ind_front)
@@ -2292,14 +2317,13 @@ impl Heritage {
             let _ = fd.op_set_input(concat_front, new_front, slot_new);
             let _ = fd.op_set_input(concat_front, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size_front + ret_size, addr, concat_front)
-                .expect("guardOutputOverlap: front concat out");
+                .new_varnode_out(size_front + ret_size, addr, concat_front)?;
             fd.op_insert_after(concat_front, insert_point);
             insert_point = concat_front;
         }
         if size_back != 0 {
             let addr_back = ret_addr + ret_size as i64;
-            let ind_back = fd.new_indirect_creation(call_op, &addr_back, size_back, false);
+            let ind_back = fd.new_indirect_creation(call_op, &addr_back, size_back, false)?;
             let new_back = fd
                 .obank()
                 .get(ind_back)
@@ -2311,14 +2335,14 @@ impl Heritage {
             let _ = fd.op_set_input(concat_back, new_back, slot_new);
             let _ = fd.op_set_input(concat_back, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size, addr, concat_back)
-                .expect("guardOutputOverlap: back concat out");
+                .new_varnode_out(size, addr, concat_back)?;
             fd.op_insert_after(concat_back, insert_point);
         }
         if let Some(v) = fd.vbank_mut().get_mut(vn_collect) {
             v.set_active_heritage();
         }
         write.push(vn_collect);
+        Ok(())
     }
 
     /// Preserve a call's exact logical output slice inside a wider killed
@@ -2340,30 +2364,30 @@ impl Heritage {
         ret_addr: &Address,
         ret_size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use kuna_num::opcodes::OpCode;
 
         if size <= 0 || ret_size <= 0 || ret_size >= size {
-            return false;
+            return Ok(false);
         }
         let truncate_amount = addr.justified_contain(size, ret_addr, ret_size, false);
         if truncate_amount < 0 {
-            return false;
+            return Ok(false);
         }
         let Some(size_front_u64) = ret_addr.get_offset().checked_sub(addr.get_offset()) else {
-            return false;
+            return Ok(false);
         };
         let Ok(size_front) = int4::try_from(size_front_u64) else {
-            return false;
+            return Ok(false);
         };
         let Some(size_back) = size
             .checked_sub(ret_size)
             .and_then(|v| v.checked_sub(size_front))
         else {
-            return false;
+            return Ok(false);
         };
         if size_front == 0 && size_back == 0 {
-            return false;
+            return Ok(false);
         }
 
         let call_addr = fd
@@ -2372,7 +2396,7 @@ impl Heritage {
             .expect("guardPreservedOutputOverlap: stale call")
             .get_addr()
             .clone();
-        let whole_vn = fd.new_varnode(size, addr, None);
+        let whole_vn = fd.new_varnode(size, addr, None)?;
         fd.vbank_mut()
             .get_mut(whole_vn)
             .expect("guardPreservedOutputOverlap: whole input")
@@ -2383,13 +2407,12 @@ impl Heritage {
         let c = fd.new_constant(4, truncate_amount as u64);
         let _ = fd.op_set_input(subpiece, c, 1);
         let mut vn_collect = fd
-            .new_varnode_out(ret_size, ret_addr, subpiece)
-            .expect("guardPreservedOutputOverlap: retained slice");
+            .new_varnode_out(ret_size, ret_addr, subpiece)?;
         fd.op_insert_before(subpiece, call_op);
 
         let mut insert_point = call_op;
         if size_front != 0 {
-            let ind_front = fd.new_indirect_creation(call_op, addr, size_front, false);
+            let ind_front = fd.new_indirect_creation(call_op, addr, size_front, false)?;
             let new_front = fd
                 .obank()
                 .get(ind_front)
@@ -2401,14 +2424,13 @@ impl Heritage {
             let _ = fd.op_set_input(concat_front, new_front, slot_new);
             let _ = fd.op_set_input(concat_front, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size_front + ret_size, addr, concat_front)
-                .expect("guardPreservedOutputOverlap: front concat out");
+                .new_varnode_out(size_front + ret_size, addr, concat_front)?;
             fd.op_insert_after(concat_front, insert_point);
             insert_point = concat_front;
         }
         if size_back != 0 {
             let addr_back = ret_addr + ret_size as i64;
-            let ind_back = fd.new_indirect_creation(call_op, &addr_back, size_back, false);
+            let ind_back = fd.new_indirect_creation(call_op, &addr_back, size_back, false)?;
             let new_back = fd
                 .obank()
                 .get(ind_back)
@@ -2420,15 +2442,14 @@ impl Heritage {
             let _ = fd.op_set_input(concat_back, new_back, slot_new);
             let _ = fd.op_set_input(concat_back, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size, addr, concat_back)
-                .expect("guardPreservedOutputOverlap: back concat out");
+                .new_varnode_out(size, addr, concat_back)?;
             fd.op_insert_after(concat_back, insert_point);
         }
         if let Some(v) = fd.vbank_mut().get_mut(vn_collect) {
             v.set_active_heritage();
         }
         write.push(vn_collect);
-        true
+        Ok(true)
     }
 
     /// Attempt to guard a stack range against a call whose return value overlaps
@@ -2450,7 +2471,7 @@ impl Heritage {
         size: int4,
         output_character: crate::fspec::Containment,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use kuna_num::opcodes::OpCode;
         use kuna_num::pcoderaw::VarnodeData;
         let call_op = fc.get_op();
@@ -2460,11 +2481,11 @@ impl Heritage {
             // storage back into the range through a join of stack pieces.
             let mut vdata = VarnodeData::default();
             if !fc.proto().get_biggest_contained_output(trans_addr, size, &mut vdata) {
-                return false;
+                return Ok(false);
             }
             let vspace = match vdata.space.clone() {
                 Some(s) => s,
-                None => return false,
+                None => return Ok(false),
             };
             // truncAddr (callee perspective) -> caller perspective via diff.
             let trunc_off_callee = vdata.offset;
@@ -2482,8 +2503,8 @@ impl Heritage {
                 &trunc_addr,
                 vdata.size as int4,
                 write,
-            );
-            return true;
+            )?;
+            return Ok(true);
         }
         // Reaching here, output exists and contains the heritage range.
         let ret_addr_callee = fc.proto().get_output().get_address();
@@ -2495,8 +2516,7 @@ impl Heritage {
         let mut vn_final: Option<crate::context::VarnodeId> = None;
         if outvn.is_none() {
             let v = fd
-                .new_varnode_out(ret_size, &ret_addr, call_op)
-                .expect("tryOutputStackGuard: new outvn");
+                .new_varnode_out(ret_size, &ret_addr, call_op)?;
             outvn = Some(v);
             vn_final = Some(v);
         }
@@ -2508,8 +2528,7 @@ impl Heritage {
             let _ = fd.op_set_input(sub_piece, c, 1);
             let _ = fd.op_set_input(sub_piece, outvn.expect("tryOutputStackGuard: outvn"), 0);
             let v = fd
-                .new_varnode_out(size, addr, sub_piece)
-                .expect("tryOutputStackGuard: subpiece out");
+                .new_varnode_out(size, addr, sub_piece)?;
             vn_final = Some(v);
             fd.op_insert_after(sub_piece, call_op);
         }
@@ -2519,7 +2538,7 @@ impl Heritage {
             }
             write.push(vf);
         }
-        true
+        Ok(true)
     }
 
     /// Guard a stack range that properly contains the return value storage for a
@@ -2538,7 +2557,7 @@ impl Heritage {
         ret_addr: &Address,
         ret_size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let size_front = (ret_addr.get_offset().wrapping_sub(addr.get_offset())) as i64 as int4;
         let size_back = size - ret_size - size_front;
@@ -2547,11 +2566,10 @@ impl Heritage {
         let mut vn_collect = match fd.obank().get(call_op).and_then(|o| o.get_out()) {
             Some(v) => v,
             None => fd
-                .new_varnode_out(ret_size, ret_addr, call_op)
-                .expect("guardOutputOverlapStack: new vnCollect"),
+                .new_varnode_out(ret_size, ret_addr, call_op)?,
         };
         if size_front != 0 {
-            let new_input = fd.new_varnode(size, addr, None);
+            let new_input = fd.new_varnode(size, addr, None)?;
             fd.vbank_mut()
                 .get_mut(new_input)
                 .expect("guardOutputOverlapStack: front newInput")
@@ -2562,13 +2580,13 @@ impl Heritage {
             let c = fd.new_constant(4, truncate_amount as i64 as u64);
             let _ = fd.op_set_input(sub_piece, c, 1);
             let _ = fd.op_set_input(sub_piece, new_input, 0);
-            let ind_op_front = fd.new_indirect_op(call_op, addr, size_front, 0);
+            let ind_op_front = fd.new_indirect_op(call_op, addr, size_front, 0)?;
             let ind_in0 = fd
                 .obank()
                 .get(ind_op_front)
                 .and_then(|o| o.get_in(0))
                 .expect("guardOutputOverlapStack: front ind in0");
-            let _ = fd.op_set_output(sub_piece, ind_in0);
+            fd.op_set_output(sub_piece, ind_in0)?;
             fd.op_insert_before(sub_piece, call_op);
             let new_front = fd
                 .obank()
@@ -2581,13 +2599,12 @@ impl Heritage {
             let _ = fd.op_set_input(concat_front, new_front, slot_new);
             let _ = fd.op_set_input(concat_front, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size_front + ret_size, addr, concat_front)
-                .expect("guardOutputOverlapStack: front concat out");
+                .new_varnode_out(size_front + ret_size, addr, concat_front)?;
             fd.op_insert_after(concat_front, insert_point);
             insert_point = concat_front;
         }
         if size_back != 0 {
-            let new_input = fd.new_varnode(size, addr, None);
+            let new_input = fd.new_varnode(size, addr, None)?;
             fd.vbank_mut()
                 .get_mut(new_input)
                 .expect("guardOutputOverlapStack: back newInput")
@@ -2599,13 +2616,13 @@ impl Heritage {
             let c = fd.new_constant(4, truncate_amount as i64 as u64);
             let _ = fd.op_set_input(sub_piece, c, 1);
             let _ = fd.op_set_input(sub_piece, new_input, 0);
-            let ind_op_back = fd.new_indirect_op(call_op, &addr_back, size_back, 0);
+            let ind_op_back = fd.new_indirect_op(call_op, &addr_back, size_back, 0)?;
             let ind_in0 = fd
                 .obank()
                 .get(ind_op_back)
                 .and_then(|o| o.get_in(0))
                 .expect("guardOutputOverlapStack: back ind in0");
-            let _ = fd.op_set_output(sub_piece, ind_in0);
+            fd.op_set_output(sub_piece, ind_in0)?;
             fd.op_insert_before(sub_piece, call_op);
             let new_back = fd
                 .obank()
@@ -2618,14 +2635,14 @@ impl Heritage {
             let _ = fd.op_set_input(concat_back, new_back, slot_new);
             let _ = fd.op_set_input(concat_back, vn_collect, 1 - slot_new);
             vn_collect = fd
-                .new_varnode_out(size, addr, concat_back)
-                .expect("guardOutputOverlapStack: back concat out");
+                .new_varnode_out(size, addr, concat_back)?;
             fd.op_insert_after(concat_back, insert_point);
         }
         if let Some(v) = fd.vbank_mut().get_mut(vn_collect) {
             v.set_active_heritage();
         }
         write.push(vn_collect);
+        Ok(())
     }
 
     /// Guard RETURN ops for a global/output range (C++ `Heritage::guardReturns`,
@@ -2647,7 +2664,7 @@ impl Heritage {
         addr: &Address,
         size: int4,
         _write: &mut [crate::context::VarnodeId],
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         if fd.get_active_output().is_some()
             && fd.get_func_proto().has_model()
@@ -2656,7 +2673,7 @@ impl Heritage {
         {
             let output_character = fd.get_func_proto().characterize_as_output(addr, size);
             if output_character == crate::fspec::Containment::ContainedBy {
-                self.guard_returns_overlapping(fd, addr, size);
+                self.guard_returns_overlapping(fd, addr, size)?;
             } else if output_character != crate::fspec::Containment::NoContainment {
                 if let Some(active) = fd.get_active_output_mut() {
                     active.register_trial(addr, size);
@@ -2672,7 +2689,7 @@ impl Heritage {
                         continue;
                     }
                     let n = o.num_input();
-                    let invn = fd.new_varnode(size, addr, None);
+                    let invn = fd.new_varnode(size, addr, None)?;
                     fd.vbank_mut()
                         .get_mut(invn)
                         .expect("guardReturns: new invn")
@@ -2682,7 +2699,7 @@ impl Heritage {
             }
         }
         if (fl & varnode_flags::persist) == 0 {
-            return;
+            return Ok(());
         }
         // Persist RETURN-COPY branch (heritage.cc:1677-1692): the global value
         // must persist past the end of the function, so a COPY is inserted before each RETURN.
@@ -2700,10 +2717,7 @@ impl Heritage {
                 continue;
             }
             let copyop = fd.new_op(1, ret_addr);
-            let vn = match fd.new_varnode_out(size, addr, copyop) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
+            let vn = fd.new_varnode_out(size, addr, copyop)?;
             if let Some(v) = fd.vbank_mut().get_mut(vn) {
                 v.set_addr_force();
                 v.set_active_heritage();
@@ -2713,13 +2727,14 @@ impl Heritage {
             if let Some(o) = fd.obank_mut().get_mut(copyop) {
                 o.set_flag(crate::op::pcodeop_flags::return_copy);
             }
-            let invn = fd.new_varnode(size, addr, None);
+            let invn = fd.new_varnode(size, addr, None)?;
             if let Some(v) = fd.vbank_mut().get_mut(invn) {
                 v.set_active_heritage();
             }
             let _ = fd.op_set_input(copyop, invn, 0);
             fd.op_insert_before(copyop, op);
         }
+        Ok(())
     }
 
     /// Guard RETURN ops when the heritaged range *contains* the output storage,
@@ -2731,16 +2746,16 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         addr: &Address,
         size: int4,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         use kuna_num::pcoderaw::VarnodeData;
         let mut vdata = VarnodeData::default();
         if !fd.get_func_proto().get_biggest_contained_output(addr, size, &mut vdata) {
-            return;
+            return Ok(());
         }
         let vspace = match vdata.space.clone() {
             Some(s) => s,
-            None => return,
+            None => return Ok(()),
         };
         let trunc_addr = Address::new(Rc::clone(&vspace), vdata.offset);
         if let Some(active) = fd.get_active_output_mut() {
@@ -2763,7 +2778,7 @@ impl Heritage {
             }
             let op_addr = o.get_addr().clone();
             let n = o.num_input();
-            let invn = fd.new_varnode(size, addr, None);
+            let invn = fd.new_varnode(size, addr, None)?;
             let sub_op = fd.new_op(2, op_addr);
             fd.op_set_opcode(sub_op, typeop_skeleton(OpCode::CPUI_SUBPIECE));
             let _ = fd.op_set_input(sub_op, invn, 0);
@@ -2771,14 +2786,14 @@ impl Heritage {
             let _ = fd.op_set_input(sub_op, coff, 1);
             fd.op_insert_before(sub_op, op);
             let ret_val = fd
-                .new_varnode_out(vdata.size as int4, &trunc_addr, sub_op)
-                .expect("guardReturnsOverlapping: new ret_val");
+                .new_varnode_out(vdata.size as int4, &trunc_addr, sub_op)?;
             fd.vbank_mut()
                 .get_mut(invn)
                 .expect("guardReturnsOverlapping: invn")
                 .set_active_heritage();
             let _ = fd.op_insert_input(op, ret_val, n);
         }
+        Ok(())
     }
 
     /// (kuna `stackstoreguard`) May this pass guard the frame of `addr`'s
@@ -2812,7 +2827,7 @@ impl Heritage {
         size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
         indexed_bytes_only: bool,
-    ) -> Vec<crate::context::OpId> {
+    ) -> kuna_base::error::KunaResult<Vec<crate::context::OpId>> {
         use crate::op::pcodeop_flags;
         use kuna_num::opcodes::OpCode;
 
@@ -2851,7 +2866,7 @@ impl Heritage {
             if !((contained && uses_spacebase) || Rc::ptr_eq(&spc, &store_space) || indirect_frame_store) {
                 continue;
             }
-            let indop = fd.new_indirect_op(op, addr, size, pcodeop_flags::indirect_store);
+            let indop = fd.new_indirect_op(op, addr, size, pcodeop_flags::indirect_store)?;
             guarded.push(op);
             let invn = fd.obank().get(indop).and_then(|o| o.get_in(0));
             if let Some(v) = invn.and_then(|v| fd.vbank_mut().get_mut(v)) {
@@ -2865,7 +2880,7 @@ impl Heritage {
                 write.push(out);
             }
         }
-        guarded
+        Ok(guarded)
     }
 
     /// (kuna `stackstoreguard`) An `indirect_store` INDIRECT on a written stack
@@ -2880,11 +2895,11 @@ impl Heritage {
         size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
         guarded: &mut Vec<crate::context::OpId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use crate::op::pcodeop_flags;
 
         if self.deadline_passed() {
-            return;
+            return Ok(());
         }
         let stores = super::kuna_stackstoreguard::indexed_stores(
             fd,
@@ -2895,10 +2910,10 @@ impl Heritage {
             guarded,
         );
         if stores.is_empty() || !self.store_frame_resolves(fd, addr) {
-            return;
+            return Ok(());
         }
         for store in stores {
-            let indop = fd.new_indirect_op(store, addr, size, pcodeop_flags::indirect_store);
+            let indop = fd.new_indirect_op(store, addr, size, pcodeop_flags::indirect_store)?;
             let (Some(invn), Some(outvn)) = (
                 fd.obank().get(indop).and_then(|o| o.get_in(0)),
                 fd.obank().get(indop).and_then(|o| o.get_out()),
@@ -2916,6 +2931,7 @@ impl Heritage {
             fd.note_indexed_guard_store(store, indop);
             guarded.push(store);
         }
+        Ok(())
     }
 
     /// (kuna `indexaliasguard global`) The global arm of `guardStores`: an
@@ -2929,7 +2945,7 @@ impl Heritage {
         addr: &Address,
         size: int4,
         write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use crate::kuna_indexaliasguard::{stores_into, GLOBAL_STORE_BUDGET};
         use crate::op::pcodeop_flags;
 
@@ -2941,7 +2957,7 @@ impl Heritage {
             if persist {
                 self.global_store_ranges.push((index, lo, lo.wrapping_add(size as u64), false));
             }
-            return;
+            return Ok(());
         }
         if self.global_stores.as_ref().map(|c| c.0) != Some(index) {
             self.global_stores = Some((index, stores_into(fd, &spc, store_space_from_const)));
@@ -2952,11 +2968,11 @@ impl Heritage {
             self.global_store_ranges.push((index, lo, lo.wrapping_add(size as u64), guarded));
         }
         if stores.is_empty() || !guarded {
-            return;
+            return Ok(());
         }
         self.global_store_guards += stores.len();
         for op in stores {
-            let indop = fd.new_indirect_op(op, addr, size, pcodeop_flags::indirect_store);
+            let indop = fd.new_indirect_op(op, addr, size, pcodeop_flags::indirect_store)?;
             let invn = fd.obank().get(indop).and_then(|o| o.get_in(0));
             if let Some(v) = invn.and_then(|v| fd.vbank_mut().get_mut(v)) {
                 v.set_active_heritage();
@@ -2969,6 +2985,7 @@ impl Heritage {
                 write.push(out);
             }
         }
+        Ok(())
     }
 
     /// Guard LOAD ops in the load-guard list (C++ `Heritage::guardLoads`,
@@ -2985,11 +3002,11 @@ impl Heritage {
         addr: &Address,
         size: int4,
         _write: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
 
         if (fl & varnode_flags::addrtied) == 0 {
-            return; // If not address tied, don't consider for index alias
+            return Ok(()); // If not address tied, don't consider for index alias
         }
         let mut kept: Vec<LoadGuard> = Vec::with_capacity(self.load_guard.len());
         let guards = std::mem::take(&mut self.load_guard);
@@ -3009,14 +3026,14 @@ impl Heritage {
             let guard_addr =
                 fd.obank().get(guard.op).expect("guard_loads: live guard op").get_addr().clone();
             let copyop = fd.new_op(1, guard_addr);
-            let vn = fd.new_varnode_out(size, addr, copyop).expect("guard_loads: COPY out");
+            let vn = fd.new_varnode_out(size, addr, copyop)?;
             {
                 let v = fd.vbank_mut().get_mut(vn).expect("guard_loads: COPY out vn");
                 v.set_active_heritage();
                 v.set_addr_force();
             }
             fd.op_set_opcode_code(copyop, OpCode::CPUI_COPY);
-            let invn = fd.new_varnode(size, addr, None);
+            let invn = fd.new_varnode(size, addr, None)?;
             fd.vbank_mut().get_mut(invn).expect("guard_loads: COPY in vn").set_active_heritage();
             let _ = fd.op_set_input(copyop, invn, 0);
             fd.op_insert_before(copyop, guard.op);
@@ -3025,6 +3042,7 @@ impl Heritage {
             kept.push(guard);
         }
         self.load_guard = kept;
+        Ok(())
     }
 
     /// (kuna `indexaliasguard global`) The global arm of `guardLoads`: an
@@ -3041,7 +3059,7 @@ impl Heritage {
         size: int4,
         write: &[crate::context::VarnodeId],
         partial_writes: Option<&[crate::context::VarnodeId]>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use crate::kuna_indexaliasguard::{loads_from, GLOBAL_LOAD_BUDGET};
         use kuna_num::opcodes::OpCode;
 
@@ -3056,7 +3074,7 @@ impl Heritage {
             })
             .count();
         if writes < 2 {
-            return;
+            return Ok(());
         }
         let spc = addr.get_space().expect("guard_global_loads: addr space").clone();
         let index = spc.get_index();
@@ -3076,7 +3094,7 @@ impl Heritage {
             })
             .unwrap_or_default();
         if loads.is_empty() || self.global_load_guards + loads.len() > GLOBAL_LOAD_BUDGET {
-            return;
+            return Ok(());
         }
         self.global_load_guards += loads.len();
         if let Some(writes) = partial_writes {
@@ -3086,25 +3104,26 @@ impl Heritage {
                 writes: writes.to_vec(),
                 loads,
             });
-            return;
+            return Ok(());
         }
         for op in loads {
             let op_addr = fd.obank().get(op).expect("guard_global_loads: live LOAD").get_addr().clone();
             let copyop = fd.new_op(1, op_addr);
-            let vn = fd.new_varnode_out(size, addr, copyop).expect("guard_global_loads: COPY out");
+            let vn = fd.new_varnode_out(size, addr, copyop)?;
             {
                 let v = fd.vbank_mut().get_mut(vn).expect("guard_global_loads: COPY out vn");
                 v.set_active_heritage();
                 v.set_addr_force();
             }
             fd.op_set_opcode_code(copyop, OpCode::CPUI_COPY);
-            let invn = fd.new_varnode(size, addr, None);
+            let invn = fd.new_varnode(size, addr, None)?;
             fd.vbank_mut().get_mut(invn).expect("guard_global_loads: COPY in vn").set_active_heritage();
             let _ = fd.op_set_input(copyop, invn, 0);
             fd.op_insert_before(copyop, op);
             self.load_copy_ops.push(copyop);
         }
         self.global_load_ranges.push((spc, lo, hi.wrapping_sub(1)));
+        Ok(())
     }
 
     /// Remove deprecated CPUI_MULTIEQUAL, CPUI_INDIRECT, or CPUI_COPY ops,
@@ -3123,7 +3142,7 @@ impl Heritage {
         remove: &[crate::context::VarnodeId],
         addr: &Address,
         size: int4,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
 
         let space = addr.get_space().expect("remove_revisited_markers: addr space").clone();
@@ -3221,7 +3240,7 @@ impl Heritage {
                 after
             } else {
                 // Remove return form COPY.
-                fd.op_unlink(op);
+                fd.op_unlink(op)?;
                 continue;
             };
 
@@ -3231,7 +3250,7 @@ impl Heritage {
                 .expect("remove_revisited_markers: stale vn for overlap")
                 .overlap_range(addr, size);
             fd.op_uninsert(op);
-            let big = fd.new_varnode(size, addr, None);
+            let big = fd.new_varnode(size, addr, None)?;
             fd.vbank_mut()
                 .get_mut(big)
                 .expect("remove_revisited_markers: new big vn")
@@ -3248,6 +3267,7 @@ impl Heritage {
                 .expect("remove_revisited_markers: stale vn for setWriteMask")
                 .set_write_mask();
         }
+        Ok(())
     }
 
     /// Determine if a CALL/CALLIND `op` has an indirect effect on the memory
@@ -3293,12 +3313,12 @@ impl Heritage {
         op: crate::context::OpId,
         addr: &Address,
         size: int4,
-    ) -> crate::context::VarnodeId {
+    ) -> kuna_base::error::KunaResult<crate::context::VarnodeId> {
         use kuna_num::opcodes::OpCode;
         let op_addr = fd.obank().get(op).expect("normalize_read_size: stale op").get_addr().clone();
         let newop = fd.new_op(2, op_addr);
         fd.op_set_opcode(newop, typeop_skeleton(OpCode::CPUI_SUBPIECE));
-        let vn1 = fd.new_varnode(size, addr, None);
+        let vn1 = fd.new_varnode(size, addr, None)?;
         // overlap = vn->overlap(addr,size): the Varnode-vs-(addr,size) overlap.
         // `Varnode::overlap` reads the varnode's own loc/size against op2; here
         // we compute it directly off the varnode's address (endianness-aware,
@@ -3321,14 +3341,14 @@ impl Heritage {
         let vn2 = fd.new_constant(addr_size as int4, overlap as uintb);
         fd.op_set_input(newop, vn1, 0).expect("normalize_read_size: set input 0");
         fd.op_set_input(newop, vn2, 1).expect("normalize_read_size: set input 1");
-        fd.op_set_output(newop, vn).expect("normalize_read_size: set output");
+        fd.op_set_output(newop, vn)?;
         if let Some(out) = fd.obank().get(newop).and_then(|o| o.get_out()) {
             if let Some(v) = fd.vbank_mut().get_mut(out) {
                 v.set_write_mask();
             }
         }
         fd.op_insert_before(newop, op);
-        vn1
+        Ok(vn1)
     }
 
     /// Normalize a too-small written Varnode (C++
@@ -3352,7 +3372,7 @@ impl Heritage {
         vn: crate::context::VarnodeId,
         addr: &Address,
         size: int4,
-    ) -> crate::context::VarnodeId {
+    ) -> kuna_base::error::KunaResult<crate::context::VarnodeId> {
         use kuna_num::opcodes::OpCode;
 
         let (op, vsize, vaddr, vbig) = {
@@ -3393,14 +3413,13 @@ impl Heritage {
                 // Does the CALL have an effect on the piece?  Don't create a new
                 // big read if the write is from a CALL — model the killed piece
                 // as an indirect creation off the CALL op.
-                let newop = fd.new_indirect_creation(op, &pieceaddr, mostsigsize, false);
+                let newop = fd.new_indirect_creation(op, &pieceaddr, mostsigsize, false)?;
                 mostvn = fd.obank().get(newop).and_then(|o| o.get_out());
             } else {
                 let newop = fd.new_op(2, op_addr.clone());
                 let mvn = fd
-                    .new_varnode_out(mostsigsize, &pieceaddr, newop)
-                    .expect("normalize_write_size: new_varnode_out mostvn");
-                let big = fd.new_varnode(size, addr, None); // The new read
+                    .new_varnode_out(mostsigsize, &pieceaddr, newop)?;
+                let big = fd.new_varnode(size, addr, None)?; // The new read
                 fd.vbank_mut().get_mut(big).expect("normalize_write_size: big").set_active_heritage();
                 fd.op_set_opcode(newop, typeop_skeleton(OpCode::CPUI_SUBPIECE));
                 fd.op_set_input(newop, big, 0).expect("normalize_write_size: SUBPIECE in0");
@@ -3422,14 +3441,13 @@ impl Heritage {
             if op_is_call && self.call_op_indirect_effect(fd, &pieceaddr, overlap, op) {
                 // Unless the CALL definitely has no effect on the piece: don't
                 // create a new big read if the write is from a CALL.
-                let newop = fd.new_indirect_creation(op, &pieceaddr, overlap, false);
+                let newop = fd.new_indirect_creation(op, &pieceaddr, overlap, false)?;
                 leastvn = fd.obank().get(newop).and_then(|o| o.get_out());
             } else {
                 let newop = fd.new_op(2, op_addr.clone());
                 let lvn = fd
-                    .new_varnode_out(overlap, &pieceaddr, newop)
-                    .expect("normalize_write_size: new_varnode_out leastvn");
-                let big = fd.new_varnode(size, addr, None); // The new read
+                    .new_varnode_out(overlap, &pieceaddr, newop)?;
+                let big = fd.new_varnode(size, addr, None)?; // The new read
                 fd.vbank_mut().get_mut(big).expect("normalize_write_size: big2").set_active_heritage();
                 fd.op_set_opcode(newop, typeop_skeleton(OpCode::CPUI_SUBPIECE));
                 fd.op_set_input(newop, big, 0).expect("normalize_write_size: SUBPIECE2 in0");
@@ -3445,8 +3463,7 @@ impl Heritage {
             let newop = fd.new_op(2, op_addr.clone());
             let midaddr = if addr.is_big_endian() { vaddr.clone() } else { addr.clone() };
             let mvn = fd
-                .new_varnode_out(overlap + vsize, &midaddr, newop)
-                .expect("normalize_write_size: new_varnode_out midvn");
+                .new_varnode_out(overlap + vsize, &midaddr, newop)?;
             fd.op_set_opcode(newop, typeop_skeleton(OpCode::CPUI_PIECE));
             fd.op_set_input(newop, vn, 0).expect("normalize_write_size: PIECE in0 (most sig)");
             fd.op_set_input(newop, leastvn.expect("normalize_write_size: leastvn"), 1)
@@ -3461,8 +3478,7 @@ impl Heritage {
         let bigout: crate::context::VarnodeId = if mostsigsize != 0 {
             let newop = fd.new_op(2, op_addr.clone());
             let bvn = fd
-                .new_varnode_out(size, addr, newop)
-                .expect("normalize_write_size: new_varnode_out bigout");
+                .new_varnode_out(size, addr, newop)?;
             fd.op_set_opcode(newop, typeop_skeleton(OpCode::CPUI_PIECE));
             fd.op_set_input(newop, mostvn.expect("normalize_write_size: mostvn"), 0)
                 .expect("normalize_write_size: PIECE2 in0 (most sig)");
@@ -3480,7 +3496,7 @@ impl Heritage {
         };
 
         fd.vbank_mut().get_mut(vn).expect("normalize_write_size: vn write mask").set_write_mask();
-        bigout
+        Ok(bigout)
     }
 
     /// Keep an unlocked entry value in the ABI's independently recoverable slots.
@@ -3526,7 +3542,7 @@ impl Heritage {
         let whole = if let Some(vn) = existing {
             fd.vbank_mut().make_free(vn);
             vn
-        } else { fd.new_varnode(size, addr, None) };
+        } else { fd.new_varnode(size, addr, None)? };
         let mut pieces = Vec::with_capacity(partition.len());
         for part in partition {
             let piece = crate::p3_dataflow::kuna_inputtile::new_tiled_input(
@@ -3535,7 +3551,7 @@ impl Heritage {
             fd.vbank_mut().get_mut(piece).expect("entry input slot").set_write_mask();
             pieces.push(piece);
         }
-        Ok(self.concat_pieces(fd, &pieces, None, whole))
+        self.concat_pieces(fd, &pieces, None, whole)
     }
 
     fn new_entry_input(
@@ -3558,20 +3574,19 @@ impl Heritage {
         addr: &Address,
         size: int4,
         input: &[crate::context::VarnodeId],
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         if input.is_empty() {
-            return;
+            return Ok(());
         }
         if input.len() == 1
             && fd.vbank().get(input[0]).expect("guard_input: stale input").get_size() == size
         {
             if let Some(partition) = self.entry_partition(fd, addr, size) {
-                let whole = self.build_entry_partition(fd, addr, size, &partition)
-                    .expect("guard_input: ABI entry partition");
+                let whole = self.build_entry_partition(fd, addr, size, &partition)?;
                 fd.vbank_mut().get_mut(whole).expect("guard_input: partition output")
                     .set_active_heritage();
             }
-            return; // single input fills everything; links in automatically
+            return Ok(()); // single input fills everything; links in automatically
         }
         // Make sure the input range is filled (no holes), then concatenate the
         // pieces into a single full-size input (heritage.cc:1962-2010).
@@ -3589,12 +3604,12 @@ impl Heritage {
                 let width = (next - cur) as int4;
                 if let Some(partition) = self.entry_partition(fd, &gap, width) {
                     for piece in partition {
-                        let vn = fd.new_varnode(piece.size as int4, &piece.get_addr(), None);
-                        newinput.push(fd.set_input_varnode(vn).expect("guard_input: ABI hole slot"));
+                        let vn = fd.new_varnode(piece.size as int4, &piece.get_addr(), None)?;
+                        newinput.push(fd.set_input_varnode(vn)?);
                     }
                 } else {
-                    let vn = fd.new_varnode(width, &gap, None);
-                    newinput.push(fd.set_input_varnode(vn).expect("guard_input: input hole"));
+                    let vn = fd.new_varnode(width, &gap, None)?;
+                    newinput.push(fd.set_input_varnode(vn)?);
                 }
                 cur = next;
             } else {
@@ -3605,14 +3620,15 @@ impl Heritage {
             }
         }
         if newinput.len() == 1 {
-            return; // will get linked in automatically
+            return Ok(()); // will get linked in automatically
         }
         for &vn in &newinput {
             fd.vbank_mut().get_mut(vn).expect("guard_input: write mask").set_write_mask();
         }
-        let newout = fd.new_varnode(size, addr, None);
-        let unified = self.concat_pieces(fd, &newinput, None, newout);
+        let newout = fd.new_varnode(size, addr, None)?;
+        let unified = self.concat_pieces(fd, &newinput, None, newout)?;
         fd.vbank_mut().get_mut(unified).expect("guard_input: unified").set_active_heritage();
+        Ok(())
     }
 
     /// Perform one level of Varnode splitting to match a [`JoinRecord`] (C++
@@ -3627,7 +3643,7 @@ impl Heritage {
         lastcombo: &[crate::context::VarnodeId],
         nextlev: &mut Vec<Option<crate::context::VarnodeId>>,
         joinrec: &Rc<kuna_base::space::JoinRecord>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let numpieces = joinrec.num_pieces();
         let mut recnum: i32 = 0;
         for &curvn in lastcombo.iter() {
@@ -3655,14 +3671,14 @@ impl Heritage {
                 let mosthalf = if numinhalf == 1 {
                     let p = joinrec.get_piece(recnum);
                     let spc = p.space.clone().expect("split_join_level: piece space");
-                    fd.new_varnode_space_off(sizeaccum, spc, p.offset)
+                    fd.new_varnode_space_off(sizeaccum, spc, p.offset)?
                 } else {
                     fd.new_unique(sizeaccum, None)
                 };
                 let leasthalf = if (j - recnum) == 2 {
                     let vdata = joinrec.get_piece(recnum + 1);
                     let spc = vdata.space.clone().expect("split_join_level: piece space");
-                    fd.new_varnode_space_off(vdata.size as int4, spc, vdata.offset)
+                    fd.new_varnode_space_off(vdata.size as int4, spc, vdata.offset)?
                 } else {
                     fd.new_unique(cursize - sizeaccum, None)
                 };
@@ -3671,6 +3687,7 @@ impl Heritage {
                 recnum = j;
             }
         }
+        Ok(())
     }
 
     /// Construct pieces for a \e join-space Varnode read by an operation (C++
@@ -3683,7 +3700,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         vn: crate::context::VarnodeId,
         joinrec: &Rc<kuna_base::space::JoinRecord>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         // vn isFree, so loneDescend must be non-null.
         let mut op = fd.lone_descend(vn).expect("split_join_read: vn has a lone descendant");
@@ -3700,7 +3717,7 @@ impl Heritage {
         let mut lastcombo: Vec<crate::context::VarnodeId> = vec![vn];
         while (lastcombo.len() as i32) < joinrec.num_pieces() {
             let mut nextlev: Vec<Option<crate::context::VarnodeId>> = Vec::new();
-            self.split_join_level(fd, &lastcombo, &mut nextlev, joinrec);
+            self.split_join_level(fd, &lastcombo, &mut nextlev, joinrec)?;
 
             for (i, &curvn) in lastcombo.iter().enumerate() {
                 let mosthalf = nextlev[2 * i];
@@ -3710,7 +3727,7 @@ impl Heritage {
                 let opaddr = fd.obank().get(op).expect("split_join_read: op").get_addr().clone();
                 let concat = fd.new_op(2, opaddr);
                 fd.op_set_opcode(concat, piece_typeop.clone());
-                fd.op_set_output(concat, curvn).expect("split_join_read: set output");
+                fd.op_set_output(concat, curvn)?;
                 fd.op_set_input(concat, mosthalf, 0).expect("split_join_read: set in0");
                 fd.op_set_input(concat, leasthalf, 1).expect("split_join_read: set in1");
                 fd.op_insert_before(concat, op);
@@ -3725,6 +3742,7 @@ impl Heritage {
 
             lastcombo = nextlev.into_iter().flatten().collect();
         }
+        Ok(())
     }
 
     /// Split a written \e join-space Varnode into the specified pieces (C++
@@ -3737,7 +3755,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         vn: crate::context::VarnodeId,
         joinrec: &Rc<kuna_base::space::JoinRecord>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         // vn cannot be free: either it has a def, or it is input.
         let mut op = fd.vbank().get(vn).expect("split_join_write: vn").get_def();
@@ -3758,7 +3776,7 @@ impl Heritage {
         let mut lastcombo: Vec<crate::context::VarnodeId> = vec![vn];
         while (lastcombo.len() as i32) < joinrec.num_pieces() {
             let mut nextlev: Vec<Option<crate::context::VarnodeId>> = Vec::new();
-            self.split_join_level(fd, &lastcombo, &mut nextlev, joinrec);
+            self.split_join_level(fd, &lastcombo, &mut nextlev, joinrec)?;
             for (i, &curvn) in lastcombo.iter().enumerate() {
                 let mosthalf = nextlev[2 * i];
                 let leasthalf = nextlev[2 * i + 1];
@@ -3776,7 +3794,7 @@ impl Heritage {
                 };
                 let split = fd.new_op(2, opaddr);
                 fd.op_set_opcode(split, sub_typeop.clone());
-                fd.op_set_output(split, mosthalf).expect("split_join_write: set output most");
+                fd.op_set_output(split, mosthalf)?;
                 fd.op_set_input(split, curvn, 0).expect("split_join_write: set in0 most");
                 let c = fd.new_constant(4, leastsize as u64);
                 fd.op_set_input(split, c, 1).expect("split_join_write: set in1 most");
@@ -3792,7 +3810,7 @@ impl Heritage {
                     fd.obank().get(prevop).expect("split_join_write: op").get_addr().clone();
                 let split2 = fd.new_op(2, opaddr2);
                 fd.op_set_opcode(split2, sub_typeop.clone());
-                fd.op_set_output(split2, leasthalf).expect("split_join_write: set output least");
+                fd.op_set_output(split2, leasthalf)?;
                 fd.op_set_input(split2, curvn, 0).expect("split_join_write: set in0 least");
                 let c0 = fd.new_constant(4, 0);
                 fd.op_set_input(split2, c0, 1).expect("split_join_write: set in1 least");
@@ -3805,6 +3823,7 @@ impl Heritage {
             }
             lastcombo = nextlev.into_iter().flatten().collect();
         }
+        Ok(())
     }
 
     /// Create float truncation into a free lower-precision \e join-space Varnode
@@ -3814,7 +3833,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         vn: crate::context::VarnodeId,
         joinrec: &Rc<kuna_base::space::JoinRecord>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let op = fd.lone_descend(vn).expect("float_extension_read: vn has a lone descendant");
         let opaddr = fd.obank().get(op).expect("float_extension_read: op").get_addr().clone();
@@ -3822,11 +3841,12 @@ impl Heritage {
         // Float extensions have exactly 1 piece.
         let vdata = joinrec.get_piece(0);
         let spc = vdata.space.clone().expect("float_extension_read: piece space");
-        let bigvn = fd.new_varnode_space_off(vdata.size as int4, spc, vdata.offset);
+        let bigvn = fd.new_varnode_space_off(vdata.size as int4, spc, vdata.offset)?;
         fd.op_set_opcode(trunc, typeop_skeleton(OpCode::CPUI_FLOAT_FLOAT2FLOAT));
-        fd.op_set_output(trunc, vn).expect("float_extension_read: set output");
+        fd.op_set_output(trunc, vn)?;
         fd.op_set_input(trunc, bigvn, 0).expect("float_extension_read: set in0");
         fd.op_insert_before(trunc, op);
+        Ok(())
     }
 
     /// Create float extension from a lower-precision \e join-space Varnode (C++
@@ -3836,7 +3856,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         vn: crate::context::VarnodeId,
         joinrec: &Rc<kuna_base::space::JoinRecord>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let op = fd.vbank().get(vn).expect("float_extension_write: vn").get_def();
         let is_input = fd.vbank().get(vn).expect("float_extension_write: vn").is_input();
@@ -3855,13 +3875,13 @@ impl Heritage {
         let spc = vdata.space.clone().expect("float_extension_write: piece space");
         let outaddr = Address::new(spc, vdata.offset);
         fd.op_set_opcode(ext, typeop_skeleton(OpCode::CPUI_FLOAT_FLOAT2FLOAT));
-        fd.new_varnode_out(vdata.size as int4, &outaddr, ext)
-            .expect("float_extension_write: new_varnode_out");
+        fd.new_varnode_out(vdata.size as int4, &outaddr, ext)?;
         fd.op_set_input(ext, vn, 0).expect("float_extension_write: set in0");
         match op {
             None => fd.op_insert_begin(ext, bb),
             Some(prevop) => fd.op_insert_after(ext, prevop),
         }
+        Ok(())
     }
 
     /// Split \e join-space Varnodes up into their real components (C++
@@ -3876,10 +3896,10 @@ impl Heritage {
     /// pieces, not the pass of its first piece's space: a struct parameter held in
     /// registers and the stack is otherwise split after the registers were
     /// heritaged, and every read of its register pieces stays a bare input.
-    fn process_joins(&mut self, fd: &mut crate::funcdata::Funcdata) {
+    fn process_joins(&mut self, fd: &mut crate::funcdata::Funcdata) -> kuna_base::error::KunaResult<()> {
         let joinspace = match fd.get_arch().manage().get_join_space().cloned() {
             Some(s) => s,
-            None => return,
+            None => return Ok(()),
         };
 
         // C++ iterates beginLoc(joinspace)..endLoc(joinspace) over a live set; the
@@ -3907,9 +3927,9 @@ impl Heritage {
             }
             if is_free {
                 if joinrec.is_float_extension() {
-                    self.float_extension_read(fd, vn, &joinrec);
+                    self.float_extension_read(fd, vn, &joinrec)?;
                 } else {
-                    self.split_join_read(fd, vn, &joinrec);
+                    self.split_join_read(fd, vn, &joinrec)?;
                 }
             }
 
@@ -3923,11 +3943,12 @@ impl Heritage {
             }
 
             if joinrec.is_float_extension() {
-                self.float_extension_write(fd, vn, &joinrec);
+                self.float_extension_write(fd, vn, &joinrec)?;
             } else {
-                self.split_join_write(fd, vn, &joinrec); // Only once for a particular varnode
+                self.split_join_write(fd, vn, &joinrec)?; // Only once for a particular varnode
             }
         }
+        Ok(())
     }
 
     /// Clear stack placeholders before heritaging the stack space (C++
@@ -3942,13 +3963,15 @@ impl Heritage {
         &mut self,
         fd: &mut crate::funcdata::Funcdata,
         info_idx: usize,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         for i in 0..fd.num_calls() {
             let mut fc = fd.replace_call_specs(i);
-            fc.abort_spacebase_relative(fd);
+            let result = fc.abort_spacebase_relative(fd);
             fd.restore_call_specs_at(i, fc);
+            result?;
         }
         self.infolist[info_idx].has_call_placeholders = false;
+        Ok(())
     }
 
     /// The heart of the renaming algorithm (C++ `Heritage::renameRecurse`,
@@ -4216,7 +4239,7 @@ impl Heritage {
         vnlist: &[crate::context::VarnodeId],
         insertop: Option<crate::context::OpId>,
         finalvn: crate::context::VarnodeId,
-    ) -> crate::context::VarnodeId {
+    ) -> kuna_base::error::KunaResult<crate::context::VarnodeId> {
         use kuna_num::opcodes::OpCode;
         let mut preexist = vnlist[0];
         let isbigendian =
@@ -4248,7 +4271,7 @@ impl Heritage {
             let newop = fd.new_op(2, opaddress.clone());
             fd.op_set_opcode(newop, piece_typeop.clone());
             let newvn = if i == n - 1 {
-                fd.op_set_output(newop, finalvn).expect("concat_pieces: op_set_output");
+                fd.op_set_output(newop, finalvn)?;
                 finalvn
             } else {
                 let presize = fd.vbank().get(preexist).expect("concat_pieces: presize").get_size();
@@ -4265,7 +4288,7 @@ impl Heritage {
             fd.op_insert(newop, bl, before);
             preexist = newvn;
         }
-        preexist
+        Ok(preexist)
     }
 
     /// Build a set of Varnode-piece SUBPIECE expressions (C++
@@ -4283,7 +4306,7 @@ impl Heritage {
         addr: &Address,
         size: int4,
         startvn: crate::context::VarnodeId,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let isbigendian = addr.is_big_endian();
         let baseoff = if isbigendian {
@@ -4330,7 +4353,7 @@ impl Heritage {
             fd.op_set_input(newop, startvn, 0).expect("split_pieces: set in0");
             let cvn = fd.new_constant(4, diff);
             fd.op_set_input(newop, cvn, 1).expect("split_pieces: set in1");
-            fd.op_set_output(newop, vn).expect("split_pieces: set output");
+            fd.op_set_output(newop, vn)?;
             // C++ `opInsert(newop,bl,insertiter)` where insertiter points just
             // after the write (or block begin).  When `after_anchor` is set we
             // insert directly after it (op_insert_after); each successive piece
@@ -4344,6 +4367,7 @@ impl Heritage {
                 }
             }
         }
+        Ok(())
     }
 
     /// Build a refinement array given an address range and a Varnode list (C++
@@ -4376,7 +4400,7 @@ impl Heritage {
         addr: &Address,
         refine: &[int4],
         split: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let (mut curaddr, mut sz, spc) = {
             let v = fd.vbank().get(vn).expect("split_by_refinement: vn");
             (v.get_addr().clone(), v.get_size(), v.get_addr().get_space().expect("split_by_refinement: space").clone())
@@ -4384,9 +4408,9 @@ impl Heritage {
         let mut diff = spc.wrap_offset(curaddr.get_offset().wrapping_sub(addr.get_offset())) as usize;
         let mut cutsz = refine[diff];
         if sz <= cutsz {
-            return; // already refined
+            return Ok(()); // already refined
         }
-        let pv = fd.new_varnode(cutsz, &curaddr, None);
+        let pv = fd.new_varnode(cutsz, &curaddr, None)?;
         split.push(pv);
         sz -= cutsz;
         while sz > 0 {
@@ -4397,10 +4421,11 @@ impl Heritage {
             if cutsz > sz {
                 cutsz = sz; // final piece
             }
-            let pv = fd.new_varnode(cutsz, &curaddr, None);
+            let pv = fd.new_varnode(cutsz, &curaddr, None)?;
             split.push(pv);
             sz -= cutsz;
         }
+        Ok(())
     }
 
     /// Split up a \b free read Varnode based on the refinement (C++
@@ -4412,11 +4437,11 @@ impl Heritage {
         addr: &Address,
         refine: &[int4],
         newvn: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         newvn.clear();
-        self.split_by_refinement(fd, vn, addr, refine, newvn);
+        self.split_by_refinement(fd, vn, addr, refine, newvn)?;
         if newvn.is_empty() {
-            return;
+            return Ok(());
         }
         let vnsize = fd.vbank().get(vn).expect("refine_read: vn").get_size();
         let replacevn = fd.new_unique(vnsize, None);
@@ -4424,13 +4449,14 @@ impl Heritage {
         let op = fd.lone_descend(vn).expect("refine_read: free read has lone descend");
         let slot = fd.obank().get(op).expect("refine_read: op").get_slot(vn);
         let pieces = newvn.clone();
-        self.concat_pieces(fd, &pieces, Some(op), replacevn);
+        self.concat_pieces(fd, &pieces, Some(op), replacevn)?;
         fd.op_set_input(op, replacevn, slot).expect("refine_read: op_set_input");
         if fd.vbank().get(vn).expect("refine_read: vn").has_no_descend() {
             fd.delete_varnode(vn).expect("refine_read: delete free read");
         } else {
             panic!("kuna heritage: refining non-free varnode");
         }
+        Ok(())
     }
 
     /// Split up a written output Varnode based on the refinement (C++
@@ -4442,11 +4468,11 @@ impl Heritage {
         addr: &Address,
         refine: &[int4],
         newvn: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         newvn.clear();
-        self.split_by_refinement(fd, vn, addr, refine, newvn);
+        self.split_by_refinement(fd, vn, addr, refine, newvn)?;
         if newvn.is_empty() {
-            return;
+            return Ok(());
         }
         // (kuna `splitstorekeep`) The partition cells are fresh Varnodes, so
         // without this the `stack_store` mark `RuleStoreVarnode` put on the
@@ -4461,11 +4487,12 @@ impl Heritage {
         let def = fd.vbank().get(vn).expect("refine_write: vn").get_def().expect(
             "refine_write: write has a def",
         );
-        fd.op_set_output(def, replacevn).expect("refine_write: op_set_output");
+        fd.op_set_output(def, replacevn)?;
         let pieces = newvn.clone();
-        self.split_pieces(fd, &pieces, Some(def), &vnaddr, vnsize, replacevn);
-        fd.total_replace(vn, replacevn).expect("refine_write: total_replace");
+        self.split_pieces(fd, &pieces, Some(def), &vnaddr, vnsize, replacevn)?;
+        fd.total_replace(vn, replacevn)?;
         fd.delete_varnode(vn).expect("refine_write: delete vn");
+        Ok(())
     }
 
     /// Split up a known input Varnode based on the refinement (C++
@@ -4477,19 +4504,20 @@ impl Heritage {
         addr: &Address,
         refine: &[int4],
         newvn: &mut Vec<crate::context::VarnodeId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         newvn.clear();
-        self.split_by_refinement(fd, vn, addr, refine, newvn);
+        self.split_by_refinement(fd, vn, addr, refine, newvn)?;
         if newvn.is_empty() {
-            return;
+            return Ok(());
         }
         let (vnsize, vnaddr) = {
             let v = fd.vbank().get(vn).expect("refine_input: vn");
             (v.get_size(), v.get_addr().clone())
         };
         let pieces = newvn.clone();
-        self.split_pieces(fd, &pieces, None, &vnaddr, vnsize, vn);
+        self.split_pieces(fd, &pieces, None, &vnaddr, vnsize, vn)?;
         fd.vbank_mut().get_mut(vn).expect("refine_input: vn").set_write_mask();
+        Ok(())
     }
 
     /// Find the common refinement of all reads and writes in the address range
@@ -4507,10 +4535,10 @@ impl Heritage {
         writevars: &[crate::context::VarnodeId],
         inputvars: &[crate::context::VarnodeId],
         byte_copy: bool,
-    ) -> Option<usize> {
+    ) -> kuna_base::error::KunaResult<Option<usize>> {
         let size = self.disjoint.get(idx).size;
         if size > 1024 {
-            return None;
+            return Ok(None);
         }
         let addr = self.disjoint.get(idx).addr.clone();
         // Add a "fencepost" for the size position.
@@ -4531,7 +4559,7 @@ impl Heritage {
             }
         }
         if lastpos == 0 {
-            return None; // No non-trivial refinements
+            return Ok(None); // No non-trivial refinements
         }
         refine[lastpos] = size - lastpos as int4;
         if !byte_copy {
@@ -4563,13 +4591,13 @@ impl Heritage {
         }
         let mut newvn: Vec<crate::context::VarnodeId> = Vec::new();
         for &vn in readvars {
-            self.refine_read(fd, vn, &addr, &refine, &mut newvn);
+            self.refine_read(fd, vn, &addr, &refine, &mut newvn)?;
         }
         for &vn in writevars {
-            self.refine_write(fd, vn, &addr, &refine, &mut newvn);
+            self.refine_write(fd, vn, &addr, &refine, &mut newvn)?;
         }
         for &vn in inputvars {
-            self.refine_input(fd, vn, &addr, &refine, &mut newvn);
+            self.refine_input(fd, vn, &addr, &refine, &mut newvn)?;
         }
 
         // Alter the disjoint cover (both locally and globally) to reflect the
@@ -4596,7 +4624,7 @@ impl Heritage {
             cut += sz as usize;
             curaddr = &curaddr + i64::from(sz);
         }
-        Some(resiter)
+        Ok(Some(resiter))
     }
 
     /// Perform phi-node placement for the current address ranges (C++
@@ -4607,7 +4635,7 @@ impl Heritage {
     /// refining mismatched sub-ranges ([`refinement`](Heritage::refinement)),
     /// guarding, calling [`calc_multiequals`](Heritage::calc_multiequals), and
     /// constructing the MULTIEQUAL ops at each merge block.
-    pub fn place_multiequals(&mut self, fd: &mut crate::funcdata::Funcdata) {
+    pub fn place_multiequals(&mut self, fd: &mut crate::funcdata::Funcdata) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let mut readvars: Vec<crate::context::VarnodeId> = Vec::new();
         let mut writevars: Vec<crate::context::VarnodeId> = Vec::new();
@@ -4637,7 +4665,7 @@ impl Heritage {
             });
             if byte_copy || (memrange.size > 4 && maxw < memrange.size) {
                 if let Some(refiter) =
-                    self.refinement(fd, idx, &readvars, &writevars, &inputvars, byte_copy)
+                    self.refinement(fd, idx, &readvars, &writevars, &inputvars, byte_copy)?
                 {
                     idx = refiter;
                     memrange = self.disjoint.get(idx).clone();
@@ -4683,11 +4711,11 @@ impl Heritage {
                 // written at one size, an aliased access at a larger size forces
                 // the SSA form to be revisited).
                 let removed = std::mem::take(&mut removevars);
-                self.remove_revisited_markers(fd, &removed, &memrange.addr, size);
+                self.remove_revisited_markers(fd, &removed, &memrange.addr, size)?;
             }
-            self.guard_input(fd, &memrange.addr, size, &inputvars);
+            self.guard_input(fd, &memrange.addr, size, &inputvars)?;
             let add_indirects = memrange.new_addresses();
-            self.guard(fd, &memrange.addr, size, add_indirects, &mut readvars, &mut writevars);
+            self.guard(fd, &memrange.addr, size, add_indirects, &mut readvars, &mut writevars)?;
             // calcMultiequals(writevars): the realized engine takes the write
             // *blocks* (the C++ derives them as `write[i]->getDef()->getParent()`
             // — the block each normalized write is defined in).  Inputs/written
@@ -4708,12 +4736,11 @@ impl Heritage {
                 let start = crate::block::block_get_start(&fd.bblocks_ref().arena, bl);
                 let multiop = fd.new_op(size_in, start);
                 let vnout = fd
-                    .new_varnode_out(size, &memrange.addr, multiop)
-                    .expect("place_multiequals: new_varnode_out");
+                    .new_varnode_out(size, &memrange.addr, multiop)?;
                 fd.vbank_mut().get_mut(vnout).expect("place_multiequals: vnout").set_active_heritage();
                 fd.op_set_opcode(multiop, multi_typeop.clone());
                 for j in 0..size_in {
-                    let vnin = fd.new_varnode(size, &memrange.addr, None);
+                    let vnin = fd.new_varnode(size, &memrange.addr, None)?;
                     fd.op_set_input(multiop, vnin, j).expect("place_multiequals: op_set_input");
                 }
                 fd.op_insert_begin(multiop, bl);
@@ -4721,6 +4748,7 @@ impl Heritage {
             idx += 1;
         }
         self.merge.clear();
+        Ok(())
     }
 
     /// (kuna decompile-all watchdog) Has the running pass's budget run out —
@@ -5036,7 +5064,7 @@ impl Heritage {
         fd: &mut crate::funcdata::Funcdata,
         spc: &Rc<AddrSpace>,
         free_stores: &mut Vec<crate::context::OpId>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         for &op in free_stores.iter() {
             fd.op_clear_spacebase_ptr(op);
@@ -5078,12 +5106,13 @@ impl Heritage {
                 if same_space {
                     let in0 = fd.obank().get(iop).and_then(|o| o.get_in(0)).expect("INDIRECT in0");
                     let out = ind_out.expect("INDIRECT out");
-                    fd.total_replace(out, in0).expect("reprocess: total_replace");
-                    fd.op_destroy(iop); // get rid of the INDIRECT
+                    fd.total_replace(out, in0)?;
+                    fd.op_destroy(iop)?; // get rid of the INDIRECT
                 }
                 ind_op = next_op;
             }
         }
+        Ok(())
     }
 
     /// Make the final determination of what range new LoadGuards protect (C++
@@ -5296,11 +5325,11 @@ impl Heritage {
     /// Given a COPY from a storage location to itself, propagate the input
     /// Varnode version of the storage location to all the ops reading the
     /// output, then eliminate the COPY.
-    fn propagate_copy_away(&mut self, fd: &mut crate::funcdata::Funcdata, op: crate::context::OpId) {
+    fn propagate_copy_away(&mut self, fd: &mut crate::funcdata::Funcdata, op: crate::context::OpId) -> kuna_base::error::KunaResult<()> {
         use kuna_num::opcodes::OpCode;
         let mut in_vn = match fd.obank().get(op).and_then(|o| o.get_in(0)) {
             Some(v) => v,
-            None => return,
+            None => return Ok(()),
         };
         // Follow any COPY chain to the earliest input.
         loop {
@@ -5329,9 +5358,10 @@ impl Heritage {
             in_vn = next_in;
         }
         if let Some(out) = fd.obank().get(op).and_then(|o| o.get_out()) {
-            let _ = fd.total_replace(out, in_vn);
+            fd.total_replace(out, in_vn)?;
         }
-        fd.op_destroy(op);
+        fd.op_destroy(op)?;
+        Ok(())
     }
 
     /// Mark the boundary of artificial ops introduced by load guards (C++
@@ -5343,9 +5373,9 @@ impl Heritage {
     /// address force on the load guard.  (The COPY sinks themselves are
     /// produced by `guardLoads`; while that guard-insertion path is stubbed
     /// the sink list is empty and this is the faithful early return.)
-    fn handle_new_load_copies(&mut self, fd: &mut crate::funcdata::Funcdata) {
+    fn handle_new_load_copies(&mut self, fd: &mut crate::funcdata::Funcdata) -> kuna_base::error::KunaResult<()> {
         if self.load_copy_ops.is_empty() {
-            return;
+            return Ok(());
         }
         let mut copy_sinks = std::mem::take(&mut self.load_copy_ops);
         let copy_sink_size = copy_sinks.len();
@@ -5388,10 +5418,11 @@ impl Heritage {
         // Eliminate or propagate away the original COPY sinks.
         for &op in copy_sinks.iter().take(copy_sink_size) {
             // Make sure load guard COPYs no longer exist.
-            self.propagate_copy_away(fd, op);
+            self.propagate_copy_away(fd, op)?;
         }
         // (marks on the remaining artificial COPYs die with the local set.)
         // We have handled all the load guard COPY ops (list stays cleared).
+        Ok(())
     }
 
     /// Perform one pass of heritage (C++ `Heritage::heritage`,
@@ -5416,7 +5447,7 @@ impl Heritage {
         &mut self,
         fd: &mut crate::funcdata::Funcdata,
         deadline: Option<std::time::Instant>,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         // A function with no basic blocks has no data-flow to heritage.  The C++
         // never reaches `heritage()` in that state (it runs after `followFlow`/
         // `structureReset` built the CFG), and `buildADT` indexes the block list
@@ -5428,7 +5459,7 @@ impl Heritage {
             bblocks.root.map(|r| bblocks.block(r).get_size()).unwrap_or(0)
         };
         if block_count == 0 {
-            return;
+            return Ok(());
         }
         // (kuna `calleeprotostack`) The alias gather is only valid for the
         // data-flow as it stands, so it is dropped at every pass boundary.
@@ -5450,7 +5481,7 @@ impl Heritage {
             // Has a restructure been forced
             self.build_adt(fd);
         }
-        self.process_joins(fd);
+        self.process_joins(fd)?;
         // STUB(W6): PreferSplitManager (pass-0 splitmanage.init/split)
         // is a no-op for an architecture with no <splitrecords> (the critical
         // path); it splits SIMD-style registers when present.
@@ -5468,7 +5499,7 @@ impl Heritage {
             // boundary.  The abandoned pass's partial state is never printed —
             // the drive turns the expiry into a per-function `Err`.
             if self.deadline_passed() {
-                return;
+                return Ok(());
             }
             if !self.infolist[i].is_heritaged() {
                 continue;
@@ -5477,7 +5508,7 @@ impl Heritage {
                 continue; // too soon to heritage this space
             }
             if self.infolist[i].has_call_placeholders {
-                self.clear_stack_placeholders(fd, i);
+                self.clear_stack_placeholders(fd, i)?;
             }
             let space = self.infolist[i]
                 .space
@@ -5563,9 +5594,9 @@ impl Heritage {
                 let _ = warnvn;
             }
         }
-        self.place_multiequals(fd);
+        self.place_multiequals(fd)?;
         if self.deadline_passed() {
-            return;
+            return Ok(());
         }
         self.rename(fd);
         // (kuna w10-chainb-gap1) reprocessFreeStores: re-derive the STORE guards
@@ -5574,9 +5605,9 @@ impl Heritage {
         // unknown stack storage and collected free STOREs).
         if reprocess_stack_count > 0 {
             let spc = stack_space.expect("heritage: reprocess set without a stack space");
-            self.reprocess_free_stores(fd, &spc, &mut free_stores);
+            self.reprocess_free_stores(fd, &spc, &mut free_stores)?;
         }
-        super::kuna_spillstoreguard::prune(fd, &self.spill_store_guards);
+        super::kuna_spillstoreguard::prune(fd, &self.spill_store_guards)?;
         // (kuna) `option loadguardrange` — the upstream ValueSet range
         // refinement of new LOAD/STORE guards (heritage.cc:2753-2754).  Off
         // reproduces the pre-port behavior: every guard keeps the whole-space
@@ -5590,15 +5621,16 @@ impl Heritage {
             &self.store_guard,
             &mut self.indexed_store_bounds,
             &self.indexed_store_guards,
-        );
+        )?;
         // Unconditional, as upstream (heritage.cc:2754): the load-guard COPY
         // sinks `option indexaliasguard` creates must be marked and propagated
         // away whether or not their guards were range-refined.  An empty sink
         // list takes the early return, so this is inert with the arm off.
         crate::kuna_partialglobalload::apply(fd, std::mem::take(&mut self.partial_global_loads));
-        self.handle_new_load_copies(fd);
+        self.handle_new_load_copies(fd)?;
         // splitmanage.splitAdditional() on pass 0: STUB(W6) PreferSplitManager.
         self.pass += 1;
+        Ok(())
     }
 
     /// `bumpDeadcodeDelay` routed through the function's **persistent**
@@ -5799,7 +5831,7 @@ mod tests {
             specs.init_active_input();
             let whole = Address::new(register.clone(), 0x20);
             for _ in 0..2 {
-                Heritage::guard_call_input(&mut fd, &mut specs, &whole, &whole, 8, crate::kuna_calloverlap::LEVEL_OFF);
+                Heritage::guard_call_input(&mut fd, &mut specs, &whole, &whole, 8, crate::kuna_calloverlap::LEVEL_OFF).unwrap();
             }
             for (slot, offset) in [0x20, 0x24].into_iter().enumerate() {
                 let piece = Address::new(register.clone(), offset);
@@ -5853,7 +5885,7 @@ mod tests {
     fn entry_partition_reuses_slots_and_replaces_an_illegal_wide_input() {
         for big in [false, true] {
             let (mut fd, addr) = entry_partition_fixture(big, true, false);
-            let original = fd.new_varnode(8, &addr, None);
+            let original = fd.new_varnode(8, &addr, None).unwrap();
             fd.set_input_varnode(original).unwrap();
             let heritage = Heritage::new();
             let value = heritage.new_entry_input(&mut fd, 8, &addr).unwrap();
@@ -5883,7 +5915,7 @@ mod tests {
             assert_eq!(fd.vbank().get(value).unwrap().get_size(), 8);
         }
         let (mut fd, addr) = entry_partition_fixture(true, true, false);
-        let partial = fd.new_varnode(2, &addr, None);
+        let partial = fd.new_varnode(2, &addr, None).unwrap();
         fd.set_input_varnode(partial).unwrap();
         assert!(Heritage::new().entry_partition(&fd, &addr, 8).is_none());
     }
@@ -5894,7 +5926,7 @@ mod tests {
             crate::varnode::varnode_flags::typelock, crate::varnode::varnode_flags::namelock,
             crate::varnode::varnode_flags::persist, crate::varnode::varnode_flags::addrtied] {
             let (mut fd, addr) = entry_partition_fixture(true, true, false);
-            let whole = fd.new_varnode(8, &addr, None);
+            let whole = fd.new_varnode(8, &addr, None).unwrap();
             fd.set_input_varnode(whole).unwrap();
             if flags == 0 { fd.vbank_mut().get_mut(whole).unwrap().set_write_mask(); }
             else { fd.vbank_mut().get_mut(whole).unwrap().set_flags_pub(flags); }
@@ -5902,7 +5934,7 @@ mod tests {
             assert!(fd.vbank().get(whole).unwrap().is_input());
         }
         let (mut fd, addr) = entry_partition_fixture(true, true, false);
-        let slot = fd.new_varnode(4, &addr, None);
+        let slot = fd.new_varnode(4, &addr, None).unwrap();
         fd.set_input_varnode(slot).unwrap();
         fd.vbank_mut().get_mut(slot).unwrap().set_flags_pub(crate::varnode::varnode_flags::typelock);
         assert!(Heritage::new().entry_partition(&fd, &addr, 8).is_none());
@@ -5927,10 +5959,10 @@ mod tests {
     fn guard_input_rewrites_existing_whole_and_tiles_complete_holes() {
         for big in [false, true] {
             let (mut fd, addr) = entry_partition_fixture(big, true, false);
-            let whole = fd.new_varnode(8, &addr, None);
+            let whole = fd.new_varnode(8, &addr, None).unwrap();
             fd.set_input_varnode(whole).unwrap();
             let mut heritage = Heritage::new();
-            heritage.guard_input(&mut fd, &addr, 8, &[whole]);
+            heritage.guard_input(&mut fd, &addr, 8, &[whole]).unwrap();
             let value = fd.vbank().get(whole).unwrap();
             assert!(value.is_written());
             assert!(value.is_active_heritage());
@@ -5938,7 +5970,7 @@ mod tests {
             let block = fd.bblocks_ref().block(fd.bblocks_ref().root.unwrap()).get_block(0);
             let copy = fd.new_op(1, fd.get_address().clone());
             fd.op_set_opcode(copy, typeop_skeleton(kuna_num::opcodes::OpCode::CPUI_COPY));
-            let read = fd.new_varnode(8, &addr, None);
+            let read = fd.new_varnode(8, &addr, None).unwrap();
             fd.vbank_mut().get_mut(read).unwrap().set_active_heritage();
             fd.op_set_input(copy, read, 0).unwrap();
             fd.new_unique_out(8, copy).unwrap();
@@ -5949,9 +5981,9 @@ mod tests {
             assert_eq!(fd.vbank().iter_def_flag(crate::varnode::varnode_flags::input).count(), 2);
             let old_slots: Vec<_> = fd.vbank().iter_def_flag(crate::varnode::varnode_flags::input).collect();
             let tail_addr = Address::new(addr.get_space().unwrap().clone(), 0x28);
-            let tail = fd.new_varnode(4, &tail_addr, None);
+            let tail = fd.new_varnode(4, &tail_addr, None).unwrap();
             fd.set_input_varnode(tail).unwrap();
-            Heritage::new().guard_input(&mut fd, &addr, 12, &[tail]);
+            Heritage::new().guard_input(&mut fd, &addr, 12, &[tail]).unwrap();
             let inputs: Vec<_> = fd.vbank().iter_def_flag(crate::varnode::varnode_flags::input)
                 .map(|id| fd.vbank().get(id).unwrap().get_size()).collect();
             assert_eq!(inputs, [4, 4, 4]);
@@ -6242,7 +6274,7 @@ mod tests {
         let mut fd = build_fd();
         let copy = || crate::context::TypeOp::new(OpCode::CPUI_COPY, 0, "copy");
 
-        let read = fd.new_varnode(1, &raddr(&fd, 0x100), None);
+        let read = fd.new_varnode(1, &raddr(&fd, 0x100), None).unwrap();
         let read_op = fd.new_op(1, raddr(&fd, 0x2000));
         fd.op_set_opcode(read_op, copy());
         fd.op_set_input(read_op, read, 0).unwrap();
@@ -6251,7 +6283,7 @@ mod tests {
         fd.op_set_opcode(write_op, copy());
         let write = fd.new_varnode_out(4, &raddr(&fd, 0x108), write_op).unwrap();
 
-        let input_free = fd.new_varnode(2, &raddr(&fd, 0x10c), None);
+        let input_free = fd.new_varnode(2, &raddr(&fd, 0x10c), None).unwrap();
         let input = fd.set_input_varnode(input_free).unwrap();
 
         let end_op = fd.new_op(1, raddr(&fd, 0x2002));
@@ -6470,7 +6502,7 @@ mod tests {
         h.build_info_list(&fd);
         h.build_adt(&fd);
         // disjoint is empty -> no MULTIEQUALs placed.
-        h.place_multiequals(&mut fd);
+        h.place_multiequals(&mut fd).unwrap();
         assert!(h.merge_points().is_empty(), "no disjoint ranges -> no phi blocks");
     }
 
@@ -6483,7 +6515,7 @@ mod tests {
         assert_eq!(h.get_pass(), 0, "fresh heritage starts at pass 0");
         // Empty function: the driver walks the spaces (no free Varnodes),
         // places no phis, renames nothing, and bumps the pass counter.
-        h.heritage(&mut fd, None);
+        h.heritage(&mut fd, None).unwrap();
         assert_eq!(h.get_pass(), 1, "one heritage pass advances `pass` to 1");
         assert_eq!(fd.vbank().num_varnodes(), 0, "empty function: no Varnodes created");
     }
@@ -6554,7 +6586,7 @@ mod tests {
         // Block 3: ram[0x200] = ram[0x100]  (free read of the heritaged loc).
         let r3 = fd.new_op(1, raddr(&fd, 0x2003));
         fd.op_set_opcode(r3, copy(0));
-        let rin = fd.new_varnode(1, &loc, None);
+        let rin = fd.new_varnode(1, &loc, None).unwrap();
         fd.op_set_input(r3, rin, 0).unwrap();
         let _r3out = fd.new_varnode_out(1, &raddr(&fd, 0x200), r3).unwrap();
         fd.op_insert_end(r3, b[3]);
@@ -6567,7 +6599,7 @@ mod tests {
         // Run the full driver.
         let mut h = Heritage::new();
         h.build_info_list(&fd);
-        h.heritage(&mut fd, None);
+        h.heritage(&mut fd, None).unwrap();
 
         // Exactly one MULTIEQUAL, at block 3 (the join).
         let phis: Vec<crate::context::OpId> = fd
@@ -6698,7 +6730,7 @@ mod tests {
 
         let h = Heritage::new();
         let mut nextlev: Vec<Option<crate::context::VarnodeId>> = Vec::new();
-        h.split_join_level(&mut fd, &[curvn], &mut nextlev, &joinrec);
+        h.split_join_level(&mut fd, &[curvn], &mut nextlev, &joinrec).unwrap();
 
         // 2-1 mapping: exactly two entries, both Some (this vn was split).
         assert_eq!(nextlev.len(), 2, "2-1 mapping: one pair per input vn");
@@ -6733,7 +6765,7 @@ mod tests {
         let small = fd.new_unique(8, None);
         let h = Heritage::new();
         let mut nextlev: Vec<Option<crate::context::VarnodeId>> = Vec::new();
-        h.split_join_level(&mut fd, &[small], &mut nextlev, &joinrec);
+        h.split_join_level(&mut fd, &[small], &mut nextlev, &joinrec).unwrap();
 
         assert_eq!(nextlev.len(), 2, "fast path still emits a 2-1 pair");
         assert_eq!(nextlev[0], Some(small), "fast path keeps the input vn as the most-half");
@@ -6750,13 +6782,13 @@ mod tests {
         assert!(fd.get_arch().manage().get_join_space().is_some(), "fixture has a join space");
         // Seed a non-join Varnode so "no-op" is meaningfully observable.
         let ram = ram(&fd);
-        let _v = fd.new_varnode_space_off(8, ram, 0x100);
+        let _v = fd.new_varnode_space_off(8, ram, 0x100).unwrap();
         let nvarnodes_before = fd.vbank().num_varnodes();
         let nops_before = fd.obank().num_alive();
 
         let mut h = Heritage::new();
         h.build_info_list(&fd);
-        h.process_joins(&mut fd); // must be a clean no-op
+        h.process_joins(&mut fd).unwrap(); // must be a clean no-op
 
         assert_eq!(fd.vbank().num_varnodes(), nvarnodes_before, "no Varnodes added");
         assert_eq!(fd.obank().num_alive(), nops_before, "no ops added");
@@ -6807,7 +6839,7 @@ mod tests {
         let (copy_op, copy_out) = make_marker(&mut fd, bl, TOpCode::CPUI_COPY, &copy_out_addr, 2, 1);
         assert_eq!(fd.bb_ops(bl).len(), 1, "block has the COPY before removal");
 
-        h.remove_revisited_markers(&mut fd, &[copy_out], &addr, 4);
+        h.remove_revisited_markers(&mut fd, &[copy_out], &addr, 4).unwrap();
 
         // C++ opUnlink: op removed from its block (parent cleared), opcode untouched.
         assert!(
@@ -6845,7 +6877,7 @@ mod tests {
         let (trail_me, _trail_out) =
             make_marker(&mut fd, bl, TOpCode::CPUI_MULTIEQUAL, &trail_addr, 2, 2);
 
-        h.remove_revisited_markers(&mut fd, &[me_out], &addr, 4);
+        h.remove_revisited_markers(&mut fd, &[me_out], &addr, 4).unwrap();
 
         // The op is rewritten in place to a SUBPIECE.
         assert_eq!(
@@ -6926,7 +6958,7 @@ mod tests {
         fd.vbank_mut().get_mut(ind_out).unwrap().set_addr_force();
         assert!(fd.vbank().get(ind_out).unwrap().is_addr_force(), "addr-force set pre-call");
 
-        h.remove_revisited_markers(&mut fd, &[ind_out], &addr, 4);
+        h.remove_revisited_markers(&mut fd, &[ind_out], &addr, 4).unwrap();
 
         // Rewritten to SUBPIECE, addr-force cleared on the original output.
         assert_eq!(
@@ -6968,7 +7000,7 @@ mod tests {
         let hi = raddr(&fd, 0x502);
         let (me_op, me_out) = make_marker(&mut fd, bl, TOpCode::CPUI_MULTIEQUAL, &hi, 2, 2);
 
-        h.remove_revisited_markers(&mut fd, &[me_out], &base, 4);
+        h.remove_revisited_markers(&mut fd, &[me_out], &base, 4).unwrap();
 
         let off = fd.obank().get(me_op).unwrap().get_in(1).unwrap();
         assert_eq!(

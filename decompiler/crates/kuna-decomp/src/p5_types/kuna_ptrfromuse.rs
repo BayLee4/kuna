@@ -117,7 +117,8 @@ pub fn pointer_from_use(
     data: &Funcdata,
     vn: VarnodeId,
     mode: PtrFromUseMode,
-) -> Option<Rc<Datatype>> {
+) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     if !mode.is_on() {
         return None;
     }
@@ -137,18 +138,23 @@ pub fn pointer_from_use(
         return None;
     }
     let arch = Rc::clone(data.get_arch());
-    let tlst = arch.types()?;
+    arch.types()?;
     // Only a pointer-width value can be a pointer.  `get_type_pointer` would mint a
     // 4-byte pointer on a 64-bit image otherwise.
     let spc = Rc::clone(arch.manage().get_default_data_space()?);
     if ptrsize != spc.get_addr_size() as int4 {
         return None;
     }
+    Some((arch, spc, ptrsize))
+    })();
+    let Some((arch, spc, ptrsize)) = candidate else { return Ok(None) };
 
-    if !walk_is_base(data, vn) {
-        return None;
+    if !walk_is_base(data, vn)? {
+        return Ok(None);
     }
 
+    Ok((|| {
+    let tlst = arch.types()?;
     let word_size = spc.get_word_size();
     let ptrto = match mode {
         PtrFromUseMode::Byte => tlst.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?,
@@ -156,13 +162,14 @@ pub fn pointer_from_use(
         PtrFromUseMode::Off => return None,
     };
     tlst.get_type_pointer(ptrsize, ptrto, word_size).ok()
+    })())
 }
 
 /// Bounded breadth-first walk over the transitive descendants of `start`.  True
 /// when at least one terminal use is a LOAD/STORE address and no use refuses.
 /// Breadth first makes the hop cap a property of the graph -- everything within
 /// [`HOP_CAP`] hops of the input is seen -- rather than of the traversal order.
-fn walk_is_base(data: &Funcdata, start: VarnodeId) -> bool {
+fn walk_is_base(data: &Funcdata, start: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let mut seen: HashSet<VarnodeId> = HashSet::new();
     // Breadth first, so a Varnode is recorded at its SHORTEST hop distance from
     // the input.  With a depth-first order the cap would depend on which path
@@ -178,8 +185,8 @@ fn walk_is_base(data: &Funcdata, start: VarnodeId) -> bool {
             None => continue,
         };
         for op in descend {
-            match classify_use(data, op, vn) {
-                Use::Refuse => return false,
+            match classify_use(data, op, vn)? {
+                Use::Refuse => return Ok(false),
                 Use::Base => found_base = true,
                 Use::Neutral => {}
                 Use::Forward(next) => {
@@ -190,19 +197,19 @@ fn walk_is_base(data: &Funcdata, start: VarnodeId) -> bool {
             }
         }
     }
-    found_base
+    Ok(found_base)
 }
 
 /// Classify what `op` does with `vn`.
-fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId) -> Use {
+fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId) -> kuna_base::error::KunaResult<Use> {
     let o = match data.obank().get(op) {
         Some(o) => o,
-        None => return Use::Neutral,
+        None => return Ok(Use::Neutral),
     };
     let opcode = o.code();
     let slot = o.get_slot(vn);
     let out = o.get_out();
-    match opcode {
+    Ok(match opcode {
         // The address operand of a dereference: this is the accept condition.
         // `LOAD(space, addr)` and `STORE(space, addr, value)` both carry it at 1.
         OpCode::CPUI_LOAD | OpCode::CPUI_STORE => {
@@ -237,14 +244,14 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId) -> Use {
             let other = if slot == 0 { 1 } else { 0 };
             let other_vn = match o.get_in(other) {
                 Some(v) => v,
-                None => return Use::Neutral,
+                None => return Ok(Use::Neutral),
             };
             let other_const =
                 data.vbank().get(other_vn).map(|v| v.is_constant()).unwrap_or(false);
             if !other_const {
-                return Use::Neutral;
+                return Ok(Use::Neutral);
             }
-            match const_base_evidence(data, op, other_vn) {
+            match const_base_evidence(data, op, other_vn)? {
                 // A named global object: the constant IS the base, so `vn` is a
                 // subscript and nothing else about it can make it a pointer.
                 BaseEvidence::Object => Use::Refuse,
@@ -294,10 +301,10 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId) -> Use {
         // a committed non-pointer there outranks use evidence.
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
             if slot > 0 {
-                let vote = crate::coreaction_infertypes::input_type_local(data, op, slot);
+                let vote = crate::coreaction_infertypes::input_type_local(data, op, slot)?;
                 let meta = vote.get_metatype();
                 if meta != type_metatype::TYPE_UNKNOWN && meta != type_metatype::TYPE_PTR {
-                    return Use::Refuse;
+                    return Ok(Use::Refuse);
                 }
             }
             Use::Neutral
@@ -309,7 +316,7 @@ fn classify_use(data: &Funcdata, op: OpId, vn: VarnodeId) -> Use {
                 Use::Neutral
             }
         }
-    }
+    })
 }
 
 /// How much a constant addend looks like the base of the expression.
@@ -333,36 +340,33 @@ enum BaseEvidence {
 /// and must not be read as one either way -- a stripped image's `.bss` table
 /// carries no symbol at all, while a struct big enough to reach past the bound
 /// (bzip2's 0x13f0-byte `bzFile`) is a real pointer reached at a real offset.
-fn const_base_evidence(data: &Funcdata, op: OpId, cvn: VarnodeId) -> BaseEvidence {
+fn const_base_evidence(data: &Funcdata, op: OpId, cvn: VarnodeId) -> kuna_base::error::KunaResult<BaseEvidence> {
     let glb = data.get_arch();
     let (off, size) = match data.vbank().get(cvn) {
         Some(v) => (v.get_offset(), v.get_size()),
-        None => return BaseEvidence::No,
+        None => return Ok(BaseEvidence::No),
     };
     let spc = match glb.manage().get_default_data_space() {
         Some(s) => Rc::clone(s),
-        None => return BaseEvidence::No,
+        None => return Ok(BaseEvidence::No),
     };
     if spc.get_pointer_lower_bound() > off || spc.get_pointer_upper_bound() < off {
-        return BaseEvidence::No;
+        return Ok(BaseEvidence::No);
     }
     let point = match data.obank().get(op) {
         Some(o) => o.get_addr().clone(),
-        None => return BaseEvidence::No,
+        None => return Ok(BaseEvidence::No),
     };
     let mut full_encoding: uintb = 0;
-    let rampoint = match glb.resolve_constant(&spc, off, size, &point, &mut full_encoding) {
-        Ok(r) => r,
-        Err(_) => return BaseEvidence::No,
-    };
+    let rampoint = glb.resolve_constant(&spc, off, size, &point, &mut full_encoding)?;
     if rampoint.is_invalid() {
-        return BaseEvidence::No;
+        return Ok(BaseEvidence::No);
     }
     let invalid = Address::new_invalid();
-    match glb.query_container_global(&rampoint, 1, &invalid) {
+    Ok(match glb.query_container_global(&rampoint, 1, &invalid)? {
         Some(_) => BaseEvidence::Object,
         None => BaseEvidence::Maybe,
-    }
+    })
 }
 
 /// Any floating-point opcode: a pointer is never one of these operands.
@@ -393,15 +397,15 @@ pub(crate) fn is_float_op(opcode: OpCode) -> bool {
 /// Does the constant `cvn` of `op` resolve to a global object kuna knows about,
 /// making it the BASE of its `INT_ADD` rather than a field offset?  Shared with
 /// [`crate::kuna_charptr`], whose walk grades a literal addend the same way.
-pub(crate) fn constant_is_global_base(data: &Funcdata, op: OpId, cvn: VarnodeId) -> bool {
-    matches!(const_base_evidence(data, op, cvn), BaseEvidence::Object)
+pub(crate) fn constant_is_global_base(data: &Funcdata, op: OpId, cvn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    Ok(matches!(const_base_evidence(data, op, cvn)?, BaseEvidence::Object))
 }
 
 /// Could the constant `cvn` of `op` be the base of its `INT_ADD` -- a global
 /// object, or an address-like value that names nothing?  Shared with
 /// [`crate::kuna_castarith`], which keeps such a sum in its integer form.
-pub(crate) fn constant_may_be_global_base(data: &Funcdata, op: OpId, cvn: VarnodeId) -> bool {
-    !matches!(const_base_evidence(data, op, cvn), BaseEvidence::No)
+pub(crate) fn constant_may_be_global_base(data: &Funcdata, op: OpId, cvn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    Ok(!matches!(const_base_evidence(data, op, cvn)?, BaseEvidence::No))
 }
 
 /// Is `cand` more specific than `cur` in the `getLocalType` fold?  The seed is one

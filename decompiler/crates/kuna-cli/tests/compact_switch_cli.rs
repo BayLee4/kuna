@@ -1,4 +1,6 @@
 //! Native switches must keep the selector and its case labels in one domain.
+//! An authored parameter name belongs to the input, not necessarily the local
+//! holding its normalized index; follow that index's producer and consumer.
 use crate::common;
 use common::process;
 
@@ -227,6 +229,10 @@ fn compilers() -> Vec<&'static str> {
 /// failure.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 fn round_trip(image: &[u8], printed: &str, stores: &[u32]) {
+    assert!(
+        printed.contains(" MSABI compact_dispatch("),
+        "lost the explicitly authored nondefault calling convention: {printed}"
+    );
     let scratch = tempfile::tempdir().unwrap();
     let binary = scratch.path().join("fixture.elf");
     std::fs::write(&binary, image).unwrap();
@@ -247,6 +253,8 @@ fn round_trip(image: &[u8], printed: &str, stores: &[u32]) {
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
+// The GCC cspec's nondefault model spelling needs its actual host ABI attribute.
+#define MSABI __attribute__((ms_abi))
 typedef int int4;
 typedef unsigned int uint4;
 typedef unsigned char uint1;
@@ -337,12 +345,24 @@ fn checked_absolute(map: &[u8], targets: &[u32], retry_bound: usize) -> String {
     c
 }
 
+/// Find the normalized index by its input computation, not its allocated name.
+fn index_variable(c: &str, bias: u32) -> &str {
+    let producer = format!(" = mode - {bias};");
+    c.split_once("switch(")
+        .unwrap_or_else(|| panic!("lost the switch: {c}"))
+        .0
+        .lines()
+        .find_map(|line| line.trim().strip_suffix(producer.as_str()))
+        .filter(|name| !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'))
+        .unwrap_or_else(|| panic!("lost the mode - {bias} index producer: {c}"))
+}
+
 /// Index 2 reads map byte 1 (return 240); index 3 reads map byte 2 (retry).
 #[test]
 fn permuted_byte_map_keeps_original_index_labels() {
     let c = checked(&[0, 3, 1, 2], &[0x102c, 0x1032, 0x1038, 0x104f], 3, true);
     assert!(
-        c.contains("switch(mode)"),
+        c.contains(&format!("switch({})", index_variable(&c, 5))),
         "selector is in a different domain: {c}"
     );
     assert!(
@@ -367,7 +387,7 @@ fn compressed_map_with_duplicate_default_targets_keeps_all_index_labels() {
         true,
     );
     assert!(
-        c.contains("switch(mode)"),
+        c.contains(&format!("switch({})", index_variable(&c, 5))),
         "selector is in a different domain: {c}"
     );
     assert!(c.contains("case 0xb:"), "lost index11/240: {c}");
@@ -390,7 +410,7 @@ fn missing_guard_recovery_retains_raw_target_labels() {
     );
     assert!(c.contains("case 0x40104f:"), "lost raw default target: {c}");
     assert!(
-        c.contains("if (4 <= mode)"),
+        c.contains(&format!("if (4 <= {})", index_variable(&c, 5))),
         "folded an unverified range guard: {c}"
     );
     assert!(
@@ -406,7 +426,10 @@ fn missing_guard_recovery_retains_raw_target_labels() {
 #[test]
 fn constant_retry_index_survives_a_rejected_late_model() {
     let c = checked(&[0, 1, 1, 1, 1], &[0x1032, 0x1038, 0x102c, 0x104f], 0, true);
-    assert!(c.contains("mode = 0"), "lost the retry index reset: {c}");
+    assert!(
+        c.contains(&format!("{} = 0", index_variable(&c, 5))),
+        "lost the retry index reset: {c}"
+    );
     assert!(
         c.contains("case 0x401032:\n          return 0xf0;"),
         "lost the raw return240 target: {c}"
@@ -439,7 +462,7 @@ fn repeated_absolute_table_row_does_not_label_a_map_byte() {
 
 fn assert_index_selector(c: &str) {
     assert!(
-        c.contains("switch(mode)"),
+        c.contains(&format!("switch({})", index_variable(c, 5))),
         "selector is in a different domain: {c}"
     );
     assert!(
@@ -468,7 +491,7 @@ fn byte_index_past_a_short_map_keeps_index_labels() {
         round_trip(&image, &c, &stores);
     }
     assert!(
-        c.contains("switch(mode & 0xff)"),
+        c.contains(&format!("switch({} & 0xff)", index_variable(&c, 9))),
         "selector is in a different domain: {c}"
     );
     assert!(

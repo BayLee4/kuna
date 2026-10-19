@@ -117,6 +117,14 @@ skip when the tool is absent, but a failed build with an installed tool is an er
 Python tooling unit tests run with `make test-tools` and are also required by CI.
 They use temporary state directories, not the live pipeline inventory.
 
+Changes to the Ghidra integration also require the complete installed-product
+gate: build the normal extension ZIP, then run
+`KUNA_GHIDRA_EXTENSION_ZIP=/absolute/path/to/zip make test-ghidra-live`.
+Use Ghidra 12.1.4, Java 21 and the prerequisites in `tests/ghidra/README.md`.
+The runner installs into an isolated profile and tests its bundled native backend.
+CI runs this gate on macOS ARM64 under the same main/manual/fork/`full-ci`
+policy as the workspace suite. Mock-Java tests and package checks do not replace it.
+
 CI also runs `make lint`, treating Clippy warnings as errors in the CLI and the
 base and numeric libraries, not the whole workspace or their test targets.
 

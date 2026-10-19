@@ -206,7 +206,7 @@ fn dwarf_wins_over_the_demangled_signature() {
             execute(&mut status);
         }
         assert!(
-            status.optr.contains("Account::deposit(Account *this,int4 amount)"),
+            status.optr.contains("Account::deposit(Account * const this,int4 amount)"),
             "DWARF must win at cppsig={mode} (the parameter name proves it), got:\n{}",
             status.optr
         );

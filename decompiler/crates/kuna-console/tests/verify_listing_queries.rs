@@ -68,7 +68,7 @@ fn listing_query_surface_partition_functions_and_xrefs() {
     let image = kuna_analysis::loadimage_object::ObjectLoadImage::from_bytes(&bin, &bytes)
         .expect("open throwaway loadimage");
 
-    let listing = Listing::build(&file, &image, arch, translate, &seeds);
+    let listing = Listing::build(&file, &image, arch, translate, &seeds).unwrap();
 
     // =========================================================================
     // PR3 — code-unit partition
@@ -304,6 +304,7 @@ fn a_partition_only_listing_walks_identically_and_files_no_references() {
 
     let build = |detail| {
         Listing::build_with_meta(&file, &image, arch, translate, &seeds, &seeds, &[], detail)
+            .unwrap()
     };
     let full = build(ListingDetail::FULL);
     let lean = build(ListingDetail::PARTITION_ONLY);

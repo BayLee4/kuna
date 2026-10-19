@@ -219,7 +219,7 @@ fn doc_prototype_matches_print_c_prototype_segment() {
             // decompile; the contract is asserted on every function that DOES.
             let Ok(fd) = decompile_func(base, &sym.name, entry, 0) else { continue };
 
-            let proto = print_c_prototype(base, &fd);
+            let proto = print_c_prototype(base, &fd).unwrap();
             assert!(
                 proto.ends_with(';'),
                 "{stem}:{}: doc_prototype must end with `;`: {proto:?}",
@@ -237,7 +237,7 @@ fn doc_prototype_matches_print_c_prototype_segment() {
                 sym.name
             );
 
-            let full = print_c(base, &fd);
+            let full = print_c(base, &fd).unwrap();
             assert!(
                 full.contains(stripped),
                 "{stem}:{}: the `.h` prototype segment is NOT char-for-char inside \

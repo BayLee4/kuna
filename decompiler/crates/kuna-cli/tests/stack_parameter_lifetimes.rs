@@ -377,7 +377,7 @@ fn incoming_parameter_names_swap_without_changing_storage() {
     for directives in [vec![first.clone(), second.clone()], vec![second, first]] {
         let after = query_for(VARIANT_FIXTURE, "param_multiple", true, &directives);
         let code = after["code"].as_str().unwrap();
-        assert!(code.contains("bool carried_value,int8 prepare_only)"), "{code}");
+        kuna_harness::c_behavior::assert_c_parameters(code, "param_multiple", &["a", "b", "c", "d", "e", "f", "carried_value", "prepare_only"], "int (*)(int,int,int,int,int,int,bool,long long)");
         execute_variant("param_multiple", code);
     }
 }
@@ -492,7 +492,7 @@ fn conditional_parameter_escapes_keep_wider_writes_in_shared_storage() {
     execute_source("conditional-parameter-escape", &format!(
         "#include <stdint.h>\n\
          typedef uint8_t uint1; typedef uint16_t uint2; typedef uint32_t uint4;\n\
-         typedef uint64_t uint8; typedef int32_t int4; typedef uint8_t undefined1;\n\
+         typedef unsigned long long uint8; typedef int32_t int4; typedef uint8_t undefined1;\n\
          uint8 global_word=UINT64_C(0x8877665544332211), *escaped;\n\
          __attribute__((noinline)) uint8 read_wide(const uint8 *p) {{ return *p; }}\n\
          __attribute__((noinline)) uint8 read_escaped(void) {{ return *escaped; }}\n\

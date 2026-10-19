@@ -2684,8 +2684,8 @@ static int source_comparator(const void *left, const void *right) {
 /// `(short)((unsigned int)v1 >> 0x10)` and `a2[1] = (int)v1` -- value conversions
 /// where the machine moves bits -- so it is refused.  The round trip compiles the
 /// seven printed callers (`-no-pie`, so the array's address survives the printed
-/// 32-bit `(int)a1 + 0xc`) against a bit-preserving `h` and compares them with the
-/// source.
+/// 32-bit `(int)a1 + 0xc`) together with the emitted `h(int, float)` and compares
+/// them with the source.
 #[test]
 fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
     let bin = repo_root()
@@ -2698,7 +2698,6 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         run_kuna(&["decompile-all", &bin, "--option", "structdefs", "on", "--sleighpath", &sp]);
     assert!(ok, "kuna decompile-all failed: {stderr}");
     for want in [
-        "return (int)h(a0,v1) + v1 + 3;",
         "(unsigned int)(v1 < 0x3fc00000)",
         "if (v1 == 0x3fc00001)",
         "(unsigned int)(0x3fc00000 < v1)",
@@ -2728,7 +2727,7 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         .filter(|cc| process::optional_output(Command::new(cc).arg("--version")).is_some())
         .collect();
     assert!(!compilers.is_empty(), "protoorder float-in-GPR round trip requires a C compiler");
-    let printed = printed_functions(&stdout, &["g3 ", "g5 ", "g6 ", "g9 ", "g20 ", "g22 ", "g24 "]);
+    let printed = printed_functions(&stdout, &["h ", "g3 ", "g5 ", "g6 ", "g9 ", "g20 ", "g22 ", "g24 "]);
     let dir = std::env::temp_dir().join(format!("kuna-protoorder-floatgpr-rt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("rt.c");
@@ -2738,7 +2737,6 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         format!(
             "#include <stdio.h>\n#include <string.h>\n\
              static float hs(int k, float x) {{ return x * 2.5f + (float)k; }}\n\
-             static float h(int k, int bits) {{ float x; memcpy(&x, &bits, 4); return hs(k, x); }}\n\
              {printed}\n\
              static float fb(int b) {{ float f; memcpy(&f, &b, 4); return f; }}\n\
              static int s3(int k, int *p) {{ int b = p[3]; return (int)hs(k, fb(b)) + b + 3; }}\n\
@@ -2866,7 +2864,6 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
     for want in [
         "float nanf(void)",
         "float sub_1150(void)",
-        "return nanf((char *)0x203d);",
         "v1 = sub_1150();",
         "unsigned int sub_11c0(void)",
         "unsigned long sub_11d0(void)",
@@ -2881,8 +2878,16 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
     for bad in ["(float)(*dat_4018)", "(float)sub_1150"] {
         assert!(!stdout.contains(bad), "`{bad}` printed:\n{stdout}");
     }
-    let names = ["nanf ", "sub_1150 ", "sub_1170 ", "sub_11c0 ", "sub_11d0 ", "sub_11e0 ", "sub_11f0 ", "sub_1200 ", "sub_1210 "];
+    let stub = printed_functions(&stdout, &["nanf "]);
+    let names = ["sub_1150 ", "sub_1170 ", "sub_11c0 ", "sub_11d0 ", "sub_11e0 ", "sub_11f0 ", "sub_1200 ", "sub_1210 "];
     let printed = printed_functions(&stdout, &names);
+    // The vendored qnan loads its empty tag with LEA RIP+disp32 before
+    // calling the import. Derive the argument from those original bytes.
+    let tag_load = image_bytes(&bin, 0x1154, 7);
+    assert_eq!(&tag_load[..3], &[0x48, 0x8d, 0x3d]);
+    let tag_displacement = i32::from_le_bytes(tag_load[3..].try_into().unwrap());
+    let tag_address = u64::try_from(0x115bi64 + i64::from(tag_displacement)).unwrap();
+    assert_eq!(image_bytes(&bin, tag_address, 1), [0]);
     let mut globals = String::new();
     let mut init = String::new();
     for (name, ty, addr, size) in [
@@ -2895,11 +2900,18 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
         globals.push_str(&format!("{ty} {name};\nstatic const unsigned char {name}_b[{size}] = {{{}}};\n", bytes.join(",")));
         init.push_str(&format!("  memcpy(&{name}, {name}_b, sizeof {name});\n"));
     }
-    // The stub takes no parameters (its jump reads none); its caller passes nanf's.
+    // Keep the emitted zero-parameter stub and its provider. A typed observer
+    // records the caller's actual argument before forwarding through that stub.
     let src = format!(
-        "#include <stdio.h>\n#include <string.h>\n{BITS}#define nanf(...) nanf_stub()\n\
-         static float target(void) {{ return __builtin_nanf(\"\"); }}\nfloat (*dat_4018)(void) = target;\n{globals}{printed}\n\
-         int main(void) {{\n{init}  printf(\"%llx %llx %llx %llx %llx %llx %llx\\n\", BITS(sub_1170(3.0f)), BITS(sub_1170(-3.0f)), \
+        "#include <stdio.h>\n#include <stdint.h>\n#include <string.h>\n{BITS}\
+         static float target(void) {{ return __builtin_nanf(\"\"); }}\nfloat (*dat_4018)(void) = target;\n{globals}\
+         #define nanf nanf_stub\n{stub}\n#undef nanf\n\
+         static unsigned nanf_calls;\nstatic uintptr_t nanf_argument;\n\
+         static float observed_nanf(const char *tag) {{\n  ++nanf_calls;\n  nanf_argument = (uintptr_t)tag;\n  return nanf_stub();\n}}\n\
+         #define nanf observed_nanf\n{printed}\n#undef nanf\n\
+         int main(void) {{\n{init}  float positive = sub_1170(3.0f), negative = sub_1170(-3.0f);\n\
+         if (nanf_calls != 1 || nanf_argument != UINT64_C({tag_address})) return 1;\n\
+         printf(\"%llx %llx %llx %llx %llx %llx %llx\\n\", BITS(positive), BITS(negative), \
          BITS(sub_11c0()), BITS(sub_11d0()), BITS(sub_11e0()), BITS(sub_11f0({})), BITS(sub_1210()));\n  return 0;\n}}\n",
         arg_of_bits(&printed, "sub_11f0", 0, 0x3fa0_0000)
     );
@@ -3651,8 +3663,9 @@ fn a_float_return_beside_a_global_read_stays_an_integer() {
 /// The entry hands `f`'s `eax` to `ExitProcess`, so `f` is decompiled again to
 /// return it, and that decompile restarts once its second indirect call
 /// resolves to `ExitProcess`. On its one returning path `f` returns the handle
-/// the comparison also reads: `return -1;`. Patched to also load through the
-/// handle on that path (`je` to a `mov ecx,[eax]` the `ExitProcess` path jumps
+/// the comparison also reads: the HANDLE with low 32 bits `0xffffffff`.
+/// Patched to also load through the handle on that path (`je` to a
+/// `mov ecx,[eax]` the `ExitProcess` path jumps
 /// over), the pass before the restart returned `eax`, joined with what the
 /// unresolved call left, and the pass after it refused the handle; the first
 /// pass's output survived as `int sub_401020(..)` around a bare `return;`, and
@@ -3668,14 +3681,17 @@ fn a_return_refused_after_a_restart_leaves_the_function_void() {
         for chunk in stdout.split("// Function: ") {
             let mut lines = chunk.lines().skip(1);
             let Some(sig) = lines.next() else { continue };
-            if !sig.starts_with("void ") {
+            let returns_void = sig.strip_prefix("void ")
+                .is_some_and(|declarator| !declarator.trim_start().starts_with('*'));
+            if !returns_void {
                 assert!(!lines.any(|l| l.trim() == "return;"), "`{sig}` returns nothing:\n{stdout}");
             }
         }
         printed_functions(&stdout, &["sub_401020 "])
     };
     let printed = decompile(fixture.to_str().unwrap());
-    assert!(printed.contains("int sub_401020(unsigned int a0)") && printed.contains("return -1;"), "{printed}");
+    assert!(printed.contains("void * sub_401020(unsigned int a0)")
+        && printed.contains("return (void *)0xffffffff;"), "{printed}");
 
     let mut image = std::fs::read(&fixture).unwrap();
     let at = |image: &[u8], pattern: &[u8]| image.windows(pattern.len()).position(|w| w == pattern).unwrap();
@@ -5422,13 +5438,15 @@ int main(void) {
   return 0;
 }
 "#;
+    // The byte's sign conversion stays in both modes; only the outer widening
+    // is implied by C's destination conversion.
     let changed: [(&str, &str); 6] = [
-        ("memchr(a0,(int)a1,(unsigned long)a2);", "memchr(a0,a1,a2);"),
+        ("memchr(a0,(int)(signed char)a1,(unsigned long)a2);", "memchr(a0,(signed char)a1,a2);"),
         ("strchr(a0,(int)a1);", "strchr(a0,a1);"),
-        ("v1 = (long)a0[v2];", "v1 = a0[v2];"),
+        ("v1 = (long)(signed char)a0[v2];", "v1 = (signed char)a0[v2];"),
         (
-            "(int)(unsigned int)(unsigned char)to_uchar((int)a1)",
-            "(int)(unsigned char)to_uchar((int)a1)",
+            "(int)(unsigned int)(unsigned char)to_uchar((int)(signed char)a1)",
+            "(int)(unsigned char)to_uchar((int)(signed char)a1)",
         ),
         ("long ret_int(int a0)\n{\n  return (long)a0;", "long ret_int(int a0)\n{\n  return a0;"),
         ("*a1 = a0 >> 1;\n  return (long)(int)a0;", "*a1 = a0 >> 1;\n  return (int)a0;"),
@@ -5748,12 +5766,13 @@ int main(void) {
 }
 "#;
     let both = [("v1 = (a2) ? (unsigned long)a0 : (unsigned long)a1;", "v1 = (a2) ? (unsigned long)a0 : a1;")];
+    // Pin signed-byte values independently of the conditional's outer widening.
     let gcc_only: [(&str, &str); 8] = [
         (
-            "v2 = (*(char *)(v7 + a1) != '=') ? (int)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
-            "v2 = (*(char *)(v7 + a1) != '=') ? *(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
+            "v2 = (*(char *)(v7 + a1) != '=') ? (int)(signed char)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
+            "v2 = (*(char *)(v7 + a1) != '=') ? (signed char)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
         ),
-        ("v1 = (a1) ? (int)*(char *)(a0 + a1) : 0;", "v1 = (a1) ? *(char *)(a0 + a1) : 0;"),
+        ("v1 = (a1) ? (int)(signed char)*(char *)(a0 + a1) : 0;", "v1 = (a1) ? (signed char)*(char *)(a0 + a1) : 0;"),
         (
             "v1 = (a1) ? (unsigned int)*(unsigned char *)(a0 + a1) : 0xffffffff;",
             "v1 = (a1) ? *(unsigned char *)(a0 + a1) : 0xffffffff;",
@@ -5767,8 +5786,8 @@ int main(void) {
             "v1 = (a1) ? (long)*(int *)(a0 + (long)a1 * 4) : 3000000000;",
             "v1 = (a1) ? *(int *)(a0 + (long)a1 * 4) : 3000000000;",
         ),
-        ("v1 = (a1) ? (int)*(char *)(a0 + a1) : -1;", "v1 = (a1) ? *(char *)(a0 + a1) : -1;"),
-        ("v5 = (*(char *)(a1 + v7 + 3) != '=') ? (int)*(char", "v5 = (*(char *)(a1 + v7 + 3) != '=') ? *(char"),
+        ("v1 = (a1) ? (int)(signed char)*(char *)(a0 + a1) : -1;", "v1 = (a1) ? (signed char)*(char *)(a0 + a1) : -1;"),
+        ("v5 = (*(char *)(a1 + v7 + 3) != '=') ? (int)(signed char)*(char", "v5 = (*(char *)(a1 + v7 + 3) != '=') ? (signed char)*(char"),
     ];
     let gcc_kept = ["v1 = (a1) ? (long)*(int *)(a0 + (long)a1 * 4) : -5;", "v1 = (a2) ? (unsigned int)(a0 < a1) : 0xffffffff;"];
     let sp = specs();
@@ -6969,15 +6988,13 @@ fn a_variable_index_and_a_byte_pointer_difference_round_trip_through_the_printed
     }
 }
 
-/// An enum element keeps the integer form under `castarith`.  kuna prints every
-/// enum as a plain `enum`, which C sizes as an `int`, while the fixture's
-/// packed enums are 1 and 2 bytes in the binary (as are `-fshort-enums` enums
-/// and a C++ `enum class : uint8_t`), so `((color *)p)[3]` would read 12 bytes
-/// past `p` instead of 3.  The round trip compiles kuna's own enum typedefs,
-/// the prelude of `castarith_enum_x86_64.c` (whose callees read the width the
-/// binary passes), the printed functions between its markers and its `main`,
-/// with the option on and off, and checks the program prints what the binary
-/// does.  The C++ build is checked for spelling only.
+/// Enum loads retain their source width, sign and identity under `castarith`.
+/// The fixture's packed enums occupy 1 and 2 bytes, not C's default enum width.
+/// Compile the actual emitted providers as well as the four original callers:
+/// a physical provider can have a private unsigned carrier and a public source
+/// enum wrapper, whose definition need not occur in the caller's preamble.
+/// Both option arms must reproduce the original fixture's complete output and
+/// preserve its source enum definitions. The C++ build is checked for spelling.
 #[test]
 fn an_enum_element_keeps_the_integer_form_and_round_trips() {
     let fx = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures");
@@ -6995,6 +7012,11 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
         .filter_map(|l| l.split('(').next())
         .collect();
     assert_eq!(tested.len(), 4, "{tested:?}");
+    let providers: Vec<&str> = prelude.lines()
+        .filter_map(|l| l.strip_prefix("KEEP void "))
+        .filter_map(|l| l.split('(').next())
+        .collect();
+    assert_eq!(providers.len(), 4, "{providers:?}");
     let sp = specs();
     let runs_here = cfg!(all(target_os = "linux", target_arch = "x86_64"));
     let have_cc = process::optional_output(Command::new("cc").arg("--version")).is_some();
@@ -7022,12 +7044,16 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
             let mut types: Vec<String> = Vec::new();
             let mut body = String::new();
             let mut seen = 0;
+            let mut seen_providers = 0;
             for part in stdout.split("// Function: ").skip(1) {
                 let name = part.split(' ').next().unwrap_or("");
-                if !tested.contains(&name) {
+                if tested.contains(&name) {
+                    seen += 1;
+                } else if providers.contains(&name) {
+                    seen_providers += 1;
+                } else {
                     continue;
                 }
-                seen += 1;
                 let mut block: Option<String> = None;
                 for line in part.lines().skip(1) {
                     if let Some(b) = block.as_mut() {
@@ -7048,10 +7074,23 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
                 }
             }
             assert_eq!(seen, tested.len(), "{build} {arm}: missing a tested function\n{stdout}");
+            assert_eq!(seen_providers, providers.len(), "{build} {arm}: missing an emitted provider\n{stdout}");
             assert_eq!(types.len(), 3, "{build} {arm}: expected kuna's color, mark and level\n{stdout}");
+            for (source, carrier) in [
+                ("use_color(*(color *)((long)p + 3));", if arm == "on" {
+                    "((unsigned char *)p)[3]"
+                } else { "*(unsigned char *)((long)p + 3)" }),
+                ("use_mark(*(mark *)((long)p + 6));", if arm == "on" {
+                    "((unsigned short *)p)[3]"
+                } else { "*(unsigned short *)((long)p + 6)" }),
+            ] {
+                assert!(body.contains(source) || body.contains(carrier),
+                    "{build} castarith {arm}: expected source or physical width-correct load `{source}` / `{carrier}`\n{body}");
+            }
             for w in [
-                "use_color(*(color *)((long)p + 3));",
-                "use_mark(*(mark *)((long)p + 6));",
+                "void use_color(color c)",
+                "void use_mark(mark m)",
+                "void use_level(level l)",
                 "use_level(*(level *)((long)p + 8));",
                 "set_color((color *)((long)p + 5));",
             ] {
@@ -7069,7 +7108,11 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
             let exe = dir.join("rt");
             std::fs::write(
                 &c,
-                format!("#include <stdio.h>\n#define KUNA_RT\n{}\n{prelude}\n{body}\n{main}", types.concat()),
+                format!("#include <stdio.h>\n{}\n\
+                    _Static_assert(sizeof(color) == 1 && sizeof(mark) == 2 && sizeof(level) == 4, \"source enum widths\");\n\
+                    _Static_assert((color)-1 > 0 && (mark)-1 > 0 && (level)-1 > 0, \"source enum signs\");\n\
+                    _Static_assert(RED == 1 && GREEN == 200 && M0 == 1 && M1 == 0x1234 && L0 == 0 && L1 == 7, \"source enum names and values\");\n\
+                    {body}\n{main}", types.concat()),
             )
             .unwrap();
             let cc = Command::new("cc")

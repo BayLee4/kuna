@@ -48,6 +48,11 @@ directly. The standalone path still reads the same register table. In Ghidra
 mode, `GhidraTranslate` delegates to `GhidraRegisterLookup`, which serves a
 cached name or sends the existing `command_getregistername` callback to the Java
 host. An empty name retains the existing “not a named hardware register” result.
+Both register-name methods return `KunaResult<String>`: absence is an empty
+successful string, while a host refusal or transport failure propagates through
+flow recovery, storage joins, variable naming, and printing. Local SLEIGH and
+snapshot lookups wrap their cache-only answers in `Ok`; speculative
+`probe_register` checks remain infallible and must not issue host queries.
 
 Returning `false` whenever `as_sleigh()` is unavailable would avoid the panic,
 but it would silently disable the V850 correction in Ghidra mode. Using the

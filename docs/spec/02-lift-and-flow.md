@@ -78,6 +78,15 @@ default-divergences are DIV-3/4/13/14 in `docs/history.md`.
 
 ## 2.1 Instruction following
 
+`exportinline on|off` is an invocation-owned enhanced export preparation
+policy, off by default. It uses the existing inline-flow machinery for
+available mapped callees before provider discovery, rather than replacing the
+selected action root or omitting ordinary C/High output. Source inline
+directives, fixup/injection bodies, no-return effects and per-call overrides
+retain their authority. The enhanced exporter prepares exactly its explicitly
+selected roots, then applies the same configuration to fresh pooled
+interfaces; ordinary interfaces and source declarations are unchanged.
+
 **Two-phase model.** `flow.rs (FlowInfo::generate_ops)` produces every raw
 p-code op into the op bank's *dead list*, instruction by instruction;
 `flow.rs (FlowInfo::generate_blocks)` later organizes them into basic blocks
@@ -519,7 +528,11 @@ recovered switch table.
   language, so in ghidra mode — no `.sla` — the payloads are registered but
   never compiled, and each injection instead asks the host to lift the snippet
   for that one call site (chapter 00). The metadata half is unchanged either
-  way; only the ops change source.
+  way; only the ops change source. Manual callfixup and callother registration
+  preserves the supplied payload name for forward lookup, reverse lookup and
+  duplicate detection. XML decoding replaces that allocation name with the
+  document's `name` or `targetop`. Unlike stock SLEIGH's source-only constructors,
+  this keeps distinct manual registrations from colliding under `"unknown"`.
 - **User ops.** `decompiler/crates/kuna-decomp/src/p2_lift/userop.rs
   (UserOpManage)` manages the CALLOTHER black-box ops (unspecialized, datatype,
   volatile, segment, jump-assist, injected). A CALLOTHER whose user op is
@@ -1445,6 +1458,9 @@ table reached once the deadline has passed is not attempted — its BRANCHIND is
 truncated like any unrecovered one, so the loop drains instead of staging more
 sub-decompilations — and the budget error names the step and the indirect
 jump's address. Without a budget each probe is one thread-local read.
+Recovery modes remain separate from fallible execution: host-query errors
+propagate out of recovery rather than becoming an unrecovered table or a
+successful action count.
 Two pre-checks bound the attempt:
 `funcdata_block.rs (Funcdata::early_jump_table_fail)` backtracks up to 8 ops
 through value-preserving arithmetic looking for a computation the recovery can

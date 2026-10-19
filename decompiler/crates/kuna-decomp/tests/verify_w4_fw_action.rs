@@ -107,10 +107,10 @@ struct LogRule {
     log: Log,
 }
 impl Rule for LogRule {
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = data.obank().get(op).unwrap().code();
         self.log.borrow_mut().push(format!("{}:{:?}", self.tag, opc));
-        0
+        Ok(0)
     }
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
@@ -127,15 +127,15 @@ struct MorphRule {
     fired: Rc<RefCell<bool>>,
 }
 impl Rule for MorphRule {
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = data.obank().get(op).unwrap().code();
         self.log.borrow_mut().push(format!("morph:{opc:?}"));
         if opc == OpCode::CPUI_COPY && !*self.fired.borrow() {
             *self.fired.borrow_mut() = true;
             data.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "INT_ADD"));
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
@@ -161,8 +161,8 @@ impl Action for NamedLeaf {
     fn base_mut(&mut self) -> &mut kuna_decomp::action::ActionBase {
         &mut self.base
     }
-    fn apply(&mut self, _d: &mut Funcdata, _c: &mut ActionContext) -> int4 {
-        0
+    fn apply(&mut self, _d: &mut Funcdata, _c: &mut ActionContext) -> kuna_base::error::KunaResult<int4> {
+        Ok(0)
     }
     fn clone_filtered(&self, _g: &ActionGroupList) -> Option<Box<dyn Action>> {
         Some(Box::new(NamedLeaf { base: self.base.clone() }))
@@ -193,7 +193,7 @@ fn w4_fw_action_consecutive_dead_ops_at_head_all_destroyed_live_visited_once() {
         Box::new(LogRule { tag: "A".into(), log: log.clone() }),
     );
     let mut ctx = ActionContext::new();
-    assert_eq!(pool.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(pool.apply(&mut fd, &mut ctx).unwrap(), 0);
 
     // The three dead ops were each opDeadAndGone-destroyed; only the live op
     // survives and only it was dispatched, exactly once.
@@ -232,7 +232,7 @@ fn w4_fw_action_rezero_reoffers_disabled_rule_without_applying_it() {
     );
 
     let mut ctx = ActionContext::new();
-    assert_eq!(pool.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(pool.apply(&mut fd, &mut ctx).unwrap(), 0);
 
     // DIS never appears (disabled, both before and after the re-zero).
     assert!(!log.borrow().iter().any(|l| l.starts_with("DIS")), "disabled rule was invoked: {:?}", log.borrow());
@@ -302,7 +302,7 @@ fn w4_fw_action_breakpoint_resumes_same_op_from_preserved_rule_index() {
     // MUST go through perform(), which owns the status state machine; calling
     // apply() directly would re-reset op_state/rule_index because apply() keys
     // its reset on status, and only perform() advances status to status_mid.)
-    let r1 = pool.perform(&mut fd, &mut ctx);
+    let r1 = pool.perform(&mut fd, &mut ctx).unwrap();
     assert_eq!(r1, -1, "expected a breakpoint partial return");
     assert_eq!(*log.borrow(), vec!["morph:CPUI_COPY"]);
 
@@ -310,7 +310,7 @@ fn w4_fw_action_breakpoint_resumes_same_op_from_preserved_rule_index() {
     // op_state/rule_index.  It must continue on the SAME (first) op at
     // rule_index=1 -> Log sees the now-INT_ADD first op (NOT morph again),
     // proving rule_index was preserved across the break.
-    let _r2 = pool.perform(&mut fd, &mut ctx);
+    let _r2 = pool.perform(&mut fd, &mut ctx).unwrap();
     // The FIRST post-break dispatch is the broken op's REMAINING rule (log on
     // the now-INT_ADD first op) -- op_state was not advanced past the broken
     // op AND rule_index resumed at 1 (morph was not re-offered on the first op).
@@ -340,9 +340,9 @@ fn w4_fw_action_empty_grouplist_derives_a_noop_root_not_a_crash() {
         log: Log,
     }
     impl Rule for XRule {
-        fn apply_op(&mut self, _op: OpId, _d: &mut Funcdata) -> int4 {
+        fn apply_op(&mut self, _op: OpId, _d: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
             self.log.borrow_mut().push("xrule".into());
-            0
+            Ok(0)
         }
         fn get_op_list(&self) -> Vec<OpCode> {
             vec![OpCode::CPUI_INT_ADD]
@@ -377,7 +377,7 @@ fn w4_fw_action_empty_grouplist_derives_a_noop_root_not_a_crash() {
     {
         let act = db.get_current_mut().unwrap();
         act.reset(&mut fd);
-        let r = act.perform(&mut fd, &mut ctx);
+        let r = act.perform(&mut fd, &mut ctx).unwrap();
         assert_eq!(r, 0);
     }
     // The filtered-out rule never ran.
@@ -412,7 +412,7 @@ fn w4_fw_action_cursor_jumps_to_op_inserted_below_after_break_documents_divergen
         done: Rc<RefCell<bool>>,
     }
     impl Rule for InsertBelowRule {
-        fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+        fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
             let opc = data.obank().get(op).unwrap().code();
             self.log.borrow_mut().push(format!("ins:{opc:?}"));
             if opc == OpCode::CPUI_COPY && !*self.done.borrow() {
@@ -423,9 +423,9 @@ fn w4_fw_action_cursor_jumps_to_op_inserted_below_after_break_documents_divergen
                 let id = data.obank_mut().create_seq(0, SeqNum::new(pc, 99));
                 data.obank_mut().mark_alive(id);
                 data.obank_mut().change_opcode(id, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "INT_ADD"));
-                return 1; // a change -> action breakpoint can trip
+                return Ok(1); // a change -> action breakpoint can trip
             }
-            0
+            Ok(0)
         }
         fn get_op_list(&self) -> Vec<OpCode> {
             vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
@@ -441,7 +441,7 @@ fn w4_fw_action_cursor_jumps_to_op_inserted_below_after_break_documents_divergen
     pool.add_rule(st, Box::new(InsertBelowRule { log: log.clone(), done: Rc::new(RefCell::new(false)) }));
 
     let mut ctx = ActionContext::new();
-    let r1 = pool.perform(&mut fd, &mut ctx);
+    let r1 = pool.perform(&mut fd, &mut ctx).unwrap();
     assert_eq!(r1, -1, "expected the action breakpoint to trip");
     assert_eq!(*log.borrow(), vec!["ins:CPUI_COPY"]);
 
@@ -456,7 +456,7 @@ fn w4_fw_action_cursor_jumps_to_op_inserted_below_after_break_documents_divergen
     // any future engine change is detected.  (Debug-only: breakpoints exist
     // only under the W9 console; the normal no-breakpoint path advances the
     // cursor AFTER rules run and is faithful.)
-    let _r2 = pool.perform(&mut fd, &mut ctx);
+    let _r2 = pool.perform(&mut fd, &mut ctx).unwrap();
     let all: Vec<String> = log.borrow().clone();
 
     // PINNED DIVERGENCE (debug-breakpoint-only).  Full log:

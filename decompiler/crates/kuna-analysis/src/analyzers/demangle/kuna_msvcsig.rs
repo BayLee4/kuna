@@ -706,7 +706,7 @@ fn byval_decl(
         pieces.innames.push(String::new());
     }
     pieces.first_var_arg_slot = -1;
-    Some(ByvalDecl { pieces, at })
+    Some(ByvalDecl::new(pieces, at))
 }
 
 /// A 32-bit x86 PE or COFF object: the one target whose MSVC conventions differ.

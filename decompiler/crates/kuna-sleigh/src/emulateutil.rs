@@ -52,7 +52,7 @@ pub struct EmulateSnippet {
     /// constants — module docs)
     manage: Rc<AddrSpaceManager>,
     /// Sequence of p-code ops to be executed
-    op_list: Vec<Rc<PcodeOpRaw>>,
+    op_list: Rc<Vec<Rc<PcodeOpRaw>>>,
     /// Values stored in temporary registers
     temp_values: BTreeMap<u64, u64>,
     /// Current p-code op being executed (C++ `PcodeOpRaw *currentOp`)
@@ -69,7 +69,7 @@ impl EmulateSnippet {
             core: EmulateCore::new(),
             loader,
             manage,
-            op_list: Vec::new(),
+            op_list: Rc::new(Vec::new()),
             temp_values: BTreeMap::new(),
             current_op: None,
             pos: 0,
@@ -147,7 +147,21 @@ impl EmulateSnippet {
         inst: &'a [Option<Rc<dyn OpBehavior>>],
         uniq_reserve: u64,
     ) -> PcodeEmitCache<'a> {
-        PcodeEmitCache::new(&mut self.op_list, inst, uniq_reserve)
+        PcodeEmitCache::new(Rc::make_mut(&mut self.op_list), inst, uniq_reserve)
+    }
+
+    /// Create an independent execution frame sharing the immutable emitted code.
+    /// No memory state or instruction position is shared with the original frame.
+    pub fn fork(&self) -> Self {
+        Self {
+            core: EmulateCore::new(),
+            loader: Rc::clone(&self.loader),
+            manage: Rc::clone(&self.manage),
+            op_list: Rc::clone(&self.op_list),
+            temp_values: BTreeMap::new(),
+            current_op: None,
+            pos: 0,
+        }
     }
 
     /// \brief Check for p-code that is deemed illegal for a \e snippet
@@ -161,7 +175,7 @@ impl EmulateSnippet {
     ///
     /// \return \b true if the current snippet is legal
     pub fn check_for_legal_code(&self) -> bool {
-        for op in &self.op_list {
+        for op in self.op_list.iter() {
             let opc = op.get_opcode();
             if opc == OpCode::CPUI_BRANCHIND
                 || opc == OpCode::CPUI_CALL

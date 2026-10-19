@@ -1,0 +1,124 @@
+--- a/ghidra/program/model/pcode/HighFunction.java
++++ b/ghidra/program/model/pcode/HighFunction.java
+@@ -27,6 +27,9 @@
+ import ghidra.program.model.address.*;
+ import ghidra.program.model.lang.CompilerSpec;
+ import ghidra.program.model.lang.Language;
++import ghidra.program.model.lang.ParameterPieces;
++import ghidra.program.model.lang.PrototypeModel;
++import ghidra.program.model.lang.PrototypePieces;
+ import ghidra.program.model.listing.*;
+ import ghidra.program.model.symbol.*;
+ import ghidra.util.exception.DuplicateNameException;
+@@ -78,6 +81,15 @@
+ 	 */
+ 	public Function getFunction() {
+ 		return func;
++	}
++
++	/** Readability survives source changes; only source editing/export authority expires. */
++	public boolean hasCurrentSourceAuthority() {
++		return getDataTypeManager().hasCurrentSourceAuthority();
++	}
++
++	public void requireCurrentSourceAuthority() {
++		getDataTypeManager().requireCurrentSourceAuthority();
+ 	}
+ 
+ 	/**
+@@ -415,6 +427,82 @@
+ 		}
+ 	}
+ 
++	private int getOverrideFirstVarArg(Program program, Address address,
++			FunctionSignature signature) {
++		int effectiveFirst = HighFunctionDBUtil.getFirstVarArg(program, address);
++		if (effectiveFirst <= 0) {
++			return effectiveFirst;
++		}
++		Function referenced = null;
++		for (Reference reference : program.getReferenceManager().getReferencesFrom(address)) {
++			if (reference.isPrimary() && reference.getReferenceType().isCall()) {
++				referenced = program.getFunctionManager().getFunctionAt(reference.getToAddress());
++				break;
++			}
++		}
++		PrototypeModel model = compilerSpec.getCallingConvention(signature.getCallingConventionName());
++		if (referenced == null || !referenced.hasVarArgs() || referenced.hasCustomVariableStorage() ||
++				referenced.getParameterCount() != effectiveFirst || model == null ||
++				model != referenced.getCallingConvention() || model.isMerged() ||
++				model.hasThisPointer() || model.hasInjection() ||
++				!signature.getReturnType().isEquivalent(referenced.getReturn().getFormalDataType())) {
++			return effectiveFirst;
++		}
++		Parameter[] fixed = referenced.getParameters();
++		int logicalFirst = 0;
++		int hidden = 0;
++		var arguments = signature.getArguments();
++		for (Parameter parameter : fixed) {
++			if (parameter.isAutoParameter()) {
++				if (parameter.getAutoParameterType() != AutoParameterType.RETURN_STORAGE_PTR) {
++					return effectiveFirst;
++				}
++				++hidden;
++			}
++			else {
++				if (parameter.isForcedIndirect() || logicalFirst >= arguments.length ||
++						!arguments[logicalFirst].getDataType().isEquivalent(parameter.getFormalDataType())) {
++					return effectiveFirst;
++				}
++				++logicalFirst;
++			}
++		}
++		if (hidden != 1 || logicalFirst <= 0 || logicalFirst + hidden != effectiveFirst) {
++			return effectiveFirst;
++		}
++		PrototypePieces pieces = new PrototypePieces(model, signature.getReturnType());
++		for (var argument : arguments) {
++			pieces.intypes.add(argument.getDataType());
++		}
++		pieces.firstVarArgSlot = logicalFirst;
++		ArrayList<ParameterPieces> allocated = new ArrayList<>();
++		model.assignParameterStorage(pieces, program.getDataTypeManager(), allocated, true);
++		if (allocated.size() != arguments.length + hidden + 1 || !allocated.get(0).isIndirect ||
++				allocated.get(0).joinPieces != null) {
++			return effectiveFirst;
++		}
++		for (int index = 1; index < allocated.size(); ++index) {
++			ParameterPieces piece = allocated.get(index);
++			if (piece.isThisPointer || piece.isIndirect || piece.joinPieces != null ||
++					piece.address == null || piece.address == Address.NO_ADDRESS) {
++				return effectiveFirst;
++			}
++			if (index <= effectiveFirst) {
++				Parameter original = fixed[index - 1];
++				Varnode[] storage = original.getVariableStorage().getVarnodes();
++				if (piece.hiddenReturnPtr != original.isAutoParameter() || storage.length != 1 ||
++						!storage[0].getAddress().equals(piece.address) ||
++						storage[0].getSize() != piece.type.getLength()) {
++					return effectiveFirst;
++				}
++			}
++			else if (piece.hiddenReturnPtr) {
++				return effectiveFirst;
++			}
++		}
++		return logicalFirst;
++	}
++
+ 	/**
+ 	 * Encode this HighFunction to a stream. The size describes how many bytes starting from the
+ 	 * entry point are used by the function, but this doesn't need to be strictly accurate as it
+@@ -469,9 +557,9 @@
+ 			Program prog = func.getProgram();
+ 			for (DataTypeSymbol sym : protoOverrides) {
+ 				Address addr = sym.getAddress();
+-				int firstVarArg = HighFunctionDBUtil.getFirstVarArg(prog, addr);
+-				FunctionPrototype fproto = new FunctionPrototype(
+-					(FunctionSignature) sym.getDataType(), compilerSpec, false);
++				FunctionSignature signature = (FunctionSignature) sym.getDataType();
++				int firstVarArg = getOverrideFirstVarArg(prog, addr, signature);
++				FunctionPrototype fproto = new FunctionPrototype(signature, compilerSpec, false);
+ 				encoder.openElement(ELEM_PROTOOVERRIDE);
+ 				AddressXML.encode(encoder, addr);
+ 				fproto.encodePrototype(encoder, dtmanage, firstVarArg);

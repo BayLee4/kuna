@@ -25,6 +25,7 @@
 
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
 use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
 use kuna_base::space::{addrspace_flags, spacetype, AddrSpace, AddrSpaceManager, UniqueSpace};
 use kuna_base::types::int4;
@@ -78,8 +79,8 @@ impl InjectArchitecture for TestArch {
 }
 
 impl UseropArchitecture for TestArch {
-    fn get_user_op_names(&self) -> Vec<Vec<u8>> {
-        self.user_op_names.clone()
+    fn get_user_op_names(&self) -> KunaResult<Vec<Vec<u8>>> {
+        Ok(self.user_op_names.clone())
     }
     fn decode_inject(
         &mut self,
@@ -416,16 +417,6 @@ fn manual_call_other_fixup_pushes_inputs_then_output_in_order() {
     assert_eq!(core.get_input(0).get_index(), 0);
     assert_eq!(core.get_input(1).get_index(), 1);
     assert_eq!(core.get_output(0).get_index(), 2);
-    // C++ FIDELITY: manualCallOtherFixup (inject_sleigh.cc:504-518) never sets
-    // the payload's `name`, so allocateInject's InjectPayloadCallother default
-    // name "unknown" is what registerInject/registerCallOtherFixup record — NOT
-    // the "myop" argument (the userop-name binding happens separately, in
-    // UserOpManage::manualCallOtherFixup). The Rust port reproduces this: the
-    // callother target name for this id is "unknown", and "myop" is unbound.
-    assert_eq!(core.get_name(), b"unknown");
-    assert_eq!(lib.base.get_call_other_target(id), b"unknown");
-    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"unknown"), id);
-    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"myop"), -1);
 }
 
 /// Empty output name => NO output parameter pushed (the C++

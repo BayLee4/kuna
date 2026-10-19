@@ -353,7 +353,7 @@ fn t5_stackguard_action_gate_off_inert_on_strips() {
     let before = fd.bblocks_get_size();
     let mut off = ActionStripStackGuard::new(false, "stackptrflow");
     let mut ctx = ActionContext::default();
-    assert_eq!(off.apply(&mut fd, &mut ctx), 0, "gate off => inert");
+    assert_eq!(off.apply(&mut fd, &mut ctx).unwrap(), 0, "gate off => inert");
     assert_eq!(fd.bblocks_get_size(), before, "gate off leaves the CFG untouched");
     assert_eq!(fd.bblocks_ref().block(h).size_out(), 2, "gate off keeps both edges");
 
@@ -364,7 +364,7 @@ fn t5_stackguard_action_gate_off_inert_on_strips() {
     // `removeUnreachableBlocks` in the real pipeline; this hand-built fixture has
     // no dominator tree, so that collection is a no-op here.)
     let mut on = ActionStripStackGuard::new(true, "stackptrflow");
-    assert_eq!(on.apply(&mut fd, &mut ctx), 1, "gate on strips the canary => change");
+    assert_eq!(on.apply(&mut fd, &mut ctx).unwrap(), 1, "gate on strips the canary => change");
     assert_eq!(
         fd.bblocks_ref().block(h).size_out(),
         1,

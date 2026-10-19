@@ -129,10 +129,87 @@ impl Seen {
     }
 }
 
+/// The source Symbol selected for one exact-width annotation occurrence.
+#[derive(Debug, Clone)]
+pub(crate) struct AnnotationSymbol {
+    pub name: String,
+    pub offset: i32,
+    pub ty: Option<Rc<Datatype>>,
+    pub id: u64,
+}
+
+/// A volatile annotation is an address, not a value with a HighVariable. Keep
+/// its existing source acquisition on the document plan instead of losing the
+/// declaration and type roots when its variable token is flattened.
+#[derive(Debug, Clone)]
+pub(crate) struct Annotation {
+    pub address: Address,
+    pub size: i32,
+    pub symbol: Option<AnnotationSymbol>,
+    pub volatile: bool,
+    pub emitted: bool,
+}
+
+impl Annotation {
+    pub fn whole_object_volatile(&self) -> bool {
+        self.volatile && self.symbol.as_ref().is_some_and(|symbol| {
+            symbol.offset == 0 && symbol.ty.as_ref().is_some_and(|ty| ty.get_size() == self.size)
+        })
+    }
+
+    /// Storage volatility can qualify a declaration only when the actual
+    /// annotation covers that whole object, never a volatile member's parent.
+    /// The acquired source datatype remains unchanged.
+    pub fn declaration_type(&self) -> Option<Rc<Datatype>> {
+        let symbol = self.symbol.as_ref()?;
+        let ty = symbol.ty.as_ref()?;
+        Some(if self.whole_object_volatile() && !crate::kuna_typequal::is_volatile(ty)
+        {
+            crate::kuna_typequal::qualified_type(Rc::clone(ty), crate::kuna_typequal::VOLATILE)
+        } else {
+            Rc::clone(ty)
+        })
+    }
+}
+
+/// The existing pushAnnotation acquisition, shared with document preparation.
+/// The annotation's one-byte address carrier does not determine the access width.
+pub(crate) fn acquire_annotation(
+    fd: &Funcdata, arch: &Architecture, vn: VarnodeId, op: OpId,
+) -> KunaResult<Annotation> {
+    let value = fd.vbank().get(vn).expect("annotation operand");
+    let operation = fd.obank().get(op).expect("annotation operation");
+    let mut size = 0;
+    if operation.code() == OpCode::CPUI_CALLOTHER {
+        let index = operation.get_in(0).and_then(|id| fd.vbank().get(id))
+            .map_or(0, |value| value.get_offset());
+        if let Some(userop) = arch.userops.get_op(index as u32) {
+            let output = operation.get_out().and_then(|id| fd.vbank().get(id))
+                .map(|value| value.get_size());
+            let input = if operation.num_input() > 2 {
+                operation.get_in(2).and_then(|id| fd.vbank().get(id))
+                    .map(|value| value.get_size())
+            } else {
+                None
+            };
+            size = userop.extract_annotation_size(output, input);
+        }
+    }
+    let symbol = fd.get_arch().name_for_global_varnode(
+        value.get_addr(), if size != 0 { size } else { 1 }, operation.get_addr(),
+    )?.map(|(name, offset, ty, id)| AnnotationSymbol { name, offset, ty, id });
+    Ok(Annotation {
+        address: value.get_addr().clone(),
+        size: if size != 0 { size } else { value.get_size() },
+        symbol, volatile: value.is_volatile(), emitted: false,
+    })
+}
+
 /// The per-function state: the facts every decision reads, computed once when
 /// the function's document starts, and the globals it has named so far.
 #[derive(Debug, Default)]
 pub struct Plan {
+    annotations: BTreeMap<(OpId, VarnodeId), Annotation>,
     on: bool,
     trace: bool,
     numeric: HashSet<uintb>,
@@ -146,11 +223,26 @@ pub struct Plan {
     pub minted: BTreeMap<u64, Minted>,
 }
 
-/// Build the plan for `fd`. Off (and empty) unless the option is on, the image
-/// reported data sections, and the output language is C.
-pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> Plan {
+/// Build the plan for `fd`. Source annotation bindings do not depend on the
+/// synthesized-address option, data-section inventory, or output language.
+pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> KunaResult<Plan> {
+    let mut annotations = BTreeMap::new();
+    for op in fd.obank().iter_alive() {
+        let operation = fd.obank().get(op).expect("live annotation operation");
+        if operation.code() != OpCode::CPUI_CALLOTHER { continue; }
+        let Some(index) = operation.get_in(0).and_then(|id| fd.vbank().get(id)) else { continue };
+        let Some(userop) = arch.userops.get_op(index.get_offset() as u32) else { continue };
+        if !matches!(userop.get_type(),
+            crate::userop::userop_type::volatile_read | crate::userop::userop_type::volatile_write)
+        {
+            continue;
+        }
+        let Some(vn) = operation.get_in(1)
+            .filter(|id| fd.vbank().get(*id).is_some_and(|value| value.is_annotation())) else { continue };
+        annotations.insert((op, vn), acquire_annotation(fd, arch, vn, op)?);
+    }
     if !on || !is_c || arch.globalref_ranges.is_empty() {
-        return Plan::default();
+        return Ok(Plan { annotations, ..Plan::default() });
     }
     let data_space = arch.manage().get_default_data_space().map(|s| s.get_index());
     let mut numeric = HashSet::new();
@@ -183,7 +275,7 @@ pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> Plan {
             }
         } else if data_space.is_some() && v.get_addr().get_space().map(|s| s.get_index()) == data_space {
             let unnamed = in_ranges(&arch.globalref_ranges, v.get_offset())
-                && fd.get_arch().query_container_global(v.get_addr(), v.get_size(), &Address::new_invalid()).is_none();
+                && fd.get_arch().query_container_global(v.get_addr(), v.get_size(), &Address::new_invalid())?.is_none();
             // (kuna `elemptr`) A global the rule typed, or whose fold names its
             // pointee and which nothing uses as a number, is used only as that
             // pointer: one of another type (its value before a call, which
@@ -206,7 +298,7 @@ pub fn plan(fd: &Funcdata, arch: &Architecture, on: bool, is_c: bool) -> Plan {
         }
     }
     let trace = std::env::var_os("KUNA_GLOBALREF_TRACE").is_some();
-    Plan { on: true, trace, numeric, direct, pointees, indexed, minted: BTreeMap::new() }
+    Ok(Plan { annotations, on: true, trace, numeric, direct, pointees, indexed, minted: BTreeMap::new() })
 }
 
 /// (kuna `elemptr`) Is `vn` the base of the `PTRADD` `op`, indexed by a value
@@ -225,6 +317,21 @@ fn reads_as_number(opcode: OpCode) -> bool {
 }
 
 impl Plan {
+    pub(crate) fn use_annotation(&mut self, op: OpId, vn: VarnodeId) -> Option<&Annotation> {
+        let annotation = self.annotations.get_mut(&(op, vn))?;
+        annotation.emitted = true;
+        Some(annotation)
+    }
+
+    pub(crate) fn annotations(&self) -> impl Iterator<Item = &Annotation> {
+        self.annotations.values()
+    }
+
+    pub(crate) fn annotation_types(&self, emitted_only: bool) -> impl Iterator<Item = &Rc<Datatype>> {
+        self.annotations.values().filter(move |annotation| !emitted_only || annotation.emitted)
+            .filter_map(|annotation| annotation.symbol.as_ref()?.ty.as_ref())
+    }
+
     /// Decide whether the pointer-typed constant `vn` (value `off`, read by
     /// `op` at type `ct`) names a global, and record it. Returns the address to
     /// name, or `None` to keep the upstream cast.
@@ -236,11 +343,11 @@ impl Plan {
         op: OpId,
         off: uintb,
         ct: &Rc<Datatype>,
-    ) -> Option<u64> {
+    ) -> KunaResult<Option<u64>> {
         if !self.on {
-            return None;
+            return Ok(None);
         }
-        let verdict = self.judge(fd, arch, vn, op, off, ct);
+        let verdict = self.judge(fd, arch, vn, op, off, ct)?;
         if self.trace {
             eprintln!(
                 "[globalref] {} 0x{off:x} {} {}",
@@ -252,9 +359,11 @@ impl Plan {
                 }
             );
         }
-        verdict.ok().map(|()| off)
+        Ok(verdict.ok().map(|()| off))
     }
 
+    // Refusals are successful decisions to keep the original expression;
+    // acquisition failures belong to the outer result and must stop printing.
     fn judge(
         &mut self,
         fd: &Funcdata,
@@ -263,43 +372,45 @@ impl Plan {
         op: OpId,
         off: uintb,
         ct: &Rc<Datatype>,
-    ) -> Result<(), Refusal> {
+    ) -> KunaResult<Result<(), Refusal>> {
         if off == 0 || ct.get_metatype() != type_metatype::TYPE_PTR || ct.get_word_size().unwrap_or(1) != 1 {
-            return Err(Refusal::NotAPointer);
+            return Ok(Err(Refusal::NotAPointer));
         }
         if fd.vbank().get(vn).map(|v| v.get_size()) != Some(ct.get_size()) {
-            return Err(Refusal::NotAPointer);
+            return Ok(Err(Refusal::NotAPointer));
         }
-        let pointee = ct.get_ptr_to().ok_or(Refusal::NotAPointer)?;
+        let Some(pointee) = ct.get_ptr_to() else { return Ok(Err(Refusal::NotAPointer)) };
         if matches!(pointee.get_metatype(), type_metatype::TYPE_CODE | type_metatype::TYPE_SPACEBASE) {
-            return Err(Refusal::Code);
+            return Ok(Err(Refusal::Code));
         }
         if !in_ranges(&arch.globalref_ranges, off) {
-            return Err(Refusal::OutsideData);
+            return Ok(Err(Refusal::OutsideData));
         }
         if self.numeric.contains(&off) {
-            return Err(Refusal::Numeric);
+            return Ok(Err(Refusal::Numeric));
         }
-        let object = self.pointees.get(&off).ok_or(Refusal::NotAPointer)?.object().ok_or(Refusal::TwoTypes)?;
+        let Some(seen) = self.pointees.get(&off) else { return Ok(Err(Refusal::NotAPointer)) };
+        let Some(object) = seen.object() else { return Ok(Err(Refusal::TwoTypes)) };
         if matches!(object.get_metatype(), type_metatype::TYPE_CODE | type_metatype::TYPE_SPACEBASE) {
-            return Err(Refusal::Code);
+            return Ok(Err(Refusal::Code));
         }
         let unknown = object.get_metatype() == type_metatype::TYPE_VOID;
         if pointee.get_metatype() == type_metatype::TYPE_VOID && !void_reader_converts(fd, op, vn) {
-            return Err(Refusal::VoidReader);
+            return Ok(Err(Refusal::VoidReader));
         }
-        let space = Rc::clone(arch.manage().get_default_data_space().ok_or(Refusal::OutsideData)?);
+        let Some(space) = arch.manage().get_default_data_space() else { return Ok(Err(Refusal::OutsideData)) };
+        let space = Rc::clone(space);
         let addr = Address::new(space, off);
         let invalid = Address::new_invalid();
-        if fd.get_arch().query_container_global(&addr, 1, &invalid).is_some() {
-            return Err(Refusal::Symbol);
+        if fd.get_arch().query_container_global(&addr, 1, &invalid)?.is_some() {
+            return Ok(Err(Refusal::Symbol));
         }
         let (decl_type, unknown) = if !unknown {
             (object, false)
         } else if let Some(read) = self.direct_type_at(off) {
             (read, false)
         } else {
-            let byte = arch.types_impl().get_base(1, type_metatype::TYPE_UNKNOWN).map_err(|_| Refusal::NotAPointer)?;
+            let byte = arch.types_impl().get_base(1, type_metatype::TYPE_UNKNOWN)?;
             (byte, true)
         };
         let size = decl_type.get_size().max(1) as u64;
@@ -319,10 +430,10 @@ impl Plan {
                     d.ty.get_name()
                 );
             }
-            return Err(Refusal::DirectAccess);
+            return Ok(Err(Refusal::DirectAccess));
         }
         self.minted.entry(off).or_insert(Minted { decl_type, unknown, array });
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// (kuna `elemptr`) Is the global this function names at `addr` an array,

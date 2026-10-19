@@ -293,20 +293,21 @@ pub struct Cache {
 /// vote the ordinary fold produced; the candidate replaces it outright, which is
 /// why a vote that already names a pointee is never offered -- it is recorded
 /// instead, so the batch compares it with the element other functions chose.
-pub fn element_pointer(data: &Funcdata, vn: VarnodeId, cur: &Rc<Datatype>, cache: &mut Cache) -> Option<Rc<Datatype>> {
+/// `None` is an evidence-based refusal; acquisition failures propagate separately.
+pub fn element_pointer(data: &Funcdata, vn: VarnodeId, cur: &Rc<Datatype>, cache: &mut Cache) -> KunaResult<Option<Rc<Datatype>>> {
     if !data.get_arch().elem_ptr {
-        return None;
+        return Ok(None);
     }
     note_direct_storage(data, vn, cache);
     if !may_replace(cur) {
-        note_claimed_global(data, vn, cur);
-        return None;
+        note_claimed_global(data, vn, cur)?;
+        return Ok(None);
     }
-    let got = candidate_pointer(data, vn, cur, cache);
+    let got = candidate_pointer(data, vn, cur, cache)?;
     if got.is_some() {
         data.kuna_elemptr_note_typed(vn);
     }
-    got
+    Ok(got)
 }
 
 /// Is `vn` storage in the data space inside the program's data sections?
@@ -344,13 +345,13 @@ fn note_direct_storage(data: &Funcdata, vn: VarnodeId, cache: &mut Cache) {
 /// synthesized record) says what this function reads through it: the batch
 /// compares that element with the one other functions chose, and anything
 /// that is not a pointer disagrees with every element.
-fn note_claimed_global(data: &Funcdata, vn: VarnodeId, cur: &Datatype) {
-    let Some(v) = data.vbank().get(vn) else { return };
+fn note_claimed_global(data: &Funcdata, vn: VarnodeId, cur: &Datatype) -> KunaResult<()> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(()) };
     if v.is_type_lock() || v.is_annotation() || in_data(data, vn).is_none() {
-        return;
+        return Ok(());
     }
-    if !matches!(candidate_kind(data, vn), Some((Kind::Global, _))) {
-        return;
+    if !matches!(candidate_kind(data, vn)?, Some((Kind::Global, _))) {
+        return Ok(());
     }
     let ptrsize = data.get_arch().manage().get_default_data_space().map(|s| s.get_addr_size() as int4);
     let verdict = match cur.get_ptr_to() {
@@ -370,23 +371,24 @@ fn note_claimed_global(data: &Funcdata, vn: VarnodeId, cur: &Datatype) {
         );
     }
     data.kuna_elemptr_note(Obj::Held(v.get_offset()), verdict);
+    Ok(())
 }
 
 /// [`element_pointer`] once the option and the vote allow it.
-fn candidate_pointer(data: &Funcdata, vn: VarnodeId, cur: &Rc<Datatype>, cache: &mut Cache) -> Option<Rc<Datatype>> {
-    let v = data.vbank().get(vn)?;
+fn candidate_pointer(data: &Funcdata, vn: VarnodeId, cur: &Rc<Datatype>, cache: &mut Cache) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     if v.is_type_lock() || v.is_annotation() {
-        return None;
+        return Ok(None);
     }
     let arch = Rc::clone(data.get_arch());
-    let spc = Rc::clone(arch.manage().get_default_data_space()?);
+    let Some(spc) = arch.manage().get_default_data_space().cloned() else { return Ok(None) };
     let ptrsize = spc.get_addr_size() as int4;
     // Storage a function holds in many Varnodes -- a global is read before each
     // call and written back after it, a constant is one Varnode per reader --
     // is decided once per address and pass.
     let memo = if v.is_constant() {
         if !only_indexed(data, vn) {
-            return None;
+            return Ok(None);
         }
         Some(&mut cache.constants)
     } else if v.get_addr().get_space().is_some_and(|s| Rc::ptr_eq(s, &spc)) {
@@ -396,28 +398,29 @@ fn candidate_pointer(data: &Funcdata, vn: VarnodeId, cur: &Rc<Datatype>, cache: 
     };
     let Some(memo) = memo else {
         if v.get_size() != ptrsize {
-            return None;
+            return Ok(None);
         }
-        let (kind, copies) = candidate_kind(data, vn)?;
+        let Some((kind, copies)) = candidate_kind(data, vn)? else { return Ok(None) };
         return decide(data, vn, cur, kind, &copies, ptrsize);
     };
     let key = (v.get_offset(), v.get_size());
     if let Some(hit) = memo.get(&key) {
-        return hit.clone();
+        return Ok(hit.clone());
     }
-    let got = candidate_kind(data, vn).and_then(|(kind, copies)| {
+    let got = if let Some((kind, copies)) = candidate_kind(data, vn)? {
         if v.get_size() != ptrsize {
             // A global read at another width than a pointer's is not an array's
             // base in this function, and says so to every other function of the batch.
             if kind == Kind::Global {
                 data.kuna_elemptr_note(Obj::Held(v.get_offset()), GlobalVerdict::Refused);
             }
-            return None;
+            None
+        } else {
+            decide(data, vn, cur, kind, &copies, ptrsize)?
         }
-        decide(data, vn, cur, kind, &copies, ptrsize)
-    });
+    } else { None };
     memo.insert(key, got.clone());
-    got
+    Ok(got)
 }
 
 /// Is every reader of the constant `cvn` an add or a `PTRADD` it is a base of?
@@ -494,10 +497,10 @@ fn decide(
     kind: Kind,
     copies: &[VarnodeId],
     ptrsize: int4,
-) -> Option<Rc<Datatype>> {
-    let v = data.vbank().get(vn)?;
+) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     let arch = Rc::clone(data.get_arch());
-    let spc = Rc::clone(arch.manage().get_default_data_space()?);
+    let Some(spc) = arch.manage().get_default_data_space().cloned() else { return Ok(None) };
     let own = match kind {
         Kind::Global => Some(Obj::Held(v.get_offset())),
         Kind::Constant => Some(Obj::Table(v.get_offset())),
@@ -507,7 +510,7 @@ fn decide(
     // for a function that names it too: it prints the scalar's address.
     if own.is_some_and(|o| data.kuna_elemptr_blocked(o)) && !(kind == Kind::Constant && holds_storage_at(data, v.get_offset()))
     {
-        return None;
+        return Ok(None);
     }
     let globals_held: Vec<u64> = copies
         .iter()
@@ -516,16 +519,16 @@ fn decide(
         .map(|c| c.get_offset())
         .collect();
     if globals_held.iter().any(|&g| data.kuna_elemptr_blocked(Obj::Held(g))) {
-        return None;
+        return Ok(None);
     }
     // With no batch to agree on a global, a pointer this function types must
     // not become a global's type by being stored there either.
     if !data.kuna_elemptr_objects() && reaches_global_storage(data, vn) {
-        return None;
+        return Ok(None);
     }
     let input = input_key(data, vn, kind);
     if input.is_some_and(|k| data.kuna_elemptr_input(k) == Some(true)) {
-        return None;
+        return Ok(None);
     }
     let mut ev = Evidence::default();
     ev.base_is_ptr = cur.get_metatype() == type_metatype::TYPE_PTR;
@@ -533,7 +536,7 @@ fn decide(
     match kind {
         Kind::Constant => {
             for c in same_constant(data, vn) {
-                walk_constant(data, c, &mut ev);
+                walk_constant(data, c, &mut ev)?;
             }
             // The same address used as another pointer -- passed, stored, copied
             // into a typed local -- says what is there too, and the name
@@ -546,10 +549,10 @@ fn decide(
             if shares_a_returned_register(data, &held) {
                 ev.refuse("return-register");
             } else {
-                walk(data, &held, &mut ev);
+                walk(data, &held, &mut ev)?;
             }
         }
-        _ => walk(data, &[vn], &mut ev),
+        _ => walk(data, &[vn], &mut ev)?,
     }
     let mut elem = if ev.refused.is_none() && ev.variable > 0 { element_type(data, &mut ev) } else { None };
     // The sign the batch decided, where this function's own was the default.
@@ -616,11 +619,12 @@ fn decide(
             }
         }
     }
-    let elem = elem?;
+    let Some(elem) = elem else { return Ok(None) };
     if kind == Kind::Constant {
         data.kuna_elemptr_note_constant(v.get_offset());
     }
-    arch.types()?.get_type_pointer(ptrsize, elem, spc.get_word_size()).ok()
+    let Some(types) = arch.types() else { return Ok(None) };
+    Ok(Some(types.get_type_pointer(ptrsize, elem, spc.get_word_size())?))
 }
 
 /// Does the function use the global `held` holds, and its copies, only in ways
@@ -726,42 +730,42 @@ fn same_storage(data: &Funcdata, vn: VarnodeId) -> Vec<VarnodeId> {
 
 /// Which kind of candidate `vn` is, with the copies of a call's returned value,
 /// or `None` when the rule does not speak about it.
-fn candidate_kind(data: &Funcdata, vn: VarnodeId) -> Option<(Kind, Vec<VarnodeId>)> {
-    let v = data.vbank().get(vn)?;
+fn candidate_kind(data: &Funcdata, vn: VarnodeId) -> KunaResult<Option<(Kind, Vec<VarnodeId>)>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     let arch = data.get_arch();
     let objects = data.kuna_elemptr_objects();
     if v.is_constant() {
         let off = v.get_offset();
         if !objects || !crate::kuna_globalref::in_ranges(&arch.elem_ptr_ranges, off) {
-            return None;
+            return Ok(None);
         }
-        let spc = Rc::clone(arch.manage().get_default_data_space()?);
+        let Some(spc) = arch.manage().get_default_data_space().cloned() else { return Ok(None) };
         let addr = Address::new(spc, off);
-        if arch.query_container_global(&addr, 1, &Address::new_invalid()).is_some() {
-            return None;
+        if arch.query_container_global(&addr, 1, &Address::new_invalid())?.is_some() {
+            return Ok(None);
         }
-        return Some((Kind::Constant, Vec::new()));
+        return Ok(Some((Kind::Constant, Vec::new())));
     }
     let addr = v.get_addr().clone();
     if v.is_input() && data.get_func_proto().possible_input_param(&addr, v.get_size()) {
-        return Some((Kind::Param, Vec::new()));
+        return Ok(Some((Kind::Param, Vec::new())));
     }
     if crate::kuna_structsynth::is_call_return(data, vn) {
-        let copies = copies_alone(data, vn)?;
+        let Some(copies) = copies_alone(data, vn) else { return Ok(None) };
         let rets = crate::kuna_structsynth::returned_values(data);
         if crate::kuna_structsynth::returned_beside_others(data, &copies, &rets)
             || returns_another_value_in_place(data, vn, &copies, &rets)
         {
-            return None;
+            return Ok(None);
         }
-        return Some((Kind::CallReturn, copies));
+        return Ok(Some((Kind::CallReturn, copies)));
     }
-    let data_space = arch.manage().get_default_data_space()?;
+    let Some(data_space) = arch.manage().get_default_data_space() else { return Ok(None) };
     let in_data = addr.get_space().is_some_and(|s| Rc::ptr_eq(s, data_space));
     if objects && in_data && crate::kuna_globalref::in_ranges(&arch.elem_ptr_ranges, v.get_offset()) {
         // A global the image names only by a symbol with no type (an ELF symtab
         // entry) is as open as one it does not name at all.
-        let open = match arch.query_container_global(&addr, v.get_size(), &Address::new_invalid()) {
+        let open = match arch.query_container_global(&addr, v.get_size(), &Address::new_invalid())? {
             None => true,
             Some(g) => {
                 g.entry_addr.get_offset() == v.get_offset()
@@ -769,10 +773,10 @@ fn candidate_kind(data: &Funcdata, vn: VarnodeId) -> Option<(Kind, Vec<VarnodeId
             }
         };
         if open {
-            return Some((Kind::Global, Vec::new()));
+            return Ok(Some((Kind::Global, Vec::new())));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Does the function return, in the register the call's value arrives in, some
@@ -969,7 +973,7 @@ fn is_null(data: &Funcdata, x: VarnodeId) -> bool {
 
 /// The breadth-first walk from a non-constant candidate.  The second component
 /// of a work item is the literal byte offset of that Varnode from the base.
-fn walk(data: &Funcdata, starts: &[VarnodeId], ev: &mut Evidence) {
+fn walk(data: &Funcdata, starts: &[VarnodeId], ev: &mut Evidence) -> KunaResult<()> {
     let mut seen: HashSet<VarnodeId> = HashSet::new();
     let mut work: VecDeque<(VarnodeId, intb, usize)> = VecDeque::new();
     for &start in starts {
@@ -979,23 +983,24 @@ fn walk(data: &Funcdata, starts: &[VarnodeId], ev: &mut Evidence) {
     }
     while let Some((vn, off, hops)) = work.pop_front() {
         if ev.refused.is_some() {
-            return;
+            return Ok(());
         }
         let descend: Vec<OpId> = match data.vbank().get(vn) {
             Some(v) => v.descend_iter().collect(),
             None => continue,
         };
         for op in descend {
-            if let Some((next, noff)) = base_use(data, op, vn, off, ev) {
+            if let Some((next, noff)) = base_use(data, op, vn, off, ev)? {
                 if hops + 1 < HOP_CAP && seen.insert(next) {
                     work.push_back((next, noff, hops + 1));
                 }
             }
             if ev.refused.is_some() {
-                return;
+                return Ok(());
             }
         }
     }
+    Ok(())
 }
 
 /// Every constant of the function naming the same address as `cvn`, at its
@@ -1036,23 +1041,24 @@ fn other_pointer_uses(data: &Funcdata, cvn: VarnodeId) -> Vec<Rc<Datatype>> {
 }
 
 /// A constant candidate's evidence: the accesses it is the base of.
-fn walk_constant(data: &Funcdata, cvn: VarnodeId, ev: &mut Evidence) {
+fn walk_constant(data: &Funcdata, cvn: VarnodeId, ev: &mut Evidence) -> KunaResult<()> {
     let descend: Vec<OpId> = match data.vbank().get(cvn) {
         Some(v) => v.descend_iter().collect(),
-        None => return,
+        None => return Ok(()),
     };
     for op in descend {
-        let _ = base_use(data, op, cvn, 0, ev);
+        let _ = base_use(data, op, cvn, 0, ev)?;
         if ev.refused.is_some() {
-            return;
+            return Ok(());
         }
     }
+    Ok(())
 }
 
 /// One use of a Varnode at literal offset `off` from the base.  Returns the
 /// Varnode the base travels on to, with its offset, when it does.
-fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Evidence) -> Option<(VarnodeId, intb)> {
-    let o = data.obank().get(op)?;
+fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Evidence) -> KunaResult<Option<(VarnodeId, intb)>> {
+    let Some(o) = data.obank().get(op) else { return Ok(None) };
     let slot = o.get_slot(vn);
     let out = o.get_out();
     let konst = |i: int4| -> Option<intb> {
@@ -1061,18 +1067,18 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
             .filter(|v| v.is_constant())
             .map(|v| sign_extend(v.get_offset(), v.get_size()))
     };
-    match o.code() {
+    Ok(match o.code() {
         OpCode::CPUI_LOAD => {
             if slot == 1 {
-                let w = out.and_then(|x| data.vbank().get(x)).map(|x| x.get_size())?;
-                element_access(data, op, w, off, false, ev);
+                let Some(w) = out.and_then(|x| data.vbank().get(x)).map(|x| x.get_size()) else { return Ok(None) };
+                element_access(data, op, w, off, false, ev)?;
             }
             None
         }
         OpCode::CPUI_STORE => {
             if slot == 1 {
-                let w = o.get_in(2).and_then(|x| data.vbank().get(x)).map(|x| x.get_size())?;
-                element_access(data, op, w, off, false, ev);
+                let Some(w) = o.get_in(2).and_then(|x| data.vbank().get(x)).map(|x| x.get_size()) else { return Ok(None) };
+                element_access(data, op, w, off, false, ev)?;
             }
             None
         }
@@ -1086,7 +1092,7 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
         }
         OpCode::CPUI_PTRSUB => {
             if slot != 0 {
-                return None;
+                return Ok(None);
             }
             match konst(1) {
                 Some(0) => out.map(|x| (x, off)),
@@ -1100,14 +1106,16 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
             if slot != 0 {
                 // The candidate is the index into something else's base.
                 ev.refuse("index-of-other");
-                return None;
+                return Ok(None);
             }
-            let elem = konst(2)?;
+            let Some(elem) = konst(2) else { return Ok(None) };
             match konst(1) {
                 Some(i) => out.map(|x| (x, off + i * elem)),
                 None => {
-                    let (t, c) = inner_stride(data, o.get_in(1)?);
-                    indexed(data, out?, elem * t, off + elem * c, ev);
+                    let Some(index) = o.get_in(1) else { return Ok(None) };
+                    let (t, c) = inner_stride(data, index);
+                    let Some(out) = out else { return Ok(None) };
+                    indexed(data, out, elem * t, off + elem * c, ev)?;
                     None
                 }
             }
@@ -1118,46 +1126,49 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
             if let Some(k) = konst(other) {
                 if is_sub && slot == 1 {
                     ev.refuse("negated");
-                    return None;
+                    return Ok(None);
                 }
                 // A constant already typed a pointer is the base, and the
                 // candidate the offset into it.
                 if !is_sub
-                    && o.get_in(other).is_some_and(|c| {
-                        data.vn_type_read_facing(c, op).get_metatype() == type_metatype::TYPE_PTR
-                    })
+                    && match o.get_in(other) {
+                        Some(c) => data.vn_type_read_facing(c, op)?.get_metatype() == type_metatype::TYPE_PTR,
+                        None => false,
+                    }
                 {
                     ev.refuse("index-of-other");
-                    return None;
+                    return Ok(None);
                 }
                 if data.vbank().get(vn).is_some_and(|v| v.is_constant()) {
-                    return None;
+                    return Ok(None);
                 }
                 let k = if is_sub { -k } else { k };
-                return out.map(|x| (x, off + k));
+                return Ok(out.map(|x| (x, off + k)));
             }
             if is_sub {
                 // A difference: of two pointers when the other side is one.
-                if let Some(p) = pointee_of(data, o.get_in(other)?, op) {
+                let Some(other) = o.get_in(other) else { return Ok(None) };
+                if let Some(p) = pointee_of(data, other, op)? {
                     ev.pointees.push(p);
                 }
-                return None;
+                return Ok(None);
             }
-            let other_vn = o.get_in(other)?;
+            let Some(other_vn) = o.get_in(other) else { return Ok(None) };
             // An operand already known to be a pointer -- by its type, or by a
             // use only a pointer has -- is the base, whatever else the program
             // does with it, and this value is its index.
             // So is one that subtracts a pointer: the sum is a difference, a number.
-            if data.vn_type_read_facing(other_vn, op).get_metatype() == type_metatype::TYPE_PTR
-                || has_pointer_use(data, other_vn)
-                || subtracts_a_pointer(data, other_vn, INDEX_DEPTH)
+            if data.vn_type_read_facing(other_vn, op)?.get_metatype() == type_metatype::TYPE_PTR
+                || has_pointer_use(data, other_vn)?
+                || subtracts_a_pointer(data, other_vn, INDEX_DEPTH)?
             {
-                return None;
+                return Ok(None);
             }
-            let scale = index_scale(data, other_vn, INDEX_DEPTH).or_else(|| ev.base_is_ptr.then_some((1, 0)));
+            let scale = index_scale(data, other_vn, INDEX_DEPTH)?.or_else(|| ev.base_is_ptr.then_some((1, 0)));
             match scale {
                 Some((scale, k)) => {
-                    indexed(data, out?, scale, off + k, ev);
+                    let Some(out) = out else { return Ok(None) };
+                    indexed(data, out, scale, off + k, ev)?;
                     None
                 }
                 None => None,
@@ -1169,25 +1180,25 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
         | OpCode::CPUI_INT_LESSEQUAL
         | OpCode::CPUI_INT_SLESS
         | OpCode::CPUI_INT_SLESSEQUAL => {
-            let other = o.get_in(if slot == 0 { 1 } else { 0 })?;
-            let ov = data.vbank().get(other)?;
+            let Some(other) = o.get_in(if slot == 0 { 1 } else { 0 }) else { return Ok(None) };
+            let Some(ov) = data.vbank().get(other) else { return Ok(None) };
             if ov.is_constant() {
                 if ov.get_offset() != 0 {
                     ev.refuse("compare-literal");
                 }
-            } else if let Some(p) = pointee_of(data, other, op) {
+            } else if let Some(p) = pointee_of(data, other, op)? {
                 ev.pointees.push(p);
             }
             None
         }
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
             if slot > 0 {
-                call_argument(data, op, slot, ev);
+                call_argument(data, op, slot, ev)?;
             }
             None
         }
-        OpCode::CPUI_INT_MULT | OpCode::CPUI_INT_2COMP if is_pointer_difference(data, op) => {
-            difference_of(data, op, ev);
+        OpCode::CPUI_INT_MULT | OpCode::CPUI_INT_2COMP if is_pointer_difference(data, op)? => {
+            difference_of(data, op, ev)?;
             None
         }
         OpCode::CPUI_INT_MULT
@@ -1214,13 +1225,13 @@ fn base_use(data: &Funcdata, op: OpId, vn: VarnodeId, off: intb, ev: &mut Eviden
             }
             None
         }
-    }
+    })
 }
 
 /// The address `sum` is the base, at literal offset `off`, plus an index
 /// scaled by `scale`.  Every access through it must be one `scale`-wide
 /// element; a further literal offset must be a whole number of elements.
-fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evidence) {
+fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evidence) -> KunaResult<()> {
     let mut seen: HashSet<VarnodeId> = HashSet::new();
     let mut work: Vec<(VarnodeId, intb, usize)> = vec![(sum, off, 0)];
     seen.insert(sum);
@@ -1256,7 +1267,7 @@ fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evi
                     if intb::from(w) != scale {
                         ev.refuse("scale-mismatch");
                     } else {
-                        element_access(data, op, w, off, true, ev);
+                        element_access(data, op, w, off, true, ev)?;
                     }
                 }
                 OpCode::CPUI_COPY | OpCode::CPUI_CAST => next = out.map(|x| (x, off)),
@@ -1268,9 +1279,10 @@ fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evi
                         .and_then(|x| data.vbank().get(x))
                         .filter(|x| x.is_constant())
                         .map(|x| sign_extend(x.get_offset(), x.get_size()));
-                    let pointer_other = o
-                        .get_in(other)
-                        .is_some_and(|x| data.vn_type_read_facing(x, op).get_metatype() == type_metatype::TYPE_PTR);
+                    let pointer_other = match o.get_in(other) {
+                        Some(x) => data.vn_type_read_facing(x, op)?.get_metatype() == type_metatype::TYPE_PTR,
+                        None => false,
+                    };
                     match k {
                         Some(_) if pointer_other => ev.refuse("index-of-other"),
                         Some(k) => next = out.map(|x| (x, off + k)),
@@ -1279,8 +1291,14 @@ fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evi
                         // record's stride or another object's base.
                         // One that subtracts a pointer makes the address a
                         // difference: a number, no longer an element's address.
-                        None if o.get_in(other).is_some_and(|x| subtracts_a_pointer(data, x, INDEX_DEPTH)) => {}
-                        None => match o.get_in(other).and_then(|x| index_scale(data, x, INDEX_DEPTH)) {
+                        None if match o.get_in(other) {
+                            Some(x) => subtracts_a_pointer(data, x, INDEX_DEPTH)?,
+                            None => false,
+                        } => {}
+                        None => match match o.get_in(other) {
+                            Some(x) => index_scale(data, x, INDEX_DEPTH)?,
+                            None => None,
+                        } {
                             Some((s, k)) if s == scale => next = out.map(|x| (x, off + k)),
                             _ => ev.refuse("sum-plus-unknown"),
                         },
@@ -1318,7 +1336,7 @@ fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evi
                         ev.refuse("record-stride");
                     }
                 }
-                OpCode::CPUI_CALL | OpCode::CPUI_CALLIND if slot > 0 => call_argument(data, op, slot, ev),
+                OpCode::CPUI_CALL | OpCode::CPUI_CALLIND if slot > 0 => call_argument(data, op, slot, ev)?,
                 OpCode::CPUI_INT_MULT
                 | OpCode::CPUI_INT_DIV
                 | OpCode::CPUI_INT_REM
@@ -1334,40 +1352,41 @@ fn indexed(data: &Funcdata, sum: VarnodeId, scale: intb, off: intb, ev: &mut Evi
                 }
             }
             if ev.refused.is_some() {
-                return;
+                return Ok(());
             }
         }
     }
+    Ok(())
 }
 
 /// One access of `w` bytes at literal offset `off` from the base, through the
 /// `LOAD`/`STORE` `op`.  Reads what the element is: how a loaded value is
 /// extended or ordered (its sign), compared (a character), and, for an element
 /// as wide as a pointer, whether it is used as an address or as a number.
-fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool, ev: &mut Evidence) {
+fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool, ev: &mut Evidence) -> KunaResult<()> {
     if !matches!(w, 1 | 2 | 4 | 8) {
         ev.refuse("width");
-        return;
+        return Ok(());
     }
     if off.rem_euclid(intb::from(w)) != 0 {
         ev.refuse("misaligned");
-        return;
+        return Ok(());
     }
     ev.access(w, variable);
-    let Some(o) = data.obank().get(op) else { return };
+    let Some(o) = data.obank().get(op) else { return Ok(()) };
     if o.code() == OpCode::CPUI_STORE {
         if let Some(val) = o.get_in(2) {
             stored_value(data, val, ev);
         }
-        return;
+        return Ok(());
     }
-    let Some(val) = o.get_out() else { return };
+    let Some(val) = o.get_out() else { return Ok(()) };
     if let Some(t) = data.vbank().get(val).map(|v| Rc::clone(v.get_type())) {
         if t.get_metatype() == type_metatype::TYPE_PTR && !points_at_nothing(&t) {
             ev.elem_types.push(t);
         }
     }
-    loaded_sign(data, val, w, ev);
+    loaded_sign(data, val, w, ev)?;
     let readers: Vec<OpId> = data.vbank().get(val).map(|v| v.descend_iter().collect()).unwrap_or_default();
     for r in readers {
         let Some(ro) = data.obank().get(r) else { continue };
@@ -1401,7 +1420,10 @@ fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool,
                     Some(0) => {}
                     Some(_) => ev.number += 1,
                     None => {
-                        if other.is_some_and(|x| data.vn_type_read_facing(x, r).get_metatype() == type_metatype::TYPE_PTR) {
+                        if match other {
+                            Some(x) => data.vn_type_read_facing(x, r)?.get_metatype() == type_metatype::TYPE_PTR,
+                            None => false,
+                        } {
                             ev.address += 1;
                         }
                     }
@@ -1420,7 +1442,10 @@ fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool,
                 Some(_) => ev.number += 1,
                 None => {
                     let other = ro.get_in(if rslot == 0 { 1 } else { 0 });
-                    if other.is_some_and(|x| data.vn_type_read_facing(x, r).get_metatype() == type_metatype::TYPE_PTR) {
+                    if match other {
+                        Some(x) => data.vn_type_read_facing(x, r)?.get_metatype() == type_metatype::TYPE_PTR,
+                        None => false,
+                    } {
                         ev.address += 1;
                     }
                 }
@@ -1428,7 +1453,7 @@ fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool,
             OpCode::CPUI_LOAD | OpCode::CPUI_STORE if rslot == 1 => ev.address += 1,
             OpCode::CPUI_PTRADD | OpCode::CPUI_PTRSUB if rslot == 0 => ev.address += 1,
             OpCode::CPUI_CALL | OpCode::CPUI_CALLIND if rslot > 0 => {
-                let t = crate::coreaction_infertypes::input_type_local(data, r, rslot);
+                let t = crate::coreaction_infertypes::input_type_local(data, r, rslot)?;
                 match t.get_metatype() {
                     type_metatype::TYPE_PTR => ev.address += 1,
                     type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_BOOL => ev.number += 1,
@@ -1440,6 +1465,7 @@ fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool,
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// The sign the loaded element `val` has without this rule: the fold of what
@@ -1448,7 +1474,7 @@ fn element_access(data: &Funcdata, op: OpId, w: int4, off: intb, variable: bool,
 /// type C carries past the function: a callee that zero-extends a `short`
 /// into `rax` is read as `unsigned short` by every caller, and an element
 /// declared signed would make those callers sign-extend it.
-fn loaded_sign(data: &Funcdata, val: VarnodeId, w: int4, ev: &mut Evidence) {
+fn loaded_sign(data: &Funcdata, val: VarnodeId, w: int4, ev: &mut Evidence) -> KunaResult<()> {
     let sign = |t: &Datatype| -> Option<bool> {
         (t.get_size() == w).then_some(()).and_then(|_| match t.get_metatype() {
             type_metatype::TYPE_INT => Some(true),
@@ -1456,11 +1482,11 @@ fn loaded_sign(data: &Funcdata, val: VarnodeId, w: int4, ev: &mut Evidence) {
             _ => None,
         })
     };
-    let Some(v) = data.vbank().get(val) else { return };
+    let Some(v) = data.vbank().get(val) else { return Ok(()) };
     let mut own: Option<Rc<Datatype>> = None;
     for r in v.descend_iter() {
         let slot = data.obank().get(r).map(|o| o.get_slot(val)).unwrap_or(0);
-        let t = crate::coreaction_infertypes::input_type_local(data, r, slot);
+        let t = crate::coreaction_infertypes::input_type_local(data, r, slot)?;
         own = Some(match own {
             Some(cur) if t.type_order(&cur).unwrap_or(0) >= 0 => cur,
             _ => t,
@@ -1484,7 +1510,7 @@ fn loaded_sign(data: &Funcdata, val: VarnodeId, w: int4, ev: &mut Evidence) {
             match o.code() {
                 OpCode::CPUI_RETURN if slot >= 1 => {
                     ev.returned += 1;
-                    match sign(&crate::coreaction_infertypes::input_type_local(data, r, slot)) {
+                    match sign(crate::coreaction_infertypes::input_type_local(data, r, slot)?.as_ref()) {
                         Some(true) => ev.ret_signed += 1,
                         Some(false) => ev.ret_unsigned += 1,
                         None => {}
@@ -1504,6 +1530,7 @@ fn loaded_sign(data: &Funcdata, val: VarnodeId, w: int4, ev: &mut Evidence) {
             }
         }
     }
+    Ok(())
 }
 
 /// What the value a `STORE` writes into an element says about the element.
@@ -1572,8 +1599,8 @@ fn is_char_literal(c: uintb) -> bool {
 /// Record what a call's declared parameter says about the value passed in
 /// `slot`: a scalar refuses; a pointer at something is checked against the
 /// element once its width is known.
-fn call_argument(data: &Funcdata, op: OpId, slot: int4, ev: &mut Evidence) {
-    let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot);
+fn call_argument(data: &Funcdata, op: OpId, slot: int4, ev: &mut Evidence) -> KunaResult<()> {
+    let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot)?;
     match declared.get_metatype() {
         type_metatype::TYPE_PTR => {
             if !points_at_nothing(&declared) {
@@ -1585,23 +1612,24 @@ fn call_argument(data: &Funcdata, op: OpId, slot: int4, ev: &mut Evidence) {
         type_metatype::TYPE_UNKNOWN => {}
         _ => ev.refuse("callee-scalar"),
     }
+    Ok(())
 }
 
 /// The pointee of `vn` as `op` reads it, when that is a pointer at something.
-fn pointee_of(data: &Funcdata, vn: VarnodeId, op: OpId) -> Option<Rc<Datatype>> {
-    let t = data.vn_type_read_facing(vn, op);
+fn pointee_of(data: &Funcdata, vn: VarnodeId, op: OpId) -> KunaResult<Option<Rc<Datatype>>> {
+    let t = data.vn_type_read_facing(vn, op)?;
     if t.get_metatype() != type_metatype::TYPE_PTR || points_at_nothing(&t) {
-        return None;
+        return Ok(None);
     }
-    t.get_ptr_to()
+    Ok(t.get_ptr_to())
 }
 
 /// Is `op` the right-hand side of a difference of two pointers, `x * -1` or
 /// `-x` added to a pointer, where the sum is a number rather than an address?
 /// `b - buf` lowers to `b + buf * -1`, and `buf` is the pointer it always was;
 /// `end - n`, whose sum is dereferenced, subtracts a number.
-fn is_pointer_difference(data: &Funcdata, op: OpId) -> bool {
-    let Some(o) = data.obank().get(op) else { return false };
+fn is_pointer_difference(data: &Funcdata, op: OpId) -> KunaResult<bool> {
+    let Some(o) = data.obank().get(op) else { return Ok(false) };
     let negation = match o.code() {
         OpCode::CPUI_INT_2COMP => true,
         OpCode::CPUI_INT_MULT => (0..2).any(|i| {
@@ -1611,110 +1639,124 @@ fn is_pointer_difference(data: &Funcdata, op: OpId) -> bool {
         }),
         _ => false,
     };
-    let Some(neg) = o.get_out().filter(|_| negation) else { return false };
-    let Some(v) = data.vbank().get(neg) else { return false };
+    let Some(neg) = o.get_out().filter(|_| negation) else { return Ok(false) };
+    let Some(v) = data.vbank().get(neg) else { return Ok(false) };
     let mut any = false;
     for r in v.descend_iter() {
-        let Some(ro) = data.obank().get(r).filter(|ro| ro.code() == OpCode::CPUI_INT_ADD) else { return false };
-        let Some(q) = ro.get_in(if ro.get_slot(neg) == 0 { 1 } else { 0 }) else { return false };
-        let pointer = data.vn_type_read_facing(q, r).get_metatype() == type_metatype::TYPE_PTR || has_pointer_use(data, q);
-        if !pointer || ro.get_out().is_none_or(|sum| has_pointer_use(data, sum)) {
-            return false;
+        let Some(ro) = data.obank().get(r).filter(|ro| ro.code() == OpCode::CPUI_INT_ADD) else { return Ok(false) };
+        let Some(q) = ro.get_in(if ro.get_slot(neg) == 0 { 1 } else { 0 }) else { return Ok(false) };
+        let pointer = data.vn_type_read_facing(q, r)?.get_metatype() == type_metatype::TYPE_PTR || has_pointer_use(data, q)?;
+        if !pointer || match ro.get_out() {
+            Some(sum) => has_pointer_use(data, sum)?,
+            None => true,
+        } {
+            return Ok(false);
         }
         any = true;
     }
-    any
+    Ok(any)
 }
 
 /// Is `x` a sum that subtracts one more pointer than it adds (`-beg - n`)?
 /// Adding it to a pointer makes a difference of two pointers: a number.  A sum
 /// that is itself a whole difference (`end - beg`) is a number already, and a
 /// pointer plus it is an element's address.
-fn subtracts_a_pointer(data: &Funcdata, x: VarnodeId, depth: usize) -> bool {
-    pointer_balance(data, x, None, depth) < 0
+fn subtracts_a_pointer(data: &Funcdata, x: VarnodeId, depth: usize) -> KunaResult<bool> {
+    Ok(pointer_balance(data, x, None, depth)? < 0)
 }
 
 /// The pointers `x` adds less the pointers it subtracts, as far as its terms
 /// say; a term nothing shows is a pointer counts as a number.
-fn pointer_balance(data: &Funcdata, x: VarnodeId, reader: Option<OpId>, depth: usize) -> i32 {
+fn pointer_balance(data: &Funcdata, x: VarnodeId, reader: Option<OpId>, depth: usize) -> KunaResult<i32> {
     let def = data.vbank().get(x).and_then(|v| v.get_def());
-    let leaf = || {
-        let typed = reader.is_some_and(|r| data.vn_type_read_facing(x, r).get_metatype() == type_metatype::TYPE_PTR);
-        i32::from(typed || has_pointer_use(data, x))
+    let leaf = || -> KunaResult<i32> {
+        let typed = match reader {
+            Some(r) => data.vn_type_read_facing(x, r)?.get_metatype() == type_metatype::TYPE_PTR,
+            None => false,
+        };
+        Ok(i32::from(typed || has_pointer_use(data, x)?))
     };
     let (Some(d), Some(o)) = (def, def.and_then(|d| data.obank().get(d))) else {
         return leaf();
     };
-    let term = |i: int4| o.get_in(i).map_or(0, |v| pointer_balance(data, v, Some(d), depth.saturating_sub(1)));
+    let term = |i: int4| match o.get_in(i) {
+        Some(v) => pointer_balance(data, v, Some(d), depth.saturating_sub(1)),
+        None => Ok(0),
+    };
     let minus_one = |i: int4| {
         o.get_in(i)
             .and_then(|c| data.vbank().get(c))
             .is_some_and(|c| c.is_constant() && sign_extend(c.get_offset(), c.get_size()) == -1)
     };
-    match o.code() {
-        _ if depth == 0 => leaf(),
+    Ok(match o.code() {
+        _ if depth == 0 => leaf()?,
         OpCode::CPUI_PTRADD | OpCode::CPUI_PTRSUB => 1,
-        OpCode::CPUI_INT_2COMP => -term(0),
-        OpCode::CPUI_INT_MULT if minus_one(1) => -term(0),
-        OpCode::CPUI_INT_MULT if minus_one(0) => -term(1),
-        OpCode::CPUI_INT_ADD => term(0) + term(1),
-        OpCode::CPUI_INT_SUB => term(0) - term(1),
-        OpCode::CPUI_COPY | OpCode::CPUI_CAST => term(0),
-        _ => leaf(),
-    }
+        OpCode::CPUI_INT_2COMP => -term(0)?,
+        OpCode::CPUI_INT_MULT if minus_one(1) => -term(0)?,
+        OpCode::CPUI_INT_MULT if minus_one(0) => -term(1)?,
+        OpCode::CPUI_INT_ADD => term(0)? + term(1)?,
+        OpCode::CPUI_INT_SUB => term(0)? - term(1)?,
+        OpCode::CPUI_COPY | OpCode::CPUI_CAST => term(0)?,
+        _ => leaf()?,
+    })
 }
 
 /// The candidate negated by the pointer difference `op` is subtracted from a
 /// pointer at the same elements, whose pointee, when it has one, says so.
-fn difference_of(data: &Funcdata, op: OpId, ev: &mut Evidence) {
-    let Some(neg) = data.obank().get(op).and_then(|o| o.get_out()) else { return };
-    let Some(v) = data.vbank().get(neg) else { return };
+fn difference_of(data: &Funcdata, op: OpId, ev: &mut Evidence) -> KunaResult<()> {
+    let Some(neg) = data.obank().get(op).and_then(|o| o.get_out()) else { return Ok(()) };
+    let Some(v) = data.vbank().get(neg) else { return Ok(()) };
     for r in v.descend_iter() {
         let Some(ro) = data.obank().get(r) else { continue };
         let other = ro.get_in(if ro.get_slot(neg) == 0 { 1 } else { 0 });
-        if let Some(p) = other.and_then(|x| pointee_of(data, x, r)) {
-            ev.pointees.push(p);
+        if let Some(x) = other {
+            if let Some(p) = pointee_of(data, x, r)? {
+                ev.pointees.push(p);
+            }
         }
     }
+    Ok(())
 }
 
 /// If `x` is an index, the element size it is scaled by and the literal offset
 /// folded into it: `i * 4` is `(4, 0)`, `(long)i + 1` is `(1, 1)`.  `None` when
 /// `x` could as well be the base.
-fn index_scale(data: &Funcdata, x: VarnodeId, depth: usize) -> Option<(intb, intb)> {
-    let v = data.vbank().get(x)?;
+fn index_scale(data: &Funcdata, x: VarnodeId, depth: usize) -> KunaResult<Option<(intb, intb)>> {
+    let Some(v) = data.vbank().get(x) else { return Ok(None) };
     if v.is_constant() {
-        return None;
+        return Ok(None);
     }
     let Some(def) = v.get_def() else {
-        return used_as_number(data, x).then_some((1, 0));
+        return Ok(used_as_number(data, x)?.then_some((1, 0)));
     };
     if is_counter(data, x) {
-        return Some((1, 0));
+        return Ok(Some((1, 0)));
     }
-    let o = data.obank().get(def)?;
+    let Some(o) = data.obank().get(def) else { return Ok(None) };
     let konst = |i: int4| -> Option<intb> {
         o.get_in(i)
             .and_then(|v| data.vbank().get(v))
             .filter(|v| v.is_constant())
             .map(|v| sign_extend(v.get_offset(), v.get_size()))
     };
-    match o.code() {
+    Ok(match o.code() {
         OpCode::CPUI_INT_MULT => {
             let (s, inner) = match (konst(1), konst(0)) {
-                (Some(s), _) => (s, o.get_in(0)?),
-                (None, Some(s)) => (s, o.get_in(1)?),
-                _ => return None,
+                (Some(s), _) => (s, o.get_in(0)),
+                (None, Some(s)) => (s, o.get_in(1)),
+                _ => return Ok(None),
             };
+            let Some(inner) = inner else { return Ok(None) };
             let (t, c) = inner_stride(data, inner);
             (s > 0).then_some((s * t, s * c))
         }
         OpCode::CPUI_INT_LEFT => {
-            let s = konst(1)?;
+            let Some(s) = konst(1) else { return Ok(None) };
             if !(0..6).contains(&s) {
-                return None;
+                return Ok(None);
             }
-            let (t, c) = inner_stride(data, o.get_in(0)?);
+            let Some(inner) = o.get_in(0) else { return Ok(None) };
+            let (t, c) = inner_stride(data, inner);
             Some(((1 << s) * t, (1 << s) * c))
         }
         OpCode::CPUI_INT_SEXT
@@ -1727,19 +1769,24 @@ fn index_scale(data: &Funcdata, x: VarnodeId, depth: usize) -> Option<(intb, int
         OpCode::CPUI_INT_AND => konst(1).or_else(|| konst(0)).filter(|&m| (0..0x10000).contains(&m)).map(|_| (1, 0)),
         OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB if depth > 0 => {
             let (inner, k) = if let Some(k) = konst(1) {
-                (o.get_in(0)?, k)
+                (o.get_in(0), k)
             } else if o.code() == OpCode::CPUI_INT_ADD {
-                (o.get_in(1)?, konst(0)?)
+                let Some(k) = konst(0) else { return Ok(None) };
+                (o.get_in(1), k)
             } else {
-                return None;
+                return Ok(None);
             };
+            let Some(inner) = inner else { return Ok(None) };
             let k = if o.code() == OpCode::CPUI_INT_SUB { -k } else { k };
-            let (s, k2) = index_scale(data, inner, depth - 1)?;
+            let Some((s, k2)) = index_scale(data, inner, depth - 1)? else { return Ok(None) };
             Some((s, k + k2))
         }
-        OpCode::CPUI_COPY | OpCode::CPUI_CAST if depth > 0 => index_scale(data, o.get_in(0)?, depth - 1),
-        _ => used_as_number(data, x).then_some((1, 0)),
-    }
+        OpCode::CPUI_COPY | OpCode::CPUI_CAST if depth > 0 => {
+            let Some(inner) = o.get_in(0) else { return Ok(None) };
+            index_scale(data, inner, depth - 1)?
+        }
+        _ => used_as_number(data, x)?.then_some((1, 0)),
+    })
 }
 
 /// `x` as `atom * t + c`, when `x` is itself scaled: `i * 2` is `(2, 0)` and
@@ -1832,7 +1879,7 @@ fn is_counter(data: &Funcdata, x: VarnodeId) -> bool {
 /// value used that way is an address, and cannot be the index of the add it is
 /// in.  A literal that is itself the address of program data is the base, and
 /// `x` its index.
-fn has_pointer_use(data: &Funcdata, x: VarnodeId) -> bool {
+fn has_pointer_use(data: &Funcdata, x: VarnodeId) -> KunaResult<bool> {
     let mut seen = vec![x];
     let mut i = 0;
     while i < seen.len() {
@@ -1843,13 +1890,13 @@ fn has_pointer_use(data: &Funcdata, x: VarnodeId) -> bool {
             let Some(o) = data.obank().get(op) else { continue };
             let slot = o.get_slot(cur);
             let follows = match o.code() {
-                OpCode::CPUI_LOAD | OpCode::CPUI_STORE if slot == 1 => return true,
-                OpCode::CPUI_PTRADD | OpCode::CPUI_PTRSUB if slot == 0 => return true,
+                OpCode::CPUI_LOAD | OpCode::CPUI_STORE if slot == 1 => return Ok(true),
+                OpCode::CPUI_PTRADD | OpCode::CPUI_PTRSUB if slot == 0 => return Ok(true),
                 OpCode::CPUI_CALL | OpCode::CPUI_CALLIND if slot > 0 => {
-                    if crate::coreaction_infertypes::declared_input_type_local(data, op, slot).get_metatype()
+                    if crate::coreaction_infertypes::declared_input_type_local(data, op, slot)?.get_metatype()
                         == type_metatype::TYPE_PTR
                     {
-                        return true;
+                        return Ok(true);
                     }
                     false
                 }
@@ -1865,13 +1912,13 @@ fn has_pointer_use(data: &Funcdata, x: VarnodeId) -> bool {
             };
             if let Some(out) = o.get_out().filter(|out| follows && !seen.contains(out)) {
                 if seen.len() >= MAX_COPIES {
-                    return false;
+                    return Ok(false);
                 }
                 seen.push(out);
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Does the program read `x` as a number somewhere -- multiply, divide or shift
@@ -1879,12 +1926,12 @@ fn has_pointer_use(data: &Funcdata, x: VarnodeId) -> bool {
 /// the add it also appears in.  A mask is not such a use: `p & 7` is how a
 /// program tests a pointer's alignment; nor is the right-hand side of a
 /// difference of two pointers.
-fn used_as_number(data: &Funcdata, x: VarnodeId) -> bool {
-    let Some(v) = data.vbank().get(x) else { return false };
-    v.descend_iter().any(|op| {
-        let Some(o) = data.obank().get(op) else { return false };
-        match o.code() {
-            OpCode::CPUI_INT_MULT => !is_pointer_difference(data, op),
+fn used_as_number(data: &Funcdata, x: VarnodeId) -> KunaResult<bool> {
+    let Some(v) = data.vbank().get(x) else { return Ok(false) };
+    for op in v.descend_iter() {
+        let Some(o) = data.obank().get(op) else { continue };
+        let number = match o.code() {
+            OpCode::CPUI_INT_MULT => !is_pointer_difference(data, op)?,
             OpCode::CPUI_INT_DIV
             | OpCode::CPUI_INT_SDIV
             | OpCode::CPUI_INT_REM
@@ -1903,8 +1950,12 @@ fn used_as_number(data: &Funcdata, x: VarnodeId) -> bool {
                     .is_some_and(|c| c.is_constant() && c.get_offset() != 0 && c.get_offset() < 0x10000)
             }),
             _ => false,
+        };
+        if number {
+            return Ok(true);
         }
-    })
+    }
+    Ok(false)
 }
 
 /// The element type the evidence commits to, or `None` (a refusal it recorded).

@@ -37,6 +37,7 @@
 //! `verify_object_formats`).
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use kuna_base::address::Address;
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram, EntrySelector};
@@ -322,4 +323,16 @@ fn pe_declared_entry_outranks_the_import_slot_test() {
         prog.resolve_body_entry(&EntrySelector::Numeric(IATINCODE_SLOTS[0])).is_ok(),
         "an explicit function declaration must make the slot a body target"
     );
+    let space = Rc::clone(prog.arch().manage().get_default_code_space().unwrap());
+    let address = Address::new(Rc::clone(&space), IATINCODE_SLOTS[0]);
+    assert!(prog.arch().is_declared_body_entry(&address));
+    assert!(prog.arch().is_body_entry(&address), "the dependency owner sees the same declaration");
+    let bytes = prog.arch().translate().loader_rc().borrow().shared_bytes().unwrap();
+    let mut reader = kuna_sleigh::kuna_sharedbytes::SharedBytesImage::new("shared PE", bytes);
+    reader.attach_to_space(space);
+    prog.arch_mut().set_loader(Box::new(reader));
+    assert!(prog.is_import_slot(IATINCODE_SLOTS[0]), "shared readers retain loader pointer identity");
+    assert!(prog.is_declared_entry(IATINCODE_SLOTS[0]));
+    assert!(prog.is_body_entry(IATINCODE_SLOTS[0]), "same-manager wrapper does not erase assertions");
+    assert!(!prog.is_body_entry(IATINCODE_SLOTS[1]), "an undeclared pointer remains bodyless");
 }

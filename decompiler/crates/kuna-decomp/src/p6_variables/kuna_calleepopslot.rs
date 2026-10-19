@@ -129,7 +129,7 @@ pub fn guess_extra_pop(
     call_sp: VarnodeId,
     call_out: VarnodeId,
     settled: &SettledPops,
-) -> (int4, bool) {
+) -> KunaResult<(int4, bool)> {
     let run = push_run(data, spacebase, call_sp, call_out, settled);
     let cleaned = |run: &Run| {
         run.bytes > 0
@@ -138,15 +138,15 @@ pub fn guess_extra_pop(
     };
     let run = match run {
         Some(r) => r,
-        None => return (RETURN_ADDRESS_ONLY, false),
+        None => return Ok((RETURN_ADDRESS_ONLY, false)),
     };
     if run.bytes == 0 || cleaned(&run) {
-        return (RETURN_ADDRESS_ONLY, true);
+        return Ok((RETURN_ADDRESS_ONLY, true));
     }
-    if !is_imported(data, entry) || (run.folded && deferred_cleanup(data, spacebase, call_out)) {
-        return (RETURN_ADDRESS_ONLY, false);
+    if !is_imported(data, entry)? || (run.folded && deferred_cleanup(data, spacebase, call_out)) {
+        return Ok((RETURN_ADDRESS_ONLY, false));
     }
-    (RETURN_ADDRESS_ONLY + run.bytes, false)
+    Ok((RETURN_ADDRESS_ONLY + run.bytes, false))
 }
 
 /// Count the argument pushes back from the return-address slot `call_sp`,

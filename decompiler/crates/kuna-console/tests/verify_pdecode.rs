@@ -140,7 +140,7 @@ fn lanes_agree_everywhere(name: &str) -> usize {
             &[],
             detail,
             &WalkPlan::serial(),
-        );
+        ).unwrap();
         assert!(
             want.num_instructions() > 50 && want.function_count() > 2,
             "{name}: the fixture must decode a real program or the comparison is vacuous \
@@ -169,7 +169,7 @@ fn lanes_agree_everywhere(name: &str) -> usize {
                     &[],
                     detail,
                     &plan,
-                );
+                ).unwrap();
                 assert_eq!(
                     plan.engaged(),
                     1,
@@ -246,7 +246,7 @@ fn repeated_lane_runs_are_identical() {
             &[],
             ListingDetail::FULL,
             &plan,
-        )
+        ).unwrap()
     };
     let first = build();
     for round in 0..4 {
@@ -282,7 +282,7 @@ fn seed_names_survive_the_merge() {
             &names,
             ListingDetail::FULL,
             plan,
-        )
+        ).unwrap()
     };
     let want: BTreeMap<u64, DiscoveredFunction> =
         build(&WalkPlan::serial()).functions().map(|(&a, f)| (a, f.clone())).collect();

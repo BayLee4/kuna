@@ -143,6 +143,104 @@ fn export_helpers_report_sections_disasm_bytes_and_globals() {
     eprintln!("global_data_symbols on fauxware ({}): {:?}", globals.len(), globals);
 }
 
+#[test]
+fn invocation_reserves_later_source_identifiers_for_enum_endpoints() {
+    use kuna_base::address::Address;
+    use kuna_decomp::decompile_drive::print_c_types;
+    use kuna_decomp::dtype::{type_metatype, TypeFactory};
+    use kuna_decomp::kuna_langtypes::SpellCtx;
+
+    let root = repo_root();
+    let specs = vec![root.join("specs").to_str().unwrap().to_string()];
+    let mut prog = bootstrap_from_object(fauxware().to_str().unwrap(), "", &specs).unwrap();
+    prog.commit_pending_analysis().unwrap();
+    let main = prog.function_entries_canonical().into_iter().find(|entry| entry.name == "main").unwrap();
+    prog.register_symbol("Flags__kuna_min_", main.addr);
+    let integer = prog.arch().types().get_base(4, type_metatype::TYPE_INT).unwrap();
+    let flags = {
+        let types = prog.arch().types_impl();
+        let shell = types.get_type_enum_sized("Flags", 4, type_metatype::TYPE_ENUM_INT).unwrap();
+        let flags = types.set_enum_values(&shell, [(1, "Ready".into())].into()).unwrap();
+        let later = types.get_type_enum_sized("Later", 4, type_metatype::TYPE_ENUM_INT).unwrap();
+        types.set_enum_values(&later, [(1, "Flags__kuna_min".into())].into()).unwrap();
+        types.get_typedef(&integer, "Flags__kuna_max_", 0, 0).unwrap();
+        flags
+    };
+    let global = prog.arch().symboltab.get_global_scope().unwrap();
+    let space = prog.arch().manage().get_default_data_space().unwrap().clone();
+    prog.arch_mut().symboltab.add_symbol_mapped(
+        global, "Flags__kuna_max", integer, &Address::new(space, 0x7777_0000),
+        &Address::new_invalid(),
+    ).unwrap();
+
+    kuna_console::project::prepare_type_names(&mut prog);
+    let reserved = prog.arch().print().reserved_identifiers().unwrap().clone();
+    for name in ["Flags", "Later", "Ready", "Flags__kuna_min", "Flags__kuna_min_", "Flags__kuna_max", "Flags__kuna_max_"] {
+        assert!(reserved.contains(name), "missing source reservation {name}");
+    }
+    let names = prog.arch().print().type_names().cloned();
+    let metadata = kuna_decomp::kuna_structdefs::definition_text_with_names(
+        &flags, &SpellCtx::OFF, names.as_deref(), Some(reserved.as_ref()),
+    );
+    let header = print_c_types(prog.arch_mut());
+    assert!(metadata.contains("Flags__kuna_min__ = -2147483648"), "{metadata}");
+    assert!(metadata.contains("Flags__kuna_max__ = 2147483647LL"), "{metadata}");
+    assert!(header.contains(&metadata), "metadata/header reservation disagreement:\n{header}\n{metadata}");
+    assert_eq!(flags.get_name(), "Flags");
+    assert_eq!(flags.as_enum_namemap().unwrap()[&1], "Ready");
+}
+
+#[test]
+fn invocation_reserves_held_function_and_callable_parameter_spellings() {
+    use std::rc::Rc;
+    use kuna_decomp::dtype::type_metatype;
+    use kuna_decomp::fspec::PrototypePieces;
+
+    let mut prog = loaded_fauxware();
+    let main = entry_named(&prog, "main");
+    let authenticate = entry_named(&prog, "authenticate");
+    let integer = prog.arch().types().get_base(4, type_metatype::TYPE_INT).unwrap();
+    let source_pieces = PrototypePieces {
+        name: main.name.clone(),
+        outtype: Some(Rc::clone(&integer)),
+        intypes: vec![Rc::clone(&integer)],
+        innames: vec!["Source.Param".into()],
+        first_var_arg_slot: -1,
+        ..Default::default()
+    };
+    let source = prog.arch().types().logical_proto(&source_pieces, "", true, false).unwrap();
+    let (main_symbol, _) = prog.arch().symboltab.find_function_across_scopes(&main.addr).unwrap();
+    prog.arch_mut().symboltab.set_function_source_proto(main_symbol, Rc::clone(&source));
+    let (other_symbol, _) = prog.arch().symboltab.find_function_across_scopes(&authenticate.addr).unwrap();
+    prog.arch_mut().symboltab.set_function_proto_pieces(other_symbol, PrototypePieces {
+        name: authenticate.name,
+        innames: vec!["Pieces.Param".into()],
+        ..source_pieces.clone()
+    });
+    let callable_proto = prog.arch().types().logical_proto(&PrototypePieces {
+        name: String::new(),
+        innames: vec!["Callable.Param".into()],
+        ..source_pieces.clone()
+    }, "", true, false).unwrap();
+    let callable_shell = prog.arch().types().reserve_code("ReservationCallback", 0x0072_6573_6572_7665).unwrap();
+    let callable = prog.arch().types().complete_code(&callable_shell, callable_proto).unwrap();
+    prog.set_pending_prototype(&main.name, PrototypePieces {
+        innames: vec!["Pending.Param".into()],
+        ..source_pieces
+    });
+
+    kuna_console::project::prepare_type_names(&mut prog);
+    let reserved = prog.arch().print().reserved_identifiers().unwrap();
+    for name in [
+        "Source.Param", "Source_Param", "Pieces.Param", "Pieces_Param",
+        "Callable.Param", "Callable_Param", "Pending.Param", "Pending_Param",
+    ] {
+        assert!(reserved.contains(name), "missing parameter reservation {name}");
+    }
+    assert_eq!(source.get_param(0).unwrap().get_name(), "Source.Param");
+    assert_eq!(callable.get_code_prototype().unwrap().get_param(0).unwrap().get_name(), "Callable.Param");
+}
+
 /// The entry named `name`, from the canonical inventory.
 fn entry_named(prog: &kuna_console::engine::ConsoleProgram, name: &str) -> FunctionEntry {
     prog.function_entries_canonical()
@@ -184,7 +282,7 @@ fn callee_hints_carry_direct_calls_and_address_taken_callees() {
     };
     let mut pending = vec![start, main].into_iter();
     let mut results: Vec<FuncResult> = Vec::new();
-    decompile_pulled(&mut prog, &opts, &mut || pending.next(), &mut |r| results.push(r));
+    decompile_pulled(&mut prog, &opts, &mut || pending.next(), &mut |r| results.push(r)).unwrap();
 
     assert_eq!(results.len(), 2, "one result per target, in pull order");
     assert_eq!((results[0].byte_address, results[1].byte_address), (start_vma, main_vma));
@@ -214,7 +312,7 @@ fn callee_hints_carry_direct_calls_and_address_taken_callees() {
 
     // Not asked for means not paid for.
     let again = entry_named(&prog, "main");
-    let quiet = decompile_targets(&mut prog, vec![again], true, false, false);
+    let quiet = decompile_targets(&mut prog, vec![again], true, false, false).unwrap();
     assert!(quiet[0].callee_hints.is_empty(), "hints are opt-in");
 }
 
@@ -230,7 +328,7 @@ fn resumable_asm_sweep_matches_the_one_shot_sweep() {
         .filter(|e| ["main", "authenticate", "accepted", "rejected"].contains(&e.name.as_str()))
         .collect();
     assert!(!targets.is_empty(), "expected named fauxware functions");
-    let results = decompile_targets(&mut prog, targets.clone(), false, true, false);
+    let results = decompile_targets(&mut prog, targets.clone(), false, true, false).unwrap();
 
     let labels = asm_labels_from_results(&results);
     let mut one_shot: Vec<u8> = Vec::new();
@@ -264,7 +362,7 @@ fn resumable_asm_sweep_matches_the_one_shot_sweep() {
     while !sweep.step(&prog, 512, &mut interleaved).unwrap() {
         let again = entry_named(&prog, "main");
         let opts = DecompileOptions { no_vars: true, ..DecompileOptions::default() };
-        assert!(decompile_entry(&mut prog, again, &opts).error.is_none());
+        assert!(decompile_entry(&mut prog, again, &opts).unwrap().error.is_none());
     }
     assert_eq!(
         String::from_utf8(interleaved).unwrap(),

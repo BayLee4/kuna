@@ -101,12 +101,34 @@ fn non_callable_slot_declarations_do_not_clone_the_current_function_prototype() 
             "the current prototype was not installed:\n{stdout}"
         );
         assert!(
-            stdout.contains("printf(); // jump-as-call"),
-            "a non-callable slot declaration supplied arguments ({declaration:?}):\n{stdout}"
+            stdout.contains("printf(fmt); // jump-as-call"),
+            "the independent import prototype lost its format argument ({declaration:?}):\n{stdout}"
         );
         assert!(
             !stdout.contains("(fmt,value); // jump-as-call"),
             "the resolver cloned the current function prototype ({declaration:?}):\n{stdout}"
+        );
+        // With the independent imported-library source disabled, arbitrary data
+        // must still supply no callable prototype or current-function arguments.
+        let (without_library, stderr, ok) = run(&[
+            "decompile", &bin, "printf", "--sleighpath", &sp,
+            "--assert", &prototype, "--assert", &declaration, "--assert-strict",
+            "--option", "libproto", "off",
+            "--option", "libcsigs", "off",
+            "--option", "declaredlibcproto", "off",
+        ]);
+        assert!(ok, "negative control rejected {declaration:?}: {stderr}");
+        assert!(
+            without_library.contains("int printf(char *fmt,int value)"),
+            "the current prototype was not installed:\n{without_library}"
+        );
+        assert!(
+            without_library.contains("printf(); // jump-as-call"),
+            "a non-callable slot supplied arguments without an imported prototype ({declaration:?}):\n{without_library}"
+        );
+        assert!(
+            !without_library.contains("(fmt,value); // jump-as-call"),
+            "the resolver cloned the current prototype ({declaration:?}):\n{without_library}"
         );
     }
 }

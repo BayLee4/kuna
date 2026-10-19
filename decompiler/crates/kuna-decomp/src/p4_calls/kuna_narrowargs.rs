@@ -16,6 +16,7 @@
 //! narrowed in the caller too.
 
 use kuna_base::address::{calc_mask, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
@@ -146,9 +147,9 @@ fn shifts_by(data: &Funcdata, vn: Option<VarnodeId>) -> bool {
 
 /// Replace every register input whose consumed bits fit a narrower low part by
 /// that part, zero-extended at the entry. Returns how many were replaced.
-pub fn narrow_inputs(data: &mut Funcdata) -> int4 {
+pub fn narrow_inputs(data: &mut Funcdata) -> KunaResult<int4> {
     if !data.get_arch().narrow_args || data.get_func_proto().is_input_locked() || data.bblocks_get_size() == 0 {
-        return 0;
+        return Ok(0);
     }
     let inputs: Vec<VarnodeId> = data.vbank().iter_def_flag(crate::varnode::varnode_flags::input).collect();
     let mut count = 0;
@@ -165,19 +166,21 @@ pub fn narrow_inputs(data: &mut Funcdata) -> int4 {
             continue;
         }
         let Some(part) = low_part(data, &addr, size, w) else { continue };
-        if replace(data, vn, &addr, size, &part, w).is_ok() {
-            if trace() {
-                eprintln!(
-                    "[narrowargs] 0x{:x} input {}:{:x}:{size} consume 0x{consume:x} -> {w}",
-                    data.get_address().get_offset(),
-                    addr.get_space().map(|s| s.get_name()).unwrap_or("?"),
-                    addr.get_offset()
-                );
-            }
-            count += 1;
+        if overlaps_another_input(data, vn, &addr, size) {
+            continue;
         }
+        replace(data, vn, &addr, size, &part, w)?;
+        if trace() {
+            eprintln!(
+                "[narrowargs] 0x{:x} input {}:{:x}:{size} consume 0x{consume:x} -> {w}",
+                data.get_address().get_offset(),
+                addr.get_space().map(|s| s.get_name()).unwrap_or("?"),
+                addr.get_offset()
+            );
+        }
+        count += 1;
     }
-    count
+    Ok(count)
 }
 
 /// Does an input other than `vn` overlap `addr:size`?
@@ -196,9 +199,8 @@ fn overlaps_another_input(data: &Funcdata, vn: VarnodeId, addr: &Address, size: 
 }
 
 /// Replace input `vn` by its low `w` bytes at `part`, zero-extended at the
-/// entry. Nothing changes when another input overlaps the register, the one
-/// case in which the narrow input could not be made; past that check a failure
-/// puts the register-wide input back.
+/// entry. The caller has excluded overlapping inputs; if making the narrow
+/// input fails, put the register-wide input back and propagate the error.
 fn replace(
     data: &mut Funcdata,
     vn: VarnodeId,
@@ -207,9 +209,6 @@ fn replace(
     part: &Address,
     w: int4,
 ) -> kuna_base::error::KunaResult<()> {
-    if overlaps_another_input(data, vn, addr, size) {
-        return Err(kuna_base::error::KunaError::lowlevel("narrowargs: overlapping input varnodes".to_string()));
-    }
     let topbl = data.bblocks_get_block(0);
     let start = data.bblocks_block_start(topbl);
     let op = data.new_op(1, start);
@@ -217,11 +216,12 @@ fn replace(
     data.op_set_opcode_code(op, OpCode::CPUI_INT_ZEXT);
     data.total_replace(vn, out)?;
     data.delete_varnode(vn)?;
-    let narrow = data.new_varnode(w, part, None);
-    let narrow = match data.set_input_varnode(narrow) {
+    let narrow = data.new_varnode(w, part, None)
+        .and_then(|narrow| data.set_input_varnode(narrow));
+    let narrow = match narrow {
         Ok(narrow) => narrow,
         Err(e) => {
-            let wide = data.new_varnode(size, addr, None);
+            let wide = data.new_varnode(size, addr, None)?;
             let wide = data.set_input_varnode(wide)?;
             data.total_replace(out, wide)?;
             let zero = data.new_constant(w, 0);

@@ -177,7 +177,7 @@ fn render_vn(arch: &Architecture, fd: &Funcdata, vn: kuna_decomp::context::Varno
         Some(s) => s,
         None => return "<nospace>".to_string(),
     };
-    let regname = trans.get_register_name(spc, loc.get_offset(), size);
+    let regname = trans.get_register_name(spc, loc.get_offset(), size).unwrap();
     let mut tok = if !regname.is_empty() {
         regname
     } else {

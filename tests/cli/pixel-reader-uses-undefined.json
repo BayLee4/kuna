@@ -23,7 +23,7 @@
       "eq": 0
     },
     "stdout_matches": [
-      "ReadFile\\([^;]*,&(v\\d+),4,&v\\d+,0\\);",
+      "ReadFile\\([^;]*,&(v\\d+),4,&v\\d+,\\s*(?:\\(\\s*void\\s*\\*\\s*\\)\\s*)?(?:NULL|0[xX]0+|0)\\s*\\);",
       "wsprintfA\\([^;]*\\(v\\d+ >> 8 & 0xff\\)"
     ],
     "stdout_absent": [

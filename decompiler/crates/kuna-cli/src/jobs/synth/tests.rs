@@ -119,6 +119,11 @@ fn a_structure_rename_rebases_recorded_pointer_arguments() {
     use kuna_decomp::kuna_pointerargs::{Call, Position, Record};
     let mut r = sample_result();
     r.code = Some("struct_3 *p; sink(&v1);".into());
+    r.type_bindings = vec![kuna_console::project::ResultTypeBinding {
+        id: 73, name: "struct_3".into(), presentation: "struct_3".into(), size: 4,
+    }];
+    r.globals[0].declaration = "struct_3 dat_4000".into();
+    r.stack_objects[0].uses[0].type_name = "struct_3 *".into();
     r.pointerargs = Some(Record {
         entry: ("ram".into(), 0x2000), parameters: vec![],
         calls: vec![Call {
@@ -131,6 +136,10 @@ fn a_structure_rename_rebases_recorded_pointer_arguments() {
     let serial = [Some(("struct_100".into(), Some(request(4))))];
     let renamed = super::rename_result(&r, Some(&own), &serial, &[]).unwrap();
     assert_eq!(renamed.code.as_deref(), Some("struct_100 *p; sink(&v1);"));
+    assert_eq!(renamed.type_bindings[0].presentation, "struct_100");
+    assert_eq!(renamed.type_bindings[0].id, 73);
+    assert_eq!(renamed.globals[0].declaration, "struct_100 dat_4000");
+    assert_eq!(renamed.stack_objects[0].uses[0].type_name, "struct_100 *");
     assert!(renamed.field_calls.iter().all(|f| f.record == "struct_100"));
     assert_eq!(renamed.pointerargs.unwrap().calls[0].position.column, 19);
 }

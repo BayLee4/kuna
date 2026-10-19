@@ -75,6 +75,42 @@ mod stock_markup {
     }
 
     #[test]
+    fn source_nominal_name_is_one_token_but_scalar_keywords_are_not() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let node = types.get_type_struct("Node").unwrap();
+        let name = "Node *64 __((offset(0x8)))";
+        let alias = types.get_typedef(&node, name, 0x1235, 0).unwrap();
+        let id = alias.get_unsized_id().unwrap();
+        let mut emitter = EmitMarkup::new();
+        let document = emitter.begin_document();
+        emitter.tag_type(name, SyntaxHighlight::TypeColor, &MarkupRef {
+            type_id: Some(id), type_name: Some(name.into()),
+            datatype: Some(MarkupDatatype(Rc::clone(&alias))), ..MarkupRef::none()
+        });
+        emitter.print(" ", SyntaxHighlight::NoColor);
+        emitter.tag_type("unsigned long *", SyntaxHighlight::TypeColor, &MarkupRef::none());
+        emitter.end_document(document);
+        assert_eq!(wire_types(&emitter.take_output()), vec![
+            (name.into(), Some(id)), ("unsigned".into(), None), ("long".into(), None)
+        ]);
+        let mut pretty = EmitPrettyPrint::new();
+        pretty.set_markup(true);
+        pretty.set_max_line_size(20).unwrap();
+        let document = pretty.begin_document();
+        pretty.tag_type(name, SyntaxHighlight::TypeColor, &MarkupRef {
+            type_id: Some(id), type_name: Some(name.into()),
+            datatype: Some(MarkupDatatype(Rc::clone(&alias))), ..MarkupRef::none()
+        });
+        pretty.end_document(document);
+        pretty.flush().unwrap();
+        let LowLevel::Markup(emitter) = pretty.lowlevel_mut() else { unreachable!() };
+        assert_eq!(wire_types(&emitter.take_output()), vec![(name.into(), Some(id))]);
+        assert_eq!(alias.get_name(), name);
+    }
+
+    #[test]
     fn queue_wrap_replaces_type_bindings_and_syntax_slots() {
         let mut pp = EmitPrettyPrint::new();
         pp.set_max_line_size(20).unwrap();

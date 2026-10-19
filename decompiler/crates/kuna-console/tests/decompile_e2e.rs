@@ -149,37 +149,98 @@ fn own_return_values(fd: &kuna_decomp::funcdata::Funcdata, pc: Option<u64>)
 }
 
 fn physical_input(fd: &kuna_decomp::funcdata::Funcdata, storage: PhysicalStorage)
-    -> kuna_decomp::context::VarnodeId
+    -> (kuna_decomp::context::VarnodeId, u32)
 {
+    assert!((1..=8).contains(&storage.2), "scalar evaluator seed width");
     let mut found = None;
     for id in fd.obank().iter_alive() {
         let op = fd.obank().get(id).unwrap();
         for slot in 0..op.num_input() {
             let Some(id) = op.get_in(slot) else { continue; };
-            if fd.vbank().get(id).unwrap().is_input() && physical_storage(fd, id) == storage {
-                if let Some(previous) = found { assert_eq!(previous, id); }
-                found = Some(id);
+            let value = fd.vbank().get(id).unwrap();
+            if !value.is_input() { continue; }
+            let (space, offset, size) = physical_storage(fd, id);
+            let Some(byte_offset) = storage.1.checked_sub(offset) else { continue; };
+            if space != storage.0 || size < storage.2 || byte_offset > (size - storage.2) as u64 {
+                continue;
             }
+            assert!(size <= 8, "scalar evaluator input width");
+            let low_byte = if value.get_space().is_big_endian() {
+                size - storage.2 - byte_offset as i32
+            } else { byte_offset as i32 };
+            let candidate = (id, low_byte as u32 * 8);
+            if let Some(previous) = found { assert_eq!(previous, candidate, "ambiguous physical input"); }
+            found = Some(candidate);
         }
     }
-    found.expect("required genuine live physical input")
+    found.expect("required genuine live physical input covering the source bytes")
+}
+
+// A model may normalize an input into a wider container. Union byte coverage
+// only within that actual input identity, not between overlapping native inputs.
+fn input_storage_ranges(
+    fd: &kuna_decomp::funcdata::Funcdata,
+    inputs: std::collections::BTreeMap<kuna_decomp::context::VarnodeId, Vec<(i32, i32)>>,
+) -> Vec<PhysicalStorage> {
+    let mut storage = Vec::new();
+    for (id, mut ranges) in inputs {
+        assert!(fd.vbank().get(id).unwrap().is_input());
+        let (space, offset, size) = physical_storage(fd, id);
+        ranges.sort_unstable();
+        let mut current: Option<(i32, i32)> = None;
+        for (start, end) in ranges {
+            assert!(start >= 0 && start < end && end <= size);
+            match current {
+                Some((first, last)) if start <= last => current = Some((first, last.max(end))),
+                Some((first, last)) => {
+                    storage.push((space, offset.checked_add(first as u64).unwrap(), last - first));
+                    current = Some((start, end));
+                }
+                None => current = Some((start, end)),
+            }
+        }
+        if let Some((first, last)) = current {
+            storage.push((space, offset.checked_add(first as u64).unwrap(), last - first));
+        }
+    }
+    storage.sort_unstable();
+    storage
 }
 
 fn assert_own_return_value(fd: &kuna_decomp::funcdata::Funcdata,
     seeds: &[(PhysicalStorage, u64)], expected: u64)
 {
+    let mut assignments = std::collections::BTreeMap::new();
+    let mut expected_ranges = std::collections::BTreeMap::new();
+    for &(storage, value) in seeds {
+        let (input, shift) = physical_input(fd, storage);
+        let mask = kuna_base::address::calc_mask(storage.2) << shift;
+        let bits = (value & kuna_base::address::calc_mask(storage.2)) << shift;
+        let (assigned, combined) = assignments.entry(input).or_insert((0u64, 0u64));
+        assert_eq!((*combined ^ bits) & *assigned & mask, 0, "conflicting physical input seeds");
+        *assigned |= mask;
+        *combined |= bits;
+        let byte_offset = (storage.1 - physical_storage(fd, input).1) as i32;
+        expected_ranges.entry(input).or_insert_with(Vec::new)
+            .push((byte_offset, byte_offset + storage.2));
+    }
+    let expected_inputs = input_storage_ranges(fd, expected_ranges);
+    let partial = assignments.iter().any(|(id, (mask, _))|
+        *mask != kuna_base::address::calc_mask(fd.vbank().get(*id).unwrap().get_size()));
+    let fills: &[u64] = if partial { &[0, 1, 0x89abcdef, u64::MAX] } else { &[0] };
     for returned in own_return_values(fd, None) {
         assert_eq!(fd.vbank().get(returned).unwrap().get_size(), 8);
-        let mut expected_inputs: Vec<_> = seeds.iter().map(|(storage, _)| *storage).collect();
-        expected_inputs.sort_unstable();
         assert_eq!(own_value_input_storage(fd, vec![returned], false), expected_inputs);
-        // A fresh evaluator for each vector/RETURN prevents cached intermediate
-        // values from hiding an input-half or arithmetic dependency.
-        let mut evaluator = kuna_decomp::kuna_emulatefunction::EmulateFunction::new(fd);
-        for &(storage, value) in seeds {
-            evaluator.seed_varnode_value(physical_input(fd, storage), value);
+        // Fresh evaluators retain every original vector and independently vary
+        // unassigned container bytes, including the overwritten low stack word.
+        for &fill in fills {
+            let mut evaluator = kuna_decomp::kuna_emulatefunction::EmulateFunction::new(fd);
+            for (&input, &(assigned, bits)) in &assignments {
+                let width = kuna_base::address::calc_mask(fd.vbank().get(input).unwrap().get_size());
+                evaluator.seed_varnode_value(input, bits | (fill & width & !assigned));
+            }
+            assert_eq!(evaluator.evaluate_held(returned, 64), Some(expected));
         }
-        assert_eq!(evaluator.evaluate_held(returned, 64), Some(expected));
     }
 }
 
@@ -188,24 +249,45 @@ fn own_value_input_storage(fd: &kuna_decomp::funcdata::Funcdata,
 {
     use kuna_num::opcodes::OpCode;
     let mut seen = Vec::new();
-    let mut inputs = Vec::new();
+    let mut inputs = std::collections::BTreeMap::new();
     while let Some(id) = pending.pop() {
         if seen.contains(&id) { continue; }
         seen.push(id);
         let value = fd.vbank().get(id).unwrap();
         if value.is_constant() { continue; }
-        if value.is_input() { inputs.push(physical_storage(fd, id)); continue; }
+        if value.is_input() {
+            inputs.entry(id).or_insert_with(Vec::new).push((0, value.get_size()));
+            continue;
+        }
         let op = fd.obank().get(value.get_def().expect("unresolved physical value")).unwrap();
         assert!(!matches!(op.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND
             | OpCode::CPUI_LOAD | OpCode::CPUI_INDIRECT), "value barrier: {:?}", op.code());
         assert!((allow_merge && op.code() == OpCode::CPUI_MULTIEQUAL)
             || kuna_decomp::kuna_emulatefunction::EmulateFunction::is_pure(op.code()),
             "unsupported value ancestry: {:?}", op.code());
+        if op.code() == OpCode::CPUI_SUBPIECE {
+            let input = op.get_in(0).unwrap();
+            let source = fd.vbank().get(input).unwrap();
+            let offset = fd.vbank().get(op.get_in(1).unwrap()).unwrap();
+            if source.is_input() && offset.is_constant() {
+                if let Ok(low_byte) = i32::try_from(offset.get_offset()) {
+                    if low_byte >= 0 && value.get_size() > 0
+                        && low_byte <= source.get_size()
+                        && value.get_size() <= source.get_size() - low_byte
+                    {
+                        let start = if source.get_space().is_big_endian() {
+                            source.get_size() - value.get_size() - low_byte
+                        } else { low_byte };
+                        inputs.entry(input).or_insert_with(Vec::new)
+                            .push((start, start + value.get_size()));
+                        continue;
+                    }
+                }
+            }
+        }
         pending.extend((0..op.num_input()).filter_map(|slot| op.get_in(slot)));
     }
-    inputs.sort_unstable();
-    inputs.dedup();
-    inputs
+    input_storage_ranges(fd, inputs)
 }
 
 // Dependency-only observations for a conditional merge or selected recursive
@@ -617,7 +699,7 @@ fn original_memory_only_initializers_keep_their_call_occurrences() {
         </decompilertest>"#);
         Corpus::from_xml("original-memory-only-initializers", &xml).run_all(
             &["caller"], |program, fd| {
-                let body = print_c(program.arch_mut(), fd);
+                let body = print_c(program.arch_mut(), fd).unwrap();
                 assert_eq!(fd.num_calls(), if expression.is_some() { 2 } else { 1 }, "{body}");
                 let targets: Vec<_> = (0..fd.num_calls())
                     .map(|index| fd.get_call_specs(index).get_entry_address().get_offset())
@@ -676,20 +758,21 @@ fn completed_recursive_callback_uses_the_original_callable_for_real_calls() {
                     declare("typedef struct Node (*Fn)(struct Node);");
                 }
                 let callback = factory.find_by_name("Fn").unwrap().unwrap();
+                let callback_reader = factory.hold_callable(std::rc::Rc::clone(&callback)).unwrap();
                 if observe_before_layout {
                     let mut pieces = kuna_decomp::fspec::PrototypePieces::default();
                     callback.get_ptr_to().unwrap().get_code_prototype().unwrap().get_pieces(&mut pieces);
                 }
                 declare("struct Node { float8 d; Fn next; };");
-                callback
+                callback_reader
             };
             corpus.command("parse line extern struct Node invoke(struct Node node, Fn callback);").unwrap();
             corpus.data().pending_prototypes.get_mut("invoke").unwrap().intypes[1] =
-                std::rc::Rc::clone(&callback);
+                std::rc::Rc::clone(callback.datatype());
             corpus.run_all(&["invoke"], |program, fd| {
                 assert_eq!(fd.num_calls(), 1);
                 program.arch_mut().ctypes = true;
-                let body = print_c(program.arch_mut(), fd);
+                let body = print_c(program.arch_mut(), fd).unwrap();
                 assert_c_behavior(
                     &common::scratch_file("completed-recursive-callback", "c"),
                     r#"#include <stddef.h>
@@ -715,6 +798,49 @@ static Node counted(Node node) { ++calls; return provider(node); }"#,
 }"#,
                 );
             });
+        }
+    }
+}
+
+#[test]
+fn original_calltarget_stage_clauses_preserve_inferred_call_domains() {
+    use kuna_base::xml::DocumentStorage;
+
+    for (stem, expected) in [
+        ("kuna-calltargetstorage", vec![
+            "viaparam", "viaglobal", "viafield", "viaparam", "viaglobal", "viafield",
+            "viafield", "viaparam", "viaparam",
+        ]),
+        ("kuna-calltargettype", [
+            "call", "call2", "calls", "twice", "chosen", "sorter", "fstore",
+            "c_call", "c_call2", "c_calls", "c_twice", "c_chosen", "c_sorter", "c_fstore",
+        ].repeat(3)),
+        ("kuna-calltargettype-a64", ["fstore", "fmul", "icall"].repeat(2)),
+        ("kuna-calltargettype-armhf", ["fstore", "fmul", "icall"].repeat(2)),
+    ] {
+        let xml = std::fs::read_to_string(repo_root().join("tests/stages").join(format!("{stem}.xml")))
+            .expect("original calltarget fixture");
+        let mut bodies = String::new();
+        Corpus::from_xml(stem, &xml).run_all(&expected, |program, fd| {
+            bodies.push_str(&print_c(program.arch_mut(), fd).unwrap());
+            bodies.push('\n');
+        });
+        // Consume the original assertions verbatim: option-off bare calls,
+        // option-on storage/call casts, ctypes/Rust controls and genuine
+        // floating-register ABI refusals all remain part of this test.
+        let mut documents = DocumentStorage::new();
+        let document = documents.parse_document(xml.as_bytes()).unwrap();
+        for clause in document.get_root().get_children().iter()
+            .filter(|element| element.get_name() == "stringmatch")
+        {
+            let attribute = |name| std::str::from_utf8(clause.get_attribute_value(name).unwrap()).unwrap();
+            let pattern = std::str::from_utf8(clause.get_content()).unwrap();
+            let expression = regex::RegexBuilder::new(pattern).multi_line(true).build().unwrap();
+            let count = expression.find_iter(&bodies).count();
+            let min: usize = attribute("min").parse().unwrap();
+            let max: usize = attribute("max").parse().unwrap();
+            assert!((min..=max).contains(&count),
+                "{stem}: {}: expected {min}..={max}, found {count}\n{bodies}", attribute("name"));
         }
     }
 }
@@ -747,6 +873,10 @@ fn callable_cast_rendering_uses_live_dialect_without_mutating_analysis() {
         Corpus::from_xml("callable-dialect", &xml).run_all(&["invoke"], |program, fd| {
             assert_eq!(fd.num_calls(), 1);
             let call = fd.get_call_specs(0).get_op();
+            let site = fd.obank().get(call).unwrap().get_addr();
+            assert!(fd.get_override().is_authored_proto_override(site));
+            assert!(fd.get_call_specs(0).proto().is_input_locked());
+            assert!(fd.get_call_specs(0).proto().is_output_locked());
             let operands: Vec<_> = (0..fd.obank().get(call).unwrap().num_input())
                 .map(|slot| fd.obank().get(call).unwrap().get_in(slot).unwrap()).collect();
             let target_value = fd.vbank().get(operands[0]).unwrap();
@@ -760,7 +890,7 @@ fn callable_cast_rendering_uses_live_dialect_without_mutating_analysis() {
             let original_definition = definition_state();
             for native in [false, true, false] {
                 program.arch_mut().ctypes = native;
-                let body = print_c(program.arch_mut(), fd);
+                let body = print_c(program.arch_mut(), fd).unwrap();
                 let object_pointer = native || target_type.starts_with("void");
                 let target_value = fd.vbank().get(operands[0]).unwrap();
                 assert_eq!(target_value.get_def(), definition);
@@ -801,8 +931,12 @@ int main(void) {{
 fn visible_indexed_code_cast_remains_callable_without_mutating_dispatch() {
     let xml = std::fs::read_to_string(repo_root().join("tests/stages/ghdec-funcptralign.xml"))
         .expect("checked-in function-pointer alignment witness");
-    Corpus::from_xml("funcptralign-callable", &xml).run_all(
+    let mut corpus = Corpus::from_xml("funcptralign-callable", &xml);
+    corpus.command("option ctypes on").unwrap();
+    corpus.command("option calltargettype on").unwrap();
+    corpus.run_all(
         &["dispatch", "dispatch"], |program, fd| {
+            assert!(fd.get_arch().call_target_type && fd.get_arch().call_target_c);
             assert_eq!(fd.num_calls(), 1);
             let call = fd.get_call_specs(0).get_op();
             let operands: Vec<_> = (0..fd.obank().get(call).unwrap().num_input())
@@ -817,9 +951,10 @@ fn visible_indexed_code_cast_remains_callable_without_mutating_dispatch() {
                 (op.code(), inputs, op.get_out())
             });
             let original_definition = definition_state();
+            let analysis_ctypes = program.arch().ctypes;
             for native in [false, true, false] {
                 program.arch_mut().ctypes = native;
-                let body = print_c(program.arch_mut(), fd);
+                let body = print_c(program.arch_mut(), fd).unwrap();
                 let target_value = fd.vbank().get(operands[0]).unwrap();
                 assert_eq!(target_value.get_def(), definition);
                 assert_eq!(definition_state(), original_definition);
@@ -844,22 +979,58 @@ int main(void) {{
     {table}
     expected = callbacks;
     dispatch(callbacks);
-    if (calls != 1 || wrong != 0) return 1;
+    if (calls != 1 || wrong != 0) {{
+        expected = 0;
+        return 1;
+    }}
     callbacks[1] = 0;
     dispatch(callbacks);
+    expected = 0;
     return calls != 1 || wrong != 0;
 }}
 "#));
             }
+            program.arch_mut().ctypes = analysis_ctypes;
         },
     );
 }
 
 #[test]
 fn immediate_tail_transfer_keeps_numeric_target_explicitly_callable() {
-    use kuna_decomp::prettyprint::TokenKind;
+    use kuna_base::marshal::{Decoder, PackedDecode, ATTRIB_CONTENT, ATTRIB_ID};
+    use kuna_decomp::prettyprint::{ids, TokenKind};
     use kuna_decomp::printc::PrintC;
     use kuna_num::opcodes::OpCode;
+
+    fn conversion_types(
+        decoder: &mut PackedDecode,
+        declaration: bool,
+        types: &mut Vec<(String, Option<u64>)>,
+    ) {
+        let element = decoder.open_element().unwrap();
+        let declaration = declaration || [
+            ids::ELEM_FUNCPROTO.get_id(), ids::ELEM_RETURN_TYPE.get_id(),
+            ids::ELEM_VARDECL.get_id(),
+        ].contains(&element);
+        let mut text = String::new();
+        let mut id = None;
+        loop {
+            let attribute = decoder.get_next_attribute_id().unwrap();
+            if attribute == 0 { break; }
+            if element == ids::ELEM_TYPE.get_id() && attribute == ATTRIB_CONTENT.get_id() {
+                text = String::from_utf8(decoder.read_string().unwrap()).unwrap();
+            } else if element == ids::ELEM_TYPE.get_id() && attribute == ATTRIB_ID.get_id() {
+                id = Some(decoder.read_unsigned_integer().unwrap());
+            }
+        }
+        if element == ids::ELEM_TYPE.get_id() && !declaration {
+            types.push((text, id));
+        }
+        while decoder.peek_element().unwrap() != 0 {
+            conversion_types(decoder, declaration, types);
+        }
+        decoder.close_element(element).unwrap();
+    }
 
     let xml = std::fs::read_to_string(repo_root().join("tests/stages/kuna-pushimmediateret.xml"))
         .expect("checked-in unmapped immediate tail-transfer witness");
@@ -895,24 +1066,38 @@ fn immediate_tail_transfer_keeps_numeric_target_explicitly_callable() {
             let value = fd.vbank().get(source).unwrap();
             assert!(value.is_constant(), "the unmapped runtime destination stays numeric");
             assert_eq!(value.get_offset(), 0x200000);
+            let code_id = target_type.get_ptr_to().unwrap().get_unsized_id().unwrap();
+            assert!(target_type.get_ptr_to().unwrap().get_code_prototype().is_none(),
+                "the unmapped generic Code target has no authored prototype");
 
             for native in [false, true, false] {
                 program.arch_mut().ctypes = native;
-                let body = print_c(program.arch_mut(), fd);
-                let (_, tokens) = PrintC::new().doc_function_tokens(fd, program.arch());
+                let body = print_c(program.arch_mut(), fd).unwrap();
+                let (_, tokens) = PrintC::new().doc_function_tokens(fd, program.arch()).unwrap();
                 let conversions: Vec<_> = tokens.iter()
                     .filter(|token| token.kind == TokenKind::Type
                         && !token.in_var_decl && !token.in_proto && !token.in_return_type)
                     .collect();
                 assert_eq!(conversions.len(), 1,
                     "numeric destination requires exactly one callable conversion:\n{body}");
+                let markup = PrintC::new().doc_function_markup(fd, program.arch()).unwrap();
+                let mut decoder = PackedDecode::new(program.arch().manage());
+                decoder.ingest_stream(&markup).unwrap();
+                let mut bindings = Vec::new();
+                conversion_types(&mut decoder, false, &mut bindings);
                 if native {
-                    assert!(conversions[0].text.contains('('),
-                        "native C requires a full callable signature:\n{body}");
+                    assert!(body.contains("(*(void (*)())0x200000)();"),
+                        "native C requires a callable conversion without inventing a prototype:\n{body}");
+                    assert_eq!(bindings, vec![("void".into(), Some(code_id))],
+                        "the native generic callable leaf must bind the actual Code datatype");
                 } else {
-                    assert_eq!(conversions[0].text, "code *",
+                    assert!(body.contains("(*(code *)0x200000)();"),
                         "legacy numeric destination must retain its generic callable conversion:\n{body}");
+                    assert_eq!(conversions[0].text, "code");
+                    assert_eq!(bindings, vec![("code".into(), Some(code_id))],
+                        "the code leaf must bind its actual datatype, not the outer pointer");
                 }
+                assert_eq!(conversions[0].type_name.as_deref(), Some("code"));
                 assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
                 assert_eq!(fd.vbank().get(target).unwrap().get_def(), definition);
                 assert!(std::rc::Rc::ptr_eq(
@@ -933,7 +1118,7 @@ fn injected_indirect_call_preserves_override_and_later_direct_collapse() {
     Corpus::load("injectoverride").run_all(
         &["callind_inject", "inject_collapse"],
         |program, fd| {
-            let body = print_c(program.arch_mut(), fd);
+            let body = print_c(program.arch_mut(), fd).unwrap();
             assert_eq!(fd.num_calls(), 1, "injection lost or duplicated its call:\n{body}");
             let call = fd.get_call_specs(0);
             let op = fd.obank().get(call.get_op()).unwrap();
@@ -984,7 +1169,7 @@ fn scripted_corpus_functions_preserve_observable_behavior() {
         ("condexesub", &["func", "iblockadd"][..]),
     ] {
         Corpus::load(stem).run_all(functions, |program, fd| {
-            let body = print_c(program.arch_mut(), fd);
+            let body = print_c(program.arch_mut(), fd).unwrap();
             match fd.get_name() {
                 "boolless" => {
                     assert_eq!(fd.get_func_proto().num_params(), 0);

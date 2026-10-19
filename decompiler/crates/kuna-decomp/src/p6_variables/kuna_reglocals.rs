@@ -18,6 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 
 use crate::context::HighVariableId;
@@ -70,14 +71,19 @@ fn stack_homes_only(
     arch: &Architecture,
     highs: &[HighVariableId],
     stack_space: Option<&Rc<AddrSpace>>,
-) -> bool {
-    let Some(stack) = stack_space else { return false };
-    let mut homes = highs
-        .iter()
-        .filter_map(|&high| crate::kuna_varsources::high_homes(fd, arch, high))
-        .flat_map(|(homes, _)| homes.into_values())
-        .peekable();
-    homes.peek().is_some() && homes.all(|(space, _)| space.get_index() == stack.get_index())
+) -> KunaResult<bool> {
+    let Some(stack) = stack_space else { return Ok(false) };
+    let mut any_home = false;
+    for &high in highs {
+        let Some((homes, _)) = crate::kuna_varsources::high_homes(fd, arch, high)? else { continue };
+        for (space, _) in homes.into_values() {
+            any_home = true;
+            if space.get_index() != stack.get_index() {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(any_home)
 }
 
 fn widest_instance(fd: &Funcdata, high: HighVariableId) -> i64 {
@@ -105,7 +111,7 @@ fn declares_high_of(fd: &Funcdata, local: &DeclaredLocal) -> bool {
 /// The rows for the locals `arch`'s printer declared for `fd` that are neither
 /// frame objects nor already in `reported` by name, in declaration order.
 /// Empty unless the printer's last document was `fd`.
-pub fn register_locals(arch: &Architecture, fd: &Funcdata, reported: &[VarInfo]) -> Vec<VarInfo> {
+pub fn register_locals(arch: &Architecture, fd: &Funcdata, reported: &[VarInfo]) -> KunaResult<Vec<VarInfo>> {
     let taken: HashSet<&str> = reported.iter().map(|v| v.name.as_str()).collect();
     let rows: Vec<(i64, i64)> = reported
         .iter()
@@ -113,38 +119,39 @@ pub fn register_locals(arch: &Architecture, fd: &Funcdata, reported: &[VarInfo])
         .collect();
     let stack_space = fd.get_scope_local().map(|scope| scope.get_space_id());
     let through = arch.print().declared_through();
-    declarations_of(arch.print(), fd)
+    let mut locals = Vec::new();
+    for local in declarations_of(arch.print(), fd)
         .iter()
         .filter(|local| declares_high_of(fd, local))
         .filter(|local| !taken.contains(local.name.as_str()))
         .filter(|local| !frame_object(fd, local.high, stack_space, &rows))
-        .filter(|local| {
-            let mut highs = vec![local.high];
-            highs.extend(through.get(&local.high).into_iter().flatten());
-            !stack_homes_only(fd, arch, &highs, stack_space)
-        })
-        .map(|local| {
-            let type_name = match &local.ty {
-                Some(ty) => crate::kuna_bytehonest::exported_type_name(arch, ty),
-                None => local.decl.clone(),
-            };
-            let size = local
-                .ty
-                .as_ref()
-                .map(|ty| i64::from(ty.get_size()))
-                .unwrap_or_else(|| widest_instance(fd, local.high));
-            VarInfo {
-                name: local.name.clone(),
-                type_name,
-                stack_offset: None,
-                size,
-                is_param: false,
-                arg_index: None,
-                line_numbers: Vec::new(),
-                addresses: Vec::new(),
-            }
-        })
-        .collect()
+    {
+        let mut highs = vec![local.high];
+        highs.extend(through.get(&local.high).into_iter().flatten());
+        if stack_homes_only(fd, arch, &highs, stack_space)? {
+            continue;
+        }
+        let type_name = match &local.ty {
+            Some(ty) => crate::kuna_bytehonest::exported_type_name(arch, ty),
+            None => local.decl.clone(),
+        };
+        let size = local
+            .ty
+            .as_ref()
+            .map(|ty| i64::from(ty.get_size()))
+            .unwrap_or_else(|| widest_instance(fd, local.high));
+        locals.push(VarInfo {
+            name: local.name.clone(),
+            type_name,
+            stack_offset: None,
+            size,
+            is_param: false,
+            arg_index: None,
+            line_numbers: Vec::new(),
+            addresses: Vec::new(),
+        });
+    }
+    Ok(locals)
 }
 
 /// Each printed declaration's name and the highs it covers: the declared high

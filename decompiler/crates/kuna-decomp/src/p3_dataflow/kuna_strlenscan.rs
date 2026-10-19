@@ -118,9 +118,9 @@ impl Action for ActionStrlenScan {
             .contains(self.get_group())
             .then(|| Box::new(Self { base: self.base.clone(), enabled: self.enabled }) as Box<dyn Action>)
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !self.enabled && !data.get_arch().strlen_scan {
-            return 0;
+            return Ok(0);
         }
         let heads: Vec<BlockId> = (0..data.bblocks_get_size())
             .map(|i| data.bblocks_get_block(i))
@@ -135,7 +135,7 @@ impl Action for ActionStrlenScan {
             changed += 1;
         }
         self.base.count += changed;
-        (changed != 0) as ApplyResult
+        Ok((changed != 0) as ApplyResult)
     }
 }
 

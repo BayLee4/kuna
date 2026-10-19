@@ -244,6 +244,19 @@ fn rename_result(
         t.name = text(&t.name)?;
         t.definition = text(&t.definition)?;
     }
+    for binding in &mut out.type_bindings {
+        if let Some((_, serial)) = map.iter().find(|(own, _)| own == &binding.presentation) {
+            binding.presentation.clone_from(serial);
+        }
+    }
+    for global in &mut out.globals {
+        global.declaration = text(&global.declaration)?;
+    }
+    for object in &mut out.stack_objects {
+        for use_ in &mut object.uses {
+            use_.type_name = text(&use_.type_name)?;
+        }
+    }
     for f in &mut out.field_calls {
         f.record = text(&f.record)?;
         if let Some(declaration) = &mut f.declaration {

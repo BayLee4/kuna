@@ -139,9 +139,9 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// The function's entry stack-pointer Varnode.
 fn sp_input(fd: &mut Funcdata) -> VarnodeId {
     let a = reg(fd, SP_OFF);
-    let vn = fd.new_varnode(SP_SIZE, &a, None);
+    let vn = fd.new_varnode(SP_SIZE, &a, None).unwrap();
     let vn = fd.set_input_varnode(vn).unwrap();
-    fd.spacebase();
+    fd.spacebase().unwrap();
     vn
 }
 
@@ -377,7 +377,7 @@ fn an_over_budget_cookie_call_keeps_its_effects() {
     push_locked_void_call(&mut fd, call, 0x2000);
     let site = fd.obank().get(call).unwrap().get_addr().clone();
     let mut act = ActionStripMsvcStackGuard::new(false, "returnsplit");
-    assert_eq!(act.apply(&mut fd, &mut ActionContext::default()), 0);
+    assert_eq!(act.apply(&mut fd, &mut ActionContext::default()).unwrap(), 0);
     assert!(!fd.has_restart_pending());
     assert!(!fd.get_override().is_msvc_cookie_call(&site));
     assert!(!fd.obank().get(call).unwrap().is_dead());
@@ -785,13 +785,13 @@ fn enabled_action_seeds_then_removes_the_exact_call() {
     let mut act = ActionStripMsvcStackGuard::new(false, "returnsplit");
     let mut ctx = ActionContext::default();
 
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(fd.has_restart_pending());
     assert!(fd.get_override().is_msvc_cookie_call(&site));
     assert!(fd.obank().get(call).is_some());
 
     fd.set_restart_pending(false);
-    assert_eq!(act.apply(&mut fd, &mut ctx), 1);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 1);
     assert!(fd.obank().get(call).unwrap().is_dead());
     assert_eq!(fd.num_calls(), 0);
 }
@@ -814,12 +814,12 @@ fn locked_void_checker_is_marked_but_not_removed_when_stripping_is_off() {
 
     let mut act = ActionStripMsvcStackGuard::new(false, "returnsplit");
     let mut ctx = ActionContext::default();
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(fd.has_restart_pending());
     assert!(fd.get_override().is_msvc_cookie_call(&site));
 
     fd.set_restart_pending(false);
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(fd.obank().get(call).is_some(), "preservation does not opt in to deletion");
     assert_eq!(fd.num_calls(), 1);
 }
@@ -840,12 +840,12 @@ fn preserve_only_marks_more_than_the_reflow_limit_in_one_restart() {
     let mut act = ActionStripMsvcStackGuard::new(false, "returnsplit");
     let mut ctx = ActionContext::default();
 
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(fd.has_restart_pending());
     assert!(sites.iter().all(|site| fd.get_override().is_msvc_cookie_call(site)));
 
     fd.set_restart_pending(false);
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert!(!fd.has_restart_pending());
     assert!(calls.iter().all(|call| fd.obank().get(*call).is_some()));
     assert_eq!(fd.num_calls(), 9);
@@ -857,5 +857,5 @@ fn action_is_inert_when_the_option_is_off() {
     let (_out, _init) = build_cancel(&mut fd, -0x48, -0x48);
     let mut act = ActionStripMsvcStackGuard::new(false, "returnsplit");
     let mut ctx = ActionContext::default();
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
 }

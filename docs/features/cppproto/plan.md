@@ -57,10 +57,13 @@ parameters alias one source parameter — which corrupted coreutils `fmt`.
 The DWARF pass runs at `load file`, upstream of the `option` commands, so a flag
 read inside the pass would see only the default. The C++ facts are therefore
 always computed and stashed in a separate `AnalysisOutput::cpp_dwarf`
-(`CppDwarfFacts { symbols, locals, prototypes }`), and
+(`CppDwarfFacts { symbols, locals, prototypes, source_prototypes }`), and
 `engine.rs::commit_analysis_output` folds them into the normal streams when
 `arch.analysis_cppproto` is on and drops them when it is off. That also makes the
 flag settable from a test without touching process environment.
+`AnalysisOutput::merge` retains both prototype streams: the selected complete
+source declaration supersedes its legacy pieces projection, not an ordinary
+mapper's less precise declaration of the same function.
 
 ## 4. Address-keyed prototype binding
 

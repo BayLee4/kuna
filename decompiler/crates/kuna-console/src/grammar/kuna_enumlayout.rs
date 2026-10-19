@@ -54,7 +54,7 @@ impl CParse<'_> {
     pub(super) fn enum_layout(
         &self,
         underlying: Option<&Rc<Datatype>>,
-        values: &[uintb],
+        values: &[i128],
     ) -> Option<(int4, type_metatype)> {
         if let Some(tp) = underlying {
             let meta = if is_signed(tp) { type_metatype::TYPE_ENUM_INT } else { type_metatype::TYPE_ENUM_UINT };
@@ -64,7 +64,7 @@ impl CParse<'_> {
         if int <= 0 {
             return None;
         }
-        let signed = values.iter().any(|&v| (v as i64) < 0);
+        let signed = values.iter().any(|&v| v < 0);
         let size = [int, self.factory.get_size_of_long(), self.factory.get_size_of_long_long(), 8]
             .into_iter()
             .filter(|&s| s >= int && s <= 8)
@@ -80,10 +80,8 @@ fn is_signed(tp: &Datatype) -> bool {
     tp.get_metatype() == type_metatype::TYPE_INT
 }
 
-/// Does the constant `v` (two's complement in 64 bits) fit `size` bytes of a
-/// signed or unsigned integer?
-fn fits(v: uintb, size: int4, signed: bool) -> bool {
-    let v = v as i64 as i128;
+/// Does the semantic constant `v` fit `size` bytes of a signed or unsigned integer?
+fn fits(v: i128, size: int4, signed: bool) -> bool {
     let bits = 8 * size.clamp(1, 8) as u32;
     if signed {
         v >= -(1i128 << (bits - 1)) && v < (1i128 << (bits - 1))
@@ -97,11 +95,11 @@ fn fits(v: uintb, size: int4, signed: bool) -> bool {
 pub(super) fn enumerator_out_of_range<'e>(
     tp: &Datatype,
     vecenum: &'e [Enumerator],
-    values: &[uintb],
+    values: &[i128],
 ) -> Option<&'e str> {
-    let in_range = |v: uintb| {
+    let in_range = |v: i128| {
         if tp.get_metatype() == type_metatype::TYPE_BOOL {
-            v <= 1
+            (0..=1).contains(&v)
         } else {
             fits(v, tp.get_size(), is_signed(tp))
         }
@@ -111,13 +109,13 @@ pub(super) fn enumerator_out_of_range<'e>(
 
 /// C's constants for `vecenum`: an enumerator with no `=` is one past the one
 /// before it, the first zero.
-pub(super) fn enum_constants(vecenum: &[Enumerator]) -> Vec<uintb> {
-    let mut next: uintb = 0;
+pub(super) fn enum_constants(vecenum: &[Enumerator]) -> Vec<i128> {
+    let mut next: i128 = 0;
     vecenum
         .iter()
         .map(|e| {
             let v = if e.constantassigned { e.value } else { next };
-            next = v.wrapping_add(1);
+            next = v + 1;
             v
         })
         .collect()
@@ -126,14 +124,14 @@ pub(super) fn enum_constants(vecenum: &[Enumerator]) -> Vec<uintb> {
 /// The `(name, constant)` pairs an enum of `size` bytes can name: C allows two
 /// enumerators one constant, but a value names one constant, so the first
 /// enumerator of a value keeps it and a later alias is dropped.
-pub(super) fn named_constants(vecenum: &[Enumerator], values: &[uintb], size: int4) -> (Vec<String>, Vec<uintb>) {
+pub(super) fn named_constants(vecenum: &[Enumerator], values: &[i128], size: int4) -> (Vec<String>, Vec<uintb>) {
     let mask = kuna_base::address::calc_mask(size);
     let mut seen = std::collections::BTreeSet::new();
     vecenum
         .iter()
         .zip(values)
-        .filter(|(_, &v)| seen.insert(v & mask))
-        .map(|(e, &v)| (e.enumconstant.clone(), v))
+        .filter(|(_, &v)| seen.insert(v as uintb & mask))
+        .map(|(e, &v)| (e.enumconstant.clone(), v as uintb & mask))
         .unzip()
 }
 

@@ -61,6 +61,7 @@ c3
   <com>option dwarfvariants off</com>
   <com>clear architecture</com>
   <com>load file decompiler/crates/kuna-analysis/tests/fixtures/dwarfvariants_x86_64</com>
+  <com>option indirectargs off</com>
   <com>read symbols</com>
   <com>load function ret_result</com>
   <com>decompile</com>
@@ -77,6 +78,7 @@ c3
   <com>option dwarfvariants on</com>
   <com>clear architecture</com>
   <com>load file decompiler/crates/kuna-analysis/tests/fixtures/dwarfvariants_x86_64</com>
+  <com>option indirectargs off</com>
   <com>read symbols</com>
   <com>load function ret_result</com>
   <com>decompile</com>
@@ -93,6 +95,7 @@ c3
   <com>option dwarfvariants off</com>
   <com>clear architecture</com>
   <com>load file decompiler/crates/kuna-analysis/tests/fixtures/dwarfvariants_overlay_x86_64</com>
+  <com>option indirectargs off</com>
   <com>read symbols</com>
   <com>load function put_res</com>
   <com>decompile</com>
@@ -103,6 +106,7 @@ c3
   <com>option dwarfvariants on</com>
   <com>clear architecture</com>
   <com>load file decompiler/crates/kuna-analysis/tests/fixtures/dwarfvariants_overlay_x86_64</com>
+  <com>option indirectargs off</com>
   <com>read symbols</com>
   <com>load function put_res</com>
   <com>decompile</com>

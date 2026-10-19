@@ -186,8 +186,8 @@ fn w10_union_set_multiequal_copies_to_duplicate_slots() {
     // different one.
     let phi = new_op_code(&mut fd, 3, OpCode::CPUI_MULTIEQUAL, "MULTIEQUAL");
     let r = ram(&fd);
-    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None);
-    let other: VarnodeId = fd.new_varnode(4, &Address::new(r, 0x200), None);
+    let same: VarnodeId = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None).unwrap();
+    let other: VarnodeId = fd.new_varnode(4, &Address::new(r, 0x200), None).unwrap();
     // Wire slot0=same, slot1=other, slot2=same.
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(same), 0);
     fd.obank_mut().get_mut(phi).unwrap().set_input(Some(other), 1);

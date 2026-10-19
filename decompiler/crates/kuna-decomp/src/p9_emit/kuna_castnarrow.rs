@@ -51,6 +51,7 @@
 use std::rc::Rc;
 
 use kuna_num::opcodes::OpCode;
+use kuna_base::error::KunaResult;
 
 use crate::context::{OpId, VarnodeId};
 use crate::dtype::{type_metatype, Datatype};
@@ -60,24 +61,24 @@ use crate::kuna_castwiden::{operand_set, plain_int, store_pointee};
 
 /// Leave out the truncation or sign change `op` prints, read by `read_op`
 /// (`None` at the top of a statement)?
-pub(crate) fn drops(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, op: OpId, read_op: Option<OpId>) -> bool {
-    let Some(o) = fd.obank().get(op) else { return false };
-    let (Some(invn), Some(outvn)) = (o.get_in(0), o.get_out()) else { return false };
-    let Some(outv) = fd.vbank().get(outvn) else { return false };
+pub(crate) fn drops(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, op: OpId, read_op: Option<OpId>) -> KunaResult<bool> {
+    let Some(o) = fd.obank().get(op) else { return Ok(false) };
+    let (Some(invn), Some(outvn)) = (o.get_in(0), o.get_out()) else { return Ok(false) };
+    let Some(outv) = fd.vbank().get(outvn) else { return Ok(false) };
     let target = outv.get_type_def_facing().clone();
     if !plain_int(&target) {
-        return false;
+        return Ok(false);
     }
     match o.code() {
-        OpCode::CPUI_SUBPIECE if p.truncation_is_cast(op) => {}
+        OpCode::CPUI_SUBPIECE if p.truncation_is_cast(op)? => {}
         OpCode::CPUI_CAST if !p.sign_dropped(op) => {}
-        _ => return false,
+        _ => return Ok(false),
     }
     let dest = match through_copies(fd, read_op, outvn) {
-        (None, _) => plain_statement(p, fd, op).then(|| ic.declared_spelling(p, fd, outvn)).flatten(),
-        (Some(r), value) => destination(ic, p, fd, r, value),
+        (None, _) => plain_statement(p, fd, op)?.then(|| ic.declared_spelling(p, fd, outvn)).flatten(),
+        (Some(r), value) => destination(ic, p, fd, r, value)?,
     };
-    dest.is_some_and(|d| d == p.spell(&target)) && integer_operand(ic, p, fd, invn, op)
+    Ok(dest.is_some_and(|d| d == p.spell(&target)) && integer_operand(ic, p, fd, invn, op)?)
 }
 
 /// Leave out the `(T)name` the printer writes for `vn`, the low piece `piece`
@@ -95,65 +96,71 @@ pub(crate) fn drops_partial(
     piece: &Rc<Datatype>,
     whole: &Rc<Datatype>,
     name: &str,
-) -> bool {
+) -> KunaResult<bool> {
     if !plain_int(piece) || !c_integer(whole) || ic.declared_named(name) != Some(p.spell(whole).as_str()) {
-        return false;
+        return Ok(false);
     }
-    let (Some(r), value) = through_copies(fd, Some(op), vn) else { return false };
-    destination(ic, p, fd, r, value).is_some_and(|d| d == p.spell(piece))
+    let (Some(r), value) = through_copies(fd, Some(op), vn) else { return Ok(false) };
+    Ok(destination(ic, p, fd, r, value)?.is_some_and(|d| d == p.spell(piece)))
 }
 
 /// The spelling of the type C converts `value` to where `r` reads it, when that
 /// is an assignment, a store, a trusted argument or a `return`.
-fn destination(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, r: OpId, value: VarnodeId) -> Option<String> {
-    let ro = fd.obank().get(r)?;
-    match ro.code() {
+fn destination(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, r: OpId, value: VarnodeId) -> KunaResult<Option<String>> {
+    let Some(ro) = fd.obank().get(r) else { return Ok(None) };
+    Ok(match ro.code() {
         OpCode::CPUI_CALL => trusted_param(fd, r, value).map(|t| p.spell(&t)),
         OpCode::CPUI_RETURN if ro.get_slot(value) == 1 => ic.return_spelling().map(str::to_string),
-        OpCode::CPUI_COPY if plain_statement(p, fd, r) => {
-            let lhs = ro.get_out()?;
-            fd.vbank().get(lhs)?.is_explicit().then(|| ic.declared_spelling(p, fd, lhs)).flatten()
+        OpCode::CPUI_COPY if plain_statement(p, fd, r)? => {
+            let Some(lhs) = ro.get_out() else { return Ok(None) };
+            let Some(lhs_var) = fd.vbank().get(lhs) else { return Ok(None) };
+            lhs_var.is_explicit().then(|| ic.declared_spelling(p, fd, lhs)).flatten()
         }
         OpCode::CPUI_STORE
             if ro.get_slot(value) == 2
                 && !ro.does_special_printing()
-                && crate::kuna_stackmem::access(fd, r).is_none() =>
+                && crate::kuna_stackmem::access(fd, r)?.is_none() =>
         {
-            store_pointee(ic, p, fd, r).filter(|t| c_integer(t)).map(|t| p.spell(&t))
+            store_pointee(ic, p, fd, r)?.filter(|t| c_integer(t)).map(|t| p.spell(&t))
         }
         _ => None,
-    }
+    })
 }
 
 /// Is `op` printed as the statement `lhs = <op>;`, not as the compound literal
 /// a stack view or a byte-wise store writes?
-fn plain_statement(p: &dyn PrintedForms, fd: &Funcdata, op: OpId) -> bool {
-    p.is_statement(op)
-        && crate::kuna_stackassign::assignment(fd, op).is_none()
-        && crate::kuna_stackbytes::assignment(fd, op).is_none()
+fn plain_statement(p: &dyn PrintedForms, fd: &Funcdata, op: OpId) -> KunaResult<bool> {
+    Ok(p.is_statement(op)
+        && crate::kuna_stackassign::assignment(fd, op)?.is_none()
+        && crate::kuna_stackbytes::assignment(fd, op)?.is_none())
 }
 
 /// Does `vn`, as printed where `op` reads it, have an integer C type?  A shift
 /// has the promoted type of its left operand (C11 6.5.7p3).
-fn integer_operand(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> bool {
-    let Some(v) = fd.vbank().get(vn) else { return false };
+fn integer_operand(ic: &ImpliedCasts, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> KunaResult<bool> {
+    let Some(v) = fd.vbank().get(vn) else { return Ok(false) };
     if v.is_constant() {
-        return false;
+        return Ok(false);
     }
-    match ic.operand_type(p, fd, vn, op) {
+    Ok(match ic.operand_type(p, fd, vn, op)? {
         CType::Known(s) => c_integer(&s),
         CType::Opaque => false,
         CType::Unknown => {
-            operand_set(ic, p, fd, vn, op, 0).is_some()
-                || v.get_def().is_some_and(|def| {
-                    fd.obank().get(def).is_some_and(|d| {
-                        matches!(d.code(), OpCode::CPUI_INT_LEFT | OpCode::CPUI_INT_RIGHT | OpCode::CPUI_INT_SRIGHT)
-                            && plain_int(v.get_type_def_facing())
-                            && d.get_in(0).is_some_and(|x| operand_set(ic, p, fd, x, def, 1).is_some())
-                    })
-                })
+            if operand_set(ic, p, fd, vn, op, 0)?.is_some() {
+                return Ok(true);
+            }
+            let Some(def) = v.get_def() else { return Ok(false) };
+            let Some(d) = fd.obank().get(def) else { return Ok(false) };
+            if !matches!(d.code(), OpCode::CPUI_INT_LEFT | OpCode::CPUI_INT_RIGHT | OpCode::CPUI_INT_SRIGHT)
+                || !plain_int(v.get_type_def_facing()) {
+                return Ok(false);
+            }
+            match d.get_in(0) {
+                Some(x) => operand_set(ic, p, fd, x, def, 1)?.is_some(),
+                None => false,
+            }
         }
-    }
+    })
 }
 
 /// Does the printer spell `t` as a C integer: a plain integer, or an unknown

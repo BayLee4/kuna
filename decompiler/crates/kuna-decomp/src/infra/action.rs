@@ -303,7 +303,7 @@ impl ActionBase {
 
     /// Reset for a new function (C++ `Action::reset`): status back to start and
     /// clear the warning-given latch.
-    fn reset_base(&mut self) {
+    pub(crate) fn reset_base(&mut self) {
         self.status = statusflags::status_start;
         self.flags &= !ruleflags::rule_warnings_given;
     }
@@ -344,6 +344,7 @@ impl WarningSink {
 /// The result of a single [`Action::apply`] / [`Action::perform`] step,
 /// mirroring the C++ convention that `int4` doubles as a status code: a
 /// non-negative value is a change count, `-1` is a breakpoint/partial return.
+/// Failures travel separately in [`KunaResult`], never as integer status codes.
 pub type ApplyResult = int4;
 
 /// Large-scale transformation applied to the varnode/op graph (C++ `Action`).
@@ -366,7 +367,8 @@ pub trait Action {
     /// C++) and an `int4`: `0` for complete application, `-1` for a partial
     /// completion (breakpoint).  `ctx` carries the engine-side sinks the C++
     /// reaches through `glb`.
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult;
+    /// Query failures propagate immediately without scheduling another action.
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> KunaResult<ApplyResult>;
 
     /// Clone this Action filtered by `grouplist` (C++ virtual
     /// `clone(grouplist)`).  Returns `None` if the action is filtered out.
@@ -469,8 +471,9 @@ pub trait Action {
     /// Run this Action until completion or a breakpoint (C++ non-virtual
     /// `Action::perform`, `action.cc:298`).  Returns the change count, or `-1`
     /// on a breakpoint.  Resumes from a prior partial return via the `status`
-    /// state.
-    fn perform(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    /// state. An error stops the schedule without converting it to a count or
+    /// breakpoint.
+    fn perform(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> KunaResult<ApplyResult> {
         loop {
             // --- the status switch with C++ fall-through preserved ---------
             let st = self.base().status;
@@ -478,7 +481,7 @@ pub trait Action {
                 self.base_mut().count = 0; // No changes made yet by this action
                 if self.base_mut().check_start_break() {
                     self.base_mut().status = statusflags::status_breakstarthit;
-                    return -1; // Indicate partial completion
+                    return Ok(-1); // Indicate partial completion
                 }
                 self.base_mut().count_tests += 1;
             }
@@ -500,11 +503,11 @@ pub trait Action {
                     self.apply(data, ctx)
                 } else {
                     self.apply(data, ctx) // Start or continue action
-                };
+                }?;
                 if res < 0 {
                     // negative indicates partial completion
                     self.base_mut().status = statusflags::status_mid;
-                    return res;
+                    return Ok(res);
                 } else if self.base().lcount < self.base().count {
                     // Action has been applied
                     let (mut_base, sink) = (self.base_mut(), &mut ctx.warnings);
@@ -512,12 +515,12 @@ pub trait Action {
                     self.base_mut().count_apply += 1;
                     if self.base_mut().check_action_break() {
                         self.base_mut().status = statusflags::status_actionbreak;
-                        return -1; // Indicate action breakpoint
+                        return Ok(-1); // Indicate action breakpoint
                     }
                 }
                 // (the apply body's C++ `break` only exits the switch)
             } else if st == statusflags::status_end {
-                return 0; // Rule applied, do not repeat until reset
+                return Ok(0); // Rule applied, do not repeat until reset
             } else if st == statusflags::status_actionbreak {
                 // Returned -1 last time, but we do not reapply; we either repeat
                 // or return our count.  Falls through to the loop tail.
@@ -550,7 +553,7 @@ pub trait Action {
             self.base_mut().status = statusflags::status_start;
         }
 
-        self.base().count
+        Ok(self.base().count)
     }
 }
 
@@ -787,7 +790,7 @@ impl Action for ActionGroup {
     }
 
     /// C++ `ActionGroup::apply`, `action.cc:506`.
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if self.base.status != statusflags::status_mid {
             self.state = 0; // Initialize the derived action (list.begin())
         }
@@ -801,23 +804,23 @@ impl Action for ActionGroup {
                 Some(prev) => format!("action {}", self.list[prev].get_name()),
                 None => format!("action {}", self.base.name),
             }) {
-                return 0;
+                return Ok(0);
             }
-            let res = self.list[self.state].perform(data, ctx);
+            let res = self.list[self.state].perform(data, ctx)?;
             if res > 0 {
                 // A change was made
                 self.base.count += res;
                 if self.base.check_action_break() {
                     self.state += 1;
-                    return -1;
+                    return Ok(-1);
                 }
             } else if res < 0 {
                 // Partial completion of member == partial completion of group
-                return -1;
+                return Ok(-1);
             }
             self.state += 1;
         }
-        0 // Indicate successful completion
+        Ok(0) // Indicate successful completion
     }
 }
 
@@ -891,29 +894,29 @@ impl Action for ActionRestartGroup {
     }
 
     /// C++ `ActionRestartGroup::apply`, `action.cc:553`.
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if self.curstart == -1 {
-            return 0; // Already completed
+            return Ok(0); // Already completed
         }
         loop {
-            let res = self.group.apply(data, ctx);
+            let res = self.group.apply(data, ctx)?;
             if res != 0 {
-                return res;
+                return Ok(res);
             }
             // (kuna decompile-all watchdog) Never begin another restart iteration
             // past the per-function deadline — the observed non-convergence hang
             // cycles heritage/deadcode restarts forever.  Return with the current
             // state; `run_pipeline` converts the expiry into a per-function `Err`.
             if ctx.deadline_expired_at(|| format!("action {}", self.group.base.name)) {
-                return 0;
+                return Ok(0);
             }
             if !data.has_restart_pending() {
                 self.curstart = -1;
-                return 0;
+                return Ok(0);
             }
             if data.is_jumptable_recovery_on() {
                 // Don't restart within jumptable recovery
-                return 0;
+                return Ok(0);
             }
             if !ctx.can_reflow {
                 // The C++ restart re-follows flow (`startProcessing` →
@@ -925,7 +928,7 @@ impl Action for ActionRestartGroup {
                 // flow and re-performs this root.  Leave `restart_pending` SET so
                 // the outer loop sees the request; signal it via the context.
                 ctx.reflow_requested = true;
-                return 0;
+                return Ok(0);
             }
             self.curstart += 1;
             if self.curstart > self.maxrestarts {
@@ -934,7 +937,7 @@ impl Action for ActionRestartGroup {
                     "Exceeded maximum restarts with more pending",
                 ));
                 self.curstart = -1;
-                return 0;
+                return Ok(0);
             }
             // C++ `data.getArch()->clearAnalysis(&data);` — fd->clear() plus the
             // comment-DB clear (comment subsystem not yet ported // STUB(W4)).
@@ -977,7 +980,8 @@ pub trait Rule {
     /// (non-zero) if it applied and made changes, `0` otherwise.  A rule that
     /// changes `op`'s opcode MUST return non-zero (the C++ enforces this with
     /// an error message — see [`ActionPool::process_op`]).
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4;
+    /// Query failures propagate immediately; they are not a no-change result.
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> KunaResult<int4>;
 
     /// List of op codes this rule operates on (C++ virtual `getOpList`).  The
     /// default is *every* opcode (the C++ `Rule::getOpList` default pushes
@@ -987,9 +991,9 @@ pub trait Rule {
     }
 
     /// Clone this Rule filtered by `grouplist` (C++ virtual `clone(grouplist)`).
-    /// Returns `None` if filtered out.  The implementor decides membership,
-    /// conventionally `grouplist.contains(my_group)`; the engine supplies the
-    /// group string to the new instance.
+    /// The owning RuleEntry first filters by its registered basegroup. Rules
+    /// retaining their own group may also filter here; stateless rules can
+    /// clone unconditionally because their membership lives in RuleState.
     fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>>;
 
     /// Reset any function-specific state (C++ virtual `reset`).  The default is
@@ -1084,6 +1088,12 @@ struct RuleEntry {
 
 impl RuleEntry {
     fn clone_filtered(&self, grouplist: &ActionGroupList) -> Option<RuleEntry> {
+        // C++ rules test getGroup() in clone(). In this port RuleState owns
+        // that group, including for stateless bitfield rules, so enforce it
+        // before asking the concrete rule to clone its transformation state.
+        if !grouplist.contains(&self.state.basegroup) {
+            return None;
+        }
         self.rule
             .clone_rule(grouplist)
             .map(|rule| RuleEntry { state: self.state.clone(), rule, applied_at_reset: 0 })
@@ -1165,9 +1175,6 @@ pub struct ActionPool {
     /// [`ActionContext`]; warnings stash here and [`drain_into`](ActionPool::drain_into)
     /// flushes them at the [`apply`](ActionPool::apply) boundary.  // LOCAL STUB(W4/W9)
     warnings: WarningSink,
-    /// An invariant-violation message (C++ "Rule changed op without returning
-    /// result of 1!") stashed for the same reason as [`warnings`](ActionPool::warnings).
-    pending_error: Option<String>,
 }
 
 /// The resumable op cursor.  Modelled as the last *consumed* [`SeqNum`] so the
@@ -1201,7 +1208,6 @@ impl ActionPool {
             lookahead_epoch: None,
             rule_index: 0,
             warnings: WarningSink::new(),
-            pending_error: None,
         }
     }
 
@@ -1256,7 +1262,7 @@ impl ActionPool {
     /// Returns `0` if no breakpoint, `-1` on a breakpoint (the caller then
     /// re-enters to resume).  The `op_state` cursor and `rule_index` carry the
     /// resume position.
-    fn process_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn process_op(&mut self, op: OpId, data: &mut Funcdata) -> KunaResult<int4> {
         if data.obank().get(op).map(|o| o.is_dead()).unwrap_or(true) {
             self.advance_op_state(data, op);
             data.obank_mut().destroy(op);
@@ -1267,7 +1273,7 @@ impl ActionPool {
                 self.lookahead_epoch = Some(data.obank().optree_epoch());
             }
             self.rule_index = 0;
-            return 0;
+            return Ok(0);
         }
         let mut opc = data.obank().get(op).expect("process_op: live op vanished").code();
         while self.rule_index < self.perop_len(opc) {
@@ -1277,14 +1283,14 @@ impl ActionPool {
                 continue;
             }
             self.allrules[rl_idx].state.count_tests += 1;
-            let res = self.allrules[rl_idx].rule.apply_op(op, data);
+            let res = self.allrules[rl_idx].rule.apply_op(op, data)?;
             if res > 0 {
                 self.allrules[rl_idx].state.count_apply += 1;
                 self.base.count += res;
                 // Route the rule warning to the pool's stash.
                 self.allrules[rl_idx].state.issue_warning(&mut self.warnings);
                 if self.allrules[rl_idx].state.check_action_break() {
-                    return -1;
+                    return Ok(-1);
                 }
                 if data.obank().get(op).map(|o| o.is_dead()).unwrap_or(true) {
                     break;
@@ -1303,7 +1309,7 @@ impl ActionPool {
                 if opc != newopc {
                     // C++ prints an ERROR via glb->printMessage; routed to the
                     // sink so the invariant violation stays observable. // STUB(W4)
-                    self.pending_error = Some(format!(
+                    self.warnings.messages.push(format!(
                         "ERROR: Rule {} changed op without returning result of 1!",
                         self.allrules[rl_idx].state.name
                     ));
@@ -1314,7 +1320,7 @@ impl ActionPool {
         }
         self.advance_op_state(data, op);
         self.rule_index = 0;
-        0
+        Ok(0)
     }
 
     /// Length of `perop[opc]` (C++ `perop[opc].size()`); 0 for an unregistered
@@ -1370,13 +1376,10 @@ impl ActionPool {
         }
     }
 
-    /// Flush the mid-[`process_op`] warning/error stash into the context at the
+    /// Flush the mid-[`process_op`] warning stash into the context at the
     /// [`apply`](ActionPool::apply) boundary.
     fn drain_into(&mut self, ctx: &mut ActionContext) {
         ctx.warnings.messages.append(&mut self.warnings.messages);
-        if let Some(err) = self.pending_error.take() {
-            ctx.warnings.messages.push(err);
-        }
     }
 }
 
@@ -1429,7 +1432,7 @@ impl Action for ActionPool {
     }
 
     /// C++ `ActionPool::apply`, `action.cc:877`.
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if self.base.status != statusflags::status_mid {
             self.op_state = OpCursor::Unstarted;
             self.rule_index = 0;
@@ -1449,21 +1452,27 @@ impl Action for ActionPool {
                     self.next_op = None;
                     self.lookahead_epoch = None;
                     self.drain_into(ctx);
-                    return 0;
+                    return Ok(0);
                 }
             }
             let r = self.process_op(op, data);
+            if r.is_err() {
+                self.next_op = None;
+                self.lookahead_epoch = None;
+                self.drain_into(ctx);
+            }
+            let r = r?;
             if r != 0 {
                 self.next_op = None;
                 self.lookahead_epoch = None;
                 self.drain_into(ctx);
-                return -1;
+                return Ok(-1);
             }
         }
         self.next_op = None;
         self.lookahead_epoch = None;
         self.drain_into(ctx);
-        0 // Indicate successful completion
+        Ok(0) // Indicate successful completion
     }
 
     fn with_sub_action(&mut self, specify: &str, f: &mut dyn FnMut(&mut ActionBase)) -> bool {
@@ -1679,9 +1688,35 @@ impl ActionDatabase {
     /// is cached in `actionmap`; the current action is then `actionmap[actname]`
     /// (see [`get_current`](ActionDatabase::get_current)).
     pub fn set_current(&mut self, actname: &str) -> KunaResult<()> {
+        self.derive_action(UNIVERSAL_NAME, actname)?;
         self.currentactname = actname.to_string();
         crate::actionprof::set_root(actname);
-        self.derive_action(UNIVERSAL_NAME, actname)?;
+        Ok(())
+    }
+
+    /// Reset derived roots and group policy without replacing the universal tree.
+    pub fn reset_defaults(&mut self) -> KunaResult<()> {
+        self.actionmap.retain(|name, _| name == UNIVERSAL_NAME);
+        self.groupmap.clear();
+        self.is_default_groups = false;
+        build_default_groups(self);
+        if self.actionmap.contains_key(UNIVERSAL_NAME) {
+            self.set_current("decompile")?;
+        }
+        Ok(())
+    }
+
+    /// Rebuild a root after changing one of its enabled action groups.
+    pub fn toggle_action(&mut self, grp: &str, basegrp: &str, val: bool) -> KunaResult<()> {
+        self.get_group(grp)?;
+        if val {
+            self.add_to_group(grp, basegrp);
+        } else {
+            self.remove_from_group(grp, basegrp);
+        }
+        let replacement = self.derive_fresh(grp)?
+            .unwrap_or_else(|| Box::new(ActionGroup::new(0, grp)));
+        self.register_action(grp, replacement);
         Ok(())
     }
 

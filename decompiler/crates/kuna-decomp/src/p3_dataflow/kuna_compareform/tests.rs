@@ -98,14 +98,14 @@ fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_var(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     set_def(fd, vn, defop)
 }
 
 fn run_action(fd: &mut Funcdata, enabled: bool) -> int4 {
     let mut action = ActionPresentCompareForm::new(enabled, "analysis");
     let mut ctx = ActionContext::new();
-    action.apply(fd, &mut ctx);
+    action.apply(fd, &mut ctx).unwrap();
     action.base().count
 }
 

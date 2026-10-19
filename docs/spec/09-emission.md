@@ -17,6 +17,16 @@ qualification. Value conversions ignore qualifiers (`cast.rs (cast_standard)`),
 so a store through `volatile float *p` prints `*p = x;` with no cast; only a
 pointer conversion that drops a `volatile` pointee still needs one.
 
+Unnegotiated host C documents expand a bare managed function definition at its
+use site: stock Java's header writer does not declare `FunctionDefinition`
+names. This spelling uses the named source prototype's logical declaration,
+including nested return and parameter types, without changing its canonical
+name, ID, High datatype or storage. Genuine typedef and pointer aliases remain
+nominal. Enhanced documents and CLI declaration-backed names retain their
+existing spelling. An active callable path prevents recursive expansion while
+allowing sibling reuse; a genuine cycle retains its existing named leaf rather
+than inventing a different signature or claiming self-contained cyclic C.
+
 A volatile annotation that covers only part of its mapped symbol renders the
 covered member. An element of an array of scalars prints as `name[index]`;
 every other partial cover (a struct field, an element of a multidimensional
@@ -33,6 +43,14 @@ width. Other widths retain their byte range through the partial-symbol walk.
 With `partialaccess` enabled, pointer views of volatile annotations retain a
 volatile pointee, including sixteen-byte views, so changing the spelling does
 not change the access width or permit the C compiler to merge the accesses.
+
+The shared action collection's `coreaction_render.rs
+(ActionMultiCse::find_match)` keeps SPACEBASE and ordinary-pointer phi outputs
+separate even when their incoming values match. A SPACEBASE marker deliberately
+propagates an unknown-byte pointer; replacing an ordinary-pointer phi with it
+would erase independent pointee inference from its incoming paths. Compatible
+roles retain the existing value comparison and survivor preference; source
+flags, storage flags and datatype locks remain unchanged.
 
 This phase renders the finished decompilation: it inserts the explicit
 cast/field-access operations a C compiler would need to *see* the recovered
@@ -65,8 +83,14 @@ brace elision, DIV-39 inline warning slugs) in `docs/history.md`.
 An address-only local is declared from its mapped object's type
 (`kuna_addressdecl.rs`), rather than the pointer-width constant used to reference
 it. Thus a four-byte scalar reached through a saved `int *` remains an `int`,
-even on a 64-bit target. Real storage representatives still determine their
-own declarations, including wider and overlapping accesses. When another
+even on a 64-bit target. A genuinely narrower nonconstant storage piece contained
+within a mapped scalar or pointer instead declares that complete object's type,
+including its qualifiers and typedef identity. Access widths and offsets remain
+unchanged: two four-byte stores at offsets zero and four of an eight-byte scalar
+need one eight-byte object. Composite and array declaration paths stay unchanged.
+Standalone pieces and accesses that outgrow a narrower frame-map Symbol keep
+their wider representative; this does not infer a new object or reinterpret a
+value. When another
 directly accessed Symbol lies wholly inside the address width from the object's
 start, the frame map has likely split one wider object, so the declaration keeps
 the address width rather than shrink to the piece. A buffer whose other part
@@ -87,6 +111,13 @@ A pointer loaded from a selected member of shared frame storage remains a pointe
 to that member's pointee, even when an object name introduces a union backing.
 The whole backing type cannot replace that pointer type: doing so would turn a
 native `head->next` dereference into an unresolved `PTRSUB(head,0)` expression.
+
+When a selected stack-write edge and the output HighVariable agree on the
+backing identity and relative offset, and the output fits that backing, ordinary
+bound-member emission owns the write. The locked-layout byte-copy fallback
+must not reselect a smaller overlapping ABI formal as its destination. Input
+materialization and later native stores therefore initialize and update the
+same shared extent, including interior members and renamed views.
 
 `decompiler/crates/kuna-decomp/src/p9_emit/kuna_stackversions.rs` separates memory
 SSA bookkeeping from writes under `stackviews`. Generated-backing definitions
@@ -187,6 +218,22 @@ The canonical union members must match the target widths (`float`/`unsigned
 int` at four bytes, or `double`/`unsigned long long` at eight); enums and
 nonmatching data organizations keep their existing handling.
 This is a storage-semantics repair without an inference option.
+
+In C, an explicit same-width `CAST` between a full struct/union object and an
+integer also transfers storage, for widths 1, 2, 4 and 8 bytes. The compound
+literal declares its `from` and `to` members with the actual source/destination
+datatypes, preserving typed declarator leaves and evaluating the input once.
+`INT_EQUAL`/`INT_NOTEQUAL` on a full object request an unsigned integer of the
+opcode's input width rather than comparing the aggregate directly or projecting
+its first field. A four-byte `Pair` parameter stays `Pair`; comparing its storage
+to `0x55` distinguishes `0x10055` from `0x55`. Integer constants remain numeric
+literals, not aggregate initializers. This rule does not change Rust, scalar
+comparisons, numeric float conversions, narrower member reads, or other opcodes.
+The aggregate side must be an operation-facing aggregate-typed value, not merely
+a scalar member whose containing declaration or merged native type happens to
+have the same size. In particular,
+an equal-sized `FloatStorage` container does not turn its `float` member into a
+whole-object transfer or bypass the `stackviews off` numeric-conversion control.
 
 **Floating comparison negation.** `printc.rs (PrintC::check_print_negation)`
 uses the shared opcode complement table, which excludes ordered float
@@ -489,6 +536,13 @@ where the binary's byte compare does not. An integer operand beside a `bool`
 of its size is the compared type instead (`integer_beside_bool`), and the
 comparison prints `*a0 == (a1 != 0)`. This is a correctness fix with no option.
 
+When a direct call has an unlocked unknown input requirement, an exact recovered
+parameter match can require a four-byte nonconstant LOAD's bits as `float`.
+The match includes parameter index, final storage address and width. Signed,
+unsigned and UNKNOWN storage all qualify; the conversion belongs to that call
+edge, leaving shared integer uses unchanged. Constants, other widths, indirect
+calls and authored input or site authority remain on their existing paths.
+
 **Integer equality on float bits (kuna).** An `INT_EQUAL` or `INT_NOTEQUAL`
 compares bits, but when the more ordered operand type is a 4- or 8-byte float
 the upstream rule coerces both sides to the float, and the comparison printed
@@ -613,6 +667,35 @@ call (chapter [05](05-types.md)), in C output only. With the same option on in
 C output, `cast_standard` also prints no cast between a record's declaration and
 its completed definition, which the factory holds as two types and C spells
 alike (`CastStrategyC::with_record_identity`).
+
+At rendering time, a complete authored call-site override can also require a
+typed conversion when the live C dialect spells its target `void *`. The same
+conversion supports an actual logical hidden-result projection with
+`indirectargs` enabled and that exact hidden occurrence omitted by the source
+call. Both borrow the existing site signature and declarator
+owners without changing analysis types or ordered physical operands. A recovered
+prototype's restart override bit, retained logical pieces, or default
+`void(void)` shell is not authored-site authority: the existing `Override` store
+distinguishes inferred restart records from authored overrides. Known prototype
+diagnostics prevent this conversion; source-type spellability remains the
+existing declarator owner's decision, not a new lock-bit or physical-arity rule.
+Inferred calls still depend on `calltargettype` and its physical ABI admission;
+rendering neither repairs the option-off bare-call controls nor fabricates an
+integer function type for values held in floating-point registers.
+
+For a `PerCallOnly` ordinary receiver, the same structural target-declarator
+owner may instead borrow the existing original-phase `calltargettype` receipt.
+This is not permission to infer again from the post-cast call. The authored and
+actual hidden-result source paths retain precedence; inferred spelling requires
+`calltargettype`, `ctypes`, C output and casts enabled. It evaluates the existing
+target once and leaves its High, ordered physical operands, source prototype
+and CAST IR unchanged. The borrowed declarator binds only real host/source/core
+leaf IDs that the stock `ClangTypeToken` decoder can resolve; a plain `void`
+keyword is syntax, while any other native-only leaf declines the conversion.
+There is no anonymous-Code token, inferred record declaration, or stock result
+prelude. `Full` receivers retain the existing inferred-type and CAST publication
+path, including its record-identity behavior. Option-OFF and ABI/clobber refusals
+remain bare calls rather than being silently cast to pass a C consumer.
 
 One value-changing case is still open. A 32-bit argument trimmed out of a
 64-bit register keeps its `int` type, so `sink64(a0 * 3)` with `int a0`
@@ -1200,6 +1283,96 @@ C adjusts array parameters to pointers, so they do not denote by-value objects.
 `option indirectargs off` prints the ABI pointer everywhere (parameter `T *v`,
 argument `&local`, function pointer `(T *)`), as upstream Ghidra does.
 
+The same source presentation applies to aggregate results only when an
+authored logical aggregate result survives alongside its ABI allocation:
+an indirect output and exactly one extra hidden-return pointer occurrence
+whose pointee is that result. Function and callable declarators return the
+aggregate and omit only that occurrence; physical parameter indices and
+High/local-symbol storage remain unchanged. The body declares an aggregate
+result and a pointer initially addressing it, preserving subsequent updates
+of the hidden pointer variable and its symbol-linked instances. Every normal
+return returns the aggregate result, including early and otherwise elidable
+void-shaped returns; halt and no-return markers retain their own meaning.
+Calls capture the destination once, assign the source call's aggregate value
+through it, and keep any physical returned-pointer value separate from that
+aggregate. Captures are per call, so nested calls do not overwrite each other's
+destinations; the callee and ordinary arguments are not duplicated. Synthetic
+locals have typed declarator leaves but no invented High or source-edit
+authority. Their existing name allocator also reserves the invocation's source
+identifiers and datatype presentation names, so a temporary cannot shadow a
+typedef needed by later declarations. Custom storage, explicit storage overrides
+and injection contracts are not reinterpreted by this presentation. A supplied physical
+`void(hidden_pointer, ...)` without the logical aggregate provenance stays
+physical, and disabling `indirectargs` retains the ABI result and operand view.
+This use-site display choice does not replace the retained logical signature
+of a genuinely named callable's canonical typedef definition.
+As with indirect parameters, this is the declared source contract, not a proof
+that handwritten machine code respects source-language non-aliasing rules.
+
+A narrow locked callsite result does not replace a genuine callback's wider
+source result. C renders the canonical call once when one PIECE exactly rejoins
+that call's implied low result and its same-call INDIRECT-creation residual,
+with no independent consumers. The actual target must be the matching authored
+caller formal, and canonical/site model, cleanup, argument types and finalized
+input slots must agree. Exact result storage and whole-expression type must
+also agree. High retains the narrow site result; no extension, padding, new
+source variable or inferred callable authority is introduced. Export bindings,
+hidden results and other shapes keep their existing dispatch.
+
+### First promoted-integer variadic entry value
+
+`option varargentry` (default on) gives one existing unrepresented entry local
+the recovered interpretation of the first default-promoted `int` after the fixed
+parameters. The P9 owner
+`decompiler/crates/kuna-decomp/src/p9_emit/kuna_varargentry.rs` requires a complete
+locked fixed boundary and a known, noncustom prototype model. It reassigns the
+fixed types followed by one target-sized signed integer, with the actual variadic
+boundary retained, and requires exact fixed-storage agreement and exact agreement
+between the first-tail storage and a genuinely consumed input Varnode. The last
+fixed parameter must itself be an int-sized signed integer, safe as `va_start`'s
+anchor. Hidden, `this`, indirect or custom storage is not reinterpreted.
+
+The input and its existing declaration must already be signed integers of the
+target's `int` width. Unknown values are not promoted by this policy. Other live
+unrepresented argument inputs, another input sharing that local, nonunique local
+owners, and values consumed only after a branch or call prevent capture at function entry.
+An actual use in the entry block before control transfer, or a direct entry
+return of the value, establishes that capturing at entry does not fetch an
+optional argument on a path which never consumes it. Alternatively, when every
+live read belongs to one terminal normal-return basic block, represented once
+as a structured leaf, capture occurs inside that leaf instead. Its straight-line
+prefix must be free of calls, memory accesses, allocation, control transfer
+and potentially trapping integer division or remainder before the first read;
+phi inputs do not qualify. The leaf has no outgoing edge,
+so the capture cannot execute twice during one invocation. Non-consuming paths
+perform no acquisition. Adding these statements preserves the leaf's braces
+rather than leaving them outside an elided single-statement branch.
+The existing local is
+assigned exactly once using `va_arg(list,int)`; `va_start` precedes that assignment
+and `va_end` immediately follows it. The temporary list receives an ordinary
+collision-free local spelling, not a new High variable or source formal. The
+original local's references retain their Varnode and symbol bindings.
+
+The actual producing C fragment includes `<stdarg.h>` at global scope only when
+it emits this capture. The directive stays inside the existing function-document
+markup group and outside the function prototype/body, so plain C, stock Java
+`getC()` and both project exporters receive the dependency without a second
+header owner or a new grammar element. Non-C languages and the off/ineligible
+paths emit neither directive nor capture.
+
+This is a named recovered-presentation policy, not proof that an arbitrary
+caller's optional source type was `int`: a wide integer or pointer can share
+physical argument storage with an int-sized machine read. It changes no source
+arity, variadic flag, physical input, High category or source-edit authority.
+It does not guess skipped or heterogeneous tail sequences, reconstruct a
+register-save area, or authorize escaping callback/export cases. In particular,
+a far-stack read which does not match the model's first integer-tail storage
+retains its original domain and rendering. `option varargentry off` retains the
+raw uninitialized-entry-local presentation for these otherwise eligible values.
+The original finite variadic own-entry consumer remains the executable oracle;
+the MSABI stage companion separately checks model-selected storage, the option
+flip, conditional placement and additional-input exclusions.
+
 ## 9.2 PrintC
 
 **Three layers.** The C back-end is a stack of three components in this
@@ -1586,7 +1759,14 @@ into 16 bytes, as `memset` when the source is a constant whose bytes are all
 equal and as `memcpy` when it is another such piece or a variable, with the
 exact byte count (`memset(&v2,0,0x10);`, `memcpy((char *)&v1 + 0x10,(char
 *)&d + 0x10,0x38);`); a whole array variable that takes a copy out of such
-bytes is copied the same way, since an array cannot be assigned. A read of 3,
+bytes is copied the same way, since an array cannot be assigned. Bounded native
+aggregate snapshots also recognize the type factory's anonymous unknown-byte
+arrays and partial datatypes stripped to those arrays. Their C byte storage still
+requires every High definition and use to satisfy the existing exact-copy plan;
+named, qualified or host-source arrays, typed elements, volatile accesses and
+out-of-range slices are not admitted by this recognition. The pre-existing
+scalar-UNKNOWN path is unchanged. Native types, JOIN identities and byte extents
+stay unchanged. A read of 3,
 5, 6 or 7 bytes out of a scalar prints as the `SUB<in><out>(v,k)` intrinsic
 the surrounding output already uses for a truncation, `k` counted from the
 value's low end (the memory offset on a little-endian space, the bytes after
@@ -1869,7 +2049,16 @@ Anonymous function types with a stored prototype participate in the C declarator
 walk alongside pointers and arrays. The function contributes a parameter suffix,
 then the walk continues through its return type. Parameters use recursive abstract
 declarators, an empty fixed parameter list spells `(void)`, and a variadic list
-retains `...`. Prototype model and ABI recovery are unchanged.
+retains `...`. An explicitly open logical C declaration instead keeps `()`;
+absence of logical source facts retains the existing empty-list spelling.
+A positive, in-range first-variadic boundary in a retained logical
+declaration limits its fixed parameter suffix, even when the effective call has
+a closed finite argument list. The remaining finite arguments stay in the
+working prototype and CALL operands; they are not additional fixed C formals or
+typed declarator leaves. Physical parameter views retain their existing suffix
+because ABI-added hidden inputs need a separate index-domain mapping. Zero or
+inconsistent logical boundaries retain their existing presentation. Prototype
+model and ABI recovery are unchanged.
 Unknown return bases use only pointer modifiers inside their return type when
 deciding the `realtypes` fallback, preserving a scalar return's recorded width.
 This applies to locals, parameters, fields, globals, casts and exported type
@@ -2006,9 +2195,15 @@ transport locations, so they do not contribute to a local's source comment.
 `decompiler/crates/kuna-decomp/src/p9_emit/kuna_calltransport.rs` checks that
 the copy has an earlier home and reaches only argument slots whose ABI storage
 matches that register. This keeps a saved register's home even when its only
-readers forward the value to outgoing arguments. A reload from an existing
-stack local can also be transport; the stack remains its source. A register
-that first receives a load, arithmetic result, or call result remains a source
+readers forward the value to outgoing arguments. A call can retain finalized
+physical slot bindings before a source prototype is known. Formal-role queries
+require an actual prototype store; missing source
+information remains absent rather than manufacturing a model or parameter list.
+The finalized slot geometry still authorizes transport independently, while a
+call with neither formals nor finalized geometry supplies no such proof.
+A reload from an existing stack local can also be transport; the stack remains
+its source. A register that first receives a load, arithmetic result, or call
+result remains a source
 even if the value is later passed to a call. Copies also read by local
 computation or a store remain homes. Parameters have no separate source comments.
 `option namestyle ghidra` emits no storage comments or storage-tracking work.
@@ -2930,23 +3125,20 @@ deliberately outside this count: it is a different lossy construct, and naming
 one number `unstructured_gotos` that meant two things would be worse than
 reporting the one.
 
-Two surfaces refuse the language rather than half-honouring it. `kuna-ghidra`
-pins its Clang token-markup document to C (`process.rs`), because that document
-is consumed by Ghidra's C token model and Rust text in C token slots is a GUI
-regression. `kuna decompile-project` errors, because its `.c`/`.h`/`.asm` export
-is C-shaped end to end.
+`kuna decompile-project` rejects non-C output, because its `.c`/`.h`/`.asm`
+export is C-shaped end to end. The native Ghidra interface retains the selected
+C or Java presentation in its typed markup; Clang token identities do not
+require C spelling.
 
-The Java back-end is deliberately not ported:
-`decompiler/crates/kuna-decomp/src/p9_emit/printjava.rs (PrintJava)` is a
-recorded LOSS whose constructor returns an error — upstream `PrintJava` is a
-thin `PrintC` subclass (shared token table and RPN driver, eight overrides for
-object references and `instanceof`), and no oracle datatest selects the
-`java-language` back-end, so kuna registers only `c-language` (the default
-capability, `printc.rs (CAPABILITY_NAME)`). What *is* live is the Java half of
-the cast strategy, `cast.rs (CastStrategyJava)` — Java's pointer-encoded
-object references change which extensions and pointer conversions are
-representable as casts — kept current alongside `CastStrategyC` so a future
-`PrintJava` port is emitter wiring only.
+The Java back-end shares `PrintC` and its RPN driver rather than introducing a
+separate `PrintJava` class. `p9_emit/kuna_lang.rs (OutLang::Java)` selects the
+`java-language` profile, and `kuna_langtypes.rs (JavaSpeller)` supplies its type
+spellings. The shared printer handles object members, implicit method
+receivers, arrays, `instanceof`, strings and Java integer literals.
+`cast.rs (CastStrategyJava)` and the selected Java type operators retain the
+pointer-encoded object-reference rules. This is the same division of concerns
+as upstream's thin `PrintJava` subclass, expressed through the existing
+language profile instead of a second emitter.
 
 ## 9.7 Whole-program document renders (`kuna decompile-project`, `kuna decompile-graph`)
 
@@ -3510,6 +3702,10 @@ test reads a def-facing type only for a written Varnode; an input or constant
 is classified by its own type. A complete scalar range uses one typed compound-literal
 evaluation for `__builtin_memcpy`; partial ranges use byte literals only when
 their source reads are safe to reproduce at the store.
+Byte-provenance and source-classification helpers propagate required type-query
+failures instead of treating them as an unsupported expression. Compound-literal
+type tokens bind the selected scalar type for a complete scalar range and the
+byte-array type for a byte list.
 
 Explicit zero-offset PTRSUB field selections keep their union write-edge
 resolution through cast fixup. Their output token is the selected member's

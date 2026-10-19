@@ -453,7 +453,7 @@ fn the_plateau_latches_when_the_first_pass_changes_nothing() {
     // A function with nothing to propagate: the first pass changes nothing.
     let mut infer = ActionInferTypes::boxed("typerecovery");
     let mut ctx = ActionContext::new();
-    infer.apply(&mut fd, &mut ctx);
+    infer.apply(&mut fd, &mut ctx).unwrap();
     assert!(fd.kuna_infertypes_settled());
 }
 

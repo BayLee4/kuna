@@ -73,7 +73,7 @@ b64424034883c438c3c3
 </script>
 <stringmatch name="ARRAYCOVERWIDTH #1: the vector zero-init of bank A reports sixteen bytes, not element zero" min="1" max="1">v2\._0_16_ = 0;</stringmatch>
 <stringmatch name="ARRAYCOVERWIDTH #2: and so does bank B's" min="1" max="1">v3\[0\]\._0_16_ = 0;</stringmatch>
-<stringmatch name="ARRAYCOVERWIDTH #3: the swap's first leg carries the transfer width on both sides" min="1" max="1">v2\._0_16_ = v3\[0\]\._0_16_;</stringmatch>
+<stringmatch name="ARRAYCOVERWIDTH #3: the swap's first leg carries the transfer width on both sides" min="1" max="1">(?:v2\._0_16_ = v3\[0\]\._0_16_;|__builtin_memcpy\(&amp;v2,&amp;v3\[0\],(?:0x10|16)\);)</stringmatch>
 <stringmatch name="ARRAYCOVERWIDTH #4: a genuine one-byte in-element read KEEPS its subscript, in both passes" min="2" max="2">return v2\[3\];</stringmatch>
 <stringmatch name="ARRAYCOVERWIDTH #5: arraycoverwidth off restores the size-blind element-zero form (the filed bug), exactly once" min="1" max="1">v2\[0\] = v3\[0\];</stringmatch>
 </decompilertest>

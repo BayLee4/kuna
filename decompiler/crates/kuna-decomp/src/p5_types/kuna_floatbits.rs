@@ -40,6 +40,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
@@ -60,13 +61,13 @@ pub(crate) struct Plan {
 impl Plan {
     /// The plan for `data`'s current IR, empty when the option is off or no
     /// input arrives in a float-class register.
-    pub(crate) fn of(data: &Funcdata) -> Plan {
+    pub(crate) fn of(data: &Funcdata) -> KunaResult<Plan> {
         if !data.get_arch().float_bits {
-            return Plan::default();
+            return Ok(Plan::default());
         }
         let proto = data.get_func_proto();
         if !proto.has_model() || proto.is_input_locked() {
-            return Plan::default();
+            return Ok(Plan::default());
         }
         let list = proto.model().input_opt();
         let mut candidates: Vec<VarnodeId> = data
@@ -81,9 +82,20 @@ impl Plan {
             })
             .collect();
         let all = candidates.clone();
-        candidates.retain(|&v| !data.vbank().get(v).is_some_and(|n| n.get_size() == 8 && half_of_a_wider_register(data, n, &all)));
+        let mut kept = 0;
+        for i in 0..candidates.len() {
+            let v = candidates[i];
+            if let Some(n) = data.vbank().get(v) {
+                if n.get_size() == 8 && half_of_a_wider_register(data, n, &all)? {
+                    continue;
+                }
+            }
+            candidates[kept] = v;
+            kept += 1;
+        }
+        candidates.truncate(kept);
         if candidates.is_empty() {
-            return Plan::default();
+            return Ok(Plan::default());
         }
         let mut walks: Vec<(VarnodeId, Walk)> =
             candidates.iter().filter_map(|&c| walk(data, c, &candidates).map(|w| (c, w))).collect();
@@ -101,7 +113,7 @@ impl Plan {
                 let returns = walks.iter().any(|(_, w)| !w.returned.is_empty());
                 floats.sort();
                 floats.dedup();
-                return Plan { floats, returns };
+                return Ok(Plan { floats, returns });
             }
             walks.retain(|(_, w)| !w.returned.iter().any(|r| refused.contains(r)));
         }
@@ -367,22 +379,29 @@ pub(crate) fn compares_as_a_float(data: &Funcdata, c: VarnodeId) -> bool {
 /// Is the 8-byte input `node` half of a 16-byte register another input of the
 /// function reads apart from the `candidates`: the low word of an `_Float128`
 /// in `xmm0` beside `XMM0_Qb`, or `d0` beside the rest of `q0`?
-fn half_of_a_wider_register(data: &Funcdata, node: &crate::varnode::Varnode, candidates: &[VarnodeId]) -> bool {
-    let Some(space) = node.get_addr().get_space() else { return false };
-    let Some(lookup) = data.get_arch().manage().register_lookup() else { return false };
+fn half_of_a_wider_register(data: &Funcdata, node: &crate::varnode::Varnode, candidates: &[VarnodeId]) -> KunaResult<bool> {
+    let Some(space) = node.get_addr().get_space() else { return Ok(false) };
+    let Some(lookup) = data.get_arch().manage().register_lookup() else { return Ok(false) };
     let off = node.get_offset();
-    let Some(base) = [off, off.wrapping_sub(8)].into_iter().find(|&b| !lookup.get_exact_register_name(space, b, 16).is_empty())
+    let mut base = None;
+    for b in [off, off.wrapping_sub(8)] {
+        if !lookup.get_exact_register_name(space, b, 16)?.is_empty() {
+            base = Some(b);
+            break;
+        }
+    }
+    let Some(base) = base
     else {
-        return false;
+        return Ok(false);
     };
-    data.vbank().iter_def_flag(varnode_flags::input).any(|w| {
+    Ok(data.vbank().iter_def_flag(varnode_flags::input).any(|w| {
         !candidates.contains(&w)
             && data.vbank().get(w).is_some_and(|n| {
                 n.get_addr().get_space().is_some_and(|s| Rc::ptr_eq(s, space))
                     && n.get_offset() < base + 16
                     && base < n.get_offset() + n.get_size() as u64
             })
-    })
+    }))
 }
 
 /// The values a RETURN hands back beside `vn`, when every one is built by bit

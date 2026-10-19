@@ -111,7 +111,7 @@ mod tests {
         let space = Rc::clone(fd.get_scope_local().unwrap().get_space_id());
         for offset in [0xffff_fffc, 0xffff_ffff_ffff_fffc, 0, 4] {
             for size in [1, 4, 8] {
-                fd.new_varnode(size, &Address::new(Rc::clone(&space), offset), None);
+                fd.new_varnode(size, &Address::new(Rc::clone(&space), offset), None).unwrap();
             }
         }
         let vars = vec![variable(-4, 4), variable(0, 8), variable(4, 1), variable(8, 4), variable(-4, i64::MAX)];
@@ -131,10 +131,10 @@ mod tests {
         let address = Address::new(ram, 0x20);
         fd.get_func_proto_mut().attach_internal_store(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
         fd.get_func_proto_mut().set_param(0, "param", &ParameterPieces { addr: address.clone(), type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))), flags: 0 });
-        let input = fd.new_varnode(4, &address, None);
+        let input = fd.new_varnode(4, &address, None).unwrap();
         let input = fd.set_input_varnode(input).unwrap();
-        fd.new_varnode(4, &address, None);
-        fd.new_varnode(8, &address, None);
+        fd.new_varnode(4, &address, None).unwrap();
+        fd.new_varnode(8, &address, None).unwrap();
         let mut var = variable(0, 4);
         var.is_param = true;
         var.arg_index = Some(0);
@@ -150,8 +150,8 @@ mod tests {
         fd.set_high_level();
         let space = Rc::clone(fd.get_scope_local().unwrap().get_space_id());
         let address = Address::new(space, 0xffff_fffc);
-        let a = fd.new_varnode(4, &address, None);
-        let b = fd.new_varnode(4, &address, None);
+        let a = fd.new_varnode(4, &address, None).unwrap();
+        let b = fd.new_varnode(4, &address, None).unwrap();
         let high = fd.vbank().get(a).unwrap().get_high().unwrap();
         fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("selected");
         let mut selected = variable(-4, 4);

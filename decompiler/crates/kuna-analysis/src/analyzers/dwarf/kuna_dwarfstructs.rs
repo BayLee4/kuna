@@ -129,31 +129,14 @@ pub(super) fn intern_aggregate(
 ) -> Option<Rc<Datatype>> {
     let want = if union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
     let size = aggregate_size(die);
+    let alias = super::aggregate_alias(die, alias, walk, cpp);
     let base = qualified_name(die, dies, alias, fallback, size);
     let name = resolve_name(types, &base, size, fallback, want)?;
 
-    // An aggregate already under this name is either a complete definition from
-    // an earlier compilation unit or the shell an enclosing frame just interned
-    // for a self-reference. Either way it is the answer; only an INCOMPLETE one
-    // that nothing is currently populating may still be filled in below.
-    let existing = match types.find_by_name(&name) {
-        Ok(Some(t)) if t.get_metatype() == want => Some(t),
-        Ok(_) => None,
-        Err(_) => return None,
-    };
-    if let Some(t) = &existing {
-        if !t.is_incomplete() {
-            return Some(Rc::clone(t));
-        }
+    let shell = types.reserve_record(&name, die.identity, union).ok()?;
+    if !shell.is_incomplete() {
+        return Some(shell);
     }
-
-    let shell = match existing {
-        Some(t) => t,
-        None => {
-            let built = if union { types.get_type_union(&name) } else { types.get_type_struct(&name) };
-            built.ok().filter(|t| t.get_metatype() == want)?
-        }
-    };
 
     // Nothing to install: a forward declaration, or an aggregate the producer
     // gave no width. Leave the named opaque (the pre-`dwarfstructs` mapping).
@@ -161,13 +144,13 @@ pub(super) fn intern_aggregate(
     if die.declaration {
         return Some(shell);
     }
-    if !walk.begin_aggregate(&name) {
+    if !walk.begin_aggregate(die.identity) {
         // An enclosing frame is already populating this aggregate; hand back the
         // shell it interned so the self-referential pointer still names it.
         return Some(shell);
     }
     let members = collect_members(die, dies, types, word_size, walk, cpp, union);
-    walk.end_aggregate(&name);
+    walk.end_aggregate(die.identity);
 
     let (fields, bits) = members;
     let align = aggregate_alignment(die, size, &fields, &bits);

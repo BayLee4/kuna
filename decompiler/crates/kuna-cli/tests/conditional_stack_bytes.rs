@@ -15,13 +15,15 @@ const PRELUDE: &str = r#"
 #include <stdint.h>
 #include <string.h>
 typedef uint8_t uint1, undefined1;
-typedef uint16_t uint2; typedef uint32_t uint4; typedef uint64_t uint8;
+typedef uint16_t uint2; typedef uint32_t uint4; typedef unsigned long long uint8;
 typedef int32_t int4;
 typedef struct Pair Pair;
 void observe_pair(const Pair *source);
 uint8 read_word(const uint8 *source);
 "#;
 const CHECKS: &str = r#"
+_Static_assert(_Generic(&conditional_frame_store, uint8 (*)(int4): 1, default: 0), "conditional prototype");
+_Static_assert(_Generic(&boolean_frame_store, uint8 (*)(int4,int4): 1, default: 0), "boolean prototype");
 int main(void) {
     const uint8 upper = UINT64_C(0x1122334455667700);
     for (int first = -1; first <= 1; ++first) {
@@ -102,8 +104,9 @@ fn conditional_byte_stores_retain_locked_layouts_and_other_bytes() {
         assert!(!code.contains("._0_1_"), "{code}");
         assert!(code.contains("__builtin_memcpy"), "{code}");
         let start = code
-            .find(&format!("uint8 {function}("))
+            .find(&format!("{function}("))
             .expect("emitted function signature");
+        let start = code[..start].rfind('\n').map_or(0, |newline| newline + 1);
         definitions.push(code[start..].to_owned());
     }
     let helpers = r#"

@@ -462,6 +462,56 @@ Four front-ends drive one engine assembly:
   `index.jsonl`, removes `.streaming`, then returns exit one. An empty narrowed
   selection has no result set and remains an ordinary filter answer.
 
+  Project collectors retain nominal result bindings independently of optional
+  layout/provenance output. Before flattening C, an invocation reserves the
+  loaded factory's authored spellings and orders colliding source nominals by
+  their explicit producer identity, not size or layout (fixed core/prelude
+  spellings take priority). The first keeps its
+  spelling; subsequent identities receive an unused `__kuna_N` suffix. The
+  collision map covers definable nominals, not scalar C vocabulary such as
+  `long long` or `unsigned long`, whose rank-bearing syntax is preserved.
+  The same invocation authority reserves all loaded enum members, source
+  function names/aliases, held function and callable-type parameter names,
+  and global names, including sanitized and selected presentation spellings,
+  before synthetic enum range endpoints are named. Workers reserve the
+  parent's complete transported canonical and alias spellings independently
+  of additive symbol replay: an already-resolved address cannot discard its
+  parent spellings. Full-load workers use the same inventory for reservations
+  without replaying symbols. This happens before any worker rendering, even
+  if it retires without producing a body. Headers, body preambles and type
+  metadata share those reservations.
+  The printer applies that map at exact datatype leaves, including nested
+  declarators, signatures, globals and definitions; source names and factory
+  objects are never renamed. Workers acquire those same source identities and
+  use the same reservation decision. `KUNAJOBRES09` carries each result's
+  original nominal id/name, selected presentation spelling and size through
+  the existing complete-prefix frame protocol. A native id remains scoped to
+  its containing result, not a global name/layout key. Named global facts also
+  retain their address-space and full source Symbol identity and whole-object
+  declaration, independently of inferred address-use observations.
+  Source-global presentation uses that same invocation reservation and suffix
+  owner: qualified or punctuation-bearing names acquire valid output spellings
+  without renaming their source Symbols or High variables. The original
+  width-sensitive global-name acquisition retains its actual nonzero source
+  Symbol id with the High's name/type/offset; deliberate root-to-piece copies
+  carry the same binding. Body tokens, whole-object header declarators and High
+  wire references read that receipt instead of selecting another width-one
+  alias. Global metadata keeps the original name, id, type and address space.
+  Workers rebind the chosen source inventory to their own database-local ids.
+  An absent receipt retains the original source-declaration query path, whose
+  result is not proof that a missing canonical identity was recovered; id zero
+  never participates in the presentation map.
+
+  Synthesized `struct_N` names continue to use the existing ledger/shard replay
+  owner, including its identity-proven compatible-result rename and forced
+  decompile path. Its chosen spelling also updates retained bindings, global
+  declarations and stack-object type rows. Streamed records keep the typed
+  bindings after dropping already-appended body text, so body-only nominal
+  dependencies survive final header pruning without rewriting earlier bytes.
+  Optional metadata being absent does not remove an ordinary selected result;
+  an actual typed acquisition/query/printing error remains that target's error
+  record with no partial C/prototype/provenance tuple.
+
   Explicit selection of an entry with **no mapped bytes** — a relocatable
   object's undefined symbol bound to a synthetic extern-area address
   so that calls to it render by name — answers with the entry's nature rather
@@ -717,10 +767,9 @@ Four front-ends drive one engine assembly:
   per-address tracked registers arrive for real: decompileAt issues
   getTrackedRegisters at the entry (`RemoteScope::tracked_at`, cached until
   flush) and merges the answer OVER the pspec `<tracked_set>` defaults —
-  wire values win per register.  A wire/decoder failure inside a lazy query
-  negative-caches the address as a one-byte hole for the flush epoch and
-  surfaces ONE "Warning:"-prefixed 16/17 line (`RemoteScope::drain_warnings`)
-  instead of re-querying unboundedly.  setOptions follows the upstream
+  wire values win per register. A failed wire query or decoder propagates its
+  typed error without admitting a negative cache entry; only genuine absence
+  answers establish holes. setOptions follows the upstream
   reset-then-apply contract (`Architecture::reset_wire_defaults` + the DIV-77
   preset layer before every decode) because Java delta-encodes the list.
   ghidra-mode also prints a `Kuna v…` plate comment (the release
@@ -734,9 +783,12 @@ Four front-ends drive one engine assembly:
   the tracked cache, non-core types (`TypeFactoryImpl::clear_noncore`),
   comments, decoded strings.
   `setOptions` decodes the `<optionslist>` for real through
-  `decompiler/crates/kuna-decomp/src/p0_knowledge/options.rs (decode_lenient)`
-  — every known option applies, unknown elements are skipped whole with a
-  "Warning:"-prefixed 16/17 line (DIV-76), and the command always answers `t`.
+  `decompiler/crates/kuna-decomp/src/p0_knowledge/options.rs (decode_native)`.
+  Unknown elements are skipped whole with a warning (DIV-76); a malformed or
+  invalid known option stops the list and answers `f`, retaining its successfully
+  applied prefix. After the producer's language selection, the native baseline
+  enables Java null printing and disables it for C before following explicit
+  rendering deltas. Console language selection retains its existing options.
   registerProgram also applies the CLI `aggressive` ENGINE-TIER preset (the
   GUI has no `--mode` surface) and flips address-derived fallback naming to the
   Ghidra GUI convention `FUN_`/`DAT_`/`LAB_` (DIV-77) via
@@ -2498,6 +2550,14 @@ value once, so the first enumerator keeps it and the later alias is not
 recorded. Only the C grammar interns an enum at a default width; DWARF and the
 Ghidra wire give theirs explicitly and are unaffected.
 
+Full-width enum constants retain mathematical sign and unsigned magnitude:
+`0x8000000000000000` and `0xffffffffffffffff` remain distinct positive values
+through implicit successors, inferred layout and explicit range checks.
+Only installation into the enum value map converts them to width-masked bits.
+The same single lexical scan also retains the original signed, saturating
+projection used for array dimensions and bitfield widths; their prefix-parsing
+and overflow contracts are unchanged.
+
 (kuna) **A tag survives being declared.** `findByName` is also how the lexer
 classifies every other identifier, so the moment `struct JSValue { … };` interns
 the tag, `JSValue` stops reaching the parser as an identifier and comes back as
@@ -2573,6 +2633,11 @@ because it ends at the `*`). The same allowance covers a parenthesised
 declarator, so the callback shape `int (__stdcall *cb)(int)` parses too. Naming
 two conventions in one declaration is the error `addFuncSpecifier` already had a
 diagnostic for, `Multiple parameter models`.
+
+Function-typed parameters, including typedef aliases, are adjusted to pointers
+to their exact declared function type (C 6.7.6.3 paragraph 8). This does not
+adjust the opaque builtin `code` type, which has no declared function prototype.
+The callback target retains the alias identity, qualifiers and source signature.
 
 Where the named convention goes is §4: it is resolved against the architecture's
 model registry and rides with the parked prototype, so the declared function's
@@ -2778,6 +2843,14 @@ pointers even when their lowered types and ABI storage coincide. Interning
 must preserve that distinction so declaration order cannot change a call's
 source-level argument contract.
 
+Enum value publication in `dtype.rs (TypeFactoryImpl::set_enum_values_impl)`
+reuses the canonical enum when its value map is unchanged. A changed map
+replaces the enum in both factory indexes, restoring the previous entry if
+insertion fails. Repeated acquisition therefore preserves typedef-base identity
+instead of returning a stale empty shell or manufacturing a new base. A real
+map change retains the existing immutable held-snapshot behavior; it does not
+mutate previously returned enums or aliases.
+
 When `TransformManager` materializes a lane of an existing varnode, storage
 addresses follow the target's byte order, but consumption masks always follow
 bit significance. `create_var_replacement` preserves the lane's original
@@ -2863,6 +2936,21 @@ readers. A rejected deletion leaves the node, both bank indexes, HighVariable
 membership, and storage-source metadata unchanged. Once eligible, the node is
 detached from its HighVariable while its location is still available; an empty
 HighVariable is erased, followed by the node and its storage-source metadata.
+
+`Funcdata::op_set_input` gives a shared non-spacebase constant a separate
+Varnode for its new read. The identical-size duplicate preserves the original
+datatype and type/name locks independently of any optional SymbolEntry. A
+symbol-less locked integer payload therefore keeps its integer interpretation
+when a call-local floating-point cast consumes the duplicate; existing integer
+readers and the constant bits remain unchanged.
+
+An element-aligned interior address in a type-locked character-array mapping
+becomes a constant pointer to that array's character type through
+`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs (spacebase_constant)`.
+The replacement retains the mapping's type lock, so local reconstruction cannot
+demote it to the integer type required by address arithmetic. The mapping may
+come from source declarations or existing string analysis; integer arrays and
+addresses outside the mapped extent retain their ordinary paths.
 
 Registering an input varnode also applies the prototype's saved-register and
 return-address effects. This is unconditional registration behavior, not a

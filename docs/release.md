@@ -96,8 +96,13 @@ and 18 tags**.
    datatest harness only makes sense inside the repo.) The `kuna_ghidra`
    binaries are not in the archives: each row uploads its binary as a
    `ghidra-bin-<platform>` workflow artifact for the **ghidra-ext** job.
-4. **ghidra-ext** — packages the ready-to-install KunaDecompiler Ghidra
-   extension, `kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip`. It
+4. **ghidra-ext** — packages one complete, ready-to-install KunaDecompiler
+   Ghidra extension:
+   `kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip`, including the
+   freshly compiled Java owners/helpers under `KunaDecompiler/bin/main`,
+   the plugin JAR and matching native backends.
+
+   The extension is qualified for **Ghidra 12.1.4 with Java 21**. The job
    downloads the pinned Ghidra release (version *and* full asset URL are
    pinned in the workflow's `env`, since the asset filename embeds a build
    date; the zip is cached with `actions/cache` under a key derived from the
@@ -105,16 +110,23 @@ and 18 tags**.
    `ghidra-bin-*` binaries into the extension's `os/<platform>/` dirs
    (restoring the exec bits that artifact upload drops), and runs Ghidra's own
    `support/buildExtension.gradle` via the runner's preinstalled Gradle under
-   Java 21. The job asserts with `zipinfo` that all five `os/` binaries are in
-   the zip and the four unix ones carry mode 0755 — Ghidra's extension
+   Java 21, invoking `buildExtension` once. It uses the native
+   products from the current release matrix, not a separate native build.
+   The job asserts with `zipinfo` that all five `os/` binaries are in
+   the zip and the four unix ones carry mode 0755, and compares the archived
+   bytes against those staged products — Ghidra's extension
    installer re-applies exactly those bits at install time. (Gradle 9
    normalizes archive entry modes for reproducibility, which would strip the
    exec bits; the extension's `build.gradle` pins 0755 on the `kuna_ghidra`
    entries explicitly, so the zip is correct under both Gradle 8 and 9.)
+   The job also checks the single module root, stamped version, plugin JAR,
+   every maintained Java owner/helper and byte identity of the complete freshly
+   compiled class closure, including nested classes.
    The zip is fully self-contained (`kuna_ghidra` needs no `.sla` files —
-   specs arrive over the wire), so it installs airgapped; it is version-locked
-   to the pinned Ghidra release, other 12.x installs go through the
-   installer's "Install Anyway" dialog. See
+   specs arrive over the wire), so it installs airgapped. Do not use
+   "Install Anyway" to bypass a version mismatch.
+   Retargeting the integration requires matching source patches and
+   qualification, not merely changing the workflow pin. See
    `integrations/ghidra/KunaDecompiler/README.md` for the install steps.
 5. **release** — `gh release create v<ver>` with all assets, tagging the built
    commit. This is what creates the git tag; no tags are pushed from anywhere
@@ -146,6 +158,32 @@ specs, and they are found from the repo root. `make specs` then
 `cargo build --release -p kuna-cli --features embed-specs` builds the
 self-contained binary locally.)
 
-The `kuna-v<ver>-KunaDecompiler-ghidra_<ghidra-version>.zip` asset is not an
-archive to extract — install it from inside Ghidra (**File → Install
-Extensions… → `+`**); see `integrations/ghidra/KunaDecompiler/README.md`.
+The `kuna-v<ver>-KunaDecompiler-ghidra_12.1.4.zip` asset is not an archive
+to extract — install it from inside matching Ghidra 12.1.4 under Java 21
+(**File → Install Extensions… → `+`**), then restart. It uses module
+name `KunaDecompiler`. Uninstall the old extension and
+restart before replacing it, and restart after uninstalling to unload its Java
+classes. The GUI native-core toggle selects the native executable; it cannot
+unload already loaded Java. See
+`integrations/ghidra/KunaDecompiler/README.md`.
+
+For a host-only source build, the existing driver explicitly selects the Rust
+compiler's host target and stages the executable reported by Cargo, including
+nondefault `CARGO_TARGET_DIR` locations. A configured cross-compilation target
+cannot mislabel the packaged host binary. Python 3 reads Cargo's artifact report:
+
+```bash
+GHIDRA_INSTALL_DIR=/abs/ghidra_12.1.4_PUBLIC \
+  integrations/ghidra/KunaDecompiler/build.sh
+# Or, after staging a matching current native backend in os/<platform>/:
+gradle -p integrations/ghidra/KunaDecompiler \
+  -PGHIDRA_INSTALL_DIR=/abs/ghidra_12.1.4_PUBLIC buildExtension
+```
+
+For extension packaging, the driver requires the matching Ghidra installation
+and checks its version before native compilation. Without it, the driver only
+builds and stages a development native backend. Both packaging paths produce the same full normal
+extension ZIP and require Java 21 plus the unmodified installation source/JAR
+pair (`Decompiler-src.zip`, `SoftwareModeling-src.zip`, `Base-src.zip`).
+The existing preparation and compilation tasks apply the bounded owner patches;
+their internal enhanced-protocol names are not distribution choices.

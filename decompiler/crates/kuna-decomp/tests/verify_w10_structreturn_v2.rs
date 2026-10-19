@@ -259,7 +259,7 @@ fn at5_findroot_tiebreak_must_replace_on_compareorder_nonzero_not_only_negative(
     // `isBigEndian()==(slot==1)` predicate is `false==true`==false, so no address
     // shift — the output's address IS the leaf's address and the PIECE is "valid".
     let piece_at = |fd: &mut Funcdata, pc: u64, hi_off: u64| -> (OpId, VarnodeId) {
-        let hi = fd.new_varnode(4, &ram_addr(fd, hi_off), None);
+        let hi = fd.new_varnode(4, &ram_addr(fd, hi_off), None).unwrap();
         let op = fd.new_op(2, ram_addr(fd, pc));
         fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_PIECE, 0, "CONCAT"));
         fd.op_set_input(op, hi, 0).unwrap();

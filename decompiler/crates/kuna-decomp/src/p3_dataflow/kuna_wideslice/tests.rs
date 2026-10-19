@@ -106,7 +106,7 @@ fn check_slice(
     let result = insert(fd, anchor, CPUI_SUBPIECE, width, &[value, off]);
     let expected = evaluate(fd, result, inputs);
     let op = fd.vbank().get(result).unwrap().get_def().unwrap();
-    assert_eq!(RuleWideSlice::new("analysis").apply_op(op, fd), 1);
+    assert_eq!(RuleWideSlice::new("analysis").apply_op(op, fd).unwrap(), 1);
     assert_eq!(evaluate(fd, result, inputs), expected, "offset={offset}, width={width}");
 }
 
@@ -199,7 +199,7 @@ fn native_width_non_byte_and_arithmetic_operations_are_left_intact() {
         let offset = fd.new_constant(4, 2);
         let result = insert(&mut fd, anchor, CPUI_SUBPIECE, 4, &[value, offset]);
         let op = fd.vbank().get(result).unwrap().get_def().unwrap();
-        assert_eq!(RuleWideSlice::new("analysis").apply_op(op, &mut fd), 0);
+        assert_eq!(RuleWideSlice::new("analysis").apply_op(op, &mut fd).unwrap(), 0);
         assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(value));
     }
 }

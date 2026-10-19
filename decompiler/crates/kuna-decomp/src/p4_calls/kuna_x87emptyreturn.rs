@@ -1,6 +1,9 @@
 //! Do not infer an x87 result when every returning path explicitly freed ST0.
 use crate::{context::OpId, fspec::ParamActive, funcdata::Funcdata};
-use kuna_base::address::Address;
+use kuna_base::{
+    address::Address,
+    error::KunaResult,
+};
 use kuna_num::{opcodes::OpCode, pcoderaw::VarnodeData};
 use std::collections::{HashMap, VecDeque};
 
@@ -12,23 +15,42 @@ pub struct Storage {
     bank: Vec<VarnodeData>,
 }
 
-pub fn storage(arch: &crate::architecture::Architecture) -> Option<Storage> {
-    let free = arch.userops.get_op_by_name(b"ffree")?;
+pub fn storage(arch: &crate::architecture::Architecture) -> KunaResult<Option<Storage>> {
+    let Some(free) = arch.userops.get_op_by_name(b"ffree") else {
+        return Ok(None);
+    };
     if free.get_inject_id().is_some() {
-        return None;
+        return Ok(None);
     }
-    let top = arch.get_register_varnode(b"ST0").ok()?;
+    // Ordinary lookup failures decline this optional proof. Malformed replies
+    // and dead transports are outside the low-level capability catch boundary.
+    let register = |name: &[u8]| match arch.get_register_varnode(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if !error.is_lowlevel() => Err(error),
+        Err(_) => Ok(None),
+    };
+    let Some(top) = register(b"ST0")? else {
+        return Ok(None);
+    };
     if top.size != 10 {
-        return None;
+        return Ok(None);
     }
-    Some(Storage {
+    let Some(tags) = register(b"FPUTagWord")? else {
+        return Ok(None);
+    };
+    let mut bank = Vec::with_capacity(8);
+    for i in 0..8 {
+        let Some(value) = register(format!("ST{i}").as_bytes())? else {
+            return Ok(None);
+        };
+        bank.push(value);
+    }
+    Ok(Some(Storage {
         free: free.get_index() as u64,
         top,
-        tags: arch.get_register_varnode(b"FPUTagWord").ok()?,
-        bank: (0..8)
-            .map(|i| arch.get_register_varnode(format!("ST{i}").as_bytes()).ok())
-            .collect::<Option<Vec<_>>>()?,
-    })
+        tags,
+        bank,
+    }))
 }
 
 #[derive(Clone, Copy)]

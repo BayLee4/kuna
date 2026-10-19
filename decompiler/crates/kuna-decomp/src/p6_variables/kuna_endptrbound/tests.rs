@@ -57,7 +57,7 @@ impl Fx {
         glb.end_ptr_bound = option;
         let entry = Address::new(Rc::clone(&reg), 0x1000);
         let mut fd = Funcdata::new("walk", "walk", Rc::new(glb), entry, 0x1000_0000, 0x40).unwrap();
-        let vn = fd.new_varnode(8, &Address::new(reg, SP_OFF), None);
+        let vn = fd.new_varnode(8, &Address::new(reg, SP_OFF), None).unwrap();
         let sp = fd.set_input_varnode(vn).unwrap();
         Fx { fd, sp, pc: 0x1000 }
     }
@@ -84,7 +84,7 @@ impl Fx {
     }
 
     fn register_input(&mut self, off: u64, size: int4) -> VarnodeId {
-        let vn = self.fd.new_varnode(size, &Address::new(self.reg(), off), None);
+        let vn = self.fd.new_varnode(size, &Address::new(self.reg(), off), None).unwrap();
         self.fd.set_input_varnode(vn).unwrap()
     }
 

@@ -1,0 +1,20 @@
+--- a/ghidra/app/plugin/core/decompile/actions/EditFieldAction.java
++++ b/ghidra/app/plugin/core/decompile/actions/EditFieldAction.java
+@@ -90,6 +90,17 @@
+ 		ClangToken tokenAtCursor = context.getTokenAtCursor();
+ 		Composite composite = getCompositeDataType(tokenAtCursor);
+ 		ClangFieldToken token = (ClangFieldToken) tokenAtCursor;
++		try {
++			if (token.getClangFunction() != null &&
++				token.getClangFunction().getHighFunction() != null) {
++				ghidra.program.model.pcode.HighFunctionDBUtil.requireSourceAuthority(
++					token.getClangFunction().getHighFunction(), composite);
++			}
++		}
++		catch (ghidra.util.exception.InvalidInputException e) {
++			Msg.showError(this, null, "Edit Field Failed", e.getMessage());
++			return;
++		}
+ 		DataTypeComponent dtc = null;
+ 		int offset = token.getOffset();
+ 		String fieldName = token.getText();

@@ -11,7 +11,8 @@ pub mod kuna_partialconcat;
 pub mod kuna_partialaccess;
 pub mod kuna_widelocal;
 pub mod prettyprint;
-pub mod printjava;
+pub mod resulttypes;
+
 pub mod cast;
 pub mod kuna_unknowncasts;
 pub mod kuna_signedread; // (kuna) a signed read of an expression that prints unsigned casts it back
@@ -70,3 +71,4 @@ pub(crate) mod kuna_stackmarkers;
 pub(crate) mod kuna_stackversions;
 
 pub(crate) mod kuna_indirectargs;
+mod kuna_varargentry;

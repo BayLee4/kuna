@@ -353,6 +353,9 @@ pub struct HighVariable {
     /// default name (`vN`) directly here and the printer reads it as the
     /// `getSymbol()->getDisplayName()` stand-in.  `None` == unnamed.
     kuna_name: Option<String>,
+    /// Source-global Symbol identity received with the bound name/type/offset.
+    /// This is not a local arena SymbolId; zero/unavailable identities are absent.
+    kuna_global_symbol_id: Option<u64>,
     /// (kuna) The data-type of the mapped Symbol this high renders through (the
     /// `getSymbol()->getType()` stand-in, used by the printer to render an array
     /// or struct member access `name[idx]`).  `None` for an unnamed/scalar high.
@@ -432,6 +435,7 @@ impl HighVariable {
             symbol: None,
             symbol_offset: -1,
             kuna_name: None,
+            kuna_global_symbol_id: None,
             kuna_symbol_type: None,
             kuna_frame_snapshot: false,
             kuna_equate_symbol: None,
@@ -458,6 +462,18 @@ impl HighVariable {
     /// (kuna) Bind the angr default name to this HighVariable.
     pub fn set_kuna_name(&mut self, name: impl Into<String>) {
         self.kuna_name = Some(name.into());
+        self.kuna_global_symbol_id = None;
+    }
+
+    /// The source-global identity acquired with this high's current binding.
+    pub fn kuna_global_symbol_id(&self) -> Option<u64> {
+        self.kuna_global_symbol_id
+    }
+
+    /// Record the source identity after binding its name/type/offset.
+    /// A new name clears this receipt; zero means the source supplied no identity.
+    pub fn set_kuna_global_symbol_id(&mut self, id: u64) {
+        self.kuna_global_symbol_id = (id != 0).then_some(id);
     }
 
     /// (kuna) Set the in-symbol byte offset for an array/struct member access
@@ -1338,6 +1354,37 @@ impl HighVariableBank {
     /// Mutably borrow a HighVariable by id.
     pub fn get_mut(&mut self, id: HighVariableId) -> Option<&mut HighVariable> {
         self.highs.get_mut(&id)
+    }
+
+    /// Retire an explicitly replaced local symbol before its arena entry dies.
+    pub(crate) fn retire_local_symbol(&mut self, symbol: crate::database::SymbolId) {
+        for high in self.highs.values_mut() {
+            let linked = high.symbol == Some(symbol) || high.kuna_link_symbol == Some(symbol)
+                || high.kuna_ref_symbol == Some(symbol) || high.kuna_equate_symbol == Some(symbol);
+            if !linked { continue; }
+            if high.symbol == Some(symbol) { high.symbol = None; }
+            if high.kuna_link_symbol == Some(symbol) { high.kuna_link_symbol = None; }
+            if high.kuna_ref_symbol == Some(symbol) { high.kuna_ref_symbol = None; }
+            if high.kuna_equate_symbol == Some(symbol) { high.kuna_equate_symbol = None; }
+            high.kuna_name = None;
+            high.kuna_global_symbol_id = None;
+            high.kuna_symbol_type = None;
+            high.symbol_offset = -1;
+            high.symbol_dirty();
+        }
+    }
+
+    pub(crate) fn refresh_local_symbol(
+        &mut self, symbol: crate::database::SymbolId, name: &str, ty: &Rc<Datatype>,
+    ) {
+        for high in self.highs.values_mut() {
+            if high.symbol == Some(symbol) || high.kuna_link_symbol == Some(symbol)
+                || high.kuna_ref_symbol == Some(symbol)
+            {
+                high.set_kuna_name(name);
+                high.kuna_symbol_type = Some(Rc::clone(ty));
+            }
+        }
     }
 
     /// Allocate a new HighVariable owning the single Varnode `vn` (C++ `new
@@ -2334,6 +2381,39 @@ mod tests {
         assert_ne!(h.highflags & high_flags::flagsdirty, 0);
         assert_ne!(h.highflags & high_flags::namerepdirty, 0);
         assert_ne!(h.highflags & high_flags::typedirty, 0);
+        assert_eq!(h.kuna_global_symbol_id(), None);
+    }
+
+    #[test]
+    fn source_global_receipt_follows_binding_clone_and_surviving_merge_high() {
+        let mut bank = HighVariableBank::new();
+        let first = bank.new_high(vid(1));
+        let second = bank.new_high(vid(2));
+        let ty = dt(4, type_metatype::TYPE_INT);
+        for (id, name, symbol_id) in [(first, "first", 0x501), (second, "second", 0x502)] {
+            let high = bank.get_mut(id).unwrap();
+            high.set_kuna_name(name);
+            high.set_symbol_type(ty.clone());
+            high.set_symbol_offset(0);
+            high.set_kuna_global_symbol_id(symbol_id);
+        }
+        let mut cloned = bank.get(first).unwrap().clone();
+        assert_eq!(cloned.kuna_global_symbol_id(), Some(0x501));
+        cloned.set_kuna_name("local");
+        assert_eq!(cloned.kuna_global_symbol_id(), None);
+        cloned.set_kuna_global_symbol_id(0x501);
+        cloned.set_kuna_global_symbol_id(0);
+        assert_eq!(cloned.kuna_global_symbol_id(), None);
+
+        let views = [vid(1), vid(2)].into_iter()
+            .map(|vn| (MapCtx::key(vn), view(0, ty.clone(), false))).collect();
+        let ctx = MapCtx { views, covers: BTreeMap::new() };
+        bank.merge_internal(first, second, false, &ctx, &mut |_, _, _| {}).unwrap();
+        let surviving = bank.get(first).unwrap();
+        assert_eq!(surviving.kuna_name(), Some("first"));
+        assert_eq!(surviving.kuna_global_symbol_id(), Some(0x501));
+        assert!(Rc::ptr_eq(surviving.kuna_symbol_type().unwrap(), &ty));
+        assert!(bank.get(second).is_none());
     }
 
     #[test]

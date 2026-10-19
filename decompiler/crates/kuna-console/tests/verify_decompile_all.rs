@@ -81,14 +81,14 @@ fn decompile_all_enumerates_and_decompiles_every_function() {
         &[],
     )
     .expect("main must decompile");
-    let code = print_c(prog.arch_mut(), &fd);
+    let code = print_c(prog.arch_mut(), &fd).unwrap();
     assert!(code.contains("main"), "decompiled C does not name `main`:\n{code}");
     assert!(code.contains('{') && code.contains('}'), "decompiled C is not a function body");
 
     // (3) Variable extraction: every variable has a non-empty C type string, the
     // recovered parameters carry a dense ABI `arg_index` (0,1,2,...), and a stack
     // local never carries one.
-    let main_vars = extract_variables(prog.arch(), &fd);
+    let main_vars = extract_variables(prog.arch(), &fd).unwrap();
     assert_var_invariants(&main_vars);
 
     // (4) `authenticate(const char *, const char *)` exercises the parameter path
@@ -104,7 +104,7 @@ fn decompile_all_enumerates_and_decompiles_every_function() {
         prog.arch_mut(), "authenticate", auth_addr, 0, &mapped, &[], &[], None, &[], &[], &[],
     )
     .expect("authenticate must decompile");
-    let auth_vars = extract_variables(prog.arch(), &fd);
+    let auth_vars = extract_variables(prog.arch(), &fd).unwrap();
     assert_var_invariants(&auth_vars);
     let args: Vec<_> = auth_vars.iter().filter(|v| v.is_param).collect();
     assert!(!args.is_empty(), "authenticate recovered no parameters");

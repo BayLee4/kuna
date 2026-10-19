@@ -129,14 +129,14 @@ impl Action for ActionIteRegion {
         }
         Some(Box::new(ActionIteRegion { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option iteregion on|off`, carried on the Architecture boundary.
         // Default-OFF (a runtime choice) ⇒ nothing marked ⇒ byte-identical output.
         if !data.get_arch().iteregion {
-            return 0;
+            return Ok(0);
         }
         if data.sblocks_get_size() == 0 {
-            return 0; // not structured
+            return Ok(0); // not structured
         }
         let root = data.sblocks_root();
 
@@ -149,7 +149,7 @@ impl Action for ActionIteRegion {
             }
         }
         if marks.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let count = marks.len() as int4;
@@ -164,7 +164,7 @@ impl Action for ActionIteRegion {
             "iteregion: rewrote {count} if/else assignment diamond(s) to ?: ternary in {name}"
         ));
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 

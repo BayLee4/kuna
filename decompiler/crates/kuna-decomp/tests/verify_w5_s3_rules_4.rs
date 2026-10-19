@@ -157,7 +157,7 @@ fn shiftand_right_shift_64_matches_cpp_no_panic() {
     let mut fd = build_fd();
     let shop = build_shift_and(&mut fd, OpCode::CPUI_INT_RIGHT, 1, 0xff, 64);
     // C++ oracle: returns 0 (AND not bypassed). Port: panics here.
-    let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
+    let res = RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap();
     assert_eq!(res, 0, "C++ x86-masked shift-by-64 declines; rule must not bypass");
 }
 
@@ -169,7 +169,7 @@ fn shiftand_right_shift_64_matches_cpp_no_panic() {
 fn shiftand_left_shift_64_matches_cpp_no_panic() {
     let mut fd = build_fd();
     let shop = build_shift_and(&mut fd, OpCode::CPUI_INT_LEFT, 1, 0xff, 64);
-    let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
+    let res = RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap();
     // C++ oracle: 1 (AND bypassed, slot 0 now reads invn directly).
     assert_eq!(res, 1, "C++ x86-masked shift-by-64 LEFT bypasses the AND");
 }
@@ -182,7 +182,7 @@ fn shiftand_left_shift_64_matches_cpp_no_panic() {
 fn shiftand_negative_int4_shift_count_no_panic() {
     let mut fd = build_fd();
     let shop = build_shift_and(&mut fd, OpCode::CPUI_INT_RIGHT, 1, 0xff, 0x8000_0000);
-    let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
+    let res = RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap();
     // 0x80000000 & 63 == 0 -> nzm/mask unchanged -> declines (as the >>64 case).
     assert_eq!(res, 0, "negative-int4 shift count must x86-mask, not panic");
 }
@@ -246,7 +246,7 @@ fn subextcomm_sub_misses_ext_bits_to_copy() {
     fd.op_insert(subop, bl, None);
     let _ = mk_out(&mut fd, 2, subop);
 
-    let res = RuleSubExtComm::new().apply_op(subop, &mut fd);
+    let res = RuleSubExtComm::new().apply_op(subop, &mut fd).unwrap();
     assert_eq!(res, 1);
     // out-size(2) + subcut(0) <= invn-size(2) -> bypass; invn-size==out-size -> COPY.
     assert_eq!(fd.obank().get(subop).unwrap().code(), OpCode::CPUI_COPY);
@@ -295,7 +295,7 @@ fn subzext_right_shift_64_matches_cpp_no_panic() {
     // C++ oracle: returns 1; op becomes INT_AND; the shift operand of the inner
     // INT_RIGHT becomes sa = (64 & 63) + 0*8 == 64; the AND mask is the unshifted
     // calc_mask(midsize=4) == 0xffffffff (since `64 & 63 == 0` masks nothing).
-    let res = RuleSubZext::new().apply_op(zop, &mut fd);
+    let res = RuleSubZext::new().apply_op(zop, &mut fd).unwrap();
     assert_eq!(res, 1, "x86-masked >>64 must fold (port must use wrapping shift, not panic)");
     assert_eq!(fd.obank().get(zop).unwrap().code(), OpCode::CPUI_INT_AND);
     let maskc = fd.obank().get(zop).unwrap().get_in(1).unwrap();
@@ -327,7 +327,7 @@ fn shiftand_mult_power_of_two_large_sa_no_panic() {
     // C++ oracle: leastsigbit_set(1<<40)=40, testval==offset ok -> treat as LEFT.
     // nzm(MAX)<<40 has bits[40..64]; mask(0xffff)<<40 has bits[40..56].
     // (mask & nzm) == mask != nzm -> declines.  Must not panic on `<< 40`.
-    let res = RuleShiftAnd::new().apply_op(shop, &mut fd);
+    let res = RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap();
     assert_eq!(res, 0, "MULT->LEFT with sa=40: (mask&nzm)!=nzm declines, no panic");
 }
 
@@ -339,7 +339,7 @@ fn shiftand_mult_non_power_of_two_rejected() {
     let mut fd = build_fd();
     // multiplier 0b110 = 6 -> leastsigbit_set==1, testval(1<<1==2) != 6 -> return 0.
     let shop = build_shift_and(&mut fd, OpCode::CPUI_INT_MULT, 8, 0xffff, 6);
-    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd), 0);
+    assert_eq!(RuleShiftAnd::new().apply_op(shop, &mut fd).unwrap(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +381,7 @@ fn humptyor_b_eq_c_swap_picks_shared_operand() {
 
     // C++ oracle: a!=c, a!=d, b==c -> swap to a=V,b=W(0xff00),c=X(0x00ff).
     // totalbits = 0xff00 | 0x00ff = 0xffff == calc_mask(size 2) -> COPY of V.
-    let res = RuleHumptyOr::new().apply_op(orop, &mut fd);
+    let res = RuleHumptyOr::new().apply_op(orop, &mut fd).unwrap();
     assert_eq!(res, 1);
     assert_eq!(fd.obank().get(orop).unwrap().code(), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(orop).unwrap().num_input(), 1);

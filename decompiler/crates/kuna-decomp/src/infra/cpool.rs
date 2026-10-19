@@ -20,13 +20,10 @@
 //!     (records are emitted in `CheapSorter` order, each as a `<ref>` followed
 //!     by a `<cpoolrec>`).
 //!
-//! STUB(W6): the data-type half of the record (`Datatype *type`,
-//! `type->encodeRef`, `typegrp.decodeType`/`decodeTypeWithCodeFlags`) belongs
-//! to the W6 `type.{hh,cc}` / `TypeFactory` port.  Until then the record holds
-//! an [`Rc<Datatype>`](crate::dtype::Datatype) (the W6 skeleton, exactly where
-//! the C++ holds `Datatype *`) and the encode/decode of the type reference goes
-//! through the local [`CPoolTypeFactory`] / [`CPoolTypeRef`] access traits; W6
-//! supplies an impl of these over the real `TypeFactory`.
+//! Analysis and printing share one architecture-owned pool. [`acquire_record`]
+//! queries the host on misses and decodes through the live type factory without
+//! retaining a pool borrow across host callbacks. Records are retained by `Rc`
+//! so a flush detaches cached facts without invalidating an existing consumer.
 
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -633,13 +630,76 @@ impl CheapSorter {
 #[derive(Debug, Default)]
 pub struct ConstantPoolInternal {
     /// A map from \e reference to constant pool record (C++ `cpoolMap`).
-    cpool_map: BTreeMap<CheapSorter, CPoolRecord>,
+    cpool_map: BTreeMap<CheapSorter, Rc<CPoolRecord>>,
 }
 
 impl ConstantPoolInternal {
     /// Construct an empty in-RAM constant pool.
     pub fn new() -> ConstantPoolInternal {
         ConstantPoolInternal::default()
+    }
+
+    /// Retain a record without holding a pool borrow during type queries or printing.
+    pub fn get_record_shared(&self, refs: &[uintb]) -> Option<Rc<CPoolRecord>> {
+        self.cpool_map.get(&CheapSorter::from_refs(refs)).cloned()
+    }
+}
+
+/// Acquire through the shared pool, releasing its borrow before a host/type query.
+pub fn acquire_record(
+    pool: &std::cell::RefCell<ConstantPoolInternal>,
+    fetch: Option<&dyn crate::remote_provider::RemoteProviderFetch>,
+    types: &crate::dtype::TypeFactoryImpl,
+    manager: &kuna_base::space::AddrSpaceManager,
+    refs: &[uintb],
+) -> KunaResult<Option<Rc<CPoolRecord>>> {
+    if refs.is_empty() {
+        return Err(KunaError::lowlevel("Empty constant-pool reference"));
+    }
+    if let Some(record) = pool.borrow().get_record_shared(refs) {
+        return Ok(Some(record));
+    }
+    let Some(fetch) = fetch else { return Ok(None) };
+    let mut decoder = kuna_base::marshal::PackedDecode::new(manager);
+    if !fetch.fetch_cpool_ref(refs, &mut decoder).map_err(cpool_acquisition_error)? {
+        return Err(KunaError::lowlevel(format!(
+            "Could not retrieve constant pool record for reference: 0x{:x}", refs[0],
+        )));
+    }
+    struct Types<'a>(&'a crate::dtype::TypeFactoryImpl);
+    impl CPoolTypeFactory for Types<'_> {
+        fn decode_type(&mut self, decoder: &mut dyn Decoder) -> KunaResult<Rc<Datatype>> {
+            self.0.decode_type(decoder)
+        }
+        fn decode_type_with_code_flags(
+            &mut self,
+            decoder: &mut dyn Decoder,
+            constructor: bool,
+            destructor: bool,
+        ) -> KunaResult<Rc<Datatype>> {
+            self.0.decode_type_with_code_flags(decoder, constructor, destructor)
+        }
+    }
+    // Decode detached: nested datatype acquisition can query the same host.
+    let mut record = CPoolRecord::new();
+    record.decode(&mut decoder, &mut Types(types)).map_err(cpool_acquisition_error)?;
+    let mut pool = pool.borrow_mut();
+    if let Some(existing) = pool.get_record_shared(refs) {
+        return Ok(Some(existing));
+    }
+    *pool.create_record(refs)? = record;
+    Ok(pool.get_record_shared(refs))
+}
+
+fn cpool_acquisition_error(error: KunaError) -> KunaError {
+    match error {
+        KunaError::Java { type_name, explain } => KunaError::java(
+            type_name, format!("Error fetching constant pool record: {explain}"),
+        ),
+        KunaError::Decoder { explain } => KunaError::decoder(
+            format!("Error in constant pool record encoding: {explain}"),
+        ),
+        other => other,
     }
 }
 
@@ -654,16 +714,17 @@ impl ConstantPool for ConstantPoolInternal {
             msg.push_str(&String::from_utf8_lossy(existing.get_token()));
             return Err(KunaError::lowlevel(msg));
         }
-        self.cpool_map.insert(sorter, CPoolRecord::new());
-        Ok(self
+        self.cpool_map.insert(sorter, Rc::new(CPoolRecord::new()));
+        Ok(Rc::get_mut(self
             .cpool_map
             .get_mut(&sorter)
             .expect("createRecord: just-inserted entry missing (internal invariant)"))
+            .expect("new constant-pool record must be uniquely owned"))
     }
 
     fn get_record(&self, refs: &[uintb]) -> Option<&CPoolRecord> {
         let sorter = CheapSorter::from_refs(refs);
-        self.cpool_map.get(&sorter)
+        self.cpool_map.get(&sorter).map(Rc::as_ref)
     }
 
     fn empty(&self) -> bool {
@@ -842,6 +903,23 @@ mod tests {
         assert_eq!(rec.get_tag(), cpool_tag::CLASS_REFERENCE);
         assert_eq!(rec.get_token(), b"MyClass");
         assert!(pool.get_record(&[11]).is_none());
+    }
+
+    #[test]
+    fn retained_record_survives_flush_without_reusing_new_fact() {
+        let mut pool = ConstantPoolInternal::new();
+        pool.put_record(&[3, 4], cpool_tag::POINTER_FIELD, b"before", void_type()).unwrap();
+        let held = pool.get_record_shared(&[3, 4]).unwrap();
+        let weak = Rc::downgrade(&held);
+        assert!(Rc::ptr_eq(&held, &pool.get_record_shared(&[3, 4]).unwrap()));
+        pool.clear();
+        assert!(pool.get_record(&[3, 4]).is_none());
+        assert_eq!(held.get_token(), b"before");
+        pool.put_record(&[3, 4], cpool_tag::POINTER_FIELD, b"after", void_type()).unwrap();
+        assert_eq!(pool.get_record(&[3, 4]).unwrap().get_token(), b"after");
+        assert_eq!(held.get_token(), b"before");
+        drop(held);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]

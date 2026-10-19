@@ -341,8 +341,8 @@ pub fn took_stated_type(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
 /// took, so the first decompile's stay what every round decides against: each
 /// statement then covers every parameter the callers agree on, not only the
 /// ones the last redo left untyped.
-pub fn record(arch: &mut Architecture, entry: &Address, fd: &mut Funcdata) {
-    let Some(me) = key_of(entry) else { return };
+pub fn record(arch: &mut Architecture, entry: &Address, fd: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
+    let Some(me) = key_of(entry) else { return Ok(()) };
     let prove = arch.caller_ptr;
     let own = if arch.kuna_calleevote.own.contains_key(&me) { None } else { own_params(arch, entry, fd) };
     let mut calls: Vec<(Address, CallSite)> = Vec::new();
@@ -368,13 +368,16 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &mut Funcdata) {
             };
             let ct = fd.high_get_type(vn).or_else(|| fd.vbank().get(vn).map(|v| Rc::clone(v.get_type())));
             let null = fd.vbank().get(vn).is_some_and(|v| v.is_constant() && v.get_offset() == 0);
-            args.push(ct.map(|ct| {
+            let argument = if let Some(ct) = ct {
                 let frame = points_at_a_pointer(&ct) && crate::kuna_protoorder::addresses_a_frame_object(fd, vn);
                 let proven = prove
                     && ct.get_metatype() == type_metatype::TYPE_PTR
-                    && crate::kuna_callerptr::provably_a_pointer(fd, vn);
-                Typed { addr, size, ct, frame, null, proven, by_class: false }
-            }));
+                    && crate::kuna_callerptr::provably_a_pointer(fd, vn)?;
+                Some(Typed { addr, size, ct, frame, null, proven, by_class: false })
+            } else {
+                None
+            };
+            args.push(argument);
         }
         calls.push((callee, CallSite { caller: me.1, at, args }));
     }
@@ -390,6 +393,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &mut Funcdata) {
     if let Some(own) = own {
         ledger.own.insert(me, own);
     }
+    Ok(())
 }
 
 /// The function's own recovered parameters, or `None` when nothing may be
@@ -639,29 +643,32 @@ pub fn seed(arch: &Architecture, data: &mut Funcdata) {
 /// pointer some caller passes as the address of its own frame object types
 /// that one object, so a callee that reaches past it (`cfg_free(&cfg)` reading
 /// the members after a `char *` first one) is not taking the object's type.
-pub fn input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> Option<Rc<Datatype>> {
-    let stated = data.kuna_calleevote_inputs()?;
-    let v = data.vbank().get(vn)?;
+pub fn input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let Some(stated) = data.kuna_calleevote_inputs() else { return Ok(None) };
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     if !v.is_input() || v.is_type_lock() {
-        return None;
+        return Ok(None);
     }
-    let want = stated.at(v.get_addr(), v.get_size())?;
+    let Some(want) = stated.at(v.get_addr(), v.get_size()) else { return Ok(None) };
     let ptr_size = data.get_arch().types().map(|t| t.get_size_of_pointer()).unwrap_or(8);
     let open = uncommitted(ct, ptr_size)
         || (uncommitted_under(ct, ptr_size, data.get_arch().struct_headless.fires())
             && crate::kuna_structheadless::gives_a_pointee(&want.ct));
+    if !open {
+        return Ok(None);
+    }
     let refuses = if want.by_class {
-        crate::kuna_callerptr::refuses(data, vn, &want.ct)
+        crate::kuna_callerptr::refuses(data, vn, &want.ct)?
     } else {
-        crate::kuna_protoorder::input_refuses(data, vn, &want.ct)
+        crate::kuna_protoorder::input_refuses(data, vn, &want.ct)?
     };
-    if !open || refuses || prints_a_table_as_a_literal(data, vn, &want.ct) {
-        return None;
+    if refuses || prints_a_table_as_a_literal(data, vn, &want.ct)? {
+        return Ok(None);
     }
     if want.frame && crate::kuna_protoorder::reaches_past_the_pointee(data, vn, &want.ct) {
-        return None;
+        return Ok(None);
     }
-    Some(Rc::clone(&want.ct))
+    Ok(Some(Rc::clone(&want.ct)))
 }
 
 /// How many varnodes [`prints_a_table_as_a_literal`] visits among the
@@ -683,12 +690,13 @@ const DERIVED_BUDGET: usize = 2048;
 /// a constant in read-only memory that is not a string literal kuna recovered
 /// (`kuna_charptr::constant_is_string`), or adds the negation of one to
 /// (`p - (long)table`). A walk that runs out of [`DERIVED_BUDGET`] refuses too.
-pub(crate) fn prints_a_table_as_a_literal(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
+/// Provider and address-resolution errors propagate to the caller.
+pub(crate) fn prints_a_table_as_a_literal(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
     if !ct.get_ptr_to().is_some_and(|p| p.get_size() == 1 && p.is_char_print()) {
-        return false;
+        return Ok(false);
     }
     let family = crate::kuna_protoorder::value_family(data, vn);
-    merged_with_a_constant(data, &family) || meets_an_address_constant(data, &family)
+    Ok(merged_with_a_constant(data, &family) || meets_an_address_constant(data, &family)?)
 }
 
 /// Does some member of `family` take a non-zero constant: copied from one, or
@@ -711,20 +719,20 @@ fn merged_with_a_constant(data: &Funcdata, family: &[VarnodeId]) -> bool {
 /// Is the constant `off` of `size` bytes, read at `op`, an address in
 /// read-only memory -- what the printer renders as a literal -- that is not a
 /// string literal kuna recovered?
-fn table_address(data: &Funcdata, op: crate::context::OpId, off: uintb, size: int4) -> bool {
+fn table_address(data: &Funcdata, op: crate::context::OpId, off: uintb, size: int4) -> kuna_base::error::KunaResult<bool> {
     let glb = data.get_arch();
-    let Some(spc) = glb.manage().get_default_data_space() else { return false };
+    let Some(spc) = glb.manage().get_default_data_space() else { return Ok(false) };
     if off < spc.get_pointer_lower_bound() || off > spc.get_pointer_upper_bound() {
-        return false;
+        return Ok(false);
     }
-    if crate::p5_types::kuna_charptr::value_is_string(data, op, off, size) {
-        return false;
+    if crate::p5_types::kuna_charptr::value_is_string(data, op, off, size)? {
+        return Ok(false);
     }
-    let Some(point) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return false };
+    let Some(point) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return Ok(false) };
     let mut full = 0;
-    glb.resolve_constant(spc, off, size, &point, &mut full).ok().filter(|a| !a.is_invalid()).is_some_and(|ram| {
-        glb.query_global_properties(&ram, 1, &Address::new_invalid()) & crate::varnode::varnode_flags::readonly != 0
-    })
+    let ram = glb.resolve_constant(spc, off, size, &point, &mut full)?;
+    Ok(!ram.is_invalid()
+        && glb.query_global_properties(&ram, 1, &Address::new_invalid())? & crate::varnode::varnode_flags::readonly != 0)
 }
 
 /// Is a member of `family`, or an address derived from one, compared with,
@@ -732,7 +740,7 @@ fn table_address(data: &Funcdata, op: crate::context::OpId, off: uintb, size: in
 /// the engine's `PTRSUB` off the constant zero, or added to the negation of
 /// one? A difference of two pointers is a number, so the walk does not follow
 /// one. Running out of [`DERIVED_BUDGET`] answers yes.
-fn meets_an_address_constant(data: &Funcdata, family: &[VarnodeId]) -> bool {
+fn meets_an_address_constant(data: &Funcdata, family: &[VarnodeId]) -> kuna_base::error::KunaResult<bool> {
     let constant_of = |other: Option<VarnodeId>| -> Option<(uintb, int4)> {
         let node = other.and_then(|o| data.vbank().get(o))?;
         let c = if node.is_constant() {
@@ -752,17 +760,16 @@ fn meets_an_address_constant(data: &Funcdata, family: &[VarnodeId]) -> bool {
     let mut work: Vec<VarnodeId> = family.to_vec();
     while let Some(v) = work.pop() {
         if seen.len() > DERIVED_BUDGET {
-            return true;
+            return Ok(true);
         }
         let Some(node) = data.vbank().get(v) else { continue };
         for r in node.descend_iter() {
             let Some(o) = data.obank().get(r) else { continue };
             let other = if o.get_in(0) == Some(v) { o.get_in(1) } else { o.get_in(0) };
-            let meets = |negated: bool| {
-                constant_of(other).is_some_and(|(off, size)| {
-                    table_address(data, r, off, size)
-                        || (negated && table_address(data, r, off.wrapping_neg() & kuna_base::address::calc_mask(size), size))
-                })
+            let meets = |negated: bool| -> kuna_base::error::KunaResult<bool> {
+                let Some((off, size)) = constant_of(other) else { return Ok(false) };
+                Ok(table_address(data, r, off, size)?
+                    || (negated && table_address(data, r, off.wrapping_neg() & kuna_base::address::calc_mask(size), size)?))
             };
             let carries = match o.code() {
                 OpCode::CPUI_INT_EQUAL
@@ -771,20 +778,20 @@ fn meets_an_address_constant(data: &Funcdata, family: &[VarnodeId]) -> bool {
                 | OpCode::CPUI_INT_LESSEQUAL
                 | OpCode::CPUI_INT_SLESS
                 | OpCode::CPUI_INT_SLESSEQUAL => {
-                    if meets(false) {
-                        return true;
+                    if meets(false)? {
+                        return Ok(true);
                     }
                     false
                 }
                 OpCode::CPUI_INT_ADD => {
-                    if meets(true) {
-                        return true;
+                    if meets(true)? {
+                        return Ok(true);
                     }
                     true
                 }
                 OpCode::CPUI_INT_SUB => {
-                    if meets(false) {
-                        return true;
+                    if meets(false)? {
+                        return Ok(true);
                     }
                     o.get_in(0) == Some(v) && other.and_then(|c| data.vbank().get(c)).is_some_and(|c| c.is_constant())
                 }
@@ -802,7 +809,7 @@ fn meets_an_address_constant(data: &Funcdata, family: &[VarnodeId]) -> bool {
             }
         }
     }
-    false
+    Ok(false)
 }
 
 #[cfg(test)]

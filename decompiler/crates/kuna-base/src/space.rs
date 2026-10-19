@@ -273,11 +273,13 @@ pub trait RegisterLookup {
 
     /// C++ `Translate::getRegisterName`: get the name of the smallest
     /// containing register given a location and size, or an empty string.
-    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String;
+    /// Query failures are errors, not unnamed storage.
+    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String>;
 
     /// C++ `Translate::getExactRegisterName`: get the name of a register
     /// with an exact location and size, or an empty string.
-    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String;
+    /// Query failures are errors, not absence of an exact register.
+    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String>;
 }
 
 /// The error for register access before a [`RegisterLookup`] is installed.
@@ -429,7 +431,7 @@ impl JoinRecord {
     /// resulting byte range has a formal register name.
     /// \param seq is the given list of triples
     /// \param trans is the language to use for register names
-    pub fn merge_sequence(seq: &mut Vec<VarnodeStorage>, trans: &dyn RegisterLookup) {
+    pub fn merge_sequence(seq: &mut Vec<VarnodeStorage>, trans: &dyn RegisterLookup) -> KunaResult<()> {
         let mut i: usize = 1;
         while i < seq.len() {
             let hi = &seq[i - 1];
@@ -440,7 +442,7 @@ impl JoinRecord {
             i += 1;
         }
         if i >= seq.len() {
-            return;
+            return Ok(());
         }
         let mut res: Vec<VarnodeStorage> = Vec::new();
         i = 1;
@@ -459,7 +461,7 @@ impl JoinRecord {
                 if hi_space.get_type() != spacetype::IPTR_SPACEBASE {
                     let hi_space = Rc::clone(hi_space);
                     last_is_informal =
-                        trans.get_exact_register_name(&hi_space, hi.offset, hi.size as i32) // cast: uint4 size -> int4 parameter
+                        trans.get_exact_register_name(&hi_space, hi.offset, hi.size as i32)? // cast: uint4 size -> int4 parameter
                             .is_empty();
                 }
             } else {
@@ -472,9 +474,10 @@ impl JoinRecord {
         }
         if last_is_informal {
             // If the merge contains an informal register,
-            return; // throw it out and keep the original sequence
+            return Ok(()); // throw it out and keep the original sequence
         }
         *seq = res;
+        Ok(())
     }
 }
 
@@ -3124,13 +3127,13 @@ impl AddrSpaceManager {
                 // if a parent register exists
                 if hiaddr.is_big_endian() {
                     if !translate
-                        .get_register_name(hispace, hiaddr.get_offset(), hisz + losz)
+                        .get_register_name(hispace, hiaddr.get_offset(), hisz + losz)?
                         .is_empty()
                     {
                         return Ok(hiaddr.clone());
                     }
                 } else if !translate
-                    .get_register_name(lospace, loaddr.get_offset(), hisz + losz)
+                    .get_register_name(lospace, loaddr.get_offset(), hisz + losz)?
                     .is_empty()
                 {
                     return Ok(loaddr.clone());

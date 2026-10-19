@@ -67,6 +67,19 @@ fn a_constant_too_wide_for_int_widens_the_enum() {
     assert_eq!(declare(&f, "enum Big { HIGH = 0x100000000 };").get_size(), 8);
     let f = factory(2, 4, 2);
     assert_eq!(declare(&f, "enum Mid { MID = 0x10000 };").get_size(), 4);
+    for (int, long, addr) in [(4, 8, 8), (4, 4, 8), (4, 4, 4)] {
+        let f = factory(int, long, addr);
+        for (tag, literal, value) in [
+            ("High", "0x8000000000000000", 1u64 << 63),
+            ("All", "0xffffffffffffffff", u64::MAX),
+        ] {
+            let ct = declare(&f, &format!("enum {tag} {{ VALUE = {literal} }};"));
+            assert_eq!((ct.get_size(), ct.get_metatype()), (8, meta::TYPE_UINT), "{literal}");
+            assert_eq!(names(&ct, value), ["VALUE"], "{literal}");
+            let packet = declare(&f, &format!("struct {tag}Packet {{ {tag} value; char tail; }};"));
+            assert_eq!(packet.get_field(1).unwrap().offset, 8, "{literal}");
+        }
+    }
 }
 
 /// An enumerator with no `=` is one past the one before it, the first zero.
@@ -86,6 +99,16 @@ fn an_unvalued_enumerator_follows_the_one_before_it() {
     for (v, name) in [(0xffff_fffe, "A"), (0xffff_ffff, "B"), (0, "C")] {
         assert_eq!(names(&neg, v), [name], "{name}");
     }
+    let boundary = declare(&f, "enum Boundary { LAST_SIGNED = 9223372036854775807, FIRST_UNSIGNED };");
+    assert_eq!((boundary.get_size(), boundary.get_metatype()), (8, meta::TYPE_UINT));
+    assert_eq!(names(&boundary, i64::MAX as u64), ["LAST_SIGNED"]);
+    assert_eq!(names(&boundary, 1u64 << 63), ["FIRST_UNSIGNED"]);
+    let top = declare(&f, "enum Top : unsigned long long { BEFORE = 18446744073709551614, LAST };");
+    assert_eq!((top.get_size(), top.get_metatype()), (8, meta::TYPE_UINT));
+    assert_eq!(names(&top, u64::MAX - 1), ["BEFORE"]);
+    assert_eq!(names(&top, u64::MAX), ["LAST"]);
+    let error = parse(&f, "enum Past : unsigned long long { LAST = 18446744073709551615, PAST };").unwrap_err();
+    assert!(error.contains("Enumerator PAST does not fit the underlying type"), "{error}");
 }
 
 /// A negative constant makes the enum `int`, as gcc and clang make it: as wide
@@ -160,7 +183,7 @@ fn a_c23_underlying_type_holds_its_own_range() {
         ("int", &["-2147483648", "2147483647", "-1"], &["-2147483649", "2147483648"]),
         ("unsigned int", &["0", "4294967295"], &["4294967296", "-1"]),
         ("long long", &["-9223372036854775808", "9223372036854775807", "-1"], &[]),
-        ("unsigned long long", &["0", "9223372036854775807"], &["-1"]),
+        ("unsigned long long", &["0", "9223372036854775807", "9223372036854775808", "18446744073709551615", "0xffffffffffffffff"], &["-1"]),
         ("_Bool", &["0", "1"], &["2", "-1"]),
     ];
     for (n, (ty, ok, bad)) in cases.iter().enumerate() {

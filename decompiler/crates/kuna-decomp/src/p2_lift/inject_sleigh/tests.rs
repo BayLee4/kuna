@@ -178,6 +178,10 @@ fn library_allocate_routes_by_type() {
     assert!(matches!(lib.injection[1], SleighPayload::Callother(_)));
     assert!(matches!(lib.injection[2], SleighPayload::Executable(_)));
     assert!(matches!(lib.injection[3], SleighPayload::Sleigh(_)));
+    assert_eq!(lib.get_payload(cf).core().get_name(), b"cf");
+    assert_eq!(lib.get_payload(co).core().get_name(), b"co");
+    assert_eq!(lib.get_payload(ex).core().get_name(), b"ex");
+    assert_eq!(lib.get_payload(cm).core().get_name(), b"cm");
 }
 
 #[test]
@@ -198,6 +202,44 @@ fn library_decode_inject_registers_in_namespace() {
 }
 
 #[test]
+fn decoded_fixup_names_override_the_allocation_name() {
+    let reg = registry();
+    let mgr = manager();
+    let mut lib = PcodeInjectLibrarySleigh::new(0x1000);
+    let fixtures: &[(int4, &[u8], &[u8])] = &[
+        (CALLFIXUP_TYPE, b"decoded-call",
+            br#"<callfixup name="decoded-call"><pcode><body>EAX = ESP;</body></pcode></callfixup>"#),
+        (CALLOTHERFIXUP_TYPE, b"decoded-other",
+            br#"<callotherfixup targetop="decoded-other"><pcode><body>EAX = ESP;</body></pcode></callotherfixup>"#),
+    ];
+    for &(ptype, name, xml) in fixtures {
+        let mut dec = XmlDecode::new(&mgr, &reg);
+        dec.ingest_stream(xml).unwrap();
+        let id = lib.decode_inject(b"src", b"allocation-name", ptype, &mut dec).unwrap();
+        assert_eq!(lib.get_payload(id).core().get_name(), name);
+        assert_eq!(lib.base.get_payload_id(ptype, name), id);
+        assert_eq!(lib.base.get_payload_id(ptype, b"allocation-name"), -1);
+    }
+}
+
+#[test]
+fn manual_call_fixups_register_distinct_formal_names_and_reject_duplicates() {
+    let mut lib = PcodeInjectLibrarySleigh::new(0x1000);
+    let first = lib.manual_call_fixup(b"first", b"").unwrap();
+    let second = lib.manual_call_fixup(b"second", b"").unwrap();
+    assert_ne!(first, second);
+    assert_eq!(lib.get_payload(first).core().get_name(), b"first");
+    assert_eq!(lib.get_payload(second).core().get_name(), b"second");
+    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"first"), first);
+    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"second"), second);
+    assert_eq!(lib.base.get_call_fixup_name(first), b"first");
+    assert_eq!(lib.base.get_call_fixup_name(second), b"second");
+    assert_eq!(lib.manual_call_fixup(b"first", b"").unwrap_err(),
+        KunaError::lowlevel("Duplicate <callfixup>: first"));
+    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"first"), first);
+}
+
+#[test]
 fn manual_call_other_fixup_orders_params_in_then_out() {
     let mut lib = PcodeInjectLibrarySleigh::new(0x1000);
     let id = lib
@@ -212,15 +254,18 @@ fn manual_call_other_fixup_orders_params_in_then_out() {
     assert_eq!(payload.core().get_input(1).get_index(), 1);
     assert_eq!(payload.core().get_output(0).get_name(), b"out");
     assert_eq!(payload.core().get_output(0).get_index(), 2);
-    // FAITHFUL C++ QUIRK: `manualCallOtherFixup` constructs the payload via
-    // `InjectPayloadCallother(sourceName)`, whose ctor hard-codes the payload
-    // name to "unknown" (the `name` argument is used only for the sourceName
-    // string, not the payload name). `registerInject` then registers the
-    // payload under "unknown", so the callother-target reverse map says
-    // "unknown" — not "myop". The userop caller does not consult this map (it
-    // uses the returned injectid directly), so the quirk is harmless. We pin it
-    // here to prove the port matches C++ `manualCallOtherFixup` exactly.
-    assert_eq!(lib.base.get_call_other_target(0), b"unknown");
+    // The formal name is shared by the payload, forward lookup and reverse
+    // target lookup, including for manual registration without XML decoding.
+    assert_eq!(payload.core().get_name(), b"myop");
+    assert_eq!(lib.base.get_call_other_target(id), b"myop");
+    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"myop"), id);
+    let second = lib.manual_call_other_fixup(b"otherop", b"", &[], b"").unwrap();
+    assert_ne!(second, id);
+    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"otherop"), second);
+    assert_eq!(lib.base.get_call_other_target(second), b"otherop");
+    assert_eq!(lib.manual_call_other_fixup(b"myop", b"", &[], b"").unwrap_err(),
+        KunaError::lowlevel("Duplicate <callotherfixup>: myop"));
+    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"myop"), id);
 }
 
 #[test]
@@ -294,6 +339,173 @@ impl SnippetLanguage for TestLang {
 #[allow(dead_code)]
 fn _assert_varnode_symbol_type(_: VarnodeSymbol) {}
 
+struct ExecutableTestImage(u64);
+
+impl kuna_sleigh::loadimage::LoadImage for ExecutableTestImage {
+    fn get_file_name(&self) -> &str { "executable-test" }
+    fn load_fill(&mut self, bytes: &mut [u8], address: &Address) -> KunaResult<()> {
+        assert_eq!(address.get_offset(), 0x100);
+        bytes.copy_from_slice(&self.0.to_le_bytes());
+        Ok(())
+    }
+    fn get_arch_type(&self) -> Vec<u8> { b"test:LE:32".to_vec() }
+    fn adjust_vma(&mut self, adjust: i64) { assert_eq!(adjust, 0); }
+}
+
+struct ExecutableTestFormats;
+impl kuna_num::opbehavior::FloatFormatProvider for ExecutableTestFormats {
+    fn get_float_format(&self, _size: i32) -> Option<&kuna_num::float::FloatFormat> { None }
+}
+
+fn executable_test_library(
+    body: &str,
+) -> (
+    Rc<RefCell<PcodeInjectLibrarySleigh>>,
+    Rc<AddrSpaceManager>,
+    Rc<RefCell<Box<dyn kuna_sleigh::loadimage::LoadImage>>>,
+    Vec<Option<Rc<dyn kuna_num::opbehavior::OpBehavior>>>,
+) {
+    let mut lang = CodeLang::new();
+    lang.manager.set_default_code_space(1).unwrap();
+    let mut library = PcodeInjectLibrarySleigh::new(0x1000);
+    let xml = format!(
+        "<pcode><input name=\"value\" size=\"4\"/><output name=\"result\" size=\"4\"/><body>{body}</body></pcode>"
+    );
+    let registry = registry();
+    let mut decoder = XmlDecode::new(&lang.manager, &registry);
+    decoder.ingest_stream(xml.as_bytes()).unwrap();
+    assert_eq!(library.decode_inject(b"test", b"helper", EXECUTABLEPCODE_TYPE, &mut decoder).unwrap(), 0);
+    library.parse_inject_all(&lang).unwrap();
+    let manager = Rc::new(lang.manager);
+    let loader: Rc<RefCell<Box<dyn kuna_sleigh::loadimage::LoadImage>>> =
+        Rc::new(RefCell::new(Box::new(ExecutableTestImage(7))));
+    let formats: Rc<dyn kuna_num::opbehavior::FloatFormatProvider> = Rc::new(ExecutableTestFormats);
+    let mut behaviors = Vec::new();
+    kuna_num::opbehavior::register_instructions(&mut behaviors, &formats);
+    (Rc::new(RefCell::new(library)), manager, loader, behaviors)
+}
+
+#[test]
+fn executable_cache_reads_replaced_canonical_image_without_rebuilding() {
+    let (library, manager, loader, behaviors) = executable_test_library("result = *:4 value;");
+    library.borrow_mut().bind_executable_runtime(
+        manager, Rc::downgrade(&loader), None, behaviors,
+    );
+    assert_eq!(evaluate_executable(&library, 0, &[0x100]).unwrap(), 7);
+    let cache = match &library.borrow().injection[0] {
+        SleighPayload::Executable(payload) => Rc::clone(payload.executable.get().unwrap()),
+        _ => unreachable!(),
+    };
+    *loader.borrow_mut() = Box::new(ExecutableTestImage(19));
+    assert_eq!(evaluate_executable(&library, 0, &[0x100]).unwrap(), 19);
+    match &library.borrow().injection[0] {
+        SleighPayload::Executable(payload) => assert!(Rc::ptr_eq(&cache, payload.executable.get().unwrap())),
+        _ => unreachable!(),
+    }
+    drop(loader);
+    assert!(evaluate_executable(&library, 0, &[0x100]).is_err());
+}
+
+struct ReentrantAdd {
+    library: Weak<RefCell<PcodeInjectLibrarySleigh>>,
+    active: std::cell::Cell<bool>,
+    nested: std::cell::Cell<usize>,
+}
+
+impl kuna_num::opbehavior::OpBehavior for ReentrantAdd {
+    fn get_opcode(&self) -> OpCode { OpCode::CPUI_INT_ADD }
+    fn is_unary(&self) -> bool { false }
+    fn evaluate_binary(&self, sizeout: i32, _sizein: i32, a: u64, b: u64) -> KunaResult<u64> {
+        if !self.active.replace(true) {
+            let library = self.library.upgrade().unwrap();
+            // Registration and same-payload evaluation must both be possible
+            // while the outer frame is in an operation callback.
+            library.borrow_mut().manual_call_fixup(b"late", b"").unwrap();
+            assert_eq!(evaluate_executable(&library, 0, &[40])?, 41);
+            self.nested.set(self.nested.get() + 1);
+            self.active.set(false);
+        }
+        Ok(a.wrapping_add(b) & kuna_base::address::calc_mask(sizeout))
+    }
+}
+
+#[test]
+fn executable_same_payload_reentry_preserves_outer_frame_and_finite_ownership() {
+    let (library, manager, loader, mut behaviors) = executable_test_library("result = value + 1;");
+    let add = Rc::new(ReentrantAdd {
+        library: Rc::downgrade(&library),
+        active: std::cell::Cell::new(false),
+        nested: std::cell::Cell::new(0),
+    });
+    behaviors[OpCode::CPUI_INT_ADD as usize] = Some(add.clone());
+    library.borrow_mut().bind_executable_runtime(
+        manager, Rc::downgrade(&loader), None, behaviors,
+    );
+    assert_eq!(evaluate_executable(&library, 0, &[5]).unwrap(), 6);
+    assert_eq!(add.nested.get(), 1);
+    let weak = Rc::downgrade(&library);
+    drop(library);
+    assert!(weak.upgrade().is_none());
+}
+
+struct ExecutableTestResolver {
+    library: Weak<RefCell<PcodeInjectLibrarySleigh>>,
+    manager: Rc<AddrSpaceManager>,
+    tpl: kuna_sleigh::semantics::ConstructTpl,
+    calls: std::cell::Cell<usize>,
+}
+
+impl crate::pcodeinject::InjectPcodeResolver for ExecutableTestResolver {
+    fn fetch_inject_pcode(
+        &self,
+        name: &[u8],
+        ptype: int4,
+        context: &InjectContext,
+        emit: &mut dyn PcodeEmit,
+    ) -> KunaResult<()> {
+        assert_eq!(name, b"helper");
+        assert_eq!(ptype, EXECUTABLEPCODE_TYPE);
+        assert_eq!(context.baseaddr.as_ref().unwrap().get_offset(), 0x1000);
+        assert_eq!(context.inputlist[0].offset, 0x10);
+        assert_eq!(context.output[0].offset, 0x30);
+        self.calls.set(self.calls.get() + 1);
+        let library = self.library.upgrade().unwrap();
+        library.borrow_mut().manual_call_fixup(b"during-build", b"").unwrap();
+        let library = library.borrow();
+        let engine = SleighInjectEngine::new(
+            Rc::clone(self.manager.get_constant_space().unwrap()),
+            Rc::clone(self.manager.get_unique_space().unwrap()),
+            Rc::clone(self.manager.get_default_code_space().unwrap()),
+        );
+        engine.emit_payload(library.get_payload(0), &self.tpl, &mut context.clone(), emit)
+    }
+}
+
+#[test]
+fn executable_host_emission_releases_registration_borrow_and_builds_once() {
+    let (library, manager, loader, behaviors) = executable_test_library("result = value + 1;");
+    let tpl = library.borrow_mut().tpls[0].take().unwrap();
+    let resolver = Rc::new(ExecutableTestResolver {
+        library: Rc::downgrade(&library),
+        manager: Rc::clone(&manager),
+        tpl,
+        calls: std::cell::Cell::new(0),
+    });
+    let capability: Rc<dyn crate::pcodeinject::InjectPcodeResolver> = resolver.clone();
+    library.borrow_mut().bind_executable_runtime(
+        manager, Rc::downgrade(&loader), Some(Rc::downgrade(&capability)), behaviors,
+    );
+    assert_eq!(evaluate_executable(&library, 0, &[7]).unwrap(), 8);
+    assert_eq!(evaluate_executable(&library, 0, &[19]).unwrap(), 20);
+    assert_eq!(resolver.calls.get(), 1);
+    assert!(library.borrow().base.get_payload_id(CALLFIXUP_TYPE, b"during-build") >= 0);
+    let weak = Rc::downgrade(&resolver);
+    drop(capability);
+    drop(resolver);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(evaluate_executable(&library, 0, &[40]).unwrap(), 41);
+}
+
 #[test]
 fn parse_inject_compiles_a_callother_snippet() {
     // Decode a callotherfixup whose body assigns a temporary, then compile it
@@ -353,8 +565,9 @@ use crate::pcodeinject::InjectContext;
 use crate::context::{ArchContext, TypeOp};
 
 /// A `SnippetLanguage` with a code space `ram`, the const/unique spaces, and a
-/// couple of x86-style registers (EAX/ESP).  Enough to compile the simple real
-/// x86 callfixups (`mcount`, `get_pc_thunk_ax`).
+/// couple of x86-style registers (EAX/ESP), and the native `inst_next` symbol.
+/// Enough to compile the simple real x86 callfixups (`mcount`,
+/// `get_pc_thunk_ax`) and the original branch-rejection fixture.
 struct CodeLang {
     manager: AddrSpaceManager,
     ram: Rc<AddrSpace>,
@@ -398,6 +611,9 @@ impl SnippetLanguage for CodeLang {
         match name {
             b"EAX" => reg(0),
             b"ESP" => reg(0x10),
+            // SleighCompile::predefinedSymbols installs this EndSymbol;
+            // PcodeSnippet resolves it as a JUMPSYM, not a register.
+            b"inst_next" => Some(SnippetSymbol::End(name.to_vec())),
             _ => None,
         }
     }
@@ -429,6 +645,286 @@ impl PcodeEmit for CollectEmitter {
     }
 }
 
+#[derive(Default)]
+struct ReentrantPayloadEmitter {
+    library: Weak<RefCell<PcodeInjectLibrarySleigh>>,
+    ops: Vec<(OpCode, Option<VarnodeData>, Vec<VarnodeData>)>,
+}
+
+impl PcodeEmit for ReentrantPayloadEmitter {
+    fn dump(&mut self, addr: &Address, opc: OpCode, outvar: Option<&VarnodeData>, vars: &[VarnodeData]) {
+        assert_eq!(addr.get_offset(), 0x1000);
+        if let Some(library) = self.library.upgrade() {
+            let name = format!("during-emit-{}", self.ops.len());
+            library.borrow_mut().manual_call_fixup(name.as_bytes(), b"").unwrap();
+        }
+        self.ops.push((opc, outvar.cloned(), vars.to_vec()));
+    }
+}
+
+fn mechanism_test_library(
+    xml: &[u8],
+) -> (Rc<RefCell<PcodeInjectLibrarySleigh>>, Rc<AddrSpaceManager>) {
+    let mut lang = CodeLang::new();
+    lang.manager.set_default_code_space(1).unwrap();
+    let mut library = PcodeInjectLibrarySleigh::new(0x1000);
+    let registry = registry();
+    let mut decoder = XmlDecode::new(&lang.manager, &registry);
+    decoder.ingest_stream(xml).unwrap();
+    assert_eq!(library.decode_inject(b"test", b"model", CALLMECHANISM_TYPE, &mut decoder).unwrap(), 0);
+    library.parse_inject_all(&lang).unwrap();
+    let manager = Rc::new(lang.manager);
+    // Ordinary payload emission needs the canonical spaces, not an image or
+    // an executable cache. An expired image must not prevent this operation.
+    library.bind_executable_runtime(Rc::clone(&manager), Weak::new(), None, Vec::new());
+    (Rc::new(RefCell::new(library)), manager)
+}
+
+#[test]
+fn live_model_payload_preserves_call_store_load_order_and_operand_geometry() {
+    use crate::action::ActionContext;
+    use crate::dtype::{TypeFactoryImpl, type_metatype};
+    use crate::fspec::{FuncCallSpecs, ProtoModel};
+    let (library, manager) = mechanism_test_library(
+        br#"<pcode inject="uponreturn"><body>
+          local addr:4 = ESP + 20;
+          *:4 addr = EAX;
+        </body></pcode>"#,
+    );
+    let ram = Rc::clone(manager.get_default_code_space().unwrap());
+    let address = Address::new(Rc::clone(&ram), 0x1000);
+    let mut context = ArchContext::new_shared(manager);
+    context.injection_library = Some(library);
+    let mut model = ProtoModel::new(context.manage());
+    model.build_param_list("standard").unwrap();
+    model.set_inject_ids(-1, 0);
+    context.defaultfp = Some(Rc::new(model));
+    let types = Rc::new(TypeFactoryImpl::new());
+    types.set_default_alignment_map();
+    types.set_core_type("void", 0, type_metatype::TYPE_VOID, false).unwrap();
+    context.types = Some(types);
+    let mut data = Funcdata::new("model", "model", Rc::new(context), address.clone(), 0x10000000, 16).unwrap();
+    let root = data.bblocks_root_pub();
+    let block = data.bblocks_mut().new_block_basic(root);
+    let call = data.new_op(1, address.clone());
+    data.op_set_opcode(call, data.get_arch().type_op_info(OpCode::CPUI_CALL).to_type_op());
+    let target = data.new_code_ref(&Address::new(Rc::clone(&ram), 0x2000));
+    data.op_set_input(call, target, 0).unwrap();
+    data.op_insert(call, block, None);
+    let load = data.new_op(2, address.clone());
+    data.op_set_opcode(load, data.get_arch().type_op_info(OpCode::CPUI_LOAD).to_type_op());
+    let selector = data.new_constant(8, ram.get_index() as u64);
+    let pointer = data.new_varnode_space_off(4, Rc::clone(&ram), 0x10).unwrap();
+    data.op_set_input(load, selector, 0).unwrap();
+    data.op_set_input(load, pointer, 1).unwrap();
+    data.new_unique_out(4, load).unwrap();
+    data.op_insert(load, block, None);
+    data.push_call_specs(FuncCallSpecs::new(call, Address::new(Rc::clone(&ram), 0x2000)));
+    let mut action = crate::coreaction_protos::ActionDefaultParams::boxed("base");
+    let mut action_context = ActionContext::new();
+    action.perform(&mut data, &mut action_context).unwrap();
+    // DefaultParams is once-per-function: resuming it must not duplicate STORE.
+    action.perform(&mut data, &mut action_context).unwrap();
+    let ops = data.bb_ops(block);
+    assert_eq!(ops.len(), 4);
+    assert_eq!(ops[0], call);
+    assert_eq!(ops[3], load);
+    assert_eq!(data.obank().get(ops[1]).unwrap().code(), OpCode::CPUI_INT_ADD);
+    assert_eq!(data.obank().get(ops[2]).unwrap().code(), OpCode::CPUI_STORE);
+    let add = data.obank().get(ops[1]).unwrap();
+    let stored = data.obank().get(ops[2]).unwrap();
+    let added = add.get_out().unwrap();
+    let store_pointer = stored.get_in(1).unwrap();
+    assert_eq!(data.vbank().get(added).unwrap().get_addr(),
+        data.vbank().get(store_pointer).unwrap().get_addr());
+    assert_eq!(data.vbank().get(added).unwrap().get_size(), 4);
+    assert_eq!(data.vbank().get(stored.get_in(0).unwrap()).unwrap().get_size(), 8);
+    assert_eq!(data.vbank().get(stored.get_in(2).unwrap()).unwrap().get_size(), 4);
+    assert_eq!(data.vbank().get(add.get_in(1).unwrap()).unwrap().get_offset(), 20);
+    assert_eq!(data.obank().num_dead(), 0);
+}
+
+#[test]
+fn scheduled_entry_model_payload_precedes_original_ops_and_runs_once() {
+    use crate::action::{Action, ActionContext, ActionGroup, ruleflags};
+    use crate::fspec::ProtoModel;
+    let (library, manager) = mechanism_test_library(
+        br#"<pcode inject="uponentry"><body>EAX = ESP;</body></pcode>"#,
+    );
+    let ram = Rc::clone(manager.get_default_code_space().unwrap());
+    let address = Address::new(Rc::clone(&ram), 0x1000);
+    let mut context = ArchContext::new_shared(manager);
+    context.injection_library = Some(library);
+    let mut model = ProtoModel::new(context.manage());
+    model.set_inject_ids(0, -1);
+    let mut data = Funcdata::new("entry", "entry", Rc::new(context), address.clone(), 0x10000000, 16).unwrap();
+    data.get_func_proto_mut().set_model(Some(Rc::new(model)));
+    let root = data.bblocks_root_pub();
+    let block = data.bblocks_mut().new_block_basic(root);
+    if let crate::block::BlockKind::Basic(basic) = data.bblocks_mut().block_mut(block).kind_mut() {
+        basic.cover.insert_range(Rc::clone(&ram), 0x1000, 0x1003);
+    }
+    let original = data.new_op(1, address.clone());
+    data.op_set_opcode(original, data.get_arch().type_op_info(OpCode::CPUI_RETURN).to_type_op());
+    let zero = data.new_constant(4, 0);
+    data.op_set_input(original, zero, 0).unwrap();
+    data.op_insert(original, block, None);
+    let mut root_action = ActionGroup::new(ruleflags::rule_onceperfunc, "entry-root");
+    root_action.add_action(crate::coreaction_early::ActionConstbase::boxed("base"));
+    let mut action_context = ActionContext::new();
+    root_action.perform(&mut data, &mut action_context).unwrap();
+    root_action.perform(&mut data, &mut action_context).unwrap();
+    let operations = data.bb_ops(block);
+    assert_eq!(operations.len(), 2);
+    assert_eq!(operations[1], original);
+    let injected = data.obank().get(operations[0]).unwrap();
+    assert_eq!(injected.code(), OpCode::CPUI_COPY);
+    assert_eq!(injected.get_addr(), &address);
+    assert_eq!(data.vbank().get(injected.get_in(0).unwrap()).unwrap().get_offset(), 0x10);
+    assert_eq!(data.vbank().get(injected.get_out().unwrap()).unwrap().get_offset(), 0);
+}
+
+#[test]
+fn live_model_payload_rejects_branching_effects() {
+    let (library, manager) = mechanism_test_library(
+        br#"<pcode inject="uponentry"><body>goto inst_next;</body></pcode>"#,
+    );
+    {
+        let library = library.borrow();
+        let ops = library.get_tpl(0).unwrap().get_opvec();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].get_opcode(), OpCode::CPUI_BRANCH);
+    }
+    let address = Address::new(Rc::clone(manager.get_default_code_space().unwrap()), 0x1000);
+    let mut context = ArchContext::new_shared(manager);
+    context.injection_library = Some(library);
+    let mut data = Funcdata::new("model", "model", Rc::new(context), address.clone(), 0x10000000, 16).unwrap();
+    let root = data.bblocks_root_pub();
+    let block = data.bblocks_mut().new_block_basic(root);
+    assert_eq!(data.do_live_inject(0, &address, block, None).unwrap_err(),
+        KunaError::lowlevel("Illegal branching injection"));
+    assert!(data.bb_empty_op(block));
+}
+
+#[test]
+fn shared_static_mechanism_preserves_store_and_releases_borrow_before_replay() {
+    let (library, manager) = mechanism_test_library(
+        br#"<pcode inject="uponreturn"><body>
+          local addr:4 = ESP + 20;
+          *:4 addr = EAX;
+        </body></pcode>"#,
+    );
+    let mut context = InjectContext::default();
+    context.baseaddr = Some(Address::new(Rc::clone(manager.get_default_code_space().unwrap()), 0x1000));
+    let mut original = ReentrantPayloadEmitter::default();
+    {
+        let library = library.borrow();
+        let engine = SleighInjectEngine::new(
+            Rc::clone(manager.get_constant_space().unwrap()),
+            Rc::clone(manager.get_unique_space().unwrap()),
+            Rc::clone(manager.get_default_code_space().unwrap()),
+        );
+        engine.emit_payload(library.get_payload(0), library.get_tpl(0).unwrap(), &mut context, &mut original).unwrap();
+    }
+    let mut emitted = ReentrantPayloadEmitter {
+        library: Rc::downgrade(&library),
+        ..Default::default()
+    };
+    emit_payload_shared(&library, 0, &mut context, &mut emitted).unwrap();
+    assert_eq!(emitted.ops, original.ops);
+    assert_eq!(emitted.ops.iter().map(|op| op.0).collect::<Vec<_>>(),
+        vec![OpCode::CPUI_INT_ADD, OpCode::CPUI_STORE]);
+    let add = &emitted.ops[0];
+    let store = &emitted.ops[1];
+    assert_eq!(add.2[0].offset, 0x10); // ESP
+    assert_eq!(add.2[1].offset, 20);
+    assert!(store.1.is_none());
+    assert_eq!(store.2.len(), 3);
+    assert_eq!(store.2[0].offset, manager.get_default_code_space().unwrap().get_index() as u64);
+    assert_eq!(store.2[0].size, 8); // encoded space selector, not the store width
+    assert_eq!(Some(&store.2[1]), add.1.as_ref());
+    assert_eq!(store.2[2].offset, 0); // EAX
+    assert_eq!(store.2[2].size, 4);
+    assert!(library.borrow().base.get_payload_id(CALLFIXUP_TYPE, b"during-emit-1") >= 0);
+    assert!(library.borrow().get_tpl(0).is_some());
+}
+
+struct MechanismTestResolver {
+    library: Weak<RefCell<PcodeInjectLibrarySleigh>>,
+    calls: std::cell::Cell<usize>,
+    fail: std::cell::Cell<bool>,
+}
+
+impl crate::pcodeinject::InjectPcodeResolver for MechanismTestResolver {
+    fn fetch_inject_pcode(
+        &self,
+        name: &[u8],
+        ptype: int4,
+        context: &InjectContext,
+        emit: &mut dyn PcodeEmit,
+    ) -> KunaResult<()> {
+        // Both native InjectPayload::decodePayloadAttributes and Java
+        // PrototypeModel.getInjectName use the entry/return-qualified identity.
+        assert_eq!(name, b"model@@inject_uponentry");
+        assert_eq!(ptype, CALLMECHANISM_TYPE);
+        assert_eq!(context.baseaddr.as_ref().unwrap().get_offset(), 0x1000);
+        assert_eq!(context.nextaddr.as_ref().unwrap().get_offset(), 0x1004);
+        assert_eq!(context.calladdr.as_ref().unwrap().get_offset(), 0x2000);
+        let call = self.calls.get();
+        self.calls.set(call + 1);
+        let library = self.library.upgrade().unwrap();
+        library.borrow_mut().manual_call_fixup(format!("host-{call}").as_bytes(), b"").unwrap();
+        if self.fail.get() {
+            return Err(KunaError::transport("mechanism callback disconnected"));
+        }
+        let addr = context.baseaddr.as_ref().unwrap();
+        // Forward all STORE inputs unchanged, including the distinct selector
+        // and value widths. There is no COPY-only callback adapter.
+        emit.dump(addr, OpCode::CPUI_STORE, None, &context.inputlist);
+        Ok(())
+    }
+}
+
+#[test]
+fn shared_dynamic_mechanism_uses_exact_kind_live_context_and_typed_errors() {
+    let (library, manager) = mechanism_test_library(br#"<pcode inject="uponentry" dynamic="true"/>"#);
+    let resolver = Rc::new(MechanismTestResolver {
+        library: Rc::downgrade(&library),
+        calls: std::cell::Cell::new(0),
+        fail: std::cell::Cell::new(false),
+    });
+    let capability: Rc<dyn crate::pcodeinject::InjectPcodeResolver> = resolver.clone();
+    library.borrow_mut().bind_executable_runtime(
+        Rc::clone(&manager), Weak::new(), Some(Rc::downgrade(&capability)), Vec::new(),
+    );
+    let code_space = manager.get_default_code_space().unwrap();
+    let mut context = InjectContext::default();
+    context.baseaddr = Some(Address::new(Rc::clone(code_space), 0x1000));
+    context.nextaddr = Some(Address::new(Rc::clone(code_space), 0x1004));
+    context.calladdr = Some(Address::new(Rc::clone(code_space), 0x2000));
+    context.inputlist = vec![
+        VarnodeData { space: manager.get_constant_space().cloned(), offset: code_space.get_index() as u64, size: 8 },
+        VarnodeData { space: Some(Rc::clone(code_space)), offset: 0x10, size: 4 },
+        VarnodeData { space: Some(Rc::clone(code_space)), offset: 0x20, size: 4 },
+    ];
+    let mut emitted = ReentrantPayloadEmitter::default();
+    emit_payload_shared(&library, 0, &mut context, &mut emitted).unwrap();
+    assert_eq!(emitted.ops[0], (OpCode::CPUI_STORE, None, context.inputlist.clone()));
+    context.inputlist[2].offset = 0x30;
+    emit_payload_shared(&library, 0, &mut context, &mut emitted).unwrap();
+    assert_eq!(emitted.ops[1], (OpCode::CPUI_STORE, None, context.inputlist.clone()));
+    assert_eq!(resolver.calls.get(), 2); // site-bound bodies are never cached
+    resolver.fail.set(true);
+    let error = emit_payload_shared(&library, 0, &mut context, &mut emitted).unwrap_err();
+    assert!(matches!(error, KunaError::Transport { explain } if explain == "mechanism callback disconnected"));
+    assert_eq!(emitted.ops.len(), 2);
+    drop(capability);
+    let weak_resolver = Rc::downgrade(&resolver);
+    drop(resolver);
+    assert!(weak_resolver.upgrade().is_none());
+    assert!(emit_payload_shared(&library, 0, &mut context, &mut emitted).is_err());
+}
+
 /// A `PcodeEmit` that actually builds the emitted ops into a [`Funcdata`],
 /// resolving each `VarnodeData` to a real `Varnode` (constants via
 /// `new_constant`, everything else via `new_varnode` at its address).
@@ -450,7 +946,7 @@ impl FuncdataEmitter<'_> {
         if Rc::ptr_eq(&space, &self.const_space) {
             self.fd.new_constant(vn.size as i32, vn.offset)
         } else {
-            self.fd.new_varnode(vn.size as i32, &Address::new(space, vn.offset), None)
+            self.fd.new_varnode(vn.size as i32, &Address::new(space, vn.offset), None).unwrap()
         }
     }
 }

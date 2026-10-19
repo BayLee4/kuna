@@ -70,7 +70,7 @@ fn run(at: &[u64], directives: Vec<Directive>) -> (String, Option<String>, Vec<O
                 .expect("the fixture has a function at this address")
         })
         .collect();
-    let funcs = decompile_targets(&mut prog, targets, false, false, false);
+    let funcs = decompile_targets(&mut prog, targets, false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     (code, funcs[0].error.clone(), prog.assertion_outcomes())
 }

@@ -58,7 +58,7 @@ fn decompile(libcsigs: &str) -> String {
     kuna_decomp::decompile_drive::print_c(
         program.arch_mut(),
         &function,
-    )
+    ).unwrap()
 }
 
 #[test]

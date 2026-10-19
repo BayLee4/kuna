@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Shared real-Ghidra startup, native selection and unchanged CppExporter helpers."""
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -10,6 +11,18 @@ KUNA_GHIDRA = os.environ.get(
     "KUNA_GHIDRA_EXE",
     os.path.join(REPO, "decompiler", "target", "release", "kuna_ghidra"),
 )
+
+
+def test_cores():
+    """Select independent product cases or stock regression observations."""
+    group = os.environ.get("KUNA_GHIDRA_TEST_GROUP", "product")
+    if group == "product":
+        return ("kuna",)
+    if group == "stock-controls":
+        return ("stock",)
+    raise ValueError("KUNA_GHIDRA_TEST_GROUP must be product or stock-controls: " + group)
+
+
 def get_exepath_field():
     from ghidra.app.decompiler import DecompileProcessFactory
     cls = DecompileProcessFactory.class_
@@ -26,14 +39,33 @@ def get_exepath_field():
 
 
 def start_ghidra():
-    """Start the real JVM; reject a patched consumer in the ordinary stock lane."""
+    """Start the real receiver; product checks require the complete Java integration."""
+    cores = test_cores()
     import pyghidra
     pyghidra.start()
     from ghidra.app.decompiler import DecompileResults
     methods = {str(method.getName()) for method in DecompileResults.class_.getMethods()}
     if "getCallableSupport" in methods or "getDiagnosticCallView" in methods:
-        raise RuntimeError("Stock regression requires unmodified Ghidra Java; "
-                           "GHIDRA_INSTALL_DIR selects an enhanced consumer")
+        raise RuntimeError("Legacy patched Ghidra Java with retired consumer APIs is unsupported; "
+                           "use stock GHIDRA_INSTALL_DIR and an isolated normal-extension settings profile")
+    required = {"isEnhancedResult", "getDataTypeManager", "hasCurrentSourceAuthority"}
+    full_java = required <= methods
+    if cores == ("kuna",) and not full_java:
+        raise RuntimeError("Product tests require the full Kuna Java extension installed before JVM startup; "
+                           "stock-controls may use unmodified Java for baseline comparison")
+    if output := os.environ.get("KUNA_SMOKE_OUT"):
+        from ghidra.framework import Application
+        from ghidra.app.util.exporter import CppExporter
+        receiver = {
+            "group": os.environ.get("KUNA_GHIDRA_TEST_GROUP", "product"),
+            "full_java": full_java,
+            "ghidra_version": str(Application.getApplicationVersion()),
+            "results_origin": str(DecompileResults.class_.getProtectionDomain().getCodeSource().getLocation()),
+            "exporter_origin": str(CppExporter.class_.getProtectionDomain().getCodeSource().getLocation()),
+        }
+        directory = Path(output)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "receiver.json").write_text(json.dumps(receiver, indent=2) + "\n")
     return pyghidra
 
 

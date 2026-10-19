@@ -131,6 +131,7 @@ fn f1_no_terminator_within_max_returns_empty_like_cpp() {
     let mut is_trunc = false;
     let out = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
 
     // C++ returns the empty buffer (no terminator found within maximumChars).
@@ -170,6 +171,7 @@ fn f2_terminated_just_under_max_decodes() {
     let mut is_trunc = true;
     let out = sm
         .get_string_data(&addr, &ct, &mut loader, &mut is_trunc)
+        .unwrap()
         .to_vec();
     assert_eq!(&out[..31], &[b'B'; 31][..]);
     assert_eq!(out[31], 0);
@@ -475,6 +477,7 @@ fn g3_no_terminator_returns_empty_but_edge_terminator_decodes() {
     let mut tr_a = false;
     let out_a = sm_a
         .get_string_data(&addr_a, &ct, &mut loader_a, &mut tr_a)
+        .unwrap()
         .to_vec();
     assert!(
         out_a.is_empty(),
@@ -495,6 +498,7 @@ fn g3_no_terminator_returns_empty_but_edge_terminator_decodes() {
     let mut tr_b = false;
     let out_b = sm_b
         .get_string_data(&addr_b, &ct, &mut loader_b, &mut tr_b)
+        .unwrap()
         .to_vec();
     // numChars(19) < maximumChars(20) -> raw charsize==1 copy of all 20 bytes.
     assert_eq!(&out_b[..19], &[b'Z'; 19][..], "edge-terminated string must decode");

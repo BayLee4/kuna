@@ -285,7 +285,7 @@ fn run_fixture(stem: &str) -> Result<Vec<(String, Outcome)>, String> {
         let entry = Address::new(space, sym.offset);
         match decompile_func(base, &sym.name, entry, 0) {
             Ok(fd) => {
-                let c = print_c(base, &fd);
+                let c = print_c(base, &fd).unwrap();
                 outcomes.push((sym.name.clone(), Outcome::Ok(c)));
             }
             Err(e) => {
@@ -482,7 +482,7 @@ fn maxinstruction_option_bounds_flow_following() {
         .expect("option errortoomanyinstructions off");
     let fd = decompile_func(arch, &sym.name, entry.clone(), 0)
         .expect("truncated flow should still decompile");
-    let truncated = print_c(arch, &fd);
+    let truncated = print_c(arch, &fd).unwrap();
     assert!(
         is_structurally_sane(&truncated, &sym.name),
         "truncated-flow C is not sane:\n{truncated}"
@@ -499,7 +499,7 @@ fn maxinstruction_option_bounds_flow_following() {
     set(arch, "maxinstruction", "100000").expect("option maxinstruction 100000");
     let fd = decompile_func(arch, &sym.name, entry, 0)
         .expect("decompile under the default bound");
-    let full = print_c(arch, &fd);
+    let full = print_c(arch, &fd).unwrap();
     assert!(is_structurally_sane(&full, &sym.name), "default-bound C is not sane:\n{full}");
     // The truncation must TRUNCATE.  The halt planted at the bound used to be
     // followed by a decode of the same instruction, so the next address was

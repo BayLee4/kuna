@@ -707,8 +707,8 @@ pub fn forget_minted(types: &TypeFactoryImpl, held: &[String]) -> Result<(), Str
         if held.contains(&name) {
             continue;
         }
-        // Completing a structure leaves its incomplete shell under the same
-        // name, so a name is destroyed until nothing minted answers to it.
+        // Retire only actual inferred owners, including any held revisions
+        // still answering to the same name.
         while let Some(ct) = types.find_by_name(&name).ok().flatten() {
             if ledger::minted_number(&ct).is_none() {
                 break;
@@ -771,7 +771,7 @@ pub fn install_table(types: &dyn TypeFactory, table: &[(String, SynthRequest)]) 
         if types.find_by_name(name).ok().flatten().is_some() {
             return Err(format!("{name}: the name is already held"));
         }
-        let shell = types.get_type_struct(name).map_err(|e| format!("{name}: {}", e.explain()))?;
+        let shell = types.kuna_synthesized_record(name).map_err(|e| format!("{name}: {}", e.explain()))?;
         let ct = types
             .set_fields_struct_raw(&shell, fields, Vec::new(), req.size, 1, 0)
             .map_err(|e| format!("{name}: {}", e.explain()))?;

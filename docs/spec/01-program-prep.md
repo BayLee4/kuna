@@ -92,6 +92,17 @@ re-seeded into each freshly-rebuilt `Funcdata`'s `ScopeLocal` at decompile time 
 `map addr`/`seed_mapped_symbols` path), and the `error(nonzero,…)` call-site list is
 stashed on the `Architecture` for the per-function flow override (§1.7).
 
+DWARF globals publish their actual qualified datatype and default-data-space
+address through `TypedDataFact`, before heuristic strings and untyped names.
+The `dwarf` gate owns these declarations independently of `datasyms`; only the
+non-debug loader and library-name streams answer to `datasyms`. A preexisting
+mapping overlapping any byte of the declared extent wins. Object-level volatile
+qualification also sets the existing storage property over that exact extent;
+qualification of a pointer's pointee does not make the pointer slot volatile.
+Complete per-entry source prototypes are installed after the pieces projections,
+retaining source arity, convention and effects independently of working ABI
+assignment. A successful analysis-output commit invalidates body-derived caches.
+
 Two timing consequences shape the tier. First, anything that must influence the
 **loader itself** runs before any `option` line exists, so load-time gates are
 bridged across the process by environment variables the CLI exports:
@@ -397,7 +408,7 @@ name only the printer fixed would be one the tool could no longer be asked for.
 The **data** half of those same two symbol tables is read alongside the function
 half (`loadimage_object.rs (data_symbols)`): every defined, named `STT_OBJECT`
 entry with a non-zero `st_size`, deduplicated by address, `.symtab` before
-`.dynsym`. Zero-size entries are dropped because the linker's section-boundary
+`.dynsym`. ELF zero-size entries are dropped because the linker's section-boundary
 markers (`__bss_start`, `_edata`, `_end`) are exactly the sizeless ones, and a
 sizeless symbol would plant a name on the first byte of whatever object follows
 it. Each surviving entry becomes a named `undefined<size>` global — the same
@@ -412,7 +423,14 @@ default ON, DIV-26/DIV-76): the stream is collected at `load file` but committed
 at `read symbols`, after the option lines are applied, so the gate is the plain
 `Architecture` flag the commit consults — no env bridge is needed on either CLI
 path. Off drops the stream at the commit and restores the raw `dat_<addr>`
-rendering exactly.
+rendering exactly. Mach-O's nlist has no size field: its defined data labels retain
+the interval to the next definition in the same section, bounded by the section's
+end. That loader interval is not a replacement for a DWARF-authored object type.
+Neutral Mach-O exports enter the function stream only when their address belongs
+to a code section; data exports do not become functions. Typed import pointer slots
+and code stubs retain their separately supplied roles. A defined function at
+address zero remains a function: undefined status, not a zero-address heuristic,
+identifies unresolved symbols.
 
 A **declared extent is never trusted to be representable.** `st_size` is a 64-bit
 field of the image that no header check validates, while the type factory sizes
@@ -1213,8 +1231,11 @@ pointer word from a function entry is not where it lives but who put the name
 there, and the loader knows: each format reports the slot addresses it resolved
 names at (`ObjectFormat::import_slots`, PE Import Address Table entries and typed
 Mach-O lazy/non-lazy symbol-pointer entries) beside the names themselves, and the engine carries them
-as `[lo, hi)` ranges (`ObjectLoadImage::import_slot_ranges` →
-`ConsoleProgram::is_import_slot`). An entry inside one is excluded from the
+as `[lo, hi)` ranges in its existing shared byte owner
+(`ImageBytes::import_slot_ranges` → `LoadImage::is_import_slot` →
+`Architecture::is_body_entry`). Object and shared-byte readers require the
+actual attached address-space identity, not only an equal space index.
+An entry inside one is excluded from the
 batch set whatever the section says. Nothing else moves: the canonical
 inventory, `kuna functions`, generic symbol resolution and the call naming the
 slot exists for are unchanged. Decompiling `--addr`/`--functions` selection
@@ -1224,6 +1245,20 @@ from 56 entries to its 6 real ones while the surviving body still renders
 test as it outranks the section-flag one, so an analyst who asserts a function
 at an address the import directory claims still gets a body; that is also the
 recourse if an image's import directory is a lie.
+
+The same body authority gates cached callee-entry dependency, return-write and
+normal-return memory acquisition before cache lookup or decoding: an import
+pointer's bytes must not manufacture physical arguments, writes or preserved
+state. Raw translator probe APIs remain available for deliberate decoding.
+This does not infer body identity from section permissions,
+`externref`, symbol spelling or source prototype. Raw, XML and host-backed loaders
+without negative import metadata retain their existing bodies. Explicit
+declarations live once in the architecture as full managed addresses; console
+selection and dependency acquisition read that same assertion. A new declaration
+invalidates body-derived caches and the active export binding, while an identical
+declaration is a no-op. Same-manager loader wrappers preserve declarations and
+shared immutable import metadata; another address-space bank cannot inherit an
+assertion merely by reusing its index and offset.
 
 Each canonical entry also carries a byte **extent**, so the inventory answers
 "how big" as well as "what is here" and a caller can order a binary's functions
@@ -2195,7 +2230,11 @@ moves.
   (`decompiler/crates/kuna-console/src/engine.rs (commit_analysis_output)`)
   declares the prototypes parked under those names with the spec's `__cdecl`
   model, whose stated `extrapop` of 4 leaves nothing for `calleeprotostack`
-  (chapter 04) to resolve. The DLL is the evidence, not the name: the BSD socket
+  (chapter 04) to resolve. The convention is registered before the library
+  declarations are published, so both the IAT slot and its address-keyed thunk
+  source are constructed under it; address-specific models and later
+  MSVC/DWARF source declarations retain their existing precedence.
+  The DLL is the evidence, not the name: the BSD socket
   spellings the libc tables carry are `__stdcall` WinSock exports and keep the
   default. Only where the default model's `extrapop` is unknown and the spec
   registers a `__cdecl` model of its own, so x86-64 and every ELF are untouched.
@@ -2256,8 +2295,14 @@ moves.
   before it is built, because the same declaration recurs in every compilation
   unit that includes its header. The sign is the enum's `DW_AT_encoding`, which
   gcc emits, else the encoding of the integer its `DW_AT_type` names, which is
-  all clang emits (clang's signed enums used to read as unsigned). An enum that
-  is not built (anonymous or memberless) falls back to a plain integer: `int` at
+  all clang emits (clang's signed enums used to read as unsigned). A genuine
+  typedef exposing an anonymous enum preserves the empty enum tag, exact enum
+  identity, width, sign and members; the typedef retains its separate source
+  name and identity. Exposure is recorded before traversal, so enum-first and
+  typedef-first visits agree within the selected view. C's `typedepth off` view
+  retains transparent typedef traversal and does not select that alias exposure;
+  full-depth C and the C++ mapper retain it. An enum that
+  is not built (unexposed anonymous or memberless) falls back to a plain integer: `int` at
   32 bits or wider, as it always was, and below 32 bits an integer of the enum's
   own sign, since that sign decides how a calling convention extends the value
   (04 §4.4, `narrowext`); an enum whose DWARF states no sign (strict DWARF 2) is
@@ -2307,11 +2352,10 @@ moves.
   lexical-block locals and composite locations are a documented loss. (ida) The
   data-global fix (DIV-24): a global used to be mapped with a size-1 type, so any
   multi-byte access queried `queryContainer(addr, 4)` past it and rendered
-  `dat_<addr>`; the pass now resolves `DW_AT_type` to a byte size
-  (`pass.rs (DataObjectFact)`) and the commit maps an `undefined<size>` entry —
-  namelocked but *not* typelocked, so inference still recovers the real type —
-  matching how IDA Pro and Ghidra name symbol-table globals (`max_width`, not
-  `dat_<addr>`). Declaration-only DIEs are skipped so DWARF never fights libproto
+  `dat_<addr>`; the pass now retains `DW_AT_type` as a complete qualified
+  `TypedDataFact`, and the commit maps its real extent with both name and type
+  locked. Non-debug symbol names remain untyped loader facts. Declaration-only
+  function DIEs are skipped so DWARF never fights libproto
   over imports. `dwarf_lines`
   (`decompiler/crates/kuna-analysis/src/analyzers/dwarf/lines.rs (DwarfLinesPass)`)
   is the separate `.debug_line` pass: each row becomes a `file:line` instruction
@@ -2381,23 +2425,18 @@ moves.
   the compiler's own answer for the target ABI and re-deriving it would silently
   disagree with the bytes the decompiler reads.
 
-  Two hazards come with populating fields, and both are handled in the naming.
-  The type factory interns by `(name, hash(name))` and refuses a second, different
-  definition of a name it already holds; while every aggregate was a sizeless
-  shell that was invisible, because two shells compare equal. It goes live the
-  moment fields exist — and it is not exotic: `rustc -g` names every enum payload
-  struct **bare** (`Some`, `Ok`, `Err`), and a five-function Rust witness carries
-  four distinct `Some` DIEs of sizes 16, 24, 16 and 12. Aggregates are therefore
-  interned under their **parent-qualified** name (the namespace/class ancestry walk
-  the C++ arm already had) and, when that name is still held by an aggregate of a
-  different size, under a size-suffixed variant; a name held by a non-aggregate is
-  stepped over the same way. The second hazard is self-reference: a
-  `struct node { struct node *next; }` reaches its own DIE while its fields are
-  being built, so the shell is interned **before** the members are walked and the
-  inner resolution finds it by name, with the walk guard refusing a re-entrant
-  population. LOSS: because an interned type is immutable in kuna, completing one
-  mints a new handle, so the pointer the inner frame captured still refers to the
-  pre-completion shell — the name renders but the chain is one level shorter.
+  Nominal identity comes from the producer's object, debug section, compilation
+  unit and DIE coordinates, following explicit specification/origin references;
+  neither a shared spelling nor a shared size proves equivalence. The importer
+  snapshots all units before construction, retaining cross-unit `ref_addr` and
+  signature/type-unit references. An adjacent Mach-O dSYM supplies debug facts
+  only when its UUID, architecture and endianness match the loaded image.
+  Parent-qualified names and existing collision suffixes remain presentation,
+  not identity. Exact records and callable definitions are reserved in TypeFactory
+  **before** recursive descent, and the walk's active set uses that nominal
+  identity. Completion targets the reserved definition, allowing semantic
+  pointer readers to follow recursive fields while immutable raw shells retain
+  their existing snapshot contract. Genuine unresolved forwards stay unresolved.
   `DW_TAG_variant_part`/`DW_TAG_variant`/`DW_AT_discr`, the Rust tagged-enum
   encoding, are not read by this arm; the sibling `dwarfvariants` increment below
   reads them, and with it off a Rust enum recovers its width and no fields. Same
@@ -2406,6 +2445,11 @@ moves.
   (`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfstructs.rs`) that the
   CLI exports before the load, and `dwarfstructs off` is the name-only mapping byte
   for byte.
+  A genuine definition with a valid producer width is terminal in that disabled
+  view: it completes the exact nominal record with no fields and the legacy
+  zero-width geometry, rather than leaving a member walk permanently pending.
+  This does not complete a true forward declaration or a DIE with no usable
+  width, and does not relax callable readiness for enabled recursive definitions.
 - **Discriminated unions** (`dwarfvariants`, default-on,
   `decompiler/crates/kuna-analysis/src/analyzers/dwarf/kuna_dwarfvariants.rs`) is
   the arm for the aggregates the member walk above cannot see at all. A Rust
@@ -2453,9 +2497,13 @@ moves.
   carries 61 named `Some` across 8 byte sizes (0/8/12/16/24/32/48/64), 61 `None`,
   and 31 each `Ok`/`Err` across 7. A suppressed facet, whose name is derived from
   its offset rather than from the variant, can collide inside a single enum
-  (`Tree::field_0x8` for both `Leaf` and `Node`); identical layouts then share one
-  interned struct and differing ones are given a numeric suffix, because the ABI
-  classifier common-refines the union's members.
+  (`Tree::field_0x8` for both `Leaf` and `Node`); each facet retains its owning
+  producer enum and variant ordinal identity even when names or layouts coincide.
+  These synthetic offset names retain the existing bounded collision policy:
+  incompatible field layouts step through numbered spellings, and exhausting
+  the candidates seals the parent at its declared width without claiming a
+  variant layout. Equal layout permits reusing a generated spelling, never
+  reusing another producer variant's nominal identity.
 
   Two shapes get specific treatment. A **fieldless** variant (`None`, `Nil`, a
   unit variant) overlays nothing and gets **no union member**: an empty struct of
@@ -2538,8 +2586,7 @@ moves.
     which is what a reader gets when the answer is unknown. Both the union member
     and the facet's own interned type name are suppressed, because a cast in the
     emitted C prints the type name and suppressing only one of the two would still
-    leak the variant. Two suppressed facets that describe the same bytes share one
-    interned struct; two that differ get distinct ones, because the ABI classifier
+    leak the variant. Suppressed facets retain distinct producer identity, because the ABI classifier
     common-refines the union's members and merging two shapes would change how the
     enum is passed.
   - a field inside a facet keeps its DWARF name only when every other variant
@@ -2563,17 +2610,30 @@ moves.
   to give up on the tag, so a pointer to one became a pointer to `void`: a
   parameter, a record field or a local declared `int (*f)(int, long)` came out
   `void *`, and every call through it was a call of a `void *` that no C compiler
-  accepts. With the option on, a prototyped subroutine type maps to a code type
+  accepts. With the option on, a supplied subroutine type maps to a code type
   whose prototype is its `DW_AT_type` (none is `void`) and its
   `DW_TAG_formal_parameter` types, a trailing `DW_TAG_unspecified_parameters`
-  making it variadic, through `TypeFactory::get_type_code_proto`
+  making it variadic, through exact reservation and `TypeFactory::logical_proto`
   (`decompiler/crates/kuna-analysis/src/analyzers/dwarf/mod.rs
   (build_subroutine)`), and a pointer to it is a function pointer:
-  `unsigned long (*hasher)(void *,unsigned long);`. A type without
-  `DW_AT_prototyped` (`int (*)()` in C, and every C++ one, which never carries
-  it) states no parameters, a `...` with nothing before it has no C spelling,
-  and a parameter type the switch cannot build leaves nothing to state, so each
-  keeps the `void` pointee. The mapping happens inside `load file`, before any
+  `unsigned long (*hasher)(void *,unsigned long);`. C's absent
+  `DW_AT_prototyped` retains open input authority; C++ and Rust signatures retain
+  their language-authorized closed parameter lists even when that attribute is
+  absent. A standalone `DW_TAG_unspecified_parameters` in an unprototyped C
+  declaration with no fixed formals describes unknown inputs, not an invented
+  ellipsis. Prototyped signatures, supplied fixed formals followed by a variable
+  tail, and source-language equivalents retain their actual variadic boundary.
+  The C++-capable mapper also visits C units and does
+  not itself authorize closing their signatures. Ordered formal names/types, independent vararg boundary, supported
+  explicitly supplied convention and no-return effect survive construction.
+  Unbuildable required formals do not become invented `void` parameters.
+  Qualifiers remain on their exact type layer, and typedefs retain nominal
+  identity. GNU C's volatile-qualified **function** carrier is interpreted as
+  no-return before qualification erasure; pointer/object volatile and Clang's
+  missing debug distinction do not supply that effect. The corresponding host
+  producer correction belongs to Ghidra's existing DWARF importer (the enhanced
+  overlay), not reconstruction by the ordinary native replacement.
+  The mapping happens inside `load file`, before any
   option is applied, so the gate is the `KUNA_CALLTARGETTYPE` environment
   variable (chapter 00) the CLI exports ahead of the load from the run's options,
   the mode's preset included, and leaves off when the output language is Rust;
@@ -2611,7 +2671,12 @@ moves.
   the live gate is the process env var
   (`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_typedepth.rs`) that the
   CLI exports before the load, the same bridge `relocobjects` and `i386_pie_plt`
-  use. With `typedepth off` the mapper is the pre-fix budget, byte for byte.
+  use. With `typedepth off` the mapper retains the pre-fix three-hop budget and
+  C alias-selection policy: a typedef is transparent and its anonymous aggregate
+  does not borrow the typedef name, even when the source snapshot records that
+  genuine alias before traversal. Both aggregate and variant-name receivers obey
+  that same selection. Exact producer identity and available qualifier facts stay
+  intact; the C++ mapper retains its own original alias eligibility.
 - **Demangling** (`decompiler/crates/kuna-analysis/src/analyzers/demangle/mod.rs
   (demangle_name)`, the `GnuDemanglerAnalyzer` analog) is not a registered pass but
   a loader hook: applied to every funcsym name after `@VERSION` stripping, before
@@ -5653,8 +5718,14 @@ retain their pre-walk context: late replacement restores it before rebuilding;
 otherwise accepted walks keep their legitimate interworking changes. Prefix
 validation temporarily restores the saved pre-walk context. The xref corpus
 instead retains the context words seen before each instruction's translation,
-stored as runs in decode order. Only the two fingerprint instructions per entry
-are rendered, each under its recorded context in a private scope. This retains
+stored as runs in decode order. The two fingerprint instructions per entry and
+actual read-reference sources into executable storage are rendered, each under
+its recorded context in a private scope; the latter retain their operand bodies
+for the existing literal-pool admission owner. The temporary xref-to-AIF Listing
+also retains genuine call/code/data/read/write references instead of fabricating
+an empty reference model. Real memory-address operands are not subject to the
+address-like scalar floor, and retain their encoded address-space selection.
+This retains
 new callees' legitimate interworking modes as well as earlier fingerprints that
 a later speculative branch could repaint, including callees identified after
 their instructions were already decoded as body code. Rebuilds discard these

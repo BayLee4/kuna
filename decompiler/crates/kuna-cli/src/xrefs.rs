@@ -257,7 +257,7 @@ fn query(args: &XrefArgs) -> Result<String, String> {
         prog.arch().translate(),
         &seeds,
         &resolution.focus(),
-    );
+    ).map_err(|e| e.to_string())?;
 
     let target = resolve_target(&prog, &file, &index, &names, resolution.settle(&index)?);
     warn_other_entries(&index, &names, &target);

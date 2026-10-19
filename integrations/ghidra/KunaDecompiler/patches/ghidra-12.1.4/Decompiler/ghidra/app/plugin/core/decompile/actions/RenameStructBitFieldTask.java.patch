@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RenameStructBitFieldTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RenameStructBitFieldTask.java
+@@ -64,6 +64,7 @@
+ 
+ 	@Override
+ 	public void commit() throws DuplicateNameException, InvalidInputException {
++		requireSourceAuthority(token.getDataType());
+ 		component.setFieldName(newName);
+ 	}
+ }

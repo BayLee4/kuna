@@ -198,9 +198,8 @@ fn signed_constant_lsl_is_defined_and_preserves_signed_consumers() {
             assert!(!code.contains("<<="), "signed compound assignment: {code}");
         }
         if function["name"] == "unsigned_2" {
-            assert!(
-                code.contains("int4 value"),
-                "locked parameter changed: {code}"
+            kuna_harness::c_behavior::assert_c_parameters(
+                code, "unsigned_2", &["value"], "unsigned int (*)(int)",
             );
         }
         if function["name"] == "healthy_2" {

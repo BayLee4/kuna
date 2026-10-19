@@ -83,8 +83,8 @@ use std::rc::Rc;
             flags: crate::fspec::parameter_pieces_flags::TYPELOCK
                 | crate::fspec::parameter_pieces_flags::NAMELOCK,
         });
-        fd.link_proto_params();
-        let vn = fd.new_varnode(ty.get_size(), &addr, Some(ty));
+        fd.link_proto_params().unwrap();
+        let vn = fd.new_varnode(ty.get_size(), &addr, Some(ty)).unwrap();
         let vn = fd.set_input_varnode(vn).unwrap();
         fd.vbank_mut().get_mut(vn).unwrap().set_explicit();
         let high = fd.vbank().get(vn).unwrap().get_high().unwrap();
@@ -102,7 +102,7 @@ use std::rc::Rc;
         let lang = if rust { crate::kuna_lang::OutLang::Rust } else { crate::kuna_lang::OutLang::C };
         let mut print = PrintC::new();
         print.set_name(lang.print_name());
-        print.rt_ctx = RealTypeCtx::from_arch(arch, lang);
+        print.rt_ctx = RealTypeCtx::from_arch(arch, lang, print.options.convention);
         print.set_output_stream();
         print
     }

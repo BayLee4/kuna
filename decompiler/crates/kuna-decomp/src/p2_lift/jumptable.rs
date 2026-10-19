@@ -14,6 +14,8 @@
 //!   - the [`JumpValues`] iterator family ([`JumpValuesRange`],
 //!     [`JumpValuesRangeDefault`]),
 //!   - [`JumpModelTrivial`] and the [`JumpModel`] trait surface,
+//!   - `JumpAssisted`, using the architecture's registered jump-assist userops
+//!     and shared executable-pcode backend for generated table helpers,
 //!   - the [`JumpBasic`] pure static helpers (`isprune`, `ispoint`, `getStride`,
 //!     `getMaxValue`, `duplicateVarnodes`, `findDeterminingVarnodes`),
 //!   - [`JumpTable`] bookkeeping (`IndexPair`, `switchOver`, `trivialSwitchOver`,
@@ -47,8 +49,6 @@
 //!     `liftVerifyUnroll`, `noInterveningStatement`, `FlowBlock::getImmedDom`,
 //!     `Funcdata::pushBranch`, the `Override`/restart machinery, and
 //!     `DynamicHash` are W5/structuring/W4.
-//!   - **`JumpAssisted`** — the `jumpassist` model is entirely W4
-//!     (`pcodeinjectlib`/`userops`/`ExecutablePcode`); ported as a shell.
 //!   - **arch config** — `switch_modulo_bound`, `funcptr_align`,
 //!     `max_jumptable_size` are W4 [`Architecture`] fields not in the ArchContext.
 //!
@@ -73,6 +73,8 @@ use crate::block::{block_get_start, BlockKind};
 use crate::funcdata::Funcdata;
 use crate::kuna_emulatefunction::EmulateFunction;
 use crate::context::{BlockId, OpId, VarnodeId};
+use crate::inject_sleigh::{evaluate_executable, executable_input_size};
+use crate::userop::UserPcodeOp;
 
 // ---------------------------------------------------------------------------
 // Marshaling identifiers (jumptable.cc:24-33)
@@ -1537,6 +1539,266 @@ impl JumpModel for JumpModelTrivial {
     }
 }
 
+/// The processor's jump-assist model (Ghidra `JumpAssisted`).
+///
+/// Only the registered userop index and table size survive a flow-copy clone.
+/// Operation and varnode IDs belong to the current Funcdata and are recovered
+/// again when matching the flow-time table in the analyzed function.
+#[derive(Debug, Default)]
+struct JumpAssisted {
+    assist_op: Option<OpId>,
+    userop_index: Option<uint4>,
+    size_indices: int4,
+    switchvn: Option<VarnodeId>,
+}
+
+impl JumpAssisted {
+    fn userop<'a>(&self, fd: &'a Funcdata) -> KunaResult<&'a UserPcodeOp> {
+        self.userop_index
+            .and_then(|index| fd.get_arch().userops.get_op(index))
+            .filter(|op| op.as_jump_assist().is_some())
+            .ok_or_else(|| KunaError::lowlevel("JumpAssisted: no registered jumpassist userop"))
+    }
+
+    /// Inputs are the assist operands after its userop ID, in payload order.
+    /// Executable lookup takes its own short borrow; no library guard escapes
+    /// this method or remains held while evaluating a generated helper.
+    fn executable_inputs(
+        &self,
+        fd: &Funcdata,
+        payload: int4,
+        element: &str,
+    ) -> KunaResult<Vec<uintb>> {
+        let library = fd
+            .get_arch()
+            .injection_library
+            .as_ref()
+            .ok_or_else(|| KunaError::lowlevel("JumpAssisted: no injection library"))?;
+        let assist = fd.obank().get(self.assist_op.unwrap()).unwrap();
+        let num_inputs = assist.num_input() - 1;
+        if executable_input_size(library, payload)? != num_inputs {
+            return Err(KunaError::lowlevel(format!(
+                "{}: <{}> has wrong number of parameters",
+                String::from_utf8_lossy(self.userop(fd)?.get_name()),
+                element,
+            )));
+        }
+        Ok((1..assist.num_input())
+            .map(|slot| {
+                fd.vbank()
+                    .get(assist.get_in(slot).unwrap())
+                    .unwrap()
+                    .get_offset()
+            })
+            .collect())
+    }
+}
+
+impl JumpModel for JumpAssisted {
+    fn is_override(&self) -> bool {
+        false
+    }
+
+    fn get_table_size(&self) -> int4 {
+        self.size_indices.wrapping_add(1)
+    }
+
+    fn recover_model(
+        &mut self,
+        fd: &mut Funcdata,
+        indop: OpId,
+        matchsize: uint4,
+        maxtablesize: uint4,
+    ) -> KunaResult<bool> {
+        let addr_vn = fd.obank().get(indop).unwrap().get_in(0).unwrap();
+        let Some(assist_id) = fd.vbank().get(addr_vn).unwrap().get_def() else {
+            return Ok(false);
+        };
+        let assist = fd.obank().get(assist_id).unwrap();
+        if assist.code() != OpCode::CPUI_CALLOTHER || assist.num_input() < 3 {
+            return Ok(false);
+        }
+        let index = fd
+            .vbank()
+            .get(assist.get_in(0).unwrap())
+            .unwrap()
+            .get_offset() as uint4;
+        let Some(userop) = fd.get_arch().userops.get_op(index) else {
+            return Ok(false);
+        };
+        let Some(jumpassist) = userop.as_jump_assist() else {
+            return Ok(false);
+        };
+        self.assist_op = Some(assist_id);
+        self.userop_index = Some(index);
+        self.switchvn = assist.get_in(1);
+        for slot in 2..assist.num_input() {
+            if !fd.vbank().get(assist.get_in(slot).unwrap()).unwrap().is_constant() {
+                return Ok(false);
+            }
+        }
+        self.size_indices = if jumpassist.calcsize == -1 {
+            fd.vbank()
+                .get(assist.get_in(2).unwrap())
+                .unwrap()
+                .get_offset() as int4
+        } else {
+            let inputs = self.executable_inputs(fd, jumpassist.calcsize, "size_pcode")?;
+            let library = fd.get_arch().injection_library.as_ref().unwrap();
+            evaluate_executable(library, jumpassist.calcsize, &inputs)? as int4
+        };
+        // The table includes one additional row for the default destination.
+        if matchsize != 0 && matchsize - 1 != self.size_indices as uint4 {
+            return Ok(false);
+        }
+        Ok(self.size_indices as uint4 <= maxtablesize)
+    }
+
+    fn build_addresses(
+        &self,
+        fd: &Funcdata,
+        indop: OpId,
+        addresstable: &mut Vec<Address>,
+        _loadpoints: Option<&mut Vec<LoadTable>>,
+        _loadcounts: Option<&mut Vec<int4>>,
+    ) -> KunaResult<()> {
+        let jumpassist = self.userop(fd)?.as_jump_assist().unwrap();
+        if jumpassist.index2addr == -1 {
+            return Err(KunaError::lowlevel(
+                "Final index2addr calculation outside of jumpassist",
+            ));
+        }
+        let mut inputs = self.executable_inputs(fd, jumpassist.index2addr, "addr_pcode")?;
+        let library = fd.get_arch().injection_library.as_ref().unwrap();
+        let (space, mask) = JumpBasicModel::destination_space(fd, indop);
+        addresstable.clear();
+        for index in 0..self.size_indices {
+            inputs[0] = index as uintb;
+            let output = evaluate_executable(library, jumpassist.index2addr, &inputs)?;
+            // Unlike JumpBasic's emulated BRANCHIND value, helper outputs are
+            // byte addresses already (Ghidra constructs Address directly).
+            addresstable.push(Address::new(Rc::clone(&space), output & mask));
+        }
+        if executable_input_size(library, jumpassist.defaultaddr)? != inputs.len() as int4 {
+            return Err(KunaError::lowlevel(format!(
+                "{}: <default_pcode> has wrong number of parameters",
+                String::from_utf8_lossy(self.userop(fd)?.get_name()),
+            )));
+        }
+        inputs[0] = 0;
+        let default_address = evaluate_executable(library, jumpassist.defaultaddr, &inputs)?;
+        // Ghidra does not apply funcptr_align to the default helper's result.
+        addresstable.push(Address::new(space, default_address));
+        Ok(())
+    }
+
+    fn find_unnormalized(
+        &mut self,
+        _fd: &mut Funcdata,
+        _maxaddsub: uint4,
+        _maxleftright: uint4,
+        _maxext: uint4,
+    ) -> KunaResult<()> {
+        // The userop's first operand is already the unnormalized switch value.
+        Ok(())
+    }
+
+    fn build_labels(
+        &self,
+        fd: &mut Funcdata,
+        _addresstable: &mut [Address],
+        label: &mut Vec<uintb>,
+        orig: &dyn JumpModel,
+    ) -> KunaResult<()> {
+        let orig = orig
+            .as_any()
+            .downcast_ref::<JumpAssisted>()
+            .ok_or_else(|| KunaError::lowlevel("JumpAssisted: original model is not assisted"))?;
+        if orig.size_indices != self.size_indices {
+            return Err(KunaError::lowlevel(
+                "JumpAssisted table size changed during recovery",
+            ));
+        }
+        let jumpassist = self.userop(fd)?.as_jump_assist().unwrap();
+        if jumpassist.index2case == -1 {
+            label.extend((0..self.size_indices).map(|index| index as uintb));
+        } else {
+            let mut inputs = self.executable_inputs(fd, jumpassist.index2case, "case_pcode")?;
+            let library = fd.get_arch().injection_library.as_ref().unwrap();
+            for index in 0..self.size_indices {
+                inputs[0] = index as uintb;
+                label.push(evaluate_executable(library, jumpassist.index2case, &inputs)?);
+            }
+        }
+        label.push(NO_LABEL);
+        Ok(())
+    }
+
+    fn fold_in_normalization(
+        &mut self,
+        fd: &mut Funcdata,
+        _indop: OpId,
+    ) -> KunaResult<Option<VarnodeId>> {
+        let assist = self
+            .assist_op
+            .ok_or_else(|| KunaError::lowlevel("JumpAssisted: assist op not recovered"))?;
+        let switchvn = self
+            .switchvn
+            .ok_or_else(|| KunaError::lowlevel("JumpAssisted: switch variable not recovered"))?;
+        let output = fd.obank().get(assist).unwrap().get_out().unwrap();
+        // Ghidra replaces slot zero of every consumer, including BRANCHIND.
+        // Usually this removes the descendant. Advance past any consumer that
+        // still reads another occurrence, matching the original forward walk
+        // without copying the descendant list.
+        let mut retained = 0;
+        loop {
+            let next = fd.vbank().get(output).unwrap().descend_iter().nth(retained);
+            let Some(reader) = next else { break };
+            fd.op_set_input(reader, switchvn, 0)?;
+            if fd.vbank().get(output).unwrap().descend_iter().nth(retained) == Some(reader) {
+                retained += 1;
+            }
+        }
+        fd.op_destroy(assist)?;
+        self.assist_op = None;
+        Ok(Some(switchvn))
+    }
+
+    fn fold_in_guards(&mut self, _fd: &mut Funcdata, jump: &mut JumpTable) -> KunaResult<bool> {
+        let previous = jump.get_default_block();
+        jump.set_last_as_default();
+        Ok(previous != jump.get_default_block())
+    }
+
+    fn sanity_check(
+        &mut self,
+        _fd: &mut Funcdata,
+        _indop: OpId,
+        _addresstable: &mut Vec<Address>,
+        _loadpoints: &mut Vec<LoadTable>,
+        _loadcounts: Option<&Vec<int4>>,
+    ) -> KunaResult<bool> {
+        Ok(true)
+    }
+
+    fn clone_box(&self) -> Box<dyn JumpModel> {
+        Box::new(Self {
+            userop_index: self.userop_index,
+            size_indices: self.size_indices,
+            ..Self::default()
+        })
+    }
+
+    fn clear(&mut self) {
+        self.assist_op = None;
+        self.switchvn = None;
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JumpBasic static helpers (jumptable.hh:374, jumptable.cc:425-547)
 // ---------------------------------------------------------------------------
@@ -2438,17 +2700,17 @@ impl JumpBasicModel {
     /// upstream index actually produces, but only when every direct or implicit
     /// load-image read is in global read-only, non-volatile memory. Without this
     /// proof, the current memory image may not describe future map values.
-    fn narrow_readonly_selector_domain(&mut self, fd: &Funcdata, maxtablesize: uint4) {
+    fn narrow_readonly_selector_domain(&mut self, fd: &Funcdata, maxtablesize: uint4) -> KunaResult<()> {
         // Model 2 adds a separate default value outside its base range. It does
         // not use this model-1 recovery path, but keep the provenance constraint
         // explicit here so a future call site cannot discard that extra value.
         if self.is_model2 {
-            return;
+            return Ok(());
         }
         let selector_pos = self.varnode_index;
         let selector_vn = self.path_meld.get_varnode(selector_pos);
         let Some(selector) = fd.vbank().get(selector_vn) else {
-            return;
+            return Ok(());
         };
         if selector.get_size() != 1
             || !selector.is_written()
@@ -2456,11 +2718,11 @@ impl JumpBasicModel {
                 .and_then(|op| fd.obank().get(op))
                 .is_none_or(|op| op.code() != OpCode::CPUI_LOAD)
         {
-            return;
+            return Ok(());
         }
         let selector_size = self.jrange().get_size();
         if selector_size <= 1 {
-            return;
+            return Ok(());
         }
 
         let mut remaining_budget = maxtablesize as uintb;
@@ -2491,12 +2753,13 @@ impl JumpBasicModel {
                 }
                 emul.set_load_collect(true);
                 emul.set_readonly_image_required(true);
-                if emul
-                    .emulate_path(inputs.get_value(), &self.path_meld, start_op, start_vn)
-                    .is_err()
-                {
-                    proven = false;
-                    break;
+                match emul.emulate_path(inputs.get_value(), &self.path_meld, start_op, start_vn) {
+                    Ok(_) => {}
+                    Err(error @ KunaError::Transport { .. }) => return Err(error),
+                    Err(_) => {
+                        proven = false;
+                        break;
+                    }
                 }
                 let Some(value) = emul.emulated_value(selector_vn) else {
                     proven = false;
@@ -2511,21 +2774,22 @@ impl JumpBasicModel {
                     break;
                 }
                 values.insert(value & calc_mask(selector.get_size()));
-                more = inputs.next().unwrap_or(false);
+                more = inputs.next()?;
             }
 
             if proven && (values.len() as uintb) < selector_size {
                 let Some(start_op) = self.path_meld.get_earliest_op(selector_pos) else {
-                    return;
+                    return Ok(());
                 };
                 let mut exact = JumpValuesRange::new();
                 exact.set_values(values.into_iter().collect());
                 exact.set_start_vn(selector_vn);
                 exact.set_start_op(start_op);
                 self.jrange = Some(Box::new(exact));
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     /// Mark/unmark the model PcodeOps (C++ `JumpBasic::markModel`,
@@ -2983,7 +3247,7 @@ impl JumpBasicModel {
             .and_then(|o| o.get_parent())
             .ok_or_else(|| KunaError::lowlevel("recoverModel: switch op has no parent block"))?;
         self.find_normalized(fd, parent, -1, matchsize, maxtablesize, indop)?;
-        self.narrow_readonly_selector_domain(fd, maxtablesize);
+        self.narrow_readonly_selector_domain(fd, maxtablesize)?;
         self.skip_stranding_variable(fd, indop, matchsize, maxtablesize);
         let unbounded = self.jrange().get_size() > maxtablesize as uintb;
         self.rows_rejected = !unbounded
@@ -5929,10 +6193,10 @@ impl JumpTable {
     /// Try to recover each model in turn until one matches the BRANCHIND
     /// (C++ `JumpTable::recoverModel`, `jumptable.cc:2408`).
     ///
-    /// Walks `JumpBasic` then `JumpBasic2` (the `JumpAssisted`/CALLOTHER model is
-    /// the `jumpassist` userop family — `// STUB(W4)`, recorded as a loss).  Each
-    /// model's `recoverModel` emulation-drives the index range over the landed
-    /// [`EmulateFunction`].  (kuna) A basic model rejected because it cannot
+    /// Tries the processor's `JumpAssisted`/CALLOTHER model before `JumpBasic`
+    /// and `JumpBasic2`. Assisted tables use generated executable helpers;
+    /// basic models emulate their index range with [`EmulateFunction`].
+    /// (kuna) A basic model rejected because it cannot
     /// label the matched flow-time `rows` ends the walk with no model.
     fn recover_model(
         &mut self,
@@ -5953,9 +6217,16 @@ impl JumpTable {
             // Otherwise this is an old attempt we should remove.
             self.jmodel = None;
         }
-        // STUB(W4): the CALLOTHER `JumpAssisted` (jumpassist userop) model — not
-        // yet ported (needs pcodeinjectlib/ExecutablePcode).  Recorded as a loss;
-        // the basic models cover the corpus switches.
+        let mut assisted = JumpAssisted::default();
+        if assisted.recover_model(
+            fd,
+            indirect,
+            self.addresstable.len() as uint4,
+            max_table_size,
+        )? {
+            self.jmodel = Some(Box::new(assisted));
+            return Ok(());
+        }
 
         // Try the basic model.
         let mut jbasic = JumpBasicModel::new();
@@ -6141,24 +6412,20 @@ impl JumpTable {
 
     /// Recover jump-table addresses keeping track of a possible previous stage
     /// (C++ `JumpTable::recoverMultistage`, `jumptable.cc:2803`).
-    ///
-    /// STUB(W4/W5): the save/restore-on-failure control flow is faithful; the
-    /// inner `recoverAddresses` needs the absent subsystems.
     pub fn recover_multistage(&mut self, fd: &mut Funcdata) -> KunaResult<()> {
         self.save_model();
         let oldaddresstable = std::mem::take(&mut self.addresstable);
         self.loadpoints.clear();
         match self.recover_addresses(fd) {
             Ok(()) => {}
-            Err(_e) => {
-                // C++ catches JumptableThunkError and LowlevelError identically:
-                // restore the saved model and warn. (We do not yet distinguish
-                // the thunk subclass; both downgrade to the same restore path.)
+            Err(e) if e.is_lowlevel() => {
+                // C++ catches JumptableThunkError and LowlevelError identically.
                 self.restore_saved_model();
                 self.addresstable = oldaddresstable;
                 // fd->warning("Second-stage recovery error", indirect->getAddr())
                 // STUB(W4): warning sink lives on Funcdata; recorded as a loss.
             }
+            Err(e) => return Err(e),
         }
         self.partial_table = false;
         self.clear_saved_model(); // Keep the new model if it was created successfully

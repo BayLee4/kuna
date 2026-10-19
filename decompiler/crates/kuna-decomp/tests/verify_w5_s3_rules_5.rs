@@ -170,7 +170,7 @@ fn boolnegate_sless_flip_keeps_booloutput_flag() {
     fd.op_set_input(op, vn, 0).unwrap();
 
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     // get_booleanflip: INT_SLESS -> INT_SLESSEQUAL, reorder = true.
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_SLESSEQUAL);
@@ -212,7 +212,7 @@ fn boolnegate_less_flip_keeps_booloutput_flag() {
     fd.op_set_input(op, vn, 0).unwrap();
 
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_LESSEQUAL);
 
     let flipped = fd.obank().get(flip).unwrap();
@@ -240,7 +240,7 @@ fn boolnegate_equal_flip_keeps_booloutput_flag_control() {
     fd.op_set_input(op, vn, 0).unwrap();
 
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_NOTEQUAL);
     assert!(fd.obank().get(flip).unwrap().is_bool_output());
 }
@@ -274,7 +274,7 @@ fn equal2zero_const_form_wrap_boundary_c_is_zero() {
     fd.op_set_input(op, addvn, 1).unwrap();
 
     let mut rule = RuleEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     // input0 := posvn, input1 := the new -c constant.
     assert_eq!(in_of(&fd, op, 0), posvn);
@@ -316,7 +316,7 @@ fn equal2constant_mult_minus1_negates_constant() {
     fd.op_set_input(op, cvn, 1).unwrap();
 
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     assert_eq!(in_of(&fd, op, 0), a);
     let new_c = in_of(&fd, op, 1);
@@ -376,7 +376,7 @@ fn sless2zero_int_and_oversize_avn_shift_panics() {
         fd.op_set_input(op, rvn, 1).unwrap();
 
         let mut rule = RuleSLess2Zero::new("analysis");
-        rule.apply_op(op, &mut fd)
+        rule.apply_op(op, &mut fd).unwrap()
     });
 
     // C++ ORACLE: returns 0 (sign bit of a 16-byte value is not in the low 64,
@@ -411,7 +411,7 @@ fn sless2zero_int_and_size8_fires_no_panic() {
     fd.op_set_input(op, rvn, 1).unwrap();
 
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // Transform: input1 := avn, opcode unchanged (INT_SLESS), input0 untouched (-1).
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESS);
     assert_eq!(in_of(&fd, op, 1), avn);
@@ -437,7 +437,7 @@ fn sless2zero_int_and_size8_lhs_form_fires() {
     fd.op_set_input(op, zero, 1).unwrap();
 
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESS);
     assert_eq!(in_of(&fd, op, 0), avn);
 }

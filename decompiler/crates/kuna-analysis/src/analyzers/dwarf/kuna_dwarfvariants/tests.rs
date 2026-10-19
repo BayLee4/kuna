@@ -858,6 +858,7 @@ fn builds_five_variants() {
     let ct = payload.get_field(2).unwrap().field_type.clone();
     assert_eq!(bt.get_name(), "Five::field_0x8");
     assert_eq!(ct.get_name(), "Five::field_0x8_1");
+    assert_ne!(bt.get_id(), ct.get_id(), "presentation selection must not coalesce producer variants");
     // Both are called `__0`, but over DIFFERENT extents ([8,16) vs [8,12)), so
     // the spellings do not agree and the offset form wins in both.
     assert_eq!(fields(&bt), vec![("field_0x8".to_string(), 4, 8)]);
@@ -1106,6 +1107,7 @@ fn tree_style_overlay_names_no_variant_but_keeps_the_uncontested_field() {
     let nodet = payload.get_field(1).unwrap().field_type.clone();
     assert_eq!(leaft.get_name(), "Tree::field_0x8");
     assert_eq!(nodet.get_name(), "Tree::field_0x8_1", "different shapes stay apart");
+    assert_ne!(leaft.get_id(), nodet.get_id(), "each producer variant retains its exact identity");
     assert_eq!(fields(&leaft), vec![("__0".to_string(), 0, 8)]);
     assert_eq!(
         fields(&nodet),
@@ -1189,7 +1191,12 @@ fn agreeing_field_names_survive_even_when_the_facet_does_not() {
     let types = factory();
     let mut t = Tree::new();
     let e = result_u32(&mut t);
-    intern(&types, &t, e).expect("Result must build");
+    let built = intern(&types, &t, e).expect("Result must build");
+    let payload = built.get_field(1).unwrap().field_type.clone();
+    let first = payload.get_field(0).unwrap().field_type.clone();
+    let second = payload.get_field(1).unwrap().field_type.clone();
+    assert_eq!(first.get_name(), second.get_name(), "equal layouts may share a generated spelling");
+    assert_ne!(first.get_id(), second.get_id(), "equal layouts do not merge independently identified variants");
     let facet = types
         .find_by_name("Result<u32, u32>::field_0x4")
         .unwrap()
@@ -1210,7 +1217,7 @@ fn seals_when_every_suppressed_facet_name_is_taken() {
     let e = result_u32(&mut t);
     // The facet wants `Result<u32, u32>::field_0x4` (payload width 4) and will
     // try `_1` .. `_7` after it. Hold every one with a COMPLETE 4-byte struct of
-    // a different shape, so `same_layout` rejects each.
+    // a different shape, so the presentation-name eligibility check rejects each.
     for n in 0..8 {
         let name = if n == 0 {
             "Result<u32, u32>::field_0x4".to_string()

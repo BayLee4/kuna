@@ -42,7 +42,7 @@ fn decompile(mut prog: ConsoleProgram) -> String {
     let entry = prog
         .resolve_entry(&EntrySelector::Numeric(0x401000))
         .expect("fixture entry");
-    decompile_targets(&mut prog, vec![entry], false, false, false)[0]
+    decompile_targets(&mut prog, vec![entry], false, false, false).unwrap()[0]
         .code
         .clone()
         .unwrap_or_default()

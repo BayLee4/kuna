@@ -3,6 +3,7 @@
 use crate::context::{OpId, VarnodeId};
 use crate::dtype::{type_metatype, Datatype};
 use crate::funcdata::Funcdata;
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
 
@@ -11,34 +12,57 @@ pub(crate) struct Transfer {
     pub target: Rc<Datatype>,
     pub size: i32,
     pub to_float: bool,
+    pub object_source: Option<Rc<Datatype>>,
 }
 
-/// A same-width `CAST` between an integer and a float, judged by the types the
-/// printed C declares: a named variable or field, else the value's own type.
-pub(crate) fn storage_transfer(fd: &Funcdata, decl_high_type: bool, op: OpId) -> Option<Transfer> {
-    let operation = fd.obank().get(op)?;
+/// A same-width storage `CAST`, judged by the types the printed C declares:
+/// a named variable or field, else the value's own type. C also transfers full
+/// aggregate objects to/from integer words; this is not a numeric C cast.
+pub(crate) fn storage_transfer(fd: &Funcdata, decl_high_type: bool, op: OpId) -> KunaResult<Option<Transfer>> {
+    let Some(operation) = fd.obank().get(op) else { return Ok(None) };
     if operation.code() != OpCode::CPUI_CAST {
-        return None;
+        return Ok(None);
     }
-    let input = operation.get_in(0)?;
-    let out = operation.get_out()?;
-    let src = fd.vbank().get(input)?;
-    let dst = fd.vbank().get(out)?;
+    let Some(input) = operation.get_in(0) else { return Ok(None) };
+    let Some(out) = operation.get_out() else { return Ok(None) };
+    let Some(src) = fd.vbank().get(input) else { return Ok(None) };
+    let Some(dst) = fd.vbank().get(out) else { return Ok(None) };
     let size = src.get_size();
-    if !matches!(size, 4 | 8) || dst.get_size() != size {
-        return None;
+    if !matches!(size, 1 | 2 | 4 | 8) || dst.get_size() != size {
+        return Ok(None);
     }
     let slot = operation.get_slot(input);
-    let from_ty = crate::kuna_stackviews::access_type(fd, input, op, slot)
-        .or_else(|| declared_member_type(fd, decl_high_type, input))
-        .unwrap_or_else(|| fd.vn_type_read_facing(input, op));
-    let to_ty = crate::kuna_stackviews::access_type(fd, out, op, -1)
-        .or_else(|| declared_member_type(fd, decl_high_type, out))
-        .unwrap_or_else(|| fd.vn_type_def_facing(out));
+    let from_ty = match crate::kuna_stackviews::access_type(fd, input, op, slot)?
+        .or_else(|| declared_member_type(fd, decl_high_type, input)) {
+        Some(ty) => ty,
+        None => fd.vn_type_read_facing(input, op)?,
+    };
+    let to_ty = match crate::kuna_stackviews::access_type(fd, out, op, -1)?
+        .or_else(|| declared_member_type(fd, decl_high_type, out)) {
+        Some(ty) => ty,
+        None => fd.vn_type_def_facing(out)?,
+    };
     let from = from_ty.get_metatype();
     let to = to_ty.get_metatype();
+    let object = |t| matches!(t, type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION);
+    let word = |t| matches!(t, type_metatype::TYPE_INT | type_metatype::TYPE_UINT);
+    // An equal-sized containing declaration or merged native type does not
+    // turn an operation-facing scalar member access into a whole-object value.
+    if fd.get_arch().out_lang == crate::kuna_lang::OutLang::C
+        && from_ty.get_size() == size && to_ty.get_size() == size
+        && ((object(from) && word(to) && object(fd.vn_type_read_facing(input, op)?.get_metatype()))
+            || (word(from) && object(to) && object(fd.vn_type_def_facing(out)?.get_metatype())))
+    {
+        return Ok(Some(Transfer {
+            input, target: to_ty, size, to_float: false,
+            object_source: Some(from_ty),
+        }));
+    }
+    if !matches!(size, 4 | 8) {
+        return Ok(None);
+    }
     if from == type_metatype::TYPE_UNKNOWN && untyped_call_value(fd, input, 0) {
-        return None;
+        return Ok(None);
     }
     let integer = |t| {
         matches!(
@@ -48,14 +72,15 @@ pub(crate) fn storage_transfer(fd: &Funcdata, decl_high_type: bool, op: OpId) ->
     };
     let to_float = to == type_metatype::TYPE_FLOAT && integer(from);
     if !to_float && !(from == type_metatype::TYPE_FLOAT && integer(to)) {
-        return None;
+        return Ok(None);
     }
-    Some(Transfer {
+    Ok(Some(Transfer {
         input,
         target: to_ty,
         size,
         to_float,
-    })
+        object_source: None,
+    }))
 }
 
 /// A low-end integer truncation reads a merged float variable's storage bits.
@@ -63,54 +88,57 @@ pub(crate) fn truncated_float_storage(
     fd: &Funcdata,
     decl_high_type: bool,
     op: OpId,
-) -> Option<(Transfer, Rc<Datatype>)> {
-    let operation = fd.obank().get(op)?;
+) -> KunaResult<Option<(Transfer, Rc<Datatype>)>> {
+    let Some(operation) = fd.obank().get(op) else { return Ok(None) };
     if operation.code() != OpCode::CPUI_SUBPIECE {
-        return None;
+        return Ok(None);
     }
-    let input = operation.get_in(0)?;
-    let source = fd.vbank().get(input)?;
+    let Some(input) = operation.get_in(0) else { return Ok(None) };
+    let Some(source) = fd.vbank().get(input) else { return Ok(None) };
     if source.is_implied() {
-        return None;
+        return Ok(None);
     }
-    let output = fd.vbank().get(operation.get_out()?)?;
-    let offset = fd.vbank().get(operation.get_in(1)?)?;
+    let Some(output_id) = operation.get_out() else { return Ok(None) };
+    let Some(output) = fd.vbank().get(output_id) else { return Ok(None) };
+    let Some(offset_id) = operation.get_in(1) else { return Ok(None) };
+    let Some(offset) = fd.vbank().get(offset_id) else { return Ok(None) };
     let size = source.get_size();
     if offset.get_offset() != 0
         || !matches!(size, 4 | 8)
         || !matches!(output.get_size(), 1 | 2 | 4)
         || output.get_size() >= size
     {
-        return None;
+        return Ok(None);
     }
-    let result_type = fd.vn_type_def_facing(operation.get_out()?);
+    let result_type = fd.vn_type_def_facing(output_id)?;
     if !matches!(
         result_type.get_metatype(),
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN
     ) {
-        return None;
+        return Ok(None);
     }
-    let declared = crate::kuna_stackviews::access_type(fd, input, op, operation.get_slot(input))
-        .or_else(|| declared_member_type(fd, decl_high_type, input))?;
+    let Some(declared) = crate::kuna_stackviews::access_type(fd, input, op, operation.get_slot(input))?
+        .or_else(|| declared_member_type(fd, decl_high_type, input)) else { return Ok(None) };
     if declared.get_metatype() != type_metatype::TYPE_FLOAT || declared.get_size() != size {
-        return None;
+        return Ok(None);
     }
-    let types = fd.get_arch().types()?;
+    let Some(types) = fd.get_arch().types() else { return Ok(None) };
     let widths_match = if size == 4 {
         types.get_size_of_int() == 4 && types.get_size_of_float() == 4
     } else {
         types.get_size_of_long_long() == 8 && types.get_size_of_double() == 8
     };
     if !widths_match || result_type.is_enum_type() {
-        return None;
+        return Ok(None);
     }
-    let target = types.get_base(size, type_metatype::TYPE_UINT).ok()?;
-    Some((Transfer {
+    let target = types.get_base(size, type_metatype::TYPE_UINT)?;
+    Ok(Some((Transfer {
         input,
         target,
         size,
         to_float: false,
-    }, result_type))
+        object_source: None,
+    }, result_type)))
 }
 
 /// Whether a same-width `CAST` of `input` to a float prints as a reinterpretation
@@ -191,6 +219,7 @@ pub(crate) fn stack_float_input(
             .ok()?,
         size: value.get_size(),
         to_float: true,
+        object_source: None,
     })
 }
 

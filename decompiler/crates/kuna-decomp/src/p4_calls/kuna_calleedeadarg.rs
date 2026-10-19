@@ -82,9 +82,9 @@
 //!   the whole callee.
 //! * Every path ENDS somewhere — at a `RETURN`, at a nested
 //!   `CALL`/`CALLIND`/`CALLOTHER`, at an unresolved `BRANCHIND`, at a `LOAD`/
-//!   `STORE` naming the register space (an indexed register file), or at an
-//!   undecodable instruction — and the register must already be WRITTEN when it
-//!   does. Past that point the walk is not reading the code that runs, so only
+//!   `STORE` naming the register space (an indexed register file) — and the
+//!   register must already be WRITTEN when it does. Past that point the walk
+//!   is not reading the code that runs, so only
 //!   bytes already written stay provable. That is what lets a body which
 //!   overwrites `x0` and then calls `printf` still prove `x0` dead, while a body
 //!   whose first act is a call proves nothing.
@@ -106,8 +106,10 @@
 //!   is what a body that is one endless loop does — and what a PE import's IAT
 //!   slot does when its pointer bytes are decoded as instructions, which is
 //!   where the argument lists of `CloseHandle` and `Process32NextW` went.
-//! * The instruction budget, a too-large written set or a too-large cut list
-//!   abandon the whole summary, which then proves nothing at all.
+//! * An unavailable or undecodable instruction, the instruction budget, a
+//!   too-large written set or a too-large cut list abandon the whole summary,
+//!   which then proves nothing at all. A terminal transport failure propagates
+//!   instead and is never cached as an unknown body.
 //!
 //! Only the `register` space is answered. A `ram`-space (global) trial would need
 //! the walk to model memory, which it does not, so those keep today's answer.
@@ -195,6 +197,20 @@ pub struct CalleeEntryDead {
     /// emits to reserve stack with dead registers). Read by
     /// [`Self::reads_low_byte`].
     live_read_bytes: ByteSet,
+    /// Entry bytes consumed by an operation other than a proved push/save
+    /// copy or a value-erasing/formal comparison. Unlike `reads_live`, this
+    /// does not mistake saving and restoring an incoming register for an ABI
+    /// argument use. Physical call dependencies use only exact recorded reads
+    /// whose entire range is present here.
+    consumed_read_bytes: ByteSet,
+    /// Exact instruction-local demand projections. Keep them separate from the
+    /// raw ranges used by dead-entry, width and convention-recovery policies.
+    projected_input_reads: Vec<(int4, u64, int4)>,
+    /// Intrinsic type policies of exact operand reads that still held every
+    /// incoming byte at that operation. Keep opcode and slot: slot-sensitive
+    /// policies and competing signed/unsigned hints are resolved by the existing
+    /// type consumer, not by source-formal projection or last-writer choice.
+    input_type_hints: Vec<(int4, u64, int4, OpCode, int4)>,
     /// [`Self::live_read_bytes`] without the reads of a register a path only
     /// pushes as an alignment pad ABOVE a call's stack arguments: `push %rdx` of
     /// a register the body never set, ahead of `__snprintf_chk`'s three stack
@@ -221,8 +237,8 @@ pub struct CalleeEntryDead {
     cuts: Vec<ByteSet>,
     /// The subset of [`Self::cuts`] taken where control left for code the walk
     /// could not NAME: an indirect call or tail call, a `CALLOTHER`, an indexed
-    /// register-file access, an undecodable instruction. Nothing a caller left
-    /// in a register survives one of these provably. Read by
+    /// register-file access. Nothing a caller left in a register survives one
+    /// of these provably. Read by
     /// [`resolve_forward_transfer`].
     opaque_cuts: Vec<ByteSet>,
     /// The subset of [`Self::cuts`] taken at a DIRECT call, with the target's
@@ -255,11 +271,78 @@ pub struct CalleeEntryDead {
     /// is abandoned, since each one is positive evidence. Read by
     /// [`Self::traps_unwritten`].
     trap_cuts: Vec<ByteSet>,
+    /// Uniform entry-SP displacement at genuine normal returns. This body fact
+    /// is independent of source formals and calling-convention declarations.
+    normal_return_delta: Option<i64>,
+    /// A lost or unsupported SP/flow state invalidates only this extra fact.
+    stack_effect_invalid: bool,
+    /// A normal return must actually load the untouched incoming caller-return
+    /// slot. A raw RETURN opcode alone does not establish this (call-next).
+    entry_return_invalid: bool,
     /// Did the walk cover every path with nothing abandoned?
     complete: bool,
 }
 
 impl CalleeEntryDead {
+    /// Exact SP displacement shared by every normal return the complete bounded
+    /// walk covers. Calls, opaque exits and unavailable paths are not returns.
+    pub(crate) fn raw_return_stack_delta(&self) -> Option<i64> {
+        if !self.walked_every_path() || self.undecodable || self.stack_effect_invalid
+            || !self.named_cuts.is_empty() || !self.opaque_cuts.is_empty()
+        {
+            return None;
+        }
+        self.normal_return_delta
+    }
+
+    /// Raw stack displacement additionally backed by exact incoming return-slot
+    /// provenance, not just an instruction classified as RETURN.
+    pub(crate) fn normal_return_stack_delta(&self) -> Option<i64> {
+        if self.entry_return_invalid { return None; }
+        self.raw_return_stack_delta()
+    }
+
+    pub(crate) fn input_type_hints(
+        &self, address: &Address, size: int4,
+    ) -> impl Iterator<Item = (OpCode, int4)> + '_ {
+        let index = address.get_space().map(|space| space.get_index());
+        let offset = address.get_offset();
+        self.input_type_hints.iter().filter_map(move |&(space, at, width, opcode, slot)| {
+            (self.walked_every_path() && !self.undecodable && index == Some(space)
+                && offset == at && size == width)
+                .then_some((opcode, slot))
+        })
+    }
+
+    /// Exact incoming register reads that are more than preservation machinery.
+    /// This is physical dependency evidence, not a source parameter list.
+    pub(crate) fn consumed_input_ranges(&self) -> impl Iterator<Item = (int4, u64, int4)> + '_ {
+        self.reads_live.iter().chain(&self.projected_input_reads).copied().filter(|&(idx, off, size)| {
+            self.walked_every_path() && !self.undecodable && size > 0
+                && off.checked_add(size as u64).is_some_and(|end| {
+                    (off..end).all(|byte| self.consumed_read_bytes.contains(&(idx, byte)))
+                })
+        })
+    }
+
+    /// Positive selected-callee dependencies whose exact bytes this path has
+    /// not written. Unlike source-prototype inference, this includes a
+    /// zero-formal forwarder without authoring another source parameter.
+    pub(crate) fn export_forwarded_inputs(
+        &self,
+        mut requirements: impl FnMut(&Address) -> Vec<(Address, int4)>,
+    ) -> Vec<(Address, Vec<(Address, int4)>)> {
+        if !self.walked_every_path() || self.undecodable { return Vec::new(); }
+        self.named_cuts.iter().map(|(target, written)| {
+            let ranges = requirements(target).into_iter().filter(|(at,size)| {
+                *size > 0 && at.get_space().is_some_and(|space| space.get_index() == self.reg_idx)
+                    && at.get_offset().checked_add(*size as u64).is_some_and(|end|
+                        (at.get_offset()..end).all(|byte| !written.contains(&(self.reg_idx,byte))))
+            }).collect();
+            (target.clone(), ranges)
+        }).collect()
+    }
+
     /// Does this summary *prove* the callee never reads any byte of
     /// `[addr, addr+size)` before writing it?
     pub fn proves_dead(&self, addr: &Address, size: int4) -> bool {
@@ -371,8 +454,11 @@ impl CalleeEntryDead {
         } else {
             addr.get_offset()
         };
-        let live = if pads { &self.unpadded_read_bytes } else { &self.live_read_bytes };
-        live.contains(&(self.reg_idx, low))
+        // Saved-cell provenance can enter the padding evidence when reloaded.
+        // Padding is an exclusion, not authority to turn a store-only read
+        // into a non-store read on conventions without a variadic-call marker.
+        (self.live_read_bytes.contains(&(self.reg_idx, low))
+            && (!pads || self.unpadded_read_bytes.contains(&(self.reg_idx, low))))
             || (stores && self.stored_read_bytes.contains(&(self.reg_idx, low)))
     }
 
@@ -406,6 +492,7 @@ impl CalleeEntryDead {
     #[cfg(test)]
     pub(crate) fn with_written_byte(mut self, b: u64) -> Self {
         self.live_read_bytes.remove(&(self.reg_idx, b));
+        self.consumed_read_bytes.remove(&(self.reg_idx, b));
         self.unpadded_read_bytes.remove(&(self.reg_idx, b));
         self
     }
@@ -595,6 +682,12 @@ impl CalleeEntryDead {
                 .iter()
                 .flat_map(|&(idx, off, sz)| (off..off + sz.max(0) as u64).map(move |b| (idx, b)))
                 .collect(),
+            consumed_read_bytes: reads
+                .iter()
+                .flat_map(|&(idx, off, sz)| (off..off + sz.max(0) as u64).map(move |b| (idx, b)))
+                .collect(),
+            projected_input_reads: Vec::new(),
+            input_type_hints: Vec::new(),
             unpadded_read_bytes: reads
                 .iter()
                 .flat_map(|&(idx, off, sz)| (off..off + sz.max(0) as u64).map(move |b| (idx, b)))
@@ -611,6 +704,9 @@ impl CalleeEntryDead {
             trap_cuts: Vec::new(),
             stored_read_bytes: ByteSet::new(),
             undecodable: false,
+            normal_return_delta: None,
+            stack_effect_invalid: true,
+            entry_return_invalid: true,
             complete,
         }
     }
@@ -621,6 +717,14 @@ impl CalleeEntryDead {
         if self.live_read_bytes.remove(&(self.reg_idx, b)) {
             self.unpadded_read_bytes.remove(&(self.reg_idx, b));
             self.stored_read_bytes.insert((self.reg_idx, b));
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_input_type_hint(mut self, address: &Address, size: int4, opcode: OpCode, slot: int4) -> Self {
+        if let Some(space) = address.get_space() {
+            self.input_type_hints.push((space.get_index(), address.get_offset(), size, opcode, slot));
         }
         self
     }
@@ -721,7 +825,7 @@ pub fn resolve_forward_transfer(
     arch: &mut crate::architecture::Architecture,
     entry: &Address,
     reg_idx: int4,
-) -> ForwardTransfer {
+) -> KunaResult<ForwardTransfer> {
     let mut visiting: Vec<(int4, u64)> = Vec::new();
     let mut budget = MAX_FORWARD_NODES;
     resolve_node(arch, entry, reg_idx, &mut visiting, &mut budget)
@@ -778,30 +882,43 @@ fn resolve_node(
     reg_idx: int4,
     visiting: &mut Vec<(int4, u64)>,
     budget: &mut usize,
-) -> ForwardTransfer {
-    let Some(sp) = entry.get_space() else { return ForwardTransfer::denied(reg_idx) };
+) -> KunaResult<ForwardTransfer> {
+    let Some(sp) = entry.get_space() else { return Ok(ForwardTransfer::denied(reg_idx)) };
     let key = (sp.get_index(), entry.get_offset());
     // A cycle in the closure is a recursive component: the recovery of every
     // member of it is short about the others, so nothing is proven.
     if visiting.contains(&key) || *budget == 0 {
-        return ForwardTransfer::denied(reg_idx);
+        return Ok(ForwardTransfer::denied(reg_idx));
     }
     *budget -= 1;
-    let Some(dead) = probe_cached(arch, entry, reg_idx) else {
-        return ForwardTransfer::denied(reg_idx);
+    let Some(dead) = probe_cached(arch, entry, reg_idx)? else {
+        return Ok(ForwardTransfer::denied(reg_idx));
     };
     visiting.push(key);
+    let mut failure = None;
     let out = fold_node(&dead, reg_idx, |target| {
+        if failure.is_some() {
+            return TargetAnswer::Unaccounted;
+        }
         if target.get_space().is_none() {
             return TargetAnswer::Unaccounted;
         }
         if declared_accounts_for_its_reads(arch, target) {
             return TargetAnswer::Accounted;
         }
-        TargetAnswer::Through(resolve_node(arch, target, reg_idx, visiting, budget))
+        match resolve_node(arch, target, reg_idx, visiting, budget) {
+            Ok(answer) => TargetAnswer::Through(answer),
+            Err(error) => {
+                failure = Some(error);
+                TargetAnswer::Unaccounted
+            }
+        }
     });
     visiting.pop();
-    out
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(out),
+    }
 }
 
 /// Does a source declaration state what the function at `entry` reads?
@@ -851,13 +968,13 @@ pub fn reads_through_calls(
     entry: &Address,
     reg_idx: int4,
     memo: &mut ThroughMemo,
-) -> Option<Rc<CalleeEntryDead>> {
-    let dead = probe_cached(arch, entry, reg_idx)?;
-    let reads = add_reads_through(&dead, |t| taken_reads(arch, t, reg_idx, MAX_THROUGH_DEPTH - 1, memo));
-    Some(match reads {
+) -> KunaResult<Option<Rc<CalleeEntryDead>>> {
+    let Some(dead) = probe_cached(arch, entry, reg_idx)? else { return Ok(None) };
+    let reads = add_reads_through(&dead, |t| taken_reads(arch, t, reg_idx, MAX_THROUGH_DEPTH - 1, memo))?;
+    Ok(Some(match reads {
         Some(reads_live) => Rc::new(CalleeEntryDead { reads_live, ..(*dead).clone() }),
         None => dead,
-    })
+    }))
 }
 
 /// The live reads of the function at `entry`, its own direct calls followed
@@ -870,19 +987,19 @@ fn taken_reads(
     reg_idx: int4,
     depth: u32,
     memo: &mut ThroughMemo,
-) -> Option<Rc<Vec<RegRead>>> {
-    let sp = entry.get_space()?;
+) -> KunaResult<Option<Rc<Vec<RegRead>>>> {
+    let Some(sp) = entry.get_space() else { return Ok(None) };
     let key = (sp.get_index(), entry.get_offset());
     if let Some(r) = memo.get(&(key.0, key.1, depth)) {
-        return Some(Rc::clone(r));
+        return Ok(Some(Rc::clone(r)));
     }
     let taken = match arch.kuna_protoorder_types.get(&key).cloned() {
         Some(stated) if stated.arity_sound => {
-            let dead = probe_cached(arch, entry, reg_idx)?;
+            let Some(dead) = probe_cached(arch, entry, reg_idx)? else { return Ok(None) };
             let through = if depth == 0 {
                 None
             } else {
-                add_reads_through(&dead, |t| taken_reads(arch, t, reg_idx, depth - 1, memo))
+                add_reads_through(&dead, |t| taken_reads(arch, t, reg_idx, depth - 1, memo))?
             };
             let reads = through.unwrap_or_else(|| dead.reads_live.clone());
             reads.into_iter().filter(|r| takes(&stated, r)).collect()
@@ -891,7 +1008,7 @@ fn taken_reads(
     };
     let out = Rc::new(taken);
     memo.insert((key.0, key.1, depth), Rc::clone(&out));
-    Some(out)
+    Ok(Some(out))
 }
 
 /// Does `stated` take a parameter that `read` overlaps, other than a variadic tail?
@@ -910,8 +1027,11 @@ pub(crate) fn probe_cached(
     arch: &mut crate::architecture::Architecture,
     entry: &Address,
     reg_idx: int4,
-) -> Option<Rc<CalleeEntryDead>> {
-    let sp = entry.get_space()?;
+) -> KunaResult<Option<Rc<CalleeEntryDead>>> {
+    if !arch.is_body_entry(entry) {
+        return Ok(None);
+    }
+    let Some(sp) = entry.get_space() else { return Ok(None) };
     let key = (sp.get_index(), entry.get_offset());
     if !arch.kuna_callee_dead_cache.contains_key(&key) {
         let follow = crate::kuna_armfloatargs::applies(arch);
@@ -919,11 +1039,18 @@ pub(crate) fn probe_cached(
             &arch.userops,
             crate::kuna_syscallregs::SyscallFamily::from_archid(&arch.archid),
         );
+        let stack_pointer = arch.manage().get_stack_space()
+            .filter(|space| space.stack_grows_negative())
+            .and_then(|space| space.get_spacebase(0).ok())
+            .filter(|base| base.space.as_ref().is_some_and(|space| space.get_index() == reg_idx))
+            .map(|base| (base.offset, base.size));
+        let memory_layout = arch.manage().get_default_data_space()
+            .map(|space| (space.get_index(), space.is_big_endian()));
         let probed =
-            probe_entry_with(arch.translate(), entry, reg_idx, follow, &traps, &arch.format_stack_args);
+            probe_entry_with(arch.translate(), entry, reg_idx, follow, &traps, &arch.format_stack_args, stack_pointer, memory_layout)?;
         arch.kuna_callee_dead_cache.insert(key, Rc::new(probed));
     }
-    arch.kuna_callee_dead_cache.get(&key).cloned()
+    Ok(arch.kuna_callee_dead_cache.get(&key).cloned())
 }
 
 /// `dead`'s live reads plus what each direct call's target takes of the bytes
@@ -937,17 +1064,17 @@ pub(crate) fn probe_cached(
 /// adds nothing, and neither does an indirect transfer, which names no target.
 fn add_reads_through(
     dead: &CalleeEntryDead,
-    mut target: impl FnMut(&Address) -> Option<Rc<Vec<RegRead>>>,
-) -> Option<Vec<RegRead>> {
+    mut target: impl FnMut(&Address) -> KunaResult<Option<Rc<Vec<RegRead>>>>,
+) -> KunaResult<Option<Vec<RegRead>>> {
     if !dead.complete || dead.named_cuts.is_empty() {
-        return None;
+        return Ok(None);
     }
     let idx = dead.reg_idx;
     let own = dead.read_bytes();
     let mut reads = dead.reads_live.clone();
     let before = reads.len();
     for (t, written) in &dead.named_cuts {
-        let Some(inner) = target(t) else { continue };
+        let Some(inner) = target(t)? else { continue };
         for &(ridx, off, sz) in inner.iter() {
             let covered = |b: u64| written.contains(&(idx, b)) || own.contains(&(idx, b));
             if ridx != idx || (off..off + sz.max(0) as u64).any(covered) {
@@ -958,7 +1085,7 @@ fn add_reads_through(
             }
         }
     }
-    (reads.len() > before).then_some(reads)
+    Ok((reads.len() > before).then_some(reads))
 }
 
 /// One decoded p-code op, kept in emission order.
@@ -995,6 +1122,112 @@ impl kuna_sleigh::translate::PcodeEmit for EntryEmit {
     }
 }
 
+/// Required input bits across exact temporaries of one instruction. Architectural
+/// writes and side effects remain fully observable. Ambiguous local geometry
+/// keeps the original raw reads; this is not cross-instruction register liveness.
+fn instruction_input_projection(
+    emit: &EntryEmit,
+    register: int4,
+) -> smallvec::SmallVec<[(usize, usize, u64); 8]> {
+    let mut projected = smallvec::SmallVec::new();
+    if emit.internal_flow || !emit.ops.iter().any(|op| op.opc == OpCode::CPUI_SUBPIECE) {
+        return projected;
+    }
+    // Fixed inline bounds keep this optional refinement allocation-free.
+    let mut locals = smallvec::SmallVec::<[(u64, u32, u64); 16]>::new();
+    let unique = |value: &VarnodeData| {
+        value.space.as_ref().is_some_and(|space| space.get_type() == spacetype::IPTR_INTERNAL)
+    };
+    for op in &emit.ops {
+        for input in &op.ins {
+            if !(1..=8).contains(&input.size)
+                || (input.space.as_ref().is_none_or(|space| space.get_type() != spacetype::IPTR_CONSTANT)
+                    && input.offset.checked_add(u64::from(input.size)).is_none())
+                || (unique(input) && !locals.iter().any(|&(at, size, _)| at == input.offset && size == input.size))
+            {
+                return projected;
+            }
+        }
+        if let Some(output) = &op.out {
+            if !(1..=8).contains(&output.size) {
+                return projected;
+            }
+            if unique(output) {
+                let Some(end) = output.offset.checked_add(u64::from(output.size)) else {
+                    return projected;
+                };
+                if locals.len() == 16 || locals.iter().any(|&(at, size, _)| {
+                    at < end && output.offset < at + u64::from(size)
+                }) {
+                    return projected;
+                }
+                locals.push((output.offset, output.size, 0));
+            }
+        }
+        let arity = match op.opc {
+            OpCode::CPUI_COPY => Some(1),
+            OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB | OpCode::CPUI_INT_MULT
+                | OpCode::CPUI_SUBPIECE => Some(2),
+            _ => None,
+        };
+        if arity.is_some_and(|arity| op.ins.len() != arity || op.out.is_none()) {
+            return projected;
+        }
+        if op.opc == OpCode::CPUI_SUBPIECE {
+            let source = &op.ins[0];
+            let skip = &op.ins[1];
+            if !skip.space.as_ref().is_some_and(|space| space.get_type() == spacetype::IPTR_CONSTANT)
+                || skip.offset > u64::from(source.size)
+                || u64::from(op.out.as_ref().expect("checked projection output").size)
+                    > u64::from(source.size) - skip.offset
+            {
+                return projected;
+            }
+        } else if arity.is_some() && op.ins.iter().any(|input| {
+            input.size != op.out.as_ref().expect("checked arithmetic output").size
+        }) {
+            return projected;
+        }
+    }
+    for (index, op) in emit.ops.iter().enumerate().rev() {
+        let output_mask = match op.out.as_ref() {
+            Some(output) if unique(output) => locals.iter()
+                .find(|&&(at, size, _)| at == output.offset && size == output.size)
+                .expect("validated instruction-local output").2,
+            Some(output) => kuna_base::address::calc_mask(output.size as int4),
+            None => !0u64,
+        };
+        for (slot, input) in op.ins.iter().enumerate() {
+            let full = kuna_base::address::calc_mask(input.size as int4);
+            let consumed = if op.out.is_none() || matches!(op.opc, OpCode::CPUI_LOAD | OpCode::CPUI_STORE) {
+                full
+            } else {
+                // Only the shared pure operations transfer reduced demand.
+                // An unsupported op can have effects even with an unused result.
+                crate::p9_emit::coreaction_render::projected_input_consumption(
+                    op.opc, output_mask, slot as int4, input.size as int4,
+                    if op.opc == OpCode::CPUI_SUBPIECE { op.ins[1].offset } else { 0 },
+                ).unwrap_or(full) & full
+            };
+            if unique(input) {
+                let local = locals.iter_mut()
+                    .find(|local| local.0 == input.offset && local.1 == input.size)
+                    .expect("validated instruction-local input");
+                local.2 |= consumed;
+            } else if input.space.as_ref().is_some_and(|space| space.get_index() == register)
+                && consumed != full
+            {
+                if projected.len() == 8 {
+                    projected.clear();
+                    return projected;
+                }
+                projected.push((index, slot, consumed));
+            }
+        }
+    }
+    projected
+}
+
 /// A pending path: where to resume and what is already written on the way there.
 struct Frame {
     at: Address,
@@ -1008,6 +1241,13 @@ struct Frame {
 struct Pushed {
     /// The stack pointer the pushes moved, `(offset, size)` in the register space.
     sp: Option<(u64, u32)>,
+    /// Current stack-pointer displacement from entry, when supplied by the
+    /// architecture. This admits exact negative private spills, not homes or
+    /// caller-owned positive slots.
+    entry_offset: Option<i64>,
+    /// Actual STORE/LOAD memory space and byte order. Partial saved-register
+    /// proofs require this layout, not a guess from the destination register.
+    memory_layout: Option<(int4, bool)>,
     /// Each slot as `(offset from the current stack pointer, width, bytes)`.
     slots: Vec<(i64, i64, ByteSet)>,
 }
@@ -1022,18 +1262,69 @@ impl Pushed {
     }
 
     /// Count the pushes in `[off, off+size)` as reads: the stack was read there.
-    fn read_back(&mut self, res: &mut CalleeEntryDead, off: i64, size: i64) {
-        let (hit, keep): (Vec<_>, Vec<_>) =
-            self.slots.drain(..).partition(|(o, w, _)| *o < off + size && off < *o + *w);
-        self.slots = keep;
-        for (_, _, bytes) in hit {
-            res.unpadded_read_bytes.extend(bytes);
+    fn read_back(
+        &mut self, res: &mut CalleeEntryDead, off: i64, size: i64,
+        destination: Option<&VarnodeData>,
+    ) -> bool {
+        // Reading a saved cell is not a memory write. Keep its provenance for a
+        // later reload, even when this read merely restores the original register.
+        let restores = self.slots.iter().find(|(at, width, _)| *at == off && *width == size)
+            .is_some_and(|(at, width, bytes)| {
+            *at == off && *width == size && destination.is_some_and(|out| {
+                out.size as i64 == size && bytes.len() == out.size as usize
+                    && out.space.as_ref().is_some_and(|space| space.get_index() == res.reg_idx)
+                    && (out.offset..out.offset + out.size as u64)
+                        .all(|byte| bytes.contains(&(res.reg_idx, byte)))
+            })
+        });
+        for &(at, width, ref bytes) in &self.slots {
+            if at >= off + size || off >= at + width {
+                continue;
+            }
+            if !restores {
+                if at == off && width == size {
+                    res.consumed_read_bytes.extend(bytes.iter().copied());
+                } else if let (Some(destination), Some(&(idx, first))) = (destination, bytes.first()) {
+                    // A partial reload is not evidence that the entire saved
+                    // register is consumed. Map only a pristine contiguous save
+                    // and a known register destination; other geometry is unknown.
+                    if bytes.len() == width as usize
+                        && (first..first + width as u64).all(|b| bytes.contains(&(idx, b)))
+                        && self.memory_layout.is_some_and(|_| {
+                            destination.space.as_ref().is_some_and(|space| {
+                                space.get_index() == idx
+                            })
+                        })
+                    {
+                        let begin = off.max(at) - at;
+                        let end = (off + size).min(at + width) - at;
+                        let count = end - begin;
+                        // These are byte-address offsets, not significance
+                        // coordinates. Only an actual mixed-endian memory
+                        // layout reverses the saved register's byte order.
+                        let memory_big = self.memory_layout.expect("checked memory layout").1;
+                        let register_big = destination.space.as_ref().expect("checked register space").is_big_endian();
+                        let relative = if register_big == memory_big { begin } else { width - end };
+                        let source = first + relative as u64;
+                        for byte in source..source + count as u64 {
+                            res.consumed_read_bytes.insert((idx, byte));
+                        }
+                        let read = (idx, source, count as int4);
+                        if !res.reads_live.contains(&read) {
+                            res.reads_live.push(read);
+                        }
+                    }
+                }
+            }
+            res.unpadded_read_bytes.extend(bytes.iter().copied());
         }
+        restores
     }
 
     /// The stack pointer moved down by `d` bytes (up, for a negative `d`); a
     /// slot it moved back past is dropped (the frame released it).
     fn shift(&mut self, d: i64) {
+        self.entry_offset = self.entry_offset.and_then(|offset| offset.checked_sub(d));
         for slot in &mut self.slots {
             slot.0 += d;
         }
@@ -1047,6 +1338,32 @@ impl Pushed {
         })
     }
 
+    fn frame_offset(
+        &self, value: &VarnodeData, derived: &HashMap<u64, Option<i64>>, reg_idx: int4,
+    ) -> Option<Option<i64>> {
+        if self.is_sp(value, reg_idx) {
+            Some(Some(0))
+        } else if value.space.as_ref().is_some_and(|s| s.get_type() == spacetype::IPTR_INTERNAL) {
+            derived.get(&value.offset).copied()
+        } else {
+            None
+        }
+    }
+
+    fn private_store(&self, op: &RawOp, derived: &HashMap<u64, Option<i64>>, reg_idx: int4) -> bool {
+        if op.opc != OpCode::CPUI_STORE { return false; }
+        if !self.memory_layout.is_some_and(|(index, _)| op.ins.first().is_some_and(|space| space.offset as int4 == index)) {
+            return false;
+        }
+        let Some(value) = op.ins.get(2) else { return false };
+        let Some(Some(offset)) = op.ins.get(1).and_then(|address| self.frame_offset(address, derived, reg_idx)) else {
+            return false;
+        };
+        self.entry_offset.and_then(|entry| entry.checked_add(offset))
+            .and_then(|at| at.checked_add(value.size as i64))
+            .is_some_and(|end| end <= 0)
+    }
+
     /// Follow one op's use of the stack pointer. `derived` holds the offset from
     /// it of every temporary computed from it so far in this instruction (`None`
     /// when not a constant), `pushing` the bytes the instruction's push copied,
@@ -1058,18 +1375,31 @@ impl Pushed {
         derived: &mut HashMap<u64, Option<i64>>,
         pushing: &mut ByteSet,
         moved: &mut i64,
-    ) {
+        restore: Option<(usize, &VarnodeData)>,
+    ) -> Option<usize> {
         let reg_idx = res.reg_idx;
-        let unique = |v: &VarnodeData| v.space.as_ref().is_some_and(|s| s.get_type() == spacetype::IPTR_INTERNAL);
-        let at = |v: &VarnodeData| -> Option<Option<i64>> {
-            if self.is_sp(v, reg_idx) {
-                Some(Some(0))
-            } else if unique(v) {
-                derived.get(&v.offset).copied()
-            } else {
-                None
+        if op.out.as_ref().is_some_and(|out| {
+            self.sp.is_some_and(|(off, size)| {
+                out.space.as_ref().is_some_and(|space| space.get_index() == reg_idx)
+                    && out.offset < off.saturating_add(u64::from(size))
+                    && off < out.offset.saturating_add(u64::from(out.size))
+                    && !self.is_sp(out, reg_idx)
+            })
+        }) {
+            res.stack_effect_invalid = true;
+        }
+        if matches!(op.opc, OpCode::CPUI_LOAD | OpCode::CPUI_STORE)
+            && self.memory_layout.is_some_and(|(index, _)| {
+                op.ins.first().is_none_or(|space| space.offset as int4 != index)
+            })
+        {
+            if op.out.as_ref().is_some_and(|out| self.is_sp(out, reg_idx)) {
+                res.stack_effect_invalid = true;
             }
-        };
+            return None;
+        }
+        let unique = |v: &VarnodeData| v.space.as_ref().is_some_and(|s| s.get_type() == spacetype::IPTR_INTERNAL);
+        let at = |v: &VarnodeData| self.frame_offset(v, derived, reg_idx);
         let constant = |v: &VarnodeData| {
             v.space.as_ref().filter(|s| s.get_type() == spacetype::IPTR_CONSTANT).map(|_| {
                 let bits = 64 - 8 * v.size.min(8);
@@ -1090,17 +1420,39 @@ impl Pushed {
             match step {
                 Some(d) => {
                     self.shift(d);
+                    // A mathematical displacement outside the architecture's
+                    // signed SP width can wrap; it is not an exact delta.
+                    if !self.entry_offset.zip(self.sp).is_some_and(|(delta, (_, size))| {
+                        match size {
+                            1..=7 => {
+                                let high = (1i64 << (size * 8 - 1)) - 1;
+                                (-high - 1..=high).contains(&delta)
+                            }
+                            8 => true,
+                            _ => false,
+                        }
+                    }) {
+                        res.stack_effect_invalid = true;
+                    }
                     *moved += d;
                 }
-                None => self.flush(res),
+                None => {
+                    self.flush(res);
+                    // The SP storage is still identifiable, but its value is
+                    // no longer relative to entry. Later constant arithmetic
+                    // must not turn an incoming-pointer store into a private spill.
+                    self.entry_offset = None;
+                }
             }
-            return;
+            return None;
         }
         match op.opc {
             OpCode::CPUI_LOAD => match op.ins.get(1).and_then(at) {
                 Some(Some(off)) => {
                     let size = op.out.as_ref().map_or(1, |o| o.size as i64);
-                    self.read_back(res, off, size);
+                    if self.read_back(res, off, size, restore.map(|(_, out)| out)) {
+                        return restore.map(|(index, _)| index);
+                    }
                 }
                 Some(None) => self.flush(res),
                 None => {}
@@ -1108,12 +1460,12 @@ impl Pushed {
             OpCode::CPUI_STORE => {
                 if op.ins.get(2).and_then(at).is_some() {
                     self.flush(res);
-                    return;
+                    return None;
                 }
                 if let (Some(Some(off)), Some(value)) = (op.ins.get(1).and_then(at), op.ins.get(2)) {
                     let size = value.size as i64;
                     self.slots.retain(|(o, w, _)| !(*o < off + size && off < *o + *w));
-                    if unique(value) {
+                    if unique(value) || value.space.as_ref().is_some_and(|space| space.get_index() == reg_idx) {
                         self.slots.push((off, size, std::mem::take(pushing)));
                     }
                 }
@@ -1124,7 +1476,7 @@ impl Pushed {
                     if let Some(o) = op.out.as_ref().filter(|o| unique(o)) {
                         derived.remove(&o.offset);
                     }
-                    return;
+                    return None;
                 };
                 match op.out.as_ref() {
                     Some(o) if unique(o) => {
@@ -1140,6 +1492,7 @@ impl Pushed {
                 }
             }
         }
+        None
     }
 
     /// At a call: classify the registers pushed for it. `n` is the number of
@@ -1160,6 +1513,9 @@ impl Pushed {
             }
             let pad = contiguous && matches!(n, Some(n) if off - moved >= 8 * n as i64);
             if !pad {
+                if contiguous && n.is_some_and(|n| off - moved < 8 * n as i64) {
+                    res.consumed_read_bytes.extend(bytes.iter().copied());
+                }
                 res.unpadded_read_bytes.extend(bytes);
             }
         }
@@ -1171,16 +1527,16 @@ impl Pushed {
 ///
 /// The walk starts at `entry`, follows fall-through and resolved machine branch
 /// targets, and ends a path at a `RETURN`, a nested call, an unresolved indirect
-/// branch, a register-file `LOAD`/`STORE`, or an undecodable instruction —
+/// branch, or a register-file `LOAD`/`STORE` —
 /// recording, at each of those, the bytes already written on the way there. Only
 /// bytes written before EVERY such terminator stay provable. It abandons the
-/// whole summary — proving nothing — on the instruction budget or a runaway
-/// written/cut set.
+/// whole summary — proving nothing — on an unavailable or undecodable
+/// instruction, the instruction budget or a runaway written/cut set.
 pub fn probe_callee_entry_dead<T: kuna_sleigh::translate::Translate + ?Sized>(
     tr: &T,
     entry: &Address,
     reg_idx: int4,
-) -> CalleeEntryDead {
+) -> KunaResult<CalleeEntryDead> {
     probe_entry(tr, entry, reg_idx, false)
 }
 
@@ -1191,15 +1547,19 @@ pub fn probe_entry<T: kuna_sleigh::translate::Translate + ?Sized>(
     entry: &Address,
     reg_idx: int4,
     follow: bool,
-) -> CalleeEntryDead {
-    probe_entry_with(tr, entry, reg_idx, follow, &[], &std::collections::BTreeMap::new())
+) -> KunaResult<CalleeEntryDead> {
+    probe_entry_with(tr, entry, reg_idx, follow, &[], &std::collections::BTreeMap::new(), None, None)
 }
 
 /// [`probe_entry`], recording where a path reaches one of the system-call user
 /// ops `traps` ([`CalleeEntryDead::traps_unwritten`]). `stack_args` gives the
 /// stack-argument count of each format call by its VMA, so a register the callee
 /// only pushes above a call's arguments (an alignment pad) is told from one it
-/// forwards as a stack argument.
+/// forwards as a stack argument. `stack_pointer` is the architecture's supplied
+/// negative-growth stack-base register, not a register-name guess; it permits
+/// exact private STORE/LOAD preservation classification. `memory_layout` names
+/// the actual data space and byte order; partial saved-byte projection is not
+/// inferred from destination-register endianness alone.
 pub fn probe_entry_with<T: kuna_sleigh::translate::Translate + ?Sized>(
     tr: &T,
     entry: &Address,
@@ -1207,28 +1567,43 @@ pub fn probe_entry_with<T: kuna_sleigh::translate::Translate + ?Sized>(
     follow: bool,
     traps: &[uint4],
     stack_args: &std::collections::BTreeMap<u64, usize>,
-) -> CalleeEntryDead {
-    let mut res = CalleeEntryDead { reg_idx, complete: true, ..CalleeEntryDead::default() };
+    stack_pointer: Option<(u64, u32)>,
+    memory_layout: Option<(int4, bool)>,
+) -> KunaResult<CalleeEntryDead> {
+    let mut res = CalleeEntryDead {
+        reg_idx, complete: true, stack_effect_invalid: stack_pointer.is_none(),
+        entry_return_invalid: stack_pointer.is_none(),
+        ..CalleeEntryDead::default()
+    };
     let Some(entry_space) = entry.get_space() else {
         res.complete = false;
-        return res;
+        return Ok(res);
     };
     if entry_space.get_type() != spacetype::IPTR_PROCESSOR || reg_idx < 0 {
         res.complete = false;
-        return res;
+        return Ok(res);
     }
-    let start = vec![Frame { at: entry.clone(), written: ByteSet::new(), pushed: Pushed::default() }];
+    let pushed = Pushed {
+        sp: stack_pointer,
+        entry_offset: stack_pointer.map(|_| 0),
+        memory_layout,
+        ..Default::default()
+    };
+    let start = vec![Frame { at: entry.clone(), written: ByteSet::new(), pushed }];
     let mut skips = Vec::new();
-    walk(tr, &mut res, start, if follow { Skips::Aside(&mut skips) } else { Skips::Dropped }, traps, stack_args);
+    walk(tr, &mut res, start, if follow { Skips::Aside(&mut skips) } else { Skips::Dropped }, traps, stack_args)?;
     if res.complete && !skips.is_empty() {
         let mut late = CalleeEntryDead { reg_idx, complete: true, ..CalleeEntryDead::default() };
-        walk(tr, &mut late, skips, Skips::Walked, traps, stack_args);
+        walk(tr, &mut late, skips, Skips::Walked, traps, stack_args)?;
         res.skipped = Some(Box::new(late));
     }
     if !res.complete {
         res.reads.clear();
         res.reads_live.clear();
         res.live_read_bytes.clear();
+        res.consumed_read_bytes.clear();
+        res.projected_input_reads.clear();
+        res.input_type_hints.clear();
         res.unpadded_read_bytes.clear();
         res.stored_read_bytes.clear();
         res.cuts.clear();
@@ -1239,7 +1614,7 @@ pub fn probe_entry_with<T: kuna_sleigh::translate::Translate + ?Sized>(
         res.cond_written.clear();
         res.skipped = None;
     }
-    res
+    Ok(res)
 }
 
 /// Where a walk sends the paths that skip a conditional return.
@@ -1260,8 +1635,8 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
     mut skips: Skips<'_>,
     traps: &[uint4],
     stack_args: &std::collections::BTreeMap<u64, usize>,
-) {
-    let mut visited: HashMap<(int4, u64), ByteSet> = HashMap::new();
+) -> KunaResult<()> {
+    let mut visited: HashMap<(int4, u64), (ByteSet, Option<(u64, u32)>, Option<i64>)> = HashMap::new();
     let mut budget = MAX_PROBE_INSTRUCTIONS;
     let follow = !matches!(skips, Skips::Dropped);
     let mut found = Vec::new();
@@ -1274,13 +1649,16 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
         // A revisit whose incoming written set is a SUPERSET of one already
         // processed adds nothing: the earlier, more conservative pass recorded
         // at least every read-before-write this one would.
-        if let Some(prev) = visited.get(&key) {
+        if let Some((prev, sp, delta)) = visited.get(&key) {
+            if *sp != frame.pushed.sp || *delta != frame.pushed.entry_offset {
+                res.stack_effect_invalid = true;
+            }
             if prev.is_subset(&frame.written) {
                 frame.pushed.flush(res);
                 continue;
             }
         }
-        visited.insert(key, frame.written.clone());
+        visited.insert(key, (frame.written.clone(), frame.pushed.sp, frame.pushed.entry_offset));
         if budget == 0 || res.cuts.len() > MAX_CUTS || frame.written.len() > MAX_WRITTEN_BYTES {
             res.complete = false;
             break;
@@ -1289,13 +1667,14 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
         let mut emit = EntryEmit::default();
         let len = match tr.one_instruction(&mut emit, &frame.at) {
             Ok(n) if n > 0 => n,
-            // Undecodable: the path ends where the walk cannot see.
+            Err(error @ kuna_base::error::KunaError::Transport { .. }) => return Err(error),
+            // A failed decode does not cover the rest of this path. In
+            // particular, an empty entry is unknown, not complete no-read
+            // evidence for consumers that trim a recovered parameter list.
             _ => {
                 res.undecodable = true;
-                frame.pushed.flush(res);
-                res.opaque_cuts.push(frame.written.clone());
-                res.cuts.push(frame.written);
-                continue;
+                res.complete = false;
+                break;
             }
         };
         let skip = if follow { Some(&mut found) } else { None };
@@ -1309,6 +1688,7 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
             Skips::Walked => todo.append(&mut found),
         }
     }
+    Ok(())
 }
 
 /// Count a user op whose instruction then only computes and returns, and keep
@@ -1437,6 +1817,8 @@ fn step_instruction(
     traps: &[uint4],
     stack_args: &std::collections::BTreeMap<u64, usize>,
 ) -> Option<Vec<Frame>> {
+    res.stack_effect_invalid |= emit.internal_flow;
+    let projection = instruction_input_projection(emit, res.reg_idx);
     let incoming = written.clone();
     let mut cur = written;
     let mut targets: Vec<Address> = Vec::new();
@@ -1454,22 +1836,81 @@ fn step_instruction(
     let push = push_copies(emit, res.reg_idx);
     if let Some((sp, _)) = &push {
         if pushed.sp.is_some_and(|s| s != *sp) {
+            res.stack_effect_invalid = true;
             pushed.flush(res);
         }
         pushed.sp = Some(*sp);
     }
     let mut derived: HashMap<u64, Option<i64>> = HashMap::new();
     let mut this_push = ByteSet::new();
+    let mut restorations = smallvec::SmallVec::<[usize; 2]>::new();
+    let mut entry_return: Option<(usize, &VarnodeData)> = None;
     let mut moved = 0;
     for (k, op) in emit.ops.iter().enumerate() {
+        let same = |a: &VarnodeData, b: &VarnodeData| {
+            a.offset == b.offset && a.size == b.size
+                && a.space.as_ref().map(|space| space.get_index())
+                    == b.space.as_ref().map(|space| space.get_index())
+        };
+        if entry_return.is_some_and(|(producer, value)| {
+            k != producer && op.out.as_ref().is_some_and(|out| {
+                out.space.as_ref().map(|space| space.get_index())
+                    == value.space.as_ref().map(|space| space.get_index())
+                    && out.offset < value.offset.saturating_add(u64::from(value.size))
+                    && value.offset < out.offset.saturating_add(u64::from(out.size))
+            })
+        }) {
+            entry_return = None;
+        }
+        if op.opc == OpCode::CPUI_STORE {
+            // Only an exactly placed, disjoint stack store proves it did not
+            // overwrite the incoming caller-return slot. Unknown pointers are
+            // not a non-alias certificate, and no new pointer analysis is added.
+            let disjoint = pushed.sp.zip(pushed.entry_offset).is_some_and(|((_, width), start)| {
+                pushed.memory_layout.is_some_and(|(space, _)| {
+                    op.ins.first().is_some_and(|input| input.offset == space as u64)
+                }) && op.ins.get(1).is_some_and(|address| pushed.is_sp(address, res.reg_idx))
+                    && op.ins.get(2).is_some_and(|value| {
+                        start.checked_add(i64::from(value.size)).is_some_and(|end| {
+                            end <= 0 || start >= i64::from(width)
+                        })
+                    })
+            });
+            res.entry_return_invalid |= !disjoint;
+        }
+        if op.opc == OpCode::CPUI_LOAD
+            && pushed.entry_offset == Some(0)
+            && pushed.memory_layout.is_some_and(|(space, _)| {
+                op.ins.first().is_some_and(|input| input.offset == space as u64)
+            })
+            && op.ins.get(1).is_some_and(|address| pushed.is_sp(address, res.reg_idx))
+            && pushed.sp.is_some_and(|(_, width)| op.out.as_ref().is_some_and(|out| out.size == width))
+        {
+            entry_return = restore_copy(emit, k, res.reg_idx);
+        }
+        if !targets.is_empty() && op.out.as_ref().is_some_and(|out| pushed.is_sp(out, res.reg_idx)) {
+            res.stack_effect_invalid = true;
+        }
         let pushing = push.as_ref().is_some_and(|(_, ks)| ks.contains(&k));
+        // A recognized push already has deferred read evidence at its COPY.
+        // Recovering it again as an ordinary STORE would bypass at_call's
+        // padding exclusion on conventions that admit store-only arguments.
+        let store_source = store_copy_source(emit, k, res.reg_idx).filter(|(copy, _)| {
+            push.as_ref().is_none_or(|(_, copies)| !copies.contains(copy))
+        });
+        let storing = !pushing && op.opc == OpCode::CPUI_COPY
+            && emit.ops.iter().enumerate().skip(k + 1)
+                .any(|(index, _)| store_copy_source(emit, index, res.reg_idx)
+                    .is_some_and(|(copy, _)| copy == k));
         // Reads. An instruction that branches inside itself is scored against
         // the set it was entered with, since a conditionally-executed write
         // earlier in the same instruction may not have run.
         let base = if emit.internal_flow { &incoming } else { &cur };
         let value_erasing = is_value_erasing(op);
         let formal = value_erasing || compares_with_itself(op);
-        for (i, v) in op.ins.iter().enumerate() {
+        let policy = crate::typeop::type_op_info(op.opc);
+        let private_store = pushed.private_store(op, &derived, res.reg_idx);
+        for (i, v) in op.ins.iter().enumerate().chain(store_source.map(|(_, source)| (2, source))) {
             if skip_input(op.opc, i) {
                 continue;
             }
@@ -1478,13 +1919,59 @@ fn step_instruction(
                 continue;
             }
             let (idx, off, sz) = (res.reg_idx, v.offset, v.size as int4);
+            let projected_mask = projection.iter().find(|&&(index, slot, _)| index == k && slot == i)
+                .map(|&(_, _, mask)| mask);
+            let required = projected_mask.unwrap_or_else(|| kuna_base::address::calc_mask(sz));
             if (off..off + v.size as u64).any(|b| !base.contains(&(idx, b))) {
-                res.reads.push((idx, off, sz));
-                if !value_erasing {
+                if store_source.is_none() || !res.reads.contains(&(idx, off, sz)) {
+                    res.reads.push((idx, off, sz));
+                }
+                if !value_erasing && (store_source.is_none() || !res.reads_live.contains(&(idx, off, sz))) {
                     res.reads_live.push((idx, off, sz));
                 }
                 let stored = op.opc == OpCode::CPUI_STORE && i == 2;
-                if !formal && !(stored && multi_store) {
+                if !emit.internal_flow && !formal && !pushing && !storing
+                    && required == kuna_base::address::calc_mask(sz)
+                    && matches!(policy.class, crate::typeop::TypeOpClass::Binary
+                        | crate::typeop::TypeOpClass::Unary | crate::typeop::TypeOpClass::Func)
+                    && matches!(policy.metain, crate::dtype::type_metatype::TYPE_INT
+                        | crate::dtype::type_metatype::TYPE_UINT)
+                    && (off..off + v.size as u64).all(|byte| !base.contains(&(idx, byte)))
+                {
+                    let hint = (idx, off, sz, op.opc, i as int4);
+                    if !res.input_type_hints.contains(&hint) {
+                        res.input_type_hints.push(hint);
+                    }
+                }
+                if !formal && !pushing && !storing && !(stored && private_store) {
+                    // Keep a positive byte-covering prefix. Zero demand does
+                    // not delete a raw read, and a high-bit use retains every
+                    // byte below it. Register endianness locates that prefix.
+                    let width = if projected_mask.is_none() || required == 0 { v.size }
+                        else { (64 - required.leading_zeros()).div_ceil(8) };
+                    let start = if sp.is_big_endian() { off + u64::from(v.size - width) } else { off };
+                    let range = (idx, start, width as int4);
+                    if width < v.size && !res.projected_input_reads.contains(&range) {
+                        res.projected_input_reads.push(range);
+                    }
+                    for byte in start..start + u64::from(width) {
+                        if !base.contains(&(idx, byte)) {
+                            res.consumed_read_bytes.insert((idx, byte));
+                        }
+                    }
+                }
+                if stored && private_store {
+                    for byte in off..off + v.size as u64 {
+                        if !base.contains(&(idx, byte)) {
+                            this_push.insert((idx, byte));
+                        }
+                    }
+                }
+                // A register copied to an instruction-local STORE temporary
+                // is still a store-only read. The STORE's recovered source
+                // records it below; counting the COPY as live would bypass
+                // the existing variadic register-save policy.
+                if !formal && !storing && !(stored && multi_store) {
                     let into = if stored { &mut res.stored_read_bytes } else { &mut res.live_read_bytes };
                     for b in off..off + v.size as u64 {
                         if !base.contains(&(idx, b)) {
@@ -1499,7 +1986,13 @@ fn step_instruction(
             }
         }
         if pushed.sp.is_some() {
-            pushed.track(op, res, &mut derived, &mut this_push, &mut moved);
+            let restore = restore_copy(emit, k, res.reg_idx);
+            if let Some(index) = pushed.track(
+                op, res, &mut derived, &mut this_push, &mut moved,
+                restore,
+            ) {
+                restorations.push(index);
+            }
         }
         if op.opc == OpCode::CPUI_STORE {
             res.unpadded_read_bytes.append(&mut this_push);
@@ -1548,6 +2041,17 @@ fn step_instruction(
             // whose whole body is `ret` reads nothing, and treating that as
             // proof would delete the arguments of every stub and thunk.
             OpCode::CPUI_RETURN => {
+                if !entry_return.is_some_and(|(_, value)| {
+                    op.ins.first().is_some_and(|target| same(value, target))
+                }) {
+                    res.entry_return_invalid = true;
+                }
+                match pushed.entry_offset {
+                    Some(delta) if !res.normal_return_delta.is_some_and(|previous| previous != delta) => {
+                        res.normal_return_delta = Some(delta);
+                    }
+                    _ => res.stack_effect_invalid = true,
+                }
                 pushed.flush(res);
                 res.cuts.push(cur);
                 return end_at_return(res, &targets, &before, skip);
@@ -1596,7 +2100,12 @@ fn step_instruction(
                     if sp.get_index() == res.reg_idx {
                         let idx = res.reg_idx;
                         for b in o.offset..o.offset + o.size as u64 {
-                            if cur.insert((idx, b)) && !targets.is_empty() {
+                            if restorations.contains(&k) {
+                                // Exact reload to its original register restores
+                                // entry provenance. A later arithmetic/address/
+                                // external-store use must still count as an input.
+                                cur.remove(&(idx, b));
+                            } else if cur.insert((idx, b)) && !targets.is_empty() {
                                 res.cond_written.insert((idx, b));
                             }
                         }
@@ -1617,6 +2126,87 @@ fn step_instruction(
         next.push(Frame { at: at + len as i64, written: cur, pushed });
     }
     Some(next)
+}
+
+/// A register copied once into the exact temporary a STORE consumes. Defer its
+/// consumption decision until that store's existing private-frame classifier;
+/// an external store remains a genuine use. No cross-instruction propagation.
+fn store_copy_source(emit: &EntryEmit, index: usize, reg_idx: int4) -> Option<(usize, &VarnodeData)> {
+    let store = emit.ops.get(index)?;
+    if store.opc != OpCode::CPUI_STORE { return None; }
+    let value = store.ins.get(2)?;
+    let space = value.space.as_ref()?;
+    if space.get_type() != spacetype::IPTR_INTERNAL { return None; }
+    let same = |other: &VarnodeData| {
+        other.offset == value.offset && other.size == value.size
+            && other.space.as_ref().is_some_and(|s| s.get_index() == space.get_index())
+    };
+    let overlaps = |other: &VarnodeData| {
+        other.space.as_ref().is_some_and(|s| s.get_index() == space.get_index())
+            && other.offset < value.offset.saturating_add(value.size as u64)
+            && value.offset < other.offset.saturating_add(other.size as u64)
+    };
+    let copy = emit.ops[..index].iter().rposition(|op| op.out.as_ref().is_some_and(overlaps))?;
+    let op = &emit.ops[copy];
+    let [source] = op.ins.as_slice() else { return None };
+    if op.opc != OpCode::CPUI_COPY || !op.out.as_ref().is_some_and(same) || source.size != value.size
+        || !source.space.as_ref().is_some_and(|s| s.get_index() == reg_idx)
+    { return None; }
+    if emit.ops[copy + 1..].iter().enumerate().any(|(relative, other)| {
+        let at = relative + copy + 1;
+        let uses = other.ins.iter().filter(|input| overlaps(input)).count();
+        (uses != 0 && (at != index || uses != 1))
+            || (at < index && other.out.as_ref().is_some_and(|out| {
+                out.space.as_ref().is_some_and(|s| s.get_index() == reg_idx)
+                    && out.offset < source.offset + source.size as u64
+                    && source.offset < out.offset + out.size as u64
+            }))
+    }) { return None; }
+    Some((copy, source))
+}
+
+/// Follow only exact, single-use instruction-local COPYs from a LOAD to its
+/// register destination. A calculation, partial use, multiple use or unique
+/// overwrite is not restoration machinery.
+fn restore_copy(emit: &EntryEmit, index: usize, reg_idx: int4) -> Option<(usize, &VarnodeData)> {
+    let op = emit.ops.get(index)?;
+    if op.opc != OpCode::CPUI_LOAD {
+        return None;
+    }
+    let mut value = op.out.as_ref()?;
+    let mut at = index;
+    loop {
+        let space = value.space.as_ref()?;
+        if space.get_index() == reg_idx {
+            return Some((at, value));
+        }
+        if space.get_type() != spacetype::IPTR_INTERNAL {
+            return None;
+        }
+        let mut use_index = None;
+        for (next, candidate) in emit.ops.iter().enumerate().skip(at + 1) {
+            let overlaps = |input: &VarnodeData| {
+                input.space.as_ref().is_some_and(|s| s.get_index() == space.get_index())
+                    && input.offset < value.offset + value.size as u64
+                    && value.offset < input.offset + input.size as u64
+            };
+            if candidate.ins.iter().any(overlaps) {
+                if use_index.is_some() || candidate.opc != OpCode::CPUI_COPY
+                    || candidate.ins.len() != 1
+                    || candidate.ins[0].offset != value.offset
+                    || candidate.ins[0].size != value.size
+                {
+                    return None;
+                }
+                use_index = Some(next);
+            }
+            if candidate.out.as_ref().is_some_and(overlaps) {
+                break;
+            }
+        }
+        at = use_index?;
+        value = emit.ops[at].out.as_ref().filter(|out| out.size == value.size)?;
+    }
 }
 
 /// The stack pointer a single-register push in `emit` stores through, with the
@@ -1682,13 +2272,44 @@ fn skip_input(opc: OpCode, i: usize) -> bool {
 pub fn seed_callee_entry_dead(
     arch: &mut crate::architecture::Architecture,
     data: &mut Funcdata,
-) {
-    if crate::kuna_armfloatargs::applies(arch) && !data.get_address().is_invalid() {
+) -> KunaResult<()> {
+    let candidate_model = if data.get_func_proto().has_model() {
+        Some(data.get_func_proto().model())
+    } else {
+        arch.eval_fp_current()
+    };
+    let mut own_cleanup = candidate_model
+        .is_some_and(|model| model.get_extra_pop() == crate::fspec::EXTRAPOP_UNKNOWN)
+        && data.get_func_proto().get_extra_pop() == crate::fspec::EXTRAPOP_UNKNOWN
+        && !data.get_func_proto().is_input_locked()
+        && !data.get_func_proto().is_model_locked()
+        && arch.manage().get_stack_space().is_some_and(|space| {
+            space.stack_grows_negative()
+                && space.get_spacebase(0).is_ok_and(|base| base.size == 4)
+        });
+    if own_cleanup {
+        // Inspect the existing canonical source owner, not the working model or
+        // absence of locks alone. Remote acquisition remains typed/fallible.
+        let source = if let Some(remote) = &arch.remote_scope {
+            remote.function_at(data.get_address())?.and_then(|facts| facts.source_proto)
+        } else {
+            arch.symboltab.function_source_proto_across_scopes(data.get_address()).cloned()
+        };
+        own_cleanup = source.as_ref().is_none_or(|source| {
+            source.has_store() && source.num_params() == 0
+                && (!source.has_model() || source.is_model_unknown())
+                && !source.is_input_locked() && !source.is_model_locked()
+                && !source.has_custom_storage() && !source.is_dotdotdot()
+        });
+    }
+    if (crate::kuna_armfloatargs::applies(arch) || own_cleanup) && !data.get_address().is_invalid() {
         let reg_idx =
             arch.manage().get_space_by_name("register").map(|s| s.get_index()).unwrap_or(-1);
         let own = data.get_address().clone();
-        if let Some(d) = (reg_idx >= 0).then(|| probe_cached(arch, &own, reg_idx)).flatten() {
-            data.kuna_set_own_entry_dead(d);
+        if reg_idx >= 0 {
+            if let Some(d) = probe_cached(arch, &own, reg_idx)? {
+                data.kuna_set_own_entry_dead(d);
+            }
         }
     }
     let body_arity = arch.callee_arity && arch.callee_arity_body;
@@ -1700,7 +2321,7 @@ pub fn seed_callee_entry_dead(
     let reg_idx =
         arch.manage().get_space_by_name("register").map(|s| s.get_index()).unwrap_or(-1);
     if reg_idx < 0 {
-        return;
+        return Ok(());
     }
     let hidden_ret = arch.hidden_ret_arg && {
         let proto = data.get_func_proto();
@@ -1708,6 +2329,18 @@ pub fn seed_callee_entry_dead(
             && crate::p4_calls::kuna_hiddenretarg::has_register_hidden_return(proto.model(), reg_idx)
     };
     let read_arg = arch.callee_read_arg;
+    let physical_inputs = (0..data.num_calls()).any(|i| {
+        let call = data.get_call_specs(i);
+        let proto = call.proto();
+        proto.is_input_locked() && !proto.is_dotdotdot() && proto.has_model()
+            && !proto.has_custom_storage() && !proto.is_inline() && proto.get_inject_id() < 0
+            && proto.get_inject_upon_entry() < 0 && proto.get_inject_upon_return() < 0
+            && !(0..proto.num_params()).any(|slot| proto.get_param(slot).is_some_and(|param| {
+                param.is_hidden_return() || param.is_indirect_storage() || param.is_this_pointer()
+                    || param.get_address().get_space().is_some_and(|space| space.get_type() == spacetype::IPTR_JOIN)
+            }))
+            && data.obank().get(call.get_op()).is_some_and(|op| op.code() == OpCode::CPUI_CALL)
+    });
     if !arch.callee_dead_arg
         && !clobber_veto
         && !(arch.callee_arity && arch.callee_arity_live)
@@ -1715,8 +2348,9 @@ pub fn seed_callee_entry_dead(
         && !pass_through
         && !hidden_ret
         && !read_arg
+        && !physical_inputs
     {
-        return;
+        return Ok(());
     }
     // The veto needs an EARLIER call to have left the value in the register, so
     // a function with fewer than two calls can never produce one — and probing
@@ -1725,8 +2359,8 @@ pub fn seed_callee_entry_dead(
     // its whole subject is the callee that is called ONCE, and so is a model
     // with a hidden-return register, whose veto needs no earlier call.  So is
     // `calleereadarg`, which reads the probe at any one call.
-    if data.num_calls() < 2 && !body_arity && !pass_through && !hidden_ret && !read_arg {
-        return;
+    if data.num_calls() < 2 && !body_arity && !pass_through && !hidden_ret && !read_arg && !physical_inputs {
+        return Ok(());
     }
     let mut through_memo = ThroughMemo::new();
     let mut entries: Vec<Address> = Vec::new();
@@ -1750,11 +2384,11 @@ pub fn seed_callee_entry_dead(
     for e in entries {
         let Some(sp) = e.get_space() else { continue };
         let key = (sp.get_index(), e.get_offset());
-        if let Some(d) = probe_cached(arch, &e, reg_idx) {
+        if let Some(d) = probe_cached(arch, &e, reg_idx)? {
             data.kuna_set_callee_entry_dead(&e, d);
         }
         if pass_through && arch.kuna_protoorder_types.get(&key).is_some_and(|s| !s.inputs.is_empty()) {
-            if let Some(t) = reads_through_calls(arch, &e, reg_idx, &mut through_memo) {
+            if let Some(t) = reads_through_calls(arch, &e, reg_idx, &mut through_memo)? {
                 data.kuna_set_callee_entry_through(&e, t);
             }
         }
@@ -1763,7 +2397,7 @@ pub fn seed_callee_entry_dead(
         // seam either.
         if clobber_veto {
             if !arch.kuna_callee_forward_cache.contains_key(&key) {
-                let fwd = resolve_forward_transfer(arch, &e, reg_idx);
+                let fwd = resolve_forward_transfer(arch, &e, reg_idx)?;
                 arch.kuna_callee_forward_cache.insert(key, Rc::new(fwd));
             }
             if let Some(f) = arch.kuna_callee_forward_cache.get(&key) {
@@ -1771,6 +2405,87 @@ pub fn seed_callee_entry_dead(
             }
         }
     }
+    Ok(())
+}
+
+/// Recover unreferenced physical stack carriers at the existing own-input
+/// recovery boundary. This does not claim their values are read by the body.
+/// Source prototypes and all independently inferred parameter types stay intact.
+pub(crate) fn recover_own_cleanup_inputs(
+    data: &mut Funcdata,
+    active: &mut crate::fspec::ParamActive,
+) -> KunaResult<()> {
+    let Some(delta) = data.kuna_own_entry_dead().and_then(CalleeEntryDead::normal_return_stack_delta)
+        .and_then(|delta| int4::try_from(delta).ok()) else { return Ok(()) };
+    let proto = data.get_func_proto();
+    if !proto.has_model() || !proto.has_store() || proto.is_input_locked() || proto.is_model_locked()
+        || proto.has_custom_storage() || proto.is_dotdotdot() || proto.is_inline()
+        || proto.is_no_return() || proto.get_inject_id() >= 0
+        || proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0
+        || proto.get_model_extra_pop() != crate::fspec::EXTRAPOP_UNKNOWN
+        || proto.get_extra_pop() != crate::fspec::EXTRAPOP_UNKNOWN
+        || proto.get_output().is_indirect_storage()
+    {
+        return Ok(());
+    }
+    let model = Rc::clone(proto.model());
+    let Some(index) = model.input().get_stack_entry() else { return Ok(()) };
+    let entry = &model.input().get_entry()[index];
+    let manager = data.get_arch().manage.clone();
+    let Some(stack) = manager.get_stack_space() else { return Ok(()) };
+    // This recovery is the existing 32-bit callee-pop domain. The model,
+    // not cleanup byte count, supplies each physical carrier's slot geometry.
+    if !stack.stack_grows_negative()
+        || !stack.get_spacebase(0).is_ok_and(|base| base.size == 4)
+        || entry.get_space().get_index() != stack.get_index()
+        || entry.get_base() != 4 || entry.get_align() != 4
+        || entry.is_exclusion() || delta < 4 || (delta - 4) % 4 != 0
+    {
+        return Ok(());
+    }
+    // Preserve the body fact independently of whether the complete inferred
+    // input vector fits this ordinary model's cleanup geometry.
+    data.get_func_proto_mut().set_extra_pop(delta);
+    for i in 0..active.get_num_trials() {
+        let trial = active.get_trial(i);
+        if trial.get_address().get_space().is_some_and(|space| space.get_index() == stack.get_index())
+            && (!trial.is_used()
+                || trial.get_entry() != Some(index)
+                || trial.get_address().get_offset() < 4
+                || trial.get_address().get_offset().checked_add(trial.get_size() as u64)
+                    .is_none_or(|end| end > delta as u64))
+        {
+            return Ok(());
+        }
+    }
+    let count = (delta - 4) / 4;
+    // Validate the complete footprint before adding any trial.
+    for slot in 0..count {
+        let mut next = slot;
+        let at = entry.get_addr_by_slot(&mut next, 4, 1, &manager)?;
+        if at.is_invalid() || at.get_offset() != 4 + slot as u64 * 4 {
+            return Ok(());
+        }
+    }
+    for slot in 0..count {
+        let start = 4 + slot as u64 * 4;
+        let covered = (0..active.get_num_trials()).any(|i| {
+            let trial = active.get_trial(i);
+            trial.is_used() && trial.get_entry() == Some(index)
+                && entry.get_slot(trial.get_address(), 0) <= entry.get_group() + slot
+                && entry.get_slot(trial.get_address(), trial.get_size() - 1) >= entry.get_group() + slot
+        });
+        if covered { continue; }
+        let at = Address::new(Rc::clone(&stack), start);
+        let position = active.get_num_trials();
+        active.register_trial(&at, 4);
+        let trial = active.get_trial_mut(position);
+        trial.set_entry(Some(index), 0);
+        trial.mark_unref();
+        trial.mark_used();
+    }
+    active.sort_trials(model.input().get_entry());
+    Ok(())
 }
 
 /// How deep the leftover-return-value test walks through value-preserving ops

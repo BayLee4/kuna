@@ -137,7 +137,67 @@ fn project_folder_written_for_fauxware() {
     let readme_text = std::fs::read_to_string(&readme).unwrap();
     assert!(readme_text.contains("x86:LE:64"), "README missing arch id:\n{readme_text}");
     assert!(readme_text.contains("Entry point"), "README missing entry point:\n{readme_text}");
-    assert!(readme_text.contains("## Sections"), "README missing sections table:\n{readme_text}");
+    assert!(readme_text.contains("## Sections"), "README must list the loader's named sections:\n{readme_text}");
+}
+
+#[test]
+fn project_callback_header_preserves_open_closed_fixed_and_variadic_types() {
+    let source = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures/dwarf_declarations.c");
+    let input = kuna_harness::dwarf_fixture::compile_dwarf(&source, "c11", &[]);
+    let dir = out_dir("callback_header");
+    std::fs::create_dir_all(&dir).unwrap();
+    let project = dir.join("project");
+    let exported = Command::new(env!("CARGO_BIN_EXE_kuna"))
+        .args(["decompile-project", input.path.to_str().unwrap(), "-o", project.to_str().unwrap(),
+            "--sleighpath", &specs(), "--mode", "aggressive", "--option", "protoorder", "off",
+            "--functions", "invoke_open,invoke_closed,invoke_fixed,invoke_variadic"])
+        .env(kuna_decomp::kuna_calltargettype::CALLTARGETTYPE_ENV, "on")
+        .output().unwrap();
+    assert!(exported.status.success(), "{}", String::from_utf8_lossy(&exported.stderr));
+    let basename = input.path.file_name().unwrap().to_str().unwrap();
+    let compiler = std::env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let original = dir.join("original.o");
+    let built = Command::new(&compiler)
+        .args(["-std=c11", "-O0", "-c", "-Dmain=retained_main",
+            "-Dinvoke_open=retained_invoke_open", "-Dinvoke_closed=retained_invoke_closed",
+            "-Dinvoke_fixed=retained_invoke_fixed", "-Dinvoke_variadic=retained_invoke_variadic"])
+        .arg(&source).arg("-o").arg(&original).output().unwrap();
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let driver = dir.join("driver.c");
+    std::fs::write(&driver, format!(r#"
+#include "{basename}.h"
+extern int target_open();
+extern int target_closed(void);
+extern int target_fixed(int);
+extern int target_variadic(int,...);
+extern int retained_invoke_open(Open,int);
+extern int retained_invoke_closed(Closed);
+extern int retained_invoke_fixed(Fixed,int);
+extern int retained_invoke_variadic(Variadic,int);
+int main(void) {{
+    const int values[] = {{ -99, -1, 0, 1, 41, 99 }};
+    if (invoke_closed(target_closed) != retained_invoke_closed(target_closed)) return 1;
+    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i) {{
+        int x = values[i];
+        if (invoke_open(target_open,x) != retained_invoke_open(target_open,x)
+            || invoke_fixed(target_fixed,x) != retained_invoke_fixed(target_fixed,x)
+            || invoke_variadic(target_variadic,x) != retained_invoke_variadic(target_variadic,x))
+            return 2;
+    }}
+    return 0;
+}}
+"#)).unwrap();
+    for optimization in ["-O0", "-O2"] {
+        let executable = dir.join(format!("consumer-{}", &optimization[1..]));
+        let built = Command::new(&compiler).args(["-std=c11", optimization])
+            .arg("-I").arg(&project).arg(project.join(format!("{basename}.c")))
+            .arg(&original).arg(&driver).arg("-o").arg(&executable).output().unwrap();
+        assert!(built.status.success(), "unchanged project C/H:\n{}", String::from_utf8_lossy(&built.stderr));
+        let ran = Command::new(&executable).output().unwrap();
+        assert!(ran.status.success(), "original callback providers changed behavior:\n{}",
+            String::from_utf8_lossy(&ran.stderr));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// The README's entry-point row was `object`'s raw `entry()`, which on a Mach-O

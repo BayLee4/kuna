@@ -12,8 +12,20 @@ use crate::prettyprint::{MarkupAssociation, MarkupProvenance};
 
 use super::{
     align_markup_to_trimmed, panic_message, resolve_markup_provenance_with_addresses,
-    rewrite_cookie_literal_returns, stack_storage_contains,
+    rewrite_cookie_literal_returns, stack_storage_contains, print_c_piece_helpers,
 };
+
+#[test]
+fn recompile_piece_helpers_cover_scalar_widths_and_mask_each_operand() {
+    let mut text = String::new();
+    print_c_piece_helpers(&mut text);
+    assert_eq!(text.matches("static inline ").count(), 28);
+    assert!(text.contains("unsigned int CONCAT31(unsigned long long high, unsigned long long low)"));
+    assert!(text.contains("((high & 0xffffffULL) << 8) | (low & 0xffULL)"));
+    assert!(text.contains("unsigned long long CONCAT44(unsigned long long high, unsigned long long low)"));
+    assert!(text.contains("((high & 0xffffffffULL) << 32) | (low & 0xffffffffULL)"));
+    assert!(!text.contains("<< 64"));
+}
 
 #[test]
 fn aggregate_stack_storage_accepts_only_fully_contained_pieces() {

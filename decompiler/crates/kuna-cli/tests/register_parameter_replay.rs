@@ -114,12 +114,20 @@ fn renaming_the_dispatch_key_keeps_the_incoming_property() {
     let fixture = common::fixture("lifetimes_x86_64");
     common::process::required_output(&mut Command::new(&fixture));
     for stack_views in ["off", "on"] {
+        let (baseline, stderr, status) = common::run_kuna(&["decompile", &fixture, "register_parameter_reuse", "--json", "--mode", "reliable", "--assert-strict", "--option", "stackviews", stack_views, "--assert", &format!("@{fixture}.kuna")]);
+        assert_eq!(status, 0, "{stderr}\n{baseline}");
+        let baseline: serde_json::Value = serde_json::from_str(&baseline).unwrap();
+        let shown = baseline["functions"][0]["code"].as_str().unwrap();
+        let local = shown.lines().find_map(|line| line.split_once("consume_key(").and_then(|(_, tail)| tail.split_once(')')).map(|(argument, _)| argument.to_owned())).unwrap();
+        assert_ne!(local, "property", "later definition must remain separate:\n{shown}");
+        let rename = format!("name register_parameter_reuse::{local} cleared_property");
+        let retype = format!("type register_parameter_reuse::{local} unsigned int cleared_property");
         for assertions in [
-            vec!["name register_parameter_reuse::property_00 cleared_property"],
-            vec!["type register_parameter_reuse::property_00 unsigned int cleared_property"],
+            vec![rename.as_str()],
+            vec![retype.as_str()],
             vec![
                 "name register_parameter_reuse::property incoming_property",
-                "name register_parameter_reuse::property_00 cleared_property",
+                rename.as_str(),
             ],
         ] {
             let mut command = Command::new(env!("CARGO_BIN_EXE_kuna"));

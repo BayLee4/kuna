@@ -109,7 +109,10 @@ impl std::fmt::Display for WireError {
 
 impl From<KunaError> for WireError {
     fn from(e: KunaError) -> WireError {
-        WireError::Kuna(e)
+        match e {
+            KunaError::Transport { .. } => WireError::PipeClosed,
+            other => WireError::Kuna(other),
+        }
     }
 }
 
@@ -124,6 +127,16 @@ pub fn java_alignment(msg: &str) -> WireError {
 /// Map a write/flush error: a broken pipe means the parent died.
 fn write_err(e: std::io::Error) -> WireError {
     if e.kind() == std::io::ErrorKind::BrokenPipe {
+        WireError::PipeClosed
+    } else {
+        WireError::Io(e)
+    }
+}
+
+/// Classify an interrupted payload read without disguising actual EOF as a
+/// recoverable protocol-alignment exception.
+pub(crate) fn read_err(e: std::io::Error) -> WireError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
         WireError::PipeClosed
     } else {
         WireError::Io(e)
@@ -341,11 +354,17 @@ pub fn read_response_end<R: Read>(s: &mut R) -> WireResult<()> {
 /// empty response.
 pub fn read_all<R: Read>(s: &mut R, decoder: &mut dyn Decoder) -> WireResult<bool> {
     read_to_response(s)?;
-    if read_string_stream_decoder(s, decoder)? {
-        read_response_end(s)?;
-        return Ok(true);
+    match read_string_stream_optional(s)? {
+        Some(payload) => {
+            // Finish transport acquisition before local decoding, so a fully
+            // received malformed document cannot leave its response terminator
+            // queued ahead of the next request.
+            read_response_end(s)?;
+            decoder.ingest_stream(&payload).map_err(WireError::Kuna)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
-    Ok(false)
 }
 
 /// Send an exception frame to the Ghidra client (C++ `passJavaException`,

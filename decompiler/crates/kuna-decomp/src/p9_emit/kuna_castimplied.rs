@@ -78,6 +78,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use kuna_num::opcodes::OpCode;
+use kuna_base::error::KunaResult;
 
 use crate::context::{HighVariableId, OpId, VarnodeId};
 use crate::dtype::{type_metatype, Datatype};
@@ -85,17 +86,19 @@ use crate::funcdata::Funcdata;
 use crate::kuna_castwiden::{narrow_operand, plain_int, store_pointee, CastWidenMode, Plan};
 
 /// What the printer knows about how an op prints, which the IR alone does not say.
+/// Queries that acquire facing types preserve errors through the recursive
+/// cast decisions rather than treating failed acquisition as a retained cast.
 pub(crate) trait PrintedForms {
     /// The text the printer writes for `ty` in a cast or a declaration.
     fn spell(&self, ty: &Rc<Datatype>) -> String;
     /// Does this `INT_SEXT`/`INT_ZEXT` print as a cast (not as `SEXT14(x)`)?
-    fn extension_is_cast(&self, op: OpId) -> bool;
+    fn extension_is_cast(&self, op: OpId) -> KunaResult<bool>;
     /// Does upstream's integer-promotion rule already hide this extension?
-    fn extension_hidden(&self, op: OpId, read_op: Option<OpId>) -> bool;
+    fn extension_hidden(&self, op: OpId, read_op: Option<OpId>) -> KunaResult<bool>;
     /// Has `signedness` already dropped this `CPUI_CAST`?
     fn sign_dropped(&self, op: OpId) -> bool;
     /// Does this `SUBPIECE` print as a cast to its output type?
-    fn truncation_is_cast(&self, op: OpId) -> bool;
+    fn truncation_is_cast(&self, op: OpId) -> KunaResult<bool>;
     /// The name the printer writes for `high`.
     fn high_name(&self, high: HighVariableId) -> Option<String>;
     /// A declared type some other pass chose for `high` (`signedness`).
@@ -104,13 +107,13 @@ pub(crate) trait PrintedForms {
     /// of a `c ? a : b`, whose type is the arms' common type)?
     fn is_statement(&self, op: OpId) -> bool;
     /// The token an integer constant prints as where `op` reads it (`castternary`).
-    fn literal_token(&self, vn: VarnodeId, op: OpId) -> Option<String>;
+    fn literal_token(&self, vn: VarnodeId, op: OpId) -> KunaResult<Option<String>>;
     /// The size of the target's `long` (`castternary`).
     fn long_size(&self) -> i32;
     /// The token the constant `vn` prints as where `op` reads it when it takes
     /// the integer path (an integer or undefined type), or with `castwiden`'s
     /// size suffix, `UL` when `Some(true)` (`castwiden`).
-    fn integer_token(&self, vn: VarnodeId, op: OpId, suffix: Option<bool>) -> Option<String>;
+    fn integer_token(&self, vn: VarnodeId, op: OpId, suffix: Option<bool>) -> KunaResult<Option<String>>;
     /// The type a header declares the unnamed global at `addr` as (`globalref`).
     fn global_declared_type(&self, _addr: u64) -> Option<Rc<Datatype>> {
         None
@@ -212,34 +215,37 @@ impl ImpliedCasts {
     }
 
     /// What the arithmetic op `r` prints differently under `castwiden`.
-    pub(crate) fn widen_plan(&self, p: &dyn PrintedForms, fd: &Funcdata, r: OpId, depth: u32) -> Plan {
+    pub(crate) fn widen_plan(&self, p: &dyn PrintedForms, fd: &Funcdata, r: OpId, depth: u32) -> KunaResult<Plan> {
         if !self.widen_on() {
-            return Plan::default();
+            return Ok(Plan::default());
         }
         if let Some(pl) = self.plans.borrow().get(&r) {
-            return *pl;
+            return Ok(*pl);
         }
-        let pl = crate::kuna_castwiden::plan(self, p, fd, r, depth);
+        let pl = crate::kuna_castwiden::plan(self, p, fd, r, depth)?;
         self.plans.borrow_mut().insert(r, pl);
-        pl
+        Ok(pl)
     }
 
     /// Does `castwiden` leave out the widening `op` prints where the arithmetic
     /// `read_op` reads it?
-    pub(crate) fn widen_drops(&self, p: &dyn PrintedForms, fd: &Funcdata, op: OpId, read_op: Option<OpId>) -> bool {
-        read_op.is_some_and(|r| self.widen_on() && self.widen_plan(p, fd, r, 0).drop == Some(op))
+    pub(crate) fn widen_drops(&self, p: &dyn PrintedForms, fd: &Funcdata, op: OpId, read_op: Option<OpId>) -> KunaResult<bool> {
+        Ok(match read_op {
+            Some(r) if self.widen_on() => self.widen_plan(p, fd, r, 0)?.drop == Some(op),
+            _ => false,
+        })
     }
 
     /// The suffix `castwiden` prints on the constant `vn` read by `op`: `Some(true)`
     /// for `UL`, `Some(false)` for `L`.
-    pub(crate) fn widen_suffix(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> Option<bool> {
+    pub(crate) fn widen_suffix(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, op: OpId) -> KunaResult<Option<bool>> {
         if !self.widen_literal() {
-            return None;
+            return Ok(None);
         }
-        match self.widen_plan(p, fd, op, 0).suffix {
+        Ok(match self.widen_plan(p, fd, op, 0)?.suffix {
             Some((c, unsigned)) if c == vn => Some(unsigned),
             _ => None,
-        }
+        })
     }
 
     /// The printer declared local `high`, named `name`, as `spelling`.
@@ -284,16 +290,19 @@ impl ImpliedCasts {
         fd: &Funcdata,
         op: OpId,
         read_op: Option<OpId>,
-    ) -> bool {
+    ) -> KunaResult<bool> {
         if self.enabled {
-            let Some(out) = fd.obank().get(op).and_then(|o| o.get_out()) else { return false };
+            let Some(out) = fd.obank().get(op).and_then(|o| o.get_out()) else { return Ok(false) };
             let (reader, _) = through_copies(fd, read_op, out);
-            let below = reader.is_some_and(|r| fixes_type(p, fd, r));
-            if self.decide(p, fd, op, read_op, below) {
-                return true;
+            let below = match reader {
+                Some(r) => fixes_type(p, fd, r)?,
+                None => false,
+            };
+            if self.decide(p, fd, op, read_op, below)? {
+                return Ok(true);
             }
         }
-        self.narrow && crate::kuna_castnarrow::drops(self, p, fd, op, read_op)
+        Ok(self.narrow && crate::kuna_castnarrow::drops(self, p, fd, op, read_op)?)
     }
 
     /// The spelling the printer declared the function's return type with.
@@ -308,57 +317,57 @@ impl ImpliedCasts {
         op: OpId,
         read_op: Option<OpId>,
         below: bool,
-    ) -> bool {
-        let Some(o) = fd.obank().get(op) else { return false };
+    ) -> KunaResult<bool> {
+        let Some(o) = fd.obank().get(op) else { return Ok(false) };
         let code = o.code();
-        let (Some(invn), Some(outvn)) = (o.get_in(0), o.get_out()) else { return false };
-        let Some(outv) = fd.vbank().get(outvn) else { return false };
+        let (Some(invn), Some(outvn)) = (o.get_in(0), o.get_out()) else { return Ok(false) };
+        let Some(outv) = fd.vbank().get(outvn) else { return Ok(false) };
         let target = outv.get_type_def_facing().clone();
         if !is_int_target(&target) {
-            return false;
+            return Ok(false);
         }
-        let Some(inv) = fd.vbank().get(invn) else { return false };
+        let Some(inv) = fd.vbank().get(invn) else { return Ok(false) };
         let ir_src = inv.get_type_read_facing(op).clone();
         match code {
             OpCode::CPUI_CAST => {
                 if p.sign_dropped(op) || int_range(&ir_src).is_none() {
-                    return false;
+                    return Ok(false);
                 }
             }
             OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT => {
-                if !p.extension_is_cast(op) || p.extension_hidden(op, read_op) {
-                    return false;
+                if !p.extension_is_cast(op)? || p.extension_hidden(op, read_op)? {
+                    return Ok(false);
                 }
             }
-            _ => return false,
+            _ => return Ok(false),
         }
-        let src = self.operand_type(p, fd, invn, op);
+        let src = self.operand_type(p, fd, invn, op)?;
         if below {
-            return src.known().is_some_and(|s| preserves(s, &target));
+            return Ok(src.known().is_some_and(|s| preserves(s, &target)));
         }
         let want = p.spell(&target);
         if code == OpCode::CPUI_CAST
             && src.known().is_some_and(|s| int_range(s).is_some() && p.spell(s) == want)
         {
-            return true;
+            return Ok(true);
         }
         let from = match &src {
             CType::Known(s) => s,
             CType::Unknown => &ir_src,
-            CType::Opaque => return false,
+            CType::Opaque => return Ok(false),
         };
         let keeps = preserves(from, &target);
         let exact = keeps || self.converts_exactly(code, &src, &target);
         if !exact {
-            return false;
+            return Ok(false);
         }
-        let plain = self.widen_on() && narrow_operand(self, p, fd, op);
+        let plain = self.widen_on() && narrow_operand(self, p, fd, op)?;
         let dest = Dest { want: &want, target: &target, keeps, exact, plain };
         let (reader, value) = through_copies(fd, read_op, outvn);
-        match reader {
+        Ok(match reader {
             None => p.is_statement(op) && self.assigns_to(p, fd, outvn, &dest),
             Some(r) => {
-                let Some(ro) = fd.obank().get(r) else { return false };
+                let Some(ro) = fd.obank().get(r) else { return Ok(false) };
                 match ro.code() {
                     OpCode::CPUI_CALL => trusted_param(fd, r, value)
                         .is_some_and(|t| self.fits_dest(p, &t, &dest)),
@@ -373,11 +382,11 @@ impl ImpliedCasts {
                         && target.get_size() == 8
                         && dest.plain
                         && ro.get_slot(value) == 2
-                        && store_pointee(self, p, fd, r).is_some_and(|t| self.fits_dest(p, &t, &dest)),
+                        && store_pointee(self, p, fd, r)?.is_some_and(|t| self.fits_dest(p, &t, &dest)),
                     _ => false,
                 }
             }
-        }
+        })
     }
 
     /// (`castwiden`) Is the widening `code` from the printed operand type `src`
@@ -416,18 +425,18 @@ impl ImpliedCasts {
     }
 
     /// The C type of `vn` as printed where `reader` reads it.
-    pub(crate) fn operand_type(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, reader: OpId) -> CType {
-        let Some(v) = fd.vbank().get(vn) else { return CType::Opaque };
+    pub(crate) fn operand_type(&self, p: &dyn PrintedForms, fd: &Funcdata, vn: VarnodeId, reader: OpId) -> KunaResult<CType> {
+        let Some(v) = fd.vbank().get(vn) else { return Ok(CType::Opaque) };
         if v.is_annotation() {
-            return CType::Opaque;
+            return Ok(CType::Opaque);
         }
         if v.is_constant() {
-            return CType::Unknown;
+            return Ok(CType::Unknown);
         }
         if v.is_explicit() {
-            return self.explicit_type(p, fd, vn, reader);
+            return Ok(self.explicit_type(p, fd, vn, reader));
         }
-        let Some(def) = v.get_def() else { return CType::Unknown };
+        let Some(def) = v.get_def() else { return Ok(CType::Unknown) };
         let t = v.get_type_def_facing().clone();
         self.def_type(p, fd, def, t, Some(reader))
     }
@@ -441,38 +450,49 @@ impl ImpliedCasts {
         def: OpId,
         t: Rc<Datatype>,
         reader: Option<OpId>,
-    ) -> CType {
-        let Some(d) = fd.obank().get(def) else { return CType::Unknown };
+    ) -> KunaResult<CType> {
+        let Some(d) = fd.obank().get(def) else { return Ok(CType::Unknown) };
         let int = int_range(&t).is_some();
         let dropped_below =
-            |r: Option<OpId>| self.enabled && r.is_some() && self.decide(p, fd, def, r, true);
-        match d.code() {
+            |r: Option<OpId>| -> KunaResult<bool> {
+                Ok(self.enabled && r.is_some() && self.decide(p, fd, def, r, true)?)
+            };
+        Ok(match d.code() {
             OpCode::CPUI_CAST if int => {
-                if p.sign_dropped(def) || !dropped_below(reader) {
-                    return CType::Known(t);
+                if p.sign_dropped(def) || !dropped_below(reader)? {
+                    return Ok(CType::Known(t));
                 }
-                d.get_in(0).map_or(CType::Unknown, |i| self.operand_type(p, fd, i, def))
+                match d.get_in(0) {
+                    Some(i) => self.operand_type(p, fd, i, def)?,
+                    None => CType::Unknown,
+                }
             }
             OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT if int => {
-                if !p.extension_is_cast(def) || p.extension_hidden(def, reader) {
-                    return CType::Unknown;
+                if !p.extension_is_cast(def)? || p.extension_hidden(def, reader)? {
+                    return Ok(CType::Unknown);
                 }
-                if !dropped_below(reader) {
-                    return CType::Known(t);
+                if !dropped_below(reader)? {
+                    return Ok(CType::Known(t));
                 }
-                d.get_in(0).map_or(CType::Unknown, |i| self.operand_type(p, fd, i, def))
+                match d.get_in(0) {
+                    Some(i) => self.operand_type(p, fd, i, def)?,
+                    None => CType::Unknown,
+                }
             }
-            OpCode::CPUI_SUBPIECE if int && p.truncation_is_cast(def) => CType::Known(t),
+            OpCode::CPUI_SUBPIECE if int && p.truncation_is_cast(def)? => CType::Known(t),
             OpCode::CPUI_COPY => {
-                d.get_in(0).map_or(CType::Unknown, |i| self.operand_type(p, fd, i, def))
+                match d.get_in(0) {
+                    Some(i) => self.operand_type(p, fd, i, def)?,
+                    None => CType::Unknown,
+                }
             }
             OpCode::CPUI_LOAD if int => {
-                let Some(ptr) = d.get_in(1) else { return CType::Unknown };
-                let Some(pv) = fd.vbank().get(ptr) else { return CType::Unknown };
+                let Some(ptr) = d.get_in(1) else { return Ok(CType::Unknown) };
+                let Some(pv) = fd.vbank().get(ptr) else { return Ok(CType::Unknown) };
                 let ptr_ty = if pv.is_explicit() {
                     match self.explicit_type(p, fd, ptr, def) {
                         CType::Known(pt) => pt,
-                        _ => return CType::Unknown,
+                        _ => return Ok(CType::Unknown),
                     }
                 } else if let Some(c) = pv.get_def().and_then(|c| fd.obank().get(c)) {
                     match c.code() {
@@ -491,16 +511,16 @@ impl ImpliedCasts {
                             // `T *` -- the base `elemptr` typed -- reads a `T`.
                             None => match self.subscript_base_type(p, fd, c.get_in(0), pv.get_def()) {
                                 Some(t) => t,
-                                None => return CType::Unknown,
+                                None => return Ok(CType::Unknown),
                             },
                         },
-                        _ => return CType::Unknown,
+                        _ => return Ok(CType::Unknown),
                     }
                 } else {
-                    return CType::Unknown;
+                    return Ok(CType::Unknown);
                 };
                 if ptr_ty.get_metatype() != type_metatype::TYPE_PTR {
-                    return CType::Unknown;
+                    return Ok(CType::Unknown);
                 }
                 match ptr_ty.get_ptr_to() {
                     Some(pointee) if p.spell(&pointee) == p.spell(&t) => CType::Known(t),
@@ -508,7 +528,7 @@ impl ImpliedCasts {
                 }
             }
             _ => CType::Unknown,
-        }
+        })
     }
 
     /// (kuna `elemptr`) The pointer type C gives the base of a subscript
@@ -691,35 +711,35 @@ pub(crate) fn through_copies(fd: &Funcdata, read_op: Option<OpId>, vn: VarnodeId
 
 /// Does the conversion `r` fix the C type of whatever it reads, so a
 /// value-preserving conversion under it can go?
-fn fixes_type(p: &dyn PrintedForms, fd: &Funcdata, r: OpId) -> bool {
-    let Some(ro) = fd.obank().get(r) else { return false };
+fn fixes_type(p: &dyn PrintedForms, fd: &Funcdata, r: OpId) -> KunaResult<bool> {
+    let Some(ro) = fd.obank().get(r) else { return Ok(false) };
     let target_is_int = ro
         .get_out()
         .and_then(|o| fd.vbank().get(o))
         .is_some_and(|v| is_int_target(v.get_type_def_facing()));
     if !target_is_int {
-        return false;
+        return Ok(false);
     }
-    match ro.code() {
+    Ok(match ro.code() {
         OpCode::CPUI_CAST => true,
         OpCode::CPUI_INT_SEXT | OpCode::CPUI_INT_ZEXT => {
-            if !p.extension_is_cast(r) {
-                return false;
+            if !p.extension_is_cast(r)? {
+                return Ok(false);
             }
-            let Some(out) = ro.get_out().and_then(|o| fd.vbank().get(o)) else { return false };
+            let Some(out) = ro.get_out().and_then(|o| fd.vbank().get(o)) else { return Ok(false) };
             let reader = if out.is_explicit() {
                 None
             } else {
                 let mut it = out.descend_iter();
                 match (it.next(), it.next()) {
                     (Some(only), None) => Some(only),
-                    _ => return false,
+                    _ => return Ok(false),
                 }
             };
-            !p.extension_hidden(r, reader)
+            !p.extension_hidden(r, reader)?
         }
         _ => false,
-    }
+    })
 }
 
 /// The declared type of the parameter `arg` fills at the direct call `call`,

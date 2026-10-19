@@ -2656,13 +2656,13 @@ impl RegisterLookup for Sleigh {
         let vd = self.base.get_register(nm.as_bytes())?;
         Ok(storage_from_varnode_data(&vd))
     }
-    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         let name = register_name_from_xref(self.base.get_all_registers(), base, off, size);
-        String::from_utf8_lossy(name).into_owned()
+        Ok(String::from_utf8_lossy(name).into_owned())
     }
-    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+    fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
         let name = exact_register_name_from_xref(self.base.get_all_registers(), base, off, size);
-        String::from_utf8_lossy(name).into_owned()
+        Ok(String::from_utf8_lossy(name).into_owned())
     }
 }
 
@@ -2717,10 +2717,11 @@ impl Translate for Sleigh {
             );
         }
     }
-    fn get_user_op_names(&self, res: &mut Vec<String>) {
+    fn get_user_op_names(&self, res: &mut Vec<String>) -> KunaResult<()> {
         for nm in self.base.get_user_op_names() {
             res.push(String::from_utf8_lossy(nm).into_owned());
         }
+        Ok(())
     }
     fn instruction_length(&self, baseaddr: &Address) -> KunaResult<i32> {
         Sleigh::instruction_length(self, baseaddr)

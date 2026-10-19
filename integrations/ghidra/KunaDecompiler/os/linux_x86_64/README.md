@@ -15,10 +15,17 @@ cp target/release/kuna_ghidra ../integrations/ghidra/KunaDecompiler/os/linux_x86
 chmod +x ../integrations/ghidra/KunaDecompiler/os/linux_x86_64/kuna_ghidra
 ```
 
-If you skip this step the extension still builds and installs, but the plugin will show
-an error dialog (and leave the stock decompiler active) until the binary appears in the
-*installed* extension's `os/linux_x86_64/` directory or you point the
-`-Dkuna.decompiler.exe=/abs/path/to/kuna_ghidra` JVM property at a build.
+The full extension build requires a staged matching native backend and compiles the
+Java owner/helper closure against the unmodified Ghidra 12.1.4 installation under
+Java 21. Prefer `GHIDRA_INSTALL_DIR=/abs/ghidra_12.1.4_PUBLIC ./build.sh` from the
+extension directory; it builds and stages the host binary before packaging.
+For manual packaging, run `gradle buildExtension` with that installation configured.
+Native staging is not a complete installation by itself: install the full ZIP
+through Ghidra's normal extension installer and restart.
+
+During native development only, the
+`-Dkuna.decompiler.exe=/abs/path/to/kuna_ghidra` JVM property may point at a matching
+build while the full Java extension is already installed in the launch profile.
 
 ## Other platforms
 

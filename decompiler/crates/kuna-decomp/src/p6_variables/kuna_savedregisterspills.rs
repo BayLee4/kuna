@@ -584,10 +584,10 @@ impl Action for ActionRestrictLocalSavedLanes {
         })
     }
 
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let count = restrict_local_saved_lanes(data);
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 

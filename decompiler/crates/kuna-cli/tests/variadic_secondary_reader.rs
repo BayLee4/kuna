@@ -377,6 +377,7 @@ fn a_stored_variadic_integer_round_trips_without_claiming_unused_registers() {
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#define MSABI __attribute__((ms_abi))
 typedef int32_t int4;
 typedef uint32_t uint4;
 typedef uint64_t uint8;

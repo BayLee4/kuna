@@ -99,7 +99,8 @@ fn constant(
 
 /// The volatile storage `(space index, byte offset, size)` a LOAD reads, when
 /// its pointer folds to a constant without reading memory or guessing an input.
-fn target(data: &Funcdata, id: OpId, memo: &mut Memo) -> Option<(i32, u64, i32)> {
+fn target(data: &Funcdata, id: OpId, memo: &mut Memo) -> kuna_base::error::KunaResult<Option<(i32, u64, i32)>> {
+    let candidate = (|| {
     let op = data
         .obank()
         .get(id)
@@ -120,20 +121,23 @@ fn target(data: &Funcdata, id: OpId, memo: &mut Memo) -> Option<(i32, u64, i32)>
         space.clone(),
         AddrSpace::address_to_byte(offset, space.get_word_size()),
     );
-    let properties = data.query_local_properties(&addr, size, op.get_addr())
+    Some((addr, size, op.get_addr().clone(), space.get_index()))
+    })();
+    let Some((addr, size, point, index)) = candidate else { return Ok(None) };
+    let properties = data.query_local_properties(&addr, size, &point)
         | data
             .get_arch()
-            .query_global_properties(&addr, size, op.get_addr());
-    (properties & varnode_flags::volatil != 0).then(|| (space.get_index(), addr.get_offset(), size))
+            .query_global_properties(&addr, size, &point)?;
+    Ok((properties & varnode_flags::volatil != 0).then(|| (index, addr.get_offset(), size)))
 }
 
 /// Whether a LOAD provably reads volatile storage.
-pub(crate) fn is_volatile(data: &Funcdata, id: OpId) -> bool {
+pub(crate) fn is_volatile(data: &Funcdata, id: OpId) -> kuna_base::error::KunaResult<bool> {
     is_volatile_with(data, id, &mut Memo::new())
 }
 
 /// [`is_volatile`] sharing `memo` across the LOADs of one unchanged op graph.
-pub(crate) fn is_volatile_with(data: &Funcdata, id: OpId, memo: &mut Memo) -> bool {
+pub(crate) fn is_volatile_with(data: &Funcdata, id: OpId, memo: &mut Memo) -> kuna_base::error::KunaResult<bool> {
     if let Some(pointer) = data.get_arch().types()
         .filter(|types| types.has_volatile_types())
         .and(data.obank().get(id))
@@ -144,17 +148,17 @@ pub(crate) fn is_volatile_with(data: &Funcdata, id: OpId, memo: &mut Memo) -> bo
         if node.and_then(|node| node.get_type().get_ptr_to())
             .is_some_and(|ty| crate::kuna_typequal::is_volatile(&ty))
         {
-            return true;
+            return Ok(true);
         }
         let mut budget = BUDGET;
         if crate::kuna_typequal::address_type(data, pointer, &mut budget)
             .and_then(|ty| ty.get_ptr_to())
             .is_some_and(|ty| crate::kuna_typequal::is_volatile(&ty))
         {
-            return true;
+            return Ok(true);
         }
     }
-    target(data, id, memo).is_some()
+    Ok(target(data, id, memo)?.is_some())
 }
 
 /// Whether a volatile LOAD repeats a read its instruction already makes:
@@ -167,13 +171,13 @@ pub(crate) fn rereads(
     id: OpId,
     memo: &mut Memo,
     kept: impl Fn(&Funcdata, OpId) -> bool,
-) -> bool {
-    let want = target(data, id, memo);
-    if want.is_none() && !is_volatile_with(data, id, memo) {
-        return false;
+) -> kuna_base::error::KunaResult<bool> {
+    let want = target(data, id, memo)?;
+    if want.is_none() && !is_volatile_with(data, id, memo)? {
+        return Ok(false);
     }
     let Some(op) = data.obank().get(id) else {
-        return false;
+        return Ok(false);
     };
     let time = op.get_time();
     let siblings: Vec<OpId> = data
@@ -182,10 +186,10 @@ pub(crate) fn rereads(
         .map(|(_, sibling)| sibling)
         .filter(|&sibling| sibling != id)
         .collect();
-    siblings.into_iter().any(|sibling| {
-        data.obank().get(sibling).is_some_and(|o| {
+    for sibling in siblings {
+        if let Some(o) = data.obank().get(sibling) {
             let same = if let Some(want) = want {
-                target(data, sibling, memo) == Some(want)
+                target(data, sibling, memo)? == Some(want)
             } else {
                 o.code() == OpCode::CPUI_LOAD
                     && o.get_in(1) == op.get_in(1)
@@ -194,11 +198,15 @@ pub(crate) fn rereads(
                     && o.get_out().and_then(|vn| data.vbank().get(vn)).map(|vn| vn.get_size())
                         == op.get_out().and_then(|vn| data.vbank().get(vn)).map(|vn| vn.get_size())
             };
-            !o.is_dead()
+            if !o.is_dead()
                 && same
                 && (kept(data, sibling) || o.get_time() < time)
-        })
-    })
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -296,15 +304,15 @@ mod tests {
             for (offset, expected) in [(0x50000000, true), (0x50000004, false)] {
                 let ptr = fd.new_constant(4, offset / word_size as u64);
                 let (load, value) = operation(&mut fd, OpCode::CPUI_LOAD, 4, &[space, ptr]);
-                assert_eq!(is_volatile(&fd, load), expected);
+                assert_eq!(is_volatile(&fd, load).unwrap(), expected);
                 assert_eq!(fold(&fd, value), None);
             }
             let ptr = fd.new_unique(4, None);
             let (load, _) = operation(&mut fd, OpCode::CPUI_LOAD, 4, &[space, ptr]);
-            assert!(!is_volatile(&fd, load));
+            assert!(!is_volatile(&fd, load).unwrap());
             let other = fd.new_unique(4, None);
             let (copy, _) = operation(&mut fd, OpCode::CPUI_COPY, 4, &[other]);
-            assert!(!is_volatile(&fd, copy));
+            assert!(!is_volatile(&fd, copy).unwrap());
         }
     }
     #[test]
@@ -321,9 +329,9 @@ mod tests {
         let second = load(&mut fd, 0x50000000);
         let plain = load(&mut fd, 0x50000004);
         let memo = &mut Memo::new();
-        assert!(!rereads(&fd, first, memo, |_, _| false));
-        assert!(rereads(&fd, second, memo, |_, _| false));
-        assert!(rereads(&fd, first, memo, |_, op| op == second));
-        assert!(!rereads(&fd, plain, memo, |_, _| true));
+        assert!(!rereads(&fd, first, memo, |_, _| false).unwrap());
+        assert!(rereads(&fd, second, memo, |_, _| false).unwrap());
+        assert!(rereads(&fd, first, memo, |_, op| op == second).unwrap());
+        assert!(!rereads(&fd, plain, memo, |_, _| true).unwrap());
     }
 }

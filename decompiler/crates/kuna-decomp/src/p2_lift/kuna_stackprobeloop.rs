@@ -119,36 +119,36 @@ impl Rule for RuleStackProbeLoop {
     }
 
     /// C++ `RuleStackProbeLoop::applyOp` (`kuna_stackprobeloop.cc:63`).
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // The live gate is carried on the ArchContext Architecture (`build_arch_handle`);
         // `enabled` stays as the unit-test OR-override (rule registered false).
         if !self.enabled && !data.get_arch().model_stack_probe_loop {
-            return 0;
+            return Ok(0);
         }
 
         // one entry edge, one back edge
         if op_num_input(data, op) != 2 {
-            return 0;
+            return Ok(0);
         }
 
         // The MULTIEQUAL must produce the stack-pointer register.
         let stackspc = match data.get_arch().manage().get_stack_space() {
             Some(s) => s.clone(),
-            None => return 0,
+            None => return Ok(0),
         };
         let sp_in = match find_spacebase_input(data, &stackspc) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let phiout = match op_out(data, op) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if vn_addr(data, phiout) != vn_addr(data, sp_in) {
-            return 0;
+            return Ok(0);
         }
         if vn_size(data, phiout) != vn_size(data, sp_in) {
-            return 0;
+            return Ok(0);
         }
 
         // One input is the back-edge `PHI - page`, the other is the stack-relative
@@ -177,10 +177,10 @@ impl Rule for RuleStackProbeLoop {
             }
         }
         if !foundback || !foundentry {
-            return 0;
+            return Ok(0);
         }
         if page == 0 {
-            return 0;
+            return Ok(0);
         }
 
         // Find the loop-exit comparison: an INT_NOTEQUAL/INT_EQUAL whose one operand
@@ -230,7 +230,7 @@ impl Rule for RuleStackProbeLoop {
             }
         }
         if !foundlimit {
-            return 0;
+            return Ok(0);
         }
 
         // At loop exit `PHI + page == limit`, so the post-loop PHI value is
@@ -243,7 +243,7 @@ impl Rule for RuleStackProbeLoop {
         // STUB(W6): glb->inst[CPUI_INT_ADD] property flags; opcode value is exact.
         data.op_set_opcode(op, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "INT_ADD"));
         data.op_set_all_input(op, &inlist).expect("opSetAllInput on rewritten MULTIEQUAL");
-        1
+        Ok(1)
     }
 }
 

@@ -75,7 +75,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, inputs: int4, off: u64, opc: OpCode) ->
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
 }
 
 fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
@@ -95,7 +95,7 @@ fn mk_defined_ptr(fd: &mut Funcdata, bl: BlockId, off: u64) -> VarnodeId {
     wire(fd, base, op, 0);
     wire(fd, disp, op, 1);
     let r = ram(fd);
-    let out = fd.new_varnode(8, &Address::new(r, 0x40), Some(unk(8)));
+    let out = fd.new_varnode(8, &Address::new(r, 0x40), Some(unk(8))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();

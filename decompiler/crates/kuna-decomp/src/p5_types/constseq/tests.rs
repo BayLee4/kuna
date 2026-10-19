@@ -374,7 +374,7 @@ fn string_copy_non_constant_input_declines() {
     // input-0 is a (written) non-constant — a fresh input varnode.
     let nonconst = make_input(&mut fd, 0x100, 1);
     fd.op_set_input(op, nonconst, 0).unwrap();
-    assert_eq!(RuleStringCopy::new("analysis").apply_op(op, &mut fd), 0);
+    assert_eq!(RuleStringCopy::new("analysis").apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn string_copy_constant_input_declines_at_stub() {
     let mut fd = build_fd(false);
     let bl = mk_block(&mut fd);
     let op = mk_copy_const(&mut fd, bl, 0x10, 0x41);
-    assert_eq!(RuleStringCopy::new("analysis").apply_op(op, &mut fd), 0);
+    assert_eq!(RuleStringCopy::new("analysis").apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -402,12 +402,12 @@ fn string_store_constant_value_declines_at_stub() {
     fd.op_set_input(st, spc, 0).unwrap();
     fd.op_set_input(st, ptr, 1).unwrap();
     fd.op_set_input(st, val, 2).unwrap();
-    assert_eq!(RuleStringStore::new("analysis").apply_op(st, &mut fd), 0);
+    assert_eq!(RuleStringStore::new("analysis").apply_op(st, &mut fd).unwrap(), 0);
 }
 
 /// A fresh input varnode at register-like offset `off` of `size` bytes.
 fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), None);
+    let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }

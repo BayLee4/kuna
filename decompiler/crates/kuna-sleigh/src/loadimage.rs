@@ -85,6 +85,10 @@ pub trait ImageBytes: Send + Sync + std::fmt::Debug {
     /// failure, so with this true of every address a walk visits, the staging
     /// window in front of the bytes cannot change an answer.
     fn mapped_covers(&self, lo: u64, hi: u64) -> bool;
+
+    /// Loader-identified import pointer words, retained with the shared image
+    /// bytes. Their function symbols name calls, but do not assert code bodies.
+    fn import_slot_ranges(&self) -> &[(u64, u64)] { &[] }
 }
 
 /// Read bytes by loaded address and expose initial image metadata.
@@ -92,6 +96,11 @@ pub trait ImageBytes: Send + Sync + std::fmt::Debug {
 /// Symbols, sections and other metadata populate the decompiler's database
 /// during initialization; byte reads continue during analysis.
 pub trait LoadImage {
+    /// Does this exact mapped address hold an import pointer rather than a
+    /// function body? Raw, XML and host-backed images have no such negative
+    /// loader evidence by default.
+    fn is_import_slot(&self, _address: &Address) -> bool { false }
+
     /// The container explicitly selects the ARM VFP procedure-call standard.
     fn arm_vfp_args(&self) -> bool { false }
 

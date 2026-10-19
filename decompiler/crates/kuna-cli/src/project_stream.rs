@@ -797,6 +797,9 @@ fn export(
     targets.sort_by(|a, b| {
         a.addr.get_offset().cmp(&b.addr.get_offset()).then_with(|| a.name.cmp(&b.name))
     });
+    kuna_console::project::prepare_type_names(&mut prog);
+    kuna_console::project::prepare_export_callables(&mut prog, &targets)
+        .map_err(|e| e.to_string())?;
     let specs = flatten_targets(&targets);
     if args.jobs <= 1 && targets.len() > SERIAL_HINT_MIN {
         eprintln!("[kuna --stream] serial run; --jobs auto uses every core");
@@ -905,6 +908,7 @@ fn export(
 
     // The parent is one more type shard: its own factory holds whatever the load
     // interned, and at `--jobs 1` everything the serial loop did.
+    kuna_console::project::prepare_type_names(&mut prog);
     type_blocks.push(print_c_types(prog.arch_mut()));
     let types = jobs::merge_type_definitions(&type_blocks, jobs::STREAM_TAG);
     writer.write_header(Some(&types))?;
@@ -1099,6 +1103,7 @@ fn run_pooled<'scope, 'env>(
         load_seconds,
     );
     cfg.arm_frames = crate::decompile_all::worker_arm_frames(prog);
+    cfg.export_spec = kuna_console::project::export_callables_spec(prog);
     let inventory = flatten_targets(&prog.function_entries_canonical());
     let send = Mutex::new(tx.clone());
     let pool = scope.spawn(move || {
@@ -1170,7 +1175,7 @@ fn run_serial(
                     run.abort.stop(None);
                 }
             },
-        );
+        ).map_err(|e| e.to_string())?;
         if run.abort.stopped() {
             return Err(run.abort.reason());
         }
@@ -1247,6 +1252,7 @@ mod tests {
 
     fn result(addr: u64, hints: Vec<u64>) -> FuncResult {
         FuncResult {
+            type_bindings: Vec::new(),
             name: format!("sub_{addr:x}"),
             address: addr,
             byte_address: addr,

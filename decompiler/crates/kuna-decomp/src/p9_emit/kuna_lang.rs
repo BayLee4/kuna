@@ -6,8 +6,8 @@
 //! `PrintLanguage` (the RPN driver and the mod/scope stacks) → `PrintC` →
 //! `PrintJava : public PrintC` — selected through a `PrintLanguageCapability`
 //! registry. The port flattened all of it into one concrete `PrintC`
-//! (`p9_emit/printc.rs`), and `p9_emit/printjava.rs` is the stub that records
-//! the loss. This module re-erects the seam, in the shape kuna actually needs.
+//! (`p9_emit/printc.rs`). This module retains the seam in the shared printer's
+//! language profiles, including the JVM's object/array policy.
 //!
 //! # The shape, and why it is not a trait object over the whole printer
 //!
@@ -49,6 +49,8 @@ pub enum OutLang {
     C,
     /// The rust-language back-end.
     Rust,
+    /// JVM object references and Java source syntax on the shared printer.
+    Java,
 }
 
 impl OutLang {
@@ -58,13 +60,14 @@ impl OutLang {
         match name {
             "c-language" | "c" => Some(OutLang::C),
             "rust-language" | "rust" => Some(OutLang::Rust),
+            "java-language" | "java" => Some(OutLang::Java),
             _ => None,
         }
     }
 
     /// Every language kuna can emit, by `option setlanguage` name.
     pub fn names() -> Vec<&'static str> {
-        [OutLang::C, OutLang::Rust].iter().map(|l| l.print_name()).collect()
+        [OutLang::C, OutLang::Rust, OutLang::Java].iter().map(|l| l.print_name()).collect()
     }
 
     /// The `option setlanguage` name this language answers to.
@@ -72,6 +75,7 @@ impl OutLang {
         match self {
             OutLang::C => "c-language",
             OutLang::Rust => "rust-language",
+            OutLang::Java => "java-language",
         }
     }
 
@@ -80,6 +84,7 @@ impl OutLang {
         match self {
             OutLang::C => &LANG_C,
             OutLang::Rust => &crate::kuna_langrust::LANG_RUST,
+            OutLang::Java => &LANG_JAVA,
         }
     }
 
@@ -88,6 +93,7 @@ impl OutLang {
         match self {
             OutLang::C => &crate::kuna_langabi::C_ABI,
             OutLang::Rust => &crate::kuna_langabi::RUST_ABI,
+            OutLang::Java => &crate::kuna_langabi::C_ABI,
         }
     }
 
@@ -96,6 +102,7 @@ impl OutLang {
         match self {
             OutLang::C => &crate::kuna_langc::C_SPELLER,
             OutLang::Rust => &crate::kuna_rusttypes::RUST_SPELLER,
+            OutLang::Java => &crate::kuna_langtypes::JAVA_SPELLER,
         }
     }
 }
@@ -575,6 +582,35 @@ pub static LANG_C: LangProfile = LangProfile {
         string_escape: StringEscape::CEscapes,
     },
     fn_attributes: &[],
+};
+
+fn java_map_token(tok: &'static OpToken) -> &'static OpToken {
+    static SCOPE: OpToken = OpToken { print1: ".", ..tokens::SCOPE };
+    static SHIFT: OpToken = OpToken { print1: ">>>", ..tokens::SHIFT_RIGHT };
+    static BOOL_XOR: OpToken = OpToken { print1: "^", precedence: tokens::BITWISE_XOR.precedence, ..tokens::BOOLEAN_XOR };
+    if std::ptr::eq(tok, &tokens::SCOPE) { &SCOPE }
+    else if std::ptr::eq(tok, &tokens::SHIFT_RIGHT) { &SHIFT }
+    else if std::ptr::eq(tok, &tokens::BOOLEAN_XOR) { &BOOL_XOR }
+    else { tok }
+}
+
+/// PrintJava's syntax differences, without a second printer or language plane.
+pub static LANG_JAVA: LangProfile = LangProfile {
+    name: "java-language",
+    file_ext: "java",
+    null_literal: "null",
+    map_token: java_map_token,
+    caps: LangCaps {
+        goto: false,
+        labeled_loop_break: true,
+        labeled_block_break: true,
+        comma_expression: false,
+        implicit_bool_conditions: false,
+        arrow_member: false,
+        signed_text_byte: false,
+        ..LANG_C.caps
+    },
+    ..LANG_C
 };
 
 #[cfg(test)]

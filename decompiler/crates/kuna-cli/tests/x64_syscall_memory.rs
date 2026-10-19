@@ -110,12 +110,9 @@ fn excluded_abis_preserve_the_register_only_syscall_model() {
                 let (text, err, rc) = common::run_kuna(&refs);
                 assert_eq!(rc, 0, "{policy} {mode}: {text}\n{err}");
                 let windows = policy.starts_with("windows");
-                let result = if windows {
-                    "unsigned int"
-                } else {
-                    "unsigned long"
-                };
-                let cast = if windows { "(unsigned int)" } else { "" };
+                // The authored rank is unsigned long on both compiler specs;
+                // LLP64 changes its width, not its C rank.
+                let cast = if windows { "(unsigned long)" } else { "" };
                 let body = if mode == "off" {
                     "  syscall();\n  return 1;".to_owned()
                 } else if mode == "abi" {
@@ -132,13 +129,31 @@ fn excluded_abis_preserve_the_register_only_syscall_model() {
                         "  char v1 [16]; // stack - 0x10\n  \n  return {cast}syscall(1,0x11,v1,8);"
                     )
                 };
-                let expected = format!("{result} {name}(void)\n{{\n{body}\n}}");
-                assert_eq!(text.trim_end(), expected, "{policy} {mode}");
-                if mode == "off" {
-                    continue;
-                }
+                let (signature, printed_body) = text.split_once('{').expect("function body");
+                assert!(signature.trim_end().ends_with(&format!("{name}(void)")), "{text}");
+                assert_eq!(printed_body.trim_end(), format!("\n{body}\n}}"), "{policy} {mode}");
+                // The off-policy syscall() body is intentionally not compiled;
+                // its source declaration still has an independent rank contract.
+                let checked_text = if mode == "off" {
+                    format!("{};", signature.trim_end())
+                } else { text.clone() };
                 let printed = common::scratch_file("x64-syscall-excluded", "c");
-                std::fs::write(&printed, format!("#include <unistd.h>\n{text}")).unwrap();
+                let rank = format!(r#"_Static_assert(_Generic({name}(), unsigned long: 1, default: 0), "source return rank");"#);
+                std::fs::write(&printed, format!("#include <unistd.h>\n#define MSABI __attribute__((ms_abi))\n#define __stdcall __attribute__((sysv_abi))\n{checked_text}\n{rank}\n")).unwrap();
+                if windows && Command::new("clang").arg("--version").output().is_ok() {
+                    let target_source = common::scratch_file("x64-syscall-target-width", "c");
+                    std::fs::write(&target_source, format!(r#"
+#define MSABI __attribute__((ms_abi))
+long long syscall(long long,...);
+{checked_text}
+{rank}
+_Static_assert(sizeof({name}()) == 4, "Windows return width");
+"#)).unwrap();
+                    let target = Command::new("clang")
+                        .args(["--target=x86_64-pc-windows-msvc", "-std=c11", "-ffreestanding", "-fsyntax-only", "-Werror=strict-prototypes"])
+                        .arg(&target_source).output().unwrap();
+                    assert!(target.status.success(), "{policy} {mode}: {}\n{text}", String::from_utf8_lossy(&target.stderr));
+                }
                 for compiler in ["cc", "clang"] {
                     if Command::new(compiler).arg("--version").output().is_err() {
                         continue;

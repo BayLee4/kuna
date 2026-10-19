@@ -79,13 +79,13 @@ fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaRes
 /// `isFree()` negative-guard tests.
 fn free_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
 }
 
 /// A formal input varnode at (off,size).
 fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), None);
+    let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -108,7 +108,7 @@ fn make_op(
     let op = fd.obank_mut().create_at(num_in, pc);
     fd.obank_mut().change_opcode(op, TypeOp::new(opc, opcode_flags(opc), format!("{opc:?}")));
     // Output varnode at a distinct address (off) so set_def doesn't dedup.
-    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize)));
+    let out = fd.new_varnode(outsize, &Address::new(r, off), Some(unk(outsize))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let out = fd.vbank_mut().set_def(out, info, &mut no_replace()).unwrap();
@@ -203,7 +203,7 @@ fn signdiv2_positive_rewrites_to_sdiv_by_2() {
     let (root, a) = build_signdiv2(&mut fd);
 
     let mut rule = RuleSignDiv2::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
 
     // op now: a s/ 2
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_SDIV, "opcode -> INT_SDIV");
@@ -221,7 +221,7 @@ fn signdiv2_negative_in1_not_one() {
     fd.op_set_input(root, c2, 1).unwrap();
 
     let mut rule = RuleSignDiv2::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "in1 != 1 must not fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "in1 != 1 must not fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_SRIGHT, "unchanged");
 }
 
@@ -247,7 +247,7 @@ fn signdiv2_negative_wrong_shift_amount() {
     wire(&mut fd, c1, root, 1);
 
     let mut rule = RuleSignDiv2::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "wrong shift -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "wrong shift -> no fire");
 }
 
 // ===========================================================================
@@ -270,7 +270,7 @@ fn divchain_positive_sdiv_collapses() {
     wire(&mut fd, c5, root, 1);
 
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_SDIV, "still SDIV");
     assert_eq!(in_vn(&fd, root, 0), x, "input0 = x");
     assert_eq!(in_off(&fd, root, 1), 15, "input1 = 3*5 = 15");
@@ -296,7 +296,7 @@ fn divchain_negative_intermediate_has_other_use() {
     wire(&mut fd, c1, other, 1);
 
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "non-lone intermediate -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "non-lone intermediate -> no fire");
 }
 
 #[test]
@@ -316,7 +316,7 @@ fn divchain_negative_signed_overflow() {
     wire(&mut fd, c2, root, 1);
 
     let mut rule = RuleDivChain::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "signed overflow -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "signed overflow -> no fire");
 }
 
 // ===========================================================================
@@ -337,7 +337,7 @@ fn signform_positive() {
     wire(&mut fd, c, root, 1);
 
     let mut rule = RuleSignForm::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_SRIGHT, "-> INT_SRIGHT");
     assert_eq!(in_vn(&fd, root, 0), v, "input0 = V");
     assert_eq!(in_off(&fd, root, 1), 31, "input1 = 8*4-1 = 31");
@@ -356,7 +356,7 @@ fn signform_negative_c_too_small() {
     wire(&mut fd, c, root, 1);
 
     let mut rule = RuleSignForm::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "c < size -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "c < size -> no fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_SUBPIECE, "unchanged");
 }
 
@@ -372,7 +372,7 @@ fn signform_negative_not_sext() {
     wire(&mut fd, c, root, 1);
 
     let mut rule = RuleSignForm::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "in0 not SEXT -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "in0 not SEXT -> no fire");
 }
 
 // ===========================================================================
@@ -402,7 +402,7 @@ fn modopt_positive_signed_constant_divisor() {
     wire(&mut fd, multout, addop, 1);
 
     let mut rule = RuleModOpt::new();
-    assert_eq!(rule.apply_op(op, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, addop), OpCode::CPUI_INT_SREM, "addop -> INT_SREM");
     assert_eq!(in_vn(&fd, addop, 0), x, "addop in0 = x");
     assert_eq!(in_off(&fd, addop, 1), 7, "addop in1 = divisor 7");
@@ -426,7 +426,7 @@ fn modopt_negative_wrong_complement() {
     wire(&mut fd, multout, addop, 1);
 
     let mut rule = RuleModOpt::new();
-    assert_eq!(rule.apply_op(op, &mut fd), 0, "wrong complement -> no fire");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0, "wrong complement -> no fire");
     assert_eq!(op_of(&fd, addop), OpCode::CPUI_INT_ADD, "addop unchanged");
 }
 
@@ -448,7 +448,7 @@ fn modopt_negative_div_unsigned_becomes_rem() {
     wire(&mut fd, multout, addop, 1);
 
     let mut rule = RuleModOpt::new();
-    assert_eq!(rule.apply_op(op, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, addop), OpCode::CPUI_INT_REM, "INT_DIV -> INT_REM (unsigned)");
 }
 
@@ -466,7 +466,7 @@ fn negatenegate_positive() {
     wire(&mut fd, neg2out, root, 0);
 
     let mut rule = RuleNegateNegate::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_COPY, "-> COPY");
     assert_eq!(in_vn(&fd, root, 0), v, "input0 = V (inner negate's input)");
 }
@@ -481,7 +481,7 @@ fn negatenegate_negative_inner_not_negate() {
     wire(&mut fd, copout, root, 0);
 
     let mut rule = RuleNegateNegate::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "inner not NEGATE -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "inner not NEGATE -> no fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_INT_NEGATE, "unchanged");
 }
 
@@ -493,7 +493,7 @@ fn negatenegate_negative_input_not_written() {
     wire(&mut fd, v, root, 0); // input is an INPUT varnode, not written
 
     let mut rule = RuleNegateNegate::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "in0 not written -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "in0 not written -> no fire");
 }
 
 // ===========================================================================
@@ -512,7 +512,7 @@ fn floatcast_float2float_superfluous_identity() {
     wire(&mut fd, innerout, root, 0);
 
     let mut rule = RuleFloatCast::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_COPY, "outsize==insize2 -> COPY identity");
     assert_eq!(in_vn(&fd, root, 0), vn2, "input0 = vn2");
 }
@@ -528,7 +528,7 @@ fn floatcast_int2float_through_float2float() {
     wire(&mut fd, innerout, root, 0);
 
     let mut rule = RuleFloatCast::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 1, "must fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 1, "must fire");
     assert_eq!(op_of(&fd, root), OpCode::CPUI_FLOAT_INT2FLOAT, "-> INT2FLOAT");
     assert_eq!(in_vn(&fd, root, 0), vn2, "input0 = vn2");
 }
@@ -549,7 +549,7 @@ fn floatcast_preserves_integer_rounding_before_a_different_float_width() {
         let root = make_op(&mut fd, 0x210, OpCode::CPUI_FLOAT_FLOAT2FLOAT, 1, final_size).0;
         wire(&mut fd, rounded, root, 0);
 
-        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd), 0);
+        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd).unwrap(), 0);
         assert_eq!(op_of(&fd, root), OpCode::CPUI_FLOAT_FLOAT2FLOAT);
         assert_eq!(in_vn(&fd, root, 0), rounded);
     }
@@ -572,7 +572,7 @@ fn floatcast_combines_exact_integer_intermediates_and_identical_float_widths() {
         let root = make_op(&mut fd, 0x210, OpCode::CPUI_FLOAT_FLOAT2FLOAT, 1, final_size).0;
         wire(&mut fd, rounded, root, 0);
 
-        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd), 1);
+        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd).unwrap(), 1);
         assert_eq!(op_of(&fd, root), OpCode::CPUI_FLOAT_INT2FLOAT);
         assert_eq!(in_vn(&fd, root, 0), source);
     }
@@ -591,7 +591,7 @@ fn floatcast_folds_every_integer_rounding_with_intfloatround_off() {
     let root = make_op(&mut fd, 0x210, OpCode::CPUI_FLOAT_FLOAT2FLOAT, 1, 8).0;
     wire(&mut fd, rounded, root, 0);
 
-    assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd), 1);
+    assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd).unwrap(), 1);
     assert_eq!(in_vn(&fd, root, 0), source);
 }
 
@@ -605,7 +605,7 @@ fn floatcast_combines_through_the_unlisted_extended_format() {
         let root = make_op(&mut fd, 0x210, OpCode::CPUI_FLOAT_FLOAT2FLOAT, 1, final_size).0;
         wire(&mut fd, rounded, root, 0);
 
-        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd), 1);
+        assert_eq!(RuleFloatCast::new().apply_op(root, &mut fd).unwrap(), 1);
         assert_eq!(op_of(&fd, root), OpCode::CPUI_FLOAT_INT2FLOAT);
         assert_eq!(in_vn(&fd, root, 0), source);
     }
@@ -622,7 +622,7 @@ fn floatcast_negative_free_input() {
     wire(&mut fd, innerout, root, 0);
 
     let mut rule = RuleFloatCast::new();
-    assert_eq!(rule.apply_op(root, &mut fd), 0, "free vn2 -> no fire");
+    assert_eq!(rule.apply_op(root, &mut fd).unwrap(), 0, "free vn2 -> no fire");
 }
 
 // ===========================================================================
@@ -696,7 +696,7 @@ fn ptrflow_copy_propagates_when_flagged() {
     fd.obank_mut().get_mut(copyop).unwrap().set_ptr_flow();
 
     let mut rule = RulePtrFlow::new();
-    assert_eq!(rule.apply_op(copyop, &mut fd), 1, "ptrflow COPY must report a change");
+    assert_eq!(rule.apply_op(copyop, &mut fd).unwrap(), 1, "ptrflow COPY must report a change");
     // copyout varnode is now ptrflow.
     assert!(fd.vbank().get(copyout).unwrap().is_ptr_flow(), "out varnode marked ptrflow");
     // the reader (INT_ADD) is now ptrflow.
@@ -711,7 +711,7 @@ fn ptrflow_copy_not_flagged_is_noop() {
     wire(&mut fd, src, copyop, 0);
     // NOT marked ptrflow -> early return 0.
     let mut rule = RulePtrFlow::new();
-    assert_eq!(rule.apply_op(copyop, &mut fd), 0, "un-flagged COPY -> no change");
+    assert_eq!(rule.apply_op(copyop, &mut fd).unwrap(), 0, "un-flagged COPY -> no change");
 }
 
 #[test]

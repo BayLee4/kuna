@@ -84,6 +84,65 @@ mod config_ir_regressions {
         assert!(ov.find_proto_override(&ram(&m, 0x40)).is_none());
         assert!(original_caller.find_proto_override(&ram(&m, 0x40)).is_some());
     }
+
+    #[test]
+    fn inferred_proto_origin_is_full_address_local_and_authored_replacement_wins() {
+        let m = manager();
+        let site = ram(&m, 0x40);
+        let other_bank = super::Address::new(
+            Rc::clone(m.get_space_by_name("stack").unwrap()), 0x40,
+        );
+        let mut ov = Override::new();
+        ov.insert_inferred_proto_override(site.clone(), 1, Box::new(prototype(&m, 0x90, 0x10)));
+        assert!(ov.is_inferred_proto_override(&site, 1));
+        assert!(!ov.is_authored_proto_override(&site));
+        ov.insert_inferred_proto_override(site.clone(), 3, Box::new(prototype(&m, 0x90, 0x10)));
+        ov.insert_proto_override(other_bank.clone(), Box::new(prototype(&m, 0x98, 0x08)));
+        assert!(ov.is_authored_proto_override(&other_bank));
+        assert!(!ov.is_authored_proto_override(&ram(&m, 0x44)));
+        assert!(!ov.is_inferred_proto_override(&site, 1));
+        assert!(ov.is_inferred_proto_override(&site, 3));
+        assert!(!ov.is_inferred_proto_override(&site, 0));
+        assert!(!ov.is_inferred_proto_override(&other_bank, 1));
+        assert!(!ov.is_inferred_proto_override(&ram(&m, 0x44), 1));
+        assert!(ov.find_proto_override(&site).unwrap().prototype().unwrap().is_override());
+
+        ov.insert_proto_override(site.clone(), Box::new(prototype(&m, 0xa0, 0x18)));
+        assert!(!ov.is_inferred_proto_override(&site, 1));
+        assert!(!ov.is_inferred_proto_override(&site, 3));
+        assert!(ov.is_authored_proto_override(&site));
+        let authored = ov.find_proto_override(&site).unwrap().prototype().unwrap();
+        assert!(authored.is_override());
+        assert_eq!(authored.get_param(0).unwrap().get_address(), ram(&m, 0xa0));
+    }
+
+    #[test]
+    fn working_copy_and_clear_preserve_inferred_proto_origin_without_source_mutation() {
+        let m = manager();
+        let site = ram(&m, 0x40);
+        let authored_site = ram(&m, 0x80);
+        let mut ov = Override::new();
+        ov.insert_inferred_proto_override(site.clone(), 2, Box::new(prototype(&m, 0x90, 0x10)));
+        ov.insert_proto_override(authored_site.clone(), Box::new(prototype(&m, 0x98, 0x08)));
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(8), 8, 8);
+        types.set_max_basetype_size(8);
+        let mut working = ov.working_copy(&types).unwrap();
+        assert!(working.is_inferred_proto_override(&site, 2));
+        assert!(!working.is_inferred_proto_override(&site, 0));
+        assert!(!working.is_inferred_proto_override(&authored_site, 2));
+        assert!(!working.is_authored_proto_override(&site));
+        assert!(working.is_authored_proto_override(&authored_site));
+        assert!(working.find_proto_override(&site).unwrap().prototype().unwrap().is_override());
+        working.clear();
+        assert!(!working.is_inferred_proto_override(&site, 2));
+        assert!(!working.is_authored_proto_override(&authored_site));
+        assert!(working.find_proto_override(&site).is_none());
+        assert!(ov.is_inferred_proto_override(&site, 2));
+        assert!(ov.find_proto_override(&authored_site).is_some());
+        ov.clear();
+        assert!(!ov.is_inferred_proto_override(&site, 2));
+    }
 }
 
 // ---------------------------------------------------------------------------

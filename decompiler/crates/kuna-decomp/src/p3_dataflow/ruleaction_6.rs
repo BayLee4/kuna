@@ -10,7 +10,7 @@ use std::rc::Rc;
 use kuna_base::address::{
     calc_mask, count_leading_zeros, popcount, sign_extend, sign_extend_sized, signbit_negative,
 };
-use kuna_base::error::{KunaError, KunaResult};
+use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, int8, uint4, uintb, Wrap};
 use kuna_num::multiprecision::{
     add128, leftshift128, set_u128, subtract128, udiv128, uless128, ulessequal128,
@@ -107,15 +107,6 @@ fn new_extended_constant(
         data.op_insert_before(piece_op, op);
     }
     Ok(new_const_vn)
-}
-
-/// `Varnode::getTypeReadFacing(op)` — the read-facing data-type resolution
-/// (union/flow aware) is W6.  // STUB(W6)
-#[inline]
-fn type_read_facing_stub(_data: &Funcdata, _vn: VarnodeId, _op: OpId) -> KunaResult<()> {
-    Err(KunaError::lowlevel(
-        "ruleaction_6: Varnode::getTypeReadFacing is a W6 type-facing surface",
-    ))
 }
 
 // =============================================================================
@@ -262,16 +253,16 @@ impl Rule for RulePtraddUndo {
         Some(Box::new(RulePtraddUndo::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         use crate::dtype::type_metatype;
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         // PTRADD element size
         let size = offset(data, in_vn(data, op, 2)) as int4;
         let basevn = in_vn(data, op, 0);
         // Resolve union/relptr in-flow.
-        let dt = Some(data.vn_type_read_facing(basevn, op));
+        let dt = Some(data.vn_type_read_facing(basevn, op)?);
         if let Some(dt) = dt {
             if dt.get_metatype() == type_metatype::TYPE_PTR {
                 // Still a pointer; check the element size and zero index.
@@ -288,13 +279,13 @@ impl Rule for RulePtraddUndo {
                         .map(|v| (v.is_constant(), v.get_offset()))
                         .unwrap_or((false, 1));
                     if !ind_const || ind_off != 0 {
-                        return 0; // Correct size and non-zero index: leave the PTRADD.
+                        return Ok(0); // Correct size and non-zero index: leave the PTRADD.
                     }
                 }
             }
         }
-        data.op_undo_ptradd(op, false);
-        1
+        data.op_undo_ptradd(op, false)?;
+        Ok(1)
     }
 }
 
@@ -454,7 +445,7 @@ impl RulePtrsubUndo {
     /// additional PTRADD/PTRSUB/INT_ADD that uses `vn` and adds a constant into a
     /// COPY, plus any reachable constant-adding INT_ADD.  Returns the sum of the
     /// removed constants.
-    fn remove_local_adds(data: &mut Funcdata, vn: VarnodeId) -> int8 {
+    fn remove_local_adds(data: &mut Funcdata, vn: VarnodeId) -> KunaResult<int8> {
         let mut extra: int8 = 0;
         let mut op = lone_descend(data, vn);
         let mut next_vn = vn;
@@ -494,7 +485,7 @@ impl RulePtrsubUndo {
                     data.op_remove_input(curop, 1);
                     set_opcode(data, curop, OpCode::CPUI_COPY);
                 } else {
-                    data.op_undo_ptradd(curop, false);
+                    data.op_undo_ptradd(curop, false)?;
                     extra = extra.wadd(Self::remove_local_add_recurse(
                         data,
                         curop,
@@ -515,7 +506,7 @@ impl RulePtrsubUndo {
                 .expect("removeLocalAdds: stale vn")
                 .update_type(nt);
         }
-        extra
+        Ok(extra)
     }
 
     /// (kuna) GH-8471 guard: should `RulePtrsubUndo` preserve this PTRSUB as a
@@ -532,7 +523,7 @@ impl RulePtrsubUndo {
         val: int8,
         extra: int8,
         multiplier: int8,
-    ) -> bool {
+    ) -> kuna_base::error::KunaResult<bool> {
         use crate::dtype::type_metatype;
         use crate::kuna_thumbfuncptr::{
             kuna_preserve_thumb_funcptr, ThumbPtrTypeFacts, ThumbSubTypeFact,
@@ -542,16 +533,16 @@ impl RulePtrsubUndo {
         // Mirror the C++ short-circuit: `!preserve_thumb_funcptr || funcptr_align
         // == 0` -> false, before any type query.
         if !arch.preserve_thumb_funcptr || funcptr_align == 0 {
-            return false;
+            return Ok(false);
         }
         // Require TYPE_PTR -> TYPE_SPACEBASE.
         let base_metatype = read_facing.get_metatype();
         if base_metatype != type_metatype::TYPE_PTR {
-            return false;
+            return Ok(false);
         }
         let ptr_to = match read_facing.get_ptr_to() {
             Some(p) => p,
-            None => return false,
+            None => return Ok(false),
         };
         let ptr_to_metatype = ptr_to.get_metatype();
         let word_size = read_facing.get_word_size().unwrap_or(1);
@@ -561,7 +552,7 @@ impl RulePtrsubUndo {
         let sub = if ptr_to_metatype == type_metatype::TYPE_SPACEBASE {
             let newoff =
                 kuna_base::space::AddrSpace::address_to_byte_int(val, word_size);
-            match data.spacebase_get_sub_type(&ptr_to, newoff) {
+            match data.spacebase_get_sub_type(&ptr_to, newoff)? {
                 Some((sub_type, residual)) => Some(ThumbSubTypeFact {
                     metatype: sub_type.get_metatype(),
                     residual_offset: residual,
@@ -577,14 +568,14 @@ impl RulePtrsubUndo {
             word_size,
             sub,
         };
-        kuna_preserve_thumb_funcptr(
+        Ok(kuna_preserve_thumb_funcptr(
             arch.preserve_thumb_funcptr,
             funcptr_align,
             val,
             extra,
             multiplier,
             &facts,
-        )
+        ))
     }
 }
 
@@ -600,9 +591,9 @@ impl Rule for RulePtrsubUndo {
         Some(Box::new(RulePtrsubUndo::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !data.has_type_recovery_started() {
-            return 0;
+            return Ok(0);
         }
         let basevn = in_vn(data, op, 0);
         let cvn = in_vn(data, op, 1);
@@ -611,9 +602,9 @@ impl Rule for RulePtrsubUndo {
         // `getTypeReadFacing(op)->isPtrsubMatching` dispatches through
         // TypeSpacebase, which the kuna `is_ptrsub_matching_scope` resolves via the
         // local-variable Scope (the same call ActionSetCasts::castFixupPtrsub uses).
-        let read_facing = data.vn_type_read_facing(basevn, op);
-        if data.is_ptrsub_matching_scope(&read_facing, val, extra0, multiplier) {
-            return 0;
+        let read_facing = data.vn_type_read_facing(basevn, op)?;
+        if data.is_ptrsub_matching_scope(&read_facing, val, extra0, multiplier)? {
+            return Ok(0);
         }
         //   return 0;  -- (kuna) GH-8471
         // A pointer to a Thumb function carries the mode bit in its LSB
@@ -625,8 +616,8 @@ impl Rule for RulePtrsubUndo {
         // routes through the function's scope; the global-symbol arm of
         // `spacebase_get_sub_type` resolves the constant `fn` to its TYPE_CODE
         // symbol type (the same path ActionConstantPtr::isPointer uses).
-        if Self::preserve_thumb_funcptr(data, &read_facing, val, extra0, multiplier) {
-            return 0;
+        if Self::preserve_thumb_funcptr(data, &read_facing, val, extra0, multiplier)? {
+            return Ok(0);
         }
 
         set_opcode(data, op, OpCode::CPUI_INT_ADD);
@@ -635,14 +626,14 @@ impl Rule for RulePtrsubUndo {
             .expect("ptrsubundo: stale op")
             .clear_stop_type_propagation();
         let outvn = out_vn(data, op);
-        let extra = Self::remove_local_adds(data, outvn);
+        let extra = Self::remove_local_adds(data, outvn)?;
         if extra != 0 {
             val = val.wadd(extra);
             let csize = size(data, cvn);
             let nc = data.new_constant(csize, (val as uintb) & calc_mask(csize));
             data.op_set_input(op, nc, 1).expect("ptrsubundo: opSetInput");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -673,18 +664,18 @@ impl Rule for RuleMultNegOne {
         Some(Box::new(RuleMultNegOne::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // a * -1 -> -a
         let constvn = in_vn(data, op, 1);
         if !is_const(data, constvn) {
-            return 0;
+            return Ok(0);
         }
         if offset(data, constvn) != calc_mask(size(data, constvn)) {
-            return 0;
+            return Ok(0);
         }
         set_opcode(data, op, OpCode::CPUI_INT_2COMP);
         data.op_remove_input(op, 1);
-        1
+        Ok(1)
     }
 }
 
@@ -716,20 +707,20 @@ impl Rule for RuleAddUnsigned {
         Some(Box::new(RuleAddUnsigned::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         use crate::dtype::type_metatype;
         let constvn = in_vn(data, op, 1);
 
         if !is_const(data, constvn) {
-            return 0;
+            return Ok(0);
         }
         // Only change integer forms
-        let dt = data.vn_type_read_facing(constvn, op);
+        let dt = data.vn_type_read_facing(constvn, op)?;
         if dt.get_metatype() != type_metatype::TYPE_UINT {
-            return 0;
+            return Ok(0);
         }
         if dt.is_char_print() {
-            return 0;
+            return Ok(0);
         }
         // 1/4 less than full bitsize
         // first quarter bits all 1's
@@ -739,7 +730,7 @@ impl Rule for RuleAddUnsigned {
         let sa = (cv_size * 6) as uint4; // 1/4 less than full bitsize
         let quarter = (mask >> sa) << sa;
         if (val & quarter) != quarter {
-            return 0;
+            return Ok(0);
         }
         // named equate
         if let Some(sym) = data.vbank().get(constvn).and_then(|v| v.kuna_symbol_entry()) {
@@ -748,7 +739,7 @@ impl Rule for RuleAddUnsigned {
                 if s.get_category() == crate::database::symbol_category::EQUATE
                     && s.is_name_locked()
                 {
-                    return 0;
+                    return Ok(0);
                 }
             }
         }
@@ -757,13 +748,13 @@ impl Rule for RuleAddUnsigned {
             && !dt.has_named_value(negated_val)
             && dt.has_named_value((!val) & mask)
         {
-            return 0;
+            return Ok(0);
         }
         data.op_set_opcode_code(op, OpCode::CPUI_INT_SUB);
         let cvn = data.new_constant(cv_size, negated_val);
         data.copy_symbol(cvn, constvn);
         let _ = data.op_set_input(op, cvn, 1);
-        1
+        Ok(1)
     }
 }
 
@@ -794,14 +785,14 @@ impl Rule for Rule2Comp2Sub {
         Some(Box::new(Rule2Comp2Sub::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opout = out_vn(data, op);
         let addop = match data.lone_descend(opout) {
             Some(a) => a,
-            None => return 0,
+            None => return Ok(0),
         };
         if code(data, addop) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         // data.opSetOpcode(addop,CPUI_INT_SUB);  -- STUB(W6)
         //   The C++ commits the opcode flip *after* rewiring inputs; here we must
@@ -817,8 +808,8 @@ impl Rule for Rule2Comp2Sub {
         let opin0 = in_vn(data, op, 0);
         data.op_set_input(addop, opin0, 1).expect("2comp2sub: opSetInput");
         // Completely remove 2COMP
-        data.op_destroy(op);
-        1
+        data.op_destroy(op)?;
+        Ok(1)
     }
 }
 
@@ -849,9 +840,9 @@ impl Rule for RuleSubRight {
         Some(Box::new(RuleSubRight::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if data.obank().get(op).expect("subright: stale op").does_special_printing() {
-            return 0;
+            return Ok(0);
         }
         //
         // `Varnode::getTypeReadFacing(op)` (varnode.cc:658) returns the varnode's
@@ -863,27 +854,27 @@ impl Rule for RuleSubRight {
         // printc.cc:866).  The marker is a pure print flag (no IR rewrite, `return
         // 0`); the rewrite tail below is unaffected.
         let a = in_vn(data, op, 0);
-        let in0_piece = data.vn_type_read_facing(a, op).is_piece_structured();
+        let in0_piece = data.vn_type_read_facing(a, op)?.is_piece_structured();
         if in0_piece {
             data.op_mark_special_print(op); // Print this as a field extraction
-            return 0;
+            return Ok(0);
         }
 
         let c = offset(data, in_vn(data, op, 1)) as int4;
         if c == 0 {
-            return 0; // SUBPIECE is not least sig
+            return Ok(0); // SUBPIECE is not least sig
         }
         let outvn = out_vn(data, op);
         if is_addr_tied(data, outvn) && is_addr_tied(data, a) && overlap(data, outvn, a) == c {
             // This SUBPIECE should get converted to a marker by ActionCopyMarker,
             // so don't convert it.
-            return 0;
+            return Ok(0);
         }
         // (kuna) The C++ reads `glb->types` only after it has already rewired the
         // graph; a hand-built Funcdata with no type factory would leave a
         // half-applied transform behind, so the availability check is hoisted here.
         if data.get_arch().types().is_none() {
-            return 0;
+            return Ok(0);
         }
         let asize = size(data, a);
         let mut op = op; // The C++ rebinds `op` to `lone` when the shift is lumped in
@@ -898,11 +889,11 @@ impl Rule for RuleSubRight {
                     d = (d as uintb).wrapping_add(offset(data, shiftamt)) as int4;
                     if d >= asize * 8 {
                         if opc2 == OpCode::CPUI_INT_RIGHT {
-                            return 0; // Result should have been 0
+                            return Ok(0); // Result should have been 0
                         }
                         d = asize * 8 - 1; // sign extraction
                     }
-                    data.op_unlink(op);
+                    data.op_unlink(op)?;
                     op = lone;
                     set_opcode(data, op, OpCode::CPUI_SUBPIECE);
                     opc = opc2;
@@ -934,7 +925,7 @@ impl Rule for RuleSubRight {
         data.op_set_input(op, newout, 0).expect("subright: opSetInput");
         let zero = data.new_constant(4, 0);
         data.op_set_input(op, zero, 1).expect("subright: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -957,23 +948,29 @@ impl RulePtrsubCharConstant {
     /// Try to push a collapsed constant pointer further through a descendant
     /// PTRADD (C++ `RulePtrsubCharConstant::pushConstFurther`).
     ///
-    /// The dtype/newConstant-with-pointer-type commit is W6/W3-varnode; the shape
-    /// guards (`PTRADD`, slot 0, constant index) are transcribed.  Returns
-    /// `false` whenever it cannot complete.
-    fn push_const_further(data: &mut Funcdata, op: OpId, slot: int4, _val: uintb) -> bool {
+    fn push_const_further(
+        data: &mut Funcdata, outtype: &std::rc::Rc<crate::dtype::Datatype>,
+        op: OpId, slot: int4, val: uintb,
+    ) -> KunaResult<bool> {
         if code(data, op) != OpCode::CPUI_PTRADD {
-            return false;
+            return Ok(false);
         }
         if slot != 0 {
-            return false;
+            return Ok(false);
         }
         let vn = in_vn(data, op, 1);
         if !is_const(data, vn) {
-            return false;
+            return Ok(false);
         }
-        // newconst->updateType(outtype);          -- STUB(W6) pointer datatype
-        // opRemoveInput(op,2); opRemoveInput(op,1); opSetOpcode(op,CPUI_COPY);  -- STUB(W6)
-        false // STUB(W6): cannot stamp pointer type / change opcode -> no push
+        let addval = offset(data, vn).wrapping_mul(offset(data, in_vn(data, op, 2)));
+        let constant = data.new_constant(size(data, vn), val.wrapping_add(addval));
+        data.vbank_mut().get_mut(constant).expect("string pointer constant")
+            .update_type(std::rc::Rc::clone(outtype));
+        data.op_remove_input(op, 2);
+        data.op_remove_input(op, 1);
+        data.op_set_opcode_code(op, OpCode::CPUI_COPY);
+        data.op_set_input(op, constant, 0)?;
+        Ok(true)
     }
 }
 
@@ -989,19 +986,66 @@ impl Rule for RulePtrsubCharConstant {
         Some(Box::new(RulePtrsubCharConstant::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> KunaResult<int4> {
         let sb = in_vn(data, op, 0);
-        // Datatype *sbType = sb->getTypeReadFacing(op);  -- STUB(W6)
-        //   The whole guard chain (TYPE_PTR -> TYPE_SPACEBASE -> getAddress / scope
-        //   isReadOnly / stringManager->isString) is W6/W4.  The descendant
-        //   push-const loop (pushConstFurther) and the COPY conversion are also W6.
-        //   Without the read-facing type we cannot proceed.
-        let _push = Self::push_const_further
-            as fn(&mut Funcdata, OpId, int4, uintb) -> bool;
-        if type_read_facing_stub(data, sb, op).is_err() {
-            return 0; // STUB(W6)
+        let sbtype = data.vn_type_read_facing(sb, op)?;
+        if sbtype.get_metatype() != crate::dtype::type_metatype::TYPE_PTR {
+            return Ok(0);
         }
-        0
+        let Some(spacebase) = sbtype.get_ptr_to() else { return Ok(0) };
+        if spacebase.get_metatype() != crate::dtype::type_metatype::TYPE_SPACEBASE {
+            return Ok(0);
+        }
+        let vn1 = in_vn(data, op, 1);
+        if !is_const(data, vn1) { return Ok(0); }
+        let out = out_vn(data, op);
+        let outtype = data.vn_type_def_facing(out)?;
+        if outtype.get_metatype() != crate::dtype::type_metatype::TYPE_PTR {
+            return Ok(0);
+        }
+        let Some(chartype) = outtype.get_ptr_to() else { return Ok(0) };
+        if !chartype.is_char_print() { return Ok(0); }
+        let usepoint = op_addr(data, op);
+        let val = offset(data, vn1);
+        let Some(addr) = spacebase.spacebase_get_address(
+            val, size(data, vn1), &usepoint, data.get_arch().manage(),
+        ) else { return Ok(0) };
+        if data.get_arch().query_global_properties(&addr, 1, &usepoint)?
+            & crate::varnode::varnode_flags::readonly == 0 {
+            return Ok(0);
+        }
+        let arch = data.get_arch();
+        let (Some(strings), Some(loader)) = (&arch.internal_strings, &arch.loader) else {
+            return Ok(0);
+        };
+        let mut truncated = false;
+        {
+            let mut strings = strings.borrow_mut();
+            let mut loader = loader.borrow_mut();
+            if strings.get_string_data(&addr, &chartype, &mut **loader, &mut truncated)?.is_empty() {
+                return Ok(0);
+            }
+        }
+        let mut remove_copy = !data.vbank().get(out).expect("string pointer").is_addr_force();
+        if remove_copy {
+            for descendant in data.descend_snapshot(out) {
+                let slot = slot_of(data, descendant, out);
+                if !Self::push_const_further(data, &outtype, descendant, slot, val)? {
+                    remove_copy = false;
+                }
+            }
+        }
+        if remove_copy {
+            data.op_destroy(op)?;
+        } else {
+            let constant = data.new_constant(size(data, out), val);
+            data.vbank_mut().get_mut(constant).expect("string pointer constant")
+                .update_type(outtype);
+            data.op_remove_input(op, 1);
+            data.op_set_input(op, constant, 0)?;
+            data.op_set_opcode_code(op, OpCode::CPUI_COPY);
+        }
+        Ok(1)
     }
 }
 
@@ -1033,25 +1077,25 @@ impl Rule for RuleExtensionPush {
         Some(Box::new(RuleExtensionPush::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let invn = in_vn(data, op, 0);
         if is_const(data, invn) {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(invn).expect("extpush: stale vn").is_addr_force() {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(invn).expect("extpush: stale vn").is_addr_tied() {
-            return 0;
+            return Ok(0);
         }
         let outvn = out_vn(data, op);
         {
             let ov = data.vbank().get(outvn).expect("extpush: stale outvn");
             if ov.is_type_lock() || ov.is_name_lock() {
-                return 0;
+                return Ok(0);
             }
             if ov.is_addr_force() || ov.is_addr_tied() {
-                return 0;
+                return Ok(0);
             }
         }
         // Walk descendants: PTRADD => ptrcount, INT_ADD whose lone descendant is a
@@ -1067,25 +1111,25 @@ impl Rule for RuleExtensionPush {
                 let sub_op = data.lone_descend(decout);
                 match sub_op {
                     Some(s) if code(data, s) == OpCode::CPUI_PTRADD => {}
-                    _ => return 0,
+                    _ => return Ok(0),
                 }
                 addcount += 1;
             } else {
-                return 0;
+                return Ok(0);
             }
         }
         if (addcount + ptrcount) <= 1 {
-            return 0;
+            return Ok(0);
         }
         if addcount > 0 {
             if data.lone_descend(invn).is_some() {
-                return 0;
+                return Ok(0);
             }
         }
         // RulePushPtr::duplicateNeed(op, data);  -- STUB(W5-sibling/W6): the
         // extension-duplication helper lives in RulePushPtr (a different batch) and
         // We validated the full guard chain with real API; the commit is the stub.
-        0
+        Ok(0)
     }
 }
 
@@ -1329,28 +1373,28 @@ impl Rule for RulePieceStructure {
         Some(Box::new(RulePieceStructure::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Check if CONCAT tree already visited
         if data.obank().get(op).expect("piecestructure: stale op").is_partial_root() {
-            return 0;
+            return Ok(0);
         }
         let outvn = out_vn(data, op);
         let (ct, base_offset) = match Self::determine_datatype(data, outvn) {
             Ok((Some(c), b)) => (c, b),
-            Ok((None, _)) => return 0,
-            Err(_) => return 0,
+            Ok((None, _)) => return Ok(0),
+            Err(_) => return Ok(0),
         };
 
         if code(data, op) == OpCode::CPUI_INT_ZEXT {
             // (kuna `mulblob`) A widened multiply operand is a value, not an
             // aggregate: leave the extension alone so it prints as ZEXT816(x).
             if crate::p3_dataflow::kuna_mulblob::declines_zext(data, op) {
-                return 0;
+                return Ok(0);
             }
             let outty = vn_type(data, outvn);
             match Self::convert_zext_to_piece(data, op, Some(outty), 0) {
-                Ok(true) => return 1,
-                _ => return 0,
+                Ok(true) => return Ok(1),
+                _ => return Ok(0),
             }
         }
 
@@ -1358,19 +1402,19 @@ impl Rule for RulePieceStructure {
         if let Some(zext) = lone_descend(data, outvn) {
             let zc = code(data, zext);
             if zc == OpCode::CPUI_PIECE {
-                return 0; // More PIECEs below us, not a root
+                return Ok(0); // More PIECEs below us, not a root
             }
             if zc == OpCode::CPUI_INT_ZEXT {
                 // Extension of a structured data-type; convert extension to PIECE first
                 // (kuna `mulblob`) unless the extension is a multiply operand.
                 if crate::p3_dataflow::kuna_mulblob::declines_zext(data, zext) {
-                    return 0;
+                    return Ok(0);
                 }
                 let zout = out_vn(data, zext);
                 let zoutty = vn_type(data, zout);
                 match Self::convert_zext_to_piece(data, zext, Some(zoutty), 0) {
-                    Ok(true) => return 1,
-                    _ => return 0,
+                    Ok(true) => return Ok(1),
+                    _ => return Ok(0),
                 }
             }
         }
@@ -1432,10 +1476,7 @@ impl Rule for RulePieceStructure {
                 // Insert a COPY into a Varnode at the correct storage.
                 let node_op = node.get_op();
                 let copy_op = data.new_op(1, op_addr(data, node_op));
-                let new_vn = match data.new_varnode_out(vnsize, &addr, copy_op) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                let new_vn = data.new_varnode_out(vnsize, &addr, copy_op)?;
                 any_addr_tied = any_addr_tied || is_addr_tied(data, new_vn);
                 let new_type = match data
                     .get_arch()
@@ -1471,10 +1512,8 @@ impl Rule for RulePieceStructure {
                 };
                 let slot = slot_of(data, lone_op, vn);
                 let vnty = vn_type(data, vn);
-                let new_vn = data.new_varnode(vnsize, &addr, Some(vnty));
-                if data.op_set_output(def_op, new_vn).is_err() {
-                    continue;
-                }
+                let new_vn = data.new_varnode(vnsize, &addr, Some(vnty))?;
+                data.op_set_output(def_op, new_vn)?;
                 if data.op_set_input(lone_op, new_vn, slot).is_err() {
                     continue;
                 }
@@ -1489,7 +1528,7 @@ impl Rule for RulePieceStructure {
         if !any_addr_tied {
             data.with_covermerge(|merge, data| merge.register_proto_partial_root(data, outvn));
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1520,28 +1559,28 @@ impl Rule for RuleSubNormal {
         Some(Box::new(RuleSubNormal::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let shiftout = in_vn(data, op, 0);
         if !is_written(data, shiftout) {
-            return 0;
+            return Ok(0);
         }
         let shiftop = def_of(data, shiftout).expect("subnormal: written vn has no def");
         let mut opc = code(data, shiftop);
         if opc != OpCode::CPUI_INT_RIGHT && opc != OpCode::CPUI_INT_SRIGHT {
-            return 0;
+            return Ok(0);
         }
         if !is_const(data, in_vn(data, shiftop, 1)) {
-            return 0;
+            return Ok(0);
         }
         let a = in_vn(data, shiftop, 0);
         if is_free(data, a) {
-            return 0;
+            return Ok(0);
         }
         let outvn = out_vn(data, op);
         {
             let ov = data.vbank().get(outvn).expect("subnormal: stale outvn");
             if ov.is_precis_hi() || ov.is_precis_lo() {
-                return 0;
+                return Ok(0);
             }
         }
         let mut n = offset(data, in_vn(data, shiftop, 1)) as int4;
@@ -1552,7 +1591,7 @@ impl Rule for RuleSubNormal {
 
         // Total shift + outsize must be greater equal to size of input
         if (n + 8 * c + 8 * outsize < 8 * insize) && (n != k * 8) {
-            return 0;
+            return Ok(0);
         }
 
         // If totalcut + remain > original input
@@ -1570,7 +1609,7 @@ impl Rule for RuleSubNormal {
                 set_opcode(data, newop, OpCode::CPUI_SUBPIECE);
                 let newout = match data.new_unique_out(trunc_size, newop) {
                     Ok(v) => v,
-                    Err(_) => return 0,
+                    Err(_) => return Ok(0),
                 };
                 data.op_set_input(newop, a, 0).expect("subnormal: opSetInput");
                 let cst = data.new_constant(4, c as uintb);
@@ -1580,7 +1619,7 @@ impl Rule for RuleSubNormal {
                 data.op_set_input(op, newout, 0).expect("subnormal: opSetInput");
                 data.op_remove_input(op, 1);
                 set_opcode(data, op, opc);
-                return 1;
+                return Ok(1);
             } else {
                 k = insize - c - outsize; // Or we can shrink the cut
             }
@@ -1594,7 +1633,7 @@ impl Rule for RuleSubNormal {
             data.op_set_input(op, a, 0).expect("subnormal: opSetInput");
             let cst = data.new_constant(4, c as uintb);
             data.op_set_input(op, cst, 1).expect("subnormal: opSetInput");
-            return 1;
+            return Ok(1);
         } else if n >= outsize * 8 {
             n = outsize * 8; // Can only shift so far
             if opc == OpCode::CPUI_INT_SRIGHT {
@@ -1606,7 +1645,7 @@ impl Rule for RuleSubNormal {
         set_opcode(data, newop, OpCode::CPUI_SUBPIECE);
         let newout = match data.new_unique_out(outsize, newop) {
             Ok(v) => v,
-            Err(_) => return 0,
+            Err(_) => return Ok(0),
         };
         data.op_set_input(newop, a, 0).expect("subnormal: opSetInput");
         let cst = data.new_constant(4, c as uintb);
@@ -1617,7 +1656,7 @@ impl Rule for RuleSubNormal {
         let nc = data.new_constant(4, n as uintb);
         data.op_set_input(op, nc, 1).expect("subnormal: opSetInput");
         set_opcode(data, op, opc);
-        1
+        Ok(1)
     }
 }
 
@@ -1648,17 +1687,17 @@ impl Rule for RulePositiveDiv {
         Some(Box::new(RulePositiveDiv::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut sa = size(data, out_vn(data, op));
         if sa as usize > std::mem::size_of::<uintb>() {
-            return 0;
+            return Ok(0);
         }
         sa = sa * 8 - 1;
         if ((nz_mask(data, in_vn(data, op, 0)) >> sa) & 1) != 0 {
-            return 0; // Input 0 may be negative
+            return Ok(0); // Input 0 may be negative
         }
         if ((nz_mask(data, in_vn(data, op, 1)) >> sa) & 1) != 0 {
-            return 0; // Input 1 may be negative
+            return Ok(0); // Input 1 may be negative
         }
         let opc = if code(data, op) == OpCode::CPUI_INT_SDIV {
             OpCode::CPUI_INT_DIV
@@ -1667,7 +1706,7 @@ impl Rule for RulePositiveDiv {
         };
         // data.opSetOpcode(op, opc); return 1;  -- STUB(W6)
         set_opcode(data, op, opc);
-        1
+        Ok(1)
     }
 }
 
@@ -1736,29 +1775,29 @@ impl Rule for RuleDivTermAdd {
         Some(Box::new(RuleDivTermAdd::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let (subop, n, shiftopc) = match Self::find_subshift(data, op) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         if n > 127 {
-            return 0; // Up to 128-bits
+            return Ok(0); // Up to 128-bits
         }
         let multvn = in_vn(data, subop, 0);
         if !is_written(data, multvn) {
-            return 0;
+            return Ok(0);
         }
         let multop = def_of(data, multvn).expect("divtermadd: written vn has no def");
         if code(data, multop) != OpCode::CPUI_INT_MULT {
-            return 0;
+            return Ok(0);
         }
         let mut mult_const = match is_constant_extended(data, in_vn(data, multop, 1)) {
             Some(v) => v,
-            None => return 0, // STUB(W3-varnode): isConstantExtended unavailable
+            None => return Ok(0), // STUB(W3-varnode): isConstantExtended unavailable
         };
         let extvn = in_vn(data, multop, 0);
         if !is_written(data, extvn) {
-            return 0;
+            return Ok(0);
         }
         let extop = def_of(data, extvn).expect("divtermadd: written vn has no def");
         let opc = code(data, extop);
@@ -1767,11 +1806,11 @@ impl Rule for RuleDivTermAdd {
         #[allow(clippy::collapsible_if)]
         if opc == OpCode::CPUI_INT_ZEXT {
             if code(data, op) == OpCode::CPUI_INT_SRIGHT {
-                return 0;
+                return Ok(0);
             }
         } else if opc == OpCode::CPUI_INT_SEXT {
             if code(data, op) == OpCode::CPUI_INT_RIGHT {
-                return 0;
+                return Ok(0);
             }
         }
 
@@ -1801,7 +1840,7 @@ impl Rule for RuleDivTermAdd {
             let new_const_vn =
                 match new_extended_constant(data, size(data, extvn), &mult_const, op) {
                     Ok(v) => v,
-                    Err(_) => return 0,
+                    Err(_) => return Ok(0),
                 };
 
             // Construct the new multiply
@@ -1809,7 +1848,7 @@ impl Rule for RuleDivTermAdd {
             set_opcode(data, newmultop, OpCode::CPUI_INT_MULT);
             let newmultvn = match data.new_unique_out(size(data, extvn), newmultop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(newmultop, extvn, 0).expect("RuleDivTermAdd: opSetInput");
             data.op_set_input(newmultop, new_const_vn, 1).expect("RuleDivTermAdd: opSetInput");
@@ -1822,7 +1861,7 @@ impl Rule for RuleDivTermAdd {
             set_opcode(data, newshiftop, shiftopc);
             let newshiftvn = match data.new_unique_out(size(data, extvn), newshiftop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(newshiftop, newmultvn, 0).expect("RuleDivTermAdd: opSetInput");
             let nc = data.new_constant(4, n as uintb);
@@ -1833,9 +1872,9 @@ impl Rule for RuleDivTermAdd {
             data.op_set_input(addop, newshiftvn, 0).expect("RuleDivTermAdd: opSetInput");
             let c0 = data.new_constant(4, 0);
             data.op_set_input(addop, c0, 1).expect("RuleDivTermAdd: opSetInput");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1867,19 +1906,19 @@ impl Rule for RuleDivTermAdd2 {
         Some(Box::new(RuleDivTermAdd2::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !is_const(data, in_vn(data, op, 1)) {
-            return 0;
+            return Ok(0);
         }
         if offset(data, in_vn(data, op, 1)) != 1 {
-            return 0;
+            return Ok(0);
         }
         if !is_written(data, in_vn(data, op, 0)) {
-            return 0;
+            return Ok(0);
         }
         let subop = def_of(data, in_vn(data, op, 0)).expect("divtermadd2: no def");
         if code(data, subop) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         // Find the INT_MULT-by-(-1) operand; x is the other operand.
         let mut x: Option<VarnodeId> = None;
@@ -1900,44 +1939,44 @@ impl Rule for RuleDivTermAdd2 {
             }
         }
         if !found {
-            return 0;
+            return Ok(0);
         }
         let x = x.expect("divtermadd2: x set when found");
         let compop = def_of(data, compvn).expect("divtermadd2: no def");
         let z = in_vn(data, compop, 0);
         if !is_written(data, z) {
-            return 0;
+            return Ok(0);
         }
         let subpieceop = def_of(data, z).expect("divtermadd2: no def");
         if code(data, subpieceop) != OpCode::CPUI_SUBPIECE {
-            return 0;
+            return Ok(0);
         }
         let n = (offset(data, in_vn(data, subpieceop, 1)) as int4) * 8;
         if n != 8 * (size(data, in_vn(data, subpieceop, 0)) - size(data, z)) {
-            return 0;
+            return Ok(0);
         }
         let multvn = in_vn(data, subpieceop, 0);
         if !is_written(data, multvn) {
-            return 0;
+            return Ok(0);
         }
         let multop = def_of(data, multvn).expect("divtermadd2: no def");
         if code(data, multop) != OpCode::CPUI_INT_MULT {
-            return 0;
+            return Ok(0);
         }
         let mut mult_const = match is_constant_extended(data, in_vn(data, multop, 1)) {
             Some(v) => v,
-            None => return 0, // STUB(W3-varnode)
+            None => return Ok(0), // STUB(W3-varnode)
         };
         let zextvn = in_vn(data, multop, 0);
         if !is_written(data, zextvn) {
-            return 0;
+            return Ok(0);
         }
         let zextop = def_of(data, zextvn).expect("divtermadd2: no def");
         if code(data, zextop) != OpCode::CPUI_INT_ZEXT {
-            return 0;
+            return Ok(0);
         }
         if in_vn(data, zextop, 0) != x {
-            return 0;
+            return Ok(0);
         }
 
         let opout = out_vn(data, op);
@@ -1962,13 +2001,13 @@ impl Rule for RuleDivTermAdd2 {
             set_opcode(data, newmultop, OpCode::CPUI_INT_MULT);
             let newmultvn = match data.new_unique_out(size(data, zextvn), newmultop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(newmultop, zextvn, 0).expect("RuleDivTermAdd2: opSetInput");
             let new_const_vn =
                 match new_extended_constant(data, size(data, zextvn), &mult_const, op) {
                     Ok(v) => v,
-                    Err(_) => return 0,
+                    Err(_) => return Ok(0),
                 };
             data.op_set_input(newmultop, new_const_vn, 1).expect("RuleDivTermAdd2: opSetInput");
             data.op_insert_before(newmultop, op);
@@ -1977,7 +2016,7 @@ impl Rule for RuleDivTermAdd2 {
             set_opcode(data, newshiftop, OpCode::CPUI_INT_RIGHT);
             let newshiftvn = match data.new_unique_out(size(data, zextvn), newshiftop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(newshiftop, newmultvn, 0).expect("RuleDivTermAdd2: opSetInput");
             let nc = data.new_constant(4, (n + 1) as uintb);
@@ -1988,9 +2027,9 @@ impl Rule for RuleDivTermAdd2 {
             data.op_set_input(addop, newshiftvn, 0).expect("RuleDivTermAdd2: opSetInput");
             let c0 = data.new_constant(4, 0);
             data.op_set_input(addop, c0, 1).expect("RuleDivTermAdd2: opSetInput");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -2348,23 +2387,23 @@ impl Rule for RuleDivOpt {
         Some(Box::new(RuleDivOpt::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if Self::recover_div3_double(op, data) {
-            return 1;
+            return Ok(1);
         }
         let (mut in_vn0, n, y, mut xsize, ext_opc) = match Self::find_form(data, op) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         if Self::check_form_overlap(data, op) {
-            return 0;
+            return Ok(0);
         }
         if ext_opc == OpCode::CPUI_INT_SEXT {
             xsize -= 1; // one less bit for signed, because of signbit
         }
         let divisor = Self::calc_divisor(n as uintb, &y, xsize);
         if divisor == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut out_size = size(data, out_vn(data, op));
 
@@ -2378,7 +2417,7 @@ impl Rule for RuleDivOpt {
             set_opcode(data, in_ext, ext_opc);
             let ext_out = match data.new_unique_out(out_size, in_ext) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(in_ext, in_vn0, 0).expect("RuleDivOpt: opSetInput");
             in_vn0 = ext_out;
@@ -2392,7 +2431,7 @@ impl Rule for RuleDivOpt {
             set_opcode(data, newop, OpCode::CPUI_INT_ADD);
             let res_vn = match data.new_unique_out(size(data, in_vn0), newop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_insert_before(newop, op);
             set_opcode(data, op, OpCode::CPUI_SUBPIECE);
@@ -2417,7 +2456,7 @@ impl Rule for RuleDivOpt {
             set_opcode(data, divop, OpCode::CPUI_INT_SDIV);
             let newout = match data.new_unique_out(out_size, divop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(divop, in_vn0, 0).expect("RuleDivOpt: opSetInput");
             let dvn = data.new_constant(out_size, divisor);
@@ -2428,7 +2467,7 @@ impl Rule for RuleDivOpt {
             set_opcode(data, sgnop, OpCode::CPUI_INT_SRIGHT);
             let sgnvn = match data.new_unique_out(out_size, sgnop) {
                 Ok(v) => v,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
             data.op_set_input(sgnop, in_vn0, 0).expect("RuleDivOpt: opSetInput");
             let shc = data.new_constant(out_size, (out_size * 8 - 1) as uintb);
@@ -2439,7 +2478,7 @@ impl Rule for RuleDivOpt {
             data.op_set_input(op, sgnvn, 1).expect("RuleDivOpt: opSetInput");
             set_opcode(data, op, OpCode::CPUI_INT_ADD);
         }
-        1
+        Ok(1)
     }
 }
 

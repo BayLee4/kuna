@@ -713,6 +713,9 @@ impl TypeFactory for PanicTypeFactory {
     fn get_type_struct(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
         unreached!()
     }
+    fn kuna_synthesized_record(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
+        unreached!()
+    }
     fn get_type_partial_struct(
         &self,
         _contain: Rc<Datatype>,
@@ -872,6 +875,100 @@ fn source_boundary_pieces(first: int4) -> PrototypePieces {
         output_storage: None,
         input_storage: Vec::new(),
         kuna_library_names: None,
+    }
+}
+
+#[test]
+fn closed_logical_variadic_override_promotes_only_its_working_tail() {
+    let (manager, register) = manager_with_default_data_space();
+    let (model, _) = source_boundary_model(&manager, &register, None);
+    let manager = Rc::new(manager);
+    let factory = crate::dtype::TypeFactoryImpl::new();
+    factory.setup_sizes(Some(4), 8, 8);
+    factory.set_max_basetype_size(8);
+    factory.set_proto_context(Rc::clone(&manager));
+    let integer = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let narrow = factory.get_base(2, type_metatype::TYPE_INT).unwrap();
+    let float = factory.get_base(4, type_metatype::TYPE_FLOAT).unwrap();
+    let model = Rc::new(model);
+    for domain in ["eligible", "fixed", "not_override", "fixed_prefix", "physical_input", "physical_output",
+                   "physical_all", "custom",
+                   "same_width_other_float", "alias_float", "deep_alias_float", "half_float"] {
+        let tail = match domain {
+            "same_width_other_float" => factory.get_base_named(4, type_metatype::TYPE_FLOAT, "other_float32").unwrap(),
+            "alias_float" => factory.get_typedef(&float, "TailFloat", 8182, 0).unwrap(),
+            "deep_alias_float" => (0..80).try_fold(Rc::clone(&float), |base, depth|
+                factory.get_typedef(&base, &format!("TailDepth{depth}"), 8200 + depth, 0)).unwrap(),
+            "half_float" => factory.get_base(2, type_metatype::TYPE_FLOAT).unwrap(),
+            _ => Rc::clone(&float),
+        };
+        let mut pieces = PrototypePieces {
+            outtype: Some(factory.get_type_void().unwrap()),
+            intypes: vec![Rc::clone(&integer), Rc::clone(&narrow), Rc::clone(&tail)],
+            innames: vec!["tag".into(), "small".into(), "number".into()],
+            first_var_arg_slot: match domain { "fixed" => -1, "fixed_prefix" => 3, _ => 1 },
+            ..PrototypePieces::default()
+        };
+        if matches!(domain, "physical_input" | "custom") {
+            pieces.input_storage.push((2, ParameterPieces {
+                addr: addr(&register, 0x70), type_: Some(Rc::clone(&tail)),
+                flags: parameter_pieces_flags::TYPELOCK | if domain == "custom" {
+                    parameter_pieces_flags::CUSTOM_STORAGE
+                } else { 0 },
+            }));
+        }
+        if matches!(domain, "physical_output" | "physical_all") {
+            pieces.outtype = Some(Rc::clone(&integer));
+            pieces.output_storage = Some(ParameterPieces {
+                addr: addr(&register, 0x90), type_: Some(Rc::clone(&integer)),
+                flags: parameter_pieces_flags::TYPELOCK,
+            });
+        }
+        if domain == "physical_all" {
+            pieces.input_storage = pieces.intypes.iter().enumerate().map(|(slot, ty)|
+                (slot as i32, ParameterPieces {
+                    addr: addr(&register, 0x10 + slot as u64 * 0x10), type_: Some(Rc::clone(ty)),
+                    flags: parameter_pieces_flags::TYPELOCK,
+                })).collect();
+        }
+        let mut source = FuncProto::from_logical(&pieces, Rc::clone(&model), &factory).unwrap();
+        // Java transports a finite vector and retains `first` independently.
+        source.set_dotdotdot(false);
+        source.set_override(domain != "not_override");
+        let expected_tail = match domain {
+            "eligible" | "alias_float" | "deep_alias_float" => 8,
+            "half_float" => 2,
+            _ => 4,
+        };
+        let expected_narrow = if matches!(domain, "eligible" | "alias_float" | "deep_alias_float" | "half_float" | "same_width_other_float") { 4 } else { 2 };
+        let working = factory.acquire_working_proto(&source).unwrap();
+        let again = factory.acquire_working_proto(&working).unwrap();
+        for result in [&working, &again] {
+            assert_eq!((0..3).map(|i| result.get_param(i).unwrap().get_size()).collect::<Vec<_>>(),
+                       vec![4, expected_narrow, expected_tail], "{domain}");
+            assert_eq!(result.get_first_var_arg_slot(), pieces.first_var_arg_slot, "{domain}");
+            assert!(!result.is_dotdotdot(), "{domain}");
+            assert_eq!(result.is_override(), source.is_override(), "{domain}");
+            assert!(result.is_input_locked() && result.is_model_locked(), "{domain}");
+            for slot in 0..3 {
+                let original = source.get_param(slot).unwrap();
+                let parameter = result.get_param(slot).unwrap();
+                assert_eq!(parameter.get_name(), original.get_name(), "{domain}");
+                assert_eq!(parameter.is_type_locked(), original.is_type_locked(), "{domain}");
+                assert_eq!(parameter.is_name_locked(), original.is_name_locked(), "{domain}");
+            }
+            for (slot, supplied) in &pieces.input_storage {
+                assert_eq!(result.get_param(*slot).unwrap().get_address(), supplied.addr, "{domain}");
+            }
+            if let Some(supplied) = &pieces.output_storage {
+                assert_eq!(result.get_output().get_address(), supplied.addr, "{domain}");
+            }
+            assert!(Rc::ptr_eq(&result.logical_pieces().unwrap().intypes[2], &tail));
+        }
+        assert_eq!(source.get_param(1).unwrap().get_size(), 2, "{domain}");
+        assert_eq!(source.get_param(2).unwrap().get_size(), tail.get_size(), "{domain}");
+        assert!(Rc::ptr_eq(source.get_param(2).unwrap().get_type().unwrap(), &tail));
+        assert_eq!(source.get_first_var_arg_slot(), pieces.first_var_arg_slot);
     }
 }
 
@@ -1546,6 +1643,64 @@ fn func_proto_inject_id_toggles_inline() {
 }
 
 #[test]
+fn func_proto_injection_origin_survives_copy_and_owner_drop() {
+    let library = Rc::new(std::cell::RefCell::new(
+        crate::inject_sleigh::PcodeInjectLibrarySleigh::new(0),
+    ));
+    library.borrow_mut().base.register_call_fixup(b"live_fixup", 3).unwrap();
+    let weak = Rc::downgrade(&library);
+    let mut original = FuncProto::new();
+    original.set_injection(3, Rc::clone(&library));
+    let mut full = FuncProto::new();
+    full.copy(&original);
+    let mut flow = FuncProto::new();
+    flow.copy_flow_effects(&original);
+    drop(library);
+    original.cancel_inject_id();
+    assert_eq!(original.injection_name().unwrap(), None);
+    assert_eq!(full.get_inject_id(), 3);
+    assert_eq!(flow.get_inject_id(), 3);
+    assert_eq!(full.injection_name().unwrap().as_deref(), Some("live_fixup"));
+    assert_eq!(flow.injection_name().unwrap().as_deref(), Some("live_fixup"));
+    full.cancel_inject_id();
+    assert!(weak.upgrade().is_some());
+    flow.set_inject_id(-1);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(flow.injection_name().unwrap(), None);
+}
+
+#[test]
+fn func_proto_live_injection_name_precedes_source_spelling() {
+    let library = Rc::new(std::cell::RefCell::new(
+        crate::inject_sleigh::PcodeInjectLibrarySleigh::new(0),
+    ));
+    library.borrow_mut().base.register_call_fixup(b"registered", 2).unwrap();
+    let mut proto = FuncProto::new();
+    proto.inject_name = Some("source_only".into());
+    assert_eq!(proto.injection_name().unwrap().as_deref(), Some("source_only"));
+    proto.set_injection(2, Rc::clone(&library));
+    proto.inject_name = Some("stale_source_spelling".into());
+    assert_eq!(proto.injection_name().unwrap().as_deref(), Some("registered"));
+    // Name resolution returns an owned string and releases the borrow before
+    // recursive encoders can query/register other source prototypes.
+    library.borrow_mut().base.register_call_fixup(b"later", 4).unwrap();
+    proto.cancel_inject_id();
+    assert_eq!(proto.injection_name().unwrap(), None);
+}
+
+#[test]
+fn func_proto_reassignment_never_reuses_another_libraries_id() {
+    let library = Rc::new(std::cell::RefCell::new(
+        crate::inject_sleigh::PcodeInjectLibrarySleigh::new(0),
+    ));
+    library.borrow_mut().base.register_call_fixup(b"first", 3).unwrap();
+    let mut proto = FuncProto::new();
+    proto.set_injection(3, library);
+    proto.set_inject_id(4);
+    assert!(proto.injection_name().is_err());
+}
+
+#[test]
 fn func_proto_input_lock_void_and_params() {
     let mgr = AddrSpaceManager::new();
     let reg = reg_space_le();
@@ -1640,18 +1795,6 @@ fn func_proto_return_bytes_consumed_takes_smallest() {
     assert_eq!(fp.get_return_bytes_consumed(), 4);
     assert!(!fp.set_return_bytes_consumed(6)); // larger -> no change
     assert_eq!(fp.get_return_bytes_consumed(), 4);
-}
-
-#[test]
-fn func_proto_stub_methods_error() {
-    let mut fp = FuncProto::new();
-    assert!(fp.set_scope().is_err());
-    assert!(fp.update_input_types().is_err());
-    assert!(fp.update_output_types().is_err());
-    assert!(fp.decode().is_err());
-    let mgr = AddrSpaceManager::new();
-    let mut model = ProtoModel::new(&mgr);
-    assert!(model.decode().is_err());
 }
 
 // =========================================================================
@@ -1872,7 +2015,7 @@ fn locked_stack_input_fallback_loads_requested_storage() {
         addr: storage.clone(), type_: Some(int4_type()), flags: parameter_pieces_flags::TYPELOCK,
     });
     restricted.set_input_lock(true);
-    fc.force_set(&mut fd, &restricted, &mut RestartLog::new()).unwrap();
+    fc.force_set(&mut fd, &restricted, 0, &mut RestartLog::new()).unwrap();
     assert!(!fd.has_restart_pending());
     let argument = fd.obank().get(call).unwrap().get_in(1).unwrap();
     let vn = fd.vbank().get(argument).unwrap();
@@ -1975,11 +2118,11 @@ fn func_call_specs_do_input_join_locked_errs() {
         ) -> KunaResult<kuna_base::space::VarnodeStorage> {
             Err(kuna_base::error::KunaError::lowlevel("no register"))
         }
-        fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: int4) -> String {
-            String::new()
+        fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: int4) -> KunaResult<String> {
+            Ok(String::new())
         }
-        fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: int4) -> String {
-            String::new()
+        fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: int4) -> KunaResult<String> {
+            Ok(String::new())
         }
     }
     let res = fc.do_input_join(1, true, &mgr, &NoLookup);
@@ -2107,9 +2250,12 @@ fn func_call_specs_force_set_restart_and_locks() {
     fp.set_output_errors(true);
 
     let mut log = RestartLog::new();
-    fc.force_set(&mut fd, &fp, &mut log).unwrap();
+    fc.force_set(&mut fd, &fp, 2, &mut log).unwrap();
 
     assert!(fd.has_restart_pending());
+    let site = fd.obank().get(call).unwrap().get_addr();
+    assert!(fd.get_override().is_inferred_proto_override(site, 2));
+    assert!(!fd.get_override().is_inferred_proto_override(site, 0));
     let dump = log.render(&fd);
     assert!(dump.contains("prototype forced late at call site"), "dump={dump}");
     // Regardless of restart, the input is locked (0 params => VOIDINPUTLOCK) and
@@ -2181,7 +2327,7 @@ fn func_call_specs_resolve_and_abort_spacebase_relative() {
     assert_eq!(fc.get_spacebase_offset(), 0x10);
 
     // abort with no placeholder slot is a no-op (slot stays -1).
-    fc.abort_spacebase_relative(&mut fd);
+    fc.abort_spacebase_relative(&mut fd).unwrap();
     assert_eq!(fc.get_stack_placeholder_slot(), -1);
 }
 
@@ -2572,12 +2718,99 @@ fn explicit_return_storage_removes_only_the_model_hidden_return_input() {
         addr: Address::new(reg.clone(), 0x80), type_: Some(int4_type()),
         flags: parameter_pieces_flags::TYPELOCK,
     }));
-    prototype.set_pieces(&pieces, Some(model), &types, &manager).unwrap();
+    prototype.set_pieces(&pieces, Some(model.clone()), &types, &manager).unwrap();
     assert_eq!(prototype.num_params(), 2);
     assert_eq!(prototype.get_param(0).unwrap().get_address().get_offset(), 0x80);
     assert_eq!(prototype.get_param(1).unwrap().get_address().get_offset(), 0x20);
     assert_eq!(prototype.get_param(1).unwrap().get_name(), "second");
     assert_eq!(prototype.get_output().get_address().get_offset(), 0x100);
+
+    types.set_proto_context(Rc::new(manager));
+    let source = FuncProto::from_logical(&pieces, model, &types).unwrap();
+    let working = types.acquire_working_proto(&source).unwrap();
+    assert_eq!(working.num_params(), 2);
+    for slot in 0..working.num_params() {
+        assert!(!working.get_param(slot).unwrap().is_hidden_return());
+    }
+    assert_eq!(working.get_param(0).unwrap().get_address().get_offset(), 0x80);
+    assert_eq!(working.get_param(1).unwrap().get_address().get_offset(), 0x20);
+    assert_eq!(working.get_param(1).unwrap().get_name(), "second");
+    assert_eq!(working.get_output().get_address().get_offset(), 0x100);
+    assert_eq!(source.num_params(), 2);
+    assert_eq!(source.get_param(0).unwrap().get_address().get_offset(), 0x80);
+    assert!(source.get_param(1).unwrap().get_address().is_invalid());
+    assert_eq!(source.get_output().get_address().get_offset(), 0x100);
+    assert_eq!(source.logical_pieces().unwrap().intypes.len(), pieces.intypes.len());
+    assert!(Rc::ptr_eq(source.logical_pieces().unwrap().outtype.as_ref().unwrap(),
+        pieces.outtype.as_ref().unwrap()));
+}
+
+#[test]
+fn acquired_physical_entry_symbol_follows_this_before_hidden_permutation() {
+    use crate::dtype::TypeFactoryImpl;
+    use crate::remote_provider::{RemoteEntry, RemoteSymbolRecord};
+    let (manager, register) = manager_with_default_data_space();
+    let factory = TypeFactoryImpl::new();
+    factory.setup_sizes(Some(4), 8, 8);
+    let (mut model, stack) = source_boundary_model(&manager, &register, None);
+    model.set_name("__thiscall");
+    model.input_mut().thisbeforeret = true;
+    let pieces = source_boundary_pieces(-1);
+    let this_type = factory.get_type_pointer(8, int4_type(), 1).unwrap();
+    let mut source = FuncProto::new();
+    source.set_internal(Rc::new(model), factory.get_type_void().unwrap());
+    source.set_output(&ParameterPieces {
+        addr: Address::new_invalid(), type_: pieces.outtype.clone(),
+        flags: parameter_pieces_flags::TYPELOCK,
+    });
+    source.set_output_lock(true);
+    source.set_param(0, "self", &ParameterPieces {
+        addr: Address::new_invalid(), type_: Some(this_type.clone()),
+        flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK | parameter_pieces_flags::ISTHIS,
+    });
+    source.set_param(1, "second", &ParameterPieces {
+        addr: Address::new_invalid(), type_: Some(int4_type()),
+        flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
+    });
+    source.set_input_lock(true);
+    let manager = Rc::new(manager);
+    factory.set_proto_context(Rc::clone(&manager));
+    let working = factory.acquire_working_proto(&source).unwrap();
+    assert!(source.logical_pieces().is_none());
+    assert_eq!(working.num_params(), 3);
+    assert!(working.get_param(0).unwrap().is_this_pointer());
+    assert!(!working.get_param(0).unwrap().is_hidden_return());
+    assert!(working.get_param(1).unwrap().is_hidden_return());
+    assert_eq!(working.get_param(2).unwrap().get_name(), "second");
+    assert_eq!(TypeFactoryImpl::physical_entry_parameter_slots(&source, &working).nth(0).flatten(), Some(0));
+    assert_eq!(TypeFactoryImpl::physical_entry_parameter_slots(&source, &working).nth(1).flatten(), Some(2));
+    assert_eq!(TypeFactoryImpl::physical_entry_parameter_slots(&source, &working).nth(2).flatten(), None);
+    let raw = RemoteSymbolRecord {
+        scope_id: 0, symbol_id: 91, name: "self".into(), display_name: "self".into(),
+        flags: crate::varnode::varnode_flags::typelock | crate::varnode::varnode_flags::namelock,
+        category: 0, cat_index: 3, hidden_return: false,
+        parameter_flags: parameter_pieces_flags::ISTHIS,
+        dtype: Some(this_type),
+        entries: vec![RemoteEntry { addr: Address::new_invalid(), size: 8, hash: 1,
+            uselimit: kuna_base::address::RangeList::default() }],
+        func: None, extern_ref: None,
+    };
+    let mut scope = crate::varmap::ScopeLocal::new(1, stack, "permutation", manager.num_spaces()).unwrap();
+    let slot = TypeFactoryImpl::physical_entry_parameter_slots(&source, &working).nth(0).flatten().unwrap();
+    let parameter = working.get_param(slot).unwrap();
+    let usepoint = addr(&register, 0xfff);
+    scope.seed_remote_symbol(&raw, Some((slot, parameter, &usepoint))).unwrap();
+    let symbol = scope.database().symbol(scope.parameter_symbol(0).unwrap());
+    assert_eq!(symbol.get_id(), 91);
+    assert_eq!(symbol.get_name(), "self");
+    assert_eq!(symbol.catindex, 0);
+    assert_eq!(symbol.get_flags() & crate::varnode::varnode_flags::hiddenretparm, 0);
+    assert_ne!(symbol.dispflags & crate::database::symbol_dispflags::IS_THIS_PTR, 0);
+    assert_eq!(scope.database().entry(scope.scope_id(), symbol.mapentry[0]).get_addr(), &parameter.get_address());
+    assert_eq!(raw.cat_index, 3);
+    assert_eq!(raw.entries[0].hash, 1);
+    assert_eq!(source.num_params(), 2);
+    assert!(source.get_param(0).unwrap().get_address().is_invalid());
 }
 
 #[test]

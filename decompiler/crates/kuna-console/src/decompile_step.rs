@@ -376,7 +376,17 @@ pub fn decompile_one_prefollowed(
     // settles the same question from the callers it decompiles (`voidret`).
     let read = match &result {
         Ok(fd) if !arch.kuna_float_scan_batch => kuna_decomp::kuna_callerreads::read(arch, fd),
-        _ => None,
+        _ => Ok(None),
+    };
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => {
+            // Keep the acquisition error intact, but reach the shared settings
+            // restoration below and publish none of this attempt's overrides.
+            result = Err(error);
+            discovered.clear();
+            None
+        }
     };
     if let Some(storage) = read {
         kuna_decomp::kuna_callerreads::force(arch, &redo_entry, storage);
@@ -394,8 +404,13 @@ pub fn decompile_one_prefollowed(
             seed.mapped_params,
         );
         kuna_decomp::kuna_callerreads::release(arch, &redo_entry);
-        if redo.as_ref().is_ok_and(kuna_decomp::kuna_callerreads::returns_value) {
-            result = redo;
+        match redo {
+            Ok(fd) if kuna_decomp::kuna_callerreads::returns_value(&fd) => result = Ok(fd),
+            Ok(_) => {}
+            Err(error) => {
+                result = Err(error);
+                discovered.clear();
+            }
         }
     }
     arch.format_override_callpoints.clear();

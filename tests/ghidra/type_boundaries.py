@@ -30,13 +30,13 @@ def main():
 
 def run(output, report):
     import pyghidra
-    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra
+    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra, test_cores
     from prototype_facts import execute_c
 
     start_ghidra()
     from jpype import JArray, JByte
     from java.lang import Object
-    from ghidra.app.decompiler import DecompInterface, DecompileOptions, ClangTypeToken
+    from ghidra.app.decompiler import DecompInterface, DecompileOptions, ClangTypeToken, ClangVariableDecl
     from ghidra.program.database import ProgramDB
     from ghidra.program.flatapi import FlatProgramAPI
     from ghidra.program.model.data import (
@@ -47,7 +47,7 @@ def run(output, report):
     )
     from ghidra.program.model.lang import LanguageID, CompilerSpecID
     from ghidra.program.model.listing import Function, ParameterImpl, ReturnParameterImpl, Variable
-    from ghidra.program.model.pcode import HighFunctionDBUtil
+    from ghidra.program.model.pcode import HighFunctionDBUtil, PcodeDataTypeManager
     from ghidra.program.model.symbol import SourceType, IllegalCharCppTransformer
     from ghidra.program.util import DefaultLanguageService
     from ghidra.util.task import ConsoleTaskMonitor
@@ -56,6 +56,7 @@ def run(output, report):
     original_exepath = field.get(None)
     monitor = ConsoleTaskMonitor()
     language = DefaultLanguageService.getLanguageService().getLanguage(LanguageID("x86:LE:64:default"))
+    ordinary_receiver = not hasattr(PcodeDataTypeManager, "ELEM_KUNA_TYPE")
 
     def type_info(datatype, manager):
         if datatype is None:
@@ -162,8 +163,8 @@ def run(output, report):
                 def identity_type(datatype):
                     return datatype if nominal_pointer else datatype.getDataType()
 
-                for core, executable in (("stock", None), ("kuna", KUNA_GHIDRA)):
-                    field.set(None, executable)
+                for core in test_cores():
+                    field.set(None, KUNA_GHIDRA if core == "kuna" else None)
                     interface = DecompInterface()
                     row = {"case": case, "core": core, "expected_target": type_info(target, manager)}
                     report["rows"].append(row)
@@ -198,8 +199,37 @@ def run(output, report):
 
                         visit(result.getCCodeMarkup())
                         named = [token for token in row["tokens"] if token["text"] == str(target.getName())]
-                        assert named and all(token["type"] is not None and token["type"]["id"] == expected_id
-                                             for token in named), row["tokens"]
+                        if case == "callback" and core == "kuna" and ordinary_receiver:
+                            # A bare function definition is not a C typedef.
+                            scalar_ids = {int(manager.getID(target.getReturnType())),
+                                          int(manager.getID(target.getArguments()[0].getDataType()))}
+                            assert len(row["tokens"]) == 4 and all(
+                                token["text"] == "int" and token["type"] is not None
+                                and token["type"]["id"] in scalar_ids for token in row["tokens"]
+                            ), row["tokens"]
+                            row["parameter_declarations"] = []
+
+                            def declarations(token):
+                                if isinstance(token, ClangVariableDecl):
+                                    symbol = token.getHighSymbol()
+                                    if symbol is not None and str(symbol.getName()) == "typed_input":
+                                        datatype = token.getDataType()
+                                        assert datatype is not None and datatype.isEquivalent(expected_parameter)
+                                        assert symbol.getDataType().isEquivalent(expected_parameter)
+                                        referent = datatype.getDataType()
+                                        assert int(manager.getID(referent)) == expected_id
+                                        row["parameter_declarations"].append({
+                                            "text": str(token), "symbol_id": int(symbol.getId()),
+                                            "referent": type_info(referent, manager),
+                                        })
+                                for index in range(token.numChildren()):
+                                    declarations(token.Child(index))
+
+                            declarations(result.getCCodeMarkup())
+                            assert len(row["parameter_declarations"]) == 1, row
+                        else:
+                            assert named and all(token["type"] is not None and token["type"]["id"] == expected_id
+                                                 for token in named), row["tokens"]
                         row["c"] = str(result.getDecompiledFunction().getC())
                         (output / f"{case}-{core}.c").write_text(row["c"])
                         tx = program.startTransaction("Commit recovered datatype identities")
@@ -217,7 +247,17 @@ def run(output, report):
                                 assert referent is not None and int(manager.getID(referent)) == expected_id, row
                         finally:
                             program.endTransaction(tx, False)
-                        if driver is not None:
+                        if case == "callback" and core == "kuna" and ordinary_receiver:
+                            row["execution"] = execute_c(
+                                row["c"], "typedef int (*CallbackPtr)(int);",
+                                "static int callback(int value) { return value * 3 - 2; }\n"
+                                "int main(void) { CallbackPtr (*identity)(CallbackPtr) = read_callback;"
+                                "CallbackPtr returned = identity(callback); if (returned != callback) return 1;"
+                                "const int values[] = {-17,-1,0,1,23};"
+                                "for (unsigned i=0;i<sizeof(values)/sizeof(values[0]);++i)"
+                                "if (returned(values[i]) != values[i]*3-2) return 2; return 0; }",
+                            )
+                        elif driver is not None:
                             row["execution"] = execute_c(row["c"], preamble, driver)
                         row["status"] = "passed"
                         print(f"PASS {core}: {case}", flush=True)

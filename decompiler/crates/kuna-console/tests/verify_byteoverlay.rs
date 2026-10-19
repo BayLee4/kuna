@@ -63,7 +63,7 @@ fn decompile_with(target: &str, directives: Vec<Directive>) -> (String, Vec<Outc
     let entry = prog
         .resolve_entry(&EntrySelector::Name(target.to_string()))
         .expect("the fixture has this function");
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     (code, prog.assertion_outcomes())
 }

@@ -355,7 +355,7 @@ fn untie_decision_is_per_function_no_token_leak() {
 /// *return-register* storage; `ptrenumequal`'s `flagfield != …` constant is typed
 /// by the comparison's enum operand, an INDEPENDENT path, so it must stay
 /// enum-named (`(FLAG_100000|FLAG_800)`, never `0x100800`), and the inequality
-/// must still guard the early return.
+/// must still guard the early return before the original call with argument 6.
 #[test]
 fn enum_reading_5_constant_stays_enum_named_not_raw_hex() {
     let bin = match rust_test_bin_any() {
@@ -393,10 +393,23 @@ fn enum_reading_5_constant_stays_enum_named_not_raw_hex() {
         ).unwrap().is_match(body),
         "the authored void result and enumstruct pointer input must survive:\n{body}"
     );
-    assert!(
-        regex::Regex::new(
+    let guard = regex::Regex::new(
             r"if\s*\(\s*ptrequal\s*->\s*flagfield\s*!=\s*\(\s*FLAG_100000\s*\|\s*FLAG_800\s*\)\s*\)\s*\{?\s*return\s*;"
-        ).unwrap().is_match(body),
-        "the enum-field inequality must guard the early return:\n{body}"
-    );
+    ).unwrap().find(body)
+        .unwrap_or_else(|| panic!("the enum-field inequality must guard the early return:\n{body}"));
+    // The original machine body then calls ram:0x101008 once with EDI = 6.
+    let call_pattern = regex::Regex::new(r"\bsub_101008\s*\(\s*([^)]*)\)\s*;").unwrap();
+    let mut calls = call_pattern.captures_iter(body);
+    let call = calls.next()
+        .unwrap_or_else(|| panic!("missing original call to ram:0x101008:\n{body}"));
+    let argument = call.get(1).unwrap().as_str().trim();
+    let value = match argument.strip_prefix("0x").or_else(|| argument.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => argument.parse(),
+    };
+    assert_eq!(value, Ok(6),
+        "the original later call must receive argument 6:\n{body}");
+    assert!(calls.next().is_none(), "the original later call must occur exactly once:\n{body}");
+    assert!(guard.end() < call.get(0).unwrap().start(),
+        "the original call must follow the inequality's early return:\n{body}");
 }

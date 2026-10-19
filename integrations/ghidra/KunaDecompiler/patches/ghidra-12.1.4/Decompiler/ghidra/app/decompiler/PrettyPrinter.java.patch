@@ -1,0 +1,146 @@
+--- a/ghidra/app/decompiler/PrettyPrinter.java
++++ b/ghidra/app/decompiler/PrettyPrinter.java
+@@ -19,6 +19,7 @@
+ import java.util.List;
+ 
+ import ghidra.app.decompiler.component.DecompilerUtils;
++import ghidra.program.model.data.DataType;
+ import ghidra.program.model.listing.Function;
+ import ghidra.program.model.symbol.IdentityNameTransformer;
+ import ghidra.program.model.symbol.NameTransformer;
+@@ -37,6 +38,7 @@
+ 	private ClangTokenGroup tokgroup;
+ 	private List<ClangLine> lines = new ArrayList<>();
+ 	private NameTransformer transformer;
++	private java.util.function.Function<DataType, String> typeNames;
+ 
+ 	/**
+ 	 * Constructs a new pretty printer using the specified C language token group.
+@@ -46,10 +48,22 @@
+ 	 * @param tokgroup the C language token group
+ 	 * @param transformer the transformer to apply to symbols
+ 	 */
+-	public PrettyPrinter(Function function, ClangTokenGroup tokgroup, NameTransformer transformer) {
++	public PrettyPrinter(Function function, ClangTokenGroup tokgroup,
++			NameTransformer transformer) {
++		this(function, tokgroup, transformer, null);
++	}
++
++	/**
++	 * Constructs a printer with invocation-local names for typed datatype atoms. Returning null
++	 * from {@code typeNames} preserves the original token text. Neither tokens nor datatypes are
++	 * changed, so held/UI readers retain their original spelling.
++	 */
++	public PrettyPrinter(Function function, ClangTokenGroup tokgroup,
++			NameTransformer transformer, java.util.function.Function<DataType, String> typeNames) {
+ 		this.function = function;
+ 		this.tokgroup = tokgroup;
+ 		this.transformer = transformer != null ? transformer : IDENTITY;
++		this.typeNames = typeNames;
+ 		flattenLines();
+ 		padEmptyLines();
+ 	}
+@@ -84,13 +98,14 @@
+ 	public DecompiledFunction print() {
+ 		StringBuilder buff = new StringBuilder();
+ 		for (ClangLine line : lines) {
+-			getText(buff, line, transformer);
++			getText(buff, line, transformer, typeNames);
+ 			buff.append(StringUtilities.LINE_SEPARATOR);
+ 		}
+ 		return new DecompiledFunction(findSignature(), buff.toString());
+ 	}
+ 
+-	private static void getText(StringBuilder buff, ClangLine line, NameTransformer transformer) {
++	private static void getText(StringBuilder buff, ClangLine line, NameTransformer transformer,
++			java.util.function.Function<DataType, String> typeNames) {
+ 		buff.append(line.getIndentString());
+ 		List<ClangToken> tokens = line.getAllTokens();
+ 
+@@ -104,7 +119,7 @@
+ 				isToken2Clean = false;
+ 			}
+ 
+-			String tokenText = token.getText();
++			String tokenText = getTokenText(token, typeNames);
+ 			if (isToken2Clean) {
+ 				tokenText = transformer.simplify(tokenText);
+ 			}
+@@ -112,6 +127,18 @@
+ 		}
+ 	}
+ 
++	private static String getTokenText(ClangToken token,
++			java.util.function.Function<DataType, String> typeNames) {
++		if (typeNames != null && token instanceof ClangTypeToken typeToken) {
++			DataType dataType = typeToken.getDataType();
++			String name = dataType == null ? null : typeNames.apply(dataType);
++			if (name != null) {
++				return name;
++			}
++		}
++		return token.getText();
++	}
++
+ 	/**
+ 	 * Returns the text of the given line as seen in the UI.
+ 	 * @param line the line
+@@ -119,7 +146,7 @@
+ 	 */
+ 	public static String getText(ClangLine line) {
+ 		StringBuilder buff = new StringBuilder();
+-		getText(buff, line, IDENTITY);
++		getText(buff, line, IDENTITY, null);
+ 		return buff.toString();
+ 	}
+ 
+@@ -128,12 +155,48 @@
+ 		for (int i = 0; i < nChildren; ++i) {
+ 			ClangNode node = tokgroup.Child(i);
+ 			if (node instanceof ClangFuncProto) {
+-				return node.toString() + ";";
++				return (typeNames == null ? node.toString() : getTypedText(node)) + ";";
+ 			}
+ 		}
+ 		return null;
+ 	}
+ 
++	/** Render an explicitly selected declaration using this printer's datatype-name mapping. */
++	public String printSignature(ClangFuncProto prototype) {
++		return prototype == null ? null : getTypedText(prototype) + ";";
++	}
++
++	private String getTypedText(ClangNode node) {
++		if (node instanceof ClangToken token) {
++			String text = getTokenText(token, typeNames);
++			if (token instanceof ClangTypeToken || token instanceof ClangFuncNameToken ||
++				token instanceof ClangVariableToken || token instanceof ClangFieldToken ||
++				token instanceof ClangLabelToken) {
++				if (token.getSyntaxType() != ClangToken.CONST_COLOR) {
++					text = transformer.simplify(text);
++				}
++			}
++			return text;
++		}
++		StringBuilder buffer = new StringBuilder();
++		for (int i = 0; i < node.numChildren(); i++) {
++			String text = getTypedText(node.Child(i));
++			if (text.isEmpty()) {
++				continue;
++			}
++			if (buffer.length() != 0 && isNameCharacter(buffer.charAt(buffer.length() - 1)) &&
++				isNameCharacter(text.charAt(0))) {
++				buffer.append(' ');
++			}
++			buffer.append(text);
++		}
++		return buffer.toString();
++	}
++
++	private static boolean isNameCharacter(char c) {
++		return Character.isLetterOrDigit(c) || c == '_';
++	}
++
+ 	private void flattenLines() {
+ 		lines = DecompilerUtils.toLines(tokgroup);
+ 	}

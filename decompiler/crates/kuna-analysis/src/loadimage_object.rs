@@ -188,6 +188,9 @@ fn clamp_virtual_tails(segments: &mut [Segment]) {
 #[derive(Debug)]
 struct SegmentBytes {
     segments: Vec<Segment>,
+    /// Half-open import pointer ranges, finalized with the byte addresses
+    /// before sharing. Call naming at these words is not body authority.
+    import_slots: Vec<(u64, u64)>,
 }
 
 impl SegmentBytes {
@@ -236,6 +239,8 @@ impl SegmentBytes {
 }
 
 impl ImageBytes for SegmentBytes {
+    fn import_slot_ranges(&self) -> &[(u64, u64)] { &self.import_slots }
+
     /// Fill `dst` with the image bytes starting at address `start`, zero-filling
     /// any part of the span no segment maps (a `.bss`-style RAM tail, or a hole
     /// between two segments).  This is the body of the C++
@@ -418,7 +423,7 @@ pub struct ElfFunctionProvenance {
 /// `size` is the symbol's `st_size`, carried so the commit can map a covering
 /// `SymbolEntry` of the right extent — a size-1 entry does not contain a 4-/8-byte
 /// access, which is exactly the bug the DWARF data globals hit (see
-/// [`crate::pass::DataObjectFact`]).
+/// [`crate::pass::TypedDataFact`]).
 #[derive(Debug, Clone)]
 struct DataSym {
     /// Symbol vma.
@@ -525,14 +530,6 @@ pub struct ObjectLoadImage {
     ///
     /// Empty for a non-ELF linked image, and with both gates off.
     dynreloc_const: Vec<(u64, u64)>,
-    /// (kuna) The image's **import pointer slots** as half-open `[lo, hi)` VMA
-    /// ranges — the PE Import Address Table words a run-time loader fills with a
-    /// resolved import address. [`Self::funcsyms`] carries a `FunctionSymbol` at
-    /// each of them so a `call [slot]` renders the import name; this records that
-    /// those addresses hold a POINTER rather than a function body, which is what
-    /// a whole-binary enumeration needs to keep them out of the decompile set.
-    /// Empty for every non-PE image and for a relocatable object.
-    import_slots: Vec<(u64, u64)>,
     elfv1: crate::loader::elfv1::Descriptors,
     elf_functions: ElfFunctionProvenance,
     /// The address space the file bytes map to (C++ `spaceid`, null until
@@ -562,6 +559,7 @@ pub struct ObjectLoadImage {
 /// (`__bss_start`, `_edata`, `_end`) are exactly the zero-size entries that would
 /// otherwise plant a spurious name on the first byte of an unrelated object.
 fn collect_data_sym<'a>(
+    unsized_extents: &std::collections::BTreeMap<u64, u64>,
     sym: &impl object::ObjectSymbol<'a>,
     out: &mut Vec<DataSym>,
     seen: &mut HashSet<u64>,
@@ -570,7 +568,11 @@ fn collect_data_sym<'a>(
     if sym.is_undefined() {
         return;
     }
-    let size = sym.size();
+    let size = if sym.size() == 0 {
+        unsized_extents.get(&sym.address()).copied().unwrap_or(0)
+    } else {
+        sym.size()
+    };
     if size == 0 {
         return;
     }
@@ -588,6 +590,61 @@ fn collect_data_sym<'a>(
     if seen.insert(addr) {
         out.push(DataSym { addr, name, size });
     }
+}
+
+/// Mach-O nlist omits sizes. Build section-bounded label intervals once, rather
+/// than rescanning all symbols for each object. DWARF declarations retain their
+/// independent, stronger authored extents at publication.
+fn macho_data_extents(
+    file: &object::File<'_>,
+    mode: NameChars,
+) -> (std::collections::BTreeMap<u64, u64>, Vec<DataSym>) {
+    use std::collections::{BTreeMap, BTreeSet};
+    if file.format() != object::BinaryFormat::MachO {
+        return (BTreeMap::new(), Vec::new());
+    }
+    let mut sections = BTreeMap::new();
+    for section in file.sections() {
+        if let Some(end) = section.address().checked_add(section.size()) {
+            sections.insert(section.index().0, (section.address(), end, section.kind(), BTreeSet::new()));
+        }
+    }
+    for symbol in file.symbols() {
+        if symbol.is_undefined() { continue; }
+        let Some(index) = symbol.section_index() else { continue };
+        if let Some((start, end, _, labels)) = sections.get_mut(&index.0) {
+            if symbol.address() >= *start && symbol.address() < *end {
+                labels.insert(symbol.address());
+            }
+        }
+    }
+    let starts: BTreeMap<_, _> = sections.iter().map(|(&index, &(start, _, _, _))| (start, index)).collect();
+    let mut exported_data = Vec::new();
+    for export in file.exports().unwrap_or_default() {
+        let Some((_, index)) = starts.range(..=export.address()).next_back() else { continue };
+        let (_, end, kind, labels) = sections.get_mut(index).unwrap();
+        if export.address() >= *end { continue; }
+        labels.insert(export.address());
+        if matches!(kind, object::SectionKind::Data | object::SectionKind::ReadOnlyData
+            | object::SectionKind::ReadOnlyString | object::SectionKind::UninitializedData)
+            && !export.name().is_empty()
+        {
+            exported_data.push((export.address(), sanitize_symbol_name_bytes(export.name(), mode).into_owned()));
+        }
+    }
+    let mut extents = BTreeMap::new();
+    for (_, (_, end, _, labels)) in sections {
+        let mut next = end;
+        for address in labels.into_iter().rev() {
+            extents.insert(address, next - address);
+            next = address;
+        }
+    }
+    let exported_data = exported_data.into_iter().filter_map(|(addr, name)| {
+        let size = *extents.get(&addr)?;
+        (size > 0).then_some(DataSym { addr, name, size })
+    }).collect();
+    (extents, exported_data)
 }
 
 /// (kuna `dynrelocs`) Store `value` into the `width`-byte slot at `vma`, in the
@@ -864,6 +921,7 @@ impl ObjectLoadImage {
         // the same walks and deduped on its own address set.  See [`DataSym`].
         let mut datasyms: Vec<DataSym> = Vec::new();
         let mut seen_data: HashSet<u64> = HashSet::new();
+        let (unsized_extents, exported_data) = macho_data_extents(&file, namechars);
 
         // 1. `.symtab` defined functions.  Skip *undefined* (import-placeholder)
         //    entries — e.g. the ELF UND `puts@@GLIBC_2.2.5` (`st_value == 0`),
@@ -880,7 +938,7 @@ impl ObjectLoadImage {
         //    COFF object's defined-at-0 function (design §3.6 object-vs-image).
         for sym in file.symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&unsized_extents, &sym, &mut datasyms, &mut seen_data, namechars);
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -925,7 +983,7 @@ impl ObjectLoadImage {
         //    functions in `.dynsym`.
         for sym in file.dynamic_symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&unsized_extents, &sym, &mut datasyms, &mut seen_data, namechars);
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -948,6 +1006,11 @@ impl ObjectLoadImage {
                 funcsyms.push(FuncSym { addr, name });
             } else if is_elf {
                 aliases.push(FuncSym { addr, name });
+            }
+        }
+        for symbol in exported_data {
+            if seen_data.insert(symbol.addr) {
+                datasyms.push(symbol);
             }
         }
 
@@ -993,7 +1056,7 @@ impl ObjectLoadImage {
             callee_extends_returns: crate::loader::kuna_returnext::callee_extends_returns(&file),
             archtype,
             fallback_archtype,
-            bytes: Arc::new(SegmentBytes { segments }),
+            bytes: Arc::new(SegmentBytes { segments, import_slots }),
             sections,
             section_metadata,
             image_entry,
@@ -1007,7 +1070,6 @@ impl ObjectLoadImage {
             data_objects: crate::loader::kuna_globalref::merged_ranges(data_object_rows),
             const_ranges,
             dynreloc_const,
-            import_slots,
             elfv1,
             elf_functions,
             spaceid: None,
@@ -1134,7 +1196,7 @@ impl ObjectLoadImage {
             callee_extends_returns: crate::loader::kuna_returnext::callee_extends_returns(&file),
             archtype,
             fallback_archtype,
-            bytes: Arc::new(SegmentBytes { segments }),
+            bytes: Arc::new(SegmentBytes { segments, import_slots: Vec::new() }),
             sections,
             section_metadata,
             // A pre-link object declares no entry.
@@ -1160,9 +1222,6 @@ impl ObjectLoadImage {
             // `msvcfpconst`, whose ranges qualify for exactly the same reason —
             // a datum that is known by construction, not by policy.
             dynreloc_const: fpconst.const_ranges,
-            // A pre-link object has no Import Address Table: its external calls
-            // are relocations, resolved by the layout pass.
-            import_slots: Vec::new(),
             elfv1: Default::default(),
             elf_functions: ElfFunctionProvenance::default(),
             spaceid: None,
@@ -1265,7 +1324,7 @@ impl ObjectLoadImage {
     /// ranges so its whole-binary enumeration can decompile the image's code
     /// without inventing a body for every import.
     pub fn import_slot_ranges(&self) -> &[(u64, u64)] {
-        &self.import_slots
+        self.bytes.import_slot_ranges()
     }
 
     /// The loader's function symbols as `(load_vma, name)` pairs — the SAME list
@@ -1370,6 +1429,13 @@ impl ObjectLoadImage {
 }
 
 impl LoadImage for ObjectLoadImage {
+    fn is_import_slot(&self, address: &Address) -> bool {
+        self.spaceid.as_ref().zip(address.get_space())
+            .is_some_and(|(mapped, requested)| Rc::ptr_eq(mapped, requested))
+            && self.import_slot_ranges().iter()
+                .any(|&(lo, hi)| address.get_offset() >= lo && address.get_offset() < hi)
+    }
+
     fn arm_vfp_args(&self) -> bool { self.arm_vfp_args }
 
     fn float_arg_registers(&self) -> Option<bool> { self.float_arg_registers }
@@ -1516,6 +1582,10 @@ impl LoadImage for ObjectLoadImage {
         let bytes = Arc::get_mut(&mut self.bytes).expect("image bytes already shared");
         for s in &mut bytes.segments {
             s.vma = s.vma.wadd(badjust);
+        }
+        for (lo, hi) in &mut bytes.import_slots {
+            *lo = lo.wadd(badjust);
+            *hi = hi.wadd(badjust);
         }
         for s in &mut self.sections {
             s.vma = s.vma.wadd(badjust);
@@ -2676,6 +2746,37 @@ mod tests {
                 .is_some_and(|&(_, _, flags)| flags & section_flags::CODE != 0);
             assert_eq!(section_is_code, executable, "{fixture}: wrong section control");
         }
+    }
+
+    #[test]
+    fn import_body_metadata_rebases_once_and_survives_shared_byte_readers() {
+        use kuna_sleigh::kuna_sharedbytes::SharedBytesImage;
+        let path = format!("{}/tests/fixtures/pe_noreturn_import.exe", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).expect("fixture");
+        let spaces = manager();
+        let ram = Rc::clone(spaces.get_space_by_name("ram").unwrap());
+        let mut image = ObjectLoadImage::from_bytes(&path, &bytes).unwrap();
+        let old = 0x1_4000_5038;
+        let at = |offset| Address::new(Rc::clone(&ram), offset);
+        assert!(!image.is_import_slot(&at(old)), "attachment establishes full space identity");
+        image.attach_to_space(Rc::clone(&ram));
+        assert!(image.is_import_slot(&at(old)));
+        image.adjust_vma(0x1000);
+        let rebased = old + 0x1000;
+        assert!(!image.is_import_slot(&at(old)));
+        assert!(image.is_import_slot(&at(rebased)));
+        assert!(image.func_symbols().iter().any(|(addr, name)| *addr == rebased && name == "ExitProcess"),
+            "body metadata does not cost the import's call symbol");
+        let shared = image.shared_bytes().unwrap();
+        assert_eq!(shared.import_slot_ranges(), image.import_slot_ranges());
+        let mut reader = SharedBytesImage::new("rebased", shared);
+        reader.attach_to_space(Rc::clone(&ram));
+        reader.adjust_vma(0x1000); // Already-final shared addresses are not rebased twice.
+        assert!(reader.is_import_slot(&at(rebased)));
+        assert!(!reader.is_import_slot(&at(rebased + 8)));
+        let other_bank = manager();
+        assert!(!reader.is_import_slot(&Address::new(
+            Rc::clone(other_bank.get_space_by_name("ram").unwrap()), rebased)));
     }
 
     /// (kuna, `pe-zero-filled-data`) A PE section that declares more RAM than

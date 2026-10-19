@@ -631,7 +631,7 @@ mod tests {
         fd.bblocks_mut().set_start_block(root, bl);
 
         // input p at ram:0x100 size 4.
-        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let p = fd.set_input_varnode(p).unwrap();
         // out = p + p  (INT_ADD reads p directly).
         let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));
@@ -656,7 +656,7 @@ mod tests {
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
 
-        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let p = fd.set_input_varnode(p).unwrap();
         fd.structure_reset();
 
@@ -675,7 +675,7 @@ mod tests {
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
 
-        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let p = fd.set_input_varnode(p).unwrap();
         // CALL target(p): input0 = call target (code ref), input1 = p.
         let call = add_op(&mut fd, bl, OpCode::CPUI_CALL, 2, Address::new(Rc::clone(&rs), 0x1000));
@@ -701,9 +701,9 @@ mod tests {
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
 
-        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let a = fd.set_input_varnode(a).unwrap();
-        let b = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x108), None);
+        let b = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x108), None).unwrap();
         let b = fd.set_input_varnode(b).unwrap();
         // out = a + b reads both directly.
         let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));
@@ -749,7 +749,7 @@ mod tests {
         let root = fd.bblocks_root_pub();
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
-        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let a = fd.set_input_varnode(a).unwrap();
         let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));
         let _out = fd.new_varnode_out(4, &Address::new(Rc::clone(&rs), 0x200), add).unwrap();

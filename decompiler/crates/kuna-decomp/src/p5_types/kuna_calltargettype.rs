@@ -79,6 +79,18 @@ use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::fspec::{FuncProto, ParameterPieces, ProtoParameter, PrototypePieces};
 use crate::funcdata::Funcdata;
 
+/// Where a receiver can represent an inferred callable type. This is an engine
+/// projection of the negotiated result capability, not another user option.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CallTargetPublication {
+    /// CLI and enhanced receivers retain the full native inferred type.
+    #[default]
+    Full,
+    /// Ordinary receivers retain their public types; C borrows a per-call
+    /// spelling from the receipt acquired at the normal ABI/clobber phase.
+    PerCallOnly,
+}
+
 /// A call through a field of a synthesized record: the record, the field's
 /// offset, and the type the call states, or `None` when the function's calls
 /// through the field disagree (see [`declare_field`]).
@@ -135,12 +147,12 @@ impl Action for ActionCallTargetType {
         }
         Some(Box::new(ActionCallTargetType { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         data.kuna_clear_call_target_types();
         if data.get_arch().call_target_type {
-            retype_call_targets(data);
+            retype_call_targets(data)?;
         }
-        0
+        Ok(0)
     }
 }
 
@@ -268,50 +280,52 @@ fn prints_as_address(data: &Funcdata, vn: VarnodeId) -> bool {
 /// The pointer to a function returning the type of `op`'s output (`void` when it
 /// has none) and taking the types of its arguments, or `None` when one of them
 /// has no C spelling.
-fn call_type(data: &mut Funcdata, tlst: &dyn TypeFactory, op: OpId) -> Option<Rc<Datatype>> {
+fn call_type(data: &mut Funcdata, tlst: &dyn TypeFactory, op: OpId) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
     let (out, args, target) = {
-        let o = data.obank().get(op)?;
+        let Some(o) = data.obank().get(op) else { return Ok(None) };
         let args: Vec<VarnodeId> = (1..o.num_input()).filter_map(|i| o.get_in(i)).collect();
-        (o.get_out(), args, o.get_in(0)?)
+        let Some(target) = o.get_in(0) else { return Ok(None) };
+        (o.get_out(), args, target)
     };
-    let wordsize = data.obank().get(op)?.get_addr().get_space().map(|s| s.get_word_size()).unwrap_or(1);
+    let wordsize = data.obank().get(op).and_then(|o| o.get_addr().get_space()).map(|s| s.get_word_size()).unwrap_or(1);
     let mut pieces = PrototypePieces { first_var_arg_slot: -1, ..Default::default() };
     pieces.outtype = Some(match out {
         Some(out) => {
-            let size = data.vbank().get(out)?.get_size();
-            let ty = data.vn_high_type_def_facing(out);
+            let Some(size) = data.vbank().get(out).map(|v| v.get_size()) else { return Ok(None) };
+            let ty = data.vn_high_type_def_facing(out)?;
             if !spellable(&ty, size) {
-                return None;
+                return Ok(None);
             }
             ty
         }
-        None => tlst.get_type_void().ok()?,
+        None => tlst.get_type_void()?,
     });
     for (slot, vn) in (1..).zip(args) {
-        let size = data.vbank().get(vn)?.get_size();
+        let Some(size) = data.vbank().get(vn).map(|v| v.get_size()) else { return Ok(None) };
         let ty = if prints_as_address(data, vn) {
-            let void = tlst.get_type_void().ok()?;
-            tlst.get_type_pointer(size, void, wordsize).ok()?
+            let void = tlst.get_type_void()?;
+            tlst.get_type_pointer(size, void, wordsize)?
         } else {
-            data.vn_high_type_read_facing(vn, op)
+            data.vn_high_type_read_facing(vn, op)?
         };
         let resolved = ty.needs_resolution() && data.get_union_field(&ty, op, slot).is_some_and(|r| r.get_field_num() >= 0);
         if !spellable(&ty, size) || resolved {
-            return None;
+            return Ok(None);
         }
         pieces.intypes.push(ty);
         pieces.innames.push(String::new());
     }
     let nargs = pieces.intypes.len();
     if clobber_is_read(data, op) {
-        return None;
+        return Ok(None);
     }
-    let code = tlst.get_type_code_proto(&pieces).ok()?;
-    if !passes_like_the_call(data, op, code.get_code_prototype()?, nargs, out) {
-        return None;
+    let code = tlst.get_type_code_proto(&pieces)?;
+    let Some(proto) = code.get_code_prototype() else { return Ok(None) };
+    if !passes_like_the_call(data, op, proto, nargs, out) {
+        return Ok(None);
     }
-    let size = data.vbank().get(target)?.get_size();
-    tlst.get_type_pointer(size, code, wordsize).ok()
+    let Some(size) = data.vbank().get(target).map(|v| v.get_size()) else { return Ok(None) };
+    Ok(Some(tlst.get_type_pointer(size, code, wordsize)?))
 }
 
 /// Is a value the call `op` overwrites read afterwards?  The call then hands
@@ -371,19 +385,40 @@ fn passes_like_the_call(data: &Funcdata, op: OpId, built: &FuncProto, nargs: usi
 type Group = Vec<(OpId, Rc<Datatype>)>;
 
 /// Type every indirect call's target from the call (see the module docs).
-pub fn retype_call_targets(data: &mut Funcdata) {
-    let Some(tlst) = data.get_arch().types_rc() else { return };
+/// Facing-type and declared-prototype acquisition errors stop the action.
+pub fn retype_call_targets(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
+    let Some(tlst) = data.get_arch().types_rc() else { return Ok(()) };
     let tlst: &dyn TypeFactory = &*tlst;
     let mut groups: BTreeMap<HighVariableId, Group> = BTreeMap::new();
     let mut casts: Vec<(OpId, Rc<Datatype>)> = Vec::new();
-    let ops: Vec<OpId> = (0..data.num_calls())
-        .filter(|&i| {
-            let fc = data.get_call_specs(i);
-            !fc.is_input_locked() && !fc.is_dotdotdot()
-        })
-        .map(|i| data.get_call_specs(i).get_op())
-        .collect();
-    for op in ops {
+    let per_call = data.get_arch().call_target_publication == CallTargetPublication::PerCallOnly;
+    for index in 0..data.num_calls() {
+        let op = {
+            let fc = data.get_call_specs(index);
+            if fc.is_input_locked() || fc.is_dotdotdot() {
+                continue;
+            }
+            if per_call {
+                let proto = fc.proto();
+                // Authored/source contracts keep their existing printer path.
+                // A default-model inference cannot replace custom roles,
+                // injection, or an incomplete working prototype.
+                if !proto.has_store() || !proto.has_model()
+                    || proto.logical_pieces().is_some()
+                    || proto.is_override() || proto.has_custom_storage()
+                    || proto.is_inline() || proto.has_this_pointer()
+                    || proto.has_input_errors() || proto.has_output_errors()
+                    || proto.get_inject_upon_return() >= 0 || fc.get_paramshift() != 0
+                    || proto.get_output().is_hidden_return()
+                    || proto.get_output().is_indirect_storage()
+                    || (0..proto.num_params()).any(|slot| proto.get_param(slot).is_some_and(|param|
+                        param.is_hidden_return() || param.is_indirect_storage()))
+                {
+                    continue;
+                }
+            }
+            fc.get_op()
+        };
         let Some(target) = data
             .obank()
             .get(op)
@@ -395,16 +430,28 @@ pub fn retype_call_targets(data: &mut Funcdata) {
         let Some(high) = data.vbank().get(target).filter(|v| !v.is_constant()).and_then(|v| v.get_high()) else {
             continue;
         };
-        let current = data.vn_high_type_read_facing(target, op);
+        let current = data.vn_high_type_read_facing(target, op)?;
         if function_pointer(&current) {
             continue;
         }
-        let Some(ty) = call_type(data, tlst, op) else { continue };
-        if uncallable_pointer(&current) {
+        if per_call && (!matches!(current.get_metatype(),
+            type_metatype::TYPE_PTR | type_metatype::TYPE_INT
+                | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
+            || !data.vbank().get(target).is_some_and(|value| spellable(&current, value.get_size())))
+        {
+            continue;
+        }
+        let Some(ty) = call_type(data, tlst, op)? else { continue };
+        if per_call {
+            data.kuna_set_call_target_type(op, ty);
+        } else if uncallable_pointer(&current) {
             groups.entry(high).or_default().push((op, ty));
         } else {
             casts.push((op, ty));
         }
+    }
+    if per_call {
+        return Ok(());
     }
     for (op, ty) in casts {
         data.kuna_set_call_target_type(op, ty);
@@ -416,7 +463,7 @@ pub fn retype_call_targets(data: &mut Funcdata) {
             continue;
         }
         let ops: BTreeSet<OpId> = group.iter().map(|(op, _)| *op).collect();
-        if retypable(data, *high, ty, &ops) {
+        if retypable(data, *high, ty, &ops)? {
             chosen.insert(*high, Rc::clone(ty));
         }
     }
@@ -435,7 +482,7 @@ pub fn retype_call_targets(data: &mut Funcdata) {
     if data.get_arch().call_target_c {
         for (high, group) in &groups {
             for (op, ty) in group {
-                if !declare_field(data, *op, ty, chosen.contains_key(high)) {
+                if !declare_field(data, *op, ty, chosen.contains_key(high))? {
                     data.kuna_set_call_target_type(*op, Rc::clone(ty));
                 }
             }
@@ -444,15 +491,17 @@ pub fn retype_call_targets(data: &mut Funcdata) {
     for (high, ty) in chosen {
         retype_high(data, tlst, high, &ty);
     }
+    Ok(())
 }
 
 /// The record and offset of the field the target of `op` is printed as a read
 /// of (`o->fn`), when that field is a pointer C cannot call.
-fn uncallable_field(data: &mut Funcdata, op: OpId) -> Option<(Rc<Datatype>, int4)> {
-    let target = data.obank().get(op)?.get_in(0)?;
-    let v = data.vbank().get(target).filter(|v| v.is_implied() && v.is_written())?;
-    let load = data.obank().get(v.get_def()?).filter(|o| o.code() == OpCode::CPUI_LOAD)?;
-    let (addr, at) = (load.get_in(1)?, v.get_def()?);
+fn uncallable_field(data: &mut Funcdata, op: OpId) -> kuna_base::error::KunaResult<Option<(Rc<Datatype>, int4)>> {
+    let Some(target) = data.obank().get(op).and_then(|o| o.get_in(0)) else { return Ok(None) };
+    let Some(v) = data.vbank().get(target).filter(|v| v.is_implied() && v.is_written()) else { return Ok(None) };
+    let Some(at) = v.get_def() else { return Ok(None) };
+    let Some(load) = data.obank().get(at).filter(|o| o.code() == OpCode::CPUI_LOAD) else { return Ok(None) };
+    let Some(addr) = load.get_in(1) else { return Ok(None) };
     let ptrsub = data
         .vbank()
         .get(addr)
@@ -461,27 +510,29 @@ fn uncallable_field(data: &mut Funcdata, op: OpId) -> Option<(Rc<Datatype>, int4
         .filter(|d| data.obank().get(*d).is_some_and(|o| o.code() == OpCode::CPUI_PTRSUB));
     let (base, at, mut off) = match ptrsub {
         Some(d) => {
-            let o = data.obank().get(d)?;
-            let c = data.vbank().get(o.get_in(1)?).filter(|c| c.is_constant())?;
-            (o.get_in(0)?, d, int4::try_from(c.get_offset()).ok()?)
+            let Some(o) = data.obank().get(d) else { return Ok(None) };
+            let Some(c) = o.get_in(1).and_then(|c| data.vbank().get(c)).filter(|c| c.is_constant()) else { return Ok(None) };
+            let Some(base) = o.get_in(0) else { return Ok(None) };
+            let Ok(off) = int4::try_from(c.get_offset()) else { return Ok(None) };
+            (base, d, off)
         }
         None => (addr, at, 0),
     };
-    let mut rec = data.vn_high_type_read_facing(base, at).get_ptr_to()?;
+    let Some(mut rec) = data.vn_high_type_read_facing(base, at)?.get_ptr_to() else { return Ok(None) };
     for _ in 0..8 {
         if rec.get_metatype() != type_metatype::TYPE_STRUCT {
-            return None;
+            return Ok(None);
         }
-        let field = (0..).map_while(|i| rec.get_field(i)).find(|f| {
+        let Some(field) = (0..).map_while(|i| rec.get_field(i)).find(|f| {
             f.offset <= off && off < f.offset + f.field_type.get_size().max(1)
-        })?;
+        }) else { return Ok(None) };
         if field.offset == off && uncallable_pointer(&field.field_type) {
-            return Some((rec, off));
+            return Ok(Some((rec, off)));
         }
         off -= field.offset;
         rec = Rc::clone(&field.field_type);
     }
-    None
+    Ok(None)
 }
 
 /// Does the call `op`, of type `ty`, print without a cast: its target is not a
@@ -498,15 +549,15 @@ fn uncallable_field(data: &mut Funcdata, op: OpId) -> Option<(Rc<Datatype>, int4
 /// ([`with_declared_fields`]). Calls that disagree within the function are cast
 /// at the call, as is any call through a field of a declared record, whose
 /// declaration says `void *`.
-fn declare_field(data: &mut Funcdata, op: OpId, ty: &Rc<Datatype>, agreed: bool) -> bool {
-    let Some((rec, offset)) = uncallable_field(data, op) else { return agreed };
+fn declare_field(data: &mut Funcdata, op: OpId, ty: &Rc<Datatype>, agreed: bool) -> kuna_base::error::KunaResult<bool> {
+    let Some((rec, offset)) = uncallable_field(data, op)? else { return Ok(agreed) };
     if !crate::kuna_structsynth::ledger::is_minted(&rec) {
-        return false;
+        return Ok(false);
     }
-    let Some(field) = (0..).map_while(|i| rec.get_field(i)).find(|f| f.offset == offset) else { return false };
+    let Some(field) = (0..).map_while(|i| rec.get_field(i)).find(|f| f.offset == offset) else { return Ok(false) };
     let (record, field) = (rec.get_name().to_string(), field.name.clone());
     data.kuna_add_field_call(FieldCall { record, field, offset, ty: agreed.then(|| Rc::clone(ty)) });
-    agreed
+    Ok(agreed)
 }
 
 /// The type each called field of a synthesized record is declared with in
@@ -554,13 +605,15 @@ pub fn with_declared_fields(types: Vec<Rc<Datatype>>, fd: &Funcdata) -> Vec<Rc<D
 /// The calls through fields of synthesized records `fd` makes, as the project
 /// header declares them.
 pub fn field_declarations(arch: &crate::architecture::Architecture, fd: &Funcdata) -> Vec<FieldDecl> {
-    let rt = crate::printc::RealTypeCtx::from_arch(arch, arch.print().out_lang());
+    let rt = crate::printc::RealTypeCtx::from_arch(arch, arch.print().out_lang(), arch.print().options.convention);
     fd.kuna_field_calls()
         .iter()
         .map(|call| FieldDecl {
             record: call.record.clone(),
             field: call.field.clone(),
-            declaration: call.ty.as_ref().map(|ty| crate::printc::declaration_text(ty, &call.field, rt)),
+            declaration: call.ty.as_ref().map(|ty| crate::printc::declaration_text_with_names(
+                ty, &call.field, &rt, arch.print().type_names().map(|names| names.as_ref()),
+            )),
         })
         .collect()
 }
@@ -622,31 +675,33 @@ fn param_slot(data: &Funcdata, vn: VarnodeId) -> Option<int4> {
 /// May `high`, the target of exactly the calls `ops`, take the call type `ty`.
 /// A parameter or a global takes it too: the parameter is declared with it, and
 /// the global is read at it in this function.
-fn retypable(data: &mut Funcdata, high: HighVariableId, ty: &Rc<Datatype>, ops: &BTreeSet<OpId>) -> bool {
+fn retypable(data: &mut Funcdata, high: HighVariableId, ty: &Rc<Datatype>, ops: &BTreeSet<OpId>) -> kuna_base::error::KunaResult<bool> {
     for vn in instances(data, high) {
-        let Some(v) = data.vbank().get(vn) else { return false };
-        if v.is_constant() || (v.is_type_lock() && !declares_call_type(data, vn, ty)) {
-            return false;
+        let Some(v) = data.vbank().get(vn) else { return Ok(false) };
+        if v.is_constant() || (v.is_type_lock() && !declares_call_type(data, vn, ty)?) {
+            return Ok(false);
         }
         let global = v.is_persist();
         if (global || v.is_input()) && !data.get_arch().call_target_c {
-            return false;
+            return Ok(false);
         }
         if !global && (v.is_addr_tied() || (v.is_input() && param_slot(data, vn).is_none())) {
-            return false;
+            return Ok(false);
         }
         let def = v.get_def().filter(|_| v.is_written());
         let uses: Vec<OpId> = v.descend_iter().collect();
-        if def.is_some_and(|def| !def_agrees(data, def, high, ty)) {
-            return false;
+        if let Some(def) = def {
+            if !def_agrees(data, def, high, ty)? {
+                return Ok(false);
+            }
         }
         for op in uses {
-            if !use_agrees(data, op, vn, high, ty, ops) {
-                return false;
+            if !use_agrees(data, op, vn, high, ty, ops)? {
+                return Ok(false);
             }
         }
     }
-    true
+    Ok(true)
 }
 
 /// Is `vn` an address formed from constants alone -- a function's or a global's
@@ -665,43 +720,44 @@ fn constant_address(data: &Funcdata, vn: VarnodeId) -> bool {
 
 /// The declared prototype of the function whose entry `vn`, a value formed from
 /// constants alone, names.
-fn declared_function(data: &Funcdata, vn: VarnodeId) -> Option<PrototypePieces> {
-    let v = data.vbank().get(vn)?;
+fn declared_function(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<Option<PrototypePieces>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     let offset = if v.is_constant() {
         v.get_offset()
     } else {
-        let o = data.obank().get(v.get_def().filter(|_| v.is_written())?)?;
+        let Some(o) = v.get_def().filter(|_| v.is_written()).and_then(|d| data.obank().get(d)) else { return Ok(None) };
         if !matches!(o.code(), OpCode::CPUI_PTRSUB | OpCode::CPUI_INT_ADD | OpCode::CPUI_COPY) {
-            return None;
+            return Ok(None);
         }
         let mut sum = 0u64;
         for i in 0..o.num_input() {
-            sum = sum.wrapping_add(data.vbank().get(o.get_in(i)?).filter(|c| c.is_constant())?.get_offset());
+            let Some(c) = o.get_in(i).and_then(|v| data.vbank().get(v)).filter(|c| c.is_constant()) else { return Ok(None) };
+            sum = sum.wrapping_add(c.get_offset());
         }
         sum
     };
-    let space = data.get_arch().manage().get_default_code_space()?;
+    let Some(space) = data.get_arch().manage().get_default_code_space() else { return Ok(None) };
     data.get_arch().callee_proto_pieces(&Address::new(Rc::clone(space), offset))
 }
 
 /// Is `vn` the address of a function declared with exactly the call type `ty`,
 /// which C then accepts into a variable of that type.
-fn declares_call_type(data: &Funcdata, vn: VarnodeId, ty: &Datatype) -> bool {
-    let Some(declared) = declared_function(data, vn) else { return false };
-    let Some(built) = ty.get_ptr_to().and_then(|t| t.get_code_prototype().cloned()) else { return false };
+fn declares_call_type(data: &Funcdata, vn: VarnodeId, ty: &Datatype) -> kuna_base::error::KunaResult<bool> {
+    let Some(declared) = declared_function(data, vn)? else { return Ok(false) };
+    let Some(built) = ty.get_ptr_to().and_then(|t| t.get_code_prototype().cloned()) else { return Ok(false) };
     let out = declared.outtype.as_ref().zip(built.get_output_type()).is_some_and(|(a, b)| same_type(a, b));
-    out && declared.first_var_arg_slot < 0
+    Ok(out && declared.first_var_arg_slot < 0
         && !built.is_dotdotdot()
         && declared.intypes.len() == built.num_params() as usize
         && declared.intypes.iter().enumerate().all(|(i, a)| {
             built.get_param(i as int4).and_then(|p| p.get_type()).is_some_and(|b| same_type(a, b))
-        })
+        }))
 }
 
 /// Does the op writing a member of `high` hand it a value C accepts into `ty`.
-fn def_agrees(data: &mut Funcdata, def: OpId, high: HighVariableId, ty: &Rc<Datatype>) -> bool {
-    let Some(o) = data.obank().get(def) else { return false };
-    match o.code() {
+fn def_agrees(data: &mut Funcdata, def: OpId, high: HighVariableId, ty: &Rc<Datatype>) -> kuna_base::error::KunaResult<bool> {
+    let Some(o) = data.obank().get(def) else { return Ok(false) };
+    Ok(match o.code() {
         OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INDIRECT => {
             let ins: Vec<VarnodeId> = (0..o.num_input()).filter_map(|i| o.get_in(i)).collect();
             let indirect = o.code() == OpCode::CPUI_INDIRECT;
@@ -709,10 +765,10 @@ fn def_agrees(data: &mut Funcdata, def: OpId, high: HighVariableId, ty: &Rc<Data
                 if indirect && slot == 1 {
                     continue;
                 }
-                let Some(v) = data.vbank().get(vn) else { return false };
+                let Some(v) = data.vbank().get(vn) else { return Ok(false) };
                 if v.is_constant() {
-                    if v.get_offset() != 0 && !declares_call_type(data, vn, ty) {
-                        return false;
+                    if v.get_offset() != 0 && !declares_call_type(data, vn, ty)? {
+                        return Ok(false);
                     }
                     continue;
                 }
@@ -720,29 +776,32 @@ fn def_agrees(data: &mut Funcdata, def: OpId, high: HighVariableId, ty: &Rc<Data
                     continue;
                 }
                 if constant_address(data, vn) {
-                    if !declares_call_type(data, vn, ty) {
-                        return false;
+                    if !declares_call_type(data, vn, ty)? {
+                        return Ok(false);
                     }
                     continue;
                 }
-                let other = data.vn_high_type_read_facing(vn, def);
+                let other = data.vn_high_type_read_facing(vn, def)?;
                 if function_pointer(&other) && !same_type(&other, ty) {
-                    return false;
+                    return Ok(false);
                 }
             }
             true
         }
         OpCode::CPUI_PTRSUB | OpCode::CPUI_INT_ADD => {
-            o.get_out().is_none_or(|out| !constant_address(data, out) || declares_call_type(data, out, ty))
+            match o.get_out() {
+                Some(out) => !constant_address(data, out) || declares_call_type(data, out, ty)?,
+                None => true,
+            }
         }
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
-            let Some(i) = data.get_call_specs_index(def) else { return true };
+            let Some(i) = data.get_call_specs_index(def) else { return Ok(true) };
             let proto = data.get_call_specs(i).proto();
             !(proto.is_output_locked()
                 && proto.get_output_type().is_some_and(|t| function_pointer(t) && !same_type(t, ty)))
         }
         _ => true,
-    }
+    })
 }
 
 /// Does reading member `vn` of `high` at `op` accept a value of type `ty`.
@@ -753,45 +812,45 @@ fn use_agrees(
     high: HighVariableId,
     ty: &Rc<Datatype>,
     ops: &BTreeSet<OpId>,
-) -> bool {
-    let Some(o) = data.obank().get(op) else { return false };
+) -> kuna_base::error::KunaResult<bool> {
+    let Some(o) = data.obank().get(op) else { return Ok(false) };
     let code = o.code();
     let slot = o.get_slot(vn);
     let out = o.get_out();
-    match code {
+    Ok(match code {
         OpCode::CPUI_RETURN => false,
         OpCode::CPUI_LOAD | OpCode::CPUI_STORE if slot == 1 => false,
         OpCode::CPUI_PTRADD | OpCode::CPUI_PTRSUB | OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB => false,
         OpCode::CPUI_INT_EQUAL | OpCode::CPUI_INT_NOTEQUAL => {
-            let Some(other) = o.get_in(1 - slot) else { return false };
+            let Some(other) = o.get_in(1 - slot) else { return Ok(false) };
             let constant = data.vbank().get(other).is_some_and(|v| v.is_constant() && v.get_offset() != 0);
-            !(constant || constant_address(data, other)) || declares_call_type(data, other, ty)
+            !(constant || constant_address(data, other)) || declares_call_type(data, other, ty)?
         }
         OpCode::CPUI_CALLIND if slot == 0 => ops.contains(&op),
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
-            let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot);
+            let declared = crate::coreaction_infertypes::declared_input_type_local(data, op, slot)?;
             if code_pointer(&declared) && !same_type(&declared, ty) {
-                return false;
+                return Ok(false);
             }
             let callee = data.get_call_specs_index(op).map(|i| data.get_call_specs(i).get_name().to_string());
             let param = usize::try_from(slot - 1).ok();
             !callee.zip(param).is_some_and(|(name, i)| crate::kuna_callbacktype::is_callback_slot(&name, i))
         }
         OpCode::CPUI_STORE if slot == 2 => {
-            let Some(ptr) = o.get_in(1) else { return false };
-            let ptr_ty = data.vn_high_type_read_facing(ptr, op);
+            let Some(ptr) = o.get_in(1) else { return Ok(false) };
+            let ptr_ty = data.vn_high_type_read_facing(ptr, op)?;
             !ptr_ty.get_ptr_to().is_some_and(|to| function_pointer(&to) && !same_type(&to, ty))
         }
         OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INDIRECT => {
-            let Some(out) = out else { return true };
+            let Some(out) = out else { return Ok(true) };
             if high_of(data, out) == Some(high) {
-                return true;
+                return Ok(true);
             }
-            let other = data.vn_high_type_def_facing(out);
+            let other = data.vn_high_type_def_facing(out)?;
             !(function_pointer(&other) && !same_type(&other, ty))
         }
         _ => true,
-    }
+    })
 }
 
 /// Give every member of `high` the type `ty`, and carry it back through the

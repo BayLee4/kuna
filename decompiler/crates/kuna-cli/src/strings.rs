@@ -231,7 +231,7 @@ fn attribute(
         prog.arch(),
         prog.arch().translate(),
         &seeds,
-    );
+    ).map_err(|e| e.to_string())?;
 
     // A name is looked up once per referencing function, not once per row: a
     // prompt string referenced from twenty sites resolves one entry.

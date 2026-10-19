@@ -109,7 +109,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, inputs: int4, off: u64, opc: OpCode) ->
 
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
 }
 
 fn mk_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
@@ -124,7 +124,7 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: u64) -> VarnodeId {
 fn set_output(fd: &mut Funcdata, op: OpId, off: u64, ct: Rc<Datatype>) -> VarnodeId {
     let r = ram(fd);
     let size = ct.get_size();
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(ct));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(ct)).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -213,7 +213,7 @@ fn w5s3r8_threeway_form1_eq_zero_collapses_to_int_equal() {
     wire(&mut fd, zero, op, 1);
     let _ = set_output(&mut fd, op, 0x440, unk(1));
 
-    let r = RuleThreeWayCompare.apply_op(op, &mut fd);
+    let r = RuleThreeWayCompare.apply_op(op, &mut fd).unwrap();
     assert_eq!(r, 1, "Form-1 threeway==0 must collapse");
     // Case 14 => INT_EQUAL, inputs (avn=b, bvn=a)  [avn=lessop.getIn(1)=b]
     assert_eq!(code(&fd, op), OpCode::CPUI_INT_EQUAL, "collapses to a==b");
@@ -251,7 +251,7 @@ fn w5s3r8_threeway_form1_sless_zero_collapses_to_a_lt_b() {
     wire(&mut fd, zero, op, 1);
     let _ = set_output(&mut fd, op, 0x440, unk(1));
 
-    let r = RuleThreeWayCompare.apply_op(op, &mut fd);
+    let r = RuleThreeWayCompare.apply_op(op, &mut fd).unwrap();
     assert_eq!(r, 1);
     // a < b  => INT_LESS(avn=b on slot0, bvn=a on slot1)
     assert_eq!(code(&fd, op), OpCode::CPUI_INT_LESS, "case 12 => a < b");
@@ -369,7 +369,7 @@ fn w5s3r8_lzcount_non_power_of_two_size_blocks_without_mutation() {
     wire(&mut fd, four, shr, 1);
     let _ = set_output(&mut fd, shr, 0x80, unk(3));
 
-    assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd), 0, "size 3 -> popcount(24)!=1 blocks");
+    assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd).unwrap(), 0, "size 3 -> popcount(24)!=1 blocks");
     // The shift reader is untouched.
     assert_eq!(code(&fd, shr), OpCode::CPUI_INT_RIGHT);
 }
@@ -394,7 +394,7 @@ fn w5s3r8_lzcount_power_of_two_completes_int_equal_rewrite() {
     wire(&mut fd, five, shr, 1);
     let _ = set_output(&mut fd, shr, 0x80, unk(4));
 
-    assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd), 1, "transform completes since w4x");
+    assert_eq!(RuleLzcountShiftBool.apply_op(lz, &mut fd).unwrap(), 1, "transform completes since w4x");
     assert_eq!(code(&fd, shr), OpCode::CPUI_INT_ZEXT, "size-4 output -> INT_ZEXT (not COPY)");
     let shr_rec = fd.obank().get(shr).expect("shift survives as zext");
     assert_eq!(shr_rec.num_input(), 1, "constant shift-amount input removed");
@@ -436,7 +436,7 @@ fn w5s3r8_orcompare_completes_and_links_v_w_descendants() {
     assert_eq!(fd.vbank().get(v).unwrap().num_descend(), 1);
     assert_eq!(fd.vbank().get(w).unwrap().num_descend(), 1);
 
-    assert_eq!(RuleOrCompare.apply_op(orop, &mut fd), 1, "rewrite completes since w4x");
+    assert_eq!(RuleOrCompare.apply_op(orop, &mut fd).unwrap(), 1, "rewrite completes since w4x");
     // The OR op itself is untouched; its READER became BOOL_AND.
     assert_eq!(code(&fd, orop), OpCode::CPUI_INT_OR);
     assert_eq!(code(&fd, eq), OpCode::CPUI_BOOL_AND);

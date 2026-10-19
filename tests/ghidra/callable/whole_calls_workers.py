@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import re
 import struct
 import subprocess
 import traceback
@@ -149,13 +150,18 @@ def main():
         driver=args.out/'consumer.c'
         dispatch_check='' if args.exclude_dispatch else 'if(carry_dispatch(raw,which)!=want) return 14;'
         narrow_dispatch='' if args.exclude_dispatch else 'if(dispatch(value,which)!=want)return 20;'
-        driver.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "'+stem+'.h"\n'+'''int main(void) {
+        driver.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "'+stem+'.h"\n'+'''static unsigned native_calls;
+static int consumer_native_callback(Flags value) {
+ ++native_calls;return (int)value*3+17;
+}
+int main(void) {
  if(choose(0)!=choose(0)||choose(1)!=choose(1)||choose(0)==choose(1))return 11;
  if(direct_dirty()!=0||direct_clean()!=1||ambient_dirty()!=0||ambient_clean()!=1)return 12;
  if(bool_byte(0)!=0||bool_byte(1)!=0)return 19;
  for(unsigned low=0;low<256;++low){
   Flags value=(Flags)low;int want=low==85;
   if(byte_target(value)!=want||word_target(value)!=want)return 18;
+  if(invoke(value,consumer_native_callback)!=(int)low*3+17)return 22;
   for(unsigned which=0;which<2;++which){
    if(invoke(value,choose(which))!=want)return 21;
 '''+narrow_dispatch+'''
@@ -166,6 +172,7 @@ def main():
  for(unsigned p=0;p<3;++p)for(unsigned low=0;low<256;++low){
   uint64_t raw=upper[p]|low;
   if(carry_ambient(raw)!=((uint32_t)raw==85)||wide_ambient(raw)!=((uint32_t)raw==85)||carry_bool(raw)!=((uint8_t)raw==85))return 13;
+  if(carry_invoke(raw,consumer_native_callback)!=(int)low*3+17)return 23;
   for(unsigned which=0;which<2;++which){
    int want=which?(uint32_t)raw==85:(uint8_t)raw==85;
    if(carry_invoke(raw,choose(which))!=want)return 15;
@@ -173,6 +180,7 @@ def main():
    ++checked;
   }
  }
+ if(native_calls!=1024)return 24;
  printf("checked=%u\\n",checked);return 0;
 }
 ''')
@@ -190,6 +198,42 @@ def main():
         report['behavioral_checks_completed']=True
     except BaseException:
         report['failure']=traceback.format_exc()
+    if args.mode == 'serial':
+        try:
+            corrected=args.out/'typed-parameter-project'
+            corrected_names=('word_target','direct_dirty','direct_clean')
+            invoke([args.cli,'decompile-project',args.binary,'-o',corrected,
+                    '--functions',','.join(corrected_names),'--language','c',
+                    '--assert','type word_target::value float sample','--assert-strict'])
+            corrected_body=corrected/(args.binary.name+'.c')
+            for name in corrected_names:
+                require_provider_body(corrected_body,name)
+            implementations=set(re.findall(
+                r'\bstatic\s+int\s+([A-Za-z_]\w*)\s*\(\s*float\s+sample\s*\)',
+                corrected_body.read_text()))
+            assert len(implementations)==1, implementations
+            implementation=implementations.pop()
+            signature=args.out/'typed-parameter-unit.c'
+            signature.write_text('#include "'+corrected_body.name+'"\n'
+                '_Static_assert(_Generic(&'+implementation+', int (*)(float): 1, default: 0),'
+                '"explicit private correction must survive publication");\n')
+            corrected_driver=args.out/'typed-parameter-consumer.c'
+            corrected_driver.write_text('#include "'+args.binary.name+'.h"\n'
+                '_Static_assert(_Generic(&word_target, int (*)(Flags): 1, default: 0),'
+                '"public source parameter must remain Flags");\n'
+                'int main(void){if(direct_clean()!=1)return 1;if(direct_dirty()!=0)return 2;'
+                'for(unsigned value=0;value<256;++value)'
+                'if(word_target((Flags)value)!=(value==85))return 3;return 0;}\n')
+            for opt in ('-O0','-O2'):
+                executable=args.out/('typed-parameter'+opt)
+                invoke(['cc','-std=c11','-Wall','-Wextra','-Werror=uninitialized',
+                        '-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',
+                        opt,'-I',corrected,signature,corrected_driver,'-o',executable])
+                invoke([executable])
+            report['typed_parameter']={'private_type':'float','public_type':'Flags',
+                                       'direct_clean':1,'direct_dirty':0,'public_byte_values':256}
+        except BaseException:
+            report['typed_parameter_failure']=traceback.format_exc()
     try:
         jobs = ['--jobs', '2'] if args.mode == 'jobs2' else []
         export_mode = ['--stream'] if args.mode == 'stream' else []
@@ -205,7 +249,8 @@ def main():
             if name!='forward':
                 require_absent_provider_body(native_body,name)
         report['native_boundary']={'project_status':exported['status']}
-        report['completed']=not any(key in report for key in ('failure','source_metadata_failure'))
+        report['completed']=not any(key in report for key in (
+            'failure','source_metadata_failure','typed_parameter_failure'))
     except BaseException:
         report['native_boundary_failure']=traceback.format_exc()
     finally:

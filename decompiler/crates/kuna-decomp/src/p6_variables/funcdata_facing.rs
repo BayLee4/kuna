@@ -29,12 +29,18 @@
 //! [`Funcdata::get_union_field`](crate::funcdata_union) cache exactly as the C++
 //! `findResolve` overrides do, so the typed-access cluster (`union_datatype.xml`)
 //! gets the resolved field type once the Casts stage drives the cache.
+//!
+//! Facing accessors are fallible because stack-view recovery can query source
+//! types. A failed query is returned immediately; only a successful absence of a
+//! stack view falls through to the varnode/high type and union cache below.
+//! `find_resolve_facing` itself only reads the union cache and is infallible.
 
 use std::rc::Rc;
 
 use crate::dtype::{type_metatype, Datatype, DatatypeKind};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
+use kuna_base::error::KunaResult;
 
 impl Funcdata {
     /// `Datatype::findResolve(op, slot)` dispatched against the live union cache
@@ -110,50 +116,50 @@ impl Funcdata {
     /// C++ `Varnode::getTypeDefFacing()` (varnode.cc:645-651): the Varnode's own
     /// data-type, resolved against the *write* edge (`slot == -1`) when it needs
     /// union resolution.  `vn` **must** be written.
-    pub fn vn_type_def_facing(&self, vn: VarnodeId) -> Rc<Datatype> {
+    pub fn vn_type_def_facing(&self, vn: VarnodeId) -> KunaResult<Rc<Datatype>> {
         if self.get_arch().stack_views {
             if let Some(op) = self.vbank().get(vn).and_then(|v| v.get_def()) {
-                if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, -1) {
-                    return view;
+                if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, -1)? {
+                    return Ok(view);
                 }
             }
         }
         let v = self.vbank().get(vn).expect("vn_type_def_facing: stale vn");
         let ty = Rc::clone(v.get_type());
         if !ty.needs_resolution() {
-            return ty;
+            return Ok(ty);
         }
         let def = v.get_def().expect("getTypeDefFacing: Varnode must be written");
-        self.find_resolve_facing(&ty, def, -1)
+        Ok(self.find_resolve_facing(&ty, def, -1))
     }
 
     /// C++ `Varnode::getTypeReadFacing(op)` (varnode.cc:658-664): the Varnode's own
     /// data-type, resolved against the *read* edge (`op->getSlot(this)`) when it
     /// needs union resolution.
-    pub fn vn_type_read_facing(&self, vn: VarnodeId, op: OpId) -> Rc<Datatype> {
+    pub fn vn_type_read_facing(&self, vn: VarnodeId, op: OpId) -> KunaResult<Rc<Datatype>> {
         if self.get_arch().stack_views {
             let slot = self.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
-            if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, slot) {
-                return view;
+            if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, slot)? {
+                return Ok(view);
             }
         }
         let ty = Rc::clone(self.vbank().get(vn).expect("vn_type_read_facing: stale vn").get_type());
         if !ty.needs_resolution() {
-            return ty;
+            return Ok(ty);
         }
         let slot = self.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
-        self.find_resolve_facing(&ty, op, slot)
+        Ok(self.find_resolve_facing(&ty, op, slot))
     }
 
     /// C++ `Varnode::getHighTypeDefFacing()` (varnode.cc:670-677): the *merged*
     /// HighVariable's data-type, resolved against the write edge when it needs
     /// union resolution.  This is the def-facing node of the type graph the Casts
     /// stage walks.
-    pub fn vn_high_type_def_facing(&mut self, vn: VarnodeId) -> Rc<Datatype> {
+    pub fn vn_high_type_def_facing(&mut self, vn: VarnodeId) -> KunaResult<Rc<Datatype>> {
         if self.get_arch().stack_views {
             if let Some(op) = self.vbank().get(vn).and_then(|v| v.get_def()) {
-                if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, -1) {
-                    return view;
+                if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, -1)? {
+                    return Ok(view);
                 }
             }
         }
@@ -161,34 +167,34 @@ impl Funcdata {
             .high_get_type(vn)
             .unwrap_or_else(|| Rc::clone(self.vbank().get(vn).expect("stale vn").get_type()));
         if !ct.needs_resolution() {
-            return ct;
+            return Ok(ct);
         }
         let def = self
             .vbank()
             .get(vn)
             .and_then(|v| v.get_def())
             .expect("getHighTypeDefFacing: Varnode must be written");
-        self.find_resolve_facing(&ct, def, -1)
+        Ok(self.find_resolve_facing(&ct, def, -1))
     }
 
     /// C++ `Varnode::getHighTypeReadFacing(op)` (varnode.cc:684-691): the *merged*
     /// HighVariable's data-type, resolved against the read edge when it needs union
     /// resolution.  This is the read-facing node of the type graph
     /// `ActionSetCasts::castInput`/`castOutput` query.
-    pub fn vn_high_type_read_facing(&mut self, vn: VarnodeId, op: OpId) -> Rc<Datatype> {
+    pub fn vn_high_type_read_facing(&mut self, vn: VarnodeId, op: OpId) -> KunaResult<Rc<Datatype>> {
         if self.get_arch().stack_views {
             let slot = self.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
-            if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, slot) {
-                return view;
+            if let Some(view) = crate::kuna_stackviews::access_type(self, vn, op, slot)? {
+                return Ok(view);
             }
         }
         let ct = self
             .high_get_type(vn)
             .unwrap_or_else(|| Rc::clone(self.vbank().get(vn).expect("stale vn").get_type()));
         if !ct.needs_resolution() {
-            return ct;
+            return Ok(ct);
         }
         let slot = self.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
-        self.find_resolve_facing(&ct, op, slot)
+        Ok(self.find_resolve_facing(&ct, op, slot))
     }
 }

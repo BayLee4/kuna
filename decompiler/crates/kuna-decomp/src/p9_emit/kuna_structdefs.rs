@@ -12,7 +12,7 @@
 //! the one surface agents actually read.
 //!
 //! angr prints its typedefs above the function for exactly this reason, and
-//! that is what `option structdefs on` does here: the composite, enum and
+//! that is what `option structdefs on` does here: the composite, enum, callable and
 //! typedef definitions the function's own C names, in dependency order, above
 //! the body.
 //!
@@ -20,8 +20,9 @@
 //!
 //! The roots are the function's semantic type surface — its prototype's return
 //! and parameter types, every Varnode's data-type, and every mapped Symbol type
-//! behind a HighVariable.  That is a SUPERSET of the type names the printer can
-//! spell: every type name in the emitted C is read off one of those three
+//! behind a HighVariable, plus retained source types of volatile annotations
+//! (which have no HighVariable). That is a SUPERSET of the type names the printer can
+//! spell: every type name in the emitted C is read off one of those roots
 //! (declarations from the highs and their symbols, the signature from the
 //! prototype, a cast from the Varnode type it casts to), so the preamble cannot
 //! miss a definition the body refers to.  Collecting from the token stream
@@ -46,6 +47,11 @@
 //! the header line for the same type are the same line, and a project export's
 //! `.c` bodies deliberately DO NOT carry the preamble — they include the header
 //! that already holds it.
+//!
+//! Enum bodies retain the recovered storage width and signedness with packed
+//! declarations and explicit range endpoints; a small set of positive flag
+//! names must not silently turn a signed 64-bit producer type into C's
+//! default-width unsigned enum. The recovered names and values are unchanged.
 
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -89,7 +95,7 @@ impl OptionStructDefs {
 /// Is `ct` a type this preamble defines?
 ///
 /// The predicate `render_type_definitions` applies to the `.h`: a user-defined
-/// (non-core), named, non-partial typedef / struct / union / enum.  Core types
+/// (non-core), named, non-partial typedef / struct / union / enum / callable. Core types
 /// (`int4`, `undefined8`, `char`) are never defined — they are the language's,
 /// and the project export declares them once in its recompile prelude.
 pub fn is_definable(ct: &Rc<Datatype>) -> bool {
@@ -100,13 +106,16 @@ pub fn is_definable(ct: &Rc<Datatype>) -> bool {
     !ct.is_core_type()
         && !ct.get_name().is_empty()
         && !ct.has_stripped()
-        && (ct.get_typedef().is_some() || composite || ct.is_enum_type())
+        && (ct.get_typedef().is_some() || composite || ct.is_enum_type()
+            || ct.get_code_prototype().is_some_and(|proto| proto.has_store()))
 }
 
 /// The definable types `fd`'s printed C can name, in definition-before-use
 /// order (see the module header for the roots and why they are a superset of
 /// what the printer spells).
-pub fn referenced_types(fd: &Funcdata) -> Vec<Rc<Datatype>> {
+pub fn referenced_types<'a>(
+    fd: &Funcdata, additional_roots: impl IntoIterator<Item = &'a Rc<Datatype>>,
+) -> Vec<Rc<Datatype>> {
     let mut order: Vec<Rc<Datatype>> = Vec::new();
     let mut seen: HashSet<*const Datatype> = HashSet::new();
 
@@ -132,6 +141,9 @@ pub fn referenced_types(fd: &Funcdata) -> Vec<Rc<Datatype>> {
             visit(sym, &mut seen, &mut order);
         }
     }
+    for root in additional_roots {
+        visit(root, &mut seen, &mut order);
+    }
     order
 }
 
@@ -145,9 +157,42 @@ fn visit(ct: &Rc<Datatype>, seen: &mut HashSet<*const Datatype>, order: &mut Vec
     if !seen.insert(Rc::as_ptr(ct)) {
         return;
     }
+    if let Some(base) = ct.qualified_base() {
+        // A qualified view names the underlying source type, not a new
+        // typedef/record declaration of its own.
+        visit(base, seen, order);
+        return;
+    }
     if let Some(base) = ct.get_typedef() {
         let base = Rc::clone(base);
         visit(&base, seen, order);
+    }
+    // A callback typedef names its source signature's types even though the
+    // upstream TypeCode component API does not enumerate them.
+    if let Some(proto) = ct.get_code_prototype() {
+        if let Some(source) = proto.logical_pieces() {
+            if let Some(output) = source.outtype.as_ref()
+                .or_else(|| source.output_storage.as_ref().and_then(|p| p.type_.as_ref()))
+            {
+                visit(output, seen, order);
+            }
+            for input in &source.intypes {
+                visit(input, seen, order);
+            }
+        }
+        if proto.has_store() && (proto.logical_pieces().is_none()
+            || (0..proto.num_params()).any(|slot|
+                proto.get_param(slot).is_some_and(|param| param.is_hidden_return())))
+        {
+            if let Some(output) = proto.get_output_type() {
+                visit(output, seen, order);
+            }
+            for slot in 0..proto.num_params() {
+                if let Some(input) = proto.get_param(slot).and_then(|p| p.get_type()) {
+                    visit(input, seen, order);
+                }
+            }
+        }
     }
     for i in 0..ct.num_depend() {
         if let Some(dep) = ct.get_depend(i) {
@@ -189,6 +234,22 @@ pub fn dedup_by_name(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
         .collect()
 }
 
+/// The presentation path distinguishes same-named producer nominals. A
+/// declaration/completion pair shares its explicit factory identity; neither
+/// size nor layout establishes equivalence.
+pub fn dedup_by_identity(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
+    let complete: HashSet<(&str, u64)> = types.iter()
+        .filter(|ct| !ct.is_incomplete())
+        .map(|ct| (ct.get_name(), ct.get_id()))
+        .collect();
+    let mut taken = HashSet::new();
+    types.iter()
+        .filter(|ct| !(ct.is_incomplete() && complete.contains(&(ct.get_name(), ct.get_id()))))
+        .filter(|ct| taken.insert((ct.get_name(), ct.get_id())))
+        .map(Rc::clone)
+        .collect()
+}
+
 /// ONE type's definition text, the line(s) `render_type_definitions` would give
 /// it in the `.h`: the body for a complete struct/union, the enum block, the
 /// `typedef <base> <name>;` line, and the forward declaration alone for an
@@ -198,10 +259,29 @@ pub fn dedup_by_name(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
 /// per-function `types` array), so a consumer reads the recovered layout
 /// without parsing C out of the body.  Returns `""` for a type the preamble does
 /// not define.
-pub fn definition_text(ct: &Rc<Datatype>, rt: SpellCtx) -> String {
+pub fn definition_text(ct: &Rc<Datatype>, rt: &SpellCtx) -> String {
+    definition_text_with_names(ct, rt, None, None)
+}
+
+/// Render a retained nominal through the invocation's identity-bound spelling.
+pub fn definition_text_with_names(
+    ct: &Rc<Datatype>,
+    rt: &SpellCtx,
+    names: Option<&std::collections::BTreeMap<usize, String>>,
+    reserved: Option<&std::collections::BTreeSet<String>>,
+) -> String {
     let raw = ct.get_name();
-    let name = sanitize_type_name(raw);
+    let name = names
+        .and_then(|names| names.get(&(Rc::as_ptr(ct) as usize)))
+        .map(|name| std::borrow::Cow::Borrowed(name.as_str()))
+        .unwrap_or_else(|| sanitize_type_name(raw));
     if let Some(base) = ct.get_typedef() {
+        if base.get_name().is_empty() && base.is_enum_type() {
+            return compose_enum_body(base, &name, reserved);
+        }
+        if names.is_some() {
+            return format!("typedef {};\n", crate::printc::declaration_text_with_names(base, &name, rt, names));
+        }
         return compose_typedef_line(base, &name, rt);
     }
     match &ct.kind {
@@ -210,10 +290,16 @@ pub fn definition_text(ct: &Rc<Datatype>, rt: SpellCtx) -> String {
             if ct.is_incomplete() {
                 format!("typedef {kw} {name} {name}; /* opaque */\n")
             } else {
-                compose_type_body(ct, &name, rt)
+                if names.is_some() {
+                    crate::printc::compose_type_body_with_names(ct, &name, rt, names)
+                } else {
+                    compose_type_body(ct, &name, rt)
+                }
             }
         }
-        _ if ct.is_enum_type() => compose_enum_body(ct, &name),
+        _ if ct.is_enum_type() => compose_enum_body(ct, &name, reserved),
+        DatatypeKind::Code { proto: Some(proto) } if proto.has_store() =>
+            crate::printc::compose_callable_definition(ct, &name, rt, names),
         _ => String::new(),
     }
 }

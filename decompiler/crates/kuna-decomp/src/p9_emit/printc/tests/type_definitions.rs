@@ -1,5 +1,5 @@
 use super::*;
-use super::support::{assert_c_source, assert_rust_source, bare_arch, execution_printer};
+use super::support::{assert_c_source, assert_c_source_with_warnings, assert_rust_source, bare_arch, execution_printer};
 use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeField};
 use std::rc::Rc;
 
@@ -39,8 +39,70 @@ mod decompile_project_type_render {
             .map(|(value, name)| (*value, (*name).to_string())).collect()).unwrap()
     }
 
-
-
+    #[test]
+    fn named_callable_definitions_preserve_recursive_aliases_and_function_type() {
+        use crate::dtype::DatatypeKind;
+        use crate::fspec::{FuncProto, ParameterPieces};
+        let types = TypeFactoryImpl::new();
+        types.set_default_alignment_map();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let integer = named(&types, 8, type_metatype::TYPE_INT, "long long");
+        let node = types.kuna_declare_record("Node", false).unwrap();
+        let alias = types.get_typedef(&node, "NodeAlias", 0, 0).unwrap();
+        let callback = |name: &str, output: Rc<Datatype>, input: Rc<Datatype>| {
+            let mut proto = FuncProto::new();
+            proto.attach_internal_store(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            proto.set_output(&ParameterPieces { type_: Some(output), ..Default::default() });
+            proto.store_set_input(0, "value", &ParameterPieces {
+                type_: Some(input), ..Default::default()
+            });
+            let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+            code.name = name.into();
+            code.display_name = name.into();
+            code.id = Datatype::hash_name(name);
+            code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+            Rc::new(code)
+        };
+        let code = callback("Callback", Rc::clone(&alias), Rc::clone(&alias));
+        let pointer = ptr_to(&types, Rc::clone(&code));
+        let complete = types.set_fields_struct_raw(&node, vec![
+            TypeField::new(0, 0, "value", integer),
+            TypeField::new(1, 8, "next", Rc::clone(&pointer)),
+        ], Vec::new(), 16, 8, 0).unwrap();
+        let code_alias = types.get_typedef(&code, "CallbackAlias", 0, 0).unwrap();
+        let pointer_alias = types.get_typedef(&pointer, "CallbackPointer", 0, 0).unwrap();
+        let array = types.get_type_array(2, Rc::clone(&complete)).unwrap();
+        let array_alias = types.get_typedef(&array, "NodeArray", 0, 0).unwrap();
+        let int = named(&types, 4, type_metatype::TYPE_INT, "int");
+        let array_code = callback("ArrayCallback", int, Rc::clone(&array_alias));
+        for first in [&code, &alias, &complete, &array_code] {
+            let declarations = render_type_definitions(&[
+                Rc::clone(first), Rc::clone(&code), Rc::clone(&complete), Rc::clone(&alias),
+                Rc::clone(&code_alias), Rc::clone(&pointer_alias),
+                Rc::clone(&array_alias), Rc::clone(&array_code),
+            ], &RealTypeCtx::OFF);
+            assert_eq!(declarations.matches("typedef NodeAlias Callback(NodeAlias);").count(), 1);
+            assert!(declarations.contains("typedef Callback CallbackAlias;"), "{declarations}");
+            assert!(declarations.contains("typedef Callback *CallbackPointer;"), "{declarations}");
+            let source = format!(
+                "#include <assert.h>\n{declarations}\n\
+                 NodeAlias provider(NodeAlias value) {{ value.value += 7; return value; }}\n\
+                 int array_provider(NodeArray values) {{ return values[0].value + values[1].value; }}\n\
+                 int main(void) {{ NodeAlias value = {{5, provider}};\n\
+                     CallbackAlias *call = provider; CallbackPointer pointer = provider;\n\
+                     assert(value.next(value).value == 12 && call(value).value == 12);\n\
+                     assert(pointer(value).value == 12);\n\
+                     NodeArray values = {{{{3, provider}}, {{9, provider}}}};\n\
+                     ArrayCallback *array_call = array_provider;\n\
+                     assert(array_call(values) == 12); return 0; }}\n"
+            );
+            super::assert_c_source(&source, &format!("named-callable-{}", first.get_name()));
+        }
+        assert_eq!(code.get_name(), "Callback");
+        assert_eq!(alias.get_name(), "NodeAlias");
+        assert!(Rc::ptr_eq(code_alias.get_typedef().unwrap(), &code));
+    }
 
     #[test]
     fn composite_declarations_preserve_layout_and_member_storage() {
@@ -63,8 +125,8 @@ mod decompile_project_type_render {
         let source = format!(
             "#include <stdint.h>\n#include <stddef.h>\n#include <string.h>\n\
              typedef int32_t int4; typedef double float8; typedef uint8_t undefined1;\n{}{}\n{}",
-            compose_type_body(&s, "mystruct", RealTypeCtx::OFF),
-            compose_type_body(&u, "myunion", RealTypeCtx::OFF),
+            compose_type_body(&s, "mystruct", &RealTypeCtx::OFF),
+            compose_type_body(&u, "myunion", &RealTypeCtx::OFF),
             r#"
 _Static_assert(sizeof(struct mystruct) == 40, "struct extent");
 _Static_assert(offsetof(struct mystruct, a) == 0, "scalar offset");
@@ -104,6 +166,108 @@ int main(void) {
     }
 
     #[test]
+    fn anonymous_enum_typedefs_preserve_source_identity_and_share_one_definition() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let shell = types.reserve_enum("", 0x27, 2, type_metatype::TYPE_ENUM_UINT).unwrap();
+        let enumeration = types.set_enum_values(&shell, [
+            (0, "EA".to_string()), (40000, "EB".to_string()), (50000, "EC".to_string()),
+        ].into_iter().collect()).unwrap();
+        let alias = types.get_typedef(&enumeration, "E2", 0x5b, 0).unwrap();
+        let second = types.get_typedef(&enumeration, "E2Alias", 0x5c, 0).unwrap();
+        let definitions = render_type_definitions(
+            &[Rc::clone(&enumeration), Rc::clone(&alias), Rc::clone(&second), Rc::clone(&alias)],
+            &RealTypeCtx::OFF,
+        );
+        assert!(definitions.contains("typedef enum __attribute__((packed)) {\n"), "{definitions}");
+        assert!(!definitions.contains("typedef enum __attribute__((packed)) E2 {"), "{definitions}");
+        assert!(definitions.contains("typedef E2 E2Alias;"), "{definitions}");
+        assert_eq!(definitions.matches("EA = ").count(), 1, "{definitions}");
+        assert!(!definitions.contains("duplicate type name skipped"), "{definitions}");
+        assert_eq!(enumeration.get_name(), "");
+        assert_eq!(enumeration.get_id(), 0x27);
+        assert_eq!(alias.get_name(), "E2");
+        assert_eq!(alias.get_id(), 0x5b);
+        assert!(Rc::ptr_eq(alias.get_typedef().unwrap(), &enumeration));
+        assert!(alias.is_enum_type());
+        assert_eq!(
+            crate::kuna_structdefs::definition_text(&alias, &RealTypeCtx::OFF),
+            crate::printc::compose_enum_body(&enumeration, "E2", None),
+        );
+        let source = format!(
+            "{definitions}\n\
+             _Static_assert(sizeof(E2) == 2 && (E2)-1 > 0, \"source storage\");\n\
+             _Static_assert(EA == 0 && EB == 40000 && EC == 50000, \"source members\");\n\
+             _Static_assert(__builtin_types_compatible_p(E2, E2Alias), \"shared enum identity\");\n\
+             int main(void) {{ E2Alias value = EC; return value != 50000; }}\n",
+        );
+        super::assert_c_source(&source, "anonymous-enum-aliases");
+
+        let names = std::collections::BTreeMap::from([
+            (Rc::as_ptr(&alias) as usize, "PresentedE2".to_string()),
+            (Rc::as_ptr(&second) as usize, "PresentedAlias".to_string()),
+        ]);
+        let presented = crate::printc::render_type_definitions_with_names(
+            &[alias, second], &RealTypeCtx::OFF, Some(&names), None,
+        );
+        assert!(presented.contains("} PresentedE2;"), "{presented}");
+        assert!(presented.contains("typedef PresentedE2 PresentedAlias;"), "{presented}");
+        assert!(!presented.contains("enum __attribute__((packed)) PresentedE2 {"), "{presented}");
+        assert_eq!(enumeration.get_name(), "");
+    }
+
+    #[test]
+    fn anonymous_enum_alias_registration_keeps_the_declared_alias_identity() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let shell = types.reserve_enum("", 0x27, 2, type_metatype::TYPE_ENUM_UINT).unwrap();
+        let enumeration = types.set_enum_values(
+            &shell, [(1, "ONE".to_string())].into_iter().collect(),
+        ).unwrap();
+        let first = types.get_typedef(&enumeration, "E2", 0x5b, 0).unwrap();
+        let distinct_alias = types.get_typedef(&enumeration, "E2", 0x5c, 0).unwrap();
+        let definitions = render_type_definitions(&[first, distinct_alias], &RealTypeCtx::OFF);
+        assert!(definitions.contains("/* duplicate type name skipped: E2 */"), "{definitions}");
+        assert_eq!(definitions.matches("ONE = ").count(), 1, "{definitions}");
+    }
+
+    #[test]
+    fn anonymous_enum_reuse_retains_one_body_owner_in_each_emission_order() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let shell = types.reserve_enum("", 0x27, 2, type_metatype::TYPE_ENUM_UINT).unwrap();
+        let enumeration = types.set_enum_values(
+            &shell, [(1, "ONE".to_string())].into_iter().collect(),
+        ).unwrap();
+        let first = types.get_typedef(&enumeration, "E2", 0x5b, 0).unwrap();
+        let second = types.get_typedef(&enumeration, "E2Alias", 0x5c, 0).unwrap();
+        let third = types.get_typedef(&enumeration, "E2Third", 0x5d, 0).unwrap();
+        for order in [[&first, &second, &third], [&second, &third, &first]] {
+            let mut text = String::new();
+            let forward = std::collections::HashSet::new();
+            let mut writer = crate::printc::CTypeDefinitionWriter {
+                rt: &RealTypeCtx::OFF, names: None, reserved: None,
+                forward: &forward, defined: std::collections::HashMap::new(), out: &mut text,
+            };
+            for alias in order {
+                writer.define(alias);
+            }
+            assert_eq!(writer.defined.values().filter(|(_, base)| base.is_some()).count(), 1);
+            for alias in order {
+                let declared = writer.defined.get(alias.get_name()).unwrap();
+                assert_eq!(declared.0, Rc::as_ptr(alias) as usize);
+            }
+            assert!(writer.out.contains(&format!(
+                "typedef {} {};", order[0].get_name(), order[2].get_name(),
+            )), "{}", writer.out);
+            assert_eq!(writer.out.matches("ONE = ").count(), 1);
+        }
+    }
+
+    #[test]
     fn generated_enum_width_sign_and_complements_are_consumed_without_repair() {
         let types = TypeFactoryImpl::new();
         types.setup_sizes(Some(4), 8, 8);
@@ -114,7 +278,7 @@ int main(void) {
                 let name = format!("Flags{}{}", size * 8, if signed { "s" } else { "u" });
                 let wide = if size == 8 { 0x8000_0000 } else { 4 };
                 let ty = make_enum(&types, &name, size, meta, &[(1, "ONE"), (2, "TWO"), (wide, "WIDE")]);
-                let declarations = render_type_definitions(&[ty.clone()], RealTypeCtx::OFF);
+                let declarations = render_type_definitions(&[ty.clone()], &RealTypeCtx::OFF);
                 let mut checks = String::new();
                 for flag in [1, 3, wide] {
                     let value = kuna_base::address::calc_mask(size) ^ flag;
@@ -142,6 +306,64 @@ int main(void) {
     }
 
     #[test]
+    fn enum_range_endpoints_preserve_producer_names_and_strict_c_literals() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        // These names deliberately collide with the renderer's range names.
+        // The signed minimum must not be spelled as the too-large positive
+        // decimal token 9223372036854775808 with a unary minus in front.
+        let signed = make_enum(&types, "Signed", 8, type_metatype::TYPE_INT, &[
+            (0x8000_0000_0000_0000, "Signed__kuna_min"),
+            (1, "Signed__kuna_max"),
+        ]);
+        let unsigned = make_enum(&types, "Unsigned", 8, type_metatype::TYPE_UINT, &[
+            (u64::MAX, "ALL_BITS"),
+        ]);
+        let declarations = render_type_definitions(&[signed, unsigned], &RealTypeCtx::OFF);
+        let source = format!(
+            "#include <stdint.h>\n{declarations}\n\
+             _Static_assert(sizeof(Signed) == 8, \"signed width\");\n\
+             _Static_assert(sizeof(Unsigned) == 8, \"unsigned width\");\n\
+             _Static_assert(Signed__kuna_min == INT64_MIN, \"producer minimum\");\n\
+             _Static_assert(Signed__kuna_max == 1, \"producer name\");\n\
+             _Static_assert(ALL_BITS == UINT64_MAX, \"producer maximum\");\n\
+             int main(void) {{ return 0; }}\n"
+        );
+        super::assert_c_source_with_warnings(
+            &source, "enum-strict-range-literals", &["-Wall", "-Werror"],
+        );
+    }
+
+    #[test]
+    fn enum_range_endpoints_respect_later_authored_ordinary_identifiers() {
+        let types = TypeFactoryImpl::new();
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let flags = make_enum(&types, "Flags", 4, type_metatype::TYPE_UINT, &[(1, "ONE")]);
+        let reserved = std::collections::BTreeSet::from([
+            "Flags__kuna_min".to_string(), "Flags__kuna_min_".to_string(),
+            "Flags__kuna_max".to_string(), "Flags__kuna_max_".to_string(),
+        ]);
+        let declaration = crate::printc::compose_enum_body(&flags, "Flags", Some(&reserved));
+        let source = format!(
+            "#include <assert.h>\n{declaration}\n\
+             enum Later {{ Flags__kuna_min = 17 }};\n\
+             int Flags__kuna_min_ = 19;\n\
+             typedef int Flags__kuna_max;\n\
+             int Flags__kuna_max_(void) {{ return 23; }}\n\
+             _Static_assert(sizeof(Flags) == 4, \"original enum width\");\n\
+             _Static_assert(!((Flags)-1 < 0), \"original enum sign\");\n\
+             int main(void) {{ Flags__kuna_max value = Flags__kuna_max_();\n\
+                 assert(ONE == 1 && Flags__kuna_min == 17);\n\
+                 assert(Flags__kuna_min_ == 19 && value == 23); return 0; }}\n"
+        );
+        super::assert_c_source_with_warnings(
+            &source, "enum-later-ordinary-identifiers", &["-Wall", "-Werror"],
+        );
+    }
+
+    #[test]
     fn generated_partial_enum_keeps_upper_byte_values_without_signed_widening() {
         let types = TypeFactoryImpl::new();
         types.setup_sizes(Some(4), 8, 8);
@@ -153,7 +375,7 @@ int main(void) {
             (0x300_0000_0000, "PARENT_HIGH"), (0x8000_0000_0000_0000, "PARENT_SIGN"),
         ]);
         let partial = types.get_type_partial_enum(parent.clone(), 4, 4).unwrap();
-        let declarations = render_type_definitions(&[parent], RealTypeCtx::OFF);
+        let declarations = render_type_definitions(&[parent], &RealTypeCtx::OFF);
         let mut checks = String::new();
         for value in [0xffff_fffe, 0, 0x300, 0x8000_0000] {
             let mut print = PrintC::new();
@@ -250,7 +472,7 @@ int main(void) {
                 },
             ], 4, 1, flags::has_bitfields).unwrap();
         let alias = types.get_typedef(&record, "BitsAlias", Datatype::hash_name("BitsAlias"), 0).unwrap();
-        let declarations = render_type_definitions(&[record, alias], RealTypeCtx::OFF);
+        let declarations = render_type_definitions(&[record, alias], &RealTypeCtx::OFF);
         let source = format!(r#"
 #include <assert.h>
 #include <stdint.h>
@@ -295,7 +517,7 @@ int main(void) {{
                 types.get_typedef(&long_long, "SourceLongLong", Datatype::hash_name("SourceLongLong"), 0).unwrap(),
                 types.get_typedef(&unsigned, "SourceUnsignedLong", Datatype::hash_name("SourceUnsignedLong"), 0).unwrap(),
             ];
-            let declarations = render_type_definitions(&aliases, RealTypeCtx::OFF);
+            let declarations = render_type_definitions(&aliases, &RealTypeCtx::OFF);
             let source = format!(r#"
 {declarations}
 _Static_assert(sizeof(SourceLong) == {long_size}, "long model width");

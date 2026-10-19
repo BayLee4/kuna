@@ -10,19 +10,25 @@ mod config_ir_regressions {
             "<maxinstruction>-1</maxinstruction>",
             "<maxinstruction><future>1</future></maxinstruction>",
             "<maxinstruction><param1>1</param1><param1>2</param1></maxinstruction>",
-            "<setlanguage>java-language</setlanguage>",
+            "<maxinstruction><param2>1</param2></maxinstruction>",
+            "<maxinstruction><param1>1</param1><futurechild>2</futurechild></maxinstruction>",
+            "<maxinstruction><param1>1</param1><param2>2</param2><param2>3</param2></maxinstruction>",
+            "<maxinstruction><param1>1</param1><param2>2</param2><param3>3</param3><param3>4</param3></maxinstruction>",
+            "<maxinstruction><param1>1<futurechild>2</futurechild></param1></maxinstruction>",
+            "<setlanguage>future_missing_language</setlanguage>",
         ] {
             let xml = format!("<optionslist><maxinstruction>777</maxinstruction>{invalid}\
-                <jumptablemax>512</jumptablemax></optionslist>");
+                <jumptablemax>512</jumptablemax><commentindent>29</commentindent></optionslist>");
             let manager = AddrSpaceManager::new();
             let mut registry = IdRegistry::with_base_ids();
             register_option_elements(&mut registry);
             let mut decoder = XmlDecode::new(&manager, &registry);
             decoder.ingest_stream(xml.as_bytes()).unwrap();
-            let mut context = RecordingContext::default();
+            let mut context = RecordingContext::c_lang();
             assert!(OptionDatabase::new().decode(&mut decoder, &mut context).is_err(), "{invalid}");
             assert_eq!(context.max_instructions, 777);
             assert_eq!(context.max_jumptable_size, 0);
+            assert!(context.log.is_empty(), "{invalid}: {:?}", context.log);
             OptionDatabase::new().set(&mut context, ELEM_MAXINSTRUCTION.get_id(), "23", "", "").unwrap();
             assert_eq!(context.max_instructions, 23);
         }
@@ -32,7 +38,7 @@ mod config_ir_regressions {
     fn lenient_decode_reports_known_application_errors_and_continues() {
         for invalid in [
             "<maxinstruction>-1</maxinstruction>",
-            "<setlanguage>java-language</setlanguage>",
+            "<setlanguage>future_missing_language</setlanguage>",
         ] {
             let xml = format!("<optionslist><maxinstruction>777</maxinstruction>{invalid}\
                 <jumptablemax>512</jumptablemax></optionslist>");
@@ -252,17 +258,20 @@ impl ArchOptionContext for RecordingContext {
         self.log.push(format!("warning[{name}]={val}"));
         true
     }
-    fn clone_action_group(&mut self, from: &str, to: &str) {
+    fn clone_action_group(&mut self, from: &str, to: &str) -> KunaResult<()> {
         self.log.push(format!("clone {from}->{to}"));
+        Ok(())
     }
-    fn set_current_action(&mut self, name: &str) {
+    fn set_current_action(&mut self, name: &str) -> KunaResult<()> {
         self.current_action = name.to_string();
+        Ok(())
     }
     fn current_action_name(&self) -> String {
         self.current_action.clone()
     }
-    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) {
+    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) -> KunaResult<()> {
         self.log.push(format!("toggle[{group}.{sub}]={val}"));
+        Ok(())
     }
     fn enable_rule(&mut self, path: &str) -> bool {
         self.log.push(format!("enable {path}"));
@@ -887,6 +896,11 @@ fn test_setlanguage() {
         "Decompiler produces c-language"
     );
     assert!(g.log.iter().any(|s| s == "language=c-language"));
+    assert_eq!(
+        apply_named(&mut g, "setlanguage", "java-language", "", "").unwrap(),
+        "Decompiler produces java-language"
+    );
+    assert!(g.log.iter().any(|s| s == "language=java-language"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,10 +1158,12 @@ fn test_decode_optionslist() {
     //   - <readonly> with bare content "on"  (no <param1>: content is param1)
     //   - <jumptablemax><param1>512</param1></jumptablemax>
     //   - <extrapop><param1>8</param1><param2>myfunc</param2></extrapop>
+    //   - <currentaction> with all three ordered parameter children
     let xml = br#"<optionslist>
   <readonly>on</readonly>
   <jumptablemax><param1>512</param1></jumptablemax>
   <extrapop><param1>8</param1><param2>myfunc</param2></extrapop>
+  <currentaction><param1>decompile</param1><param2>deadcode</param2><param3>on</param3></currentaction>
 </optionslist>"#;
 
     let manager = AddrSpaceManager::new();
@@ -1167,6 +1183,9 @@ fn test_decode_optionslist() {
     assert_eq!(g.max_jumptable_size, 512);
     // extrapop 8 for function myfunc
     assert!(g.log.iter().any(|s| s == "fn_extrapop[myfunc]=8"));
+    // All three ordered parameter leaves are valid.
+    assert_eq!(g.current_action, "decompile");
+    assert!(g.log.iter().any(|s| s == "toggle[decompile.deadcode]=true"));
 }
 
 #[test]
@@ -1223,6 +1242,50 @@ fn the_element_list_and_the_dispatch_map_register_the_same_options() {
     let dispatched: BTreeMap<uint4, &str> =
         db.optionmap.iter().map(|(id, opt)| (*id, opt.get_name())).collect();
     let listed: BTreeMap<uint4, &str> =
-        UPSTREAM_OPTION_ELEMENTS.iter().map(|e| (e.get_id(), e.get_name())).collect();
+        UPSTREAM_OPTION_ELEMENTS.iter().chain(std::iter::once(&ELEM_EXPORTINLINE))
+            .map(|e| (e.get_id(), e.get_name())).collect();
     assert_eq!(dispatched, listed);
+}
+
+#[test]
+fn native_known_option_failure_preserves_prefix_and_recovers() {
+    let manager = AddrSpaceManager::new();
+    let mut registry = IdRegistry::with_base_ids();
+    register_option_elements(&mut registry);
+    let db = OptionDatabase::new();
+    let mut context = RecordingContext::default();
+    let mut decoder = XmlDecode::new(&manager, &registry);
+    decoder.ingest_stream(br#"<optionslist><maxinstruction>177</maxinstruction><readonly>invalid</readonly><maxinstruction>999</maxinstruction></optionslist>"#).unwrap();
+    assert!(db.decode_native(&mut decoder, &mut context).is_err());
+    assert_eq!(context.max_instructions, 177, "later options must not run after a known error");
+    let mut decoder = XmlDecode::new(&manager, &registry);
+    decoder.ingest_stream(br#"<optionslist><readonly>on</readonly><notarealoption><param1>x</param1></notarealoption><maxinstruction>199</maxinstruction></optionslist>"#).unwrap();
+    let warnings = db.decode_native(&mut decoder, &mut context).unwrap();
+    assert_eq!(warnings.len(), 1);
+    assert!(context.readonly_propagate);
+    assert_eq!(context.max_instructions, 199);
+}
+
+#[test]
+fn native_known_option_rejects_noncanonical_parameter_shape() {
+    let manager = AddrSpaceManager::new();
+    let mut registry = IdRegistry::with_base_ids();
+    register_option_elements(&mut registry);
+    let db = OptionDatabase::new();
+    for invalid in [
+        "<readonly><param2>on</param2></readonly>",
+        "<readonly><param1>on</param1><param1>off</param1></readonly>",
+        "<readonly><param1>on<futurechild>x</futurechild></param1></readonly>",
+        "<readonly><param1>on</param1><param2/><param3/><futurechild/></readonly>",
+    ] {
+        let xml = format!("<optionslist><maxinstruction>177</maxinstruction>{invalid}\
+            <maxinstruction>999</maxinstruction><commentindent>29</commentindent></optionslist>");
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(xml.as_bytes()).unwrap();
+        let mut context = RecordingContext::c_lang();
+        assert!(db.decode_native(&mut decoder, &mut context).is_err(), "{invalid}");
+        assert!(!context.readonly_propagate);
+        assert_eq!(context.max_instructions, 177);
+        assert!(context.log.is_empty(), "{invalid}: {:?}", context.log);
+    }
 }

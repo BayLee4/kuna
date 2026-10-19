@@ -209,6 +209,39 @@ callback_execution!(fixed_callback_preserves_argument_at_o0_o2, "invoke_fixed", 
 callback_execution!(variadic_callback_preserves_tail_at_o0_o2, "invoke_variadic", "int tail_provider(int x, ...) { __builtin_va_list ap; int tail; __builtin_va_start(ap,x); tail = __builtin_va_arg(ap,int); __builtin_va_end(ap); return x + tail; } int main(void) { return invoke_variadic(target_variadic, 41) != 44 || invoke_variadic(target_variadic, 99) != 102 || invoke_variadic(tail_provider, 41) != 44 || invoke_variadic(tail_provider, 99) != 102; }");
 
 #[test]
+fn old_style_definition_keeps_known_formals_and_values() {
+    let source = fixtures().join("dwarf_declarations.c");
+    for standard in ["c89", "c11"] {
+        let fixture = producer::compile_dwarf(&source, standard, &[]);
+        for cppproto in [false, true] {
+            let program = boot_with_cppproto(&fixture.path, cppproto);
+            let entry = program.function_entries_canonical().into_iter()
+                .find(|entry| entry.name == "target_open").unwrap();
+            let prototype = program.arch().symboltab
+                .function_source_proto_across_scopes(&entry.addr).unwrap();
+            assert!(prototype.is_input_locked(), "the actual definition owns its formals");
+            let parameter = prototype.get_param(0).unwrap();
+            assert_eq!(parameter.get_name(), "x");
+            assert_eq!(parameter.get_type().unwrap().get_size(), 4);
+            let body = emitted(program, "target_open");
+            kuna_harness::c_behavior::assert_c_parameters(
+                &body, "target_open", &["x"], "int (*)(int)",
+            );
+            execute_c(fixture.path.parent().unwrap(), &body, &source, "target_open", r#"
+#include <limits.h>
+int main(void) {
+    const int values[] = { INT_MIN, -99, -1, 0, 1, 41, 99, INT_MAX - 1 };
+    for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); ++i)
+        if (target_open(values[i]) != retained_source_target_open(values[i]))
+            return 1;
+    return 0;
+}
+"#, &[]);
+        }
+    }
+}
+
+#[test]
 fn cpp_absent_prototyped_is_closed_and_declared_conventions_survive() {
     if !callable_child("cpp_absent_prototyped_is_closed_and_declared_conventions_survive") { return; }
     let fixture = producer::compile_dwarf(&fixtures().join("dwarf_callback_conventions.cpp"), "c++11", &["--target=i686-w64-windows-gnu"]);
@@ -359,6 +392,65 @@ fn typed_globals_keep_callback_array_extent_and_top_level_volatility() {
     let callback = database.symbol(ids[0]).dtype.as_ref().unwrap();
     assert_eq!(callback.get_name(), "Fixed");
     assert_eq!(callback.get_ptr_to().unwrap().get_metatype(), type_metatype::TYPE_CODE);
+}
+
+#[test]
+fn dwarf_data_authority_is_independent_of_datasyms_and_preserves_user_mappings() {
+    if !callable_child("dwarf_data_authority_is_independent_of_datasyms_and_preserves_user_mappings") {
+        return;
+    }
+    let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
+    let source = boot(&fixture.path);
+    let database = &source.arch().symboltab;
+    let global = database.get_global_scope().unwrap();
+    let symbol = database.symbol(database.query_by_name(global, "callback_global")[0]);
+    let storage = database.entry(symbol.scope, symbol.mapentry[0]);
+    let offset = storage.addr.get_offset();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let specs = vec![root.join("specs").to_str().unwrap().to_string()];
+    for dwarf in [false, true] {
+        for datasyms in [false, true] {
+            let mut program = bootstrap_from_object(fixture.path.to_str().unwrap(), "", &specs).unwrap();
+            program.arch_mut().analysis_dwarf = dwarf;
+            program.arch_mut().analysis_datasyms = datasyms;
+            program.commit_pending_analysis().unwrap();
+            let arch = program.arch();
+            let address = kuna_base::address::Address::new(
+                arch.manage().get_default_data_space().unwrap().clone(), offset,
+            );
+            let global = arch.symboltab.get_global_scope().unwrap();
+            let mapped = arch.symboltab.find_container(
+                global, &address, 1, &kuna_base::address::Address::new_invalid(),
+            );
+            assert_eq!(mapped.is_some(), dwarf || datasyms, "dwarf={dwarf} datasyms={datasyms}");
+            let declarations = arch.symboltab.query_by_name(global, "callback_global");
+            if dwarf {
+                assert_eq!(declarations.len(), 1);
+                let declared = arch.symboltab.symbol(declarations[0]);
+                assert_ne!(declared.flags & varnode_flags::typelock, 0);
+                let callback = declared.dtype.as_ref().unwrap();
+                assert_eq!(callback.get_name(), "Fixed");
+                assert_eq!(callback.get_ptr_to().unwrap().get_metatype(), type_metatype::TYPE_CODE);
+            }
+        }
+    }
+    let mut program = bootstrap_from_object(fixture.path.to_str().unwrap(), "", &specs).unwrap();
+    let address = kuna_base::address::Address::new(
+        program.arch().manage().get_default_data_space().unwrap().clone(), offset + 1,
+    );
+    let user_type = program.arch().types().get_base(1, type_metatype::TYPE_UINT).unwrap();
+    let global = program.arch().symboltab.get_global_scope().unwrap();
+    let (sid, _) = program.arch_mut().symboltab.add_symbol_mapped(
+        global, "analyst_object", user_type.clone(), &address,
+        &kuna_base::address::Address::new_invalid(),
+    ).unwrap();
+    program.arch_mut().symboltab.set_attribute(sid, varnode_flags::typelock | varnode_flags::namelock);
+    program.commit_pending_analysis().unwrap();
+    let database = &program.arch().symboltab;
+    assert_eq!(database.query_by_name(global, "analyst_object"), [sid]);
+    assert!(std::rc::Rc::ptr_eq(database.symbol(sid).dtype.as_ref().unwrap(), &user_type));
+    assert!(database.query_by_name(global, "callback_global").is_empty(),
+        "a debug declaration must not overlap an analyst mapping inside its extent");
 }
 
 #[test]

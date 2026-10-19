@@ -2,9 +2,8 @@
 # Ghidra GUI <-> decompiler stdin/stdout protocol; upstream's `decompile`
 # binary, built from ghidra_process.cc / ghidra_arch.cc).
 #
-# Phase 1 (see docs/ghidra-integration.md): wire-protocol complete, engine
-# stubbed.  Deliberately does NOT depend on kuna-decomp — the engine bridge
-# (Funcdata encode, ScopeGhidra, TypeFactoryGhidra, ...) is phase 2.
+# The engine bridge uses kuna-decomp with wire-backed source/type providers.
+# Protocol, lifecycle and result publication: docs/ghidra-integration.md.
 
 [package]
 autotests = false
@@ -39,6 +38,7 @@ kuna-decomp.workspace = true
 # nothing depends on kuna-ghidra, and dev-deps do not propagate.
 kuna-console.workspace = true
 kuna-analysis.workspace = true
+kuna-harness = { path = "../kuna-harness" }
 
 [lints]
 workspace = true

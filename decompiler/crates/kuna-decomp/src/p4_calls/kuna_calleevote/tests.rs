@@ -38,6 +38,7 @@ fn record(name: &str) -> Rc<Datatype> {
 /// it for a closed getter.
 fn lone(name: &str) -> Rc<Datatype> {
     let mut t = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+    t.flags |= flags::kuna_synthesized;
     t.name = name.to_string();
     t.kind = DatatypeKind::Struct {
         field: vec![crate::dtype::TypeField {
@@ -56,6 +57,7 @@ fn lone(name: &str) -> Rc<Datatype> {
 /// at 0.
 fn headless(name: &str) -> Rc<Datatype> {
     let mut t = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+    t.flags |= flags::kuna_synthesized;
     t.name = name.to_string();
     let field = |offset: int4| crate::dtype::TypeField {
         ident: offset,

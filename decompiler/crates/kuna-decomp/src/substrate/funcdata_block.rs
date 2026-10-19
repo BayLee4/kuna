@@ -780,7 +780,7 @@ impl Funcdata {
                 .expect("opZeroMulti: MULTIEQUAL with no output");
             let sz = self.vbank().get(out).expect("opZeroMulti: stale out").get_size();
             let m = self.vbank().get(out).expect("opZeroMulti: stale out").get_addr().clone();
-            let nv = self.new_varnode(sz, &m, None);
+            let nv = self.new_varnode(sz, &m, None)?;
             self.op_insert_input(op, nv, 0)?;
             let in0 = self.obank().get(op).expect("opZeroMulti: stale op").get_in(0).expect("opZeroMulti: just-inserted in0");
             self.set_input_varnode(in0)?;
@@ -1100,7 +1100,7 @@ impl Funcdata {
         // No decision left.
         if self.bblocks_ref().block(bb).size_out() == 2 {
             if let Some(lastop) = self.bb_op_tail(bb) {
-                self.op_destroy(lastop);
+                self.op_destroy(lastop)?;
             }
         }
         let bbout = self.bblocks_ref().block(bb).get_out(num);
@@ -1128,7 +1128,7 @@ impl Funcdata {
     /// Build a replacement Varnode for `origvn` (C++ `Funcdata::createReplaceVarnode`,
     /// `funcdata_block.cc:86`).  Used by [`Funcdata::push_multiequals`] when a
     /// MULTIEQUAL output is read beyond the block being removed.
-    fn create_replace_varnode(&mut self, origvn: VarnodeId, make_unique: bool) -> VarnodeId {
+    fn create_replace_varnode(&mut self, origvn: VarnodeId, make_unique: bool) -> KunaResult<VarnodeId> {
         let (sz, ty) = {
             let v = self.vbank().get(origvn).expect("createReplaceVarnode: stale origvn");
             (v.get_size(), v.get_type().clone())
@@ -1137,13 +1137,13 @@ impl Funcdata {
             self.new_unique(sz, Some(ty))
         } else {
             let m = self.vbank().get(origvn).expect("createReplaceVarnode: stale origvn").get_addr().clone();
-            self.new_varnode(sz, &m, Some(ty))
+            self.new_varnode(sz, &m, Some(ty))?
         };
         if self.is_high_on() {
             self.vn_replace_in_high(origvn, replacevn);
             self.vbank_mut().get_mut(replacevn).expect("createReplaceVarnode").set_explicit();
         }
-        replacevn
+        Ok(replacevn)
     }
 
     /// Swap `origvn` with the freshly created `replacevn` between their high
@@ -1257,7 +1257,7 @@ impl Funcdata {
                 continue;
             }
             // Construct artificial MULTIEQUAL in outblock.
-            let replacevn = self.create_replace_varnode(origvn, neednewunique);
+            let replacevn = self.create_replace_varnode(origvn, neednewunique)?;
             let mut branches: Vec<VarnodeId> = Vec::new();
             let outblock_size_in = self.bblocks_ref().block(outblock).size_in();
             for i in 0..outblock_size_in {
@@ -1487,7 +1487,7 @@ impl Funcdata {
                 // Prune the call from the call-spec registry.
                 self.delete_call_specs(op);
             }
-            self.op_destroy(op); // No longer has descendants
+            self.op_destroy(op)?; // No longer has descendants
         }
         let graph = self.bblocks_root_pub();
         self.bblocks_mut().remove_block(graph, bb); // Remove the block altogether
@@ -2109,7 +2109,7 @@ impl Funcdata {
         if let Some(cmp) = head_cmp {
             if self.obank().get(cmp).is_some() {
                 let mut scratch: Vec<OpId> = Vec::new();
-                self.op_destroy_recursive(cmp, &mut scratch);
+                self.op_destroy_recursive(cmp, &mut scratch)?;
             }
         }
 
@@ -2122,7 +2122,7 @@ impl Funcdata {
             None => {
                 let swvn = match swvn {
                     Some(v) if self.vbank().get(v).is_some() => v,
-                    _ => self.new_varnode(var_size, &read_addr, None),
+                    _ => self.new_varnode(var_size, &read_addr, None)?,
                 };
                 let op = self.new_op(1, branch_addr.clone());
                 self.op_set_opcode_code(op, OpCode::CPUI_BRANCHIND);
@@ -2475,47 +2475,53 @@ impl Funcdata {
         visited: &crate::flow::VisitedMap,
         run_pipeline: &mut crate::flow::JtPipelineFn<'_>,
         shared: &mut Option<Funcdata>,
-    ) -> Result<Option<usize>, crate::jumptable::RecoveryMode> {
+    ) -> KunaResult<Result<Option<usize>, crate::jumptable::RecoveryMode>> {
         use crate::jumptable::RecoveryMode;
         // linkJumpTable: search for a pre-existing table.
         if let Some(idx) = self.link_jump_table(op) {
             let jt = self.get_jump_table(idx as int4);
             if !jt.is_override() && !jt.is_partial() && jt.num_entries() != 0 {
-                return Ok(Some(idx)); // Previously calculated, complete, non-override
+                return Ok(Ok(Some(idx))); // Previously calculated, complete, non-override
             }
             // Recover empty/override table.
             let mode =
-                self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared);
+                self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared)?;
             if mode != RecoveryMode::Success {
-                return Err(mode);
+                return Ok(Err(mode));
             }
             let addr = self.obank().get(op).unwrap().get_addr().clone();
             self.jumpvec_mut()[idx].set_indirect_op_addr(op, addr);
-            return Ok(Some(idx));
+            return Ok(Ok(Some(idx)));
         }
 
         if (self.flags() & crate::funcdata::funcdata_flags::jumptablerecovery_dont) != 0 {
-            return Ok(None); // Explicitly told not to recover
+            return Ok(Ok(None)); // Explicitly told not to recover
         }
         // earlyJumpTableFail.
         let early = self.early_jump_table_fail(op);
         if early != RecoveryMode::Success {
-            return Err(early);
+            return Ok(Err(early));
         }
         // Trial recovery into a fresh table appended to jumpvec.
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         let trial = crate::jumptable::JumpTable::new(addr);
         self.jumpvec_mut().push(trial);
         let idx = self.num_jump_tables() as usize - 1;
-        let mode = self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared);
+        let mode = match self.stage_jump_table(idx, op, record_loads, visited, run_pipeline, shared) {
+            Ok(mode) => mode,
+            Err(err) => {
+                self.jumpvec_mut().remove(idx);
+                return Err(err);
+            }
+        };
         if mode != RecoveryMode::Success {
             // Discard the trial table on failure.
             self.jumpvec_mut().remove(idx);
-            return Err(mode);
+            return Ok(Err(mode));
         }
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         self.jumpvec_mut()[idx].set_indirect_op_addr(op, addr);
-        Ok(Some(idx))
+        Ok(Ok(Some(idx)))
     }
 
     /// Run the reduced "jumptable" pipeline on a partial clone and recover the
@@ -2529,7 +2535,7 @@ impl Funcdata {
         visited: &crate::flow::VisitedMap,
         run_pipeline: &mut crate::flow::JtPipelineFn<'_>,
         shared: &mut Option<Funcdata>,
-    ) -> crate::jumptable::RecoveryMode {
+    ) -> KunaResult<crate::jumptable::RecoveryMode> {
         use crate::jumptable::RecoveryMode;
         self.jumpvec_mut()[jt_idx].increment_recovery_count();
 
@@ -2541,15 +2547,19 @@ impl Funcdata {
         if !share || shared.is_none() {
             let mut fresh = match self.build_jumptable_partial() {
                 Ok(p) => p,
-                Err(_) => return RecoveryMode::FailNormal,
+                Err(err) if err.is_lowlevel() => return Ok(RecoveryMode::FailNormal),
+                Err(err) => return Err(err),
             };
             // Mark the partial as a jump-table-recovery clone, then build its blocks
             // and run the reduced "jumptable" universalAction over it (C++
             // partial.truncatedFlow + allacts.setCurrent("jumptable") + perform).
             fresh.set_flag_raw(crate::funcdata::funcdata_flags::jumptablerecovery_on);
-            if run_pipeline(&mut fresh, visited).is_err() {
-                // C++ catches LowlevelError, warns, and returns fail_normal.
-                return RecoveryMode::FailNormal;
+            if let Err(err) = run_pipeline(&mut fresh, visited) {
+                if err.is_lowlevel() {
+                    // C++ catches LowlevelError; dead transport bypasses recovery.
+                    return Ok(RecoveryMode::FailNormal);
+                }
+                return Err(err);
             }
             if share {
                 *shared = Some(fresh);
@@ -2568,22 +2578,22 @@ impl Funcdata {
         let addr = self.obank().get(op).unwrap().get_addr().clone();
         let partop = match partial.obank().find_op(&seq) {
             Some(p) => p,
-            None => return RecoveryMode::FailNormal, // Bad partial clone
+            None => return Ok(RecoveryMode::FailNormal), // Bad partial clone
         };
         let partop_ok = partial.obank().get(partop).map(|o| {
             o.code() == OpCode::CPUI_BRANCHIND && *o.get_addr() == addr
         }).unwrap_or(false);
         if !partop_ok {
-            return RecoveryMode::FailNormal;
+            return Ok(RecoveryMode::FailNormal);
         }
         if partial.obank().get(partop).unwrap().is_dead() {
             // Indirect op eliminated as dead code (unreachable).
-            return RecoveryMode::Success;
+            return Ok(RecoveryMode::Success);
         }
         // testForReturnAddress on the partial's BRANCHIND input.
         let in0 = partial.obank().get(partop).unwrap().get_in(0).unwrap();
         if partial.test_for_return_address(in0) {
-            return RecoveryMode::FailReturn;
+            return Ok(RecoveryMode::FailReturn);
         }
 
         // Recover addresses into the table (clone the table out, recover, store).
@@ -2603,15 +2613,10 @@ impl Funcdata {
         jt.set_indirect_op_addr(op, addr);
         self.jumpvec_mut()[jt_idx] = jt;
         match res {
-            Ok(()) => RecoveryMode::Success,
-            Err(e) => {
-                // recoverAddresses throws JumptableThunkError as "Likely thunk".
-                if e.explain().contains("Likely thunk") {
-                    RecoveryMode::FailThunk
-                } else {
-                    RecoveryMode::FailNormal
-                }
-            }
+            Ok(()) => Ok(RecoveryMode::Success),
+            Err(KunaError::JumptableThunk { .. }) => Ok(RecoveryMode::FailThunk),
+            Err(err) if err.is_lowlevel() => Ok(RecoveryMode::FailNormal),
+            Err(err) => Err(err),
         }
     }
 
@@ -2630,6 +2635,11 @@ impl Funcdata {
             uniq_start,
             0,
         )?;
+        // This private invocation state is not carried by truncated_flow_clone.
+        // Ordinary source/jump recovery retains its original constructor path.
+        if self.kuna_export_working {
+            partial.acquire_export_working_proto(self.get_func_proto())?;
+        }
         // C++ `Funcdata` ctor calls `funcp.setScope(localmap, baseaddr-1)`, which
         // attaches the architecture's default prototype model when none is set
         // (fspec.cc:2785).  The merged tree defers model assignment to
@@ -3500,7 +3510,7 @@ impl Funcdata {
         // W3-op boundary is closed.
         if let Some(jumpop) = self.bb_op_tail(bl) {
             if self.obank().get(jumpop).expect("spliceBlockBasic").is_branch() {
-                self.op_destroy(jumpop);
+                self.op_destroy(jumpop)?;
             }
         }
 
@@ -4373,12 +4383,37 @@ mod tests {
                 Err(KunaError::lowlevel("unrecoverable switch expression"))
             };
             let mut shared = None;
-            let result = fd.recover_jump_table_flow(op, false, &VisitedMap::new(), &mut pipeline, &mut shared);
+            let result = fd.recover_jump_table_flow(op, false, &VisitedMap::new(), &mut pipeline, &mut shared).unwrap();
             assert!(matches!(result, Err(RecoveryMode::FailNormal)));
             assert_eq!(visits, 1, "the real partial pipeline must be reached");
             assert_eq!(fd.num_jump_tables(), 0);
             assert!(shared.is_none());
             assert!(fd.obank().get(op).is_some(), "caller flow remains available after recoverable failure");
+        }
+
+        #[test]
+        fn jumptable_terminal_pipeline_failure_is_not_a_recovery_mode() {
+            use crate::flow::VisitedMap;
+            use kuna_base::error::KunaError;
+            let mut fd = build_fd();
+            let pc = addr(&ramspace(&fd), 0x1000);
+            let op = fd.obank_mut().create_at(1, pc);
+            fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_BRANCHIND, pcodeop_flags::branch, "BRANCHIND"));
+            let target = fd.new_constant(8, 0x2000);
+            fd.op_set_input(op, target, 0).unwrap();
+            let expected = KunaError::transport("host closed during partial analysis");
+            let mut visits = 0;
+            let mut pipeline = |_: &mut Funcdata, _: &VisitedMap| {
+                visits += 1;
+                Err(expected.clone())
+            };
+            let mut shared = None;
+            let result = fd.recover_jump_table_flow(op, false, &VisitedMap::new(), &mut pipeline, &mut shared);
+            assert_eq!(result.unwrap_err(), expected);
+            assert_eq!(visits, 1);
+            assert_eq!(fd.num_jump_tables(), 0, "failed trial must be discarded");
+            assert!(shared.is_none());
+            assert!(fd.obank().get(op).is_some());
         }
     }
 
@@ -4769,7 +4804,7 @@ mod tests {
         let rs = ramspace(fd);
         let op = fd.new_op(1, pc);
         fd.op_set_opcode(op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
-        let outvn = fd.new_varnode(4, &addr(&rs, out_off), None);
+        let outvn = fd.new_varnode(4, &addr(&rs, out_off), None).unwrap();
         fd.op_set_output(op, outvn).unwrap();
         fd.obank_mut().mark_alive(op);
         fd.bb_insert_op(op, bb, None);
@@ -4864,7 +4899,7 @@ mod tests {
         let v_pred = fd.obank().get(c_pred).unwrap().get_out().unwrap(); // DIFFERENT value
         let mq = fd.new_op(2, addr(&rs, 0x7000));
         fd.op_set_opcode(mq, crate::typeop::type_op_for(OpCode::CPUI_MULTIEQUAL));
-        let mq_out = fd.new_varnode(4, &addr(&rs, 0xd0), None);
+        let mq_out = fd.new_varnode(4, &addr(&rs, 0xd0), None).unwrap();
         fd.op_set_output(mq, mq_out).unwrap();
         fd.op_set_input(mq, v_bb, in_bb).unwrap();
         fd.op_set_input(mq, v_pred, in_pred).unwrap();
@@ -4920,7 +4955,7 @@ mod tests {
         let in1 = fd.bblocks_ref().block(ret).get_in_index(p1);
         let mq = fd.new_op(2, addr(&rs, 0x8000));
         fd.op_set_opcode(mq, crate::typeop::type_op_for(OpCode::CPUI_MULTIEQUAL));
-        let mq_out = fd.new_varnode(4, &addr(&rs, 0x50), None);
+        let mq_out = fd.new_varnode(4, &addr(&rs, 0x50), None).unwrap();
         fd.op_set_output(mq, mq_out).unwrap();
         fd.op_set_input(mq, v0, in0).unwrap();
         fd.op_set_input(mq, v1, in1).unwrap();
@@ -5015,7 +5050,7 @@ mod tests {
         let in1 = fd.bblocks_ref().block(ret).get_in_index(p1);
         let mq = fd.new_op(2, addr(&rs, 0x9000));
         fd.op_set_opcode(mq, crate::typeop::type_op_for(OpCode::CPUI_MULTIEQUAL));
-        let m = fd.new_varnode(4, &addr(&rs, 0x70), None);
+        let m = fd.new_varnode(4, &addr(&rs, 0x70), None).unwrap();
         fd.op_set_output(mq, m).unwrap();
         fd.op_set_input(mq, v0, in0).unwrap();
         fd.op_set_input(mq, v1, in1).unwrap();
@@ -5024,7 +5059,7 @@ mod tests {
 
         let add = fd.new_op(2, addr(&rs, 0x9004));
         fd.op_set_opcode(add, crate::typeop::type_op_for(OpCode::CPUI_INT_ADD));
-        let t = fd.new_varnode(4, &addr(&rs, 0x78), None);
+        let t = fd.new_varnode(4, &addr(&rs, 0x78), None).unwrap();
         fd.op_set_output(add, t).unwrap();
         let k7 = fd.new_constant(4, 7);
         fd.op_set_input(add, m, 0).unwrap();
@@ -5084,7 +5119,7 @@ mod tests {
         let make_phi = |fd: &mut Funcdata, out_off: u64| {
             let mq = fd.new_op(2, addr(&rs, 0x8000));
             fd.op_set_opcode(mq, crate::typeop::type_op_for(OpCode::CPUI_MULTIEQUAL));
-            let out = fd.new_varnode(4, &addr(&rs, out_off), None);
+            let out = fd.new_varnode(4, &addr(&rs, out_off), None).unwrap();
             fd.op_set_output(mq, out).unwrap();
             fd.op_set_input(mq, v0, in0).unwrap();
             fd.op_set_input(mq, v1, in1).unwrap();
@@ -5097,7 +5132,7 @@ mod tests {
         let phi_head = make_phi(&mut fd, 0x50);
         let add = fd.new_op(2, addr(&rs, 0x8000));
         fd.op_set_opcode(add, crate::typeop::type_op_for(OpCode::CPUI_INT_ADD));
-        let add_out = fd.new_varnode(4, &addr(&rs, 0x58), None);
+        let add_out = fd.new_varnode(4, &addr(&rs, 0x58), None).unwrap();
         fd.op_set_output(add, add_out).unwrap();
         fd.op_set_input(add, v0, 0).unwrap();
         let k = fd.new_constant(4, 4);

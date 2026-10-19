@@ -54,5 +54,5 @@
 </script>
 <stringmatch name="EVALCURRENTPROTO #1: off, the __stdcall default model sees only the stack argument" min="1" max="1">int4 fc\(int4 a0\)</stringmatch>
 <stringmatch name="EVALCURRENTPROTO #2: off, the ECX argument survives as an undefined local" min="1" max="1">// ecx</stringmatch>
-<stringmatch name="EVALCURRENTPROTO #3: default, the spec's merged model resolves to __fastcall and recovers all three arguments" min="1" max="1">int4 fc\(int4 a0,int4 a1,int4 a2\)</stringmatch>
+<stringmatch name="EVALCURRENTPROTO #3: default, the spec's merged model resolves to __fastcall and recovers all three arguments" min="1" max="1">int4 __fastcall fc\(int4 a0,int4 a1,int4 a2\)</stringmatch>
 </decompilertest>

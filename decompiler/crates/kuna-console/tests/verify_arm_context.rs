@@ -61,7 +61,7 @@ fn explicit_isa_preserves_backward_inventory_callee_modes() {
                 let file = object::File::parse(&*bytes).unwrap();
                 for _ in 0..2 {
                     seeds.reverse();
-                    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds);
+                    let index = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap();
                     let outgoing: Vec<_> = index.refs_from_function(0x1680).into_iter()
                         .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
                     assert_eq!(outgoing, vec![(0x1684, 0x1300)]);
@@ -93,7 +93,7 @@ fn ordinary_aif_does_not_publish_unreachable_interworking_modes() {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             for _ in 0..2 {
-                let index = xrefs::build_with_focus(&file, prog.arch(), prog.arch().translate(), &[0x1000], &[0x1700]);
+                let index = xrefs::build_with_focus(&file, prog.arch(), prog.arch().translate(), &[0x1000], &[0x1700]).unwrap();
                 let calls: Vec<_> = index.refs_from_function(0x1700).into_iter()
                     .filter(|r| r.kind == XrefKind::Call).map(|r| (r.from, r.to)).collect();
                 assert_eq!(calls, vec![(0x1704, 0x1100)]);
@@ -128,7 +128,7 @@ fn ordinary_decompilation_preserves_a_backward_blx_callers_mode() {
                         let space = prog.arch().manage().get_default_code_space().unwrap().clone();
                         for iteration in 0..2 {
                             let entry = prog.resolve_address(&Address::new(space.clone(), 0x1600)).unwrap();
-                            let result = decompile_entry(&mut prog, entry, &DecompileOptions::default());
+                            let result = decompile_entry(&mut prog, entry, &DecompileOptions::default()).unwrap();
                             assert!(result.error.is_none(), "{:?}", result.error);
                             let code = result.code.unwrap();
                             assert!(code.contains("sub_1380(") && !code.lines().any(|line| line.trim_start().starts_with('*')),
@@ -197,7 +197,7 @@ fn recovered_xrefs_leave_unclaimed_modes_and_later_c_unchanged() {
                     prog.arch().translate(),
                     &[0x1000],
                     &[],
-                );
+                ).unwrap();
                 assert!(index
                     .refs_from_function(0x1680)
                     .iter()
@@ -219,7 +219,7 @@ fn recovered_xrefs_leave_unclaimed_modes_and_later_c_unchanged() {
                     );
                 }
                 let entry = prog.resolve_address(&Address::new(space, 0x1750)).unwrap();
-                let result = decompile_entry(&mut prog, entry, &DecompileOptions::default());
+                let result = decompile_entry(&mut prog, entry, &DecompileOptions::default()).unwrap();
                 assert!(result.error.is_none(), "{:?}", result.error);
                 let code = result.code.unwrap();
                 assert!(
@@ -265,7 +265,7 @@ fn queued_thumb_callee_keeps_its_distant_block_across_an_arm_seed() {
                 prog.arch().translate(),
                 &[0x1000, 0x1600],
                 &[],
-            );
+            ).unwrap();
             let calls: Vec<_> = index
                 .refs_to(0x1200)
                 .iter()
@@ -325,7 +325,7 @@ fn generated_graphs_preserve_calls_modes_and_c_across_layouts_and_reuse() {
                         let unrelated =
                             fresh.resolve_address(&Address::new(space, 0x1b00)).unwrap();
                         let baseline =
-                            decompile_entry(&mut fresh, unrelated, &DecompileOptions::default());
+                            decompile_entry(&mut fresh, unrelated, &DecompileOptions::default()).unwrap();
                         assert!(baseline.error.is_none(), "{:?}", baseline.error);
                         let baseline = baseline.code.unwrap();
                         // Initial Listing interworking follows the separate flowmode policy.
@@ -382,7 +382,7 @@ fn generated_graphs_preserve_calls_modes_and_c_across_layouts_and_reuse() {
                                         prog.arch().translate(),
                                         &seeds,
                                         &focus,
-                                    );
+                                    ).unwrap();
                                     let mut calls: Vec<_> = (0x1000..0x2400)
                                         .flat_map(|at| index.refs_from_instruction(at))
                                         .filter(|r| r.kind == XrefKind::Call)
@@ -423,7 +423,7 @@ fn generated_graphs_preserve_calls_modes_and_c_across_layouts_and_reuse() {
                                 let entry =
                                     prog.resolve_address(&Address::new(space, 0x1b00)).unwrap();
                                 let result =
-                                    decompile_entry(&mut prog, entry, &DecompileOptions::default());
+                                    decompile_entry(&mut prog, entry, &DecompileOptions::default()).unwrap();
                                 assert!(result.error.is_none(), "{label}: {:?}", result.error);
                                 let code = result.code.unwrap();
                                 assert_eq!(code, baseline, "{label}: unrelated C changed");
@@ -489,7 +489,7 @@ fn failed_callee_decodes_preserve_context_values_boundaries_and_write_policy() {
                 prog.arch(),
                 prog.arch().translate(),
                 &[0x1000, 0x1600],
-            );
+            ).unwrap();
             assert_eq!(
                 index.function_instruction_counts(&[0x1580], 100),
                 [0],

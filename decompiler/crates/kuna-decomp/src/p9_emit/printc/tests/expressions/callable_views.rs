@@ -1,6 +1,60 @@
 use super::*;
 use crate::dtype::DatatypeKind;
 
+#[test]
+fn callable_target_borrows_only_complete_authored_site_contracts() {
+    use crate::fspec::FuncCallSpecs;
+
+    for kind in ["authored", "inferred", "locked", "input_open", "output_open", "wrong_arity"] {
+        for generic_code in [false, true] {
+            let mut fd = build_fd();
+            let types = callable_types();
+            let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let code = declared_code(&types, &fd, integer.clone(), vec![integer], false);
+            let mut signature = code.get_code_prototype().unwrap().as_ref().clone();
+            assert!(signature.logical_pieces().is_some(),
+                "logical pieces also exist on inferred generated Code");
+            let target_type = types.get_type_pointer(8, if generic_code {
+                types.get_type_code().unwrap()
+            } else { types.get_type_void().unwrap() }, 1).unwrap();
+            fd.set_high_level();
+            let target = execution_input(&mut fd, "callback", target_type.clone());
+            let call = mk_op(&mut fd, if kind == "wrong_arity" { 1 } else { 2 }, 0x1000, OpCode::CPUI_CALLIND);
+            fd.op_set_input(call, target, 0).unwrap();
+            if kind != "wrong_arity" {
+                let argument = fd.new_constant(4, 7);
+                fd.op_set_input(call, argument, 1).unwrap();
+            }
+            let site = fd.obank().get(call).unwrap().get_addr().clone();
+            if kind == "inferred" {
+                fd.get_override_mut().insert_inferred_proto_override(site, 0, Box::new(signature.clone()));
+                signature.set_override(true);
+            } else if kind != "locked" {
+                fd.get_override_mut().insert_proto_override(site, Box::new(signature.clone()));
+                signature.set_override(true);
+            }
+            if kind == "input_open" { signature.set_input_lock(false); }
+            if kind == "output_open" { signature.set_output_lock(false); }
+            let mut specs = FuncCallSpecs::new(call, Address::new_invalid());
+            specs.proto_mut().copy(&signature);
+            fd.push_call_specs(specs);
+            for native in [false, true, false] {
+                let mut arch = bare_arch();
+                arch.ctypes = native;
+                let mut print = execution_printer(&arch, false);
+                print.push_callable_target_ir(&fd, &arch, target, call, Some(fd.get_call_specs(0).proto()), None).unwrap();
+                print.recurse();
+                let text = print.emit_mut().output_str();
+                let authored = !matches!(kind, "inferred" | "locked");
+                assert_eq!(text.contains("(*)"), authored && (!generic_code || native),
+                    "{kind}, generic_code={generic_code}, ctypes={native}: {text}");
+                assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(target));
+                assert!(Rc::ptr_eq(fd.vbank().get(target).unwrap().get_type(), &target_type));
+            }
+        }
+    }
+}
+
 fn apply_display_authority(proto: &mut crate::fspec::FuncProto, fd: &Funcdata,
     types: &TypeFactoryImpl, ty: &Rc<Datatype>, authority: &str) {
     use crate::fspec::{parameter_pieces_flags as pf, ParameterPieces, PrototypePieces};
@@ -101,7 +155,7 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
                 fd.vbank_mut().get_mut(value).unwrap().set_implied();
                 value
             } else {
-                let value = fd.new_varnode(source_type.get_size(), &source_address, Some(source_type.clone()));
+                let value = fd.new_varnode(source_type.get_size(), &source_address, Some(source_type.clone())).unwrap();
                 fd.set_input_varnode(value).unwrap()
             };
             let mut model = ProtoModel::new(fd.get_arch().manage());
@@ -145,7 +199,7 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
                 arch.ctypes = native;
                 arch.types_impl().setup_sizes(Some(4), 8, 8);
                 let mut print = execution_printer(&arch, false);
-                print.op_type_cast_ir(&fd, &arch, cast);
+                print.op_type_cast_ir(&fd, &arch, cast).unwrap();
                 let text = print.emit_mut().output_str();
                 assert!(text.contains(if native { "int" } else { "int4" }) && text.contains("(*)"),
                     "explicit signature erased for {source_kind}: {text}");
@@ -161,6 +215,102 @@ fn callable_dialect_cast_preserves_explicit_semantic_declaration() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn generic_numeric_transfer_keeps_code_identity_and_refuses_other_domains() {
+    use crate::fspec::FuncProto;
+    for kind in [
+        "transfer", "inferred", "legacy", "nocasts", "zero", "nonconstant",
+        "ordinary_reader", "argument", "arguments", "result", "width_mismatch",
+        "explicit_space", "truncated", "word_addressed", "pointer_alias",
+        "pointer_qualified", "code_alias", "code_qualified", "source_full", "authored",
+    ] {
+        let mut fd = build_fd();
+        let types = callable_types();
+        let code = types.get_type_code().unwrap();
+        assert!(code.get_code_prototype().is_none());
+        let pointee = match kind {
+            "source_full" => declared_code(&types, &fd, types.get_type_void().unwrap(), vec![], false),
+            "code_alias" => types.get_typedef(&code, "OpaqueCode", 0, 0).unwrap(),
+            "code_qualified" => types.get_qualified_type(code.clone(), crate::kuna_typequal::CONST).unwrap(),
+            _ => code.clone(),
+        };
+        let pointer = if kind == "explicit_space" {
+            types.get_type_pointer_with_space(pointee, ram(&fd), "").unwrap()
+        } else {
+            types.get_type_pointer(8, pointee, 1).unwrap()
+        };
+        let pointer = match kind {
+            "truncated" | "word_addressed" => {
+                let mut supplied = (*pointer).clone();
+                if let DatatypeKind::Pointer { truncate, wordsize, .. } = &mut supplied.kind {
+                    if kind == "truncated" {
+                        *truncate = Some(types.get_type_pointer(4, code.clone(), 1).unwrap());
+                    } else {
+                        *wordsize = 2;
+                    }
+                }
+                Rc::new(supplied)
+            }
+            "pointer_alias" => types.get_typedef(&pointer, "OpaqueCallback", 0, 0).unwrap(),
+            "pointer_qualified" => types.get_qualified_type(pointer, crate::kuna_typequal::CONST).unwrap(),
+            _ => pointer,
+        };
+        let value = if kind == "nonconstant" {
+            fd.new_unique(8, Some(pointer.clone()))
+        } else {
+            fd.new_constant(if kind == "width_mismatch" { 4 } else { 8 },
+                if kind == "zero" { 0 } else { 0x200000 })
+        };
+        fd.vn_update_type(value, pointer.clone());
+        let slot = int4::from(kind == "argument");
+        let reader = mk_op(&mut fd, if slot == 1 || kind == "arguments" { 2 } else { 1 }, 0x1000,
+            if kind == "ordinary_reader" { OpCode::CPUI_COPY } else { OpCode::CPUI_CALLIND });
+        let other = fd.new_constant(8, 7);
+        fd.op_set_input(reader, other, 0).unwrap();
+        if slot == 1 || kind == "arguments" {
+            fd.op_set_input(reader, other, 1).unwrap();
+        }
+        fd.op_set_input(reader, value, slot).unwrap();
+        if kind == "result" {
+            let result = fd.new_unique(4, Some(types.get_base(4, type_metatype::TYPE_INT).unwrap()));
+            fd.op_set_output(reader, result).unwrap();
+        }
+        let site = fd.obank().get(reader).unwrap().get_addr().clone();
+        if kind == "authored" {
+            fd.get_override_mut().insert_proto_override(site, Box::new(FuncProto::new()));
+        } else if kind == "inferred" {
+            fd.get_override_mut().insert_inferred_proto_override(site, 0, Box::new(FuncProto::new()));
+        }
+        let mut arch = bare_arch();
+        arch.ctypes = kind != "legacy";
+        let mut print = execution_printer(&arch, false);
+        print.set_no_cast_printing(kind == "nocasts");
+        let spelling = print.generic_numeric_callable_type(&fd, value, reader, &pointer);
+        if matches!(kind, "transfer" | "inferred") {
+            let spelling = spelling.expect("generic zero-argument transfer needs one callable conversion");
+            assert_eq!(format!("{}{}", spelling.front, spelling.back), "void (*)()");
+            assert_eq!(spelling.front_types.len(), 1);
+            assert!(Rc::ptr_eq(&spelling.front_types[0].datatype, &code));
+            assert!(spelling.back_types.is_empty());
+            print.push_vn_explicit_ir(&fd, &arch, value, reader).unwrap();
+            print.recurse();
+            let text = print.emit_mut().output_str();
+            assert_eq!(text, "(void (*)())0x200000");
+            assert_c_source(&format!(r#"
+_Static_assert(_Generic({text}, void (*)(): 1, default: 0),
+               "the numeric expression remains a callable C type");
+int main(void) {{ return 0; }}
+"#), &format!("generic-numeric-{kind}"));
+        } else {
+            assert!(spelling.is_none(), "generic numeric projection admitted {kind}");
+        }
+        assert!(Rc::ptr_eq(fd.vbank().get(value).unwrap().get_type(), &pointer));
+        assert_eq!(fd.vbank().get(value).unwrap().get_def(), None);
+        assert_eq!(fd.obank().get(reader).unwrap().get_in(slot), Some(value));
+        assert_eq!(fd.vbank().get(value).unwrap().is_constant(), kind != "nonconstant");
     }
 }
 
@@ -227,7 +377,7 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
             arch.ctypes = native;
             let mut print = execution_printer(&arch, false);
             print.options.null = kind == "null";
-            print.push_vn_explicit_ir(&fd, &arch, value, reader);
+            print.push_vn_explicit_ir(&fd, &arch, value, reader).unwrap();
             print.recurse();
             let text = print.emit_mut().output_str();
             if kind == "null" { assert_eq!(text, "NULL"); }
@@ -280,7 +430,7 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
             let address = Address::new(ram(&fd), 0x400);
             let table = fd.new_varnode(8, &address, Some(if case == "declared_void" {
                 code_table.clone()
-            } else { declaration.clone() }));
+            } else { declaration.clone() })).unwrap();
             let table = fd.set_input_varnode(table).unwrap();
             let mut model = ProtoModel::new(fd.get_arch().manage());
             model.build_param_list("standard").unwrap();
@@ -381,13 +531,13 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
             for native in [false, true, false] {
                 arch.ctypes = native;
                 let mut plain = execution_printer(&arch, false);
-                plain.op_type_cast_ir(&fd, &arch, cast);
+                plain.op_type_cast_ir(&fd, &arch, cast).unwrap();
                 let text = plain.emit_mut().output_str().to_string();
                 let mut print = PrintC::new();
-                print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C);
+                print.rt_ctx = RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention);
                 print.set_markup(true);
                 print.emit_mut().set_capture_tokens(true);
-                print.op_type_cast_ir(&fd, &arch, cast);
+                print.op_type_cast_ir(&fd, &arch, cast).unwrap();
                 let tokens = print.emit_mut().take_markup_tokens();
                 let presented: String = tokens.iter().flat_map(|token| token.text.chars())
                     .filter(|character| !character.is_whitespace()).collect();
@@ -397,13 +547,13 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
                     // Read the pointer exactly as the real LOAD renderer does,
                     // rather than directly forcing its defining CAST to print.
                     let mut plain_view = execution_printer(&arch, false);
-                    plain_view.push_vn_ir(&fd, &arch, pointer, load);
+                    plain_view.push_vn_ir(&fd, &arch, pointer, load).unwrap();
                     plain_view.recurse();
                     let view = plain_view.emit_mut().output_str().to_string();
                     let mut marked_view = execution_printer(&arch, false);
                     marked_view.set_markup(true);
                     marked_view.emit_mut().set_capture_tokens(true);
-                    marked_view.push_vn_ir(&fd, &arch, pointer, load);
+                    marked_view.push_vn_ir(&fd, &arch, pointer, load).unwrap();
                     marked_view.recurse();
                     let view_tokens = marked_view.emit_mut().take_markup_tokens();
                     let view_presentation: String = view_tokens.iter().flat_map(|token| token.text.chars())
@@ -415,7 +565,7 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
                             "the named High must not expose its hidden member CAST: {view_tokens:?}");
                     } else {
                         let parameter = crate::printc::declaration_text(
-                            &declaration, "table", RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C));
+                            &declaration, "table", &RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention));
                         let expected_view = if native { "void **" } else { "code **" };
                         let consumer = format!(r#"
 #include <stdint.h>
@@ -435,7 +585,7 @@ int main(void) {{ verify_view(0); return 0; }}
                 assert_eq!(fd.obank().get(cast).unwrap().get_in(0), Some(source));
                 assert_eq!(fd.obank().get(call).unwrap().get_in(0), Some(output));
                 let parameter = crate::printc::declaration_text(
-                    &declaration, "table", RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C));
+                    &declaration, "table", &RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, print.options.convention));
                 let consumer = format!(r#"
 #include <stdint.h>
 typedef int32_t int4;

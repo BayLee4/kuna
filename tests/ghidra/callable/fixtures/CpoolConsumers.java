@@ -24,4 +24,12 @@ public class CpoolConsumers {
     public int method(int value) {
         return value + field;
     }
+
+    public static Object nil() {
+        return null;
+    }
+
+    public static boolean isNil(Object value) {
+        return value == null;
+    }
 }

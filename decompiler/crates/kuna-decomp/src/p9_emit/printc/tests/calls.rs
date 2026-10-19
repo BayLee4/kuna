@@ -70,8 +70,12 @@ use std::rc::Rc;
         model.output_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
             space.clone(), 0x200, 8, 1, 0, 0, true, false, &[], &manager).unwrap());
         model.output_mut().finish_decode();
-        let model = Rc::new(model);
-        types.set_proto_models(Some(model.clone()), std::collections::BTreeMap::new());
+        // This is the fixture's default ABI, not a source-level convention
+        // keyword. Use the real publication owner so the architecture and type
+        // factory share it and default declaration visibility is implicit.
+        arch.set_default_model_rc(Rc::new(model));
+        let model = arch.default_fp().unwrap().clone();
+        assert!(!model.print_in_decl());
         types.set_proto_context(manager.clone());
         let declaration = PrototypePieces {
             outtype: Some(big.clone()),
@@ -175,9 +179,13 @@ use std::rc::Rc;
         }
         specs.proto_mut().copy(abi.as_ref());
         specs.proto_mut().set_override(true); // source survives site pinning
+        assert!(specs.proto().is_input_locked() && specs.proto().is_output_locked());
+        assert!(crate::kuna_indirectargs::hidden_result(specs.proto()).is_some());
+        assert!(!fd.get_override().is_authored_proto_override(fd.obank().get(call).unwrap().get_addr()),
+            "the logical-result positive must not depend on an authored site override");
         fd.push_call_specs(specs);
         if indirect {
-            fd.action_set_casts();
+            fd.action_set_casts().unwrap();
         }
         let consumed_pointer = if let Some(out) = physical_output {
             if matches!(result_use, LogicalResultUse::NestedPointer) {
@@ -235,7 +243,7 @@ use std::rc::Rc;
         }
         fd.get_func_proto_mut().set_input_lock(true);
         fd.seed_sblocks_copy();
-        PrintC::new().doc_function_full(&fd, &arch)
+        PrintC::new().doc_function_full(&fd, &arch).unwrap()
     }
 
     fn compact_c(text: &str) -> String {
@@ -274,7 +282,7 @@ use std::rc::Rc;
         let record = types.set_fields_struct_raw(&shell,
             (0..3).map(|i| TypeField::new(i, i * 8, format!("v{i}"), word.clone())).collect(),
             vec![], 24, 8, 0).unwrap();
-        let declarations = render_type_definitions(&[record], RealTypeCtx::OFF);
+        let declarations = render_type_definitions(&[record], &RealTypeCtx::OFF);
         let provider = match inputs {
             LogicalInputs::Tag => r#"
 Big24 make_big(int4 tag) {

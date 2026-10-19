@@ -55,6 +55,10 @@ fn repo_root() -> PathBuf {
 /// Bootstrap the fixture with `dwarfstructs` on/off, decompile each of `funcs` and return
 /// the concatenated C.
 fn decompile(funcs: &[&str], structs: bool) -> String {
+    decompile_with_options(funcs, structs, &[])
+}
+
+fn decompile_with_options(funcs: &[&str], structs: bool, options: &[(&str, &str)]) -> String {
     let _guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
     let root = repo_root();
     let specs = root.join("specs");
@@ -69,6 +73,9 @@ fn decompile(funcs: &[&str], structs: bool) -> String {
     std::env::remove_var(DWARFSTRUCTS_ENV);
     let mut prog = prog.expect("bootstrap fixture with built processor specs");
     prog.commit_pending_analysis().expect("analysis commit succeeds");
+    for &(name, value) in options {
+        prog.arch_mut().set_kuna_option(name, value).expect("registered presentation option");
+    }
 
     let mut cmds: Vec<String> = Vec::new();
     for f in funcs {
@@ -128,7 +135,13 @@ fn small_struct_return_loses_its_phantom_sret() {
 /// pointer that the ABI genuinely has, only type what it points at.
 #[test]
 fn large_struct_return_keeps_its_real_sret() {
-    let (off, on) = (decompile(&["ret_big"], false), decompile(&["ret_big"], true));
+    // This guard observes the physical hidden parameter. Keep the default
+    // source-level return presentation unchanged for every other test.
+    let physical = &[("indirectargs", "off")];
+    let (off, on) = (
+        decompile_with_options(&["ret_big"], false, physical),
+        decompile_with_options(&["ret_big"], true, physical),
+    );
     assert!(off.contains("rethidden"), "the 24-byte sret is real off, got:\n{off}");
     assert!(
         on.contains("rethidden") && on.contains("rethidden->x") && on.contains("rethidden->z"),

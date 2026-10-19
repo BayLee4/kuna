@@ -35,7 +35,7 @@ use std::rc::Rc;
 use kuna_base::types::int4;
 
 use crate::dtype::{type_metatype, Datatype};
-use crate::kuna_langtypes::{SpellCtx, TypeSpeller};
+use crate::kuna_langtypes::{DeclaratorTypeSpan, SpellCtx, TypedDeclarator, TypeSpeller};
 
 /// The rust-language type speller.
 pub struct RustSpeller;
@@ -78,45 +78,67 @@ fn byte_array(size: int4) -> String {
 }
 
 impl RustSpeller {
-    /// The full prefix spelling of `ct`, built inward-out.
-    fn type_expr(&self, cx: &SpellCtx, ct: &Rc<Datatype>, depth: u32) -> String {
+    /// Typed and ordinary spelling share the same traversal. Only rendered
+    /// leaves carry identity: pointer/array syntax must not bind their owner
+    /// in place of the actual pointee or element.
+    fn type_expr(&self, cx: &SpellCtx, ct: &Rc<Datatype>, typed: bool) -> TypedDeclarator {
+        let mut spelling = TypedDeclarator::default();
+        self.append_type_expr(cx, ct, 0, typed, &mut spelling);
+        spelling
+    }
+
+    fn append_type_expr(
+        &self, cx: &SpellCtx, ct: &Rc<Datatype>, depth: u32,
+        typed: bool, spelling: &mut TypedDeclarator,
+    ) {
         // A recovered type graph can be cyclic through a struct pointer; the C
         // declarator walk stops at the first NAMED type, and this one needs the
         // same guard because it recurses through pointees.
         if depth > 16 {
-            return "*const ()".to_string();
+            spelling.front.push_str("*const ()");
+            return;
         }
         match ct.get_metatype() {
             type_metatype::TYPE_PTR => {
-                let inner = match ct.get_ptr_to() {
-                    Some(p) => self.type_expr(cx, &p, depth + 1),
-                    None => "()".to_string(),
-                };
-                format!("*mut {inner}")
+                spelling.front.push_str("*mut ");
+                match ct.get_ptr_to() {
+                    Some(p) => self.append_type_expr(cx, &p, depth + 1, typed, spelling),
+                    None => spelling.front.push_str("()"),
+                }
             }
             type_metatype::TYPE_ARRAY => {
                 let base = ct.get_array_base();
-                let elem = match &base {
-                    Some(b) => self.type_expr(cx, b, depth + 1),
-                    None => "u8".to_string(),
-                };
+                spelling.front.push('[');
+                match &base {
+                    Some(b) => self.append_type_expr(cx, b, depth + 1, typed, spelling),
+                    None => spelling.front.push_str("u8"),
+                }
                 let n = ct.num_elements().unwrap_or_else(|| {
                     let w = base.map(|b| b.get_size()).unwrap_or(1).max(1);
                     ct.get_size() / w
                 });
-                format!("[{elem}; {n}]")
+                use std::fmt::Write;
+                write!(spelling.front, "; {n}]").expect("writing type to string");
             }
-            _ => match self.relabel(cx, ct, false) {
-                Some(n) => n.into_owned(),
-                None => {
-                    let name = ct.get_name();
-                    if name.is_empty() {
-                        self.anonymous(ct)
-                    } else {
-                        type_path(ct.get_display_name())
+            _ => {
+                let start = spelling.front.len();
+                match self.relabel(cx, ct, false) {
+                    Some(n) => spelling.front.push_str(&n),
+                    None => {
+                        let name = ct.get_name();
+                        if name.is_empty() {
+                            spelling.front.push_str(&self.anonymous(ct));
+                        } else {
+                            spelling.front.push_str(&type_path(ct.get_display_name()));
+                        }
                     }
                 }
-            },
+                if typed {
+                    spelling.front_types.push(DeclaratorTypeSpan {
+                        range: start..spelling.front.len(), datatype: Rc::clone(ct),
+                    });
+                }
+            }
         }
     }
 }
@@ -271,11 +293,20 @@ impl TypeSpeller for RustSpeller {
 
     /// Rust types are pure prefixes, so `back` is always empty.
     fn declarator(&self, cx: &SpellCtx, ct: &Rc<Datatype>) -> (String, String) {
-        (self.type_expr(cx, ct, 0), String::new())
+        let spelling = self.type_expr(cx, ct, false);
+        (spelling.front, spelling.back)
+    }
+
+    fn typed_declarator(&self, cx: &SpellCtx, ct: &Rc<Datatype>) -> TypedDeclarator {
+        self.type_expr(cx, ct, true)
     }
 
     fn type_name(&self, cx: &SpellCtx, t: &Rc<Datatype>) -> (String, String) {
-        (self.type_expr(cx, t, 0), String::new())
+        self.declarator(cx, t)
+    }
+
+    fn typed_type_name(&self, cx: &SpellCtx, t: &Rc<Datatype>) -> TypedDeclarator {
+        self.typed_declarator(cx, t)
     }
 
     fn unknown_base(

@@ -751,7 +751,7 @@ enum Src {
 #[derive(Clone, Debug, PartialEq)]
 enum Kind {
     PushBack(Src),
-    Append { n: u64, lit: u64 },
+    Append { n: u64, lit: u64, bytes: Vec<Val> },
 }
 
 struct Site {
@@ -1197,18 +1197,10 @@ fn try_match(data: &Funcdata, regs: &Regs, call: OpId) -> Option<Site> {
         {
             return None;
         }
-        let lit_addr = Address::new(regs.ram.clone(), lit);
-        if data.get_arch().query_global_properties(&lit_addr, n as int4, &call_addr) & varnode_flags::readonly == 0 {
+        if bytes.iter().any(|byte| byte.as_const().is_none()) {
             return None;
         }
-        for (i, b) in bytes.iter().enumerate() {
-            let want = b.as_const()?;
-            let at = Address::new(regs.ram.clone(), lit.wrapping_add(i as u64));
-            if data.get_arch().get_load_image_value(&at, 1).ok()? != want {
-                return None;
-            }
-        }
-        Kind::Append { n, lit }
+        Kind::Append { n, lit, bytes }
     };
     let this = materialize(&mut eng, &sh, &a, &regs.bases)?;
 
@@ -1247,14 +1239,14 @@ fn emit_assign(data: &mut Funcdata, before: OpId, at: &Address, dest: &Address, 
         Src::Reg(r, 0) => {
             let op = data.new_op(1, at.clone());
             data.op_set_opcode_code(op, OpCode::CPUI_COPY);
-            let v = data.new_varnode(size, r, None);
+            let v = data.new_varnode(size, r, None)?;
             data.op_set_input(op, v, 0)?;
             op
         }
         Src::Reg(r, k) => {
             let op = data.new_op(2, at.clone());
             data.op_set_opcode_code(op, OpCode::CPUI_INT_ADD);
-            let v = data.new_varnode(size, r, None);
+            let v = data.new_varnode(size, r, None)?;
             let c = data.new_constant(size, *k);
             data.op_set_input(op, v, 0)?;
             data.op_set_input(op, c, 1)?;
@@ -1269,6 +1261,21 @@ fn emit_assign(data: &mut Funcdata, before: OpId, at: &Address, dest: &Address, 
 fn rewrite(data: &mut Funcdata, regs: &Regs, site: &Site) -> KunaResult<bool> {
     use crate::dtype::type_metatype;
     use crate::fspec::{effect_type, EffectRecord};
+    if let Kind::Append { n, lit, bytes } = &site.kind {
+        let Some(call) = data.obank().get(site.call) else { return Ok(false) };
+        let lit_addr = Address::new(regs.ram.clone(), *lit);
+        if data.get_arch().query_global_properties(&lit_addr, *n as int4, call.get_addr())?
+            & varnode_flags::readonly == 0
+        {
+            return Ok(false);
+        }
+        for (i, byte) in bytes.iter().enumerate() {
+            let at = Address::new(regs.ram.clone(), lit.wrapping_add(i as u64));
+            if Some(data.get_arch().get_load_image_value(&at, 1)?) != byte.as_const() {
+                return Ok(false);
+            }
+        }
+    }
     let Some(types) = data.get_arch().types() else { return Ok(false) };
     let (Ok(void_ty), Ok(char_ty), Ok(ulong_ty)) =
         (types.get_type_void(), types.get_type_char(1), types.get_base(WORD, type_metatype::TYPE_UINT))
@@ -1326,12 +1333,12 @@ fn rewrite(data: &mut Funcdata, regs: &Regs, site: &Site) -> KunaResult<bool> {
     let anchor = gops[site.first_call_ix];
     data.remove_branch(site.head, site.fast_slot)?;
     for &o in &gops[..site.first_call_ix] {
-        data.op_destroy(o);
+        data.op_destroy(o)?;
     }
     emit_assign(data, anchor, &call_addr, &regs.rcx, WORD, &site.this)?;
     match &site.kind {
         Kind::PushBack(ch) => emit_assign(data, anchor, &call_addr, &regs.rdx, 1, ch)?,
-        Kind::Append { n, lit } => {
+        Kind::Append { n, lit, .. } => {
             emit_assign(data, anchor, &call_addr, &regs.rdx, WORD, &Src::Const(*lit))?;
             emit_assign(data, anchor, &call_addr, &regs.r8, WORD, &Src::Const(*n))?;
         }
@@ -1375,11 +1382,11 @@ impl Action for ActionMsvcStrAppend {
         }
         Some(Box::new(ActionMsvcStrAppend { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !data.get_arch().msvc_str_append || data.num_calls() == 0 {
-            return 0;
+            return Ok(0);
         }
-        let Some(regs) = Regs::resolve(data) else { return 0 };
+        let Some(regs) = Regs::resolve(data) else { return Ok(0) };
         let mut changed = 0;
         let mut seen: BTreeSet<OpId> = BTreeSet::new();
         'sites: while changed < MAX_SITES {
@@ -1389,17 +1396,15 @@ impl Action for ActionMsvcStrAppend {
                     continue;
                 }
                 let Some(site) = try_match(data, &regs, call) else { continue };
-                match rewrite(data, &regs, &site) {
-                    Ok(true) => {
-                        changed += 1;
-                        continue 'sites;
-                    }
-                    _ => break 'sites,
+                if rewrite(data, &regs, &site)? {
+                    changed += 1;
+                    continue 'sites;
                 }
+                break 'sites;
             }
             break;
         }
-        (changed != 0) as ApplyResult
+        Ok((changed != 0) as ApplyResult)
     }
 }
 

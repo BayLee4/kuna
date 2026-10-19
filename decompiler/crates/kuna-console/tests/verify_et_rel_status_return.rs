@@ -10,6 +10,9 @@
 //! is the upstream behaviour, where the failure call's use of the same register
 //! vetoes the return trial and the helper recovers as `void`.
 
+#[path = "common/corpus.rs"]
+mod corpus;
+
 use std::path::PathBuf;
 
 use kuna_console::engine::bootstrap_from_object;
@@ -50,7 +53,7 @@ fn decompile_pair(name: &str, noreturn_ret_use: bool, library_prototypes: bool) 
         /* no_vars= */ false,
         /* want_proto= */ false,
         /* want_provenance= */ false,
-    );
+    ).unwrap();
     let code_for = |function: &str| {
         output
             .iter()
@@ -107,4 +110,48 @@ fn a_known_zero_argument_failure_does_not_consume_the_status_return() {
         assert!(helper.contains("__stack_chk_fail();"), "{name}: {helper}");
         assert!(caller.contains("guarded_status(") && caller.contains("return "), "{name}: {caller}");
     }
+}
+
+#[test]
+fn declared_canary_signature_keeps_independent_noreturn_and_integer_bits() {
+    use kuna_decomp::dtype::type_metatype;
+    let path = fixture("floatparam_x86_64_O0.o");
+    let roots = vec![repo_root().join("specs").to_string_lossy().into_owned()];
+    let mut program = bootstrap_from_object(path.to_str().unwrap(), "", &roots).unwrap();
+    program.commit_pending_analysis().unwrap();
+    let mut corpus = corpus::Corpus::from_program("declared-canary-bits", program, Vec::new());
+    corpus.command("load function bits").unwrap();
+    let (callee, source) = {
+        let data = corpus.data();
+        let fd = data.fd.as_ref().unwrap();
+        let arch = data.conf.as_ref().unwrap().arch();
+        assert!(!fd.get_func_proto().is_input_locked());
+        assert!(!fd.get_func_proto().is_output_locked());
+        assert!(data.pending_prototypes.get("bits").is_none());
+        assert!(arch.symboltab.function_source_proto_across_scopes(fd.get_address()).is_none());
+        let call = (0..fd.num_calls()).map(|i| fd.get_call_specs(i))
+            .find(|call| call.get_name() == "__stack_chk_fail").unwrap();
+        let entry = call.get_entry_address().clone();
+        let source = arch.symboltab.function_source_proto_across_scopes(&entry).unwrap().clone();
+        assert!(!source.is_no_return(), "the type source does not supply this flow fact");
+        assert!(source.is_output_locked());
+        assert!(arch.noreturn_extern_match && arch.noreturn_extern_calls);
+        assert!(call.proto().is_no_return(), "callee type acquisition erased the effective flow fact");
+        (entry, source)
+    };
+    corpus.command("decompile").unwrap();
+    {
+        let data = corpus.data();
+        let fd = data.fd.as_ref().unwrap();
+        let output = fd.get_func_proto().get_output_type().unwrap();
+        assert_eq!(output.get_size(), 8);
+        assert!(matches!(output.get_metatype(), type_metatype::TYPE_INT
+            | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN));
+        let retained = data.conf.as_ref().unwrap().arch().symboltab
+            .function_source_proto_across_scopes(&callee).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&source, retained));
+        assert!(!retained.is_no_return(), "working flow must not rewrite the type source");
+    }
+    let code = corpus.render_c();
+    assert!(code.contains("return a0;"), "{code}");
 }

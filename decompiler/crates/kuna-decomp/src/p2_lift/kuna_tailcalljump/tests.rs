@@ -96,12 +96,12 @@ fn without_a_branch_override_tailcalljump_claims_first() {
         crate::flow::select_inferred_tail_call(
             false,
             false,
-            || kuna_is_tail_call_branch(&fd, op, true, true, false),
+            || Ok(kuna_is_tail_call_branch(&fd, op, true, true, false)),
             || {
                 frame_consulted.set(true);
                 true
             },
-        ),
+        ).unwrap(),
         Some("tailcalljump")
     );
     assert!(!frame_consulted.get(), "tailcallframe was consulted after tailcalljump claimed");
@@ -144,9 +144,9 @@ fn conditional_tail_requires_a_bound_and_another_known_entry() {
         crate::flow::select_inferred_tail_call(
             false,
             true,
-            || kuna_is_tail_call_branch(&fd, op, true, true, false),
+            || Ok(kuna_is_tail_call_branch(&fd, op, true, true, false)),
             || panic!("an interior entry must never consult frame teardown"),
-        ),
+        ).unwrap(),
         None,
     );
     let mut unbounded = Funcdata::new(
@@ -164,7 +164,7 @@ fn conditional_tail_staging_accepts_a_free_condition_input() {
     fd.op_set_opcode_code(branch, OpCode::CPUI_CBRANCH);
     let dest = Address::new(ram.clone(), 0x18d0);
     let target = fd.new_code_ref(&dest);
-    let condition = fd.new_varnode(1, &Address::new(ram, 0x2000), None);
+    let condition = fd.new_varnode(1, &Address::new(ram, 0x2000), None).unwrap();
     fd.op_set_input(branch, target, 0).unwrap();
     fd.op_set_input(branch, condition, 1).unwrap();
     conditional_tail_branches(&mut fd, branch, &dest).unwrap();
@@ -174,24 +174,24 @@ fn conditional_tail_staging_accepts_a_free_condition_input() {
 fn indirect_branch_with_a_sole_foreign_destination_is_a_tail_call() {
     let mut fd = build_fd();
     let op = build_branch_op(&mut fd, OpCode::CPUI_BRANCHIND, 0x18d0);
-    let yes = || true;
-    let no = || false;
-    assert!(kuna_is_tail_call_table(&fd, op, true, true, false, false, yes), "locked");
-    assert!(kuna_is_tail_call_table(&fd, op, true, true, false, true, no), "out of extent");
+    let yes = || Ok(true);
+    let no = || Ok(false);
+    assert!(kuna_is_tail_call_table(&fd, op, true, true, false, false, yes).unwrap(), "locked");
+    assert!(kuna_is_tail_call_table(&fd, op, true, true, false, true, no).unwrap(), "out of extent");
     assert!(
-        !kuna_is_tail_call_table(&fd, op, true, true, false, false, no),
+        !kuna_is_tail_call_table(&fd, op, true, true, false, false, no).unwrap(),
         "no prototype, inside the extent"
     );
-    assert!(!kuna_is_tail_call_table(&fd, op, false, true, false, true, yes), "gate off");
-    assert!(!kuna_is_tail_call_table(&fd, op, true, false, false, true, yes), "not a function");
-    assert!(!kuna_is_tail_call_table(&fd, op, true, true, true, true, yes), "its own entry");
+    assert!(!kuna_is_tail_call_table(&fd, op, false, true, false, true, yes).unwrap(), "gate off");
+    assert!(!kuna_is_tail_call_table(&fd, op, true, false, false, true, yes).unwrap(), "not a function");
+    assert!(!kuna_is_tail_call_table(&fd, op, true, true, true, true, yes).unwrap(), "its own entry");
     let direct = build_branch_op(&mut fd, OpCode::CPUI_BRANCH, 0x18d0);
-    assert!(!kuna_is_tail_call_table(&fd, direct, true, true, false, true, yes), "direct jump");
+    assert!(!kuna_is_tail_call_table(&fd, direct, true, true, false, true, yes).unwrap(), "direct jump");
     let asked = std::cell::Cell::new(false);
     kuna_is_tail_call_table(&fd, op, false, true, false, false, || {
         asked.set(true);
-        true
-    });
+        Ok(true)
+    }).unwrap();
     assert!(!asked.get(), "a closed gate never looks the callee up");
 }
 

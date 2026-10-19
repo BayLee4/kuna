@@ -90,7 +90,7 @@ fn wire_const(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_written(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     set_def(fd, vn, defop)
 }
 
@@ -132,7 +132,7 @@ fn boolsignless_folds_to_noteq() {
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     let o = fd.obank().get(op).unwrap();
     assert_eq!(o.code(), OpCode::CPUI_INT_NOTEQUAL);
@@ -160,7 +160,7 @@ fn boolsignless_gate_off_is_noop() {
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_SLESS);
 }
 
@@ -183,7 +183,7 @@ fn boolsignless_extra_nzmask_bit_declines() {
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleBoolSignLess::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // --- GH-8777 RuleSborrowGe (AND-of-ORs form) --------------------------------
@@ -248,7 +248,7 @@ fn sborrowge_and_of_ors_folds_to_slessequal() {
     let andop = build_and_of_ors(&mut fd, n, v);
 
     let mut rule = RuleSborrowGe::new(true);
-    assert_eq!(rule.apply_op(andop, &mut fd), 1);
+    assert_eq!(rule.apply_op(andop, &mut fd).unwrap(), 1);
 
     let o = fd.obank().get(andop).unwrap();
     assert_eq!(o.code(), OpCode::CPUI_INT_SLESSEQUAL);
@@ -267,7 +267,7 @@ fn sborrowge_gate_off_is_noop() {
     let andop = build_and_of_ors(&mut fd, n, v);
 
     let mut rule = RuleSborrowGe::new(false);
-    assert_eq!(rule.apply_op(andop, &mut fd), 0);
+    assert_eq!(rule.apply_op(andop, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(andop).unwrap().code(), OpCode::CPUI_BOOL_AND);
 }
 
@@ -284,7 +284,7 @@ fn sborrowge_non_xnor_declines() {
     let _ = set_def(&mut fd, out, andop);
 
     let mut rule = RuleSborrowGe::new(true);
-    assert_eq!(rule.apply_op(andop, &mut fd), 0);
+    assert_eq!(rule.apply_op(andop, &mut fd).unwrap(), 0);
 }
 
 #[test]

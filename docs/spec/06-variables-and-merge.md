@@ -81,6 +81,17 @@ into `r3` printed as `s.y = *k; ... take3(...,s.y)` the same way. The stack piec
 of such a parameter is still read through its input, so `d.field_b` keeps the
 parameter's name.
 
+Fresh remote parameter symbols follow the physical-entry allocator's
+source-to-working correspondence. The materializer compacts source category
+slots, and ABI acquisition can insert a hidden return carrier among ordinary
+inputs; neither a raw category nor a blanket offset identifies the working
+parameter. Local categories follow that correspondence while retaining host
+symbol IDs and immutable raw source records. Only symbols without supplied
+physical mappings acquire the working datatype, roles and storage, using the
+same entry-usepoint policy as ordinary parameters. Supplied mappings and their
+use limits, dynamic locals, and logical callable allocation remain unchanged.
+This projection precedes analysis; it does not remap an analyzed HighVariable.
+
 A standalone name or type assertion on a parameter must update both its scoped
 Symbol and the prototype used on the next decompile. Chapter 00 describes the
 replay of those edits by parameter slot and input storage. In particular, a
@@ -91,6 +102,13 @@ prototype seed recreates their input-scoped entries. Seeding the same parameter
 again as a locked local can separate it from its input HighVariable.
 
 Parameter materialization queries storage at the function's entry usepoint.
+A newly created free Varnode has neither an input nor a definition usepoint;
+its initial property query uses an invalid address, as in Ghidra's
+`Funcdata::newVarnode`. Whole-scope mappings still apply, but restricted
+parameter mappings do not grant a free value the parameter's name or locks.
+Once the value becomes an input or receives a definition, property acquisition
+uses that established usepoint. This also keeps a later upper-register
+SUBPIECE from inheriting an entry parameter's mapping before it is defined.
 A later usepoint-scoped register local at the same address is a separate Symbol
 and retains its non-parameter category. Once the naming pass selects an entry
 by storage and usepoint, it assigns or reads the name through that selected
@@ -328,6 +346,17 @@ forbids a forced merge, the machinery edits the data flow until it doesn't:
    whole decompilation, `ActionMergeRequired` swallows it at the action
    boundary and keeps the partially merged state — the failure mode is a
    residual un-fused marker op, not a dead function.
+
+Late trim COPYs from a SPACEBASE value use the same unknown-byte pointer seed
+as ordinary COPY type propagation
+(`coreaction_infertypes.rs (spacebase_pointer)`, applied by
+`substrate/funcdata.rs (Funcdata::build_copy_trim_op)`). The frame-backed
+pointee describes the original storage, not every address held by a merged
+walking pointer. Copying that pointee onto a fresh ordinary temporary after
+type propagation could select a word-pointer High type for a byte walk and
+introduce misaligned word-pointer conversions on its backedge. The original
+frame value, word accesses and layout remain unchanged; non-SPACEBASE trim
+inputs keep their original data-type.
 
 The inserted trim COPYs accumulate in the persistent `Merge::copy_trims`
 (`funcdata_merge.rs (Funcdata::with_covermerge)` keeps one `Merge` per
@@ -572,6 +601,12 @@ parameter in one variable, and if the reload that follows a call clobbering the
 same storage is called redundant and silenced, the emitted C returns the call's
 result on a path where the binary returns the parameter.
 
+Binding a proto-partial to its existing whole VariableGroup also preserves the
+whole's storage role. A piece of a persistent global group remains global even
+when its own representative is a register or unique temporary. A shared source
+receipt alone does not establish this role: an independent value copied before
+a later global mutation remains a local snapshot.
+
 The copy marker also runs
 `decompiler/crates/kuna-decomp/src/p6_variables/kuna_undefinedcopy.rs` for trim
 copies whose source is an INDIRECT creation explicitly marked as killed by a
@@ -815,14 +850,18 @@ routes a high with no covering Symbol to `dat_<addr>` when its storage is global
 data, and kuna's proxy for global data was "an `IPTR_PROCESSOR` address with no
 register name". The register space is `IPTR_PROCESSOR` too, so a high living
 only in an unnamed register piece printed as an undeclared global and the C did
-not compile: a function returning the 64-bit `rax` after a call that wrote only
-`eax` printed `return CONCAT44(dat_4,v1);`, and the upper half of `rcx` a
+not compile: a function returning the 64-bit `rax` after a call whose declared
+result covers only `eax` printed `return CONCAT44(dat_4,v1);`, and the upper half of `rcx` a
 64-bit product leaves there printed `dat_c`. `coreaction_cleanup.rs
 (name_local_highs_angr)` now excludes the register space from that test, so
 such a high is a `vN` local declared with its storage (`// register 0x4`). The
-local is read but never assigned, as the binary reads the register's
-undefined upper half. Only register pieces change; real globals keep
-`dat_<addr>` (`tests/stages/kuna-regpiece.xml`).
+local represents the upper half not modeled by that narrow call result.
+When the supplied callee body proves an EAX write zero-extends into RAX, the
+existing call-output owner carries that fact and no unknown upper-piece local
+is needed. The stage fixture retains that original case and a wide-return
+caller whose callee loads the whole RAX while declaring only an `int4` result;
+the latter keeps the positive naming witness live. Only register pieces
+change; real globals keep `dat_<addr>` (`tests/stages/kuna-regpiece.xml`).
 
 **A default name skips one a caller locked.** The `vN` allocator (and the
 `<prefix>Var<N>` arm under Ghidra names) used to hand out `v<base++>` without
@@ -2336,7 +2375,9 @@ Structurally identical code (an unrolled loop) produces colliding hashes at
 one address. The resolver cycles the methods, collecting for each the list of
 same-address Varnodes with an equal comparable hash, and keeps the *smallest*
 collision list not exceeding the budget; a singleton wins immediately. If no
-method reaches uniqueness, the champion list's *position* and *total* are
+method reaches uniqueness, the champion's method, opcode/slot, CRC and anchor
+address stay with that same collision list; probing a later, larger list must
+not replace its descriptor. The champion list's *position* and *total* are
 packed into dedicated bit fields of the hash (bits 49–51 and 52–54), making
 "the 3rd of 5 identical values at this address" a stable identity. When even
 that fails — every method's list overflows the budget — the hash is 0 and the
@@ -2358,7 +2399,9 @@ upstream budget and the abort. The live gate is
 `force varnode` path).
 
 **Addressing across re-decompilations.** A dynamic Symbol persists as
-(first-use address, hash). On the next run,
+(first-use address, hash). Wire-only local publication retains the hash
+calculator's anchor with its hash, rather than substituting the representative's
+defining PC: a skipped CAST can place those at different instructions. On the next run,
 `dynamic.rs (DynamicHash::find_varnode)` gathers the Varnodes at that address,
 re-computes their hashes with the recorded method, and re-binds on match; an
 IR that simplified differently simply fails to match, and the assertion lies

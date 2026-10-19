@@ -45,15 +45,19 @@ use crate::varnode::varnode_flags;
 /// write-masked vs. live — rather than the bare "Overlapping input varnodes"
 /// the C++ `LowlevelError` carries.
 pub fn new_tiled_input(fd: &mut Funcdata, size: int4, addr: &Address) -> KunaResult<VarnodeId> {
-    let candidate = fd.new_varnode(size, addr, None);
-    let overlap_err = match fd.set_input_varnode(candidate) {
-        Ok(vn) => return Ok(vn),
+    let candidate = fd.new_varnode(size, addr, None)?;
+    let overlap_err = match fd.find_input_overlap(candidate) {
+        Ok(_) => return fd.set_input_varnode(candidate),
         Err(e) => e,
     };
-    // setInputVarnode raises before mutating, so the candidate is still a free
-    // Varnode with no reads.
+    // Only geometric overlap calls for tiling. Property-query failures from
+    // set_input_varnode propagate without entering this recovery path.
     let _ = fd.delete_varnode(candidate);
     combine_covered_pieces(fd, size, addr).map_err(|reason| {
+        let reason = match reason {
+            TileError::Geometry(reason) => reason,
+            TileError::Query(error) => return error,
+        };
         let spacename = addr.get_space().map(|s| s.get_name()).unwrap_or("?");
         let lo = addr.get_offset();
         let hi = lo.wrapping_add(size as u64);
@@ -63,14 +67,30 @@ pub fn new_tiled_input(fd: &mut Funcdata, size: int4, addr: &Address) -> KunaRes
     })
 }
 
+enum TileError {
+    Geometry(String),
+    Query(KunaError),
+}
+
+impl From<String> for TileError {
+    fn from(reason: String) -> Self {
+        Self::Geometry(reason)
+    }
+}
+
+impl From<KunaError> for TileError {
+    fn from(error: KunaError) -> Self {
+        Self::Query(error)
+    }
+}
+
 /// Fold the write-masked input pieces covering `[addr, addr+size)` into one
 /// full-size input Varnode.
 ///
-/// `Err` carries a human-readable reason instead of `None` so
-/// [`new_tiled_input`] can fold it into a diagnostic message; every `?`/early
-/// return below states the geometry it saw, not just that reconciliation
-/// declined.
-fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Result<VarnodeId, String> {
+/// Geometry errors carry a human-readable reason so [`new_tiled_input`] can
+/// fold them into a diagnostic message. Query errors retain their original
+/// typed error and bypass geometry reconciliation diagnostics.
+fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Result<VarnodeId, TileError> {
     let space = addr
         .get_space()
         .ok_or_else(|| "requested address has no space".to_string())?
@@ -103,19 +123,19 @@ fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Resu
                 "existing input [{voff:#x},{vend:#x}) straddles the request \
                  (write_mask={})",
                 v.is_write_mask()
-            ));
+            ).into());
         }
         if !v.is_write_mask() {
             return Err(format!(
                 "existing input [{voff:#x},{vend:#x}) is fully contained in the \
                  request but is a live (non-write-masked) input, not a \
                  guardInput leftover piece"
-            ));
+            ).into());
         }
         pieces.push((voff, vsize, id));
     }
     if pieces.is_empty() {
-        return Err("no existing input Varnode overlaps the requested range".to_string());
+        return Err("no existing input Varnode overlaps the requested range".to_string().into());
     }
     pieces.sort_by_key(|p| p.0);
 
@@ -127,7 +147,7 @@ fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Resu
         if voff < cur {
             return Err(format!(
                 "pieces overlap each other at offset {voff:#x} (previous piece ends at {cur:#x})"
-            ));
+            ).into());
         }
         if voff > cur {
             plan.push((cur, (voff - cur) as int4, None));
@@ -145,9 +165,8 @@ fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Resu
             Some(id) => id,
             None => {
                 let holeaddr = Address::new(std::rc::Rc::clone(&space), off);
-                let hole = fd.new_varnode(sz, &holeaddr, None);
-                fd.set_input_varnode(hole)
-                    .map_err(|e| format!("setInputVarnode on hole [{off:#x},+{sz:#x}): {e}"))?
+                let hole = fd.new_varnode(sz, &holeaddr, None)?;
+                fd.set_input_varnode(hole)?
             }
         };
         tiling.push((off, sz, vn));
@@ -159,8 +178,7 @@ fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Resu
         let (_boff, bsize, bvn) = tiling.remove(0);
         // combineInputVarnodes takes (most significant, least significant).
         let (vn_hi, vn_lo) = if big_endian { (avn, bvn) } else { (bvn, avn) };
-        fd.combine_input_varnodes(vn_hi, vn_lo)
-            .map_err(|e| format!("combineInputVarnodes: {e}"))?;
+        fd.combine_input_varnodes(vn_hi, vn_lo)?;
         let joinaddr = Address::new(std::rc::Rc::clone(&space), aoff);
         let joined = fd
             .find_varnode_input(asize + bsize, &joinaddr)
@@ -171,7 +189,7 @@ fn combine_covered_pieces(fd: &mut Funcdata, size: int4, addr: &Address) -> Resu
     if joinedsize != size {
         return Err(format!(
             "tiled result has size {joinedsize:#x}, expected {size:#x}"
-        ));
+        ).into());
     }
     Ok(joined)
 }
@@ -238,7 +256,7 @@ mod tests {
     /// own w10dm tests use).
     fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        let vn = fd.new_varnode(size, &Address::new(r, off), None);
+        let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
         fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
     }
 

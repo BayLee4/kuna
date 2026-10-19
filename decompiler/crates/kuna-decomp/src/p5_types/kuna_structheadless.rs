@@ -240,6 +240,7 @@ mod tests {
         assert!(gives_a_pointee(&ptr_to(Rc::new(named))));
         assert!(!gives_a_pointee(&ptr_to(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)))));
         let mut minted = Datatype::new(0x18, type_metatype::TYPE_STRUCT);
+        minted.flags |= flags::kuna_synthesized;
         minted.name = "struct_19".to_string();
         let field = |offset: i32| TypeField {
             ident: offset,

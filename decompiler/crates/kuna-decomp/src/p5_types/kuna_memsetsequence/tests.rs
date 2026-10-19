@@ -275,7 +275,7 @@ fn rule_gate_off_is_noop() {
     let bl = mk_block(&mut fd);
     let op = mk_copy_const(&mut fd, bl, 0, 1, 0x00);
     let mut rule = RuleMemsetCopy::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 /// Gate on, but the driver body is stub-blocked (W4 symbol table / W6 type
@@ -287,7 +287,7 @@ fn rule_gate_on_declines_until_stubs_land() {
     let op = mk_copy_const(&mut fd, bl, 0, 1, 0x00);
     let mut rule = RuleMemsetCopy::new(true);
     // getTypeDefFacing/queryContainer are not reachable yet (see module docs).
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 /// The rule matches on CPUI_COPY and clone-filters by group.

@@ -109,7 +109,7 @@ impl Fx {
     fn var(&mut self, size: int4, ty: Rc<Datatype>) -> VarnodeId {
         self.next += 0x10;
         let at = Address::new(Rc::clone(&self.ram), 0x10_0000 + self.next);
-        let vn = self.fd.new_varnode(size, &at, Some(ty));
+        let vn = self.fd.new_varnode(size, &at, Some(ty)).unwrap();
         self.fd.set_input_varnode(vn).unwrap()
     }
 
@@ -183,7 +183,7 @@ fn ptradd_address(fx: &Fx, op: OpId, p: u64) -> u64 {
 /// Rewrite the add and check it is a `PTRADD` whose address equals `p + k` for
 /// several base addresses, with a base of type `T *`.
 fn rewritten(fx: &mut Fx, op: OpId, k: i64, want_elem: u64, want_index: i64) -> VarnodeId {
-    assert!(rewrite(&mut fx.fd, op), "the add was not rewritten");
+    assert!(rewrite(&mut fx.fd, op).unwrap(), "the add was not rewritten");
     let o = fx.fd.obank().get(op).unwrap();
     assert_eq!(o.code(), OpCode::CPUI_PTRADD);
     assert_eq!(o.num_input(), 3);
@@ -283,10 +283,10 @@ fn a_negative_index_c_would_read_as_unsigned_keeps_the_integer_form() {
         fx.load(out, t);
         fx.high();
         assert!(
-            matches!(plan(&mut fx.fd, add), Err(Leave::WideNegativeIndex)),
+            matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::WideNegativeIndex)),
             "width {width} k {k:#x}"
         );
-        assert!(!rewrite(&mut fx.fd, add));
+        assert!(!rewrite(&mut fx.fd, add).unwrap());
         assert_eq!(fx.fd.obank().get(add).unwrap().code(), OpCode::CPUI_INT_ADD);
     }
     for (width, k) in [(8, -0x3_ffff_fff8i64), (4, -0x1_ffff_fffc), (8, 0x4_0000_0000)] {
@@ -312,8 +312,8 @@ fn an_offset_that_is_not_whole_elements_keeps_the_integer_form() {
     let (add, out) = fx.add(p, 0x6a, tp);
     fx.load(out, t);
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::NonDividing)));
-    assert!(!rewrite(&mut fx.fd, add));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::NonDividing)));
+    assert!(!rewrite(&mut fx.fd, add).unwrap());
     assert_eq!(fx.fd.obank().get(add).unwrap().code(), OpCode::CPUI_INT_ADD);
 }
 
@@ -365,7 +365,7 @@ fn a_base_that_is_itself_a_cast_read_only_here_is_retargeted() {
     fx.load(out, t);
     fx.high();
     assert!(matches!(
-        plan(&mut fx.fd, add),
+        plan(&mut fx.fd, add).unwrap(),
         Ok(Plan {
             base: Base::Retype,
             ..
@@ -396,7 +396,7 @@ fn a_base_that_is_a_cast_other_ops_read_is_recast_from_its_input() {
     fx.load(p, fx.base(8, type_metatype::TYPE_UINT));
     fx.high();
     assert!(matches!(
-        plan(&mut fx.fd, add),
+        plan(&mut fx.fd, add).unwrap(),
         Ok(Plan {
             base: Base::Recast(src),
             ..
@@ -449,7 +449,7 @@ fn a_pointer_that_is_stored_or_compared_keeps_its_type_and_a_subtracted_one_stay
         if consumer == "subtract" {
             fx.high();
             assert!(
-                matches!(plan(&mut fx.fd, add), Err(Leave::IntegerUse)),
+                matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::IntegerUse)),
                 "a subtracted sum stays integer"
             );
             continue;
@@ -491,7 +491,7 @@ fn a_void_sum_passed_to_a_call_keeps_the_integer_form() {
     fx.fd.op_set_input(call, target, 0).unwrap();
     fx.fd.op_set_input(call, out, 1).unwrap();
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::VoidTarget)));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::VoidTarget)));
 }
 
 #[test]
@@ -536,7 +536,7 @@ fn an_aggregate_element_keeps_the_integer_form() {
     let (add, out) = fx.add(p, 0x20, ap);
     fx.binary(OpCode::CPUI_INT_EQUAL, out, q, boolt);
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::AggregateTarget)));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::AggregateTarget)));
 }
 
 #[test]
@@ -554,8 +554,8 @@ fn an_integer_sum_or_an_integer_base_keeps_the_integer_form() {
     let (add2, out2) = fx.add(x, 0x10, tp);
     fx.load(out2, t);
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::OutNotPointer)));
-    assert!(matches!(plan(&mut fx.fd, add2), Err(Leave::NoPointer)));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::OutNotPointer)));
+    assert!(matches!(plan(&mut fx.fd, add2).unwrap(), Err(Leave::NoPointer)));
 }
 
 #[test]
@@ -575,7 +575,7 @@ fn a_variable_index_keeps_the_integer_form() {
     fx.fd.vbank_mut().get_mut(out).unwrap().set_implied();
     fx.load(out, t);
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::NonConstant)));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::NonConstant)));
 }
 
 #[test]
@@ -588,8 +588,8 @@ fn the_option_off_leaves_the_add_alone() {
     let (add, out) = fx.add(p, 8, tp);
     fx.load(out, t);
     fx.high();
-    assert!(plan(&mut fx.fd, add).is_ok());
-    let _ = fx.fd.action_set_casts();
+    assert!(plan(&mut fx.fd, add).unwrap().is_ok());
+    let _ = fx.fd.action_set_casts().unwrap();
     assert_eq!(fx.fd.obank().get(add).unwrap().code(), OpCode::CPUI_INT_ADD);
 }
 
@@ -639,7 +639,7 @@ fn the_cast_pass_rewrites_the_add_when_the_option_is_on() {
     let (add, out) = fx.add(p, 8, tp);
     fx.load(out, t);
     fx.high();
-    let _ = fx.fd.action_set_casts();
+    let _ = fx.fd.action_set_casts().unwrap();
     assert_eq!(fx.fd.obank().get(add).unwrap().code(), OpCode::CPUI_PTRADD);
 }
 
@@ -662,7 +662,7 @@ fn a_store_of_a_value_the_pass_has_not_reached_keeps_the_integer_form() {
     fx.fd.vbank_mut().get_mut(prod).unwrap().set_implied();
     fx.store(out, prod);
     fx.high();
-    assert!(matches!(plan(&mut fx.fd, add), Err(Leave::UnsettledStore)));
+    assert!(matches!(plan(&mut fx.fd, add).unwrap(), Err(Leave::UnsettledStore)));
 }
 
 #[test]
@@ -741,9 +741,9 @@ fn an_enum_element_keeps_the_integer_form() {
 }
 
 fn assert_refused(fx: &mut Fx, add: OpId, why: Leave, size: int4, via: &str) {
-    let got = plan(&mut fx.fd, add).map(|_| ());
+    let got = plan(&mut fx.fd, add).unwrap().map(|_| ());
     assert_eq!(got, Err(why), "size {size} via {via}");
-    assert!(!rewrite(&mut fx.fd, add));
+    assert!(!rewrite(&mut fx.fd, add).unwrap());
     assert_eq!(fx.fd.obank().get(add).unwrap().code(), OpCode::CPUI_INT_ADD);
 }
 
@@ -839,7 +839,7 @@ impl Fx {
 
 fn index_rewritten(fx: &mut Fx, add: OpId, index: VarnodeId, elem: u64) -> VarnodeId {
     let strat = fx.strat();
-    assert!(rewrite_index(&mut fx.fd, &strat, add), "the add was not rewritten");
+    assert!(rewrite_index(&mut fx.fd, &strat, add).unwrap(), "the add was not rewritten");
     let o = fx.fd.obank().get(add).unwrap();
     assert_eq!(o.code(), OpCode::CPUI_PTRADD);
     assert_eq!(fx.input(add, 1), index, "the index is the unscaled value");
@@ -849,7 +849,7 @@ fn index_rewritten(fx: &mut Fx, add: OpId, index: VarnodeId, elem: u64) -> Varno
 
 fn index_plan(fx: &mut Fx, add: OpId) -> Result<IndexPlan, Leave> {
     let strat = fx.strat();
-    plan_index(&mut fx.fd, &strat, add)
+    plan_index(&mut fx.fd, &strat, add).unwrap()
 }
 
 /// `p + (long)i * sizeof(T)` read as a `T` is `((T *)p)[i]`: the multiply goes,
@@ -1048,7 +1048,7 @@ fn a_value_use_is_rewritten_only_where_it_saves_a_cast() {
         fx.binary(OpCode::CPUI_COPY, out, out, if same { up } else { lp });
         fx.high();
         let strat = fx.strat();
-        assert_eq!(rewrite_index(&mut fx.fd, &strat, add), want, "same type {same}");
+        assert_eq!(rewrite_index(&mut fx.fd, &strat, add).unwrap(), want, "same type {same}");
     }
 }
 
@@ -1063,7 +1063,7 @@ fn the_cast_pass_rewrites_a_scaled_index_only_when_the_option_is_on() {
         let i = fx.var(4, int);
         let (add, _, _) = fx.scaled(p, i, OpCode::CPUI_INT_SEXT, 4, t);
         fx.high();
-        let _ = fx.fd.action_set_casts();
+        let _ = fx.fd.action_set_casts().unwrap();
         assert_eq!(fx.fd.obank().get(add).unwrap().code(), want, "castindex {on}");
     }
 }
@@ -1089,7 +1089,7 @@ fn a_difference_of_two_byte_pointers_keeps_its_operands() {
             let (op, _, _) = difference(&mut fx, Rc::clone(&cp), cp, out);
             fx.high();
             let long = fx.base(8, type_metatype::TYPE_INT);
-            let tok = pointer_difference(&mut fx.fd, op).expect("a byte-pointer difference");
+            let tok = pointer_difference(&mut fx.fd, op).unwrap().expect("a byte-pointer difference");
             assert!(Rc::ptr_eq(&tok, &long), "the result is a ptrdiff_t");
         }
     }
@@ -1105,7 +1105,7 @@ fn other_differences_keep_the_integer_form() {
     let lp = fx.ptr(Rc::clone(&long));
     let (op, _, _) = difference(&mut fx, Rc::clone(&lp), lp, Rc::clone(&long));
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::DiffPointee)));
 
     let mut fx = Fx::new();
     let long = fx.base(8, type_metatype::TYPE_INT);
@@ -1114,21 +1114,21 @@ fn other_differences_keep_the_integer_form() {
     let (pc, puc) = (fx.ptr(c), fx.ptr(uc));
     let (op, _, _) = difference(&mut fx, pc, puc, Rc::clone(&long));
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::DiffPointee)));
 
     let mut fx = Fx::new();
     let long = fx.base(8, type_metatype::TYPE_INT);
     let vp = fx.void_ptr();
     let (op, _, _) = difference(&mut fx, Rc::clone(&vp), vp, long);
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffPointee)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::DiffPointee)));
 
     let mut fx = Fx::new();
     let c = fx.base(1, type_metatype::TYPE_INT);
     let cp = fx.ptr(c);
     let (op, _, _) = difference(&mut fx, Rc::clone(&cp), Rc::clone(&cp), cp);
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffResult)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::DiffResult)));
 
     let mut fx = Fx::new();
     let long = fx.base(8, type_metatype::TYPE_INT);
@@ -1138,7 +1138,7 @@ fn other_differences_keep_the_integer_form() {
     let k = fx.konst(8, 0x1000);
     let op = fx.binary(OpCode::CPUI_INT_SUB, b, k, long);
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::DiffNotPointers)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::DiffNotPointers)));
 }
 
 /// An operand that is an integer the pass cast to a pointer costs the integer
@@ -1157,7 +1157,7 @@ fn a_difference_that_saves_no_cast_keeps_the_integer_form() {
     fx.binary(OpCode::CPUI_COPY, b2, b2, Rc::clone(&cp));
     let op = fx.binary(OpCode::CPUI_INT_SUB, a, b2, Rc::clone(&long));
     fx.high();
-    assert!(matches!(pointer_difference(&mut fx.fd, op), Err(Leave::NoCastSaved)));
+    assert!(matches!(pointer_difference(&mut fx.fd, op).unwrap(), Err(Leave::NoCastSaved)));
 }
 
 #[test]
@@ -1169,7 +1169,7 @@ fn the_cast_pass_leaves_a_byte_pointer_difference_uncast_only_when_the_option_is
         let cp = fx.ptr(c);
         let (op, a, b) = difference(&mut fx, Rc::clone(&cp), cp, long);
         fx.high();
-        let _ = fx.fd.action_set_casts();
+        let _ = fx.fd.action_set_casts().unwrap();
         let uncast = fx.input(op, 0) == a && fx.input(op, 1) == b;
         assert_eq!(uncast, on, "castindex {on}");
     }

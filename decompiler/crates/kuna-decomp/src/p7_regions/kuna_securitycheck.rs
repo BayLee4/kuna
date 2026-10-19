@@ -238,9 +238,9 @@ impl Action for ActionRemoveSecurityCheck {
         }))
     }
 
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !self.enabled && !data.get_arch().strip_security_check {
-            return 0; // P0 assertion not set
+            return Ok(0); // P0 assertion not set
         }
         let size = data.bblocks_get_size();
         for i in 0..size {
@@ -285,9 +285,9 @@ impl Action for ActionRemoveSecurityCheck {
                 .expect("ActionRemoveSecurityCheck: removeUnreachableBlocks");
             self.base.count += 1;
             // One check per apply; the fullloop re-invokes and self-gates.
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 

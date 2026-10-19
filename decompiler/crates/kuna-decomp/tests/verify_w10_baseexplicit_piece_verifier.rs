@@ -127,7 +127,7 @@ fn render_one(stem: &str, which: usize) -> Result<String, String> {
     let space = arch.manage().get_space_by_name(&space_name).ok_or(format!("no space {space_name}"))?.clone();
     let entry = Address::new(space, off);
     let fd = decompile_func(arch, &name, entry, 0).map_err(|e| format!("decompile: {e}"))?;
-    Ok(print_c(arch, &fd))
+    Ok(print_c(arch, &fd).unwrap())
 }
 fn skippable(e: &str) -> bool {
     e.contains("not built") || e.contains("no .sla") || e.contains("resolved no .sla")

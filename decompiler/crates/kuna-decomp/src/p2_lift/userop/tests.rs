@@ -20,6 +20,7 @@ use crate::pcodeinject;
 // tests exercise the genuine library bookkeeping (parse/compile is the seam).
 struct TestArch {
     user_op_names: Vec<Vec<u8>>,
+    enumeration_error: bool,
     lib: PcodeInjectLibrarySleigh,
     uniq: Rc<AddrSpace>,
     code: Rc<AddrSpace>,
@@ -39,7 +40,13 @@ impl TestArch {
             1,
             1,
         ));
-        TestArch { user_op_names, lib: PcodeInjectLibrarySleigh::new(0x1000), uniq, code }
+        TestArch {
+            user_op_names,
+            enumeration_error: false,
+            lib: PcodeInjectLibrarySleigh::new(0x1000),
+            uniq,
+            code,
+        }
     }
 }
 
@@ -53,8 +60,11 @@ impl InjectArchitecture for TestArch {
 }
 
 impl UseropArchitecture for TestArch {
-    fn get_user_op_names(&self) -> Vec<Vec<u8>> {
-        self.user_op_names.clone()
+    fn get_user_op_names(&self) -> KunaResult<Vec<Vec<u8>>> {
+        if self.enumeration_error {
+            return Err(KunaError::lowlevel("userop enumeration failed"));
+        }
+        Ok(self.user_op_names.clone())
     }
     fn decode_inject(
         &mut self,
@@ -101,6 +111,21 @@ fn manager() -> AddrSpaceManager {
 }
 
 // --- Constructors / BUILTIN ids -------------------------------------------
+
+#[test]
+fn enumeration_failure_preserves_existing_userops() {
+    let mut arch = TestArch::new(vec![b"existing".to_vec()]);
+    let mut manage = UserOpManage::new();
+    manage.initialize(&arch).unwrap();
+    arch.user_op_names = vec![b"uncommitted".to_vec()];
+    arch.enumeration_error = true;
+
+    let error = manage.initialize(&arch).unwrap_err();
+
+    assert!(error.to_string().contains("userop enumeration failed"));
+    assert_eq!(manage.get_op(0).unwrap().get_name(), b"existing");
+    assert!(manage.get_op_by_name(b"uncommitted").is_none());
+}
 
 #[test]
 fn builtin_ids_are_pinned() {

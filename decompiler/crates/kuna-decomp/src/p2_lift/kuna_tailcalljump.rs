@@ -243,13 +243,13 @@ pub fn kuna_is_tail_call_table(
     dest_is_known_function: bool,
     dest_is_self: bool,
     dest_outside_extent: bool,
-    call_states_the_body: impl FnOnce() -> bool,
-) -> bool {
-    gate
+    call_states_the_body: impl FnOnce() -> KunaResult<bool>,
+) -> KunaResult<bool> {
+    Ok(gate
         && dest_is_known_function
         && !dest_is_self
         && data.obank().get(op).is_some_and(|o| o.code() == OpCode::CPUI_BRANCHIND)
-        && (dest_outside_extent || call_states_the_body())
+        && (dest_outside_extent || call_states_the_body()?))
 }
 
 /// (kuna) What a callee's stated prototype fixes about a call to it: the

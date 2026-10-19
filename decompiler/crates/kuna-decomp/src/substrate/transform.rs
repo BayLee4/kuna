@@ -1091,7 +1091,7 @@ impl TransformManager {
         let mut input_list: Vec<TVarRef> = Vec::new();
         self.create_ops(fd)?;
         self.create_varnodes(fd, &mut input_list)?;
-        self.remove_old(fd);
+        self.remove_old(fd)?;
         self.transform_input_varnodes(fd, &input_list)?;
         self.place_inputs(fd)?;
         Ok(())
@@ -1314,7 +1314,7 @@ impl TransformManager {
                 {
                     let original = self.var(rvn).vn.expect("create_var_replacement: piece temp has no vn");
                     let replacement = self.var(rvn).replacement.expect("create_var_replacement: temp created");
-                    fd.kuna_inherit_storage_slice(replacement, original, (self.var(rvn).val / 8) as int4, byte_size);
+                    fd.kuna_inherit_storage_slice(replacement, original, (self.var(rvn).val / 8) as int4, byte_size)?;
                 }
                 Ok(())
             }
@@ -1338,7 +1338,7 @@ impl TransformManager {
                 let def = self.var(rvn).def;
                 let replacement = match def {
                     None => {
-                        fd.new_varnode(byte_size, &addr, None)
+                        fd.new_varnode(byte_size, &addr, None)?
                     }
                     Some(def_rop) => {
                         let def_repl = self.new_ops[def_rop.0]
@@ -1348,7 +1348,7 @@ impl TransformManager {
                     }
                 };
                 self.var_mut(rvn).replacement = Some(replacement);
-                fd.kuna_inherit_storage_slice(replacement, vn, lsb_byte_pos, byte_size);
+                fd.kuna_inherit_storage_slice(replacement, vn, lsb_byte_pos, byte_size)?;
                 fd.transfer_varnode_properties(vn, replacement, lsb_byte_pos);
                 Ok(())
             }
@@ -1365,16 +1365,17 @@ impl TransformManager {
 
     /// Remove old preexisting PcodeOps that are now obsolete (C++
     /// `TransformManager::removeOld`, transform.cc:713).
-    fn remove_old(&mut self, fd: &mut Funcdata) {
+    fn remove_old(&mut self, fd: &mut Funcdata) -> KunaResult<()> {
         for i in 0..self.new_ops.len() {
             let special = self.new_ops[i].special;
             if (special & top_special::op_replacement) != 0 {
                 let op = self.new_ops[i].op.expect("remove_old: op_replacement op is null");
                 if !fd.obank().get(op).expect("remove_old: stale op").is_dead() {
-                    fd.op_destroy(op);
+                    fd.op_destroy(op)?;
                 }
             }
         }
+        Ok(())
     }
 
     /// Remove old input Varnodes, mark new input Varnodes (C++

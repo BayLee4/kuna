@@ -58,9 +58,9 @@ impl Action for ProbeAction {
     fn base_mut(&mut self) -> &mut ActionBase {
         &mut self.base
     }
-    fn apply(&mut self, _: &mut Funcdata, _: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _: &mut Funcdata, _: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         assert!(!self.panic, "intentional test action panic");
-        0
+        Ok(0)
     }
     fn clone_filtered(&self, _: &ActionGroupList) -> Option<Box<dyn Action>> {
         None
@@ -114,7 +114,7 @@ fn nested_panic_closes_frames_and_later_actions_publish() {
     let mut group = ActionGroup::new(0, "outer");
     group.add_action(Box::new(ProbeAction::new("panics", true)));
 
-    assert!(catch_unwind(AssertUnwindSafe(|| group.perform(&mut data, &mut context))).is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| group.perform(&mut data, &mut context).unwrap())).is_err());
     let after_panic = actionprof::render();
     assert_eq!(calls(&after_panic, "probe/panics"), 1);
     assert_eq!(calls(&after_panic, "probe/outer"), 1);
@@ -122,7 +122,7 @@ fn nested_panic_closes_frames_and_later_actions_publish() {
 
     for count in 1..=2 {
         assert_eq!(
-            ProbeAction::new("healthy", false).perform(&mut data, &mut context),
+            ProbeAction::new("healthy", false).perform(&mut data, &mut context).unwrap(),
             0
         );
         let table = actionprof::render();
@@ -133,7 +133,7 @@ fn nested_panic_closes_frames_and_later_actions_publish() {
 
     std::env::set_var(actionprof::ENV_VAR, &scratch.0);
     assert_eq!(
-        ProbeAction::new("healthy", false).perform(&mut data, &mut context),
+        ProbeAction::new("healthy", false).perform(&mut data, &mut context).unwrap(),
         0
     );
     assert_eq!(calls(&actionprof::render(), "probe/healthy"), 3);

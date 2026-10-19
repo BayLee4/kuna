@@ -73,6 +73,32 @@ fn a_pointer_parameter_pulls_in_its_pointee_struct() {
     assert_eq!(walk(&[ptr_to(s)]), vec!["struct_0".to_string()]);
 }
 
+#[test]
+fn callback_source_formals_and_result_precede_the_callback_typedef() {
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
+    use crate::fspec::{FuncProto, ProtoModel, PrototypePieces};
+    let factory = TypeFactoryImpl::new();
+    factory.set_default_alignment_map();
+    factory.set_max_basetype_size(8);
+    let byte = factory.get_base(1, type_metatype::TYPE_UINT).unwrap();
+    let flags = factory.get_typedef(&byte, "Flags", 0, 0).unwrap();
+    let integer = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let result = factory.get_typedef(&integer, "Result", 0, 0).unwrap();
+    let pieces = PrototypePieces {
+        outtype: Some(result),
+        intypes: vec![flags],
+        innames: vec!["value".into()],
+        ..PrototypePieces::default()
+    };
+    let model = Rc::new(ProtoModel::new(&kuna_base::space::AddrSpaceManager::new()));
+    let proto = FuncProto::from_logical(&pieces, model, &factory).unwrap();
+    let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+    code.kind = DatatypeKind::Code { proto: Some(Rc::new(proto)) };
+    let pointer = ptr_to(Rc::new(code));
+    let callback = factory.get_typedef(&pointer, "Callback", 0, 0).unwrap();
+    assert_eq!(walk(&[callback]), ["Result", "Flags", "Callback"]);
+}
+
 /// Definition-before-use: an inner struct reached through an outer struct's
 /// field lands BEFORE the outer one.
 #[test]
@@ -115,7 +141,7 @@ fn core_and_unnamed_types_are_never_defined() {
 fn an_incomplete_struct_defines_as_the_opaque_forward_declaration() {
     let f = opaque("FILE");
     assert!(is_definable(&f));
-    assert_eq!(definition_text(&f, RealTypeCtx::OFF), "typedef struct FILE FILE; /* opaque */\n");
+    assert_eq!(definition_text(&f, &RealTypeCtx::OFF), "typedef struct FILE FILE; /* opaque */\n");
 }
 
 /// A complete struct defines as its body — the text `structscore.py`'s layout
@@ -130,9 +156,44 @@ fn a_complete_struct_defines_as_its_body() {
         &[(0, "field_0x0", ptr_to(u1)), (8, "field_0x8", Rc::clone(&i4))],
     );
     assert_eq!(
-        definition_text(&s, RealTypeCtx::OFF),
+        definition_text(&s, &RealTypeCtx::OFF),
         "struct struct_0 {\n    undefined1 *field_0x0;\n    int4 field_0x8;\n};\n"
     );
+}
+
+#[test]
+fn invocation_names_reach_nested_declarations_without_renaming_field_identifiers() {
+    let integer = core(4, type_metatype::TYPE_INT, "int4");
+    let first = struct_of("Record", 4, &[(0, "first", Rc::clone(&integer))]);
+    let mut other = (*struct_of("Record", 4, &[(0, "second", integer)])).clone();
+    other.id = first.id + 1;
+    let second = Rc::new(other);
+    let owner = struct_of("Owner", 8, &[(0, "Record", ptr_to(Rc::clone(&second)))]);
+    let mut forward = (*opaque("Record")).clone();
+    forward.id = first.id;
+    let identities = dedup_by_identity(&[Rc::new(forward), Rc::clone(&first), Rc::clone(&second)]);
+    assert_eq!(identities.len(), 2);
+    assert!(Rc::ptr_eq(&identities[0], &first));
+    assert!(Rc::ptr_eq(&identities[1], &second));
+    let names = std::collections::BTreeMap::from([
+        (Rc::as_ptr(&first) as usize, "Record".into()),
+        (Rc::as_ptr(&second) as usize, "Record__kuna_2".into()),
+    ]);
+    let rendered = crate::printc::render_type_definitions_with_names(
+        &[Rc::clone(&first), Rc::clone(&second), Rc::clone(&owner)],
+        &RealTypeCtx::OFF,
+        Some(&names),
+        None,
+    );
+    assert!(rendered.contains("struct Record {\n    int4 first;\n};"), "{rendered}");
+    assert!(rendered.contains("struct Record__kuna_2 {\n    int4 second;\n};"), "{rendered}");
+    assert!(rendered.contains("Record__kuna_2 *Record;"), "{rendered}");
+    assert!(!rendered.contains("duplicate type name skipped"), "{rendered}");
+    assert_eq!(
+        definition_text_with_names(&owner, &RealTypeCtx::OFF, Some(&names), None),
+        "struct Owner {\n    Record__kuna_2 *Record;\n};\n",
+    );
+    assert_eq!(second.get_name(), "Record");
 }
 
 /// A DWARF image holds both the forward-declared and the defined `_IO_FILE`;

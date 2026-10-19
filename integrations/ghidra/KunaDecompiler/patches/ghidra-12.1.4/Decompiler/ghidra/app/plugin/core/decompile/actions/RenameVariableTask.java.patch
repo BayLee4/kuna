@@ -1,0 +1,25 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RenameVariableTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RenameVariableTask.java
+@@ -21,7 +21,7 @@
+ import ghidra.program.model.listing.Function;
+ import ghidra.program.model.listing.Program;
+ import ghidra.program.model.pcode.*;
+-import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
++
+ import ghidra.program.model.symbol.SourceType;
+ import ghidra.util.exception.DuplicateNameException;
+ import ghidra.util.exception.InvalidInputException;
+@@ -49,11 +49,8 @@
+ 
+ 	@Override
+ 	public void commit() throws DuplicateNameException, InvalidInputException {
+-		if (commitRequired) {
+-			HighFunctionDBUtil.commitParamsToDatabase(hfunction, false,
+-				ReturnCommitOption.NO_COMMIT, signatureSrcType);
+-		}
+-		HighFunctionDBUtil.updateDBVariable(highSymbol, newName, null, srctype);
++		HighFunctionDBUtil.updateDBVariableAndCommitParameters(highSymbol, newName, null,
++			srctype, commitRequired, false, signatureSrcType);
+ 	}
+ 
+ 	@Override

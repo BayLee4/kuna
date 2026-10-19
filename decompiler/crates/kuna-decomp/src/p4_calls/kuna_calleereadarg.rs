@@ -332,43 +332,49 @@ pub(crate) fn extension<'a>(row: &'a [Option<Slot>], used: &HashSet<int4>) -> Ve
 /// Extend each captured call's final argument list with the registers its
 /// callee reads, once every other rule has settled it. Returns how many calls
 /// gained arguments.
-pub fn extend_pending(data: &mut Funcdata, pending: &[PendingReadArg]) -> int4 {
-    pending.iter().filter(|p| extend_one(data, p)).count() as int4
+pub fn extend_pending(data: &mut Funcdata, pending: &[PendingReadArg]) -> kuna_base::error::KunaResult<int4> {
+    let mut count = 0;
+    for pending in pending {
+        if extend_one(data, pending)? {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// [`extend_pending`] for one call.
-fn extend_one(data: &mut Funcdata, p: &PendingReadArg) -> bool {
-    let Some(idx) = data.get_call_specs_index(p.op) else { return false };
+fn extend_one(data: &mut Funcdata, p: &PendingReadArg) -> kuna_base::error::KunaResult<bool> {
+    let Some(idx) = data.get_call_specs_index(p.op) else { return Ok(false) };
     let current = data.get_call_specs(idx).final_input_storage().to_vec();
     let inputs: Vec<VarnodeId> = match data.obank().get(p.op) {
         Some(o) if !o.is_dead() && o.code() == OpCode::CPUI_CALL => {
             (0..o.num_input()).filter_map(|i| o.get_in(i)).collect()
         }
-        _ => return false,
+        _ => return Ok(false),
     };
     if inputs.len() != current.len() + 1 {
-        return false;
+        return Ok(false);
     }
     let mut have: Vec<(int4, VarnodeId, (Address, int4))> = Vec::new();
     for (k, (a, s)) in current.iter().enumerate() {
-        let Some(&(_, index)) = p.order.iter().find(|(x, _)| x == a) else { return false };
+        let Some(&(_, index)) = p.order.iter().find(|(x, _)| x == a) else { return Ok(false) };
         have.push((index, inputs[k + 1], (a.clone(), *s)));
     }
     if have.windows(2).any(|w| w[0].0 >= w[1].0) {
-        return false;
+        return Ok(false);
     }
     let used: HashSet<int4> = have.iter().map(|h| h.0).collect();
     let added: Vec<Slot> = extension(&p.row, &used).into_iter().cloned().collect();
     if added.is_empty() {
-        return false;
+        return Ok(false);
     }
     for s in &added {
-        let Some(vn) = s.vn else { return false };
-        let Some(vsize) = data.vbank().get(vn).map(|v| v.get_size()) else { return false };
+        let Some(vn) = s.vn else { return Ok(false) };
+        let Some(vsize) = data.vbank().get(vn).map(|v| v.get_size()) else { return Ok(false) };
         let arg = if vsize > s.width {
-            match crate::p4_calls::kuna_passthrough::truncate_before(data, vn, s.width, p.op) {
+            match crate::p4_calls::kuna_passthrough::truncate_before(data, vn, s.width, p.op)? {
                 Some(v) => v,
-                None => return false,
+                None => return Ok(false),
             }
         } else {
             vn
@@ -380,10 +386,10 @@ fn extend_one(data: &mut Funcdata, p: &PendingReadArg) -> bool {
     let mut newparam = vec![inputs[0]];
     newparam.extend(have.iter().map(|h| h.1));
     if data.op_set_all_input(p.op, &newparam).is_err() {
-        return false;
+        return Ok(false);
     }
     data.get_call_specs_mut(idx).set_final_input_storage(have.into_iter().map(|h| h.2).collect());
-    true
+    Ok(true)
 }
 
 #[cfg(test)]

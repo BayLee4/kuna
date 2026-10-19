@@ -33,6 +33,11 @@
     default. The option is a printer flag, so it can be set anywhere before
     `print C`; after `clear architecture` it is back at its default.
 
+    The direct byte read in w_buffer keeps its machine sign conversion in both
+    passes, independently of naming the buffer's address. `(signed char)`
+    pins that interpretation while C promotes it for `+ 1`; no outer int4 cast
+    is needed. This fixture's memset fixes the selected byte at 0x78.
+
     Source: decompiler/crates/kuna-analysis/tests/fixtures/globalref_x86_64.c
 -->
 <bytechunk space="ram" offset="0x100000" readonly="true">
@@ -80,6 +85,6 @@ c3
 <stringmatch name="KUNA-GLOBALREF #4: on, it is the address of the global" min="1" max="1">strlen\(&amp;dat_30002034\)</stringmatch>
 <stringmatch name="KUNA-GLOBALREF #5: storage also read directly as a long keeps the cast in both passes" min="2" max="2">dat_300040a0 \+ strlen\(\(char \*\)0x300040a0\)</stringmatch>
 <stringmatch name="KUNA-GLOBALREF #6: a value the function also divides by keeps the cast in both passes" min="2" max="2">memset\(\(void \*\)0x300040c0,0,4\);</stringmatch>
-<stringmatch name="KUNA-GLOBALREF #7: the direct read beside the named buffer is unchanged" min="2" max="2">return dat_300040c3 \+ 1;</stringmatch>
+<stringmatch name="KUNA-GLOBALREF #7: the direct read beside the named buffer is unchanged" min="2" max="2">return \(signed char\)dat_300040c3 \+ 1;</stringmatch>
 <stringmatch name="KUNA-GLOBALREF #8: the buffer the function also reads as a long is never named by address" min="0" max="0">&amp;dat_300040a0</stringmatch>
 </decompilertest>

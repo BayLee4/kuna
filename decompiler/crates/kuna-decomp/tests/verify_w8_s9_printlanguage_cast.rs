@@ -145,8 +145,8 @@ impl CastContext for LongCtx {
     fn vn_high_type(&self, _vn: VnRef) -> Rc<Datatype> {
         Rc::clone(&self.ty)
     }
-    fn vn_high_type_read_facing(&self, _vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.ty)
+    fn vn_high_type_read_facing(&self, _vn: VnRef, _op: OpRef) -> kuna_base::error::KunaResult<Rc<Datatype>> {
+        Ok(Rc::clone(&self.ty))
     }
     fn op_inherits_sign(&self, _op: OpRef) -> bool {
         false

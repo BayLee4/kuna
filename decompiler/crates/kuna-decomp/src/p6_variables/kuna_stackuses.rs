@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_num::opcodes::OpCode;
 
@@ -11,23 +12,19 @@ use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::userop::BUILTIN_VOLATILE_WRITE;
 
-fn storage_type(fd: &Funcdata, address: &Address, width: i32) -> Option<Rc<Datatype>> {
-    let entry = fd
+fn storage_type(fd: &Funcdata, address: &Address, width: i32) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(entry) = fd
         .get_arch()
-        .query_container_global(address, width, &Address::new_invalid())?;
+        .query_container_global(address, width, &Address::new_invalid())? else { return Ok(None) };
     if !entry.is_type_locked() {
-        return None;
+        return Ok(None);
     }
-    let offset = address
-        .get_offset()
-        .checked_sub(entry.entry_addr.get_offset())?;
-    let offset = i32::try_from(offset)
-        .ok()?
-        .checked_add(entry.symbol_offset)?;
-    fd.get_arch()
-        .types()?
-        .get_exact_piece(entry.symbol_type?, offset, width)
-        .ok()?
+    let Some((factory, ty, offset)) = (|| {
+        let offset = address.get_offset().checked_sub(entry.entry_addr.get_offset())?;
+        let offset = i32::try_from(offset).ok()?.checked_add(entry.symbol_offset)?;
+        Some((fd.get_arch().types()?, entry.symbol_type?, offset))
+    })() else { return Ok(None) };
+    factory.get_exact_piece(ty, offset, width)
 }
 
 fn pointed_storage(fd: &Funcdata, mut id: VarnodeId, width: i32) -> Option<Rc<Datatype>> {
@@ -86,78 +83,79 @@ fn pointed_storage(fd: &Funcdata, mut id: VarnodeId, width: i32) -> Option<Rc<Da
     None
 }
 
-pub(crate) fn input_contract(fd: &Funcdata, id: OpId, slot: i32) -> Option<Rc<Datatype>> {
-    let op = fd.obank().get(id).filter(|op| !op.is_dead())?;
+pub(crate) fn input_contract(fd: &Funcdata, id: OpId, slot: i32) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(op) = fd.obank().get(id).filter(|op| !op.is_dead()) else { return Ok(None) };
     if op.is_marker() || op.is_return_copy() {
-        return None;
+        return Ok(None);
     }
     let contract = match op.code() {
         OpCode::CPUI_CALL | OpCode::CPUI_CALLIND if slot > 0 => {
-            let spec = fd.get_call_specs(fd.get_call_specs_index(id)?);
+            let Some(index) = fd.get_call_specs_index(id) else { return Ok(None) };
+            let spec = fd.get_call_specs(index);
             if !spec.proto().has_store() {
-                return None;
+                return Ok(None);
             }
-            let param = spec.proto().get_param(slot - 1)?;
+            let Some(param) = spec.proto().get_param(slot - 1) else { return Ok(None) };
             if !param.is_type_locked() {
-                return None;
+                return Ok(None);
             }
-            param.get_type()?.clone()
+            param.get_type().cloned()
         }
         OpCode::CPUI_COPY if slot == 0 => {
-            let out = fd.vbank().get(op.get_out()?)?;
+            let Some(out) = op.get_out().and_then(|id| fd.vbank().get(id)) else { return Ok(None) };
             if out.is_persist() {
                 storage_type(fd, out.get_addr(), out.get_size())?
             } else if out.is_type_lock() {
-                out.get_type().clone()
+                Some(out.get_type().clone())
             } else {
-                return None;
+                return Ok(None);
             }
         }
         OpCode::CPUI_STORE if slot == 2 => {
-            let destination = fd.vbank().get(op.get_in(1)?)?;
-            let width = fd.vbank().get(op.get_in(2)?)?.get_size();
+            let Some((destination, width)) = (|| {
+                Some((fd.vbank().get(op.get_in(1)?)?, fd.vbank().get(op.get_in(2)?)?.get_size()))
+            })() else { return Ok(None) };
             if destination.is_constant() {
-                let index = fd.vbank().get(op.get_in(0)?)?.get_offset();
-                let space = fd
-                    .get_arch()
-                    .manage()
-                    .get_space(i32::try_from(index).ok()?)?;
+                let Some(space) = (|| {
+                    let index = fd.vbank().get(op.get_in(0)?)?.get_offset();
+                    fd.get_arch().manage().get_space(i32::try_from(index).ok()?)
+                })() else { return Ok(None) };
                 let address = Address::new(
                     space.clone(),
                     AddrSpace::address_to_byte(destination.get_offset(), space.get_word_size()),
                 );
                 storage_type(fd, &address, width)?
             } else {
-                pointed_storage(fd, op.get_in(1)?, width)?
+                pointed_storage(fd, op.get_in(1).expect("store destination present"), width)
             }
         }
         OpCode::CPUI_CALLOTHER if slot == 2 => {
-            let code = fd.vbank().get(op.get_in(0)?)?;
+            let Some(code) = op.get_in(0).and_then(|id| fd.vbank().get(id)) else { return Ok(None) };
             if !code.is_constant() || code.get_offset() != BUILTIN_VOLATILE_WRITE as u64 {
-                return None;
+                return Ok(None);
             }
-            let target = fd.vbank().get(op.get_in(1)?)?;
-            let width = fd.vbank().get(op.get_in(2)?)?.get_size();
+            let Some((target, width)) = (|| {
+                Some((fd.vbank().get(op.get_in(1)?)?, fd.vbank().get(op.get_in(2)?)?.get_size()))
+            })() else { return Ok(None) };
             storage_type(fd, target.get_addr(), width)?
         }
         OpCode::CPUI_RETURN if slot == 1 && fd.get_func_proto().is_output_locked() => {
-            fd.get_func_proto().get_output_type()?.clone()
+            fd.get_func_proto().get_output_type().cloned()
         }
-        _ => return None,
+        _ => return Ok(None),
     };
-    Some(contract)
+    Ok(contract)
 }
 
-pub(crate) fn declared_view(fd: &Funcdata, id: OpId, slot: i32) -> Option<Rc<Datatype>> {
-    let pointer = input_contract(fd, id, slot)?;
+pub(crate) fn declared_view(fd: &Funcdata, id: OpId, slot: i32) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(pointer) = input_contract(fd, id, slot)? else { return Ok(None) };
     if pointer.get_metatype() != type_metatype::TYPE_PTR {
-        return None;
+        return Ok(None);
     }
-    let view = pointer.get_ptr_to()?;
-    (!view.is_incomplete() && view.get_size() > 0).then_some(view)
+    Ok(pointer.get_ptr_to().filter(|view| !view.is_incomplete() && view.get_size() > 0))
 }
 
-pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
+pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) -> KunaResult<()> {
     let mut uses = Vec::new();
     for id in fd.obank().iter_alive() {
         let op = fd.obank().get(id).unwrap();
@@ -165,7 +163,7 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
             continue;
         }
         for slot in 0..op.num_input() {
-            if let Some(ty) = declared_view(fd, id, slot) {
+            if let Some(ty) = declared_view(fd, id, slot)? {
                 uses.push((id, slot, ty));
             }
         }
@@ -223,4 +221,5 @@ pub(crate) fn prepare_casts(fd: &mut Funcdata, factory: &dyn TypeFactory) {
             }
         }
     }
+    Ok(())
 }

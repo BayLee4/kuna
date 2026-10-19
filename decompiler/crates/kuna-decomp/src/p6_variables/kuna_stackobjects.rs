@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_num::opcodes::OpCode;
 
@@ -324,19 +325,19 @@ impl Origins<'_> {
 }
 
 /// Keep content families separate without assigning them different addresses.
-pub fn recover(fd: &mut Funcdata) {
+pub fn recover(fd: &mut Funcdata) -> KunaResult<()> {
     fd.stack_objects.clear();
     if !fd.get_arch().stack_views {
-        return;
+        return Ok(());
     }
     let Some(space) = fd
         .get_scope_local()
         .map(|scope| Rc::clone(scope.get_space_id()))
     else {
-        return;
+        return Ok(());
     };
     if space.get_word_size() != 1 || !(1..=8).contains(&space.get_addr_size()) {
-        return;
+        return Ok(());
     }
     let mut requests = Vec::new();
     let mut total = 0;
@@ -345,7 +346,7 @@ pub fn recover(fd: &mut Funcdata) {
             continue;
         };
         for slot in 0..op.num_input() {
-            let Some(ty) = crate::kuna_stackviews::declared_view(fd, call, slot) else {
+            let Some(ty) = crate::kuna_stackviews::declared_view(fd, call, slot)? else {
                 continue;
             };
             if ty.get_size() > MAX_OBJECT_SIZE {
@@ -416,12 +417,12 @@ pub fn recover(fd: &mut Funcdata) {
         }
     }
     fd.stack_objects = objects;
+    Ok(())
 }
 
-pub(crate) fn finish(fd: &mut Funcdata) {
+pub(crate) fn finish(fd: &mut Funcdata) -> KunaResult<()> {
     if fd.stack_objects.is_empty() {
-        recover(fd);
-        return;
+        return recover(fd);
     }
     let mut objects = std::mem::take(&mut fd.stack_objects);
     for object in &mut objects {
@@ -434,6 +435,7 @@ pub(crate) fn finish(fd: &mut Funcdata) {
     }
     objects.retain(|object| !object.uses.is_empty());
     fd.stack_objects = objects;
+    Ok(())
 }
 
 pub fn describe(fd: &Funcdata) -> String {

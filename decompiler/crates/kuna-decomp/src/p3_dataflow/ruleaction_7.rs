@@ -202,21 +202,21 @@ impl Rule for RuleSignDiv2 {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = op_in(data, op, 1).expect("signdiv2: missing in1");
         if !vn_is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         if vn_offset(data, in1) != 1 {
-            return 0;
+            return Ok(0);
         }
         let addout = op_in(data, op, 0).expect("signdiv2: missing in0");
         if !vn_is_written(data, addout) {
-            return 0;
+            return Ok(0);
         }
         let addop = vn_def(data, addout).expect("signdiv2: addout written");
         if op_code(data, addop) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         let mut i: int4 = 0;
         let mut a: Option<VarnodeId> = None;
@@ -273,7 +273,7 @@ impl Rule for RuleSignDiv2 {
             break;
         }
         if i == 2 {
-            return 0;
+            return Ok(0);
         }
         let a = a.expect("signdiv2: a set when i<2");
 
@@ -282,7 +282,7 @@ impl Rule for RuleSignDiv2 {
         let two = data.new_constant(asize, 2);
         data.op_set_input(op, two, 1).expect("signdiv2: opSetInput 2");
         data.op_set_opcode(op, typeop_for(OpCode::CPUI_INT_SDIV));
-        1
+        Ok(1)
     }
 }
 
@@ -320,27 +320,27 @@ impl Rule for RuleDivChain {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc2 = op_code(data, op);
         let const_vn2 = op_in(data, op, 1).expect("divchain: in1");
         if !vn_is_constant(data, const_vn2) {
-            return 0;
+            return Ok(0);
         }
         let vn = op_in(data, op, 0).expect("divchain: in0");
         if !vn_is_written(data, vn) {
-            return 0;
+            return Ok(0);
         }
         let div_op = vn_def(data, vn).expect("divchain: vn written");
         let opc1 = op_code(data, div_op);
         if opc1 != opc2 && (opc2 != OpCode::CPUI_INT_DIV || opc1 != OpCode::CPUI_INT_RIGHT) {
-            return 0;
+            return Ok(0);
         }
         let const_vn1 = op_in(data, div_op, 1).expect("divchain: divOp in1");
         if !vn_is_constant(data, const_vn1) {
-            return 0;
+            return Ok(0);
         }
         if data.lone_descend(vn).is_none() {
-            return 0;
+            return Ok(0);
         }
         let val1: uintb = if opc1 == opc2 {
             vn_offset(data, const_vn1)
@@ -354,13 +354,13 @@ impl Rule for RuleDivChain {
         };
         let base_vn = op_in(data, div_op, 0).expect("divchain: divOp in0");
         if vn_is_free(data, base_vn) {
-            return 0;
+            return Ok(0);
         }
         let sz = vn_size(data, vn);
         let val2 = vn_offset(data, const_vn2);
         let resval = val1.wrapping_mul(val2) & calc_mask(sz);
         if resval == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut val1 = val1;
         if signbit_negative(val1, sz) {
@@ -372,15 +372,15 @@ impl Rule for RuleDivChain {
         }
         let bitcount = mostsigbit_set(val1) + mostsigbit_set(val2) + 2;
         if opc2 == OpCode::CPUI_INT_DIV && bitcount > sz * 8 {
-            return 0;
+            return Ok(0);
         }
         if opc2 == OpCode::CPUI_INT_SDIV && bitcount > sz * 8 - 2 {
-            return 0;
+            return Ok(0);
         }
         data.op_set_input(op, base_vn, 0).expect("divchain: opSetInput base");
         let c = data.new_constant(sz, resval);
         data.op_set_input(op, c, 1).expect("divchain: opSetInput resval");
-        1
+        Ok(1)
     }
 }
 
@@ -418,22 +418,22 @@ impl Rule for RuleSignForm {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let sextout = op_in(data, op, 0).expect("signform: in0");
         if !vn_is_written(data, sextout) {
-            return 0;
+            return Ok(0);
         }
         let sextop = vn_def(data, sextout).expect("signform: sextout written");
         if op_code(data, sextop) != OpCode::CPUI_INT_SEXT {
-            return 0;
+            return Ok(0);
         }
         let a = op_in(data, sextop, 0).expect("signform: sextop in0");
         let c = vn_offset(data, op_in(data, op, 1).expect("signform: in1")) as int4;
         if c < vn_size(data, a) {
-            return 0;
+            return Ok(0);
         }
         if vn_is_free(data, a) {
-            return 0;
+            return Ok(0);
         }
 
         data.op_set_input(op, a, 0).expect("signform: opSetInput a");
@@ -441,7 +441,7 @@ impl Rule for RuleSignForm {
         let cn = data.new_constant(4, n as uintb);
         data.op_set_input(op, cn, 1).expect("signform: opSetInput n");
         data.op_set_opcode(op, typeop_for(OpCode::CPUI_INT_SRIGHT));
-        1
+        Ok(1)
     }
 }
 
@@ -483,36 +483,36 @@ impl Rule for RuleSignForm2 {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = op_in(data, op, 1).expect("signform2: in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         let in_vn = op_in(data, op, 0).expect("signform2: in0");
         let sizeout = vn_size(data, in_vn);
         if (vn_offset(data, const_vn) as int4) != sizeout * 8 - 1 {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_written(data, in_vn) {
-            return 0;
+            return Ok(0);
         }
         let sub_op = vn_def(data, in_vn).expect("signform2: inVn written");
         if op_code(data, sub_op) != OpCode::CPUI_SUBPIECE {
-            return 0;
+            return Ok(0);
         }
         let c = vn_offset(data, op_in(data, sub_op, 1).expect("signform2: subOp in1")) as int4;
         let mult_out = op_in(data, sub_op, 0).expect("signform2: subOp in0");
         let mult_size = vn_size(data, mult_out);
         // Must be extracting high part
         if c + sizeout != mult_size {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_written(data, mult_out) {
-            return 0;
+            return Ok(0);
         }
         let mult_op = vn_def(data, mult_out).expect("signform2: multOut written");
         if op_code(data, mult_op) != OpCode::CPUI_INT_MULT {
-            return 0;
+            return Ok(0);
         }
         // Search for the INT_SEXT
         let mut slot: int4 = 0;
@@ -531,37 +531,37 @@ impl Rule for RuleSignForm2 {
             slot += 1;
         }
         if slot > 1 {
-            return 0;
+            return Ok(0);
         }
         let sext_op = sext_op.expect("signform2: sextOp set when slot<=1");
         let a = op_in(data, sext_op, 0).expect("signform2: sextOp in0");
         if vn_is_free(data, a) || vn_size(data, a) != sizeout {
-            return 0;
+            return Ok(0);
         }
         let other_vn = op_in(data, mult_op, 1 - slot).expect("signform2: multOp 1-slot");
         // otherVn must be a positive integer and small enough...
         if vn_is_constant(data, other_vn) {
             if vn_offset(data, other_vn) > calc_mask(sizeout) {
-                return 0;
+                return Ok(0);
             }
             if 2 * sizeout > mult_size {
-                return 0;
+                return Ok(0);
             }
         } else if vn_is_written(data, other_vn) {
             let zext_op = vn_def(data, other_vn).expect("signform2: otherVn written");
             if op_code(data, zext_op) != OpCode::CPUI_INT_ZEXT {
-                return 0;
+                return Ok(0);
             }
             let zin = op_in(data, zext_op, 0).expect("signform2: zextOp in0");
             if vn_size(data, zin) + sizeout > mult_size {
-                return 0;
+                return Ok(0);
             }
         } else {
-            return 0;
+            return Ok(0);
         }
         data.op_set_input(op, a, 0).expect("signform2: opSetInput a");
         // return 0;   (faithful: the input set is NOT reported as a change)
-        0
+        Ok(0)
     }
 }
 
@@ -604,18 +604,18 @@ impl Rule for RuleSignNearMult {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = op_in(data, op, 1).expect("signnearmult: in1");
         if !vn_is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0).expect("signnearmult: in0");
         if !vn_is_written(data, in0) {
-            return 0;
+            return Ok(0);
         }
         let addop = vn_def(data, in0).expect("signnearmult: in0 written");
         if op_code(data, addop) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         let mut i: int4 = 0;
         let mut shiftvn: Option<VarnodeId> = None;
@@ -639,22 +639,22 @@ impl Rule for RuleSignNearMult {
             i += 1;
         }
         if i == 2 {
-            return 0;
+            return Ok(0);
         }
         let shiftvn = shiftvn.expect("signnearmult: shiftvn");
         let unshiftop = unshiftop.expect("signnearmult: unshiftop");
         let x = op_in(data, addop, 1 - i).expect("signnearmult: addop 1-i");
         if vn_is_free(data, x) {
-            return 0;
+            return Ok(0);
         }
         let mut n = vn_offset(data, op_in(data, unshiftop, 1).expect("signnearmult: unshiftop in1"))
             as int4;
         if n <= 0 {
-            return 0;
+            return Ok(0);
         }
         n = vn_size(data, shiftvn) * 8 - n;
         if n <= 0 {
-            return 0;
+            return Ok(0);
         }
         let mut mask = calc_mask(vn_size(data, shiftvn));
         // C++ `mask << n` on a uintb with x86 shift-count masking (count & 63);
@@ -663,26 +663,26 @@ impl Rule for RuleSignNearMult {
         // `n > 0` is guaranteed by the two `if n <= 0 { return 0 }` guards above.
         mask = mask.wshl(n as u32) & mask;
         if mask != vn_offset(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let sgnvn = op_in(data, unshiftop, 0).expect("signnearmult: unshiftop in0");
         if !vn_is_written(data, sgnvn) {
-            return 0;
+            return Ok(0);
         }
         let sshiftop = vn_def(data, sgnvn).expect("signnearmult: sgnvn written");
         if op_code(data, sshiftop) != OpCode::CPUI_INT_SRIGHT {
-            return 0;
+            return Ok(0);
         }
         if !vn_is_constant(data, op_in(data, sshiftop, 1).expect("signnearmult: sshiftop in1")) {
-            return 0;
+            return Ok(0);
         }
         if op_in(data, sshiftop, 0).expect("signnearmult: sshiftop in0") != x {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, op_in(data, sshiftop, 1).expect("signnearmult: sshiftop in1"))
             as int4;
         if val != 8 * vn_size(data, x) - 1 {
-            return 0;
+            return Ok(0);
         }
 
         // Same x86 shift-count masking as `mask` above; ADR-0003 `wshl` so a
@@ -695,7 +695,7 @@ impl Rule for RuleSignNearMult {
         let xsize = vn_size(data, x);
         let divvn = data.new_unique(xsize, None);
         if data.op_set_output(newdiv, divvn).is_err() {
-            return 0; // STUB(W3-output): construction deferred; see module doc.
+            return Ok(0); // STUB(W3-output): construction deferred; see module doc.
         }
         data.op_set_input(newdiv, x, 0).expect("signnearmult: newdiv in0");
         let c1 = data.new_constant(xsize, pow);
@@ -706,7 +706,7 @@ impl Rule for RuleSignNearMult {
         data.op_set_input(op, divvn, 0).expect("signnearmult: op in0");
         let c2 = data.new_constant(xsize, pow);
         data.op_set_input(op, c2, 1).expect("signnearmult: op in1");
-        1
+        Ok(1)
     }
 }
 
@@ -743,7 +743,7 @@ impl Rule for RuleModOpt {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let x = op_in(data, op, 0).expect("modopt: in0");
         let div = op_in(data, op, 1).expect("modopt: in1");
         let outvn = op_out(data, op).expect("modopt: out");
@@ -804,10 +804,10 @@ impl Rule for RuleModOpt {
                 } else {
                     data.op_set_opcode(addop, typeop_for(OpCode::CPUI_INT_SREM));
                 }
-                return 1;
+                return Ok(1);
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -868,19 +868,19 @@ impl Rule for RuleSignMod2nOpt {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = op_in(data, op, 1).expect("signmod2nopt: in1");
         if !vn_is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let shift_amt = vn_offset(data, in1) as int4;
         let in0 = op_in(data, op, 0).expect("signmod2nopt: in0");
         let a = match RuleSignMod2nOpt::check_sign_extraction(data, in0) {
             Some(a) => a,
-            None => return 0,
+            None => return Ok(0),
         };
         if vn_is_free(data, a) {
-            return 0;
+            return Ok(0);
         }
         let correct_vn = op_out(data, op).expect("signmod2nopt: out");
         let n = vn_size(data, a) * 8 - shift_amt;
@@ -1027,9 +1027,9 @@ impl Rule for RuleSignMod2nOpt {
             let asize = vn_size(data, a);
             let c = data.new_constant(asize, mask + 1);
             data.op_set_input(base_op, c, 1).expect("signmod2nopt: baseOp in1");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1067,21 +1067,21 @@ impl Rule for RuleSignMod2Opt {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = op_in(data, op, 1).expect("signmod2opt: in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         if vn_offset(data, const_vn) != 1 {
-            return 0;
+            return Ok(0);
         }
         let add_out = op_in(data, op, 0).expect("signmod2opt: in0");
         if !vn_is_written(data, add_out) {
-            return 0;
+            return Ok(0);
         }
         let add_op = vn_def(data, add_out).expect("signmod2opt: addOut written");
         if op_code(data, add_op) != OpCode::CPUI_INT_ADD {
-            return 0;
+            return Ok(0);
         }
         let mut mult_slot: int4 = 0;
         let mut mult_op: Option<OpId> = None;
@@ -1110,55 +1110,55 @@ impl Rule for RuleSignMod2Opt {
             mult_slot += 1;
         }
         if mult_slot > 1 {
-            return 0;
+            return Ok(0);
         }
         let mult_op = mult_op.expect("signmod2opt: multOp set");
         let mult_in0 = op_in(data, mult_op, 0).expect("signmod2opt: multOp in0");
         let mut base = match RuleSignMod2nOpt::check_sign_extraction(data, mult_in0) {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
         let mut other_base = op_in(data, add_op, 1 - mult_slot).expect("signmod2opt: addOp other");
         if base != other_base {
             if !vn_is_written(data, base) || !vn_is_written(data, other_base) {
-                return 0;
+                return Ok(0);
             }
             let sub_op = vn_def(data, base).expect("signmod2opt: base written");
             if op_code(data, sub_op) != OpCode::CPUI_SUBPIECE {
-                return 0;
+                return Ok(0);
             }
             let trunc_amt =
                 vn_offset(data, op_in(data, sub_op, 1).expect("signmod2opt: subOp in1")) as int4;
             // Must truncate all but high part
             let sub_in0 = op_in(data, sub_op, 0).expect("signmod2opt: subOp in0");
             if trunc_amt + vn_size(data, base) != vn_size(data, sub_in0) {
-                return 0;
+                return Ok(0);
             }
             base = sub_in0;
             let sub_op2 = vn_def(data, other_base).expect("signmod2opt: otherBase written");
             if op_code(data, sub_op2) != OpCode::CPUI_SUBPIECE {
-                return 0;
+                return Ok(0);
             }
             if vn_offset(data, op_in(data, sub_op2, 1).expect("signmod2opt: subOp2 in1")) != 0 {
-                return 0;
+                return Ok(0);
             }
             other_base = op_in(data, sub_op2, 0).expect("signmod2opt: subOp2 in0");
             if other_base != base {
-                return 0;
+                return Ok(0);
             }
             trunc = true;
         }
         if vn_is_free(data, base) {
-            return 0;
+            return Ok(0);
         }
         let mut and_out = op_out(data, op).expect("signmod2opt: out");
         if trunc {
             let ext_op = match data.lone_descend(and_out) {
                 Some(e) => e,
-                None => return 0,
+                None => return Ok(0),
             };
             if op_code(data, ext_op) != OpCode::CPUI_INT_ZEXT {
-                return 0;
+                return Ok(0);
             }
             and_out = op_out(data, ext_op).expect("signmod2opt: extOp out");
         }
@@ -1177,9 +1177,9 @@ impl Rule for RuleSignMod2Opt {
             let bsize = vn_size(data, base);
             let c = data.new_constant(bsize, 2);
             data.op_set_input(root_op, c, 1).expect("signmod2opt: rootOp in1");
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1361,56 +1361,56 @@ impl Rule for RuleSignMod2nOpt2 {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = op_in(data, op, 1).expect("signmod2nopt2: in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         let mask = calc_mask(vn_size(data, const_vn));
         if vn_offset(data, const_vn) != mask {
-            return 0; // Must be INT_MULT by -1
+            return Ok(0); // Must be INT_MULT by -1
         }
         let and_out = op_in(data, op, 0).expect("signmod2nopt2: in0");
         if !vn_is_written(data, and_out) {
-            return 0;
+            return Ok(0);
         }
         let and_op = vn_def(data, and_out).expect("signmod2nopt2: andOut written");
         if op_code(data, and_op) != OpCode::CPUI_INT_AND {
-            return 0;
+            return Ok(0);
         }
         let const_vn = op_in(data, and_op, 1).expect("signmod2nopt2: andOp in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         let npow = ((!vn_offset(data, const_vn)).wrapping_add(1)) & mask;
         if popcount(npow) != 1 {
-            return 0; // constVn must be of form 11111..000..
+            return Ok(0); // constVn must be of form 11111..000..
         }
         if npow == 1 {
-            return 0;
+            return Ok(0);
         }
         let adj_vn = op_in(data, and_op, 0).expect("signmod2nopt2: andOp in0");
         if !vn_is_written(data, adj_vn) {
-            return 0;
+            return Ok(0);
         }
         let adj_op = vn_def(data, adj_vn).expect("signmod2nopt2: adjVn written");
         let base: Option<VarnodeId>;
         if op_code(data, adj_op) == OpCode::CPUI_INT_ADD {
             if npow != 2 {
-                return 0; // Special mod 2 form
+                return Ok(0); // Special mod 2 form
             }
             base = RuleSignMod2nOpt2::check_sign_ext_form(data, adj_op);
         } else if op_code(data, adj_op) == OpCode::CPUI_MULTIEQUAL {
             base = RuleSignMod2nOpt2::check_multiequal_form(data, adj_op, npow);
         } else {
-            return 0;
+            return Ok(0);
         }
         let base = match base {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
         if vn_is_free(data, base) {
-            return 0;
+            return Ok(0);
         }
         let mult_out = op_out(data, op).expect("signmod2nopt2: out");
         for root_op in vn_descend(data, mult_out) {
@@ -1428,9 +1428,9 @@ impl Rule for RuleSignMod2nOpt2 {
             let c = data.new_constant(bsize, npow);
             data.op_set_input(root_op, c, 1).expect("signmod2nopt2: rootOp in1");
             data.op_set_opcode(root_op, typeop_for(OpCode::CPUI_INT_SREM));
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1472,11 +1472,11 @@ impl Rule for RuleSegment {
         }
     }
 
-    fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // STUB(W4): SegmentOp *segdef =
         // ... segdef->execute(bindlist) / hasFarPointerSupport / contiguous_test /
         // findContiguousWhole are all unported W4 surfaces.  No change here.
-        0
+        Ok(0)
     }
 }
 
@@ -1599,7 +1599,7 @@ impl Rule for RulePtrFlow {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Push pointer-ness.  Only the branches that do NOT need getSpaceFromConst
         // / getDefaultCodeSpace / truncatePointer are reachable here; the LOAD/
         // STORE/CALLIND/BRANCHIND arms reach W4/W3-output stubs.
@@ -1608,11 +1608,11 @@ impl Rule for RulePtrFlow {
             OpCode::CPUI_LOAD | OpCode::CPUI_STORE => {
                 // STUB(W4): spc = op->getIn(0)->getSpaceFromConst();
                 //   then propagateFlowToDef(vn).  Deferred entirely.
-                return 0;
+                return Ok(0);
             }
             OpCode::CPUI_CALLIND | OpCode::CPUI_BRANCHIND => {
                 // STUB(W4): spc = data.getArch()->getDefaultCodeSpace();
-                return 0;
+                return Ok(0);
             }
             OpCode::CPUI_NEW => {
                 let vn = op_out(data, op).expect("ptrflow: NEW out");
@@ -1622,7 +1622,7 @@ impl Rule for RulePtrFlow {
             }
             OpCode::CPUI_INDIRECT => {
                 if !data.obank().get(op).expect("ptrflow: op").is_ptr_flow() {
-                    return 0;
+                    return Ok(0);
                 }
                 let out = op_out(data, op).expect("ptrflow: INDIRECT out");
                 if RulePtrFlow::propagate_flow_to_reads(data, out) {
@@ -1635,7 +1635,7 @@ impl Rule for RulePtrFlow {
             }
             OpCode::CPUI_COPY | OpCode::CPUI_PTRSUB | OpCode::CPUI_PTRADD => {
                 if !data.obank().get(op).expect("ptrflow: op").is_ptr_flow() {
-                    return 0;
+                    return Ok(0);
                 }
                 let out = op_out(data, op).expect("ptrflow: copy out");
                 if RulePtrFlow::propagate_flow_to_reads(data, out) {
@@ -1648,7 +1648,7 @@ impl Rule for RulePtrFlow {
             }
             OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INT_ADD => {
                 if !data.obank().get(op).expect("ptrflow: op").is_ptr_flow() {
-                    return 0;
+                    return Ok(0);
                 }
                 let out = op_out(data, op).expect("ptrflow: multi out");
                 if RulePtrFlow::propagate_flow_to_reads(data, out) {
@@ -1664,7 +1664,7 @@ impl Rule for RulePtrFlow {
             }
             _ => {}
         }
-        made_change
+        Ok(made_change)
     }
 }
 
@@ -1701,22 +1701,22 @@ impl Rule for RuleNegateNegate {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = op_in(data, op, 0).expect("negatenegate: in0");
         if !vn_is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let neg2 = vn_def(data, vn1).expect("negatenegate: vn1 written");
         if op_code(data, neg2) != OpCode::CPUI_INT_NEGATE {
-            return 0;
+            return Ok(0);
         }
         let vn2 = op_in(data, neg2, 0).expect("negatenegate: neg2 in0");
         if vn_is_free(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         data.op_set_input(op, vn2, 0).expect("negatenegate: opSetInput vn2");
         data.op_set_opcode(op, typeop_for(OpCode::CPUI_COPY));
-        1
+        Ok(1)
     }
 }
 
@@ -1874,27 +1874,27 @@ impl Rule for RuleConditionalMove {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if op_num_input(data, op) != 2 {
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0).expect("condmove: in0");
         if RuleConditionalMove::check_boolean(data, in0).is_none() {
-            return 0;
+            return Ok(0);
         }
         let in1 = op_in(data, op, 1).expect("condmove: in1");
         if RuleConditionalMove::check_boolean(data, in1).is_none() {
-            return 0;
+            return Ok(0);
         }
 
         let bb = match data.obank().get(op).expect("condmove: op").get_parent() {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
         let inblock0 = block_get_in(data, bb, 0);
         let rootblock0 = if block_size_out(data, inblock0) == 1 {
             if block_size_in(data, inblock0) != 1 {
-                return 0;
+                return Ok(0);
             }
             block_get_in(data, inblock0, 0)
         } else {
@@ -1903,23 +1903,23 @@ impl Rule for RuleConditionalMove {
         let inblock1 = block_get_in(data, bb, 1);
         let rootblock1 = if block_size_out(data, inblock1) == 1 {
             if block_size_in(data, inblock1) != 1 {
-                return 0;
+                return Ok(0);
             }
             block_get_in(data, inblock1, 0)
         } else {
             inblock1
         };
         if rootblock0 != rootblock1 {
-            return 0;
+            return Ok(0);
         }
 
         // rootblock must end in CBRANCH
         let cbranch = match data.bb_op_tail(rootblock0) {
             Some(c) => c,
-            None => return 0,
+            None => return Ok(0),
         };
         if op_code(data, cbranch) != OpCode::CPUI_CBRANCH {
-            return 0;
+            return Ok(0);
         }
 
         // Re-resolve the boolean roots (checkBoolean returns the expression root).
@@ -1929,12 +1929,12 @@ impl Rule for RuleConditionalMove {
         let mut op_list0: Vec<OpId> = Vec::new();
         if !RuleConditionalMove::gather_expression(data, bool0, &mut op_list0, rootblock0, inblock0)
         {
-            return 0;
+            return Ok(0);
         }
         let mut op_list1: Vec<OpId> = Vec::new();
         if !RuleConditionalMove::gather_expression(data, bool1, &mut op_list1, rootblock0, inblock1)
         {
-            return 0;
+            return Ok(0);
         }
 
         let mut path0istrue = if rootblock0 != inblock0 {
@@ -1956,14 +1956,14 @@ impl Rule for RuleConditionalMove {
                 // Force 0 branch to either be boolvn OR !boolvn
                 if boolvn != in0 {
                     if !vn_is_written(data, boolvn) {
-                        return 0;
+                        return Ok(0);
                     }
                     let negop = vn_def(data, boolvn).expect("condmove: boolvn written");
                     if op_code(data, negop) != OpCode::CPUI_BOOL_NEGATE {
-                        return 0;
+                        return Ok(0);
                     }
                     if op_in(data, negop, 0) != Some(in0) {
-                        return 0;
+                        return Ok(0);
                     }
                     andorselect = !andorselect;
                     let _ = &mut boolvn;
@@ -1976,21 +1976,21 @@ impl Rule for RuleConditionalMove {
                 let secondvn = RuleConditionalMove::construct_bool(data, bool1, op, &mut op_list1);
                 data.op_set_input(op, firstvn, 0).expect("condmove: set in0");
                 data.op_set_input(op, secondvn, 1).expect("condmove: set in1");
-                return 1;
+                return Ok(1);
             } else if inblock1 == rootblock0 {
                 let boolvn = op_in(data, cbranch, 1).expect("condmove: cbranch in1");
                 let mut andorselect = !path0istrue;
                 // Force 1 branch to either be boolvn OR !boolvn
                 if boolvn != in1 {
                     if !vn_is_written(data, boolvn) {
-                        return 0;
+                        return Ok(0);
                     }
                     let negop = vn_def(data, boolvn).expect("condmove: boolvn written");
                     if op_code(data, negop) != OpCode::CPUI_BOOL_NEGATE {
-                        return 0;
+                        return Ok(0);
                     }
                     if op_in(data, negop, 0) != Some(in1) {
-                        return 0;
+                        return Ok(0);
                     }
                     andorselect = !andorselect;
                 }
@@ -2002,9 +2002,9 @@ impl Rule for RuleConditionalMove {
                 let secondvn = RuleConditionalMove::construct_bool(data, bool0, op, &mut op_list0);
                 data.op_set_input(op, firstvn, 0).expect("condmove: set in0");
                 data.op_set_input(op, secondvn, 1).expect("condmove: set in1");
-                return 1;
+                return Ok(1);
             }
-            return 0;
+            return Ok(0);
         }
 
         // Below here some change is being made.
@@ -2075,7 +2075,7 @@ impl Rule for RuleConditionalMove {
             data.op_set_input(op, boolvn, 0).expect("condmove: set boolvn");
             data.op_set_input(op, body0, 1).expect("condmove: set body0");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -2113,15 +2113,15 @@ impl Rule for RuleFloatCast {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = op_in(data, op, 0).expect("floatcast: in0");
         if !vn_is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let castop = vn_def(data, vn1).expect("floatcast: vn1 written");
         let opc2 = op_code(data, castop);
         if opc2 != OpCode::CPUI_FLOAT_FLOAT2FLOAT && opc2 != OpCode::CPUI_FLOAT_INT2FLOAT {
-            return 0;
+            return Ok(0);
         }
         let opc1 = op_code(data, op);
         let vn2 = op_in(data, castop, 0).expect("floatcast: castop in0");
@@ -2130,7 +2130,7 @@ impl Rule for RuleFloatCast {
         let outsize = vn_size(data, op_out(data, op).expect("floatcast: out"));
 
         if vn_is_free(data, vn2) {
-            return 0; // Don't propagate free
+            return Ok(0); // Don't propagate free
         }
 
         if opc2 == OpCode::CPUI_FLOAT_FLOAT2FLOAT && opc1 == OpCode::CPUI_FLOAT_FLOAT2FLOAT {
@@ -2140,27 +2140,27 @@ impl Rule for RuleFloatCast {
                 if outsize == insize2 {
                     data.op_set_opcode(op, typeop_for(OpCode::CPUI_COPY)); // identity
                 }
-                return 1;
+                return Ok(1);
             } else if insize2 < insize1 {
                 // Convert two increases -> one combined increase
                 data.op_set_input(op, vn2, 0).expect("floatcast: combine in0");
-                return 1;
+                return Ok(1);
             }
         } else if opc2 == OpCode::CPUI_FLOAT_INT2FLOAT && opc1 == OpCode::CPUI_FLOAT_FLOAT2FLOAT {
             if !super::kuna_intfloatround::combines(data.get_arch(), insize2, insize1, outsize) {
-                return 0;
+                return Ok(0);
             }
             // Convert integer straight into final float size
             data.op_set_input(op, vn2, 0).expect("floatcast: int2float in0");
             data.op_set_opcode(op, typeop_for(OpCode::CPUI_FLOAT_INT2FLOAT));
-            return 1;
+            return Ok(1);
         } else if opc2 == OpCode::CPUI_FLOAT_FLOAT2FLOAT && opc1 == OpCode::CPUI_FLOAT_TRUNC {
             // Convert float straight into final integer
             data.op_set_input(op, vn2, 0).expect("floatcast: trunc in0");
-            return 1;
+            return Ok(1);
         }
 
-        0
+        Ok(0)
     }
 }
 
@@ -2352,20 +2352,20 @@ impl Rule for RuleIgnoreNan {
         }
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
-        if crate::kuna_floatnegation::fold_nan_consumers(data, op) {
-            return 1;
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        if crate::kuna_floatnegation::fold_nan_consumers(data, op)? {
+            return Ok(1);
         }
         if data.get_arch().nan_ignore_all {
             // Treat these NaN operation as always returning false (0)
             data.op_set_opcode(op, typeop_for(OpCode::CPUI_COPY));
             let c = data.new_constant(1, 0);
             data.op_set_input(op, c, 0).expect("ignorenan: all const");
-            return 1;
+            return Ok(1);
         }
         let float_var = op_in(data, op, 0).expect("ignorenan: in0");
         if vn_is_free(data, float_var) {
-            return 0;
+            return Ok(0);
         }
         let out1 = op_out(data, op).expect("ignorenan: out");
         let mut count: int4 = 0;
@@ -2403,11 +2403,11 @@ impl Rule for RuleIgnoreNan {
                 }
             }
         }
-        if count > 0 {
+        Ok(if count > 0 {
             1
         } else {
             0
-        }
+        })
     }
 }
 

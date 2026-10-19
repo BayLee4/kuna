@@ -27,7 +27,7 @@
 //! - `p9_emit/coreaction_casts.rs`    — cast insertion hooks (P9)
 
 use kuna_base::address::Address;
-use kuna_base::error::KunaResult;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int2, int4, uint4, uint8, uintm, Wrap};
 
 use crate::block::{block_flags, BasicData, BlockGraph, BlockKind, FlowBlock};
@@ -159,6 +159,7 @@ pub struct DirectiveSymbol {
 pub struct Funcdata {
     pub(crate) kuna_x87_empty_returns: Vec<Address>,
     pub(crate) kuna_fpu_trunc_views: Vec<OpId>,
+    pub(crate) kuna_export_working: bool,
     /// Boolean properties associated with \b this function (C++ `flags`)
     flags: uint4,
     /// Creation index of first Varnode created after start of cleanup
@@ -665,6 +666,27 @@ impl Funcdata {
         uniq_start: uintm,
         sz: int4,
     ) -> KunaResult<Funcdata> {
+        let remote_facts = if nm.is_empty() { None } else {
+            match &glb.remote_scope {
+                Some(remote) => remote.function_at(&addr)?,
+                None => None,
+            }
+        };
+        let source = remote_facts.as_ref().and_then(|facts| facts.source_proto.clone()).or_else(|| {
+            let space = addr.get_space()?;
+            glb.global_query.as_ref()?.source_protos.get(&(space.get_index(), addr.get_offset())).cloned()
+        });
+        let funcp = match source {
+            Some(source) => glb.types_impl()
+                .ok_or_else(|| KunaError::lowlevel("Source prototype requires the concrete type factory"))?
+                .apply_source_prototype(&source)?,
+            None => FuncProto::new(),
+        };
+        let localoverride = match &remote_facts {
+            Some(facts) => facts.overrides.working_copy(glb.types_impl()
+                .ok_or_else(|| KunaError::lowlevel("Source overrides require the concrete type factory"))?)?,
+            None => crate::overrides::Override::new(),
+        };
         let vbank = VarnodeBank::new(glb.manage(), uniq_start)?;
         let min_laned_size = glb.get_minimum_laned_register_size();
         // bblocks / sblocks each get a root BlockGraph node (the C++ BlockGraph
@@ -705,9 +727,10 @@ impl Funcdata {
             }
         };
 
-        Ok(Funcdata {
+        let mut result = Funcdata {
             kuna_fpu_trunc_views: Vec::new(),
             kuna_x87_empty_returns: Vec::new(),
+            kuna_export_working: false,
             flags: 0,
             clean_up_index: 0,
             high_level_index: 0,
@@ -723,7 +746,7 @@ impl Funcdata {
             name: nm.to_string(),
             display_name: disp.to_string(),
             baseaddr: addr,
-            funcp: FuncProto::new(),
+            funcp,
             activeoutput: None,
             localmap,
             frame_slots: std::cell::RefCell::new(std::collections::BTreeMap::new()),
@@ -756,7 +779,7 @@ impl Funcdata {
             qlst: Vec::new(),
             covermerge: None,
             affecting_ops_revision: 0,
-            localoverride: crate::overrides::Override::new(),
+            localoverride,
             union_map: std::collections::BTreeMap::new(),
             stack_write_views: std::collections::BTreeMap::new(),
             stack_objects: Vec::new(),
@@ -829,7 +852,31 @@ impl Funcdata {
             kuna_elemptr_no_objects: false,
             kuna_elemptr_stated: std::collections::HashMap::new(),
             kuna_pushed_registers: crate::kuna_retpushedhalf::PushedRegisters::default(),
-        })
+        };
+        if let Some(facts) = remote_facts {
+            let restricted_usepoint = &result.baseaddr + -1;
+            // RemoteScope compacts the sorted source category vector into its
+            // physical source prototype. Every localdb parameter has a symbol;
+            // internal-list-only inputs have none and supply no symbol vector.
+            let mut working_slots = facts.source_proto.as_ref().map(|prototype|
+                crate::dtype::TypeFactoryImpl::physical_entry_parameter_slots(prototype, &result.funcp));
+            for source in &facts.parameter_symbols {
+                let working_slot = working_slots.as_mut().and_then(Iterator::next).flatten();
+                let parameter = working_slot.and_then(|slot| result.funcp.get_param(slot));
+                let supplied_usepoint = parameter.map(|parameter| parameter.get_usepoint());
+                let usepoint = supplied_usepoint.as_ref().filter(|address| !address.is_invalid())
+                    .unwrap_or(&restricted_usepoint);
+                result.localmap.as_mut()
+                    .ok_or_else(|| KunaError::lowlevel("Source parameters require a local scope"))?
+                    .seed_remote_symbol(source, working_slot.zip(parameter).map(|(slot, parameter)| (slot, parameter, usepoint)))?;
+            }
+            for source in &facts.locals {
+                result.localmap.as_mut()
+                    .ok_or_else(|| KunaError::lowlevel("Source locals require a local scope"))?
+                    .seed_remote_symbol(source, None)?;
+            }
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------
@@ -986,6 +1033,61 @@ impl Funcdata {
     /// (kuna `--assert`) The Symbols a `name`/`type` directive touched on this pass.
     pub fn kuna_directive_symbols(&self) -> &[DirectiveSymbol] {
         &self.kuna_directive_symbols
+    }
+
+    /// Reconcile an explicit live source edit using ProtoStoreSymbol::setInput's
+    /// slot policy. Unlike fresh export acquisition, this also retires analyzed
+    /// references before removing a changed/omitted parameter symbol.
+    pub fn refresh_source_parameters(&mut self, previous_count: int4) -> KunaResult<()> {
+        let count = self.get_func_proto().num_params();
+        for slot in 0..previous_count.max(count) {
+            let old = self.get_scope_local().and_then(|scope| scope.parameter_symbol(slot));
+            let Some(old) = old else { continue; };
+            let parameter = self.get_func_proto().get_param(slot).map(|parameter|
+                (parameter.get_name().to_owned(), parameter.get_type().cloned(),
+                    parameter.get_address(), parameter.get_size()));
+            let same_geometry = parameter.as_ref().is_some_and(|(_, _, address, size)|
+                !address.is_invalid() && self.get_scope_local().is_some_and(|scope|
+                    scope.symbol_storage(old).iter().any(|(at, width)| at == address && width == size)));
+            if !same_geometry {
+                self.retire_local_parameter_symbol(old);
+                continue;
+            }
+            let (name, ty, _, _) = parameter.expect("matching parameter geometry");
+            let scope = self.get_scope_local_mut().expect("parameter scope");
+            if !name.is_empty() { scope.rename_symbol(old, &name)?; }
+            if let Some(ty) = ty { scope.retype_symbol(old, ty)?; }
+            scope.reset_parameter_attributes(old);
+            let symbol = scope.database().symbol(old);
+            let name = symbol.get_name().to_owned();
+            let ty = symbol.dtype.clone();
+            if let Some(ty) = ty { self.high_bank.refresh_local_symbol(old, &name, &ty); }
+        }
+        self.link_proto_params()
+    }
+
+    /// A newer authored slot/declaration supersedes only its parameter edits.
+    pub fn forget_parameter_directives(&mut self, slot: Option<int4>) {
+        let scope = self.localmap.as_ref();
+        self.kuna_directive_symbols.retain(|directive| {
+            !scope.and_then(|scope| scope.database().try_symbol(directive.symbol))
+                .is_some_and(|symbol| symbol.get_category() == crate::database::symbol_category::FUNCTION_PARAMETER
+                    && slot.is_none_or(|slot| int4::from(symbol.get_category_index()) == slot))
+        });
+    }
+
+    fn retire_local_parameter_symbol(&mut self, symbol: crate::database::SymbolId) {
+        self.kuna_directive_targets.retain(|_, id| self.high_bank.get(*id).is_none_or(|high|
+            high.kuna_dynamic_symbol() != Some(symbol) && high.kuna_link_symbol() != Some(symbol)
+                && high.kuna_ref_symbol() != Some(symbol) && high.kuna_equate_symbol() != Some(symbol)));
+        self.high_bank.retire_local_symbol(symbol);
+        self.vbank.retire_local_symbol(symbol);
+        self.kuna_directive_symbols.retain(|directive| directive.symbol != symbol);
+        // These are presentation-only snapshots, not canonical symbols.
+        self.kuna_wire_symbols.clear();
+        self.kuna_wire_symbol_for_high.clear();
+        self.kuna_wrapped_wire_storage.clear();
+        if let Some(scope) = self.get_scope_local_mut() { scope.remove_symbol(symbol); }
     }
 
     /// (kuna `--assert`) Record that a directive touched `entry.symbol`.  The
@@ -1779,14 +1881,9 @@ impl Funcdata {
     /// no-op (returns `Ok`) if the architecture has no default model (no model
     /// to lock to); the function then falls back to the unlocked recovery path.
     ///
-    /// If storage assignment for the declared parameters reaches an un-ported
-    /// seam (e.g. `assignParameterStorage`'s hidden-return-pointer path for a
-    /// struct-returning function — a W4 surface), the partially-mutated `funcp`
-    /// is reset to the clean empty prototype and the prototype is left
-    /// **unapplied** (returning `Ok`).  The function then decompiles exactly as
-    /// it did before this seed wired in (the prior unrecovered behavior), so a
-    /// not-yet-supported declaration degrades gracefully rather than aborting the
-    /// whole decompile.
+    /// A seeding error resets the partially-mutated working prototype and
+    /// propagates unchanged. The declaration remains on its source owner, so a
+    /// failed acquisition is not published as successful untyped recovery.
     ///
     /// (kuna `cppsig`) A `pieces` with no `outtype` locks the INPUT half only —
     /// see [`FuncProto::seed_locked_from_pieces`], which owns that contract so the
@@ -1826,10 +1923,8 @@ impl Funcdata {
         if let Err(e) =
             self.funcp.seed_locked_from_pieces(pieces, defaultfp, void_type, types, manager)
         {
-            // Storage assignment reached an un-ported seam (W4); discard the
-            // half-applied prototype and decompile as the unrecovered function.
             self.funcp = FuncProto::new();
-            let _ = e;
+            return Err(e);
         }
         Ok(())
     }
@@ -1853,14 +1948,25 @@ impl Funcdata {
         if params.is_empty() {
             return;
         }
-        let void_type =
-            Rc::new(crate::dtype::Datatype::new(0, crate::dtype::type_metatype::TYPE_VOID));
         // C++ `getFuncProto().setParam` relies on the store the Funcdata's
         // `setScope` attached at construction; the rebuilt proto may have no store
         // yet, so attach the internal store first (as `IfcMapParam` does).
-        self.funcp.attach_internal_store(void_type);
+        if !self.funcp.has_store() {
+            let void_type =
+                Rc::new(crate::dtype::Datatype::new(0, crate::dtype::type_metatype::TYPE_VOID));
+            self.funcp.attach_internal_store(void_type);
+        }
         for (i, name, piece) in params {
+            // A mapped parameter is an independent authored input fact. Keep
+            // retained declaration acquisition in agreement without classifying
+            // the whole prototype as custom storage.
+            let source_slot = (0..*i).filter(|&slot|
+                self.funcp.get_param(slot).is_some_and(|p| !p.is_hidden_return())).count();
+            let hidden = self.funcp.get_param(*i).is_some_and(|p| p.is_hidden_return());
             self.funcp.set_param(*i, name, piece);
+            if *i >= 0 && !hidden {
+                self.funcp.retain_mapped_declaration_input(*i,source_slot,name,piece);
+            }
         }
     }
 
@@ -2094,7 +2200,7 @@ impl Funcdata {
     /// move-back).  `build_info_list` is idempotent and ensures the per-space
     /// info list exists — the merged-tree substitute for the
     /// `startProcessing` → `heritage.buildInfoList()` call (a W4 seam there).
-    pub fn op_heritage(&mut self) {
+    pub fn op_heritage(&mut self) -> KunaResult<()> {
         self.op_heritage_with_deadline(None)
     }
 
@@ -2104,7 +2210,7 @@ impl Funcdata {
     /// per-address-space loop (`ActionHeritage` passes its
     /// [`ActionContext::deadline`](crate::action::ActionContext); every other
     /// caller passes `None` and is byte-identical to before).
-    pub fn op_heritage_with_deadline(&mut self, deadline: Option<std::time::Instant>) {
+    pub fn op_heritage_with_deadline(&mut self, deadline: Option<std::time::Instant>) -> KunaResult<()> {
         let mut heritage = std::mem::take(&mut self.heritage);
         heritage.build_info_list(self);
         // C++ `Funcdata::startProcessing` runs `localoverride.applyDeadCodeDelay`
@@ -2127,8 +2233,9 @@ impl Funcdata {
                 let _ = heritage.set_dead_code_delay(&spc, delay);
             }
         }
-        heritage.heritage(self, deadline);
+        let result = heritage.heritage(self, deadline);
         self.heritage = heritage;
+        result
     }
 
     /// (kuna `indexaliasguard global`) Is the global storage of `vn` covered by
@@ -2642,35 +2749,6 @@ impl Funcdata {
         None
     }
 
-    /// Seed name recommendations into the local scope (the ghidra-mode
-    /// carrier for C++ `ScopeLocal::collectNameRecs` results: the host
-    /// `<localdb>`'s namelocked-but-not-typelocked locals, i.e. GUI renames of
-    /// untyped variables).  `(name, storage addr, usepoint, size)`; an invalid
-    /// usepoint = address-tied.  Applied by the `ActionNameVars` port
-    /// (`recoverNameRecommendationsForSymbols`).
-    pub fn seed_name_recommendations(&mut self, specs: &[(String, Address, Address, int4)]) {
-        if let Some(lm) = self.localmap.as_mut() {
-            for (name, addr, usepoint, size) in specs {
-                lm.add_recommend_name(addr.clone(), usepoint.clone(), *size, name);
-            }
-        }
-    }
-
-    /// Seed DYNAMIC name recommendations (the hash-storage half of the
-    /// ghidra-mode carrier — C++ `ScopeLocal::dynRecommend`).  `(name,
-    /// first-use address, hash)`: the Ghidra GUI writes hash storage for any
-    /// variable that `requiresDynamicStorage` (unique-space representatives,
-    /// `splitOutMergeGroup` products), so this is the channel a rename of such
-    /// a variable comes back through.  Applied by
-    /// [`Funcdata::kuna_apply_dynamic_recommendations`].
-    pub fn seed_dynamic_recommendations(&mut self, specs: &[(String, Address, u64)]) {
-        if let Some(lm) = self.localmap.as_mut() {
-            for (name, addr, hash) in specs {
-                lm.add_recommend_dynamic(addr.clone(), *hash, name);
-            }
-        }
-    }
-
     /// Apply the dynamic name recommendations (C++
     /// `ScopeLocal::recoverNameRecommendationsForSymbols`'s `dynRecommend`
     /// loop, varmap.cc:1557-1573): resolve each recorded hash back to its
@@ -2684,102 +2762,68 @@ impl Funcdata {
     /// `ActionNameVars::apply`); a no-op with no recommendations, so the
     /// standalone pipeline is structurally unaffected.
     ///
-    /// PLACEMENT (a real divergence, guarded rather than reordered): upstream
-    /// runs this loop AFTER `linkSymbols`, so `vn->getHigh()->getSymbol()` is
-    /// already populated and its guards — `sym == 0`, `sym->getScope() != this`,
-    /// `!sym->isNameUndefined()` — are live, and it only ever RENAMES an
-    /// existing Symbol.  kuna's naming pass fuses linkSymbols with the `vN`
-    /// default assignment into one location-ordered walk, so there is no point
-    /// "after linking, before defaults" to run at; the loop therefore runs
-    /// first and CREATES a dynamic Symbol.  The per-high guard below is then
-    /// vacuous (no high is named yet), so the equivalent guard is applied
-    /// against the SCOPE instead: a hash that lands on storage the naming walk
-    /// would bind to a real Symbol — a cat-0 parameter, or any Symbol that
-    /// already has a defined name — is skipped, which is what upstream's
-    /// `sym != 0 && !isNameUndefined` pair achieves.  Without it a stale or
-    /// shape-shifted host hash could take a parameter's variable, and that
-    /// high's `<high symref>` would stop pointing at the parameter.
-    pub fn kuna_apply_dynamic_recommendations(&mut self) {
-        let recs: Vec<(String, Address, u64)> = match self.localmap.as_ref() {
-            Some(lm) => lm
-                .dynamic_recommendations()
-                .iter()
-                .map(|r| (r.name.clone(), r.use_point.clone(), r.hash))
-                .collect(),
-            None => return,
+    /// Linking and default naming share one walk here. Reuse its generated
+    /// symbol when present, but never replace a parameter or an asserted name.
+    pub fn kuna_apply_dynamic_recommendations(&mut self) -> KunaResult<()> {
+        let recs = match self.localmap.as_ref() {
+            Some(lm) => lm.dynamic_recommendations().to_vec(),
+            None => return Ok(()),
         };
-        if recs.is_empty() {
-            return;
-        }
-        for (name, addr, hash) in recs {
-            // Java computes the same hash with a hardcoded budget of 8
-            // (`DynamicHash.java:440`); use it so both sides agree.
+        for rec in recs {
             let mut dh = crate::dynamic::DynamicHash::new();
-            let Some(vn) = dh.find_varnode(self, &addr, hash) else {
+            let Some(vn) = dh.find_varnode(self, &rec.use_point, rec.hash) else {
                 continue;
             };
-
             let Some(high) = self.vbank().get(vn).and_then(|v| v.get_high()) else {
                 continue;
             };
             if self.vbank().get(vn).map(|v| v.is_annotation()).unwrap_or(true) {
                 continue;
             }
-            // C++ `!sym->isNameUndefined()` — never paint over a resolved name.
-            let already = self
-                .high_bank()
-                .get(high)
-                .map(|h| {
-                    h.kuna_name().is_some()
-                        || h.kuna_dynamic_symbol().is_some()
-                        || h.kuna_equate_symbol().is_some()
-                        || h.kuna_link_symbol().is_some()
-                })
-                .unwrap_or(true);
-            if already {
+            let h = self.high_bank().get(high).expect("dynamic recommendation: missing high");
+            if h.kuna_equate_symbol().is_some() {
                 continue;
             }
-            // The scope-side stand-in for upstream's `sym == 0` /
-            // `!sym->isNameUndefined()` pair (see the placement note above):
-            // never take a Varnode whose storage the naming walk is going to
-            // bind to a real Symbol.
-            {
-                let usepoint = self.vn_use_point(vn);
-                let Some(v_addr) = self.vbank().get(vn).map(|v| v.get_addr().clone()) else {
-                    continue;
-                };
-                let blocked = self
-                    .localmap
-                    .as_ref()
-                    .and_then(|lm| lm.query_container_for_link(&v_addr, &usepoint))
-                    .map(|info| {
-                        info.category == crate::database::symbol_category::FUNCTION_PARAMETER
-                            || !info.is_name_undefined
-                    })
-                    .unwrap_or(false);
-                if blocked {
-                    continue;
-                }
-            }
+            let candidate = h.kuna_dynamic_symbol().or_else(|| h.kuna_link_symbol())
+                .or_else(|| self.vbank().get(vn).and_then(|v| v.kuna_symbol_entry()))
+                .or_else(|| {
+                    let v = self.vbank().get(vn)?;
+                    self.localmap.as_ref()?.query_container_for_link(v.get_addr(), &self.vn_use_point(vn))
+                        .map(|info| info.symbol)
+                });
             let dtype = self.with_high_split(|hb, ctx| {
                 hb.get_mut(high).expect("dyn rec: stale high").get_type(ctx, None)
             });
-            let unique = self
-                .localmap
-                .as_ref()
-                .map(|lm| lm.make_local_name_unique(&name))
-                .unwrap_or_else(|| name.clone());
-            let sid = self
-                .localmap
-                .as_mut()
-                .and_then(|lm| lm.add_dynamic_symbol(&unique, dtype, &addr, hash).ok());
+            let lm = self.localmap.as_mut().expect("dynamic recommendation: missing scope");
+            if candidate.is_some_and(|sid| {
+                let symbol = lm.database().symbol(sid);
+                symbol.get_category() >= 0
+                    || (!symbol.is_name_undefined() && (symbol.is_name_locked() || symbol.is_type_locked()))
+                    || symbol.dtype.as_ref().is_none_or(|ty| ty.get_size() != dtype.get_size())
+            }) {
+                continue;
+            }
+            let unique = lm.make_local_name_unique(&rec.name);
+            let sid = match candidate {
+                Some(sid) => {
+                    lm.rename_symbol(sid, &unique)?;
+                    sid
+                }
+                None => lm.add_dynamic_symbol(&unique, dtype, &rec.use_point, rec.hash)?,
+            };
+            lm.restore_recommended_identity(sid, rec.symbol_id);
+            let entry = lm.remap_symbol_dynamic(sid, &rec.use_point, rec.hash);
+            if let Some(v) = self.vbank_mut().get_mut(vn) {
+                v.set_kuna_symbol_entry(sid);
+                v.set_flags_pub(crate::varnode::varnode_flags::namelock);
+            }
             if let Some(h) = self.high_bank_mut().get_mut(high) {
                 h.set_kuna_name(unique);
-                if let Some(sid) = sid {
-                    h.set_kuna_link_symbol(sid);
-                }
+                h.set_kuna_link_symbol(sid);
             }
+            crate::kuna_dynamiclocals::bind(self, vn, &entry)?;
         }
+        Ok(())
     }
 
     /// C++ `localmap->resetLocalWindow()` — reset the local-variable discovery
@@ -2971,6 +3015,14 @@ impl Funcdata {
     }
     /// (kuna `calltargettype`) The type the indirect call `op` states, if recorded.
     pub fn kuna_call_target_type(&self, op: OpId) -> Option<std::rc::Rc<crate::dtype::Datatype>> {
+        if self.get_arch().call_target_publication == crate::kuna_calltargettype::CallTargetPublication::PerCallOnly {
+            return None;
+        }
+        self.kuna_call_target_print_type(op)
+    }
+    /// The original-phase receipt for structural C spelling. Per-call-only
+    /// receipts are deliberately invisible to type requirements and CAST IR.
+    pub(crate) fn kuna_call_target_print_type(&self, op: OpId) -> Option<std::rc::Rc<crate::dtype::Datatype>> {
         self.kuna_call_target_types.get(&op).cloned()
     }
     /// Toggle whether normalization transforms will be performed
@@ -3050,39 +3102,42 @@ impl Funcdata {
     }
 
     /// Retain homes of an equivalent value without following computational inputs.
-    pub fn kuna_inherit_storage(&mut self, destination: VarnodeId, original: VarnodeId) {
+    /// Register queries used to distinguish local homes from call transport may fail.
+    pub fn kuna_inherit_storage(&mut self, destination: VarnodeId, original: VarnodeId) -> KunaResult<()> {
         let Some(size) = self.vbank.get(original).map(|v| v.get_size()) else {
-            return;
+            return Ok(());
         };
         if self
             .vbank
             .get(destination)
             .is_some_and(|v| v.get_size() == size)
         {
-            self.kuna_inherit_storage_slice(destination, original, 0, size);
+            self.kuna_inherit_storage_slice(destination, original, 0, size)?;
         }
+        Ok(())
     }
 
     /// Retain a byte slice, with its offset measured from the least-significant end.
+    /// Propagate register-query failures rather than treating unclassified storage as local.
     pub fn kuna_inherit_storage_slice(
         &mut self,
         destination: VarnodeId,
         original: VarnodeId,
         byte_offset: int4,
         byte_size: int4,
-    ) {
+    ) -> KunaResult<()> {
         use crate::kuna_varsources::StorageSource;
         use kuna_base::space::spacetype;
 
         if !self.glb.name_style_angr || destination == original || byte_offset < 0 || byte_size <= 0
         {
-            return;
+            return Ok(());
         }
         let Some(from) = self.vbank.get(original) else {
-            return;
+            return Ok(());
         };
         let Some(to) = self.vbank.get(destination) else {
-            return;
+            return Ok(());
         };
         if from.is_constant()
             || to.is_constant()
@@ -3091,7 +3146,7 @@ impl Funcdata {
             || to.get_size() != byte_size
             || byte_offset > from.get_size() - byte_size
         {
-            return;
+            return Ok(());
         }
         let original_size = from.get_size();
         let original_address = from.get_addr().clone();
@@ -3101,14 +3156,14 @@ impl Funcdata {
             .and_then(|id| self.obank.get(id))
             .map(|op| op.get_addr().clone());
         let mut sources = self.kuna_storage_sources(original).to_vec();
-        if self.kuna_has_local_storage_use(original) {
+        if self.kuna_has_local_storage_use(original)? {
             self.kuna_mark_meaningful_storage_write(original);
         }
-        let transport = self.kuna_is_call_transport(original);
+        let transport = self.kuna_is_call_transport(original)?;
         if transport {
             self.kuna_record_call_transport(original);
         }
-        let projection = self.kuna_is_call_transport_projection(original, byte_offset, byte_size);
+        let projection = self.kuna_is_call_transport_projection(original, byte_offset, byte_size)?;
         if projection {
             self.kuna_mark_call_transport_projection(original, byte_size);
             if let Some(input) = self
@@ -3118,7 +3173,7 @@ impl Funcdata {
                 .and_then(|op| self.obank.get(op))
                 .and_then(|op| op.get_in(0))
             {
-                if self.kuna_is_call_transport(input) {
+                if self.kuna_is_call_transport(input)? {
                     self.kuna_record_call_transport(input);
                 }
             }
@@ -3157,6 +3212,7 @@ impl Funcdata {
             });
         }
         self.kuna_extend_storage_sources(destination, sliced);
+        Ok(())
     }
 
     pub(crate) fn kuna_extend_storage_sources(
@@ -3620,11 +3676,20 @@ impl Funcdata {
     /// exact global types, preserving existing mapped properties. In high-level mode, create
     /// a missing cover and mark its HighVariable cover dirty when necessary.
     /// (C++ `Funcdata::setVarnodeProperties`, `funcdata_varnode.cc:25`).
-    pub fn set_varnode_properties(&mut self, vn: VarnodeId) {
+    pub fn set_varnode_properties(&mut self, vn: VarnodeId) -> KunaResult<()> {
+        let Some(value) = self.vbank().get(vn) else { return Ok(()) };
+        if value.is_mapped() {
+            self.ensure_varnode_cover(vn);
+            return Ok(());
+        }
+        self.set_varnode_properties_at(vn, self.vn_use_point(vn))
+    }
+
+    pub(crate) fn set_varnode_properties_at(&mut self, vn: VarnodeId, usepoint: Address) -> KunaResult<()> {
         // An already-mapped Varnode keeps its flags.
         let already_mapped = match self.vbank().get(vn) {
             Some(v) => v.is_mapped(),
-            None => return,
+            None => return Ok(()),
         };
         if !already_mapped {
             // Both halves of the C++ walk are now wired: the LOCAL symbol-map half
@@ -3642,10 +3707,9 @@ impl Funcdata {
             // separate HighVariables instead of collapsing into one; and the global
             // store's HighVariable reports `addrtied`/`persist` so it carries its
             // global Symbol name in `ActionNameVars` rather than a `dat_`/`Unique`.
-            let usepoint = self.vn_use_point(vn);
             let (addr, size) = match self.vbank().get(vn) {
                 Some(v) => (v.get_addr().clone(), v.get_size()),
-                None => return,
+                None => return Ok(()),
             };
             use crate::varnode::varnode_flags;
             // The LOCAL-scope half of `setVarnodeProperties` (funcdata_varnode.cc:30).
@@ -3656,7 +3720,7 @@ impl Funcdata {
             // address-tied — the keystone `RuleStringCopy::applyOp`'s
             // `outvn->isAddrTied()` guard reads.  OR'd with the global half below.
             let mut vflags = self.query_local_properties(&addr, size, &usepoint);
-            vflags |= self.get_arch().query_global_properties(&addr, size, &usepoint);
+            vflags |= self.get_arch().query_global_properties(&addr, size, &usepoint)?;
             if vflags != 0 {
                 // typelock is set by `updateType`, never here.  These flags
                 // (`mapped|addrtied|persist`, plus any `readonly`/`volatile`) are
@@ -3687,15 +3751,15 @@ impl Funcdata {
             // constant (`globaloct = 05555`). Ordinary recovered local types
             // remain the inference/naming wave's seam.
             if let Some((symtype, off)) =
-                self.get_arch().sized_type_for_global_varnode(&addr, size, &usepoint)
+                self.get_arch().sized_type_for_global_varnode(&addr, size, &usepoint)?
             {
                 // The exact type piece against the shared TypeFactory; null (no
                 // exact piece) leaves the Varnode untyped, as C++ `getSizedType`
                 // returning NULL skips the `updateType`.
-                let dt = self
-                    .get_arch()
-                    .types()
-                    .and_then(|t| t.get_exact_piece(symtype, off, size).ok().flatten());
+                let dt = match self.get_arch().types() {
+                    Some(types) => types.get_exact_piece(symtype, off, size)?,
+                    None => None,
+                };
                 if let Some(dt) = dt {
                     if let Some(v) = self.vbank_mut().get_mut(vn) {
                         v.update_type_locked(dt, true, true);
@@ -3704,6 +3768,7 @@ impl Funcdata {
             }
         }
         self.ensure_varnode_cover(vn);
+        Ok(())
     }
 
     /// The cover half of [`set_varnode_properties`](Funcdata::set_varnode_properties):
@@ -4019,6 +4084,7 @@ impl Funcdata {
         self.kuna_regnarrow_failed.clear();
         self.kuna_fpu_trunc_views.clear();
         self.kuna_x87_empty_returns.clear();
+        self.pending_comments.clear();
         // Clear the analysis-derived flags (the exact mask from funcdata.cc:88).
         self.flags &= !(funcdata_flags::highlevel_on
             | funcdata_flags::blocks_generated
@@ -4178,18 +4244,64 @@ impl Funcdata {
                 kuna_base::error::KunaError::lowlevel("spacebaseConstant: no type factory")
             })?;
         let invalid = Address::new_invalid();
-        let sb_spacebase = types.get_type_spacebase(Rc::clone(&spaceid), &invalid)?;
-        let sb_type = types.get_type_pointer(sz, sb_spacebase, wordsize)?;
         // The covering Symbol's declared type.
         let entrytype = entry
             .symbol_type
             .clone()
             .ok_or_else(|| kuna_base::error::KunaError::lowlevel("spacebaseConstant: entry has no type"))?;
-        let ptrentrytype =
-            types.get_type_pointer_strip_array(sz, Rc::clone(&entrytype), wordsize)?;
-
         let extra_bytes = rampoint.get_offset().wrapping_sub(entry.entry_addr.get_offset());
         let extra = AddrSpace::byte_to_address(extra_bytes, wordsize);
+
+        // Keep a source character-array offcut as the original typed pointer.
+        // Building PTRSUB(base) + residual and subsequently folding that pair
+        // loses the character type on the resulting bare constant.
+        let interior_character = (|| {
+            if extra_bytes == 0 || !entry.is_type_locked()
+                || entrytype.get_metatype() != crate::dtype::type_metatype::TYPE_ARRAY
+                || entrytype.is_opaque_string()
+            {
+                return None;
+            }
+            let element = entrytype.get_array_base()?;
+            let width = element.get_size();
+            if !matches!(width, 1 | 2 | 4)
+                || !element.is_char_print() || element.is_opaque_string()
+            {
+                return None;
+            }
+            let offset = i64::try_from(extra_bytes).ok()?
+                .checked_add(i64::from(entry.symbol_offset))?;
+            if offset < 0 || offset % i64::from(width) != 0
+                || offset + i64::from(width) > i64::from(entrytype.get_size())
+            {
+                return None;
+            }
+            Some(element)
+        })();
+        if let Some(element) = interior_character {
+            let mapped = self.get_arch().query_container_global(
+                rampoint, element.get_size(), &invalid,
+            )?;
+            if mapped.as_ref().is_some_and(|mapped| {
+                mapped.symbol_id == entry.symbol_id
+                    && mapped.entry_addr == entry.entry_addr
+                    && mapped.symbol_offset == entry.symbol_offset
+                    && mapped.symbol_type.as_ref().is_some_and(|ty| Rc::ptr_eq(ty, &entrytype))
+            }) {
+                let pointer = types.get_type_pointer(origsize, element, wordsize)?;
+                let constant = self.new_constant(origsize, origval);
+                let value = self.vbank_mut().get_mut(constant).expect("source character offcut");
+                value.update_type_locked(pointer, true, true);
+                value.set_ptr_check();
+                self.op_set_input(op, constant, slot)?;
+                return Ok(());
+            }
+        }
+
+        let sb_spacebase = types.get_type_spacebase(Rc::clone(&spaceid), &invalid)?;
+        let sb_type = types.get_type_pointer(sz, sb_spacebase, wordsize)?;
+        let ptrentrytype =
+            types.get_type_pointer_strip_array(sz, Rc::clone(&entrytype), wordsize)?;
 
         // COPY-replacement bookkeeping (funcdata.cc:370-388).  For the INT_ADD/
         // STORE/CALL/comparison cases isCopy stays false and addOp/extraOp/... are
@@ -4758,11 +4870,20 @@ impl Funcdata {
     ) -> KunaResult<OpId> {
         let copy_op = self.new_op(1, addr);
         self.op_set_opcode(copy_op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
+        // This COPY is inserted after type propagation. Apply its existing
+        // SPACEBASE transfer rule here: the frame object's pointee describes
+        // storage at this address, not every value of a merged walking pointer.
         let (ct, size) = {
             let v = self.vbank.get(in_vn).expect("build_copy_trim_op: stale in_vn");
-            (Rc::clone(v.get_type()), v.get_size())
+            let size = v.get_size();
+            let ct = if v.is_spacebase() {
+                crate::coreaction_infertypes::spacebase_pointer(self, size)
+            } else {
+                Some(Rc::clone(v.get_type()))
+            };
+            (ct, size)
         };
-        let out_vn = self.new_unique(size, Some(ct));
+        let out_vn = self.new_unique(size, ct);
         self.op_set_output(copy_op, out_vn)?;
         self.op_set_input(copy_op, in_vn, 0)?;
         // (kuna LOSS-229) Preserve the dynamic-symbol / `mapped` binding across a
@@ -4845,7 +4966,8 @@ impl Funcdata {
     /// never compare equal, so `mergeAdjacent` could never tie an op's input to
     /// its output.  Falls back to a fresh unknown only when no TypeFactory is
     /// attached (hand-built fixtures) or the op-code's dispatch errors.
-    pub(crate) fn op_output_type_local_pub(&self, op: OpId) -> Rc<Datatype> {
+    pub(crate) fn op_output_type_local_pub(&self, op: OpId) -> KunaResult<Rc<Datatype>> {
+        if let Some(ty) = self.cpool_output_type_local(op)? { return Ok(ty); }
         let (sz, opc) = match self.obank.get(op) {
             Some(o) => {
                 let sz = o
@@ -4858,11 +4980,32 @@ impl Funcdata {
             None => (1, OpCode::CPUI_COPY),
         };
         if let Some(tlst) = self.get_arch().types() {
-            if let Ok(ct) = crate::typeop::type_op_info(opc).get_output_local(tlst, sz) {
-                return ct;
+            if let Ok(ct) = self.get_arch().type_op_info(opc).get_output_local(tlst, sz) {
+                return Ok(ct);
             }
         }
-        Rc::new(Datatype::new(sz, crate::dtype::type_metatype::TYPE_UNKNOWN))
+        Ok(Rc::new(Datatype::new(sz, crate::dtype::type_metatype::TYPE_UNKNOWN)))
+    }
+
+    /// The constant-pool-specific output local type, shared by both local
+    /// metadata consumers, including passes before RuleTransformCpool.
+    pub(crate) fn cpool_output_type_local(&self, op: OpId) -> KunaResult<Option<Rc<Datatype>>> {
+        let Some(operation) = self.obank.get(op) else { return Ok(None) };
+        if operation.code() != OpCode::CPUI_CPOOLREF { return Ok(None); }
+        let end = operation.num_input() - int4::from(operation.is_cpool_transformed());
+        let refs: Vec<_> = (1..end)
+            .map(|slot| operation.get_in(slot).and_then(|vn| self.vbank.get(vn)).map(|vn| vn.get_offset()))
+            .collect::<Option<_>>()
+            .ok_or_else(|| KunaError::lowlevel("Missing constant-pool reference input"))?;
+        let Some(record) = self.get_arch().get_cpool_record(&refs)? else { return Ok(None) };
+        if record.get_tag() == crate::cpool::cpool_tag::INSTANCE_OF {
+            match self.get_arch().types() {
+                Some(types) => Ok(Some(types.get_base(1, crate::dtype::type_metatype::TYPE_BOOL)?)),
+                None => Ok(None),
+            }
+        } else {
+            Ok(record.get_type().cloned())
+        }
     }
 
     /// `op->inputTypeLocal(slot)` — see `op_output_type_local_pub`.
@@ -4879,7 +5022,7 @@ impl Funcdata {
             None => (1, OpCode::CPUI_COPY),
         };
         if let Some(tlst) = self.get_arch().types() {
-            if let Ok(ct) = crate::typeop::type_op_info(opc).get_input_local(tlst, slot, sz) {
+            if let Ok(ct) = self.get_arch().type_op_info(opc).get_input_local(tlst, slot, sz) {
                 return ct;
             }
         }
@@ -5149,7 +5292,7 @@ impl Funcdata {
             }
             count = 0;
             if dom_copy_is_new {
-                self.op_destroy(dom_copy);
+                self.op_destroy(dom_copy)?;
             }
         }
 
@@ -5166,7 +5309,7 @@ impl Funcdata {
                     self.high_remove_member(out_high, out_vn);
                 }
                 self.total_replace(out_vn, dom_vn)?;
-                self.op_destroy(op);
+                self.op_destroy(op)?;
             }
         }
 
@@ -5864,6 +6007,208 @@ mod tests {
     }
 
     #[test]
+    fn late_spacebase_copy_trim_uses_the_copy_transfer_type_without_retyping_storage() {
+        use crate::dtype::{TypeFactory, TypeFactoryImpl};
+        use crate::varnode::varnode_flags;
+
+        let mut manager = build_manager();
+        manager.set_default_code_space(2).unwrap();
+        manager.set_default_data_space(2).unwrap();
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        let word = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
+        let word_pointer = types.get_type_pointer(4, word, 1).unwrap();
+        let mut context = ArchContext::new(manager);
+        context.types = Some(types);
+        let ram = Rc::clone(context.manage().get_space_by_name("ram").unwrap());
+        let pc = Address::new(Rc::clone(&ram), 0x1000);
+        let mut fd = Funcdata::new(
+            "func", "func", Rc::new(context), pc.clone(), 0x10000000, 0x40,
+        ).unwrap();
+
+        for spacebase in [true, false] {
+            let input = fd.new_varnode(
+                4, &Address::new(Rc::clone(&ram), if spacebase { 0x54 } else { 0x24 }),
+                Some(Rc::clone(&word_pointer)),
+            ).unwrap();
+            let input = fd.vbank_mut().set_input(input, &mut |_, _, _| Ok(())).unwrap();
+            let flags = varnode_flags::mapped
+                | if spacebase { varnode_flags::spacebase } else { 0 };
+            fd.vbank_mut().get_mut(input).unwrap().set_flags_pub(flags);
+            let original_flags = fd.vbank().get(input).unwrap().get_flags();
+            let marker = fd.new_op(2, pc.clone());
+            fd.op_set_opcode_code(marker, OpCode::CPUI_MULTIEQUAL);
+            fd.op_set_input(marker, input, 0).unwrap();
+            fd.op_set_input(marker, input, 1).unwrap();
+            fd.new_unique_out(4, marker).unwrap();
+
+            let copy = fd.build_copy_trim_op(input, pc.clone(), marker).unwrap();
+            let operation = fd.obank().get(copy).unwrap();
+            assert_eq!(operation.code(), OpCode::CPUI_COPY);
+            assert_eq!(operation.get_in(0), Some(input));
+            let output = fd.vbank().get(operation.get_out().unwrap()).unwrap();
+            assert_eq!(output.get_size(), 4);
+            assert!(output.is_mapped(), "the existing mapped binding survives the trim");
+            assert!(!output.is_spacebase(), "the temporary is an ordinary pointer value");
+            if spacebase {
+                let pointee = output.get_type().get_ptr_to().unwrap();
+                assert_eq!(pointee.get_size(), 1);
+                assert_eq!(pointee.get_metatype(), type_metatype::TYPE_UNKNOWN);
+                assert_eq!(output.get_type().get_word_size(), Some(1));
+            } else {
+                assert!(Rc::ptr_eq(output.get_type(), &word_pointer),
+                    "an ordinary pointer keeps its exact original type");
+            }
+            let original = fd.vbank().get(input).unwrap();
+            assert!(Rc::ptr_eq(original.get_type(), &word_pointer));
+            assert_eq!(original.get_flags(), original_flags);
+        }
+    }
+
+    #[test]
+    fn locked_prototype_seed_error_is_not_published_as_success_and_can_retry() {
+        let manager = build_manager();
+        let mut concrete = crate::fspec::ProtoModel::new(&manager);
+        concrete.build_param_list("standard").unwrap();
+        let concrete = Rc::new(concrete);
+        let mut merged = crate::fspec::ProtoModel::new_merged(&manager);
+        merged.merged_push(Rc::clone(&concrete)).unwrap();
+        let mut context = ArchContext::new(manager);
+        context.types = Some(Rc::new(crate::dtype::TypeFactoryImpl::new()));
+        let ram = Rc::clone(context.manage().get_space_by_name("ram").unwrap());
+        let mut fd = Funcdata::new(
+            "func", "func", Rc::new(context), Address::new(ram, 0x1000), 0x10000000, 0x40,
+        ).unwrap();
+        let pieces = crate::fspec::PrototypePieces {
+            outtype: Some(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))),
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let error = fd.apply_locked_prototype_with_model(&pieces, Some(Rc::new(merged)))
+            .expect_err("unresolved model must not silently discard the declaration");
+        assert!(matches!(error, kuna_base::error::KunaError::Lowlevel { .. }));
+        assert!(!fd.get_func_proto().has_store());
+        assert!(!fd.get_func_proto().has_model());
+        assert!(pieces.intypes.is_empty());
+        assert_eq!(pieces.outtype.as_ref().unwrap().get_metatype(), type_metatype::TYPE_VOID);
+        fd.apply_locked_prototype_with_model(&pieces, Some(concrete)).unwrap();
+        assert!(fd.get_func_proto().has_store());
+        assert!(fd.get_func_proto().is_input_locked());
+        assert!(fd.get_func_proto().is_output_locked());
+        assert_eq!(fd.get_func_proto().num_params(), 0);
+    }
+
+    #[test]
+    fn locked_prototype_without_a_model_keeps_the_query_free_empty_context() {
+        let mut fd = build_fd();
+        let pieces = crate::fspec::PrototypePieces {
+            outtype: Some(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))),
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        fd.apply_locked_prototype(&pieces).unwrap();
+        assert!(!fd.get_func_proto().has_model());
+        assert!(!fd.get_func_proto().has_store());
+    }
+
+    #[test]
+    fn whole_signature_replacement_does_not_inherit_authored_logical_pieces() {
+        let manager = build_manager();
+        let types = crate::dtype::TypeFactoryImpl::new();
+        let mut model = crate::fspec::ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        let model = Rc::new(model);
+        let authored = crate::fspec::PrototypePieces {
+            name: "authored".into(),
+            outtype: Some(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))),
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        let mut proto = FuncProto::from_logical(&authored, Rc::clone(&model), &types).unwrap();
+        let replacement = crate::fspec::PrototypePieces {
+            first_var_arg_slot: 0,
+            ..authored.clone()
+        };
+        proto.set_pieces(&replacement, Some(model), &types, &manager).unwrap();
+        assert!(proto.logical_pieces().is_none());
+        let mut physical = crate::fspec::PrototypePieces::default();
+        proto.get_pieces(&mut physical);
+        assert_eq!(physical.first_var_arg_slot, 0);
+        proto.retain_logical_declaration(&replacement);
+        assert_eq!(proto.logical_pieces().unwrap().first_var_arg_slot, 0);
+        assert!(proto.is_dotdotdot(), "retention must not rewrite working signature flags");
+        assert_eq!(proto.num_params(), 0);
+    }
+
+    #[test]
+    fn sparse_mapped_input_survives_working_acquisition_without_invented_formals() {
+        let mut manager = build_manager();
+        let register = Rc::new(AddrSpace::new(
+            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3, 0, 1, 1,
+        ));
+        manager.insert_space(Rc::clone(&register)).unwrap();
+        manager.set_default_code_space(2).unwrap();
+        manager.set_default_data_space(2).unwrap();
+        let manager = Rc::new(manager);
+        let types = Rc::new(crate::dtype::TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.setup_sizes(Some(8), 8, 8);
+        types.set_proto_context(Rc::clone(&manager));
+        let mut model = crate::fspec::ProtoModel::new(&manager);
+        model.build_param_list("standard").unwrap();
+        model.input_mut().push_entry(crate::fspec::ParamEntry::seed(
+            0, crate::dtype::type_class::TYPECLASS_GENERAL, Rc::clone(&register),
+            0x20, 8, 1, 0, 0, true, false, &[], &manager,
+        ).unwrap());
+        model.input_mut().finish_decode();
+        let model = Rc::new(model);
+        let mut context = ArchContext::new_shared(Rc::clone(&manager));
+        context.types = Some(Rc::clone(&types));
+        let entry = Address::new(Rc::clone(manager.get_space_by_name("ram").unwrap()), 0x1000);
+        let mut fd = Funcdata::new(
+            "func", "func", Rc::new(context), entry.clone(), 0x10000000, 0x40,
+        ).unwrap();
+        let authored = crate::fspec::PrototypePieces {
+            outtype: Some(Rc::new(Datatype::new(0, type_metatype::TYPE_VOID))),
+            intypes: vec![Rc::new(Datatype::new(4, type_metatype::TYPE_INT))],
+            innames: vec!["value".into()],
+            first_var_arg_slot: -1,
+            ..Default::default()
+        };
+        fd.apply_locked_prototype_with_model(&authored, Some(model)).unwrap();
+        fd.get_func_proto_mut().retain_logical_declaration(&authored);
+        let mapped = crate::fspec::ParameterPieces {
+            addr: Address::new(register, 0x40),
+            type_: Some(Rc::new(Datatype::new(2, type_metatype::TYPE_UINT))),
+            flags: crate::fspec::parameter_pieces_flags::TYPELOCK
+                | crate::fspec::parameter_pieces_flags::NAMELOCK,
+        };
+        fd.apply_mapped_params(&[(2, "mapped".into(), mapped.clone())]);
+        fd.get_func_proto_mut().set_param_usepoint(2, entry.clone());
+        let source = fd.get_func_proto();
+        assert_eq!(source.logical_pieces().unwrap().intypes.len(), 1);
+        assert_eq!(source.logical_pieces().unwrap().innames, ["value"]);
+        assert!(source.get_param(1).is_none());
+        let mut working = types.acquire_working_proto(source).unwrap();
+        for _ in 0..2 {
+            assert_eq!(working.num_params(), 3);
+            assert!(working.get_param(1).is_none());
+            let parameter = working.get_param(2).unwrap();
+            assert_eq!(parameter.get_name(), "mapped");
+            assert_eq!(parameter.get_address(), mapped.addr);
+            assert_eq!(parameter.get_type().unwrap().get_size(), 2);
+            assert_eq!(parameter.get_flags(), mapped.flags);
+            assert_eq!(parameter.get_usepoint(), entry);
+            assert_eq!(working.logical_pieces().unwrap().intypes.len(), 1);
+            assert!(!working.has_custom_storage());
+            working = types.acquire_working_proto(&working).unwrap();
+        }
+        assert_eq!(source.num_params(), 3);
+        assert!(source.get_param(1).is_none());
+    }
+
+    #[test]
     fn scoped_input_symbol_properties_wait_for_varnode_lifetime() {
         let mut manager = build_manager();
         let register = Rc::new(AddrSpace::new(
@@ -5888,14 +6233,14 @@ mod tests {
             .unwrap().unwrap();
         scope.set_attribute(symbol, crate::varnode::varnode_flags::namelock
             | crate::varnode::varnode_flags::typelock);
-        let free = fd.new_varnode(4, &storage, None);
+        let free = fd.new_varnode(4, &storage, None).unwrap();
         assert!(fd.vbank().get(free).unwrap().is_free());
         assert!(!fd.vbank().get(free).unwrap().is_name_lock());
         assert!(!fd.vbank().get(free).unwrap().is_mapped());
         let input = fd.set_input_varnode(free).unwrap();
         assert!(fd.vbank().get(input).unwrap().is_name_lock());
         assert!(fd.vbank().get(input).unwrap().is_mapped());
-        let later = fd.new_varnode(4, &storage, None);
+        let later = fd.new_varnode(4, &storage, None).unwrap();
         assert!(!fd.vbank().get(later).unwrap().is_name_lock());
         assert!(!fd.vbank().get(later).unwrap().is_mapped());
         let copy = fd.new_op(1, Address::new(code, 0x1020));
@@ -6266,7 +6611,7 @@ mod tests {
         let bl = fd.bblocks_mut().new_block_basic(root);
         fd.bblocks_mut().set_start_block(root, bl);
         // out = in + in, so `out` is a written varnode the hasher can key on.
-        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let a = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let a = fd.set_input_varnode(a).unwrap();
         let op = fd.new_op(2, Address::new(Rc::clone(&rs), 0x1000));
         fd.op_set_opcode(op, crate::context::TypeOp::new(OpCode::CPUI_INT_ADD, 0, "ADD"));
@@ -6283,8 +6628,8 @@ mod tests {
             crate::dynamic::dynamic_unique_hash(out, 8, &mut fd).expect("hash");
         assert_ne!(hash, 0, "the fixture varnode must hash uniquely");
 
-        fd.seed_dynamic_recommendations(&[("user_renamed".to_string(), hash_addr, hash)]);
-        fd.kuna_apply_dynamic_recommendations();
+        fd.get_scope_local_mut().unwrap().add_recommend_dynamic(hash_addr, hash, "user_renamed");
+        fd.kuna_apply_dynamic_recommendations().unwrap();
 
         let high = fd.vbank().get(out).and_then(|v| v.get_high()).expect("high");
         let h = fd.high_bank().get(high).expect("high present");
@@ -6297,8 +6642,9 @@ mod tests {
             h.kuna_link_symbol().is_some(),
             "the recommendation must also bind a Symbol so the wire carries an id"
         );
+        assert_eq!(h.kuna_dynamic_symbol(), h.kuna_link_symbol());
         // A second apply is idempotent (the name is already resolved).
-        fd.kuna_apply_dynamic_recommendations();
+        fd.kuna_apply_dynamic_recommendations().unwrap();
         assert_eq!(
             fd.high_bank().get(high).unwrap().kuna_name(),
             Some("user_renamed")
@@ -6323,7 +6669,7 @@ mod tests {
         ).unwrap();
         let root = fd.bblocks_root_pub();
         let block = fd.bblocks_mut().new_block_basic(root);
-        let input = fd.new_varnode(4, &Address::new(Rc::clone(&ram), 0x100), None);
+        let input = fd.new_varnode(4, &Address::new(Rc::clone(&ram), 0x100), None).unwrap();
         let input = fd.set_input_varnode(input).unwrap();
         let op = fd.new_op(2, Address::new(Rc::clone(&ram), 0x1000));
         fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "ADD"));
@@ -6424,7 +6770,7 @@ mod tests {
         fd.vbank.get_mut(v).unwrap().clear_cover();
         assert!(fd.vbank.get(v).unwrap().cover().is_none());
         // The `opSetOutput` half: `setVarnodeProperties` re-allocates it empty.
-        fd.set_varnode_properties(v);
+        fd.set_varnode_properties(v).unwrap();
         assert!(fd.vbank.get(v).unwrap().cover().is_some());
         assert!(fd.vbank.get(v).unwrap().is_cover_dirty_flag());
         assert!(

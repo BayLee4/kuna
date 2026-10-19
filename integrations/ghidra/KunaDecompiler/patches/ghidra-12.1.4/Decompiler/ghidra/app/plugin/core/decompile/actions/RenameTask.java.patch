@@ -1,0 +1,26 @@
+--- a/ghidra/app/plugin/core/decompile/actions/RenameTask.java
++++ b/ghidra/app/plugin/core/decompile/actions/RenameTask.java
+@@ -24,6 +24,8 @@
+ import ghidra.framework.plugintool.PluginTool;
+ import ghidra.program.model.listing.Function;
+ import ghidra.program.model.listing.Program;
++import ghidra.program.model.data.DataType;
++import ghidra.program.model.pcode.HighFunctionDBUtil;
+ import ghidra.program.model.symbol.SymbolTable;
+ import ghidra.util.Msg;
+ import ghidra.util.exception.DuplicateNameException;
+@@ -56,6 +58,14 @@
+ 	public abstract boolean isValid(String newNm);
+ 
+ 	public abstract void commit() throws DuplicateNameException, InvalidInputException;
++
++	protected final void requireSourceAuthority(DataType type) throws InvalidInputException {
++		if (tokenAtCursor.getClangFunction() != null &&
++			tokenAtCursor.getClangFunction().getHighFunction() != null) {
++			HighFunctionDBUtil.requireSourceAuthority(
++				tokenAtCursor.getClangFunction().getHighFunction(), type);
++		}
++	}
+ 
+ 	public String getNewName() {
+ 		return newName;

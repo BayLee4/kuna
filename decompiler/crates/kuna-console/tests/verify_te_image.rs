@@ -149,7 +149,7 @@ fn thumb_te_dispatches_maps_and_decompiles() {
     assert_eq!(even.addr.get_offset(), 0x401000);
     assert!(program.entry_bytes_mapped(&even.addr));
 
-    let results = decompile_targets(&mut program, vec![odd], true, false, false);
+    let results = decompile_targets(&mut program, vec![odd], true, false, false).unwrap();
     assert_eq!(results.len(), 1);
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(
@@ -203,7 +203,7 @@ fn armthumb_mixed_uses_thumb2_without_painting_a32_code() {
         1
     );
 
-    let results = decompile_targets(&mut program, vec![arm, thumb], true, false, false);
+    let results = decompile_targets(&mut program, vec![arm, thumb], true, false, false).unwrap();
     for result in &results {
         assert!(result.error.is_none(), "{:?}", result.error);
     }
@@ -266,7 +266,7 @@ fn odd_thumb_entry_carries_mode_across_bl_but_not_blx() {
         true,
         false,
         false,
-    );
+    ).unwrap();
     for result in &results {
         assert!(result.error.is_none(), "{:?}", result.error);
     }
@@ -324,7 +324,7 @@ fn assert_it_return_paths(code: &[u8]) {
         assert_eq!(tmode_at(&program, 0x401006), 1, "the conditional fall-through is Thumb");
         assert_eq!(tmode_at(&program, 0x401008), 1, "the fall-through return is Thumb");
         let entry = program.find_entry_at(0x401001).unwrap();
-        let results = decompile_targets(&mut program, vec![entry], true, false, false);
+        let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
         assert!(results[0].error.is_none(), "{:?}", results[0].error);
         let code = results[0].code.clone().unwrap();
         assert!(code.contains("if (") && code.contains("return 7;"), "{code}");
@@ -397,7 +397,7 @@ fn a_blx_target_below_a_thumb_callee_does_not_flatten_it() {
     let callee = program
         .resolve_entry(&EntrySelector::Numeric(0x401018))
         .expect("Thumb callee");
-    let results = decompile_targets(&mut program, vec![callee], true, false, false);
+    let results = decompile_targets(&mut program, vec![callee], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(
         results[0].code.as_deref().unwrap().contains("return 7;"),
@@ -459,7 +459,7 @@ fn odd_generic_arm_entry_preserves_a32_code_on_either_side() {
         let arm = program.resolve_entry(&EntrySelector::Numeric(arm_addr)).expect("A32 function");
         let thumb = program.find_entry_at(thumb_addr | 1).expect("odd Thumb entry");
         let entries = if arm_addr < thumb_addr { vec![arm, thumb] } else { vec![thumb, arm] };
-        let results = decompile_targets(&mut program, entries, true, false, false);
+        let results = decompile_targets(&mut program, entries, true, false, false).unwrap();
         for (addr, expected) in [(arm_addr, "return;"), (thumb_addr, "return 7;")] {
             let result = results.iter().find(|result| result.address == addr).unwrap();
             assert!(result.error.is_none(), "{addr:#x}: {:?}", result.error);
@@ -496,7 +496,7 @@ fn entry_thumb_walk_decodes_overlaid_bytes() {
         1,
         "the entry walk must follow the overlaid branch"
     );
-    let results = decompile_targets(&mut program, vec![entry], true, false, false);
+    let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(
         results[0].code.as_deref().unwrap().contains("return 7;"),
@@ -596,7 +596,7 @@ fn apply_byte_assertions(program: &mut ConsoleProgram, overlays: &[(u64, &[u8])]
 
 fn assert_entry_returns_7(program: &mut ConsoleProgram) {
     let entry = program.find_entry_at(0x401001).unwrap();
-    let results = decompile_targets(program, vec![entry], true, false, false);
+    let results = decompile_targets(program, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(results[0].code.as_deref().unwrap().contains("return 7;"), "{:?}", results[0].code);
 }
@@ -613,7 +613,7 @@ fn arm_te_literal_pool_folds_only_with_litpoolconst() {
     assert!(!enabled.arch().readonlypropagate);
     enabled.commit_pending_analysis().unwrap();
     let entry = enabled.find_entry_at(0x401000).expect("TE entry");
-    let results = decompile_targets(&mut enabled, vec![entry], true, false, false);
+    let results = decompile_targets(&mut enabled, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     let enabled_c = results[0].code.as_deref().unwrap();
     assert!(enabled_c.contains("return 7;"), "{enabled_c}");
@@ -626,7 +626,7 @@ fn arm_te_literal_pool_folds_only_with_litpoolconst() {
         .unwrap();
     disabled.commit_pending_analysis().unwrap();
     let entry = disabled.find_entry_at(0x401000).expect("TE entry");
-    let results = decompile_targets(&mut disabled, vec![entry], true, false, false);
+    let results = decompile_targets(&mut disabled, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(
         results[0]

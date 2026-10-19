@@ -119,7 +119,7 @@ impl BreakTableCallBack {
         func: Rc<RefCell<dyn BreakCallBack>>,
     ) -> KunaResult<()> {
         let mut userops: Vec<String> = Vec::new();
-        self.trans.get_user_op_names(&mut userops);
+        self.trans.get_user_op_names(&mut userops)?;
         let mut i: i32 = 0;
         while (i as usize) < userops.len() {
             // cast: C++ int4 i < vector::size() comparison
@@ -1135,19 +1135,19 @@ pub(crate) mod test_support {
             Err(KunaError::sleigh(format!("Unknown register name: {nm}")))
         }
 
-        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             self.get_exact_register_name(base, off, size)
         }
 
-        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> String {
+        fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: i32) -> KunaResult<String> {
             if Rc::ptr_eq(base, &self.register_space)
                 && off.is_multiple_of(8)
                 && off < 64
                 && size == 8
             {
-                format!("r{}", off / 8)
+                Ok(format!("r{}", off / 8))
             } else {
-                String::new()
+                Ok(String::new())
             }
         }
     }
@@ -1177,8 +1177,9 @@ pub(crate) mod test_support {
             }
         }
 
-        fn get_user_op_names(&self, res: &mut Vec<String>) {
+        fn get_user_op_names(&self, res: &mut Vec<String>) -> KunaResult<()> {
             res.extend(self.userops.iter().cloned());
+            Ok(())
         }
 
         fn instruction_length(&self, baseaddr: &Address) -> KunaResult<i32> {

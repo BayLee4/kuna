@@ -11,7 +11,9 @@
 //!   - the [`JumpValuesRange`] / [`JumpValuesRangeDefault`] iterator bookkeeping
 //!     (`truncate`, `get_size`, `initialize_for_reading`, default last-value);
 //!   - [`IndexPair`] / [`PcodeOpNode`] ordering, and the [`JumpTable`] `<jumptable>`
-//!     decode (addresses + labels + loadtables) and encode round-trip.
+//!     decode (addresses + labels + loadtables) and encode round-trip;
+//!   - processor-assisted model selection, parameter matching, labels,
+//!     normalization, default folding, and flow-copy lifecycle.
 //!
 //! Paths that need the genuinely-absent subsystems (CircleRange value-set ops,
 //! emulation, the loader, TypeOp reverse-eval) are seam `Err` shells and are not
@@ -103,7 +105,7 @@ fn mk_const(fd: &mut Funcdata, val: u64) -> VarnodeId {
 /// a *free* varnode can have only one descendant, mirroring the C++ rule).
 fn mk_input(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.new_varnode(4, &Address::new(ram, off), None);
+    let vn = fd.new_varnode(4, &Address::new(ram, off), None).unwrap();
     fd.vbank_mut()
         .set_input(vn, &mut |_: &mut crate::varnode::VarnodeBank, _: VarnodeId, _: VarnodeId| {
             Ok(())
@@ -758,4 +760,108 @@ fn guard_range_retry_keeps_both_wrapped_bounds() {
     model.selectguards = guards;
     model.calc_range(&fd, input, &mut range);
     assert_eq!((range.get_min(), range.get_end(), range.get_size()), (58, 62, 4));
+}
+
+fn build_assisted_fd() -> (Funcdata, OpId, OpId, VarnodeId) {
+    let mut arch = ArchContext::new(build_manager());
+    arch.max_jumptable_size = 3;
+    let mut userops = crate::userop::UserOpManage::new();
+    let mut userop = UserPcodeOp::new_jump_assist();
+    userop.base.name = b"switchassist".to_vec();
+    userops.register_op(userop).unwrap();
+    arch.userops = Rc::new(userops);
+    let ram = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
+    let mut fd = Funcdata::new(
+        "func",
+        "func",
+        Rc::new(arch),
+        Address::new(ram, 0x1000),
+        0x10000000,
+        0x40,
+    )
+    .unwrap();
+    let assist = mk_op(&mut fd, 4, 0x1000, OpCode::CPUI_CALLOTHER);
+    let userop_id = mk_const(&mut fd, 0);
+    let switchvn = mk_input(&mut fd, 0x10);
+    let size = mk_const(&mut fd, 3);
+    let table = mk_const(&mut fd, 0x2000);
+    for (slot, vn) in [userop_id, switchvn, size, table].into_iter().enumerate() {
+        fd.op_set_input(assist, vn, slot as int4).unwrap();
+    }
+    let destination = mk_vn(&mut fd, 0x20);
+    fd.op_set_output(assist, destination).unwrap();
+    let branch = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_BRANCHIND);
+    fd.op_set_input(branch, destination, 0).unwrap();
+    let root = fd.bblocks_root_pub();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    fd.op_insert_end(assist, block);
+    fd.op_insert_end(branch, block);
+    (fd, assist, branch, switchvn)
+}
+
+#[test]
+fn assisted_recovery_matches_size_and_requires_constant_parameters() {
+    let (mut fd, assist, branch, _) = build_assisted_fd();
+    let mut model = JumpAssisted::default();
+    assert!(model.recover_model(&mut fd, branch, 0, 3).unwrap());
+    assert_eq!(model.get_table_size(), 4); // Three indices and the default.
+    assert!(model.recover_model(&mut fd, branch, 4, 3).unwrap());
+    assert!(!model.recover_model(&mut fd, branch, 3, 3).unwrap());
+    assert!(!model.recover_model(&mut fd, branch, 0, 2).unwrap());
+    let variable_table = mk_input(&mut fd, 0x30);
+    fd.op_set_input(assist, variable_table, 3).unwrap();
+    assert!(!model.recover_model(&mut fd, branch, 0, 3).unwrap());
+}
+
+#[test]
+fn assisted_model_is_selected_naturally_and_labels_default_last() {
+    let (mut fd, _, branch, _) = build_assisted_fd();
+    let mut jump = JumpTable::new(fd.obank().get(branch).unwrap().get_addr().clone());
+    jump.set_indirect_op(&fd, branch);
+    jump.recover_model(&mut fd, None).unwrap();
+    let model = jump.jmodel.as_ref().unwrap();
+    assert!(model.as_any().is::<JumpAssisted>());
+    let mut labels = Vec::new();
+    model.build_labels(&mut fd, &mut [], &mut labels, model.as_ref()).unwrap();
+    assert_eq!(labels, vec![0, 1, 2, NO_LABEL]);
+
+    let mut assisted = JumpAssisted::default();
+    jump.last_block = 2;
+    assert!(assisted.fold_in_guards(&mut fd, &mut jump).unwrap());
+    assert_eq!(jump.get_default_block(), 2);
+    assert!(!assisted.fold_in_guards(&mut fd, &mut jump).unwrap());
+}
+
+#[test]
+fn assisted_clone_and_clear_keep_only_architecture_level_model_state() {
+    let (mut fd, _, branch, _) = build_assisted_fd();
+    let mut model = JumpAssisted::default();
+    assert!(model.recover_model(&mut fd, branch, 0, 3).unwrap());
+    let cloned = model.clone_box();
+    let cloned = cloned.as_any().downcast_ref::<JumpAssisted>().unwrap();
+    assert_eq!(cloned.size_indices, 3);
+    assert_eq!(cloned.userop_index, model.userop_index);
+    assert!(cloned.assist_op.is_none());
+    assert!(cloned.switchvn.is_none());
+    model.clear();
+    assert!(model.assist_op.is_none());
+    assert!(model.switchvn.is_none());
+    assert_eq!(model.get_table_size(), 4);
+    assert!(model.recover_model(&mut fd, branch, 4, 3).unwrap());
+}
+
+#[test]
+fn assisted_normalization_replaces_all_consumers_and_removes_assist() {
+    let (mut fd, assist, branch, switchvn) = build_assisted_fd();
+    let destination = fd.obank().get(assist).unwrap().get_out().unwrap();
+    let copy = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
+    fd.op_set_input(copy, destination, 0).unwrap();
+    let mut model = JumpAssisted::default();
+    assert!(model.recover_model(&mut fd, branch, 0, 3).unwrap());
+    assert_eq!(model.fold_in_normalization(&mut fd, branch).unwrap(), Some(switchvn));
+    assert_eq!(fd.obank().get(branch).unwrap().get_in(0), Some(switchvn));
+    assert_eq!(fd.obank().get(copy).unwrap().get_in(0), Some(switchvn));
+    assert!(fd.vbank().get(destination).is_none());
+    assert!(fd.obank().get(assist).unwrap().get_out().is_none());
+    assert!(model.assist_op.is_none());
 }

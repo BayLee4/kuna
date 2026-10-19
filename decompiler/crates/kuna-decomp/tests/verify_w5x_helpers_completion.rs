@@ -94,7 +94,7 @@ fn mk_input(fd: &mut Funcdata, off: u64) -> VarnodeId {
 
 fn give_out(fd: &mut Funcdata, op: OpId, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.new_varnode(4, &Address::new(ram, off), Some(dt(4)));
+    let vn = fd.new_varnode(4, &Address::new(ram, off), Some(dt(4))).unwrap();
     fd.op_set_output(op, vn).unwrap();
     fd.obank().get(op).unwrap().get_out().unwrap()
 }

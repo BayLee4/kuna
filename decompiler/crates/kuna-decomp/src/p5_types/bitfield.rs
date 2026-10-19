@@ -791,40 +791,40 @@ impl Rule for RuleBitFieldStore {
         Some(Box::new(RuleBitFieldStore))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:1677-1692):
         let in1 = match data.obank().get(op).and_then(|o| o.get_in(1)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
-        let ptr = data.vn_type_read_facing(in1, op);
-        let (dt, off) = match ptr.get_ptr_into() {
-            Ok(Some((dt, off))) => (dt, off),
-            _ => return 0,
+        let ptr = data.vn_type_read_facing(in1, op)?;
+        let (dt, off) = match ptr.get_ptr_into()? {
+            Some((dt, off)) => (dt, off),
+            None => return Ok(0),
         };
         if !dt.has_bitfields() {
-            return 0;
+            return Ok(0);
         }
         let vn = match data.obank().get(op).and_then(|o| o.get_in(2)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if data.vbank().get(vn).map(|v| v.is_written()).unwrap_or(false) {
             let def = data.vbank().get(vn).unwrap().get_def().unwrap();
             if data.obank().get(def).map(|o| o.code()) == Some(OpCode::CPUI_INSERT) {
-                return 0;
+                return Ok(0);
             }
         }
         let big_endian = bitfield_big_endian(data);
         let mut transform = match insert::BitFieldInsertTransform::new(data, op, &dt, off, big_endian) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
-        if !transform.do_trace(data) {
-            return 0;
+        if !transform.do_trace(data)? {
+            return Ok(0);
         }
-        transform.apply(data);
-        1
+        transform.apply(data)?;
+        Ok(1)
     }
 }
 
@@ -845,26 +845,26 @@ impl Rule for RuleBitFieldOut {
         Some(Box::new(RuleBitFieldOut))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:1701-1712):
         let outvn = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
-        let dt = data.vn_type_def_facing(outvn);
+        let dt = data.vn_type_def_facing(outvn)?;
         if !dt.has_bitfields() {
-            return 0;
+            return Ok(0);
         }
         let big_endian = bitfield_big_endian(data);
         let mut transform = match insert::BitFieldInsertTransform::new(data, op, &dt, 0, big_endian) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
-        if !transform.do_trace(data) {
-            return 0;
+        if !transform.do_trace(data)? {
+            return Ok(0);
         }
-        transform.apply(data);
-        1
+        transform.apply(data)?;
+        Ok(1)
     }
 }
 
@@ -882,37 +882,37 @@ impl Rule for RuleBitFieldLoad {
         Some(Box::new(RuleBitFieldLoad))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:1720-1734):
         let in1 = match data.obank().get(op).and_then(|o| o.get_in(1)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
-        let ptr = data.vn_type_read_facing(in1, op);
-        let (dt, off) = match ptr.get_ptr_into() {
-            Ok(Some((dt, off))) => (dt, off),
-            _ => return 0,
+        let ptr = data.vn_type_read_facing(in1, op)?;
+        let (dt, off) = match ptr.get_ptr_into()? {
+            Some((dt, off)) => (dt, off),
+            None => return Ok(0),
         };
         if !dt.has_bitfields() {
-            return 0;
+            return Ok(0);
         }
         if data.obank().get(op).map(|o| o.not_printed()).unwrap_or(true) {
-            return 0; // LOAD visited before
+            return Ok(0); // LOAD visited before
         }
         let out = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let big_endian = bitfield_big_endian(data);
         let mut transform = match pull::BitFieldPullTransform::new(data, out, &dt, off, big_endian) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         if !transform.do_trace(data) {
-            return 0;
+            return Ok(0);
         }
-        transform.apply(data);
-        1
+        transform.apply(data)?;
+        Ok(1)
     }
 }
 
@@ -949,26 +949,26 @@ impl Rule for RuleBitFieldIn {
         Some(Box::new(RuleBitFieldIn))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:1748-1759):
         let invn = match data.obank().get(op).and_then(|o| o.get_in(0)) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
-        let dt = data.vn_type_read_facing(invn, op);
+        let dt = data.vn_type_read_facing(invn, op)?;
         if !dt.has_bitfields() {
-            return 0;
+            return Ok(0);
         }
         let big_endian = bitfield_big_endian(data);
         let mut transform = match pull::BitFieldPullTransform::new(data, invn, &dt, 0, big_endian) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         if !transform.do_trace(data) {
-            return 0;
+            return Ok(0);
         }
-        transform.apply(data);
-        1
+        transform.apply(data)?;
+        Ok(1)
     }
 }
 
@@ -986,7 +986,7 @@ impl Rule for RulePullAbsorb {
         Some(Box::new(RulePullAbsorb))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:2168-2208): walks the descendants of the
         // ZPULL/SPULL output and dispatches into the absorb* helpers, all of
         // which emit/destroy ops.  Ported in `absorb::pull_absorb_apply`.
@@ -1008,7 +1008,7 @@ impl Rule for RuleInsertAbsorb {
         Some(Box::new(RuleInsertAbsorb))
     }
 
-    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // C++ applyOp (bitfield.cc:2363-2400): switches on the def opcode of the
         // INSERT value input and dispatches into the absorb* helpers.  Ported in
         // `absorb::insert_absorb_apply`.

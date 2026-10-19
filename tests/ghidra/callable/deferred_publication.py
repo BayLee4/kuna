@@ -109,10 +109,16 @@ for mode in ['serial','stream','jobs2']:
     stem=a.binary.name;driver=out/'consumer.c';driver.write_text('#include "'+stem+'.h"\nint main(void){'+body+'return 0;}\n')
     data_sources=[]
     if label in ['scalar_only','returned_scalar_callback','deferred_scalar_cycle']:
-     header=(project/(stem+'.h')).read_text();declaration=re.search(r'(?m)^\s*extern\s+(volatile\s+)?Fn\s+(volatile\s+)?scalar_slot\s*;',header);assert declaration,header
+     header=(project/(stem+'.h')).read_text()
+     declarations=list(re.finditer(r'(?m)^[ \t]*extern[ \t]+(?P<pre>volatile[ \t]+)?(?P<type>[A-Za-z_][A-Za-z_0-9]*)[ \t]+(?P<post>volatile[ \t]+)?scalar_slot[ \t]*;[ \t]*$',header))
+     assert len(declarations)==1,header
+     declaration=declarations[0]
+     slot_type=declaration.group('type')
+     callable_definitions=re.findall(r'(?m)^[ \t]*typedef[ \t]+int[ \t]*\([ \t]*\*[ \t]*'+re.escape(slot_type)+r'[ \t]*\)[ \t]*\([ \t]*int[ \t]*\)[ \t]*;[ \t]*$',header)
+     assert len(callable_definitions)==1,(slot_type,header)
      row['original_external_data']=authenticate_scalar_slot()
-     actual_volatile=bool(declaration.group(1)or declaration.group(2));assert actual_volatile,header;row['actual_external_declaration']=declaration.group().strip()
-     row['qualifier_projection_limit']='Original fixture storage is Fn volatile. Consumer matches actual public '+('volatile Fn; actual qualifier retained.'if actual_volatile else'Fn; no volatile qualifier projection claimed.')
+     actual_volatile=bool(declaration.group('pre')or declaration.group('post'));assert actual_volatile,header;row['actual_external_declaration']=declaration.group().strip()
+     row['qualifier_projection_limit']='Original fixture storage is Fn volatile. Consumer matches actual public '+('volatile '+slot_type+'; actual qualifier retained.'if actual_volatile else slot_type+'; no volatile qualifier projection claimed.')
      data=out/'fixture-data.c';data.write_text('#include "'+stem+'.h"\nFn '+('volatile 'if actual_volatile else'')+'scalar_slot=actual_leaf;\n');data_sources.append(data)
     row['emitted_sha256']={path.name:hashlib.sha256(path.read_bytes()).hexdigest()for path in [project/(stem+'.c'),project/(stem+'.h')]}
     for opt in ['-O0','-O2']:

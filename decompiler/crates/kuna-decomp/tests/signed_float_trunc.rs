@@ -83,7 +83,7 @@ fn conversion(
             .unwrap(),
         _ => factory.get_base(size, destination).unwrap(),
     };
-    let output = fd.new_varnode(size, &Address::new(ram, 0x3000), Some(destination_type));
+    let output = fd.new_varnode(size, &Address::new(ram, 0x3000), Some(destination_type)).unwrap();
     fd.op_set_output(op, output).unwrap();
     let output = fd.obank().get(op).unwrap().get_out().unwrap();
     fd.op_insert(op, block, None);
@@ -96,7 +96,7 @@ fn truncation_precedes_unsigned_coercion() {
         for destination in [type_metatype::TYPE_UINT, type_metatype::TYPE_ENUM_UINT] {
             let (mut fd, op, output) = conversion(size, destination, OpCode::CPUI_FLOAT_TRUNC);
             let destination_type = Rc::clone(fd.vbank().get(output).unwrap().get_type());
-            fd.action_set_casts();
+            fd.action_set_casts().unwrap();
             assert!(Rc::ptr_eq(
                 fd.vbank().get(output).unwrap().get_type(),
                 &destination_type
@@ -127,7 +127,7 @@ fn signed_truncation_and_float_conversion_do_not_gain_casts() {
             (OpCode::CPUI_FLOAT_INT2FLOAT, type_metatype::TYPE_FLOAT),
         ] {
             let (mut fd, op, output) = conversion(size, destination, opcode);
-            fd.action_set_casts();
+            fd.action_set_casts().unwrap();
             assert_eq!(fd.obank().get(op).unwrap().get_out(), Some(output), "{opcode:?} {destination:?} size={size}");
         }
     }
@@ -136,7 +136,7 @@ fn signed_truncation_and_float_conversion_do_not_gain_casts() {
 #[test]
 fn truncation_precedes_one_byte_boolean_coercion() {
     let (mut fd, op, output) = conversion(1, type_metatype::TYPE_BOOL, OpCode::CPUI_FLOAT_TRUNC);
-    fd.action_set_casts();
+    fd.action_set_casts().unwrap();
     let signed = fd.obank().get(op).unwrap().get_out().unwrap();
     assert_eq!(
         fd.vbank().get(signed).unwrap().get_type().get_metatype(),

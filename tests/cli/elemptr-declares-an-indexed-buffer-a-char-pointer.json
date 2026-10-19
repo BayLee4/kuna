@@ -1,6 +1,6 @@
 {
   "schema": "re-probe/1",
-  "probe_id": "p-c5b9f2e3524e",
+  "probe_id": "p-4cae2d053881",
   "kind": "cli",
   "cmd": [
     "{{KUNA}}",
@@ -34,7 +34,7 @@
       "char \\* w_decode\\(char \\*a0,unsigned long a1,unsigned long \\*a2\\)",
       "p\\[v8\\] = v5 >> 0x10;",
       "\\(a0\\[v7\\] != '='\\)",
-      "\\? dat_300053e0\\[\\(unsigned char\\)a0\\[v7\\]\\] : 0;"
+      "\\? (?:\\(signed char\\))?dat_300053e0\\[\\(unsigned char\\)a0\\[v7\\]\\] : 0;"
     ],
     "stdout_absent": [
       "\\(long\\)p \\+",
@@ -42,5 +42,5 @@
       "\\(int\\)dat_"
     ]
   },
-  "notes": "With elemptr on, a base64 decoder's input string, which the body only indexes a byte at a time, is char * rather than long, and the buffer malloc returned is char * with a subscript store instead of *(char *)((long)v6 + (long)v8). A lookup in the program's allocated global table is a char, which the conditional it is an arm of widens itself, so it prints with no (int)."
+  "notes": "With elemptr on, byte-indexed input and malloc buffer are char pointers with subscript accesses. The global table's char value widens in the conditional without an int cast; an explicit signed-char cast may retain its target promotion. The independent table index remains unsigned char."
 }

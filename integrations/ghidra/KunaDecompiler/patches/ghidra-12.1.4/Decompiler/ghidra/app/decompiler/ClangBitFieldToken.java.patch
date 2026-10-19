@@ -1,0 +1,31 @@
+--- a/ghidra/app/decompiler/ClangBitFieldToken.java
++++ b/ghidra/app/decompiler/ClangBitFieldToken.java
+@@ -56,6 +56,7 @@
+ 	public void decode(Decoder decoder, PcodeFactory pfactory) throws DecoderException {
+ 		String datatypestring = null;
+ 		long id = 0;
++		long local = 0;
+ 		ident = -1;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+@@ -68,6 +69,9 @@
+ 			else if (attribId == ATTRIB_ID.id()) {
+ 				id = decoder.readUnsignedInteger();
+ 			}
++			else if (attribId == PcodeDataTypeManager.ATTRIB_KUNA_LOCAL.id()) {
++				local = decoder.readUnsignedInteger();
++			}
+ 			else if (attribId == ATTRIB_OPREF.id()) {
+ 				int refid = (int) decoder.readUnsignedInteger();
+ 				op = pfactory.getOpRef(refid);
+@@ -76,8 +80,8 @@
+ 				ident = (int) decoder.readSignedInteger();
+ 			}
+ 		}
+-		if (datatypestring != null) {
+-			DataType dt = pfactory.getDataTypeManager().findBaseType(datatypestring, id);
++		if (datatypestring != null || local != 0) {
++			DataType dt = pfactory.getDataTypeManager().findResultType(datatypestring, id, local);
+ 			if (dt == null) {
+ 				throw new DecoderException("Cannot find data-type in <bitfield>");
+ 			}

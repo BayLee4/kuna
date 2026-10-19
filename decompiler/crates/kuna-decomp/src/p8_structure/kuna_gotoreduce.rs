@@ -89,13 +89,13 @@ impl Action for ActionGotoReduce {
         }
         Some(Box::new(ActionGotoReduce { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option gotoreduce on|off`, carried on the Architecture boundary.
         if !data.get_arch().reduce_return_gotos {
-            return 0;
+            return Ok(0);
         }
         if data.sblocks_get_size() == 0 {
-            return 0; // not structured
+            return Ok(0); // not structured
         }
         let root = data.sblocks_root();
 
@@ -128,7 +128,7 @@ impl Action for ActionGotoReduce {
             }
         }
         if conversions.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let mut count: int4 = 0;
@@ -145,7 +145,7 @@ impl Action for ActionGotoReduce {
         crate::p8_structure::kuna_gotolabel::release_converted_labels(data, &converted_targets);
 
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 

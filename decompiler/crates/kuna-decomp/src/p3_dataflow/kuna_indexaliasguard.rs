@@ -534,7 +534,7 @@ mod tests {
                         fd.op_insert_end(op, block);
                     }
                     if via_high {
-                        let member = fd.new_varnode(4, &Address::new(Rc::clone(&ram), global_offset), None);
+                        let member = fd.new_varnode(4, &Address::new(Rc::clone(&ram), global_offset), None).unwrap();
                         let member = fd.set_input_varnode(member).unwrap();
                         fd.vbank_mut().get_mut(member).unwrap().set_flags_pub(varnode_flags::persist);
                         let target = fd.vbank().get(writer.unwrap()).unwrap().get_high().unwrap();

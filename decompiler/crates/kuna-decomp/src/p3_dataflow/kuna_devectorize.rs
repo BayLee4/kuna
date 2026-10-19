@@ -70,9 +70,9 @@ impl Action for ActionDevectorize {
         })
     }
 
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !self.enabled && !data.get_arch().devectorize_reduction {
-            return 0;
+            return Ok(0);
         }
         for i in 0..data.bblocks_get_size() {
             let Some((guard, edge)) = match_reduction(data, data.bblocks_get_block(i)) else {
@@ -82,9 +82,9 @@ impl Action for ActionDevectorize {
             data.remove_unreachable_blocks(false, true)
                 .expect("devectorize: remove_unreachable_blocks");
             self.base.count += 1;
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 

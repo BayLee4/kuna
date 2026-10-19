@@ -122,7 +122,7 @@ fn build_listing(prog: &ConsoleProgram, bin: &str, seed: u64) -> Listing {
     let translate = arch.translate();
     let image = kuna_analysis::loadimage_object::ObjectLoadImage::from_bytes(bin, &bytes)
         .expect("open loadimage");
-    Listing::build(&file, &image, arch, translate, &[seed])
+    Listing::build(&file, &image, arch, translate, &[seed]).unwrap()
 }
 
 /// ARM Thumb: the walker paints `TMode=1` at `compute`'s even entry (reusing the

@@ -2,6 +2,8 @@
 """Historical Apple conversion record replay from exact embedded Mach-O bytes.
 
 The active graph/object suite retains its original machine and provider consumers.
+The original Big24 control and a colliding source typedef both consume unchanged
+exported C/H, so generated hidden-result locals cannot capture nominal names.
 The missing original donor remains a bounded source-provenance prerequisite.
 """
 import argparse,base64,hashlib,json,subprocess,traceback,zlib
@@ -37,15 +39,18 @@ try:
  finally:m.close()
  def run(cmd):
   cmd=list(map(str,cmd));q=subprocess.run(cmd,cwd=repo,capture_output=True,text=True,timeout=240);v={'command':cmd,'status':q.returncode,'stdout':q.stdout,'stderr':q.stderr};r['commands'].append(v);return v
- common=['--functions','drive_big,make_big','--language','c','--option','structdefs','on','--assert','typedef typedef struct Big24 { unsigned long long a; unsigned long long b; unsigned long long c; } Big24;','--assert','typedef typedef Big24 (*BigFn)(int);','--assert','prototype drive_big unsigned long long drive_big(BigFn callback,int tag)','--assert','prototype make_big Big24 make_big(int tag)','--assert-strict']
- meta=run([a.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
- metadata=json.loads(meta['stdout']);(a.out/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==2 and {f['name'].lstrip('_')for f in metadata['functions']}=={'drive_big','make_big'}
- assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
- project=a.out/'project';export=run([a.cli,'decompile-project',binary,'-o',project,*common]);assert export['status']==0,export
- for name in ('_drive_big','_make_big'):require_provider_body(project/'production-smoke.c',name)
- driver=a.out/'consumer.c';driver.write_text('#include "production-smoke.h"\nint main(void){for(int tag=-20;tag<=20;++tag){Big24 r=_make_big(tag);if(r.a!=(unsigned long long)tag||r.b!=7||r.c!=(unsigned long long)(tag+3))return 1;if(_drive_big(_make_big,tag)!=(unsigned long long)(2*tag+3))return 2;}return 0;}\n')
- for opt in ['-O0','-O2']:
-  exe=a.out/('consumer'+opt);v=run([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/'production-smoke.c',driver,'-o',exe]);assert v['status']==0,v;v=run([exe]);assert v['status']==0,v
+ for type_name in ('Big24','hidden_result'):
+  case=a.out if type_name=='Big24' else a.out/'colliding-typedef'
+  if case!=a.out:case.mkdir()
+  common=['--functions','drive_big,make_big','--language','c','--option','structdefs','on','--assert',f'typedef typedef struct {type_name} {{ unsigned long long a; unsigned long long b; unsigned long long c; }} {type_name};','--assert',f'typedef typedef {type_name} (*BigFn)(int);','--assert','prototype drive_big unsigned long long drive_big(BigFn callback,int tag)','--assert',f'prototype make_big {type_name} make_big(int tag)','--assert-strict']
+  meta=run([a.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
+  metadata=json.loads(meta['stdout']);(case/'metadata.json').write_text(json.dumps(metadata,indent=2)+'\n');assert len(metadata['functions'])==2 and {f['name'].lstrip('_')for f in metadata['functions']}=={'drive_big','make_big'}
+  assert all(f.get('error')is None and f.get('code')for f in metadata['functions']),metadata
+  project=case/'project';export=run([a.cli,'decompile-project',binary,'-o',project,*common]);assert export['status']==0,export
+  for name in ('_drive_big','_make_big'):require_provider_body(project/'production-smoke.c',name)
+  driver=case/'consumer.c';driver.write_text('#include "production-smoke.h"\nint main(void){for(int tag=-20;tag<=20;++tag){'+type_name+' r=_make_big(tag);if(r.a!=(unsigned long long)tag||r.b!=7||r.c!=(unsigned long long)(tag+3))return 1;if(_drive_big(_make_big,tag)!=(unsigned long long)(2*tag+3))return 2;}return 0;}\n')
+  for opt in ['-O0','-O2']:
+   exe=case/('consumer'+opt);v=run([tool('cc'),'-std=c11','-Wall','-Wextra','-Werror=uninitialized','-Werror=incompatible-pointer-types','-Werror=implicit-function-declaration',opt,'-I',project,project/'production-smoke.c',driver,'-o',exe]);assert v['status']==0,v;v=run([exe]);assert v['status']==0,v
  r['completed']=True
 except BaseException:r['failure']=traceback.format_exc()
 finally:(a.out/'report.json').write_text(json.dumps(r,indent=2)+'\n');print(json.dumps({'completed':r['completed'],'failure':r.get('failure')}))

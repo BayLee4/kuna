@@ -19,6 +19,7 @@
 //! ([`force`]), and keeps the redo only when it returns a value.
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::spacetype;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
@@ -33,12 +34,17 @@ pub const MAX_CALL_SITES: usize = 32;
 /// to it, when that function was recovered `void` and has no declared or locked
 /// output: the widest read of the first model output register a caller reads,
 /// when every caller that reads one reads the same register.
-pub fn read(arch: &Architecture, data: &Funcdata) -> Option<(Address, int4)> {
+///
+/// Unavailable or recoverably undecodable caller bodies prove no read. Actual
+/// acquisition failures propagate immediately, without probing another caller.
+pub fn read(arch: &Architecture, data: &Funcdata) -> KunaResult<Option<(Address, int4)>> {
     if !arch.caller_reads || arch.kuna_call_returns.is_empty() {
-        return None;
+        return Ok(None);
     }
     let entry = data.get_address();
-    let code = entry.get_space().filter(|s| s.get_type() == spacetype::IPTR_PROCESSOR)?;
+    let Some(code) = entry.get_space().filter(|s| s.get_type() == spacetype::IPTR_PROCESSOR) else {
+        return Ok(None);
+    };
     let proto = data.get_func_proto();
     if !proto.has_model()
         || !proto.has_store()
@@ -48,16 +54,16 @@ pub fn read(arch: &Architecture, data: &Funcdata) -> Option<(Address, int4)> {
             .get_output_type()
             .is_some_and(|t| t.get_metatype() != crate::dtype::type_metatype::TYPE_VOID)
     {
-        return None;
+        return Ok(None);
     }
     let returns = data
         .obank()
         .iter_code(OpCode::CPUI_RETURN)
         .any(|r| data.obank().get(r).is_some_and(|o| !o.is_dead() && o.get_halt_type() == 0));
     if !returns {
-        return None;
+        return Ok(None);
     }
-    let reg = arch.manage().get_space_by_name("register")?;
+    let Some(reg) = arch.manage().get_space_by_name("register") else { return Ok(None) };
     let outputs: Vec<(Address, int4)> = proto
         .model()
         .output()
@@ -67,7 +73,7 @@ pub fn read(arch: &Architecture, data: &Funcdata) -> Option<(Address, int4)> {
         .map(|e| (Address::new(std::rc::Rc::clone(e.get_space()), e.get_base()), e.get_size()))
         .collect();
     if outputs.is_empty() {
-        return None;
+        return Ok(None);
     }
     let off = entry.get_offset();
     let lo = arch.kuna_call_returns.partition_point(|&(callee, _)| callee < off);
@@ -75,19 +81,19 @@ pub fn read(arch: &Architecture, data: &Funcdata) -> Option<(Address, int4)> {
     let sites = arch.kuna_call_returns[lo..].iter().take_while(|&&(callee, _)| callee == off);
     for &(_, back) in sites.take(MAX_CALL_SITES) {
         let at = Address::new(std::rc::Rc::clone(code), back);
-        let probe = crate::p4_calls::kuna_calleedeadarg::probe_entry(arch.translate(), &at, reg.get_index(), false);
+        let probe = crate::p4_calls::kuna_calleedeadarg::probe_entry(arch.translate(), &at, reg.get_index(), false)?;
         let read = outputs.iter().enumerate().find_map(|(k, (addr, size))| Some((k, probe.low_read_width(addr, *size)?)));
         let Some(read) = read else { continue };
         match &mut found {
             None => found = Some(read),
-            Some((k, _)) if *k != read.0 => return None,
+            Some((k, _)) if *k != read.0 => return Ok(None),
             Some((_, width)) => *width = (*width).max(read.1),
         }
     }
-    let (k, width) = found?;
+    let Some((k, width)) = found else { return Ok(None) };
     let (addr, size) = &outputs[k];
     let low = if addr.is_big_endian() { addr + i64::from(size - width) } else { addr.clone() };
-    Some((low, width))
+    Ok(Some((low, width)))
 }
 
 /// Have the next decompile of the function at `entry` force its return to

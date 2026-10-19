@@ -62,7 +62,7 @@ fn function(word_size: u32) -> (Funcdata, Rc<AddrSpace>, VarnodeId) {
     .unwrap();
     let root = data.bblocks_ref().root.unwrap();
     data.bblocks_mut().new_block_basic(root);
-    let sp = data.new_varnode(4, &Address::new(register, 0), None);
+    let sp = data.new_varnode(4, &Address::new(register, 0), None).unwrap();
     let sp = data.set_input_varnode(sp).unwrap();
     data.vbank_mut().get_mut(sp).unwrap().set_spacebase();
     (data, stack, sp)
@@ -140,10 +140,10 @@ fn provisional_guards_keep_only_exact_nonwrapping_stack_overlaps() {
             &std::collections::HashMap::new(),
             &mut guards,
             &mut Vec::new(),
-        );
+        ).unwrap();
         assert_eq!(guards.len(), 1);
         let indirect = guards[0].0;
-        prune(&mut data, &guards);
+        prune(&mut data, &guards).unwrap();
         assert_eq!(
             data.obank().get(indirect).is_some_and(|op| !op.is_dead()),
             kept,
@@ -174,7 +174,7 @@ fn spilled_store(
     let store = data.new_op(3, data.get_address().clone());
     data.op_set_opcode(store, crate::typeop::type_op_for(OpCode::CPUI_STORE));
     let space = data.new_constant(4, stack.get_contain().unwrap().get_index() as u64);
-    let reload = data.new_varnode(4, &Address::new(Rc::clone(stack), slot), None);
+    let reload = data.new_varnode(4, &Address::new(Rc::clone(stack), slot), None).unwrap();
     let value = data.new_constant(4, 9);
     for (i, vn) in [space, reload, value].into_iter().enumerate() {
         data.op_set_input(store, vn, i as int4).unwrap();
@@ -201,7 +201,7 @@ fn closed_frame_prefilter_excludes_pointer_slot_mutation_and_partial_writes() {
         &limited,
         &mut guards,
         &mut Vec::new(),
-    );
+    ).unwrap();
     assert_eq!(guards.len(), 1);
     let patch = data.new_op(1, data.get_address().clone());
     data.op_set_opcode(patch, crate::typeop::type_op_for(OpCode::CPUI_COPY));

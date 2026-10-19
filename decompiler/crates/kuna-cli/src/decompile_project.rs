@@ -56,7 +56,7 @@ use kuna_console::project::{
 use kuna_decomp::decompile_drive::{print_c_recompile_prelude, print_c_types};
 
 use crate::decompile_all::{
-    decompile_targets_pooled, load_program, parse_args, resolve_targets, synth_base, Args,
+    decompile_targets_pooled_with_export, load_program, parse_args, resolve_targets, synth_base, Args,
     DriverDefaults,
 };
 
@@ -230,6 +230,9 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
         return Err(format!("no functions selected/discovered in {}", args.binary));
     }
     crate::interior::selections(&prog, args, &targets);
+    kuna_console::project::prepare_type_names(&mut prog);
+    kuna_console::project::prepare_export_callables(&mut prog, &targets)
+        .map_err(|e| e.to_string())?;
 
     // `--jobs N`: the per-function loop fans out over worker processes, but the
     // parent's program stays loaded — the `.asm` section sweep and the README
@@ -253,7 +256,8 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
             );
         }
         let inventory = prog.function_entries_canonical();
-        let pooled = decompile_targets_pooled(
+        let export_spec = kuna_console::project::export_callables_spec(&prog);
+        let pooled = decompile_targets_pooled_with_export(
             args,
             &targets,
             &inventory,
@@ -264,6 +268,7 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
             synth_base(&prog),
             callee_first,
             crate::decompile_all::worker_arm_frames(&prog),
+            export_spec.as_ref(),
         )?;
         (pooled.results, pooled.types)
     } else if callee_first {
@@ -276,10 +281,11 @@ fn decompile_project(args: &Args, output: Option<&str>) -> Result<ProjectComplet
         }
         let base = kuna_console::project::export_options(targets.len() == 1);
         let funcs =
-            crate::decompile_all::decompile_callee_first(&mut prog, args, targets, explicit, base);
+            crate::decompile_all::decompile_callee_first(&mut prog, args, targets, explicit, base)
+                .map_err(|error| error.to_string())?;
         (funcs, None)
     } else {
-        (decompile_export_targets(&mut prog, targets), None)
+        (decompile_export_targets(&mut prog, targets).map_err(|e| e.to_string())?, None)
     };
     // Every artifact is address-ordered (resolve_targets only guarantees that
     // for the no-filter default; --addr/--functions arrive in user order).

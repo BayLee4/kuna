@@ -16,7 +16,7 @@
 //! The C++ oracle values used below were produced with a standalone
 //! `istringstream >> int/unsigned int` harness (see the verdict file).
 
-use kuna_base::error::KunaError;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4};
 use kuna_decomp::options::{
     split_datatype, ArchOption, ArchOptionContext, NamespaceStrategy, OptionDatabase,
@@ -135,14 +135,15 @@ impl ArchOptionContext for Ctx {
     fn set_action_warning(&mut self, _v: bool, _n: &str) -> bool {
         true
     }
-    fn clone_action_group(&mut self, _f: &str, _t: &str) {}
-    fn set_current_action(&mut self, n: &str) {
+    fn clone_action_group(&mut self, _f: &str, _t: &str) -> KunaResult<()> { Ok(()) }
+    fn set_current_action(&mut self, n: &str) -> KunaResult<()> {
         self.current_action = n.to_string();
+        Ok(())
     }
     fn current_action_name(&self) -> String {
         self.current_action.clone()
     }
-    fn toggle_action(&mut self, _g: &str, _s: &str, _v: bool) {}
+    fn toggle_action(&mut self, _g: &str, _s: &str, _v: bool) -> KunaResult<()> { Ok(()) }
     fn enable_rule(&mut self, _p: &str) -> bool {
         true
     }

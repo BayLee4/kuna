@@ -603,14 +603,15 @@ pub fn discovery_seeds(file: &object::File, entries: &[u64], patterns: bool) -> 
 /// walk paints. `seeds` is the caller's function inventory — the walk explores
 /// the call graph out of it, so a callee the inventory missed is still covered.
 ///
-/// Never fails and never panics past a bad decode: an undecodable address just
-/// ends that path, exactly as [`super::walk`] does.
+/// An undecodable address ends that path, exactly as [`super::walk`] does.
+/// Register-name query failures during table acquisition propagate to the
+/// caller rather than being treated as an absent table.
 pub fn build(
     file: &object::File,
     arch: &Architecture,
     translate: &dyn Translate,
     seeds: &[u64],
-) -> XrefIndex {
+) -> kuna_base::error::KunaResult<XrefIndex> {
     descend(file, arch, translate, seeds, &[], false)
 }
 
@@ -623,7 +624,7 @@ pub fn build_measured(
     arch: &Architecture,
     translate: &dyn Translate,
     seeds: &[u64],
-) -> XrefIndex {
+) -> kuna_base::error::KunaResult<XrefIndex> {
     descend(file, arch, translate, seeds, &[], true)
 }
 
@@ -645,7 +646,7 @@ pub fn build_with_focus(
     translate: &dyn Translate,
     seeds: &[u64],
     focus: &[u64],
-) -> XrefIndex {
+) -> kuna_base::error::KunaResult<XrefIndex> {
     descend(file, arch, translate, seeds, focus, false)
 }
 
@@ -656,9 +657,9 @@ fn descend(
     seeds: &[u64],
     focus: &[u64],
     measure: bool,
-) -> XrefIndex {
+) -> kuna_base::error::KunaResult<XrefIndex> {
     let Some(code_space) = arch.manage().get_default_code_space().map(Rc::clone) else {
-        return empty();
+        return Ok(empty());
     };
 
     let exec: Vec<(u64, u64)> = {
@@ -747,7 +748,7 @@ fn descend(
 
     // Share the decoded partition with prologue recovery and AIF.
     let gapwalk = arch.analysis_aif;
-    let mut fingerprint_contexts = (prologues && gapwalk)
+    let mut fingerprint_contexts = (gapwalk && file.architecture() == object::Architecture::Arm)
         .then(super::kuna_fingerprintcontext::FingerprintContexts::default);
     let mut prologues_done = false;
     let mut pending_prologues: VecDeque<u64> = VecDeque::new();
@@ -790,7 +791,7 @@ fn descend(
             Some(entry) => entry,
             None if prologues && !prologues_done => {
                 prologues_done = true;
-                let mut listing = partition_listing(&partition, &st.funcs, &exec);
+                let mut listing = partition_listing(&partition, &st.funcs, &exec, &st);
                 if gapwalk {
                     render_fingerprints(
                         &mut listing, &st.funcs, arch, translate, &code_space,
@@ -848,7 +849,7 @@ fn descend(
                         let original = frame_partition.as_ref().unwrap();
                         let candidates = frame_candidates.iter().copied()
                             .filter(|root| st.funcs.contains(root)).collect();
-                        let mut corpus = partition_listing(&partition, &st.funcs, &exec);
+                        let mut corpus = partition_listing(&partition, &st.funcs, &exec, &st);
                         render_fingerprints(
                             &mut corpus, &st.funcs, arch, translate, &code_space,
                             &partition, fingerprint_contexts.as_ref(),
@@ -946,6 +947,7 @@ fn descend(
                         &partition,
                         &st.funcs,
                         &exec,
+                        &st,
                         fingerprint_contexts.as_ref(),
                         frame_partition.as_ref(),
                         arch.analysis_aifbracket
@@ -986,33 +988,38 @@ fn descend(
         // instruction ending at the gap reaches the dispatch by falling into
         // it, so once that body drains it reads the table again and walks the
         // cases as its own.
-        while let Some((vma, mode)) = insn_queue.pop_front().or_else(|| {
-            let p = pool.as_ref()?;
-            for (vma, mode, branch) in std::mem::take(&mut woken) {
-                let read = branch_cases(
-                    translate,
-                    &code_space,
-                    data_space.as_ref(),
-                    &st.decoded,
-                    vma,
-                    Some(&branch),
-                    p,
-                    &exec,
-                    &reach,
-                    thumb_tables.as_ref(),
-                );
-                if read.cases.is_empty() && read.stated.is_none() {
-                    if let Some(gap) = read.gap {
-                        waiting.entry(gap).or_default().push((vma, mode, branch));
+        loop {
+            let next = if let Some(next) = insn_queue.pop_front() {
+                Some(next)
+            } else {
+                if let Some(p) = pool.as_ref() {
+                    for (vma, mode, branch) in std::mem::take(&mut woken) {
+                        let read = branch_cases(
+                            translate,
+                            &code_space,
+                            data_space.as_ref(),
+                            &st.decoded,
+                            vma,
+                            Some(&branch),
+                            p,
+                            &exec,
+                            &reach,
+                            thumb_tables.as_ref(),
+                        )?;
+                        if read.cases.is_empty() && read.stated.is_none() {
+                            if let Some(gap) = read.gap {
+                                waiting.entry(gap).or_default().push((vma, mode, branch));
+                            }
+                            continue;
+                        }
+                        let text = if read.cases.is_empty() { String::new() } else { assembly(translate, vma, &code_space) };
+                        st.take_switch(vma, entry, &read.cases, read.stated, max_entries, &text);
+                        insn_queue.extend(read.cases.iter().map(|&target| (target, mode)));
                     }
-                    continue;
                 }
-                let text = if read.cases.is_empty() { String::new() } else { assembly(translate, vma, &code_space) };
-                st.take_switch(vma, entry, &read.cases, read.stated, max_entries, &text);
-                insn_queue.extend(read.cases.iter().map(|&target| (target, mode)));
-            }
-            insn_queue.pop_front()
-        }) {
+                insn_queue.pop_front()
+            };
+            let Some((vma, mode)) = next else { break };
             if st.decoded.contains(&vma) {
                 continue; // already decoded (the VisitStat dedup)
             }
@@ -1171,7 +1178,7 @@ fn descend(
                             &exec,
                             &reach,
                             thumb_tables.as_ref(),
-                        );
+                        )?;
                         if let (Some(gap), Some(branch)) = (read.gap, branch) {
                             if read.cases.is_empty() && read.stated.is_none() {
                                 waiting.entry(gap).or_default().push((vma, mode, branch.clone()));
@@ -1272,7 +1279,7 @@ fn descend(
     if !measure {
         index.flow = None;
     }
-    index
+    Ok(index)
 }
 
 /// Ghidra's `MINIMUM_FUNCTION_COUNT`, mirrored here so the partition is not even
@@ -1302,6 +1309,7 @@ fn gap_entries(
     partition: &[(u64, u32)],
     funcs: &BTreeSet<u64>,
     exec: &[(u64, u64)],
+    state: &State,
     contexts: Option<&super::kuna_fingerprintcontext::FingerprintContexts>,
     frame: Option<&super::Listing>,
     bracket: Option<&crate::aif::kuna_aifbracket::BracketEvidence>,
@@ -1309,7 +1317,7 @@ fn gap_entries(
     if funcs.len() < AIF_MIN_FUNCTIONS || partition.is_empty() {
         return Vec::new();
     }
-    let mut listing = partition_listing(partition, funcs, exec);
+    let mut listing = partition_listing(partition, funcs, exec, state);
     let _probe = crate::aif::arm_gap_probe_scope(translate);
     render_fingerprints(&mut listing, funcs, arch, translate, code_space, partition, contexts);
     let poolslide = (arch.analysis_aifpoolslide && crate::loadimage_object::is_arm32_language(&arch.archid))
@@ -1388,6 +1396,7 @@ fn partition_listing(
     partition: &[(u64, u32)],
     funcs: &BTreeSet<u64>,
     exec: &[(u64, u64)],
+    state: &State,
 ) -> super::Listing {
     let mut insns = super::kuna_insnstore::InstructionStore::default();
     for &(addr, len) in partition {
@@ -1405,7 +1414,7 @@ fn partition_listing(
             },
         );
     }
-    super::Listing::from_partition_store(
+    let mut listing = super::Listing::from_partition_store(
         insns,
         funcs
             .iter()
@@ -1423,7 +1432,23 @@ fn partition_listing(
             })
             .collect(),
         exec.to_vec(),
-    )
+    );
+    listing.refs = super::kuna_compactrefs::ReferenceIndex::new(
+        state.by_source.values().flatten().map(|reference| super::Reference {
+            from: reference.from,
+            to: reference.to,
+            kind: match reference.kind {
+                XrefKind::Call => super::RefKind::Call,
+                XrefKind::Jump => super::RefKind::Code,
+                XrefKind::Read => super::RefKind::Read,
+                XrefKind::Write => super::RefKind::Write,
+                XrefKind::Data => super::RefKind::Data,
+            },
+            op_index: None,
+        }).collect(),
+    );
+    listing.has_refs = true;
+    listing
 }
 
 /// A forwarding veneer: the fixed pointer slot it jumps through, and the VMA one
@@ -1658,7 +1683,7 @@ fn branch_cases(
     exec: &[(u64, u64)],
     reach: &kuna_switchtable::Reach,
     thumb_tables: Option<&super::kuna_thumbswitch::HalfwordTables<'_>>,
-) -> kuna_switchtable::TableRead {
+) -> kuna_base::error::KunaResult<kuna_switchtable::TableRead> {
     let mut read = match branch {
         Some(branch) => kuna_switchtable::register_targets(
             translate, code_space, data_space, decoded, vma, branch, pool, exec, reach,
@@ -1670,10 +1695,10 @@ fn branch_cases(
     if read.cases.is_empty() && read.stated.is_none() {
         if let Some(tables) = thumb_tables {
             let decoded = |at: u64| decoded.contains(&at);
-            (read.cases, read.stated) = tables.targets(translate, code_space, exec, &decoded, vma);
+            (read.cases, read.stated) = tables.targets(translate, code_space, exec, &decoded, vma)?;
         }
     }
-    read
+    Ok(read)
 }
 
 /// Decode the instruction at `vma` into `cap`, keeping every input varnode, and
@@ -1816,7 +1841,14 @@ fn data_refs(
                 continue;
             }
             let value = vn.offset;
-            if !looks_like_address(value) || !in_range(mapped, value) {
+            let memory_address = i == 1
+                && matches!(op.opcode, OpCode::CPUI_LOAD | OpCode::CPUI_STORE);
+            if memory_address && !matches!((op.ins.first(), data_space), (Some(encoded), Some(space))
+                if encoded.offset == space.get_index() as u64)
+            {
+                continue;
+            }
+            if (!memory_address && !looks_like_address(value)) || !in_range(mapped, value) {
                 continue;
             }
             let kind = match op.opcode {
@@ -1975,7 +2007,7 @@ mod tests {
     /// data space; its index is what [`data_refs`] is told to match.
     fn spaces() -> (Rc<AddrSpace>, Rc<AddrSpace>) {
         (
-            Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_PROCESSOR)),
+            Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR, "ram", false, 8, 1, 0x1b, 0, 0, 0)),
             Rc::new(AddrSpace::new_for_decode(spacetype::IPTR_CONSTANT)),
         )
     }
@@ -2109,6 +2141,19 @@ mod tests {
         let (ram, cst) = spaces();
         let ops = [op(OpCode::CPUI_LOAD, None, vec![vn(&cst, 0x1b), vn(&cst, 0x4010)])];
         assert_eq!(refs(&ram, &ops), vec![(0x4010, XrefKind::Read)]);
+    }
+
+    #[test]
+    fn memory_reference_retains_its_encoded_space_and_low_address() {
+        let (ram, cst) = spaces();
+        let load = |space, address| op(
+            OpCode::CPUI_LOAD, None, vec![vn(&cst, space), vn(&cst, address)],
+        );
+        assert!(refs(&ram, &[load(0x1c, 0x4010)]).is_empty());
+        assert_eq!(
+            data_refs(&[load(0x1b, 0x80)], Some(&ram), &[(0, 0x1000)], 0, None),
+            vec![(0x80, XrefKind::Read)],
+        );
     }
 
     /// A `STORE` through a constant pointer is a write of the pointer, and the

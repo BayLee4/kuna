@@ -100,9 +100,10 @@ pub fn pointer_vote(sites: &[&CallSite], j: usize, p: &Typed, void_ptr: &Rc<Data
 /// derives from the value by a literal offset and then masks, shifts, divides
 /// or multiplies refuses it too (`(p + 7) & ~7`, an alignment helper over a
 /// `uintptr_t`).
-pub(crate) fn refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
-    crate::kuna_protoorder::input_refuses_declared(data, vn, ct)
-        || masks_a_derived_address(data, &crate::kuna_protoorder::value_family(data, vn))
+/// Errors acquiring declared use evidence propagate without becoming refusals.
+pub(crate) fn refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
+    Ok(crate::kuna_protoorder::input_refuses_declared(data, vn, ct)?
+        || masks_a_derived_address(data, &crate::kuna_protoorder::value_family(data, vn)))
 }
 
 /// Does the callee derive an address from a member of `family` by a literal
@@ -161,26 +162,30 @@ fn masks_a_derived_address(data: &Funcdata, family: &[VarnodeId]) -> bool {
 /// pointer is one variable, typed as the pointer, at every use, and the merge
 /// that joins the two values is where the size would pick up the pointer's
 /// dereference.
-pub fn provably_a_pointer(data: &Funcdata, vn: VarnodeId) -> bool {
+/// String-address query errors propagate only when that proof is needed.
+pub fn provably_a_pointer(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let value = same_value(data, vn);
     if dereferenced(data, &value) {
-        return true;
+        return Ok(true);
     }
-    value.iter().any(|&v| {
-        let Some(node) = data.vbank().get(v) else { return false };
-        if frame_address(data, v) || addresses_a_string(data, v) {
-            return true;
+    for v in value {
+        let Some(node) = data.vbank().get(v) else { continue };
+        if frame_address(data, v) || addresses_a_string(data, v)? {
+            return Ok(true);
         }
         if node.is_input() && stated_pointer(data, node.get_addr(), node.get_size()) {
-            return true;
+            return Ok(true);
         }
         if let Some(def) = node.get_def() {
             if declared_pointer_result(data, def) {
-                return true;
+                return Ok(true);
             }
         }
-        node.descend_iter().any(|r| declared_pointer_argument(data, r, v))
-    })
+        if node.descend_iter().any(|r| declared_pointer_argument(data, r, v)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `vn` and every varnode a COPY, CAST or INDIRECT joins to it, in either
@@ -281,27 +286,32 @@ fn dereferenced(data: &Funcdata, family: &[VarnodeId]) -> bool {
     false
 }
 
-/// Is `v` a string literal: a constant, or the engine's `PTRSUB` off the
-/// constant zero, that resolves to a character array kuna recovered
+/// Is `v` a string literal: a constant, its same-width COPY, or the engine's
+/// `PTRSUB` off the constant zero, that resolves to a character array kuna recovered
 /// (`kuna_charptr::constant_is_string`)? Any other constant is a number as
 /// often as an address -- `0x2000` is a buffer size and the address of
 /// `.init` -- so it proves nothing.
-fn addresses_a_string(data: &Funcdata, v: VarnodeId) -> bool {
-    let Some(node) = data.vbank().get(v) else { return false };
+fn addresses_a_string(data: &Funcdata, v: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    let Some(node) = data.vbank().get(v) else { return Ok(false) };
     let (reader, constant) = if node.is_constant() {
         (node.descend_iter().next(), Some(v))
     } else {
         let def = node.get_def();
         let base = def
             .and_then(|d| data.obank().get(d))
-            .filter(|o| o.code() == OpCode::CPUI_PTRSUB)
-            .filter(|o| o.get_in(0).and_then(|b| data.vbank().get(b)).is_some_and(|b| b.is_constant() && b.get_offset() == 0))
-            .and_then(|o| o.get_in(1));
+            .and_then(|o| match o.code() {
+                OpCode::CPUI_COPY if o.num_input() == 1 => o.get_in(0).filter(|&input| {
+                    data.vbank().get(input).is_some_and(|v| v.is_constant() && v.get_size() == node.get_size())
+                }),
+                OpCode::CPUI_PTRSUB
+                    if o.get_in(0).and_then(|b| data.vbank().get(b)).is_some_and(|b| b.is_constant() && b.get_offset() == 0) => o.get_in(1),
+                _ => None,
+            });
         (def, base)
     };
     match (reader, constant) {
         (Some(op), Some(c)) => crate::p5_types::kuna_charptr::constant_is_string(data, op, c),
-        _ => false,
+        _ => Ok(false),
     }
 }
 

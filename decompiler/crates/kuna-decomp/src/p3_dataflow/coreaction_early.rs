@@ -37,7 +37,7 @@
 //! | `ActionLateDoNothing` | `"latedonothing"` | `0` | partial (flags realized, surgery STUB) |
 //! | `ActionRedundBranch` | `"redundbranch"` | `0` | partial (splice realized, removeBranch STUB) |
 //! | `ActionDeterminedBranch` | `"determinedbranch"` | `0` | realized (detect + `removeBranch`) |
-//! | `ActionNormalizeSetup` | `"normalizesetup"` | `rule_onceperfunc` | realized `reset`, STUB body (W4 proto) |
+//! | `ActionNormalizeSetup` | `"normalizesetup"` | `rule_onceperfunc` | realized reset and prototype lock clearing |
 //!
 //! **The boundary** is the next class, [`ActionDeadCode`] (`coreaction.hh:565`,
 //! `name() == "deadcode"`).  Its `apply` body needs `FuncCallSpecs` /
@@ -62,9 +62,7 @@
 //! * Varnode loc-set iteration `beginLoc`/`endLoc`, `getHeritagePass`, and the
 //!   replace primitives `fillinReadOnly`/`replaceVolatile`/
 //!   `totalReplaceConstant` (W3-vn / W4).
-//! * Prototype / injection surface `getFuncProto().*`, `getArch()->context`,
-//!   `pcodeinjectlib`, `doLiveInject` (W4 — `FuncProto` is an empty `Default`
-//!   placeholder in `substrate/context.rs`).
+
 //!
 //! Where a primitive is **realized** the body calls it and is exercised by a
 //! test.  Where it is **stubbed** the body transcribes the C++ structure and
@@ -117,12 +115,12 @@ impl Action for ActionStart {
         }
         Some(Box::new(ActionStart { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++: data.startProcessing(); return 0;
         // STUB(W3-op/W4): Funcdata::startProcessing (the per-function p-code
         // gather / processing-start bookkeeping) is not in the merged tree.
         crate::p4_calls::kuna_x87emptyreturn::capture(data);
-        0
+        Ok(0)
     }
 }
 
@@ -153,10 +151,10 @@ impl Action for ActionStop {
         }
         Some(Box::new(ActionStop { base: self.base.clone() }))
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++: data.stopProcessing(); return 0;
         // STUB(W3-op/W4): Funcdata::stopProcessing not in the merged tree.
-        0
+        Ok(0)
     }
 }
 
@@ -187,9 +185,9 @@ impl Action for ActionStartCleanUp {
         }
         Some(Box::new(ActionStartCleanUp { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         data.start_clean_up();
-        0
+        Ok(0)
     }
 }
 
@@ -230,11 +228,11 @@ impl Action for ActionStartTypes {
     fn reset(&mut self, data: &mut Funcdata) {
         data.set_type_recovery(true);
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if data.start_type_recovery() {
             self.base.count += 1;
         }
-        0
+        Ok(0)
     }
 }
 
@@ -270,21 +268,21 @@ impl Action for ActionConstbase {
         }
         Some(Box::new(ActionConstbase { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:693.
         if data.bblocks_get_size() == 0 {
-            return 0; // No blocks
+            return Ok(0); // No blocks
         }
         // Entry block (block 0) — constructed to have nothing falling into it.
         let bb = data.bblocks_get_block(0);
         let bb_start = data.bblocks_block_start(bb);
 
-        // STUB(W4): getFuncProto().getInjectUponEntry + doLiveInject are the
-        // upon-entry pcode-inject surface (FuncProto is an empty Default
-        // placeholder in substrate/context.rs).  None of the tracked-register datatests drive
-        // it, so it stays deferred; the tracked-set COPY injection below is the
-        // half `set track <reg> <val> [start end]` (ifacedecomp.cc `IfcSettrackedrange`)
-        // depends on.
+        if data.get_func_proto().has_model() {
+            let inject_id = data.get_func_proto().get_inject_upon_entry();
+            if inject_id >= 0 {
+                data.do_live_inject(inject_id, &bb_start, bb, data.bb_op_head(bb))?;
+            }
+        }
 
         // C++ takes a copy; the per-function `glb` skeleton holds a snapshot of the
         // engine track base (taken at `build_arch_handle`), so clone the queried set
@@ -294,7 +292,7 @@ impl Action for ActionConstbase {
         let trackset: Vec<kuna_sleigh::globalcontext::TrackedContext> =
             arch.get_tracked_set(&func_addr).clone();
         if trackset.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         // For each tracked register: emit a `COPY #val` whose output is the
@@ -309,13 +307,13 @@ impl Action for ActionConstbase {
             let addr = kuna_base::address::Address::new(space, ctx.loc.offset);
             let size = ctx.loc.size as int4;
             let op = data.new_op(1, bb_start.clone());
-            data.new_varnode_out(size, &addr, op).expect("ActionConstbase: newVarnodeOut");
+            data.new_varnode_out(size, &addr, op)?;
             let vnin = data.new_constant(size, ctx.val);
             data.op_set_opcode_code(op, OpCode::CPUI_COPY);
             data.op_set_input(op, vnin, 0).expect("ActionConstbase: opSetInput");
             data.op_insert_begin(op, bb);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -346,10 +344,10 @@ impl Action for ActionSpacebase {
         }
         Some(Box::new(ActionSpacebase { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:1648.
-        data.spacebase();
-        0
+        data.spacebase()?;
+        Ok(0)
     }
 }
 
@@ -380,7 +378,7 @@ impl Action for ActionHeritage {
         }
         Some(Box::new(ActionHeritage { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:289.
         // `opHeritage` drives the owned Heritage engine (heritage.rs), mutating
         // the live Funcdata into SSA form (reads linked to writes, MULTIEQUAL
@@ -389,13 +387,13 @@ impl Action for ActionHeritage {
         // is why `break action heritage` never fires; see kuna/goldens.py B3).
         // (kuna decompile-all watchdog) thread the per-function deadline into
         // the heritage per-space loop; `None` everywhere but a budgeted drive.
-        data.op_heritage_with_deadline(ctx.deadline);
+        data.op_heritage_with_deadline(ctx.deadline)?;
         // (kuna) Repair any synthetic lowered-switch BRANCHIND whose input
         // heritage normalized away (see `kuna_repair_lowered_switch_inputs`).
         // A no-op unless a lowered-switch was installed this function, so it
         // never perturbs the datatest corpus.
         data.kuna_repair_lowered_switch_inputs();
-        0
+        Ok(0)
     }
 }
 
@@ -426,9 +424,9 @@ impl Action for ActionNonzeroMask {
         }
         Some(Box::new(ActionNonzeroMask { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         data.calc_nz_mask();
-        0
+        Ok(0)
     }
 }
 
@@ -461,7 +459,7 @@ impl Action for ActionVarnodeProps {
         }
         Some(Box::new(ActionVarnodeProps { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:1298.
         let cachereadonly = data.get_arch().readonly_propagate();
         let pass = data.get_heritage_pass();
@@ -553,7 +551,9 @@ impl Action for ActionVarnodeProps {
                         }
                     }
                     skip |= crate::kuna_stackalias::holds_store(data, vn);
-                    skip |= def.is_some_and(|op| crate::p3_dataflow::kuna_volatileload::is_volatile(data, op));
+                    if let Some(op) = def {
+                        skip |= crate::p3_dataflow::kuna_volatileload::is_volatile(data, op)?;
+                    }
                     if !skip {
                         data.vbank_mut()
                             .get_mut(vn)
@@ -631,7 +631,7 @@ impl Action for ActionVarnodeProps {
                 }
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -665,7 +665,7 @@ impl Action for ActionUnreachable {
         }
         Some(Box::new(ActionUnreachable { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3560
         // The reachability sweep + block deletion is now realized: unreachable
         // blocks are collected from the entry's reachable set, severed, and
@@ -677,7 +677,7 @@ impl Action for ActionUnreachable {
         {
             self.base.count += 1;
         }
-        0
+        Ok(0)
     }
 }
 
@@ -710,7 +710,7 @@ impl Action for ActionDoNothing {
         }
         Some(Box::new(ActionDoNothing { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3569.
         // The `clearDelayedDonothing()` sweep runs on every block on every call,
         // independent of removal.  Then we walk for do-nothing blocks: the first
@@ -740,7 +740,7 @@ impl Action for ActionDoNothing {
                 if data.is_normalization_on() || data.bb_has_no_immediate_copy(bb, 0) {
                     if data.remove_do_nothing_block(bb).is_ok() {
                         self.base.count += 1;
-                        return 0;
+                        return Ok(0);
                     }
                 } else {
                     // Immediate COPYs but otherwise removable -> defer to
@@ -749,7 +749,7 @@ impl Action for ActionDoNothing {
                 }
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -812,7 +812,7 @@ impl Action for ActionLateDoNothing {
         }
         Some(Box::new(ActionLateDoNothing { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3623.
         // Collect the removable delayed-do-nothing blocks, then remove them.
         let size = data.bblocks_get_size();
@@ -845,7 +845,7 @@ impl Action for ActionLateDoNothing {
                 self.base.count += 1;
             }
         }
-        0
+        Ok(0)
     }
 }
 
@@ -874,7 +874,7 @@ impl Action for ActionRedundBranch {
         }
         Some(Box::new(ActionRedundBranch { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3650.
         // The single-out **splice** path is realized (Funcdata::splice_block_basic
         // exists, though it itself `Err`s on a trailing branch op — STUB(W3-op));
@@ -925,7 +925,7 @@ impl Action for ActionRedundBranch {
             self.base.count += data.remove_branch(bb, 1).map(|_| 1).unwrap_or(0);
             i += 1;
         }
-        0 // Indicate full rule was applied
+        Ok(0) // Indicate full rule was applied
     }
 }
 
@@ -954,7 +954,7 @@ impl Action for ActionDeterminedBranch {
         }
         Some(Box::new(ActionDeterminedBranch { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3688.
         // The last op of each block is a CBRANCH on a constant condition; the dead
         // edge `num` is severed by `removeBranch`, collapsing the conditional into
@@ -998,7 +998,7 @@ impl Action for ActionDeterminedBranch {
             let num: kuna_base::types::int4 = if (val != 0) != is_flip { 0 } else { 1 };
             self.base.count += data.remove_branch(bb, num).map(|_| 1).unwrap_or(0);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1037,26 +1037,20 @@ impl Action for ActionNormalizeSetup {
         }
         Some(Box::new(ActionNormalizeSetup { base: self.base.clone() }))
     }
-    /// C++ `ActionNormalizeSetup::reset`: `{ data.setNormalization(true); }`.
-    ///
-    /// Faithful: the C++ override *replaces* `Action::reset` (does not chain to
-    /// it), so the base status/warning latch is intentionally left untouched
-    /// here — only the function's normalization flag is set.
+    /// Restore the inherited C++ `Action::reset` scheduling state for each
+    /// function, and mark the working function for normalization.
     fn reset(&mut self, data: &mut Funcdata) {
+        self.base.reset_base();
         data.set_normalization(true);
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
-        // C++ coreaction.cc:4801
-        //   FuncProto &fp(data.getFuncProto());
-        //   fp.clearInput();
-        //   fp.setModelLock(false);   // forces model re-evaluation
-        //   fp.setOutputLock(false);
-        //   return 0;
-        // STUB(W4): FuncProto is an empty Default placeholder in substrate/context.rs;
-        // clearInput / setModelLock / setOutputLock are W4 prototype surfaces.
-        // The realized `reset` already flips the function into normalization mode;
-        // the lock-stripping is deferred to the prototype wave (no change count).
-        0
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        // C++ coreaction.cc:4618-4629: retain return storage, but remove input
+        // symbols and allow the model and return type to be recovered again.
+        let fp = data.get_func_proto_mut();
+        fp.clear_input();
+        fp.set_model_lock(false);
+        fp.set_output_lock(false);
+        Ok(0)
     }
 }
 

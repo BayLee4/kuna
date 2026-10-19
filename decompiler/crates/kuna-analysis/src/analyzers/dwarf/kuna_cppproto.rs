@@ -123,14 +123,14 @@ pub(super) fn resolve_subprogram(
     };
 
     let mut params: Vec<usize> = formal_parameters(sub, dies);
-    let mut first_var_arg_slot = var_arg_slot(sub, dies, params.len());
+    let mut first_var_arg_slot = super::source_var_arg_slot(sub, dies, params.len());
     if params.is_empty() && first_var_arg_slot < 0 {
         // A definition that lists no parameters of its own (gcc does this for a
         // `DW_AT_declaration`-linked definition of a parameterless-looking body):
         // fall back to the declaration's list, which carries the real types.
         if let Some(d) = decl {
             params = formal_parameters(d, dies);
-            first_var_arg_slot = var_arg_slot(d, dies, params.len());
+            first_var_arg_slot = super::source_var_arg_slot(d, dies, params.len());
         }
     }
 
@@ -168,21 +168,6 @@ fn formal_parameters(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>) -> Vec<usiz
         }
     }
     out
-}
-
-/// The fixed-parameter count at which a trailing `DW_TAG_unspecified_parameters`
-/// starts the `...`, or `-1` when the DIE has none.
-fn var_arg_slot(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>, nparams: usize) -> i32 {
-    let variadic = die
-        .children
-        .iter()
-        .filter_map(|c| dies.get(c))
-        .any(|c| c.tag == gimli::DW_TAG_unspecified_parameters);
-    if variadic {
-        nparams as i32
-    } else {
-        -1
-    }
 }
 
 /// Build the `A::B::name` source name by walking `die`'s namespace/class/struct

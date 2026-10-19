@@ -77,15 +77,15 @@ impl Rule for RuleCallPush {
         Some(Box::new(RuleCallPush { enabled: self.enabled, group: self.group.clone() }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !self.enabled && !data.get_arch().drop_call_push {
-            return 0;
+            return Ok(0);
         }
         if !is_call_push(data, op) {
-            return 0;
+            return Ok(0);
         }
-        data.op_destroy(op);
-        1
+        data.op_destroy(op)?;
+        Ok(1)
     }
 }
 

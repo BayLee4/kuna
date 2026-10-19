@@ -60,7 +60,7 @@ fn variables_for(framelayout: bool) -> Vec<(String, Vec<VarInfo>)> {
         ) else {
             continue;
         };
-        out.push((name, extract_variables(prog.arch(), &fd)));
+        out.push((name, extract_variables(prog.arch(), &fd).unwrap()));
     }
     out
 }

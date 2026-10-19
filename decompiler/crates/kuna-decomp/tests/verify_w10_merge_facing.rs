@@ -258,7 +258,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
             // the high-facing type IS the merged high type (interned identity).
             if !high_ty.needs_resolution() {
                 if let Some(def) = w.def {
-                    let def_facing = fd.vn_high_type_def_facing(w.vn);
+                    let def_facing = fd.vn_high_type_def_facing(w.vn).unwrap();
                     assert!(
                         Rc::ptr_eq(&def_facing, &high_ty),
                         "{name}: getHighTypeDefFacing must equal high->getType() for \
@@ -266,7 +266,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                     );
                 }
                 for &op in &w.reads {
-                    let read_facing = fd.vn_high_type_read_facing(w.vn, op);
+                    let read_facing = fd.vn_high_type_read_facing(w.vn, op).unwrap();
                     assert!(
                         Rc::ptr_eq(&read_facing, &high_ty),
                         "{name}: getHighTypeReadFacing must equal high->getType() for \
@@ -280,7 +280,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
             // getTypeDefFacing/getTypeReadFacing base, varnode.cc:645-664).
             if !bare_ty.needs_resolution() {
                 if w.def.is_some() {
-                    let dfac = fd.vn_type_def_facing(w.vn);
+                    let dfac = fd.vn_type_def_facing(w.vn).unwrap();
                     assert!(
                         Rc::ptr_eq(&dfac, &bare_ty),
                         "{name}: getTypeDefFacing must equal vn->getType() for \
@@ -288,7 +288,7 @@ fn check_facing_invariants(file: &str) -> Result<usize, String> {
                     );
                 }
                 for &op in &w.reads {
-                    let rfac = fd.vn_type_read_facing(w.vn, op);
+                    let rfac = fd.vn_type_read_facing(w.vn, op).unwrap();
                     assert!(
                         Rc::ptr_eq(&rfac, &bare_ty),
                         "{name}: getTypeReadFacing must equal vn->getType() for \

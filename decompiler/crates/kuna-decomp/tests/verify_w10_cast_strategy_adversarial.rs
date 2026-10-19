@@ -106,9 +106,9 @@ fn decide_zext(
     let invn = ctx.op_in(op, 0);
     // (out->getHighTypeDefFacing(), in0->getHighTypeReadFacing(op))
     let outtype = ctx.vn_high_type(outvn);
-    let intype = ctx.vn_high_type_read_facing(invn, op);
+    let intype = ctx.vn_high_type_read_facing(invn, op).unwrap();
     if strat.is_zext_cast(&outtype, &intype) {
-        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op) {
+        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op).unwrap() {
             Render::Hidden
         } else {
             Render::Cast
@@ -129,9 +129,9 @@ fn decide_sext(
     let outvn = ctx.op_out(op).unwrap();
     let invn = ctx.op_in(op, 0);
     let outtype = ctx.vn_high_type(outvn);
-    let intype = ctx.vn_high_type_read_facing(invn, op);
+    let intype = ctx.vn_high_type_read_facing(invn, op).unwrap();
     if strat.is_sext_cast(&outtype, &intype) {
-        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op) {
+        if hide_exts && strat.is_extension_cast_implied(ctx, op, read_op).unwrap() {
             Render::Hidden
         } else {
             Render::Cast
@@ -238,8 +238,8 @@ impl CastContext for MockCtx {
     fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype> {
         Rc::clone(&self.vns[vn.0].ty)
     }
-    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> kuna_base::error::KunaResult<Rc<Datatype>> {
+        Ok(Rc::clone(&self.vns[vn.0].ty))
     }
     fn op_inherits_sign(&self, op: OpRef) -> bool {
         kuna_decomp::typeop::type_op_info(self.ops[op.0].code).inherits_sign()
@@ -354,7 +354,7 @@ fn w10_cast_strategy_null_readop_never_hidden() {
     );
 
     // Cross-check the predicate directly: implied is false with no reader.
-    assert!(!strat.is_extension_cast_implied(&ctx, zext, None));
+    assert!(!strat.is_extension_cast_implied(&ctx, zext, None).unwrap());
 }
 
 /// (V3) The big-constant boundary in `isExtensionCastImplied` (cast.cc:281-284):
@@ -386,7 +386,7 @@ fn w10_cast_strategy_big_constant_boundary_flips_implied() {
     // const size == promoteSize (4): NOT bigger -> implied -> Hidden (hide on).
     let (ctx_eq, zext_eq, read_eq) = build(promote);
     assert!(
-        strat.is_extension_cast_implied(&ctx_eq, zext_eq, Some(read_eq)),
+        strat.is_extension_cast_implied(&ctx_eq, zext_eq, Some(read_eq)).unwrap(),
         "const at exactly promoteSize must be implied (boundary inclusive)"
     );
     assert_eq!(
@@ -397,7 +397,7 @@ fn w10_cast_strategy_big_constant_boundary_flips_implied() {
     // const size == promoteSize + 1 (5 > 4): bigger -> NOT implied -> Cast.
     let (ctx_gt, zext_gt, read_gt) = build(promote + 1);
     assert!(
-        !strat.is_extension_cast_implied(&ctx_gt, zext_gt, Some(read_gt)),
+        !strat.is_extension_cast_implied(&ctx_gt, zext_gt, Some(read_gt)).unwrap(),
         "const strictly bigger than promoteSize must NOT be implied"
     );
     assert_eq!(
@@ -429,7 +429,7 @@ fn w10_cast_strategy_hide_exts_gate_is_and() {
         },
     );
     // Precondition: it IS implied.
-    assert!(strat.is_extension_cast_implied(&ctx, zext, Some(read)));
+    assert!(strat.is_extension_cast_implied(&ctx, zext, Some(read)).unwrap());
 
     // hide ON  -> Hidden ; hide OFF -> Cast (the AND short-circuits the implied test).
     assert_eq!(decide_zext(&strat, &ctx, zext, Some(read), true), Render::Hidden);
@@ -457,7 +457,7 @@ fn w10_cast_strategy_metatype_mismatch_not_implied() {
         },
     );
     assert!(
-        !strat.is_extension_cast_implied(&ctx, zext, Some(read)),
+        !strat.is_extension_cast_implied(&ctx, zext, Some(read)).unwrap(),
         "a mismatched-metatype other operand must defeat the implied test"
     );
     assert_eq!(decide_zext(&strat, &ctx, zext, Some(read), true), Render::Cast);

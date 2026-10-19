@@ -280,7 +280,7 @@ fn render_named(stem: &str, want: &[&str]) -> Result<Vec<(String, String)>, Stri
         };
         let entry = Address::new(space, sym.offset);
         if let Ok(fd) = decompile_func(base, &sym.name, entry, 0) {
-            out.push((sym.name.clone(), print_c(base, &fd)));
+            out.push((sym.name.clone(), print_c(base, &fd).unwrap()));
         }
     }
     Ok(out)

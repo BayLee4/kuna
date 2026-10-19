@@ -39,15 +39,15 @@ impl CallGraph {
         let bytes = image_bytes(binary, pref)?;
         let file = kuna_analysis::loadimage_object::parse_object(&bytes)
             .map_err(|e| format!("could not parse {binary}: {e}"))?;
-        Ok(CallGraph::walk(prog, &file, measured))
+        CallGraph::walk(prog, &file, measured).map_err(|e| e.to_string())
     }
 
     /// [`Self::build`] off an already-parsed image, for a caller that holds one.
-    pub(crate) fn build_from(prog: &ConsoleProgram, file: &object::File) -> CallGraph {
+    pub(crate) fn build_from(prog: &ConsoleProgram, file: &object::File) -> kuna_base::error::KunaResult<CallGraph> {
         CallGraph::walk(prog, file, false)
     }
 
-    fn walk(prog: &ConsoleProgram, file: &object::File, measured: bool) -> CallGraph {
+    fn walk(prog: &ConsoleProgram, file: &object::File, measured: bool) -> kuna_base::error::KunaResult<CallGraph> {
         let mut entries: Vec<(u64, u64)> = prog
             .function_entries_canonical()
             .iter()
@@ -61,7 +61,7 @@ impl CallGraph {
         } else {
             kuna_analysis::listing::xrefs::build
         };
-        let index = walk(file, prog.arch(), prog.arch().translate(), &seeds);
+        let index = walk(file, prog.arch(), prog.arch().translate(), &seeds)?;
         // PE names both the IAT slot and its veneer in the canonical inventory;
         // ELF traditionally names only the PLT veneer. Keep the graph vocabulary
         // symmetric by admitting every decoded forwarding slot as a zero-extent
@@ -74,7 +74,7 @@ impl CallGraph {
             }
         }
         entries.sort_unstable();
-        CallGraph { index, entries }
+        Ok(CallGraph { index, entries })
     }
 
     /// (kuna `callbacktype`) The entries of the functions that CALL or tail-jump
@@ -519,7 +519,7 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             for measured in [false, true] {
-                let mut graph = CallGraph::walk(&prog, &file, measured);
+                let mut graph = CallGraph::walk(&prog, &file, measured).unwrap();
                 assert!(graph.is_entry(0x1600));
                 assert_eq!(graph.direct_callers(0x1100), Some(vec![0x1500]));
                 assert_eq!(graph.owner_of(0x1754), Some(0x1500));
@@ -578,7 +578,7 @@ mod tests {
             let bytes = std::fs::read(&path).unwrap();
             let file = object::File::parse(&*bytes).unwrap();
             for measured in [false, true] {
-                let mut graph = CallGraph::walk(&prog, &file, measured);
+                let mut graph = CallGraph::walk(&prog, &file, measured).unwrap();
                 assert!(graph.is_entry(0x1600));
                 assert_eq!(graph.direct_callers(0x1100), Some(vec![0x1500]));
                 assert_eq!(graph.owner_of(0x1754), Some(0x1500));

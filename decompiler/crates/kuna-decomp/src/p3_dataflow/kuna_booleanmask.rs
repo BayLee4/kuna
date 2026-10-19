@@ -83,72 +83,72 @@ impl Rule for RuleBoolSignShift {
     }
 
     /// C++ `RuleBoolSignShift::applyOp` (`kuna_booleanmask.cc:19`) — transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // The live gate is carried on the boundary Architecture (`build_arch_handle`);
         // `enabled` stays as the unit-test OR-override (rule registered false).
         if !self.enabled && !data.get_arch().fold_boolean_mask {
-            return 0;
+            return Ok(0);
         }
 
         let in1 = match op_in(data, op, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let sa: uintb = vn_offset(data, in1);
         if sa == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let shiftin = match op_in(data, op, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_written(data, shiftin) {
-            return 0;
+            return Ok(0);
         }
         let leftshift = match vn_def(data, shiftin) {
             Some(d) => d,
-            None => return 0,
+            None => return Ok(0),
         };
         if op_code(data, leftshift) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         let ls1 = match op_in(data, leftshift, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, ls1) {
-            return 0;
+            return Ok(0);
         }
         // Same shift amount.
         if vn_offset(data, ls1) != sa {
-            return 0;
+            return Ok(0);
         }
 
         // RuleLeftRight already handles the byte-aligned case; defer to it there.
         if (sa & 7) == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let boolvn = match op_in(data, leftshift, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let width: int4 = vn_size(data, boolvn);
         // The value shifted up must occupy only the low (width*8 - sa) bits.
         if (width as uintb).wrapping_mul(8) <= sa {
-            return 0;
+            return Ok(0);
         }
         let tophalf: uintb = (1u64 << ((width as uintb).wrapping_mul(8) - sa)).wrapping_sub(1);
         if (vn_nzmask(data, boolvn) & !tophalf) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         if data.lone_descend(shiftin) != Some(op) {
-            return 0;
+            return Ok(0);
         }
 
         // Rewrite `(b << sa) s>> sa`  =>  `0 - b`  (INT_2COMP gives 0 or all-ones).
@@ -158,7 +158,7 @@ impl Rule for RuleBoolSignShift {
             .expect("RuleBoolSignShift: opSetInput on a live op (internal invariant)");
         // Drop the shift-amount constant.
         data.op_remove_input(op, 1);
-        1
+        Ok(1)
     }
 }
 

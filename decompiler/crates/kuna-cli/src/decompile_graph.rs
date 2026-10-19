@@ -191,7 +191,7 @@ fn export(args: &Args, label: &str) -> Result<String, String> {
             want_pointer_arguments: true,
             ..DecompileOptions::default()
         };
-        decompile_targets_with(&mut prog, targets, &opts)
+        decompile_targets_with(&mut prog, targets, &opts).map_err(|e| e.to_string())?
     };
     for result in &results {
         if let Some(error) = &result.error {
@@ -204,7 +204,7 @@ fn export(args: &Args, label: &str) -> Result<String, String> {
     let by_address: BTreeMap<u64, &FuncResult> =
         results.iter().map(|result| (result.byte_address, result)).collect();
 
-    let graph = CallGraph::build_from(&prog, &file);
+    let graph = CallGraph::build_from(&prog, &file).map_err(|e| e.to_string())?;
     // PE already inventories both halves of an import. ELF names its PLT veneer
     // but not the GOT slot, so materialize the missing half from the very same
     // decoded relation that supplies `forwardsTo` and the jump edge.

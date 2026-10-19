@@ -192,14 +192,14 @@ pub fn capture_partial_call(fc: &FuncCallSpecs, data: &Funcdata) -> Option<Pendi
 ///
 /// Applied in capture order, so a site extended here can itself witness a later
 /// one — the same chaining the in-order rule already has.
-pub fn extend_pending(data: &mut Funcdata, pending: &[PendingExtend]) -> int4 {
+pub fn extend_pending(data: &mut Funcdata, pending: &[PendingExtend]) -> KunaResult<int4> {
     let mut extended = 0;
     for p in pending {
-        if extend_one(data, p) {
+        if extend_one(data, p)? {
             extended += 1;
         }
     }
-    extended
+    Ok(extended)
 }
 
 /// The model's argument locations that `witness` does NOT claim.
@@ -275,16 +275,16 @@ fn callee_body_agrees(
 
 /// Extend one captured call's input list from a now-final sibling, or leave it
 /// alone. Returns whether the call gained arguments.
-fn extend_one(data: &mut Funcdata, p: &PendingExtend) -> bool {
+fn extend_one(data: &mut Funcdata, p: &PendingExtend) -> KunaResult<bool> {
     let keep = p.recovered.len() + 1;
     match data.obank().get(p.op) {
         Some(o)
             if !o.is_dead()
                 && o.code() == OpCode::CPUI_CALL
                 && o.num_input() == keep as int4 => {}
-        _ => return false,
+        _ => return Ok(false),
     }
-    let format_witness = crate::p4_calls::kuna_formatwitness::best_witness(&p.entry, p.op, data);
+    let format_witness = crate::p4_calls::kuna_formatwitness::best_witness(&p.entry, p.op, data)?;
     let format_agrees = !format_witness.is_empty();
     let witness = if format_agrees {
         format_witness
@@ -292,7 +292,7 @@ fn extend_one(data: &mut Funcdata, p: &PendingExtend) -> bool {
         best_witness_for(&p.entry, p.op, data)
     };
     if witness.len() <= p.recovered.len() {
-        return false;
+        return Ok(false);
     }
     // Positional: this site's own list has to be the witness's leading run.
     if !witness
@@ -300,49 +300,47 @@ fn extend_one(data: &mut Funcdata, p: &PendingExtend) -> bool {
         .zip(p.recovered.iter())
         .all(|((wa, wsz), (ra, rsz))| wa == ra && wsz == rsz)
     {
-        return false;
+        return Ok(false);
     }
     let tail = &witness[p.recovered.len()..];
     // All or nothing: every missing location needs a live, right-width Varnode
     // still standing at this site, in prototype order.
     let locs: Vec<(Address, int4)> =
         p.candidates.iter().map(|(a, sz, _)| (a.clone(), *sz)).collect();
-    let Some(picked) = plan_tail(tail, &locs) else { return false };
+    let Some(picked) = plan_tail(tail, &locs) else { return Ok(false) };
     let promoted: Vec<VarnodeId> =
         picked.iter().map(|i| p.candidates[*i as usize].2).collect();
-    let Some(idx) = data.get_call_specs_index(p.op) else { return false };
+    let Some(idx) = data.get_call_specs_index(p.op) else { return Ok(false) };
     let entries = {
         let fc = data.get_call_specs(idx);
         if !fc.proto().has_model() {
-            return false;
+            return Ok(false);
         }
         fc.proto().input_param_entries()
     };
     if entries.is_empty() {
-        return false;
+        return Ok(false);
     }
     if !format_agrees && !callee_body_agrees(data, &p.entry, &entries, &witness, tail) {
-        return false;
+        return Ok(false);
     }
     let mut newparam: Vec<VarnodeId> = Vec::new();
     for i in 0..keep as int4 {
         match data.obank().get(p.op).and_then(|o| o.get_in(i)) {
             Some(v) => newparam.push(v),
-            None => return false,
+            None => return Ok(false),
         }
     }
     for vn in &promoted {
         if data.vbank().get(*vn).is_none() {
-            return false;
+            return Ok(false);
         }
         newparam.push(*vn);
     }
-    if data.op_set_all_input(p.op, &newparam).is_err() {
-        return false;
-    }
+    data.op_set_all_input(p.op, &newparam)?;
     // Record where the arguments lived so a later extension can witness this site.
     data.get_call_specs_mut(idx).set_final_input_storage(witness);
-    true
+    Ok(true)
 }
 
 #[cfg(test)]

@@ -9,7 +9,8 @@
 //!   2. **Behavior on realized surfaces** — the parts of each `apply`/`reset`
 //!      body that bind to primitives present in the merged tree are exercised on
 //!      a hand-built [`Funcdata`]: `ActionStartTypes`/`ActionNormalizeSetup`
-//!      flag-setting, the `ActionRedundBranch` single-out splice, the
+//!      flag-setting and normalization lock clearing, the `ActionRedundBranch`
+//!      single-out splice, the
 //!      `ActionDeterminedBranch` constant-condition detection walk,
 //!      `ActionLateDoNothing::removing_creates_redundancy`, the
 //!      `ActionDoNothing` delayed-donothing sweep, and `ActionConstbase`'s
@@ -66,7 +67,7 @@ mod config_ir_regressions {
             ).unwrap();
             analysis.get_func_proto_mut().copy(&seed);
             act.reset(&mut analysis);
-            act.perform(&mut analysis, &mut ctx);
+            act.perform(&mut analysis, &mut ctx).unwrap();
             let normalized = analysis.get_func_proto();
             assert_eq!(normalized.num_params(), 0);
             assert!(!normalized.is_model_locked());
@@ -211,13 +212,13 @@ fn starttypes_reset_and_apply() {
 
     // First apply: startTypeRecovery() returns true => count increments.
     assert!(!fd.has_type_recovery_started());
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert!(fd.has_type_recovery_started());
     assert_eq!(act.base().count, 1, "first start counts as a change");
 
     // Second apply: already started => no change.
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 1, "already-started start makes no change");
 }
@@ -228,7 +229,16 @@ fn starttypes_reset_and_apply() {
 
 #[test]
 fn normalizesetup_reset_sets_normalization() {
+    use crate::dtype::{type_metatype, Datatype};
+    use crate::fspec::ProtoModel;
+
     let mut fd = build_fd();
+    // Normalization operates on an initialized working prototype store.
+    let mut model = ProtoModel::new(fd.get_arch().manage());
+    model.build_param_list("standard").unwrap();
+    fd.get_func_proto_mut().set_internal(
+        Rc::new(model), Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)),
+    );
     let mut ctx = ActionContext::new();
     let mut act = ActionNormalizeSetup::boxed("base");
 
@@ -236,8 +246,8 @@ fn normalizesetup_reset_sets_normalization() {
     act.reset(&mut fd);
     assert!(fd.is_normalization_on(), "reset must setNormalization(true)");
 
-    // apply body is the W4-stubbed lock-stripping => no change count.
-    let res = act.apply(&mut fd, &mut ctx);
+    // Prototype lock stripping does not contribute to the action change count.
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0);
 }
@@ -253,14 +263,14 @@ fn constbase_no_blocks_early_return() {
     let mut act = ActionConstbase::boxed("base");
 
     assert_eq!(fd.bblocks_get_size(), 0);
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0, "no blocks => no injected COPYs");
 
     // With a block present the W4 inject/track surface is stubbed => still 0.
     let root = fd.bblocks_root_pub();
     let _bb = fd.bblocks_mut().new_block_basic(root);
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0);
 }
@@ -282,7 +292,7 @@ fn donothing_clears_delayed_flag_on_every_block() {
     assert!(fd.bblocks_ref().block(a).is_delayed_donothing());
 
     let mut act = ActionDoNothing::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // The realized clearDelayedDonothing() sweep cleared both flags.
     assert!(!fd.bblocks_ref().block(a).is_delayed_donothing());
@@ -342,7 +352,7 @@ fn late_donothing_apply_skips_non_delayed_blocks() {
     fd.bblocks_mut().add_edge(a, b);
 
     let mut act = ActionLateDoNothing::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0);
     assert_eq!(fd.bblocks_get_size(), 2);
@@ -369,7 +379,7 @@ fn redundbranch_splices_single_in_single_out_chain() {
 
     let size_before = fd.bblocks_get_size();
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0, "ActionRedundBranch returns 0 (full rule applied)");
     // The bl->out splice merged out into bl, removing one block and counting it.
     assert!(act.base().count >= 1, "single-out chain should splice at least once");
@@ -414,7 +424,7 @@ fn determinedbranch_detects_constant_condition_without_panicking() {
     let _op = block_with_const_cbranch(&mut fd, bl, 0x1000, 1);
 
     let mut act = ActionDeterminedBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // removeBranch is now wired: the determined (constant) branch folds, count==1.
     assert_eq!(act.base().count, 1);
@@ -437,7 +447,7 @@ fn determinedbranch_ignores_empty_and_non_cbranch_blocks() {
     fd.op_insert_end(op, other);
 
     let mut act = ActionDeterminedBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0);
 }
@@ -460,7 +470,7 @@ fn stubbed_wrappers_apply_cleanly() {
         ActionVarnodeProps::boxed("base"),
         ActionUnreachable::boxed("base"),
     ] {
-        let res = act.apply(&mut fd, &mut ctx);
+        let res = act.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(res, 0, "{} should apply cleanly", act.get_name());
         assert_eq!(act.base().count, 0, "{} should make no change yet", act.get_name());
     }

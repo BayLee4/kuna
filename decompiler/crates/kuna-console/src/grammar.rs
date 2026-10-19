@@ -122,7 +122,7 @@ pub mod tok {
 #[derive(Debug, Clone)]
 enum TokenValue {
     /// `value.integer` (C++ `uintb`).
-    Integer(uintb),
+    Integer { legacy: uintb, full_width: i128 },
     /// `value.stringval` (C++ `string *`).
     StringVal(String),
     /// No value (punctuation / structural tokens).
@@ -162,7 +162,8 @@ impl GrammarToken {
         self.ty = tp;
         match tp {
             tok::INTEGER => {
-                self.value = TokenValue::Integer(parse_c_integer(bytes));
+                let (legacy, full_width) = parse_integer_values(bytes);
+                self.value = TokenValue::Integer { legacy, full_width };
             }
             tok::IDENTIFIER | tok::STRINGVAL => {
                 // C++ `new string(ptr,len)`.  The lexer never feeds non-UTF-8
@@ -186,7 +187,7 @@ impl GrammarToken {
                         other => other as uintb,
                     }
                 };
-                self.value = TokenValue::Integer(v);
+                self.value = TokenValue::Integer { legacy: v, full_width: i128::from(v) };
             }
             _ => {
                 return Err(KunaError::lowlevel("Bad internal grammar token set"));
@@ -207,9 +208,10 @@ impl GrammarToken {
     }
 
     /// C++ `getInteger` (`grammar.hh:63`).
+    #[cfg(test)]
     fn get_integer(&self) -> uintb {
         match self.value {
-            TokenValue::Integer(v) => v,
+            TokenValue::Integer { legacy, .. } => legacy,
             _ => 0,
         }
     }
@@ -243,7 +245,15 @@ impl GrammarToken {
 /// Overflow is the signed saturation the C++11 facet performs on `intb`:
 /// positive overflow leaves `val == INT64_MAX`, negative overflow leaves
 /// `val == INT64_MIN` (e.g. `0xffffffffffffffff` -> `i64::MAX`).
+#[cfg(test)]
 fn parse_c_integer(bytes: &[u8]) -> uintb {
+    parse_integer_values(bytes).0
+}
+
+/// Keep the original signed-prefix value for legacy grammar dimensions and
+/// the signed value or full positive magnitude for enum declarations. Both
+/// projections come from one scan, before signed saturation loses source bits.
+fn parse_integer_values(bytes: &[u8]) -> (uintb, i128) {
     // The lexer corpus is ASCII; treat the bytes directly (matches the C++
     // `istringstream` over the raw `char` buffer, which never sees a leading
     // space here — but `operator>>` would skip leading whitespace, so honor it).
@@ -281,9 +291,8 @@ fn parse_c_integer(bytes: &[u8]) -> uintb {
         10
     };
 
-    // Accumulate the longest valid-digit prefix with signed saturation, exactly
-    // as the C++11 num_get facet leaves `val`.
-    let mut val: i64 = 0;
+    // Accumulate the longest valid-digit prefix without narrowing to intb.
+    let mut val: uintb = 0;
     while i < n {
         // cast: ASCII byte to char for digit classification; bytes are the
         // lexer's `number` corpus (ASCII only).
@@ -292,25 +301,20 @@ fn parse_c_integer(bytes: &[u8]) -> uintb {
             None => break,
         };
         // cast: `digit` is in `0..radix` (<= 16) and `radix` is one of 8/10/16,
-        // both fit i64 exactly.
-        let d = digit as i64;
-        let base = radix as i64;
-        if neg {
-            val = val
-                .checked_mul(base)
-                .and_then(|v| v.checked_sub(d))
-                .unwrap_or(i64::MIN);
-        } else {
-            val = val
-                .checked_mul(base)
-                .and_then(|v| v.checked_add(d))
-                .unwrap_or(i64::MAX);
-        }
+        // both fit uintb exactly.
+        let d = digit as uintb;
+        let base = radix as uintb;
+        val = val.checked_mul(base).and_then(|v| v.checked_add(d)).unwrap_or(uintb::MAX);
         i += 1;
     }
 
-    // cast: re-tag the signed `intb` as unsigned, matching `(uintb)val`.
-    val as uintb
+    if neg {
+        // Preserve the signed overflow contract, including negative hex/octal.
+        let signed = val.min(1u64 << 63).wrapping_neg();
+        (signed, i128::from(signed as i64))
+    } else {
+        (val.min(i64::MAX as uintb), i128::from(val))
+    }
 }
 
 // =============================================================================
@@ -845,7 +849,17 @@ fn function_get_in_types(
 ) -> KunaResult<Vec<Rc<Datatype>>> {
     let mut intypes = Vec::new();
     for p in paramlist {
-        intypes.push(p.build_type(factory, org)?);
+        let ty = p.build_type(factory, org)?;
+        // C 6.7.6.3p8 applies to declared function types, including typedefs.
+        // The opaque builtin `code` type is not a function declaration.
+        let ty = if ty.get_metatype() == type_metatype::TYPE_CODE
+            && ty.get_code_prototype().is_some()
+        {
+            factory.get_type_pointer(org.addr_size, ty, org.word_size)?
+        } else {
+            ty
+        };
+        intypes.push(ty);
     }
     Ok(intypes)
 }
@@ -1106,7 +1120,7 @@ impl TypeSpecifiers {
 struct Enumerator {
     enumconstant: String,
     constantassigned: bool,
-    value: uintb,
+    value: i128,
 }
 
 impl Enumerator {
@@ -1114,7 +1128,7 @@ impl Enumerator {
         Enumerator { enumconstant: nm.to_string(), constantassigned: false, value: 0 }
     }
 
-    fn with_value(nm: &str, val: uintb) -> Enumerator {
+    fn with_value(nm: &str, val: i128) -> Enumerator {
         Enumerator { enumconstant: nm.to_string(), constantassigned: true, value: val }
     }
 }
@@ -1228,7 +1242,7 @@ enum PToken {
     /// A single-character punctuation token (`(`, `)`, `*`, `,`, `;`, `[`, `]`,
     /// `{`, `}`, `=`, `:`).
     Punct(u8),
-    Number(uintb),
+    Number { legacy: uintb, full_width: i128 },
     Identifier(String),
     StorageClassSpecifier(String),
     TypeQualifier(String),
@@ -1426,7 +1440,12 @@ impl<'a> CParse<'a> {
         self.colno = t.colno;
         self.filenum = t.filenum;
         match t.get_type() {
-            tok::INTEGER | tok::CHARCONSTANT => Ok(PToken::Number(t.get_integer())),
+            tok::INTEGER | tok::CHARCONSTANT => match t.value {
+                TokenValue::Integer { legacy, full_width } => {
+                    Ok(PToken::Number { legacy, full_width })
+                }
+                _ => unreachable!("integer token carries an integer value"),
+            },
             tok::IDENTIFIER => {
                 let s = t.get_string();
                 match self.lookup_identifier(&s) {
@@ -1743,7 +1762,8 @@ impl<'a> CParse<'a> {
     /// A run of exactly one keyword is looked up by name first, so `void`,
     /// `char` and any host-supplied type spelled with a keyword resolve to the
     /// same interned type they always have; only combinations, and the keywords
-    /// the type factory does not name, take the width-driven path.
+    /// the type factory does not name, resolve against the target's widths.
+    /// Explicit integer combinations also retain their canonical C rank.
     fn scalar_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
         let mut kws: Vec<ScalarKw> = Vec::new();
         while let PToken::ScalarSpecifier(kw) = self.peek()? {
@@ -1850,16 +1870,20 @@ impl<'a> CParse<'a> {
         if kws.len() != sign_only + sh + lng + int_ {
             return Ok(None);
         }
-        let size = if sh > 0 {
-            self.factory.get_size_of_short()
+        let (size, signed_name, unsigned_name) = if sh > 0 {
+            (self.factory.get_size_of_short(), "short", "unsigned short")
         } else if lng == 2 {
-            self.factory.get_size_of_long_long()
+            (self.factory.get_size_of_long_long(), "long long", "unsigned long long")
         } else if lng == 1 {
-            self.factory.get_size_of_long()
+            (self.factory.get_size_of_long(), "long", "unsigned long")
         } else {
-            self.factory.get_size_of_int()
+            (self.factory.get_size_of_int(), "int", "unsigned int")
         };
-        self.sized_scalar(size, Some(if uns > 0 { TYPE_UINT } else { TYPE_INT }))
+        if size <= 0 {
+            return Ok(None);
+        }
+        let (meta, name) = if uns > 0 { (TYPE_UINT, unsigned_name) } else { (TYPE_INT, signed_name) };
+        self.factory.get_base_named(size, meta, name).map(Some)
     }
 
     /// (kuna) The core type of `size` bytes with the given meta-type, or the
@@ -2026,7 +2050,7 @@ impl<'a> CParse<'a> {
         if matches!(self.peek()?, PToken::Punct(b':')) {
             self.next()?;
             match self.next()? {
-                PToken::Number(n) => dec.set_num_bits(n as int4),
+                PToken::Number { legacy, .. } => dec.set_num_bits(legacy as int4),
                 _ => return self.syntax_error(),
             }
         }
@@ -2088,7 +2112,7 @@ impl<'a> CParse<'a> {
         if matches!(self.peek()?, PToken::Punct(b'=')) {
             self.next()?;
             match self.next()? {
-                PToken::Number(n) => Ok(Enumerator::with_value(&nm, n)),
+                PToken::Number { full_width, .. } => Ok(Enumerator::with_value(&nm, full_width)),
                 _ => self.syntax_error(),
             }
         } else {
@@ -2453,7 +2477,7 @@ impl<'a> CParse<'a> {
     /// `assignment_expression: NUMBER` (`grammar.y:214-216`).
     fn assignment_expression(&mut self) -> KunaResult<uintb> {
         match self.next()? {
-            PToken::Number(n) => Ok(n),
+            PToken::Number { legacy, .. } => Ok(legacy),
             _ => self.syntax_error(),
         }
     }
@@ -2802,8 +2826,15 @@ pub fn parse_c(
         if decl.get_identifier().is_empty() {
             return Err(KunaError::parse("Missing identifier for typedef"));
         }
-        if ct.get_metatype() == type_metatype::TYPE_STRUCT
-            && (ct.get_name().is_empty() || ct.get_name() == decl.get_identifier())
+        // Tags and ordinary typedef identifiers have separate C namespaces.
+        // The factory already uses a tagged type's spelling as its printable
+        // typedef name, so `typedef enum Flags {...} Flags` publishes that
+        // same tag just like the existing struct case; it must not attempt
+        // to create a second, conflicting factory identity.
+        let tagged = matches!(ct.get_metatype(),
+            type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION) || ct.is_enum_type();
+        if (ct.get_metatype() == type_metatype::TYPE_STRUCT && ct.get_name().is_empty())
+            || (tagged && ct.get_name() == decl.get_identifier())
         {
             factory.set_name(&ct, decl.get_identifier())?;
         } else {

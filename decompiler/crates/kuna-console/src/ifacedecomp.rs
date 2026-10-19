@@ -627,6 +627,8 @@ fn mark_property_range(
     let off = addr.get_offset();
     let addr2 = kuna_base::address::Address::new(space, off.wrapping_add(size as u64));
     prog.arch_mut().symboltab.set_property_range(flag, &addr, &addr2);
+    prog.arch_mut().print_mut().set_export_binding(None);
+    prog.arch_mut().invalidate_body_caches();
     status.out(&format!("{success}\n"));
     Ok(())
 }
@@ -684,6 +686,78 @@ fn apply_prototype_to_symbol(
     Ok(())
 }
 
+/// Keep the live source parameter scope usable by the next console command.
+/// Source acquisition stays on the same owner as initial/reflow decompilation.
+fn refresh_current_source(
+    status: &mut IfaceStatus,
+    pieces: &kuna_decomp::fspec::PrototypePieces,
+    model: Option<std::rc::Rc<kuna_decomp::fspec::ProtoModel>>,
+) -> IfaceResult<()> {
+    let dcp = dcp_mut(status)?;
+    if !dcp.fd.as_ref().is_some_and(|fd| fd.get_name() == pieces.name) { return Ok(()); }
+    let (Some(prog), Some(fd)) = (dcp.conf.as_ref(), dcp.fd.as_mut()) else { return Ok(()); };
+    let previous_count = if fd.get_func_proto().has_store() { fd.get_func_proto().num_params() } else { 0 };
+    let mut previous = kuna_decomp::fspec::FuncProto::new();
+    previous.copy(fd.get_func_proto());
+    // A held Funcdata keeps its analysis context. Resolve this newly authored
+    // declaration against current source/model facts without refreshing that IR.
+    let model = match model {
+        Some(model) => Some(model),
+        None => kuna_decomp::decompile_drive::source_prototype_model(
+            &prog.arch().build_arch_handle(), fd.get_address(), pieces, None,
+        ).map_err(|error| IfaceError::execution(error.explain()))?,
+    };
+    if let Err(error) = kuna_decomp::decompile_drive::initialize_source_prototype(
+        prog.arch(), fd, Some(pieces), model, &[],
+    ) {
+        fd.get_func_proto_mut().copy(&previous);
+        return Err(IfaceError::execution(error.explain()));
+    }
+    forget_parameter_checks(fd, &mut dcp.pending_local_checks, &mut dcp.printed_checks, None);
+    fd.refresh_source_parameters(previous_count)
+        .map_err(|error| IfaceError::execution(error.explain()))?;
+    dcp.pending_param_maps.remove(&pieces.name);
+    Ok(())
+}
+
+fn forget_parameter_checks(
+    fd: &mut Funcdata,
+    checks: &mut Vec<(String, kuna_decomp::database::SymbolId, Option<std::rc::Rc<kuna_decomp::dtype::Datatype>>)>,
+    printed: &mut Option<(Vec<String>, Vec<crate::assertions::Expected>)>,
+    slot: Option<kuna_base::types::int4>,
+) {
+    let replaced_name = slot.filter(|_| fd.get_func_proto().has_store())
+        .and_then(|slot| fd.get_func_proto().get_param(slot))
+        .map(|parameter| parameter.get_name());
+    if let Some((_, expected)) = printed {
+        expected.retain(|expected| !expected.is_parameter()
+            || slot.is_some() && replaced_name.is_none_or(|name| expected.name() != name));
+    }
+    checks.retain(|(_, symbol, _)| !fd.get_scope_local()
+        .and_then(|scope| scope.database().try_symbol(*symbol))
+        .is_some_and(|symbol| symbol.get_category() == kuna_decomp::database::symbol_category::FUNCTION_PARAMETER
+            && slot.is_none_or(|slot| i32::from(symbol.get_category_index()) == slot)));
+    fd.forget_parameter_directives(slot);
+}
+
+fn refresh_current_parameter(
+    status: &mut IfaceStatus, func: &str, slot: kuna_base::types::int4,
+    name: &str, piece: &kuna_decomp::fspec::ParameterPieces,
+) -> IfaceResult<()> {
+    let dcp = dcp_mut(status)?;
+    let Some(fd) = dcp.fd.as_mut().filter(|fd| fd.get_name() == func) else { return Ok(()); };
+    let previous_count = if fd.get_func_proto().has_store() { fd.get_func_proto().num_params() } else { 0 };
+    forget_parameter_checks(fd, &mut dcp.pending_local_checks, &mut dcp.printed_checks, Some(slot));
+    let mapped = (slot, name.to_owned(), piece.clone());
+    fd.apply_mapped_params(std::slice::from_ref(&mapped));
+    fd.refresh_source_parameters(previous_count)
+        .map_err(|error| IfaceError::execution(error.explain()))?;
+    let maps = dcp.pending_param_maps.entry(func.to_owned()).or_default();
+    maps.retain(|(index, _, _)| *index != slot);
+    maps.push(mapped);
+    Ok(())
+}
+
 /// Shared body of `IfcParseFile`/`IfcParseLine` (`ifacedecomp.cc:347,384`): run
 /// `parse_C` against the program's [`Architecture`].  A `ParseError` is reported
 /// as the C++ does — `"Error in C syntax: <explain>"` on the output stream, then
@@ -702,7 +776,7 @@ fn run_parse_c(status: &mut IfaceStatus, content: &str) -> IfaceResult<()> {
         // mutable `dcp`); the symbol existence check mirrors C++ queryFunction.
         let captured: RefCell<Option<(kuna_decomp::fspec::PrototypePieces, String)>> =
             RefCell::new(None);
-        let models: Vec<String> = arch.proto_model_names().map(str::to_string).collect();
+        let models: Vec<String> = arch.proto_model_names().collect();
         let res = crate::grammar::parse_c(content, arch.types(), org, &models, |pieces, model| {
             // C++ Architecture::setPrototype resolves the function via queryFunction
             // (which lazily builds the Funcdata from the function symbol) and locks
@@ -752,6 +826,7 @@ fn run_parse_c(status: &mut IfaceStatus, content: &str) -> IfaceResult<()> {
                     }
                 };
                 apply_prototype_to_symbol(status, &pieces, model.as_ref())?;
+                refresh_current_source(status, &pieces, model)?;
                 // Also stash for re-application when THIS function is the one being
                 // decompiled (the IR is rebuilt on `decompile`, discarding the
                 // symbol-table proto link for the active Funcdata).
@@ -843,9 +918,10 @@ fn bind_func_param(
     })?;
     entry.innames[slot] = pname.to_string();
     entry.input_storage.retain(|(i, _)| *i != index);
-    entry.input_storage.push((index, piece));
+    entry.input_storage.push((index, piece.clone()));
     let pieces = entry.clone();
-    retype_symbol_if_complete(status, &pieces)
+    retype_symbol_if_complete(status, &pieces)?;
+    refresh_current_parameter(status, func, index, pname, &piece)
 }
 
 /// Park the locked return storage + type of `func` on its prototype pieces —
@@ -961,7 +1037,7 @@ pub(crate) fn bind_prototype(
         let org = crate::grammar::DataOrg { addr_size, word_size };
         let captured: RefCell<Option<(kuna_decomp::fspec::PrototypePieces, String)>> =
             RefCell::new(None);
-        let models: Vec<String> = arch.proto_model_names().map(str::to_string).collect();
+        let models: Vec<String> = arch.proto_model_names().collect();
         let parsed = crate::grammar::parse_c(&text, arch.types(), org, &models, |pieces, model| {
             *captured.borrow_mut() = Some((pieces, model.to_string()));
             Ok(())
@@ -982,8 +1058,10 @@ pub(crate) fn bind_prototype(
     let target = crate::assertions::resolve_proto_target(prog, func)
         .map_err(IfaceError::execution)?;
     let model = crate::assertions::declared_model(prog, &model);
-    crate::assertions::park_prototype(prog, &target, &mut pieces, model.as_ref());
-    dcp.pending_prototypes.insert(target.name().to_string(), pieces);
+    crate::assertions::park_prototype(prog, &target, &mut pieces, model.as_ref())
+        .map_err(|error| IfaceError::execution(error.explain()))?;
+    dcp.pending_prototypes.insert(target.name().to_string(), pieces.clone());
+    refresh_current_source(status, &pieces, model)?;
     Ok(())
 }
 
@@ -1710,28 +1788,8 @@ decomp_command!(
             type_: Some(ct),
             flags: parameter_pieces_flags::TYPELOCK | parameter_pieces_flags::NAMELOCK,
         };
-        // The C++ `FuncProto::store` is always present (set by `setScope` at
-        // Funcdata construction); the merged-tree load path leaves it null, so
-        // attach the stand-alone internal store before writing (as IfcMapReturn).
-        let void_type = prog
-            .arch()
-            .types()
-            .get_type_void()
-            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
-        // C++: dcp->fd->getFuncProto().setParam(i, name, piece).
-        let fd = dcp.fd.as_mut().expect("fd checked Some above");
-        fd.get_func_proto_mut().attach_internal_store(void_type);
-        fd.get_func_proto_mut().set_param(i, &name, &piece);
-        // Stash the lock keyed by function name so the `decompile` IR rebuild can
-        // re-seed it on the fresh prototype (C++ keeps it on the reused Funcdata;
-        // the kuna console discards `dcp.fd` on `decompile`).  Precedent:
-        // `pending_prototypes` / `pending_flow_overrides`.
-        let fname = fd.get_name().to_string();
-        dcp.pending_param_maps
-            .entry(fname)
-            .or_default()
-            .push((i, name, piece));
-        Ok(())
+        let fname = dcp.fd.as_ref().expect("fd checked Some above").get_name().to_string();
+        refresh_current_parameter(status, &fname, i, &name, &piece)
     }
 );
 
@@ -2222,7 +2280,10 @@ decomp_command!(
         // unaffected — the default-model recovery still applies there.
         let all_pending_protos_empty = all_pending_protos.is_empty();
         for pieces in all_pending_protos {
-            prog.arch_mut().set_function_prototype_pieces(&pieces.name.clone(), pieces);
+            if let Err(error) = prog.arch_mut().set_function_prototype_pieces(&pieces.name.clone(), pieces) {
+                dcp_mut(status)?.conf = Some(prog);
+                return Err(IfaceError::execution(error.explain()));
+            }
         }
         // The `override flow` facts stashed for this function (re-seeded on the
         // rebuilt IR, like `pending_proto`/`mapped_symbols`).
@@ -2340,13 +2401,11 @@ decomp_command!(
             //    resolves and the varargs never get typed.
             //  * the watchdog arms its per-function deadline inside the drive
             //    (`kuna_fn_budget` is `None` on every console path).
-            //  * ghidra mode stages name/dynamic/prototype-model recommendations that
+            //  * ghidra mode stages prototype-model recommendations that
             //    the drive takes; a follow that ran while they were still parked is
             //    not the same follow.
             let same_config = !prog.arch().analysis_formatstring.loop_pass()
                 && prog.arch().kuna_fn_budget.is_none()
-                && prog.arch().kuna_pending_name_recs.is_empty()
-                && prog.arch().kuna_pending_dyn_recs.is_empty()
                 && prog.arch().kuna_pending_proto_model.is_none();
             if seeds_empty && stamp_matches && same_config {
                 dcp.adopted_flows += 1;
@@ -2573,6 +2632,7 @@ decomp_command!(
                 print_c(prog.arch_mut(), &fd)
             };
             dcp.fd = Some(fd);
+            let text = text.map_err(|e| IfaceError::execution(e.explain()))?;
             let refusals: Vec<String> = match (dcp.printed_checks.take(), dcp.conf.as_ref(), dcp.fd.as_ref()) {
                 (Some((lines, expected)), Some(prog), Some(fd)) => {
                     crate::assertions::check_printed(prog.arch(), fd, &text, &expected)
@@ -2726,6 +2786,8 @@ decomp_command!(
             // No range indicates a default value: context->setVariableDefault.
             prog.arch().with_context_db_mut(|db| db.set_variable_default(name.as_bytes(), value))
                 .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+            prog.arch_mut().print_mut().set_export_binding(None);
+            prog.arch_mut().invalidate_body_caches();
             return Ok(());
         }
         // Otherwise parse the [begin,end) range.
@@ -2740,6 +2802,8 @@ decomp_command!(
         prog.arch()
             .with_context_db_mut(|db| db.set_variable_region(name.as_bytes(), &addr1, &addr2, value))
             .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        prog.arch_mut().print_mut().set_export_binding(None);
+        prog.arch_mut().invalidate_body_caches();
         Ok(())
     }
 );
@@ -3897,6 +3961,7 @@ decomp_command!(
         let injectid = prog
             .arch()
             .pcodeinjectlib
+            .borrow()
             .base
             .get_payload_id(kuna_decomp::pcodeinject::CALLFIXUP_TYPE, fixup_name.as_bytes());
         if injectid < 0 {
@@ -3911,6 +3976,8 @@ decomp_command!(
             .map_err(|_| IfaceError::execution(format!("Unknown function name: {func_name}")))?;
         // C++ fd->getFuncProto().setInjectId(injectid).
         prog.arch_mut().symboltab.set_function_inject_id(sid, injectid);
+        prog.arch_mut().print_mut().set_export_binding(None);
+        prog.arch_mut().invalidate_body_caches();
         status.out("Successfully applied callfixup\n");
         Ok(())
     }

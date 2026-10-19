@@ -61,29 +61,29 @@ impl Rule for RuleArrayStride {
     }
 
     /// C++ `RuleArrayStride::applyOp` (`kuna_arraystride.cc:88`) — transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (kuna) gate (ArchContext-carried).
         if !self.enabled && !data.get_arch().recover_array_stride {
-            return 0;
+            return Ok(0);
         }
 
         // `op` must be the strided OFFSET accumulator phi: MULTIEQUAL(#0, acc + STRIDE).
         let (init_idx, back_idx, stride, accadd) = match kuna_is_induction_phi(data, op, true) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         // A unit step is the counter itself.
         if stride == 1 {
-            return 0;
+            return Ok(0);
         }
 
         let accout = match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         let bl: BlockId = match data.obank().get(op).and_then(|o| o.get_parent()) {
             Some(b) => b,
-            None => return 0,
+            None => return Ok(0),
         };
 
         // Find a sibling unit-step counter phi `cnt = MULTIEQUAL(#0, cnt + 1)` in
@@ -114,10 +114,10 @@ impl Rule for RuleArrayStride {
         }
         let cntout = match cntout {
             Some(c) => c,
-            None => return 0,
+            None => return Ok(0),
         };
         if vn_size(data, cntout) != vn_size(data, accout) {
-            return 0;
+            return Ok(0);
         }
 
         // Build the multiply  cnt * stride  and redirect all descendants of acc.
@@ -135,13 +135,12 @@ impl Rule for RuleArrayStride {
         data.op_insert_begin(multop, bl);
 
         // Every use of acc now reads cnt*stride.
-        data.total_replace(accout, multout)
-            .expect("RuleArrayStride: totalReplace (internal invariant)");
+        data.total_replace(accout, multout)?;
         // The dead accumulator phi ...
-        data.op_destroy(op);
+        data.op_destroy(op)?;
         // ... and its now-dead back-edge add.
-        data.op_destroy(accadd);
-        1
+        data.op_destroy(accadd)?;
+        Ok(1)
     }
 }
 

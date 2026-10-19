@@ -62,30 +62,31 @@ use crate::varnode::Varnode;
 /// The float `vn` is, when the function returns it in a float register and
 /// nothing the function does with it says otherwise; `ct` is the fold's type
 /// for it.
-pub(crate) fn float_register_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> Option<Rc<Datatype>> {
+pub(crate) fn float_register_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
     vote(data, vn, ct, None)
 }
 
 /// The float the function's input `vn` is, when it arrives in a float-class
 /// register of the function's own model, the fold says nothing of it (`ct` is
 /// raw bytes), and [`only_moved_as_a_float`] holds for its value.
-pub(crate) fn float_input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> Option<Rc<Datatype>> {
+pub(crate) fn float_input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
     if ct.get_metatype() != type_metatype::TYPE_UNKNOWN {
-        return None;
+        return Ok(None);
     }
-    let node = data.vbank().get(vn)?;
+    let Some(node) = data.vbank().get(vn) else { return Ok(None) };
     let size = node.get_size();
     if !node.is_input() || !matches!(size, 4 | 8) || node.is_type_lock() {
-        return None;
+        return Ok(None);
     }
     let proto = data.get_func_proto();
     if !proto.has_model() || proto.is_input_locked() || !float_class(data, proto.model().input_opt(), node) {
-        return None;
+        return Ok(None);
     }
-    if !only_moved_as_a_float(data, vn) || !spells_exactly(data, vn) {
-        return None;
+    if !only_moved_as_a_float(data, vn)? || !spells_exactly(data, vn) {
+        return Ok(None);
     }
-    data.get_arch().types()?.get_base(size, type_metatype::TYPE_FLOAT).ok()
+    let Some(types) = data.get_arch().types() else { return Ok(None) };
+    Ok(Some(types.get_base(size, type_metatype::TYPE_FLOAT)?))
 }
 
 /// Is every varnode of `vn`'s value family made and used only the way a float
@@ -96,27 +97,27 @@ pub(crate) fn float_input_vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>
 /// return, a store through a pointer the function also moves integers through,
 /// a global that is not declared a float of its width -- is evidence the vote
 /// loses to.
-fn only_moved_as_a_float(data: &Funcdata, vn: VarnodeId) -> bool {
+fn only_moved_as_a_float(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let family = crate::kuna_protoorder::value_family(data, vn);
     if family.len() >= 128 {
-        return false;
+        return Ok(false);
     }
     let proto = data.get_func_proto();
     let data_space = data.get_arch().manage().get_default_data_space().map(Rc::clone);
     let globals: std::cell::RefCell<Vec<(Address, int4)>> = std::cell::RefCell::new(Vec::new());
-    let through_a_global = |op: crate::context::OpId, p: VarnodeId, size: int4| {
-        if !addresses_a_global(data, p) {
-            return true;
+    let through_a_global = |op: crate::context::OpId, p: VarnodeId, size: int4| -> kuna_base::error::KunaResult<bool> {
+        if !addresses_a_global(data, p)? {
+            return Ok(true);
         }
-        let Some(at) = constant_global(data, op, p) else { return false };
+        let Some(at) = constant_global(data, op, p) else { return Ok(false) };
         globals.borrow_mut().push((at, size));
-        true
+        Ok(true)
     };
-    let moved = family.iter().all(|&v| {
-        let Some(node) = data.vbank().get(v) else { return false };
+    for &v in &family {
+        let Some(node) = data.vbank().get(v) else { return Ok(false) };
         let declared_float = node.is_type_lock() && node.get_type().get_metatype() == type_metatype::TYPE_FLOAT;
         if node.is_type_lock() && !declared_float {
-            return false;
+            return Ok(false);
         }
         let global = node.is_persist()
             || data_space.as_ref().is_some_and(|d| node.get_addr().get_space().is_some_and(|s| Rc::ptr_eq(s, d)));
@@ -130,21 +131,28 @@ fn only_moved_as_a_float(data: &Funcdata, vn: VarnodeId) -> bool {
                 OpCode::CPUI_INDIRECT => !o.is_indirect_creation(),
                 OpCode::CPUI_LOAD => {
                     !crate::kuna_protoorder::moves_integers_beside(data, d, node.get_size())
-                        && o.get_in(1).is_some_and(|p| through_a_global(d, p, node.get_size()))
+                        && match o.get_in(1) {
+                            Some(p) => through_a_global(d, p, node.get_size())?,
+                            None => false,
+                        }
                 }
                 OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => call_returns_a_float(data, d),
                 code => makes_a_float(code),
             },
         };
-        made && node.descend_iter().all(|r| {
-            let Some(o) = data.obank().get(r) else { return true };
-            match o.code() {
+        if !made { return Ok(false) }
+        for r in node.descend_iter() {
+            let Some(o) = data.obank().get(r) else { continue };
+            let used = match o.code() {
                 OpCode::CPUI_COPY | OpCode::CPUI_CAST | OpCode::CPUI_MULTIEQUAL | OpCode::CPUI_INDIRECT => true,
                 OpCode::CPUI_STORE => {
                     o.get_in(1) != Some(v)
                         && o.get_in(0) != Some(v)
                         && !crate::kuna_protoorder::moves_integers_beside(data, r, node.get_size())
-                        && o.get_in(1).is_some_and(|p| through_a_global(r, p, node.get_size()))
+                        && match o.get_in(1) {
+                            Some(p) => through_a_global(r, p, node.get_size())?,
+                            None => false,
+                        }
                 }
                 OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
                     o.get_in(0) != Some(v)
@@ -156,23 +164,29 @@ fn only_moved_as_a_float(data: &Funcdata, vn: VarnodeId) -> bool {
                         })
                 }
                 code => reads_a_float(code),
-            }
-        })
-    });
-    moved && globals.into_inner().iter().all(|(at, size)| crate::kuna_floatglobals::float_only(data, at, *size))
+            };
+            if !used { return Ok(false) }
+        }
+    }
+    for (at, size) in globals.into_inner() {
+        if !crate::kuna_floatglobals::float_only(data, &at, size)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Is the pointer `ptr` the address of a global, or of an element or field of
 /// one: a constant in the data space, or such a constant added to an index?
 /// A global has one declaration for every function, and another function may
 /// read it as an integer.
-fn addresses_a_global(data: &Funcdata, ptr: VarnodeId) -> bool {
+fn addresses_a_global(data: &Funcdata, ptr: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let mut work = vec![(ptr, 0)];
     while let Some((v, depth)) = work.pop() {
         let Some(node) = data.vbank().get(v) else { continue };
         if node.is_constant() {
             if node.get_offset() != 0 {
-                return true;
+                return Ok(true);
             }
             continue;
         }
@@ -187,8 +201,8 @@ fn addresses_a_global(data: &Funcdata, ptr: VarnodeId) -> bool {
             OpCode::CPUI_INT_ADD => {
                 for i in (0..2).filter_map(|k| o.get_in(k)) {
                     if data.vbank().get(i).is_some_and(|n| n.is_constant()) {
-                        if crate::kuna_ptrfromuse::constant_may_be_global_base(data, d, i) {
-                            return true;
+                        if crate::kuna_ptrfromuse::constant_may_be_global_base(data, d, i)? {
+                            return Ok(true);
                         }
                     } else {
                         work.push((i, depth + 1));
@@ -198,7 +212,7 @@ fn addresses_a_global(data: &Funcdata, ptr: VarnodeId) -> bool {
             _ => {}
         }
     }
-    false
+    Ok(false)
 }
 
 /// The constant address the pointer `ptr` of the LOAD or STORE `op` holds,
@@ -259,18 +273,18 @@ const MAX_GLOBAL_FAMILY: usize = 4096;
 /// own code is the one view the whole-program scan cannot miss, and a float
 /// taken against it prints a conversion where the machine moves the bits
 /// (`v1 = (long)gd` for a case body that adds to them).
-pub(crate) fn moved_as_a_float_here(data: &Funcdata, addr: &Address, size: int4) -> bool {
+pub(crate) fn moved_as_a_float_here(data: &Funcdata, addr: &Address, size: int4) -> kuna_base::error::KunaResult<bool> {
     let key = (addr.get_offset(), size);
     if let Some(known) = MOVED.with(|m| m.borrow().as_ref().and_then(|c| c.get(&key).copied())) {
-        return known;
+        return Ok(known);
     }
-    let moved = walk_the_global(data, addr, size);
+    let moved = walk_the_global(data, addr, size)?;
     MOVED.with(|m| {
         if let Some(c) = m.borrow_mut().as_mut() {
             c.insert(key, moved);
         }
     });
-    moved
+    Ok(moved)
 }
 
 type MovedMemo = std::collections::HashMap<(u64, int4), bool>;
@@ -293,8 +307,8 @@ pub(crate) fn with_moved_memo<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-fn walk_the_global(data: &Funcdata, addr: &Address, size: int4) -> bool {
-    let Some(space) = addr.get_space() else { return false };
+fn walk_the_global(data: &Funcdata, addr: &Address, size: int4) -> kuna_base::error::KunaResult<bool> {
+    let Some(space) = addr.get_space() else { return Ok(false) };
     let (lo, hi) = (addr.get_offset(), addr.get_offset() + size as u64);
     let start = Address::new(Rc::clone(space), lo.saturating_sub(16));
     let end = Address::new(Rc::clone(space), hi);
@@ -305,12 +319,12 @@ fn walk_the_global(data: &Funcdata, addr: &Address, size: int4) -> bool {
             continue;
         }
         if off != lo || node.get_size() != size || !written_as_a_float(data, id) || !read_as_a_float(data, id) {
-            return false;
+            return Ok(false);
         }
     }
-    let Some(cspace) = data.get_arch().manage().get_constant_space().map(Rc::clone) else { return false };
-    let Some(ptr) = data.get_arch().types().map(|t| t.get_size_of_pointer()) else { return false };
-    let symbol = data.get_arch().global_symbol_extent(addr).map(|(first, whole)| (first, first.saturating_add(whole as u64)));
+    let Some(cspace) = data.get_arch().manage().get_constant_space().map(Rc::clone) else { return Ok(false) };
+    let Some(ptr) = data.get_arch().types().map(|t| t.get_size_of_pointer()) else { return Ok(false) };
+    let symbol = data.get_arch().global_symbol_extent(addr)?.map(|(first, whole)| (first, first.saturating_add(whole as u64)));
     let aggregate = symbol.filter(|&(first, last)| first <= lo && hi <= last && last - first > size as u64);
     let indexable = symbol.is_none() || aggregate.is_some();
     let (from, to) = aggregate.unwrap_or((lo, hi));
@@ -320,10 +334,10 @@ fn walk_the_global(data: &Funcdata, addr: &Address, size: int4) -> bool {
         let Some(node) = data.vbank().get(c).filter(|n| n.is_constant() && n.get_size() == ptr) else { continue };
         let own = (lo..hi).contains(&node.get_offset());
         if !used_as_an_address(data, c, (lo, hi), indexable, own) {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// How the address `v` reaches the output of `o`: `Some(Some(k))` moved by the
@@ -532,7 +546,8 @@ pub(crate) fn argument_vote(
     fc: &crate::fspec::FuncCallSpecs,
     op: crate::context::OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     if fc.proto().get_param(slot - 1).is_some_and(|p| p.is_type_locked()) {
         return None;
     }
@@ -577,10 +592,17 @@ pub(crate) fn argument_vote(
                 })
             })
     });
-    if !floats || global.is_some_and(|at| !crate::kuna_floatglobals::float_only(data, &at, size)) {
+    if !floats {
         return None;
     }
-    data.get_arch().types()?.get_base(size, type_metatype::TYPE_FLOAT).ok()
+    Some((global, size))
+    })();
+    let Some((global, size)) = candidate else { return Ok(None) };
+    if let Some(at) = global {
+        if !crate::kuna_floatglobals::float_only(data, &at, size)? { return Ok(None) }
+    }
+    let Some(types) = data.get_arch().types() else { return Ok(None) };
+    Ok(Some(types.get_base(size, type_metatype::TYPE_FLOAT)?))
 }
 
 /// The float C requires of argument `slot` of the call `op`: the callee's
@@ -700,34 +722,37 @@ pub(crate) fn reads_a_float(code: OpCode) -> bool {
 
 /// [`float_register_vote`], taking the result of the call `jump` for whatever
 /// the function returns: an import stub's jump through its slot.
-fn vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>, jump: Option<crate::context::OpId>) -> Option<Rc<Datatype>> {
+fn vote(data: &Funcdata, vn: VarnodeId, ct: &Rc<Datatype>, jump: Option<crate::context::OpId>) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
     if !matches!(ct.get_metatype(), type_metatype::TYPE_UNKNOWN | type_metatype::TYPE_INT | type_metatype::TYPE_UINT) {
-        return None;
+        return Ok(None);
     }
-    let node = data.vbank().get(vn)?;
+    let Some(node) = data.vbank().get(vn) else { return Ok(None) };
     let size = node.get_size();
     if !matches!(size, 4 | 8 | 10) || node.is_type_lock() || !returned_in_a_float_register(data, vn, node) {
-        return None;
+        return Ok(None);
     }
-    let float = data.get_arch().types()?.get_base(size, type_metatype::TYPE_FLOAT).ok()?;
-    if returned_beside(data, vn).into_iter().any(|r| refuses(data, r, &float, jump)) {
-        return None;
+    let Some(types) = data.get_arch().types() else { return Ok(None) };
+    let float = types.get_base(size, type_metatype::TYPE_FLOAT)?;
+    for r in returned_beside(data, vn) {
+        if refuses(data, r, &float, jump)? {
+            return Ok(None);
+        }
     }
-    Some(float)
+    Ok(Some(float))
 }
 
 /// Does anything about the value `vn`, returned in a float register, refuse
 /// the float `float` for it?
-fn refuses(data: &Funcdata, vn: VarnodeId, float: &Rc<Datatype>, jump: Option<crate::context::OpId>) -> bool {
+fn refuses(data: &Funcdata, vn: VarnodeId, float: &Rc<Datatype>, jump: Option<crate::context::OpId>) -> kuna_base::error::KunaResult<bool> {
     if data.vbank().get(vn).is_some_and(|n| n.is_constant()) {
-        return !spells(data, vn);
+        return Ok(!spells(data, vn));
     }
     let family = crate::kuna_protoorder::value_family(data, vn);
-    family.iter().any(|&v| data.vbank().get(v).is_some_and(|n| n.is_input()))
-        || crate::kuna_protoorder::input_refuses(data, vn, float)
+    Ok(family.iter().any(|&v| data.vbank().get(v).is_some_and(|n| n.is_input()))
+        || crate::kuna_protoorder::input_refuses(data, vn, float)?
         || family.iter().any(|&v| crosses_a_call_as_other_than_a_float(data, v, jump))
         || family.iter().any(|&v| loaded_beside_integers(data, v))
-        || !spells_exactly(data, vn)
+        || !spells_exactly(data, vn))
 }
 
 /// `vn` and every other value a live RETURN hands back in a slot `vn` is
@@ -818,7 +843,8 @@ fn call_returns_a_float(data: &Funcdata, op: crate::context::OpId) -> bool {
 /// its register makes it -- and the stub returns the jump's result.  Otherwise
 /// the result is untyped and the stub prints `v1 = (float)(*dat_4018)()`,
 /// converting what the target handed back.
-pub(crate) fn jump_result_type(data: &Funcdata, op: crate::context::OpId, size: int4) -> Option<Rc<Datatype>> {
+pub(crate) fn jump_result_type(data: &Funcdata, op: crate::context::OpId, size: int4) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     let o = data.obank().get(op)?;
     if o.code() != OpCode::CPUI_CALLIND {
         return None;
@@ -836,9 +862,14 @@ pub(crate) fn jump_result_type(data: &Funcdata, op: crate::context::OpId, size: 
     let proto = data.get_func_proto();
     if proto.is_output_locked() {
         let t = proto.get_output_type()?;
-        return (t.get_metatype() == type_metatype::TYPE_FLOAT && t.get_size() == size).then(|| Rc::clone(t));
+        return Some((out, Some((t.get_metatype() == type_metatype::TYPE_FLOAT && t.get_size() == size).then(|| Rc::clone(t)))));
     }
-    let unknown = data.get_arch().types()?.get_base(size, type_metatype::TYPE_UNKNOWN).ok()?;
+    Some((out, None))
+    })();
+    let Some((out, locked)) = candidate else { return Ok(None) };
+    if let Some(ty) = locked { return Ok(ty) }
+    let Some(types) = data.get_arch().types() else { return Ok(None) };
+    let unknown = types.get_base(size, type_metatype::TYPE_UNKNOWN)?;
     vote(data, out, &unknown, Some(op))
 }
 

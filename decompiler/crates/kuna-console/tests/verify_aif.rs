@@ -212,7 +212,7 @@ fn a_text_free_listing_fingerprints_exactly_like_a_text_carrying_one() {
             &seeds,
             &[],
             detail,
-        );
+        ).unwrap();
         let count = listing.function_count();
         let insns = listing.num_instructions();
         let exec = listing.exec_ranges().to_vec();

@@ -108,13 +108,13 @@ fn actual_private_spill_reload_and_escape_keep_raw_effects_and_source_formals() 
         assert_eq!(opcode_count(&raw, OpCode::CPUI_LOAD), loads, "{name}");
         let arch = program.arch();
         let (addr_size, word_size) = arch.data_org();
-        let models = arch.proto_model_names().map(str::to_owned).collect::<Vec<_>>();
+        let models = arch.proto_model_names().collect::<Vec<_>>();
         let mut pieces = None;
         parse_c(declaration, arch.types(), DataOrg { addr_size, word_size }, &models,
             |parsed, _| { pieces = Some(parsed); Ok(()) }).unwrap();
         let fd = decompile_func_full(program.arch_mut(), name, at, 0, &[], pieces.as_ref()).unwrap();
         assert_eq!(fd.get_func_proto().num_params(), 0, "{name}: GP is not an invented source formal");
-        let c = print_c(program.arch_mut(), &fd);
+        let c = print_c(program.arch_mut(), &fd).unwrap();
         if let Some(global) = expected_global {
             assert!(c.contains(global), "{name}: lost authored global observation:\n{c}");
         }

@@ -36,9 +36,9 @@ impl Action for ActionArmFloatArgs {
             .contains(self.get_group())
             .then(|| Self::boxed(self.get_group()))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
-        prepare_inputs(data);
-        0
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        prepare_inputs(data)?;
+        Ok(0)
     }
 }
 
@@ -50,13 +50,13 @@ pub fn applies(arch: &Architecture) -> bool {
 
 /// Keep a proven double argument independent of an overlapping float call result.
 /// Run after passthrough claims, which must inspect the function's original reads.
-pub fn link_call_inputs(data: &mut Funcdata, index: i32) {
+pub fn link_call_inputs(data: &mut Funcdata, index: i32) -> kuna_base::error::KunaResult<()> {
     if !data.get_arch().arm_float_args {
-        return;
+        return Ok(());
     }
     let call = data.get_call_specs(index);
     if call.is_input_locked() || call.is_dotdotdot() {
-        return;
+        return Ok(());
     }
     let op = call.get_op();
     if !data
@@ -64,19 +64,19 @@ pub fn link_call_inputs(data: &mut Funcdata, index: i32) {
         .get(op)
         .is_some_and(|o| o.code() == OpCode::CPUI_CALL)
     {
-        return;
+        return Ok(());
     }
     let Some(stated) = data.kuna_protoorder_types(call.get_entry_address()) else {
-        return;
+        return Ok(());
     };
     if !stated.arity_sound {
-        return;
+        return Ok(());
     }
     let Some((result_addr, result_size, result_type)) = &stated.output else {
-        return;
+        return Ok(());
     };
     if *result_size != 4 || result_type.get_metatype() != type_metatype::TYPE_FLOAT {
-        return;
+        return Ok(());
     }
     let inputs: Vec<_> = stated
         .inputs
@@ -103,10 +103,11 @@ pub fn link_call_inputs(data: &mut Funcdata, index: i32) {
         data.get_call_specs_mut(index)
             .get_active_input()
             .register_trial(&addr, size);
-        let vn = data.new_varnode(size, &addr, None);
+        let vn = data.new_varnode(size, &addr, None)?;
         let slot = data.obank().get(op).map_or(1, |o| o.num_input());
         let _ = data.op_insert_input(op, vn, slot);
     }
+    Ok(())
 }
 
 /// The s-register words the callee's recovered prototype states.
@@ -733,8 +734,9 @@ fn single_entry(data: &Funcdata, addr: &Address) -> bool {
 }
 
 /// Replace an eight-byte VFP input by its two s-register words.
-fn split_input(data: &mut Funcdata, vn: VarnodeId) -> Option<()> {
-    let addr = data.vbank().get(vn)?.get_addr().clone();
+fn split_input(data: &mut Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<()> {
+    let Some(node) = data.vbank().get(vn) else { return Ok(()); };
+    let addr = node.get_addr().clone();
     let high = &addr + 4;
     let (lo_addr, hi_addr) = if addr.is_big_endian() {
         (high, addr.clone())
@@ -745,27 +747,28 @@ fn split_input(data: &mut Funcdata, vn: VarnodeId) -> Option<()> {
     let start = data.bblocks_block_start(block);
     let piece = data.new_op(2, start);
     data.op_set_opcode_code(piece, OpCode::CPUI_PIECE);
-    let whole = data.new_varnode_out(8, &addr, piece).ok()?;
+    let whole = data.new_varnode_out(8, &addr, piece)?;
     data.op_insert_begin(piece, block);
-    data.total_replace(vn, whole).ok()?;
-        data.delete_varnode(vn).ok()?;
-    let lo = data.new_varnode(4, &lo_addr, None);
-    let lo = data.set_input_varnode(lo).ok()?;
-    let hi = data.new_varnode(4, &hi_addr, None);
-    let hi = data.set_input_varnode(hi).ok()?;
-    data.op_set_input(piece, hi, 0).ok()?;
-    data.op_set_input(piece, lo, 1).ok()?;
-    read_words(data, whole, [lo, hi], 0, 4);
+    data.total_replace(vn, whole)?;
+    data.delete_varnode(vn)?;
+    let lo = data.new_varnode(4, &lo_addr, None)?;
+    let lo = data.set_input_varnode(lo)?;
+    let hi = data.new_varnode(4, &hi_addr, None)?;
+    let hi = data.set_input_varnode(hi)?;
+    data.op_set_input(piece, hi, 0)?;
+    data.op_set_input(piece, lo, 1)?;
+    read_words(data, whole, [lo, hi], 0, 4)?;
     if data.vbank().get(whole).is_some_and(|w| w.has_no_descend()) {
-        data.op_destroy(piece);
+        data.op_destroy(piece)?;
     }
-    Some(())
+    Ok(())
 }
 
 /// Point each word read of `vn` (shifted right by `shift` bytes) at its input.
-fn read_words(data: &mut Funcdata, vn: VarnodeId, words: [VarnodeId; 2], shift: u64, depth: u32) {
+/// Propagate failures destroying readers made unused by the rewrite.
+fn read_words(data: &mut Funcdata, vn: VarnodeId, words: [VarnodeId; 2], shift: u64, depth: u32) -> kuna_base::error::KunaResult<()> {
     if depth == 0 {
-        return;
+        return Ok(());
     }
     for reader in data.descend_snapshot(vn) {
         let Some(op) = data.obank().get(reader) else {
@@ -794,23 +797,24 @@ fn read_words(data: &mut Funcdata, vn: VarnodeId, words: [VarnodeId; 2], shift: 
                 continue;
             }
             (OpCode::CPUI_INT_RIGHT, Some(32)) if shift == 0 && op.get_in(0) == Some(vn) => {
-                read_words(data, out, words, 4, depth - 1);
+                read_words(data, out, words, 4, depth - 1)?;
             }
             (OpCode::CPUI_COPY | OpCode::CPUI_CAST, _) => {
-                read_words(data, out, words, shift, depth - 1);
+                read_words(data, out, words, shift, depth - 1)?;
             }
             _ => continue,
         }
         if data.vbank().get(out).is_some_and(|o| o.has_no_descend()) {
-            data.op_destroy(reader);
+            data.op_destroy(reader)?;
         }
     }
+    Ok(())
 }
 
 /// A d-register input read only as two words that floating operations consume
 /// holds two s-register inputs. Words read only as integers stay one input: they
 /// may be a double handed to an integer helper.
-fn split_word_inputs(data: &mut Funcdata, typed: &[(Address, i32)]) {
+fn split_word_inputs(data: &mut Funcdata, typed: &[(Address, i32)]) -> kuna_base::error::KunaResult<()> {
     let floating = |addr: &Address| typed.iter().any(|(a, s)| *s == 4 && a == addr);
     let inputs: Vec<VarnodeId> = data
         .vbank()
@@ -828,8 +832,9 @@ fn split_word_inputs(data: &mut Funcdata, typed: &[(Address, i32)]) {
         })
         .collect();
     for vn in inputs {
-        split_input(data, vn);
+        split_input(data, vn)?;
     }
+    Ok(())
 }
 
 /// A right shift by whole bytes: its shifted value and the byte count, so a
@@ -1007,15 +1012,15 @@ fn typed_inputs(data: &Funcdata) -> Vec<(Address, i32)> {
 }
 
 /// Rejoin word-sized input pieces only when a floating reader consumes their whole value.
-pub fn prepare_inputs(data: &mut Funcdata) {
+pub fn prepare_inputs(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     if !data.get_arch().arm_float_args
         || data.get_func_proto().is_input_locked()
         || !data.get_func_proto().has_model()
     {
-        return;
+        return Ok(());
     }
     let candidates = typed_inputs(data);
-    split_word_inputs(data, &candidates);
+    split_word_inputs(data, &candidates)?;
     for (addr, size) in candidates {
         if !matches!(size, 4 | 8)
             || !data
@@ -1043,9 +1048,8 @@ pub fn prepare_inputs(data: &mut Funcdata) {
                 } else {
                     (second, first)
                 };
-                if data.combine_input_varnodes(hi, lo).is_ok() {
-                    input = data.find_varnode_input(size, &addr);
-                }
+                data.combine_input_varnodes(hi, lo)?;
+                input = data.find_varnode_input(size, &addr);
             }
         }
         if let Some(vn) = input {
@@ -1058,6 +1062,7 @@ pub fn prepare_inputs(data: &mut Funcdata) {
             }
         }
     }
+    Ok(())
 }
 
 /// A resolved variadic format call states its parameters in base AAPCS storage.

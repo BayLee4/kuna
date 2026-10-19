@@ -92,27 +92,27 @@ pub fn is_uint1(t: &Datatype) -> bool {
 
 /// Is the unsigned vote on the loaded byte `vn` a zero-extension and nothing
 /// else?  An `INT_ZEXT` must read it, and no other reader may vote `TYPE_UINT`.
-pub fn zext_is_only_unsigned_vote(data: &Funcdata, vn: VarnodeId) -> bool {
+pub fn zext_is_only_unsigned_vote(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let v = match data.vbank().get(vn) {
         Some(v) => v,
-        None => return false,
+        None => return Ok(false),
     };
     let mut zext = false;
     for r in v.descend_iter() {
         let o = match data.obank().get(r) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
         if o.code() == OpCode::CPUI_INT_ZEXT {
             zext = true;
             continue;
         }
-        let vote = crate::p5_types::coreaction_infertypes::input_type_local(data, r, o.get_slot(vn));
+        let vote = crate::p5_types::coreaction_infertypes::input_type_local(data, r, o.get_slot(vn))?;
         if vote.get_metatype() == type_metatype::TYPE_UINT {
-            return false;
+            return Ok(false);
         }
     }
-    zext
+    Ok(zext)
 }
 
 /// Does `vn` reach, directly or through copies, joins and one-byte
@@ -260,8 +260,8 @@ pub fn is_counter(data: &Funcdata, vn: VarnodeId) -> bool {
 
 /// May the loaded byte `vn` be re-seeded `char`?  Its only unsigned vote is
 /// the zero-extension, and it is neither read without a cast nor a counter.
-pub fn is_candidate(data: &Funcdata, vn: VarnodeId) -> bool {
-    zext_is_only_unsigned_vote(data, vn) && !read_without_cast(data, vn) && !is_counter(data, vn)
+pub fn is_candidate(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    Ok(zext_is_only_unsigned_vote(data, vn)? && !read_without_cast(data, vn) && !is_counter(data, vn))
 }
 
 /// Start recording for one `ActionInferTypes` propagation of `data`.
@@ -301,33 +301,34 @@ pub fn note_edge(
     outvn: VarnodeId,
     newtype: &Rc<Datatype>,
     cur: &Rc<Datatype>,
-) {
+) -> kuna_base::error::KunaResult<()> {
     let byte = if inslot == 1 && outslot == -1 {
         if !is_char(newtype) || !is_uint1(cur) {
-            return;
+            return Ok(());
         }
         outvn
     } else if inslot == -1 && outslot == 1 {
         if !points_to(newtype, is_uint1) || !points_to(cur, is_char) {
-            return;
+            return Ok(());
         }
         invn
     } else {
-        return;
+        return Ok(());
     };
     let recording = NOTED.with(|n| n.borrow().is_some());
     if !recording || data.obank().get(op).map(|o| o.code()) != Some(OpCode::CPUI_LOAD) {
-        return;
+        return Ok(());
     }
     let byte_is_uint1 =
         data.vbank().get(byte).and_then(|v| v.get_temp_type()).map(|t| is_uint1(t)).unwrap_or(false);
-    if byte_is_uint1 && is_candidate(data, byte) {
+    if byte_is_uint1 && is_candidate(data, byte)? {
         NOTED.with(|n| {
             if let Some(v) = n.borrow_mut().as_mut() {
                 v.push(byte);
             }
         });
     }
+    Ok(())
 }
 
 /// Seed each recorded byte `char` in place of the `uint1` its local-type fold

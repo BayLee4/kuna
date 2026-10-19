@@ -1,9 +1,85 @@
-//! Recover source-level values for parameters passed indirectly by the ABI.
+//! Recover source-level arguments and results lowered indirectly by the ABI.
 
 use crate::dtype::Datatype;
 use crate::fspec::{FuncProto, ProtoParameter};
 use crate::funcdata::Funcdata;
 use std::rc::Rc;
+
+pub(crate) struct HiddenResult {
+    pub value_type: Rc<Datatype>,
+    pub pointer_type: Rc<Datatype>,
+    pub slot: i32,
+}
+
+/// A source result and the one extra occurrence introduced by ABI allocation.
+pub(crate) fn hidden_result(proto: &FuncProto) -> Option<HiddenResult> {
+    if !proto.has_store() || proto.has_custom_storage() || proto.get_inject_id() >= 0
+        || proto.decoded_inject_name().is_some()
+        || !proto.has_model() || proto.get_inject_upon_entry() >= 0
+        || proto.get_inject_upon_return() >= 0 || !proto.get_output().is_indirect_storage()
+    {
+        return None;
+    }
+    let logical = proto.logical_pieces()?;
+    if logical.output_storage.is_some() || !logical.input_storage.is_empty() {
+        return None;
+    }
+    let value_type = Datatype::completed_record(logical.outtype.as_ref()?);
+    if !matches!(value_type.get_metatype(),
+        crate::dtype::type_metatype::TYPE_STRUCT | crate::dtype::type_metatype::TYPE_UNION)
+        || value_type.get_size() <= 0
+    {
+        return None;
+    }
+    let mut hidden = (0..proto.num_params())
+        .filter(|&slot| proto.get_param(slot).is_some_and(|p| p.is_hidden_return()));
+    let slot = hidden.next()?;
+    if hidden.next().is_some() { return None; }
+    let param = proto.get_param(slot)?;
+    let pointer_type = param.get_type()?.clone();
+    let pointee = Datatype::completed_record(&pointer_type.get_ptr_to()?);
+    if param.get_address().is_invalid() || !Rc::ptr_eq(&pointee, &value_type) {
+        return None;
+    }
+    let output = proto.get_output_type()?;
+    if output.get_metatype() != crate::dtype::type_metatype::TYPE_VOID {
+        let returned = Datatype::completed_record(&output.get_ptr_to()?);
+        if output.get_size() != pointer_type.get_size() || !Rc::ptr_eq(&returned, &value_type) {
+            return None;
+        }
+    }
+    Some(HiddenResult { value_type, pointer_type, slot })
+}
+
+pub(crate) fn callable_logical(proto: &FuncProto, enabled: bool) -> Option<&crate::fspec::PrototypePieces> {
+    let logical = proto.logical_pieces()?;
+    // The off policy exposes allocated ABI inputs, not pending logical slots.
+    let physical_indirect = !enabled && proto.has_store()
+        && (0..proto.num_params()).any(|slot| proto.get_param(slot)
+            .is_some_and(|param| param.is_indirect_storage()))
+        && (0..proto.num_params()).all(|slot| proto.get_param(slot)
+            .is_some_and(|param| !param.get_address().is_invalid()))
+        && proto.get_output_type().is_some_and(|ty|
+            ty.get_metatype() == crate::dtype::type_metatype::TYPE_VOID
+                || !proto.get_output().get_address().is_invalid());
+    if physical_indirect { return None; }
+    let hidden = proto.has_store() && (0..proto.num_params())
+        .any(|slot| proto.get_param(slot).is_some_and(|p| p.is_hidden_return()));
+    if hidden && (!enabled || hidden_result(proto).is_none()) { return None; }
+    Some(logical)
+}
+
+pub(crate) fn hidden_input_highs(data: &Funcdata, result: &HiddenResult) -> Vec<crate::context::HighVariableId> {
+    let param = data.get_func_proto().get_param(result.slot).expect("hidden result parameter");
+    let high = data.vbank().find_input(param.get_size(), &param.get_address())
+        .and_then(|vn| data.vbank().get(vn)?.get_high());
+    let symbol = high.and_then(|id| data.high_bank().get(id)?.kuna_link_symbol())
+        .or_else(|| data.get_scope_local()?.parameter_symbol(result.slot));
+    data.high_bank().iter().filter_map(|(id, variable)| {
+        (Some(id) == high || symbol.is_some_and(|symbol| variable.kuna_link_symbol() == Some(symbol)))
+            .then_some(id)
+    }).collect()
+}
 
 pub(crate) fn indirect_pointee(
     proto: &FuncProto,

@@ -47,8 +47,8 @@ fn run(slot_ptr: bool) -> Vec<(String, Vec<VarInfo>, String)> {
         ) else {
             continue;
         };
-        let vars = extract_variables(prog.arch(), &fd);
-        let code = print_c(prog.arch_mut(), &fd);
+        let vars = extract_variables(prog.arch(), &fd).unwrap();
+        let code = print_c(prog.arch_mut(), &fd).unwrap();
         out.push((name, vars, code));
     }
     out

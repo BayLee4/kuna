@@ -143,11 +143,11 @@ impl Action for ActionAssignHigh {
         }
         Some(Box::new(ActionAssignHigh { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:347 — ActionAssignHigh::apply
         //   data.setHighLevel(); return 0;
         data.set_high_level();
-        0
+        Ok(0)
     }
 }
 
@@ -176,7 +176,7 @@ impl Action for ActionAssignHigh {
 /// is then marked IMPLIED by `baseExplicit` and the printer inlines it
 /// (`return <expr>;`), matching the C++ oracle.  This is an IR-shape +
 /// recovered-output condition, not a function/address special case.
-fn mark_output_storage_addr_tied(data: &mut Funcdata) {
+fn mark_output_storage_addr_tied(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     // The return-value storage is the first return op's value input (`getIn(1)`):
     // that storage location is in (implicit) local scope, so C++'s
     // ScopeLocal/`inScope` would mark it `mapped | addrtied`.  Reading it from the
@@ -185,7 +185,7 @@ fn mark_output_storage_addr_tied(data: &mut Funcdata) {
     // likewise established well before output recovery).
     let retop = match data.get_first_return_op() {
         Some(op) => op,
-        None => return,
+        None => return Ok(()),
     };
     let trial0 = {
         let o = data.obank().get(retop).expect("mark_output: stale return op");
@@ -197,10 +197,10 @@ fn mark_output_storage_addr_tied(data: &mut Funcdata) {
     };
     let (addr, size) = match trial0.and_then(|vn| data.vbank().get(vn)) {
         Some(v) => (v.get_addr().clone(), v.get_size()),
-        None => return,
+        None => return Ok(()),
     };
     if addr.is_invalid() || size <= 0 || addr.get_space().is_none() {
-        return;
+        return Ok(());
     }
     // Every Varnode of the output size at the output address is the return-value
     // storage.  Whether C++ ties this register comes down to one structural fact
@@ -316,7 +316,7 @@ fn mark_output_storage_addr_tied(data: &mut Funcdata) {
     if all_marker_inputs_persist {
         // The register is the persist global passing through the join — leave it
         // un-tied so `mergeMarker` folds it into the global HighVariable.
-        return;
+        return Ok(());
     }
 
     // (kuna over-tie fix) A return register written *only* by `COPY`s of a
@@ -351,7 +351,7 @@ fn mark_output_storage_addr_tied(data: &mut Funcdata) {
         });
     if all_writes_const_copy {
         // Pure constant-return transient — leave un-tied (collapses to `return N;`).
-        return;
+        return Ok(());
     }
 
     // (kuna LOSS-206 ScopeLocal-ownership gate) The C++ `addrtied` derivation for a
@@ -588,20 +588,22 @@ fn mark_output_storage_addr_tied(data: &mut Funcdata) {
         if !has_marker_write || has_transient_self_chain || has_loop_carried_marker {
             // Leave un-tied so `baseExplicit` marks the value IMPLIED and the
             // printer collapses the return-register round-trip / chain.
-            return;
+            return Ok(());
         }
     }
-    let is_register = data.get_arch().manage().register_lookup().is_some_and(|lookup| {
-        !lookup.get_register_name(addr.get_space().unwrap(), addr.get_offset(), size).is_empty()
-    });
+    let is_register = match data.get_arch().manage().register_lookup() {
+        Some(lookup) => !lookup.get_register_name(addr.get_space().unwrap(), addr.get_offset(), size)?.is_empty(),
+        None => false,
+    };
     if is_register && !crate::kuna_registerepochs::single_family(data, &written) {
-        return;
+        return Ok(());
     }
     for vn in targets {
         if let Some(v) = data.vbank_mut().get_mut(vn) {
             v.mark_mapped_addr_tied();
         }
     }
+    Ok(())
 }
 
 /// Make *required* Varnode merges as dictated by `CPUI_MULTIEQUAL`,
@@ -633,7 +635,7 @@ impl Action for ActionMergeRequired {
         }
         Some(Box::new(ActionMergeRequired { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:370 — ActionMergeRequired::apply
         //   data.getMerge().mergeAddrTied();
         //   data.getMerge().groupPartials();
@@ -655,8 +657,8 @@ impl Action for ActionMergeRequired {
         // would let an un-tied input (a global like `dat_52`) wrongly merge into
         // it (no trim COPY fires).  Marking the output storage addrtied restores
         // the `high_is_addr_tied(out) && !high_is_addr_tied(in)` trim trigger.
-        crate::kuna_stackobjects::recover(data);
-        mark_output_storage_addr_tied(data);
+        crate::kuna_stackobjects::recover(data)?;
+        mark_output_storage_addr_tied(data)?;
 
         // Drive over `data.getMerge()` — the single persistent `Merge` on
         // `Funcdata` (C++ `covermerge`) so the trim COPYs `mergeAddrTied`/
@@ -665,17 +667,11 @@ impl Action for ActionMergeRequired {
         // the W7 stack-alias cross-call test source; the merged-tree default is
         // empty (no stack-affecting ops on the boolless/condconst slices).
         data.with_covermerge(|merge, data| {
-            if merge.merge_addr_tied(data).is_err() {
-                return;
-            }
-            if crate::kuna_fputruncviews::recover(data).is_err() {
-                return;
-            }
-            if merge.group_partials(data).is_err() {
-                return;
-            }
-            let _ = merge.merge_marker(data);
-        });
+            merge.merge_addr_tied(data)?;
+            crate::kuna_fputruncviews::recover(data)?;
+            merge.group_partials(data)?;
+            merge.merge_marker(data)
+        })?;
 
         // (kuna LOSS-229) Re-attach dynamic-hash symbols to the firstuse COPYs that
         // `mergeAddrTied` just re-materialised.  In upstream the firstuse COPY that a
@@ -699,7 +695,7 @@ impl Action for ActionMergeRequired {
         for entry in entries {
             let _ = data.attempt_dynamic_mapping(&entry);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1038,7 +1034,7 @@ impl Action for ActionMarkExplicit {
         }
         Some(Box::new(ActionMarkExplicit { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3340 — ActionMarkExplicit::apply.
         let maxref = data.get_arch().max_implied_ref;
         // beginDef()..beginDef(0): iterate the non-free (input|written) varnodes.
@@ -1089,7 +1085,7 @@ impl Action for ActionMarkExplicit {
             data.vbank_mut().get_mut(*vn).expect("markexplicit clearmark").clear_mark();
         }
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 
@@ -1125,7 +1121,7 @@ impl Action for ActionMarkImplied {
         }
         Some(Box::new(ActionMarkImplied { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3519 — ActionMarkImplied::apply: a depth-first walk
         // of each non-free, not-yet-marked Varnode's descend tree, classifying
         // each leaf as implied (if its cover permits) or explicit.
@@ -1184,7 +1180,7 @@ impl Action for ActionMarkImplied {
             }
         }
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 
@@ -1668,7 +1664,7 @@ impl Action for ActionMergeMultiEntry {
         }
         Some(Box::new(ActionMergeMultiEntry { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:404 — ActionMergeMultiEntry::apply
         //   data.getMerge().mergeMultiEntry(); return 0;
         //
@@ -1676,10 +1672,8 @@ impl Action for ActionMergeMultiEntry {
         // merged-tree default `multi_entry_symbols` is empty (no W4 multi-entry
         // ScopeLocal symbols), so this is a true no-op, but it is now wired to the
         // real engine so it activates the moment that layer lands.
-        data.with_covermerge(|merge, data| {
-            let _ = merge.merge_multi_entry(data);
-        });
-        0
+        data.with_covermerge(|merge, data| merge.merge_multi_entry(data))?;
+        Ok(0)
     }
 }
 
@@ -1715,7 +1709,7 @@ impl Action for ActionMergeCopy {
         }
         Some(Box::new(ActionMergeCopy { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:393 — ActionMergeCopy::apply
         //   data.getMerge().mergeOpcode(CPUI_COPY); return 0;
         //
@@ -1725,10 +1719,8 @@ impl Action for ActionMergeCopy {
         // `MergeContext for Funcdata` bridge (same construction as the other
         // merge actions).  Once merged, `markInternalCopies` (ActionCopyMarker)
         // marks the now-intra-high COPY nonprinting so it does not materialise.
-        data.with_covermerge(|merge, data| {
-            let _ = merge.merge_opcode(data, OpCode::CPUI_COPY);
-        });
-        0
+        data.with_covermerge(|merge, data| merge.merge_opcode(data, OpCode::CPUI_COPY))?;
+        Ok(0)
     }
 }
 
@@ -1764,7 +1756,7 @@ impl Action for ActionDominantCopy {
         }
         Some(Box::new(ActionDominantCopy { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:1023 — ActionDominantCopy::apply
         //   data.getMerge().processCopyTrims(); return 0;
         //
@@ -1773,10 +1765,8 @@ impl Action for ActionDominantCopy {
         // source Varnode and replaced with a single dominating COPY hoisted to the
         // common dominator (`buildDominantCopy`), emptying the per-block trim
         // COPYs so `ActionBlockStructure` can splice them away.
-        data.with_covermerge(|merge, data| {
-            let _ = merge.process_copy_trims(data);
-        });
-        0
+        data.with_covermerge(|merge, data| merge.process_copy_trims(data))?;
+        Ok(0)
     }
 }
 
@@ -1812,7 +1802,7 @@ impl Action for ActionMarkIndirectOnly {
         }
         Some(Box::new(ActionMarkIndirectOnly { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:358 — ActionMarkIndirectOnly::apply
         //   data.markIndirectOnly(); return 0;
         //
@@ -1823,7 +1813,7 @@ impl Action for ActionMarkIndirectOnly {
         if data.get_arch().mark_indirect_only {
             crate::kuna_indirectonly::mark_indirect_only(data);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1859,16 +1849,14 @@ impl Action for ActionMergeAdjacent {
         }
         Some(Box::new(ActionMergeAdjacent { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:382 — ActionMergeAdjacent::apply
         //   data.getMerge().mergeAdjacent(); return 0;
         //
         // Drive over `data.getMerge()` (the persistent `covermerge`): try to merge
         // each op's same-storage input into its output Varnode.
-        data.with_covermerge(|merge, data| {
-            let _ = merge.merge_adjacent(data);
-        });
-        0
+        data.with_covermerge(|merge, data| merge.merge_adjacent(data))?;
+        Ok(0)
     }
 }
 
@@ -1904,7 +1892,7 @@ impl Action for ActionMergeType {
         }
         Some(Box::new(ActionMergeType { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:415 — ActionMergeType::apply
         //   data.getMerge().mergeByDatatype(data.beginLoc(), data.endLoc());
         //   return 0;
@@ -1912,10 +1900,8 @@ impl Action for ActionMergeType {
         // Drive `Merge::merge_by_datatype` over the loc-ordered Varnode slice
         // (`beginLoc()..endLoc()`) via the persistent `covermerge`.
         let range: Vec<crate::context::VarnodeId> = data.vbank().iter_loc().collect();
-        data.with_covermerge(|merge, data| {
-            let _ = merge.merge_by_datatype(data, &range);
-        });
-        0
+        data.with_covermerge(|merge, data| merge.merge_by_datatype(data, &range))?;
+        Ok(0)
     }
 }
 
@@ -1953,16 +1939,16 @@ impl Action for ActionHideShadow {
         }
         Some(Box::new(ActionHideShadow { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:4976 — ActionHideShadow::apply
         //
         // (kuna) option `hideshadow`: OFF reproduces the historical stub exactly
         // (no walk, no change), ON runs the upstream body.
         if !data.get_arch().hide_shadow {
-            return 0;
+            return Ok(0);
         }
         self.base.count += crate::kuna_hideshadow::hide_shadow_copies(data);
-        0
+        Ok(0)
     }
 }
 
@@ -1998,7 +1984,7 @@ impl Action for ActionCopyMarker {
         }
         Some(Box::new(ActionCopyMarker { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.hh:1034 — ActionCopyMarker::apply
         //   data.getMerge().markInternalCopies(); return 0;
         //
@@ -2013,7 +1999,7 @@ impl Action for ActionCopyMarker {
             merge.mark_internal_copies(data);
         });
         crate::p6_variables::kuna_undefinedcopy::mark(data);
-        0
+        Ok(0)
     }
 }
 
@@ -2151,7 +2137,7 @@ fn bind_proto_partial_piece(
     } else {
         None
     };
-    let (root_name, root_sym_off, root_type) = match container {
+    let (root_name, root_sym_off, root_type, root_global_symbol_id, root_global) = match container {
         Some(info) => {
             // Member of a mapped composite.  Resolve the name on demand: reuse the
             // root's existing name; else rename the undefined Symbol to `vN` once
@@ -2165,7 +2151,9 @@ fn bind_proto_partial_piece(
                         .unwrap_or_else(|| default_v_name(data, base))
                 }),
             };
-            (name, info.sym_off, info.sym_type)
+            // This is a fresh local container binding, not a copy of a source-global
+            // binding the root may previously have carried.
+            (name, info.sym_off, info.sym_type, None, false)
         }
         None => {
             // No mapped container — the whole-value (register-return) path.  Keep the
@@ -2190,9 +2178,22 @@ fn bind_proto_partial_piece(
                 },
             };
             taken.insert(name.clone());
-            let cur_off = data.high_bank().get(root_high).map(|h| h.get_symbol_offset()).unwrap_or(-1);
-            let rep_ty = data.vbank().get(root_rep).map(|v| v.get_type().clone());
-            (name, cur_off, rep_ty)
+            let binding = data.high_bank().get(root_high);
+            let cur_off = binding.map(|h| h.get_symbol_offset()).unwrap_or(-1);
+            let global_symbol_id = binding.and_then(|h| h.kuna_global_symbol_id());
+            let global = binding.is_some_and(|h| {
+                h.kuna_global() || (0..h.num_instances()).any(|i|
+                    data.vbank().get(h.get_instance(i)).is_some_and(|v| v.is_persist()))
+            });
+            // A retained global receipt names the whole source object, even if
+            // this CONCAT represents only a portion. Copy its held type with
+            // the name/offset/identity, not the representative's access type.
+            let ty = if global_symbol_id.is_some() {
+                binding.and_then(|h| h.kuna_symbol_type()).cloned()
+            } else {
+                data.vbank().get(root_rep).map(|v| v.get_type().clone())
+            };
+            (name, cur_off, ty, global_symbol_id, global)
         }
     };
     // Bind the resolved Symbol (name + the root's in-symbol byte offset + the whole
@@ -2203,6 +2204,9 @@ fn bind_proto_partial_piece(
         h.set_symbol_offset(root_sym_off);
         if let Some(t) = root_type.clone() {
             h.set_symbol_type(t);
+        }
+        if let Some(id) = root_global_symbol_id {
+            h.set_kuna_global_symbol_id(id);
         }
     }
     // rootHigh->establishGroupSymbolOffset();  — write the group's symbol offset so
@@ -2224,8 +2228,12 @@ fn bind_proto_partial_piece(
     if let Some(h) = data.high_bank_mut().get_mut(piece_high) {
         h.set_kuna_name(root_name);
         h.set_symbol_offset(sym_off);
+        h.set_kuna_global(root_global);
         if let Some(t) = root_type {
             h.set_symbol_type(t);
+        }
+        if let Some(id) = root_global_symbol_id {
+            h.set_kuna_global_symbol_id(id);
         }
     }
     true
@@ -2255,21 +2263,21 @@ fn kuna_qualify_global_name(
     sym_scope_path: &[String],
     func_ns_path: &[String],
     name_used: &dyn Fn(&str) -> bool,
-) -> String {
+) -> kuna_base::error::KunaResult<String> {
     let prefix = crate::kuna_namespaces::scope_prefix(
         crate::printlanguage::NamespaceStrategy::MinimalNamespaces,
         base,
         sym_scope_path,
         func_ns_path,
-        &|name: &str, _: usize| name_used(name),
-    );
+        &|name: &str, _: usize| Ok(name_used(name)),
+    )?;
     let mut out = String::new();
     for name in prefix {
         out.push_str(&name);
         out.push_str("::");
     }
     out.push_str(base);
-    out
+    Ok(out)
 }
 
 /// The current function's namespace path (outermost first, global excluded), parsed
@@ -2476,7 +2484,7 @@ fn recommended_name_for(
     v_size: i32,
     v_input: bool,
     v_addrtied: bool,
-) -> Option<String> {
+) -> Option<crate::varmap::NameRecommend> {
     let lm = data.get_scope_local()?;
     if lm.name_recommendations().is_empty() {
         return None;
@@ -2545,7 +2553,7 @@ fn recommended_name_for(
             def_addrs.iter().any(|a| *a == rec.useaddr)
         };
         if hit {
-            return Some(rec.name.clone());
+            return Some(rec.clone());
         }
     }
     None
@@ -2587,12 +2595,12 @@ fn func_param_name_for_high(
 /// The `ActionNameVars` walk.  `taken` holds every name a HighVariable already
 /// has, including those no local Symbol records, so a callee's parameter name
 /// never gives two distinct highs one identifier.
-fn name_local_highs_angr(data: &mut Funcdata) {
+fn name_local_highs_angr(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     use crate::context::HighVariableId;
     // Materialize the recovered/locked parameters as Symbols in the local scope
     // (C++ `ProtoStoreSymbol::setInput` did this at recovery time; the kuna
     // `ProtoStoreInternal` does not, so it is done here before the walk).
-    data.link_proto_params();
+    data.link_proto_params()?;
 
     // C++ `ActionNameVars::apply` (coreaction.cc:3065) opens with
     // `getScopeLocal()->recoverNameRecommendationsForSymbols()`.  Its
@@ -2614,7 +2622,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
         lm.set_rename_targets(targets);
         lm.set_assigned_numbers(assigned);
     }
-    data.kuna_apply_dynamic_recommendations();
+    data.kuna_apply_dynamic_recommendations()?;
     if let Some(lm) = data.get_scope_local_mut() {
         lm.recover_addrtied_name_recommendations();
     }
@@ -2753,7 +2761,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
         // function, so a recommendation recorded at a NON-representative
         // instance's def address must still match).  Empty outside ghidra
         // mode.
-        if let Some(rec_name) = rename.is_none().then(|| recommended_name_for(
+        if let Some(rec) = rename.is_none().then(|| recommended_name_for(
             data,
             high,
             name_rep.unwrap(),
@@ -2764,11 +2772,18 @@ fn name_local_highs_angr(data: &mut Funcdata) {
         )).flatten() {
             let unique = data
                 .get_scope_local()
-                .map(|lm| lm.make_local_name_unique(&rec_name))
-                .unwrap_or(rec_name);
+                .map(|lm| lm.make_local_name_unique(&rec.name))
+                .unwrap_or(rec.name);
+            let dtype = data.with_high_split(|bank, ctx| {
+                bank.get_mut(high).expect("name recommendation: missing high").get_type(ctx, None)
+            });
+            let lm = data.get_scope_local_mut().expect("name recommendation: missing scope");
+            let symbol = lm.add_symbol(&unique, dtype, &v_addr, &rec.useaddr)?;
+            lm.restore_recommended_identity(symbol, rec.symbol_id);
             taken.insert(unique.clone());
             if let Some(h) = data.high_bank_mut().get_mut(high) {
                 h.set_kuna_name(unique);
+                h.set_kuna_link_symbol(symbol);
             }
             continue;
         }
@@ -2992,12 +3007,14 @@ fn name_local_highs_angr(data: &mut Funcdata) {
         // it must NOT acquire a `vN`.  A persistent **register** would still be `vN`,
         // matching the angr arm's `getRegisterName` guard.
         let spc = v_addr.get_space().expect("named high rep has no space");
-        let is_register = data
+        let is_register = match data
             .get_arch()
             .manage()
             .register_lookup()
-            .map(|rl| !rl.get_register_name(spc, v_addr.get_offset(), v_size).is_empty())
-            .unwrap_or(false);
+        {
+            Some(rl) => !rl.get_register_name(spc, v_addr.get_offset(), v_size)?.is_empty(),
+            None => false,
+        };
         // `buildDefaultName`'s `dat_<addr>` arm (database.cc:1778-1782) fires for a
         // **persistent** Varnode that is **not a register**.  In C++ that persist
         // flag is painted by `localmap->queryProperties` from the *global* scope's
@@ -3032,8 +3049,8 @@ fn name_local_highs_angr(data: &mut Funcdata) {
             // address-tied).  A hit binds the high's name + symbol offset + type
             // identically to the local `resolve_default_name` branch above.
             let usepoint = kuna_base::address::Address::new_invalid();
-            if let Some((sym_name, sym_off, sym_type, scope_path)) =
-                data.get_arch().name_for_global_varnode_scoped(&v_addr, v_size, &usepoint)
+            if let Some((sym_name, sym_off, sym_type, scope_path, symbol_id)) =
+                data.get_arch().name_for_global_varnode_scoped(&v_addr, v_size, &usepoint)?
             {
                 // Namespace-qualify the global name for the body render (C++
                 // `PrintC::pushSymbolScope` -> `getResolutionDepth(curscope)`), where
@@ -3046,13 +3063,14 @@ fn name_local_highs_angr(data: &mut Funcdata) {
                     data.get_scope_local().map(|lm| lm.local_name_used(nm)).unwrap_or(false)
                 };
                 let qualified =
-                    kuna_qualify_global_name(&sym_name, &scope_path, &func_ns_path, &name_used);
+                    kuna_qualify_global_name(&sym_name, &scope_path, &func_ns_path, &name_used)?;
                 if let Some(h) = data.high_bank_mut().get_mut(high) {
                     h.set_kuna_name(qualified);
                     h.set_symbol_offset(sym_off);
                     if let Some(t) = sym_type {
                         h.set_symbol_type(t);
                     }
+                    h.set_kuna_global_symbol_id(symbol_id);
                 }
                 continue;
             }
@@ -3124,7 +3142,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
     let all_locs: Vec<crate::context::VarnodeId> = data.vbank().iter_loc().collect();
     for vn in &all_locs {
         if data.vbank().get(*vn).map(|v| v.is_spacebase()).unwrap_or(false) {
-            data.link_spacebase_symbol(*vn);
+            data.link_spacebase_symbol(*vn)?;
         }
     }
 
@@ -3155,6 +3173,7 @@ fn name_local_highs_angr(data: &mut Funcdata) {
         data.set_kuna_name_snapshot(snapshot);
     }
     crate::kuna_libcnames::apply(data, &library);
+    Ok(())
 }
 
 /// Type every instance of `high` as `ct` and lock it, after the merge and before
@@ -3241,7 +3260,7 @@ impl Action for ActionNameVars {
         }
         Some(Box::new(ActionNameVars { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:3076 — ActionNameVars::apply
         //
         // The W4 ScopeLocal/`Symbol` surface (`getScopeLocal`/`buildDefaultName`/
@@ -3255,8 +3274,8 @@ impl Action for ActionNameVars {
         // input, not persist/global — i.e. exactly the locals that
         // `buildDefaultName` would route to the `vN` arm.  The name is bound on
         // the HighVariable (the `Symbol` stand-in; see `HighVariable::kuna_name`).
-        name_local_highs_angr(data);
-        0
+        name_local_highs_angr(data)?;
+        Ok(0)
     }
 }
 
@@ -3296,7 +3315,7 @@ impl Action for ActionSetCasts {
         }
         Some(Box::new(ActionSetCasts { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // C++ coreaction.cc:2812 — ActionSetCasts::apply.  The full driver +
         // helpers (castInput/castOutput/resolveUnion/checkPointerIssues/
         // insertPtrsubZero/testStructOffset0/tryResolution*/isOpIdentical), the
@@ -3307,8 +3326,8 @@ impl Action for ActionSetCasts {
         if data.get_arch().cast_object {
             crate::kuna_castobject::reconcile(data);
         }
-        let _count = data.action_set_casts();
-        0
+        let _count = data.action_set_casts()?;
+        Ok(0)
     }
 }
 
@@ -3352,6 +3371,7 @@ mod tests {
 
     use super::*;
     use crate::context::ArchContext;
+use crate::varnode::varnode_flags;
 
     // Mirrors the coreaction_protos.rs test harness (funcdata_block fixtures).
     fn build_manager() -> AddrSpaceManager {
@@ -3379,6 +3399,262 @@ mod tests {
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
+    }
+
+    #[test]
+    fn source_global_receipts_follow_width_spacebase_and_piece_bindings() {
+        use crate::context::{GlobalEntry, GlobalQuery, TypeOp};
+        use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+        use kuna_base::address::RangeList;
+        use kuna_base::partmap::PartMap;
+        use kuna_num::opcodes::OpCode;
+
+        let mut context = ArchContext::new(build_manager());
+        let ram = context.manage().get_space_by_name("ram").unwrap().clone();
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let narrow_type = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let wide_type = types.get_base(8, type_metatype::TYPE_INT).unwrap();
+        let whole_type = types.get_type_array(2, wide_type.clone()).unwrap();
+        context.types = Some(types);
+        context.global_query = Some(Rc::new(GlobalQuery::new(
+            [(4, "narrow", narrow_type.clone(), 0x501),
+             (8, "wide", wide_type.clone(), 0x502),
+             (16, "container", whole_type.clone(), 0x503)]
+                .into_iter().map(|(size, name, ty, id)| GlobalEntry {
+                    space_index: ram.get_index(), first: 0x2000, last: 0x2000 + size as u64 - 1,
+                    size, all_flags: varnode_flags::persist | varnode_flags::addrtied,
+                    addrtied: true, uselimit: RangeList::new(), symbol_name: name.into(),
+                    symbol_offset: 0, symbol_type: Some(ty), scope_path: Vec::new(),
+                    symbol_id: id, is_function: false, func_inject_id: -1, func_no_return: false,
+                }).collect(),
+            RangeList::new(), PartMap::new(0),
+        )));
+        let entry = Address::new(ram.clone(), 0x1000);
+        let global = Address::new(ram.clone(), 0x2000);
+        let mut fd = Funcdata::new("func", "func", Rc::new(context), entry.clone(),
+            0x10000000, 0x40).unwrap();
+        fd.set_high_level();
+        let root = fd.bblocks_root_pub();
+        let block = fd.bblocks_mut().new_block_basic(root);
+        let mut bound = Vec::new();
+        for (size, ty) in [(4, narrow_type.clone()), (8, wide_type.clone())] {
+            let op = fd.new_op(1, entry.clone());
+            fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
+            let input = fd.new_constant(size, 7);
+            fd.op_set_input(op, input, 0).unwrap();
+            let output = fd.new_varnode(size, &global, Some(ty)).unwrap();
+            fd.op_set_output(op, output).unwrap();
+            fd.vbank_mut().get_mut(output).unwrap().set_explicit();
+            fd.op_insert_end(op, block);
+            bound.push(fd.vbank().get(output).unwrap().get_high().unwrap());
+        }
+        ActionNameVars::boxed("analysis").apply(&mut fd, &mut ActionContext::new()).unwrap();
+        for (high, name, id) in [(bound[0], "narrow", 0x501), (bound[1], "wide", 0x502)] {
+            let binding = fd.high_bank().get(high).unwrap();
+            assert_eq!(binding.kuna_name(), Some(name));
+            assert_eq!(binding.kuna_symbol_offset(), 0);
+            assert_eq!(binding.kuna_global_symbol_id(), Some(id));
+        }
+
+        let base = fd.construct_const_spacebase(&ram).unwrap();
+        let offset = fd.new_constant(8, 0x2004);
+        let reference = fd.new_op(2, entry.clone());
+        fd.op_set_opcode(reference, TypeOp::new(OpCode::CPUI_PTRSUB, 0, "PTRSUB"));
+        fd.op_set_all_input(reference, &[base, offset]).unwrap();
+        fd.new_unique_out(8, reference).unwrap();
+        fd.op_insert_end(reference, block);
+        fd.link_spacebase_symbol(base).unwrap();
+        let high = fd.vbank().get(offset).unwrap().get_high().unwrap();
+        let binding = fd.high_bank().get(high).unwrap();
+        assert_eq!(binding.kuna_name(), Some("wide"));
+        assert_eq!(binding.kuna_symbol_offset(), 4);
+        assert_eq!(binding.kuna_global_symbol_id(), Some(0x502));
+        assert!(binding.kuna_global());
+
+        let piece = fd.new_varnode(4, &Address::new(ram, 0x2004), Some(narrow_type)).unwrap();
+        fd.vbank_mut().get_mut(piece).unwrap().set_proto_partial();
+        let low = fd.new_constant(4, 0);
+        let concat = fd.new_op(2, entry);
+        fd.op_set_opcode(concat, TypeOp::new(OpCode::CPUI_PIECE, 0, "PIECE"));
+        fd.op_set_all_input(concat, &[piece, low]).unwrap();
+        let whole = fd.new_varnode(8, &global, Some(wide_type.clone())).unwrap();
+        fd.op_set_output(concat, whole).unwrap();
+        fd.op_insert_end(concat, block);
+        let whole_high = fd.vbank().get(whole).unwrap().get_high().unwrap();
+        let piece_high = fd.vbank().get(piece).unwrap().get_high().unwrap();
+        // Acquire the root from the same source query, then exercise the deliberate
+        // root-to-piece binding rather than reconstructing identity at the piece.
+        let (name, off, ty, id) = fd.get_arch()
+            .name_for_global_varnode(&global, 16, &Address::new_invalid()).unwrap().unwrap();
+        let binding = fd.high_bank_mut().get_mut(whole_high).unwrap();
+        binding.set_kuna_name(name);
+        binding.set_symbol_offset(off);
+        binding.set_symbol_type(ty.unwrap());
+        binding.set_kuna_global_symbol_id(id);
+        fd.high_bank_mut().group_with(piece_high, 4, whole_high, 4, 8).unwrap();
+        assert!(bind_proto_partial_piece(&mut fd, piece, piece_high, &mut 1,
+            &Default::default(), &mut Default::default(), &mut Default::default()));
+        for high in [whole_high, piece_high] {
+            let binding = fd.high_bank().get(high).unwrap();
+            assert_eq!(binding.kuna_name(), Some("container"));
+            assert_eq!(binding.kuna_global_symbol_id(), Some(0x503));
+            assert!(Rc::ptr_eq(binding.kuna_symbol_type().unwrap(), &whole_type));
+            assert_eq!(binding.kuna_symbol_type().unwrap().get_size(), 16);
+        }
+        assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_symbol_offset(), 4);
+    }
+
+    #[test]
+    fn partial_binding_retains_storage_role_without_promoting_receipt_provenance() {
+        use crate::context::TypeOp;
+        use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
+        use kuna_num::opcodes::OpCode;
+
+        for persistent in [false, true] {
+            let mut context = ArchContext::new(build_manager());
+            let types = Rc::new(TypeFactoryImpl::new());
+            types.setup_sizes(Some(4), 8, 8);
+            types.set_max_basetype_size(8);
+            let word = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
+            let whole_type = types.get_type_array(2, word.clone()).unwrap();
+            context.types = Some(types);
+            let ram = context.manage().get_space_by_name("ram").unwrap().clone();
+            let entry = Address::new(ram.clone(), 0x1000);
+            let mut fd = Funcdata::new("func", "func", Rc::new(context),
+                entry.clone(), 0x10000000, 0x40).unwrap();
+            fd.set_high_level();
+            let root = fd.bblocks_root_pub();
+            let block = fd.bblocks_mut().new_block_basic(root);
+            let piece = fd.new_varnode(4, &Address::new(ram.clone(), 0x2004),
+                Some(word)).unwrap();
+            fd.vbank_mut().get_mut(piece).unwrap().set_proto_partial();
+            let low = fd.new_constant(4, 0);
+            let concat = fd.new_op(2, entry);
+            fd.op_set_opcode(concat, TypeOp::new(OpCode::CPUI_PIECE, 0, "PIECE"));
+            fd.op_set_all_input(concat, &[piece, low]).unwrap();
+            let whole = fd.new_varnode(8, &Address::new(ram, 0x2000),
+                Some(whole_type.clone())).unwrap();
+            if persistent {
+                fd.vbank_mut().get_mut(whole).unwrap().set_flags_pub(varnode_flags::persist);
+            }
+            fd.op_set_output(concat, whole).unwrap();
+            fd.op_insert_end(concat, block);
+            let whole_high = fd.vbank().get(whole).unwrap().get_high().unwrap();
+            let piece_high = fd.vbank().get(piece).unwrap().get_high().unwrap();
+            let binding = fd.high_bank_mut().get_mut(whole_high).unwrap();
+            binding.set_kuna_name("bound");
+            binding.set_symbol_offset(0);
+            binding.set_symbol_type(whole_type.clone());
+            binding.set_kuna_global_symbol_id(0x503);
+            fd.high_bank_mut().group_with(piece_high, 4, whole_high, 4, 8).unwrap();
+            assert!(bind_proto_partial_piece(&mut fd, piece, piece_high, &mut 1,
+                &Default::default(), &mut Default::default(), &mut Default::default()));
+            assert!(!fd.vbank().get(piece).unwrap().is_persist());
+            assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_global(), persistent);
+            assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_global_symbol_id(), Some(0x503));
+            assert!(Rc::ptr_eq(fd.high_bank().get(piece_high).unwrap().kuna_symbol_type().unwrap(), &whole_type));
+            assert!(fd.high_bank().is_same_group(whole_high, piece_high));
+        }
+    }
+
+    #[test]
+    fn volatile_local_types_keep_exact_source_piece_and_callable_identity() {
+        use crate::context::{GlobalEntry, GlobalQuery};
+        use crate::dtype::{type_metatype, Datatype, DatatypeKind, TypeFactory, TypeFactoryImpl};
+        use crate::fspec::{FuncProto, ProtoModel, PrototypePieces};
+        use crate::userop::{UserOpManage, BUILTIN_VOLATILE_READ, BUILTIN_VOLATILE_WRITE};
+        use kuna_base::address::RangeList;
+        use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+        use kuna_base::partmap::PartMap;
+        use kuna_num::opcodes::OpCode;
+
+        let mut context = ArchContext::new(build_manager());
+        let ram = context.manage().get_space_by_name("ram").unwrap().clone();
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.setup_sizes(Some(4), 8, 8);
+        types.set_max_basetype_size(8);
+        let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let signature = FuncProto::from_logical(&PrototypePieces {
+            outtype: Some(integer.clone()), intypes: vec![integer.clone()],
+            innames: vec!["value".into()], ..PrototypePieces::default()
+        }, Rc::new(ProtoModel::new(context.manage())), types.as_ref()).unwrap();
+        let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+        code.kind = DatatypeKind::Code { proto: Some(Rc::new(signature)) };
+        let pointer = types.get_type_pointer(8, Rc::new(code), 1).unwrap();
+        let function = types.get_typedef(&pointer, "Fn", 0, 0).unwrap();
+        let array = types.get_type_array(2, function.clone()).unwrap();
+        let mut userops = UserOpManage::new();
+        let mut registry = IdRegistry::with_base_ids();
+        crate::userop::register_ids(&mut registry);
+        let mut decoder = XmlDecode::new(context.manage(), &registry);
+        decoder.ingest_stream(br#"<volatile inputop="read_volatile" outputop="write_volatile"/>"#).unwrap();
+        let element = decoder.open_element().unwrap();
+        userops.decode_volatile(&mut decoder).unwrap();
+        decoder.close_element(element).unwrap();
+        drop(decoder);
+        context.userops = Rc::new(userops);
+        context.types = Some(types);
+        context.global_query = Some(Rc::new(GlobalQuery::new(
+            [(0x2000, 4, 0, integer.clone()), (0x2000, 8, 0, function.clone()),
+             (0x3000, 8, 8, array)].into_iter().enumerate().map(|(index, (first, size, offset, ty))| GlobalEntry {
+                space_index: ram.get_index(), first, last: first + size as u64 - 1, size,
+                // special_prop authorizes this userop query: the original
+                // VolatileRead/Write hooks do not require another Symbol lock.
+                all_flags: varnode_flags::persist | varnode_flags::addrtied | varnode_flags::volatil,
+                addrtied: true, uselimit: RangeList::new(), symbol_name: format!("source_{index}"),
+                symbol_offset: offset, symbol_type: Some(ty), scope_path: Vec::new(),
+                symbol_id: index as u64 + 1, is_function: false, func_inject_id: -1,
+                func_no_return: false,
+            }).collect(), RangeList::new(), PartMap::new(0),
+        )));
+        let entry = Address::new(ram.clone(), 0x1000);
+        let mut data = Funcdata::new("subject", "subject", Rc::new(context), entry,
+            0x1000_0000, 1).unwrap();
+        fn read(data: &mut Funcdata, address: &Address, size: i32, special: bool) -> crate::context::OpId {
+            let op = data.new_op(2, data.get_address().clone());
+            data.op_set_opcode_code(op, OpCode::CPUI_CALLOTHER);
+            let index = data.new_constant(4, BUILTIN_VOLATILE_READ as u64);
+            let annotation = data.new_code_ref(address);
+            data.op_set_all_input(op, &[index, annotation]).unwrap();
+            data.new_unique_out(size, op).unwrap();
+            if special {
+                data.obank_mut().get_mut(op).unwrap()
+                    .set_additional_flag(crate::op::pcodeop_addlflags::special_prop);
+            }
+            op
+        }
+        for (address, size, expected) in [
+            (0x2000, 8, Some(&function)), (0x2000, 4, Some(&integer)),
+            (0x3000, 8, Some(&function)), (0x4000, 8, None),
+        ] {
+            let op = read(&mut data, &Address::new(ram.clone(), address), size, true);
+            let actual = crate::coreaction_infertypes::output_type_local(&data, op).unwrap();
+            if let Some(expected) = expected {
+                assert!(Rc::ptr_eq(&actual, expected), "exact source piece at {address:#x}/{size}");
+            } else {
+                assert_eq!((actual.get_metatype(), actual.get_size()), (type_metatype::TYPE_UNKNOWN, size));
+            }
+        }
+        let address = Address::new(ram, 0x2000);
+        let ordinary = read(&mut data, &address, 8, false);
+        assert_eq!(crate::coreaction_infertypes::output_type_local(&data, ordinary).unwrap().get_metatype(),
+            type_metatype::TYPE_UNKNOWN, "absence of special_prop retains ordinary inference");
+        let write = data.new_op(3, data.get_address().clone());
+        data.op_set_opcode_code(write, OpCode::CPUI_CALLOTHER);
+        let index = data.new_constant(4, BUILTIN_VOLATILE_WRITE as u64);
+        let annotation = data.new_code_ref(&address);
+        let value = data.new_unique(8, None);
+        data.op_set_all_input(write, &[index, annotation, value]).unwrap();
+        data.obank_mut().get_mut(write).unwrap()
+            .set_additional_flag(crate::op::pcodeop_addlflags::special_prop);
+        let actual = crate::coreaction_infertypes::input_type_local(&data, write, 2).unwrap();
+        assert!(Rc::ptr_eq(&actual, &function));
+        assert_ne!(crate::coreaction_infertypes::input_type_local(&data, write, 1).unwrap().get_size(), 8,
+            "the annotation itself is not the volatile value");
+        assert_eq!(function.get_ptr_to().unwrap().get_code_prototype().unwrap().num_params(), 1);
+        assert_eq!(function.get_name(), "Fn");
     }
 
     /// Every merge-group leaf carries the exact C++ `name()` string and is
@@ -3446,13 +3722,13 @@ mod tests {
         assert!(!fd.is_high_on(), "high layer starts off");
 
         let mut act = ActionAssignHigh::boxed("merge");
-        let r = act.apply(&mut fd, &mut ctx);
+        let r = act.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(r, 0, "apply returns 0");
         assert_eq!(act.base().count, 0, "setHighLevel signals no change");
         assert!(fd.is_high_on(), "high layer is on after assignhigh");
 
         // Idempotent: a second pass changes nothing.
-        let r2 = act.apply(&mut fd, &mut ctx);
+        let r2 = act.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(r2, 0);
         assert!(fd.is_high_on());
     }
@@ -3474,7 +3750,7 @@ mod tests {
             ActionCopyMarker::boxed("merge"),
         ];
         for act in &mut acts {
-            let r = act.apply(&mut fd, &mut ctx);
+            let r = act.apply(&mut fd, &mut ctx).unwrap();
             assert_eq!(r, 0, "{} stub returns 0", act.get_name());
             assert_eq!(act.base().count, 0, "{} stub makes no change", act.get_name());
         }
@@ -3494,7 +3770,7 @@ mod tests {
             ActionSetCasts::boxed("casts"),
         ];
         for act in &mut acts {
-            let r = act.apply(&mut fd, &mut ctx);
+            let r = act.apply(&mut fd, &mut ctx).unwrap();
             assert_eq!(r, 0, "{} stub returns 0", act.get_name());
             assert_eq!(act.base().count, 0, "{} stub makes no change", act.get_name());
         }

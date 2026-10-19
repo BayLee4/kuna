@@ -740,7 +740,7 @@ use crate::pcodeinject::ELEM_ADDR_PCODE;
 pub trait UseropArchitecture: InjectArchitecture {
     /// C++ `glb->translate->getUserOpNames(res)`: the SLEIGH-assigned user-op
     /// names, indexed by CALLOTHER constant id (empty string => no op).
-    fn get_user_op_names(&self) -> Vec<Vec<u8>>;
+    fn get_user_op_names(&self) -> KunaResult<Vec<Vec<u8>>>;
 
     /// C++ `glb->pcodeinjectlib->decodeInject(src,suffix,tp,decoder)`: allocate,
     /// decode, and register an injection payload, returning its id.
@@ -877,7 +877,7 @@ impl UserOpManage {
     /// Every user-defined p-code op presented by the architecture's translator
     /// is assigned a default `UnspecializedPcodeOp` description.
     pub fn initialize<A: UseropArchitecture>(&mut self, arch: &A) -> KunaResult<()> {
-        let basicops = arch.get_user_op_names();
+        let basicops = arch.get_user_op_names()?;
         for (i, nm) in basicops.iter().enumerate() {
             if nm.is_empty() {
                 continue;

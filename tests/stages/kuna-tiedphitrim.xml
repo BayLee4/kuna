@@ -352,9 +352,9 @@ v1\[0\] = v1\[0\] \* 0x1f \+ 7;
 \}
 return v1\[0\];</stringmatch>
 <stringmatch name="TIEDPHITRIM #11: both passes keep xa11's upstream merge, the loop's x stored into buf[0] only after the loop" min="2" max="2">while \(v1 = v2, v6\[0\]\) \{
-v2 = v6\[0\] \+ 1 \+ v5;
+v2 = \(signed char\)v6\[0\] \+ 1 \+ v5;
 v3 = &amp;v4\[1\];
-v5 = v5 \* 3 \+ \(int4\)v6\[0\];
+v5 = v5 \* 3 \+ \(int4\)\(signed char\)v6\[0\];
 v6\[0\] = \*v4;
 v4 = v3;
 v1 = v2;
@@ -381,7 +381,7 @@ v2\[0\] = \(int8 \*\)\*v2\[0\];
 <stringmatch name="TIEDPHITRIM #15: default, t8 keeps the loop variable out of buf[1] and stores the exit byte only after the loop" min="1" max="1">v1 = v4;
 do \{
 v3 = &amp;v3\[1\];
-v6 \+= v1;
+v6 \+= \(signed char\)v1;
 v2 \+= 1;
 v1 = \*v3;
 if \(!v1\) break;
@@ -406,7 +406,7 @@ v6\[0\] = v1;
 return use9\(&amp;v5\) \+ v4;</stringmatch>
 <stringmatch name="TIEDPHITRIM #17: default, t1b stores the exit byte into buf[2] only after the loop" min="1" max="1">v1 = v5\[0\];
 do \{
-v4 = v4 \* 3 \+ \(int4\)v1;
+v4 = v4 \* 3 \+ \(int4\)\(signed char\)v1;
 v1 = v5\[v3\];
 v2 = v3;
 v3 \+= 1;

@@ -241,7 +241,10 @@ impl TypeOpInfo {
     /// `opcode`/`flags`/`name`).  This is the canonical replacement for the
     /// per-wave `type_op_lookup`/`w6_type_op`/`typeop_for` local helpers.
     pub fn to_type_op(&self) -> TypeOp {
-        TypeOp::new(self.opcode, self.opflags, self.name)
+        let mut op = TypeOp::new(self.opcode, self.opflags, self.name);
+        op.metain = self.metain;
+        op.metaout = self.metaout;
+        op
     }
 
     /// Find the minimal (suggested) data-type of an output to this op-code
@@ -1088,52 +1091,40 @@ pub const REGISTERED_OPCODES: &[OpCode] = &[
 /// (`INT_ZEXT`, `INT_NEGATE`, `INT_XOR`, `INT_OR`, `INT_AND`, `INT_RIGHT`) are
 /// modified; the rest are left as registered.
 pub fn select_java_operators(inst: &mut [Option<TypeOpInfo>], java: bool) {
-    fn set_meta_in(inst: &mut [Option<TypeOpInfo>], opc: OpCode, m: type_metatype) {
-        if let Some(rec) = inst.get_mut(opc as usize).and_then(|s| s.as_mut()) {
-            rec.metain = m;
+    let lang = if java { crate::kuna_lang::OutLang::Java } else { crate::kuna_lang::OutLang::C };
+    for rec in inst.iter_mut().flatten() {
+        if matches!(rec.opcode, OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_NEGATE
+            | OpCode::CPUI_INT_XOR | OpCode::CPUI_INT_OR | OpCode::CPUI_INT_AND
+            | OpCode::CPUI_INT_RIGHT)
+        {
+            let effective = effective_type_op_info(rec.opcode, lang);
+            rec.metain = effective.metain;
+            rec.metaout = effective.metaout;
+            rec.name = effective.name;
         }
-    }
-    fn set_meta_out(inst: &mut [Option<TypeOpInfo>], opc: OpCode, m: type_metatype) {
-        if let Some(rec) = inst.get_mut(opc as usize).and_then(|s| s.as_mut()) {
-            rec.metaout = m;
-        }
-    }
-    if java {
-        set_meta_in(inst, OpCode::CPUI_INT_ZEXT, TYPE_UNKNOWN);
-        set_meta_out(inst, OpCode::CPUI_INT_ZEXT, TYPE_INT);
-        set_meta_in(inst, OpCode::CPUI_INT_NEGATE, TYPE_INT);
-        set_meta_out(inst, OpCode::CPUI_INT_NEGATE, TYPE_INT);
-        set_meta_in(inst, OpCode::CPUI_INT_XOR, TYPE_INT);
-        set_meta_out(inst, OpCode::CPUI_INT_XOR, TYPE_INT);
-        set_meta_in(inst, OpCode::CPUI_INT_OR, TYPE_INT);
-        set_meta_out(inst, OpCode::CPUI_INT_OR, TYPE_INT);
-        set_meta_in(inst, OpCode::CPUI_INT_AND, TYPE_INT);
-        set_meta_out(inst, OpCode::CPUI_INT_AND, TYPE_INT);
-        set_meta_in(inst, OpCode::CPUI_INT_RIGHT, TYPE_INT);
-        set_meta_out(inst, OpCode::CPUI_INT_RIGHT, TYPE_INT);
-        set_symbol(inst, OpCode::CPUI_INT_RIGHT, ">>>");
-    } else {
-        set_meta_in(inst, OpCode::CPUI_INT_ZEXT, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_ZEXT, TYPE_UINT);
-        set_meta_in(inst, OpCode::CPUI_INT_NEGATE, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_NEGATE, TYPE_UINT);
-        set_meta_in(inst, OpCode::CPUI_INT_XOR, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_XOR, TYPE_UINT);
-        set_meta_in(inst, OpCode::CPUI_INT_OR, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_OR, TYPE_UINT);
-        set_meta_in(inst, OpCode::CPUI_INT_AND, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_AND, TYPE_UINT);
-        set_meta_in(inst, OpCode::CPUI_INT_RIGHT, TYPE_UINT);
-        set_meta_out(inst, OpCode::CPUI_INT_RIGHT, TYPE_UINT);
-        set_symbol(inst, OpCode::CPUI_INT_RIGHT, ">>");
     }
 }
 
-/// Set the display symbol of an op-code's record (C++ `TypeOp::setSymbol`).
-fn set_symbol(inst: &mut [Option<TypeOpInfo>], opc: OpCode, sym: &'static str) {
-    if let Some(rec) = inst.get_mut(opc as usize).and_then(|s| s.as_mut()) {
-        rec.name = sym;
+/// The single language-aware metadata lookup, shared by the live instruction
+/// table and operation-local type acquisition.
+pub fn effective_type_op_info(opcode: OpCode, lang: crate::kuna_lang::OutLang) -> TypeOpInfo {
+    let mut info = type_op_info(opcode);
+    if lang == crate::kuna_lang::OutLang::Java {
+        match opcode {
+            OpCode::CPUI_INT_ZEXT => {
+                info.metain = TYPE_UNKNOWN;
+                info.metaout = TYPE_INT;
+            }
+            OpCode::CPUI_INT_NEGATE | OpCode::CPUI_INT_XOR | OpCode::CPUI_INT_OR
+            | OpCode::CPUI_INT_AND | OpCode::CPUI_INT_RIGHT => {
+                info.metain = TYPE_INT;
+                info.metaout = TYPE_INT;
+                if opcode == OpCode::CPUI_INT_RIGHT { info.name = ">>>"; }
+            }
+            _ => {}
+        }
     }
+    info
 }
 
 /// Return `CPUI_FLOAT_NEG` if the \e sign bit is flipped, `CPUI_FLOAT_ABS` if the

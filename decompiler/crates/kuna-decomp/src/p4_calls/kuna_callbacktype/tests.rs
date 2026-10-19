@@ -647,3 +647,80 @@ fn a_direct_call_that_contradicts_the_declaration_refuses_it() {
         "a caller whose body holds no call to it"
     );
 }
+
+#[test]
+fn raw_callback_queries_keep_terminal_failure_separate_from_unknown() {
+    use crate::engine_translate::test_support::failure_arch;
+    for terminal in [true, false] {
+        let (arch, entry, queries) = failure_arch(terminal);
+        let window = (2, 0x10, 8);
+        let straight = straight_to_return(&arch, &entry, &(&entry + 1), window);
+        if terminal {
+            assert!(matches!(straight, Err(KunaError::Transport { .. })));
+        } else {
+            assert!(!straight.unwrap(), "unavailable instructions do not prove a straight path");
+        }
+        assert_eq!(queries.get(), 1);
+        let zero = zero_at_every_return(&arch, &entry, window, &[]);
+        if terminal {
+            assert!(matches!(zero, Err(KunaError::Transport { .. })));
+        } else {
+            assert_eq!(zero.unwrap(), None, "unavailable instructions do not prove zero bytes");
+        }
+        assert_eq!(queries.get(), 2);
+    }
+}
+
+fn parking_fixture(terminal: bool) -> (Architecture, Address, Rc<std::cell::Cell<usize>>) {
+    let (mut arch, entry, queries) = crate::engine_translate::test_support::failure_arch(terminal);
+    arch.types_impl().setup_sizes(Some(8), 8, 8);
+    arch.build_core_types().unwrap();
+    arch.set_cspec_xml(br#"<compiler_spec>
+      <default_proto><prototype name="test" extrapop="0" stackshift="0">
+        <input><pentry minsize="1" maxsize="8"><addr space="register" offset="0x10"/></pentry></input>
+        <output><pentry minsize="1" maxsize="8"><addr space="register" offset="0x20"/></pentry></output>
+      </prototype></default_proto>
+    </compiler_spec>"#.to_vec());
+    arch.build_default_proto().unwrap();
+    // Match init_post_engine: publication assigns callable storage through
+    // the architecture's actual manager, independently of entry decoding.
+    arch.types_impl().set_proto_context(arch.translate().manager_rc());
+    assert_eq!(arch.default_fp().unwrap().get_name(), "test");
+    let global = arch.symboltab.get_global_scope().unwrap();
+    arch.symboltab.add_function(
+        global, &entry, "callback", 1, Rc::new(Datatype::new(1, type_metatype::TYPE_CODE)),
+    ).unwrap();
+    arch.kuna_callbacktype = ledger(&[(
+        (1, 0x2000), vec![fact(entry.get_offset(), 0x2010, "atexit", NULLARY)],
+    )]);
+    arch.kuna_callbacktype.own.insert(key_of(&entry).unwrap(), OwnFacts::default());
+    (arch, entry, queries)
+}
+
+#[test]
+fn terminal_entry_query_stops_callback_publication() {
+    let (mut arch, entry, queries) = parking_fixture(true);
+    let outcome = park(&mut arch, &entry, "callback", ImageFacts { is_target: true, ..Default::default() });
+    assert!(matches!(outcome, Err(KunaError::Transport { .. })));
+    assert_eq!(queries.get(), 1, "no query follows the failing entry query");
+    assert!(arch.kuna_callee_dead_cache.is_empty(), "a failed query is not cached as unknown");
+    assert!(arch.symboltab.function_proto_pieces_across_scopes(&entry).is_none());
+    assert!(arch.kuna_callbacktype.own.contains_key(&key_of(&entry).unwrap()));
+}
+
+#[test]
+fn unavailable_entry_keeps_callback_conservative_policy() {
+    let (mut arch, entry, queries) = parking_fixture(false);
+    let outcome = park(&mut arch, &entry, "callback", ImageFacts { is_target: true, ..Default::default() });
+    assert!(outcome.unwrap().is_ok(), "ordinary unknown entry facts do not refuse the declaration");
+    assert_eq!(queries.get(), 1);
+    assert!(arch.symboltab.function_proto_pieces_across_scopes(&entry).is_some());
+}
+
+#[test]
+fn callback_semantic_refusal_stays_in_the_inner_channel() {
+    let (mut arch, entry, queries) = parking_fixture(true);
+    let outcome = park(&mut arch, &entry, "callback", ImageFacts { escapes: true, is_target: true, ..Default::default() });
+    assert!(matches!(outcome, Ok(Err(Decline::Escapes))));
+    assert_eq!(queries.get(), 0, "semantic refusal needs no entry query");
+}

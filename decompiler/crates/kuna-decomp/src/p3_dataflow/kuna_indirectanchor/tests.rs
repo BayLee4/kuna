@@ -74,8 +74,8 @@ fn build_call(fd: &mut Funcdata, refine: bool) -> FuncCallSpecs {
     fd.op_insert(call, bl, None);
 
     let ret_addr = Address::new(Rc::clone(&sp), RET_OFF);
-    fd.new_indirect_creation(call, &ret_addr, RET_SIZE, true);
-    let second = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), 0x800), 8, true);
+    fd.new_indirect_creation(call, &ret_addr, RET_SIZE, true).unwrap();
+    let second = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), 0x800), 8, true).unwrap();
 
     if refine {
         let g = fd.new_op(1, Address::new(Rc::clone(&sp), 0x1010));
@@ -127,7 +127,7 @@ fn the_anchor_is_the_op_the_marker_speaks_for() {
     fd.obank_mut()
         .change_opcode(call, TypeOp::new(OpCode::CPUI_CALL, 0, "CPUI_CALL".to_string()));
     fd.op_insert(call, bl, None);
-    let ind = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), RET_OFF), RET_SIZE, true);
+    let ind = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), RET_OFF), RET_SIZE, true).unwrap();
 
     assert_eq!(anchor_of(&fd, ind), Some(call), "the marker resolves to its CALL");
     assert_eq!(anchor_of(&fd, call), None, "a CALL is not a marker");
@@ -144,7 +144,7 @@ fn off_nothing_is_redirected() {
     fd.obank_mut()
         .change_opcode(call, TypeOp::new(OpCode::CPUI_CALL, 0, "CPUI_CALL".to_string()));
     fd.op_insert(call, bl, None);
-    let ind = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), RET_OFF), RET_SIZE, true);
+    let ind = fd.new_indirect_creation(call, &Address::new(Rc::clone(&sp), RET_OFF), RET_SIZE, true).unwrap();
 
     assert_eq!(anchor_of(&fd, ind), None);
 }

@@ -101,10 +101,10 @@ impl Action for ActionEarlyReturn {
         }
         Some(Box::new(ActionEarlyReturn { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option earlyreturn on|off`, carried on the Architecture boundary.
         if !data.get_arch().early_return {
-            return 0;
+            return Ok(0);
         }
         let changes = data.earlyreturn_apply(MAX_EARLYRETURN_SPLITS, MAX_EARLYRETURN_INEDGES);
         if changes > 0 {
@@ -114,7 +114,7 @@ impl Action for ActionEarlyReturn {
             ));
         }
         self.base_mut().count += changes;
-        0
+        Ok(0)
     }
 }
 

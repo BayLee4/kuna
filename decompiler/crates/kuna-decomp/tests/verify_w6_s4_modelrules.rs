@@ -217,6 +217,7 @@ impl TypeFactory for PanicFactory {
     fn get_type_pointer_with_space(&self, ptr_to: Rc<Datatype>, spc: Rc<AddrSpace>, nm: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
     fn get_type_array(&self, as_: int4, ao: Rc<Datatype>) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
     fn get_type_struct(&self, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
+    fn kuna_synthesized_record(&self, _n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
     fn get_type_partial_struct(&self, contain: Rc<Datatype>, off: int4, sz: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
     fn get_type_union(&self, n: &str) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }
     fn get_type_partial_union(&self, contain: Rc<Datatype>, off: int4, sz: int4) -> kuna_base::error::KunaResult<Rc<Datatype>> { panic!() }

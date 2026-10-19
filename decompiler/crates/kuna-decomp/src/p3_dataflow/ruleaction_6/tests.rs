@@ -52,7 +52,7 @@ mod config_ir_regressions {
         );
         assert!(pool.clone_filtered(&ActionGroupList::from_names(["analysis"])).is_none());
         let mut selected = pool.clone_filtered(&ActionGroupList::from_names(["registered"])).unwrap();
-        assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()), 0);
+        assert_eq!(selected.apply(&mut fd, &mut ActionContext::new()).unwrap(), 0);
         assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_2COMP);
         assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(x));
         assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
@@ -119,14 +119,14 @@ fn mk_const(fd: &mut Funcdata, size: int4, val: uintb) -> VarnodeId {
 /// A free (input-style) Varnode at a distinct ram address.
 fn mk_vn(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+    fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
 }
 
 /// Make `op` define a fresh written output Varnode at ram `off` (size `size`),
 /// returning that output.  Mirrors funcdata_varnode's `make_written`.
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -137,6 +137,72 @@ fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
 /// Wire `vn` into `op`'s slot.
 fn set_in(fd: &mut Funcdata, op: OpId, vn: VarnodeId, slot: int4) {
     fd.op_set_input(op, vn, slot).unwrap();
+}
+
+#[test]
+fn ptrsub_char_cleanup_requires_readonly_string_and_preserves_pointer_type() {
+    use crate::dtype::{TypeFactory, TypeFactoryImpl};
+    use crate::context::GlobalQuery;
+    use kuna_base::partmap::PartMap;
+    use kuna_base::address::RangeList;
+    use kuna_sleigh::loadimage::LoadImage;
+    struct LiteralImage;
+    impl LoadImage for LiteralImage {
+        fn get_file_name(&self) -> &str { "literal" }
+        fn load_fill(&mut self, bytes: &mut [u8], address: &Address) -> KunaResult<()> {
+            for (i, byte) in bytes.iter_mut().enumerate() {
+                *byte = b"literal\0".get(
+                    address.get_offset().wrapping_sub(0x5000) as usize + i,
+                ).copied().unwrap_or(0);
+            }
+            Ok(())
+        }
+        fn get_arch_type(&self) -> Vec<u8> { Vec::new() }
+        fn adjust_vma(&mut self, _: i64) {}
+    }
+    for readonly in [false, true] {
+        let mut context = ArchContext::new(build_manager());
+        let ram = Rc::clone(context.manage().get_space_by_name("ram").unwrap());
+        let types = Rc::new(TypeFactoryImpl::new());
+        types.set_default_alignment_map();
+        types.set_max_basetype_size(8);
+        types.set_core_type("char", 1, type_metatype::TYPE_INT, true).unwrap();
+        let char_type = types.find_by_name("char").unwrap().unwrap();
+        let pointer = types.get_type_pointer(8, char_type, 1).unwrap();
+        let spacebase = types.get_type_spacebase(Rc::clone(&ram), &Address::new_invalid()).unwrap();
+        let base_pointer = types.get_type_pointer(8, spacebase, 1).unwrap();
+        context.global_query = Some(Rc::new(GlobalQuery::new(
+            Vec::new(), RangeList::new(), PartMap::new(if readonly { varnode_flags::readonly } else { 0 }),
+        )));
+        context.internal_strings = Some(Rc::new(std::cell::RefCell::new(
+            crate::stringmanage::StringManagerUnicode::new(64),
+        )));
+        context.loader = Some(Rc::new(std::cell::RefCell::new(
+            Box::new(LiteralImage) as Box<dyn LoadImage>,
+        )));
+        let mut fd = Funcdata::new("strings", "strings", Rc::new(context),
+            Address::new(ram, 0x1000), 0x10000000, 0x40).unwrap();
+        let op = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_PTRSUB);
+        let base = mk_const(&mut fd, 8, 0);
+        fd.vbank_mut().get_mut(base).unwrap().update_type_locked(base_pointer, true, true);
+        let offset = mk_const(&mut fd, 8, 0x5000);
+        set_in(&mut fd, op, base, 0);
+        set_in(&mut fd, op, offset, 1);
+        let out = give_output(&mut fd, op, 0x2000, 8);
+        fd.vbank_mut().get_mut(out).unwrap().update_type_locked(Rc::clone(&pointer), true, true);
+        fd.vbank_mut().get_mut(out).unwrap().set_flags_pub(varnode_flags::addrforce);
+        let mut rule = RulePtrsubCharConstant::new("cleanup");
+        assert_eq!(rule.apply_op(op, &mut fd).unwrap(), if readonly { 1 } else { 0 });
+        if readonly {
+            assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_COPY);
+            let value = fd.obank().get(op).unwrap().get_in(0).unwrap();
+            assert_eq!(fd.vbank().get(value).unwrap().get_offset(), 0x5000);
+            assert!(Rc::ptr_eq(fd.vbank().get(value).unwrap().get_type(), &pointer));
+            assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
+        } else {
+            assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_PTRSUB);
+        }
+    }
 }
 
 // =============================================================================
@@ -510,13 +576,13 @@ fn mult_neg_one_requires_const_minus_one() {
     set_in(&mut fd, m1, x, 0);
     let yvn = mk_vn(&mut fd, 0x14, 4); // non-constant slot 1
     set_in(&mut fd, m1, yvn, 1);
-    assert_eq!(rule.apply_op(m1, &mut fd), 0, "non-constant multiplier: no fire");
+    assert_eq!(rule.apply_op(m1, &mut fd).unwrap(), 0, "non-constant multiplier: no fire");
 
     let m2 = mk_op(&mut fd, 2, 0x104, OpCode::CPUI_INT_MULT);
     set_in(&mut fd, m2, x, 0);
     let c5 = mk_const(&mut fd, 4, 5);
     set_in(&mut fd, m2, c5, 1);
-    assert_eq!(rule.apply_op(m2, &mut fd), 0, "multiplier != -1: no fire");
+    assert_eq!(rule.apply_op(m2, &mut fd).unwrap(), 0, "multiplier != -1: no fire");
 }
 
 #[test]
@@ -531,7 +597,7 @@ fn mult_neg_one_minus_one_fires_to_2comp() {
     set_in(&mut fd, m, x, 0);
     let cm1 = mk_const(&mut fd, 4, 0xffffffff);
     set_in(&mut fd, m, cm1, 1);
-    assert_eq!(rule.apply_op(m, &mut fd), 1, "x * -1 => -x fires");
+    assert_eq!(rule.apply_op(m, &mut fd).unwrap(), 1, "x * -1 => -x fires");
     assert_eq!(fd.obank().get(m).unwrap().code(), OpCode::CPUI_INT_2COMP);
     assert_eq!(fd.obank().get(m).unwrap().num_input(), 1, "constant input removed");
     assert_eq!(fd.obank().get(m).unwrap().get_in(0), Some(x), "operand preserved");
@@ -549,7 +615,7 @@ fn positive_div_bails_when_input_may_be_negative() {
     set_in(&mut fd, sdiv, a, 0);
     set_in(&mut fd, sdiv, b, 1);
     let _o = give_output(&mut fd, sdiv, 0x20, 4);
-    assert_eq!(rule.apply_op(sdiv, &mut fd), 0, "sign bit possibly set -> no fire");
+    assert_eq!(rule.apply_op(sdiv, &mut fd).unwrap(), 0, "sign bit possibly set -> no fire");
 }
 
 #[test]
@@ -565,7 +631,7 @@ fn positive_div_positive_inputs_converts_to_unsigned() {
     set_in(&mut fd, sdiv, a, 0);
     set_in(&mut fd, sdiv, b, 1);
     let _o = give_output(&mut fd, sdiv, 0x20, 4);
-    assert_eq!(rule.apply_op(sdiv, &mut fd), 1, "provably positive -> unsigned div");
+    assert_eq!(rule.apply_op(sdiv, &mut fd).unwrap(), 1, "provably positive -> unsigned div");
     assert_eq!(fd.obank().get(sdiv).unwrap().code(), OpCode::CPUI_INT_DIV);
 }
 
@@ -579,7 +645,7 @@ fn two_comp_two_sub_no_lone_add_descendant() {
     let x = give_output(&mut fd, xdef, 0x10, 4);
     set_in(&mut fd, comp, x, 0);
     let _o = give_output(&mut fd, comp, 0x20, 4); // no descendants at all
-    assert_eq!(rule.apply_op(comp, &mut fd), 0);
+    assert_eq!(rule.apply_op(comp, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -594,7 +660,7 @@ fn two_comp_two_sub_lone_descendant_not_add() {
     let compout = give_output(&mut fd, comp, 0x20, 4);
     let copy = mk_op(&mut fd, 1, 0x104, OpCode::CPUI_COPY);
     set_in(&mut fd, copy, compout, 0);
-    assert_eq!(rule.apply_op(comp, &mut fd), 0, "lone descendant must be INT_ADD");
+    assert_eq!(rule.apply_op(comp, &mut fd).unwrap(), 0, "lone descendant must be INT_ADD");
 }
 
 #[test]
@@ -616,7 +682,7 @@ fn two_comp_two_sub_fires_v_plus_neg_w_to_v_minus_w() {
     set_in(&mut fd, add, compout, 1);
     let _ao = give_output(&mut fd, add, 0x28, 4);
 
-    assert_eq!(rule.apply_op(comp, &mut fd), 1, "v + -w => v - w fires");
+    assert_eq!(rule.apply_op(comp, &mut fd).unwrap(), 1, "v + -w => v - w fires");
     // INT_ADD became INT_SUB reading (v, w); 2COMP destroyed (inputs unset).
     assert_eq!(fd.obank().get(add).unwrap().code(), OpCode::CPUI_INT_SUB);
     assert_eq!(fd.obank().get(add).unwrap().get_in(0), Some(v));
@@ -638,7 +704,7 @@ fn sub_normal_requires_written_shift_input() {
     let c = mk_const(&mut fd, 4, 1);
     set_in(&mut fd, sub, c, 1);
     let _o = give_output(&mut fd, sub, 0x20, 4);
-    assert_eq!(rule.apply_op(sub, &mut fd), 0);
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -655,7 +721,7 @@ fn sub_normal_requires_shift_def() {
     let c = mk_const(&mut fd, 4, 1);
     set_in(&mut fd, sub, c, 1);
     let _o = give_output(&mut fd, sub, 0x20, 4);
-    assert_eq!(rule.apply_op(sub, &mut fd), 0, "shift input must be defined by a right shift");
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0, "shift input must be defined by a right shift");
 }
 
 #[test]
@@ -686,7 +752,7 @@ fn sub_normal_unnecessary_shift_collapses_to_subpiece() {
     set_in(&mut fd, sub, c, 1);
     let _o = give_output(&mut fd, sub, 0x30, 4);
 
-    assert_eq!(rule.apply_op(sub, &mut fd), 1, "unnecessary-shift fold commits");
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 1, "unnecessary-shift fold commits");
     // op now reads a directly, with constant 2 in slot 1.
     assert_eq!(fd.obank().get(sub).unwrap().get_in(0), Some(a));
     let new_c = fd.obank().get(sub).unwrap().get_in(1).unwrap();
@@ -708,7 +774,7 @@ fn div_term_add2_requires_shift_by_one() {
     let two = mk_const(&mut fd, 4, 2);
     set_in(&mut fd, shift, two, 1);
     let _o = give_output(&mut fd, shift, 0x20, 8);
-    assert_eq!(rule.apply_op(shift, &mut fd), 0, "must be >> 1");
+    assert_eq!(rule.apply_op(shift, &mut fd).unwrap(), 0, "must be >> 1");
 }
 
 #[test]
@@ -723,7 +789,7 @@ fn div_term_add2_non_const_shift_amount() {
     let amt = mk_vn(&mut fd, 0x18, 4); // non-constant
     set_in(&mut fd, shift, amt, 1);
     let _o = give_output(&mut fd, shift, 0x20, 8);
-    assert_eq!(rule.apply_op(shift, &mut fd), 0);
+    assert_eq!(rule.apply_op(shift, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -735,7 +801,7 @@ fn extension_push_const_input_bails() {
     let c = mk_const(&mut fd, 4, 0x10);
     set_in(&mut fd, zext, c, 0);
     let _o = give_output(&mut fd, zext, 0x20, 8);
-    assert_eq!(rule.apply_op(zext, &mut fd), 0);
+    assert_eq!(rule.apply_op(zext, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -754,7 +820,7 @@ fn extension_push_single_descendant_bails() {
     set_in(&mut fd, ptradd, idx, 1);
     let elt = mk_const(&mut fd, 8, 4);
     set_in(&mut fd, ptradd, elt, 2);
-    assert_eq!(rule.apply_op(zext, &mut fd), 0, "single pointer use -> no duplicate");
+    assert_eq!(rule.apply_op(zext, &mut fd).unwrap(), 0, "single pointer use -> no duplicate");
 }
 
 #[test]
@@ -769,7 +835,7 @@ fn extension_push_non_pointer_descendant_bails() {
     let zout = give_output(&mut fd, zext, 0x20, 8);
     let cpy = mk_op(&mut fd, 1, 0x104, OpCode::CPUI_COPY);
     set_in(&mut fd, cpy, zout, 0);
-    assert_eq!(rule.apply_op(zext, &mut fd), 0);
+    assert_eq!(rule.apply_op(zext, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -786,7 +852,7 @@ fn ptradd_undo_skips_without_type_recovery() {
     set_in(&mut fd, ptradd, idx, 1);
     set_in(&mut fd, ptradd, elt, 2);
     let _o = give_output(&mut fd, ptradd, 0x20, 8);
-    assert_eq!(rule.apply_op(ptradd, &mut fd), 0);
+    assert_eq!(rule.apply_op(ptradd, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -807,7 +873,7 @@ fn sub_right_special_printing_bails() {
         .get_mut(sub)
         .unwrap()
         .set_additional_flag(crate::op::pcodeop_addlflags::special_print);
-    assert_eq!(rule.apply_op(sub, &mut fd), 0);
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -823,7 +889,7 @@ fn sub_right_least_significant_bails() {
     let c = mk_const(&mut fd, 4, 0);
     set_in(&mut fd, sub, c, 1);
     let _o = give_output(&mut fd, sub, 0x20, 4);
-    assert_eq!(rule.apply_op(sub, &mut fd), 0);
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(sub).unwrap().get_in(1), Some(c));
 }
 
@@ -850,7 +916,7 @@ fn sub_right_addr_tied_marker_bails() {
     }
     assert!(fd.vbank().get(o).unwrap().is_addr_tied());
     assert!(fd.vbank().get(a).unwrap().is_addr_tied());
-    assert_eq!(rule.apply_op(sub, &mut fd), 0);
+    assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(sub).unwrap().get_in(1), Some(c));
 }
 

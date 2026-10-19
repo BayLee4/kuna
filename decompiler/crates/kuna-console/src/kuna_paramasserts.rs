@@ -66,8 +66,16 @@ pub(crate) fn apply(fd: &mut Funcdata, symbol: SymbolId, mut binding: Binding) {
     if !name.is_empty() {
         binding.pieces.flags |= parameter_pieces_flags::NAMELOCK;
     }
-    fd.get_func_proto_mut()
-        .set_param(binding.slot, &name, &binding.pieces);
+    fd.apply_mapped_params(&[(binding.slot, name, binding.pieces)]);
+}
+
+/// Capture only a parameter whose symbol still owns its exact prototype storage.
+pub(crate) fn capture(
+    fd: &Funcdata,
+    symbol: SymbolId,
+) -> Result<Option<(int4, ParameterPieces)>, String> {
+    let Some(binding) = prepare(fd, symbol, None)? else { return Ok(None) };
+    Ok(Some((binding.slot, binding.pieces)))
 }
 
 fn touched(fd: &Funcdata) -> Vec<SymbolId> {

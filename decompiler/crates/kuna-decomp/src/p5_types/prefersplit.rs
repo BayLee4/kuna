@@ -260,7 +260,7 @@ impl PreferSplitManager {
         bigendian: bool,
         sethi: bool,
         setlo: bool,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let vn = inst.vn.expect("fillinInstance: null vn");
         let vn_size = vn_get_size(data, vn);
         let losize = if bigendian { vn_size - inst.splitoffset } else { inst.splitoffset };
@@ -281,21 +281,22 @@ impl PreferSplitManager {
             if bigendian {
                 if setlo && inst.lo.is_none() {
                     let a = &vn_addr + inst.splitoffset as i64;
-                    inst.lo = Some(data.new_varnode(losize, &a, None));
+                    inst.lo = Some(data.new_varnode(losize, &a, None)?);
                 }
                 if sethi && inst.hi.is_none() {
-                    inst.hi = Some(data.new_varnode(hisize, &vn_addr, None));
+                    inst.hi = Some(data.new_varnode(hisize, &vn_addr, None)?);
                 }
             } else {
                 if setlo && inst.lo.is_none() {
-                    inst.lo = Some(data.new_varnode(losize, &vn_addr, None));
+                    inst.lo = Some(data.new_varnode(losize, &vn_addr, None)?);
                 }
                 if sethi && inst.hi.is_none() {
                     let a = &vn_addr + inst.splitoffset as i64;
-                    inst.hi = Some(data.new_varnode(hisize, &a, None));
+                    inst.hi = Some(data.new_varnode(hisize, &a, None)?);
                 }
             }
         }
+        Ok(())
     }
 
     /// Create COPY ops based on input `ininst` and output `outinst` to replace
@@ -307,7 +308,7 @@ impl PreferSplitManager {
         outinst: &SplitInstance,
         op: OpId,
         _istemp: bool,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let addr = op_get_addr(data, op);
         let hiop = data.new_op(1, addr.clone()); // Create two new COPYs
         let loop_ = data.new_op(1, addr);
@@ -318,12 +319,13 @@ impl PreferSplitManager {
         data.op_insert_after(hiop, op);
         data.op_unset_input(op, 0); // Unset input so we can reassign free inputs to new ops
 
-        data.op_set_output(hiop, outinst.hi.expect("createCopyOps: out hi")).ok(); // Outputs
-        data.op_set_output(loop_, outinst.lo.expect("createCopyOps: out lo")).ok();
+        data.op_set_output(hiop, outinst.hi.expect("createCopyOps: out hi"))?; // Outputs
+        data.op_set_output(loop_, outinst.lo.expect("createCopyOps: out lo"))?;
         data.op_set_input(hiop, ininst.hi.expect("createCopyOps: in hi"), 0).ok();
         data.op_set_input(loop_, ininst.lo.expect("createCopyOps: in lo"), 0).ok();
         self.tempsplits.push(hiop);
         self.tempsplits.push(loop_);
+        Ok(())
     }
 
     /// Check that `inst`, defined by `def` (a COPY), is really splittable
@@ -359,13 +361,14 @@ impl PreferSplitManager {
         inst: &mut SplitInstance,
         def: OpId,
         istemp: bool,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let invn = op_get_in(data, def, 0);
         let mut ininst = SplitInstance::new(Some(invn), inst.splitoffset);
         let bigendian = vn_space_is_big_endian(data, inst.vn.expect("splitDefiningCopy"));
-        Self::fillin_instance(data, inst, bigendian, true, true);
-        Self::fillin_instance(data, &mut ininst, bigendian, true, true);
-        self.create_copy_ops(data, &ininst, inst, def, istemp);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
+        Self::fillin_instance(data, &mut ininst, bigendian, true, true)?;
+        self.create_copy_ops(data, &ininst, inst, def, istemp)?;
+        Ok(())
     }
 
     /// Check that `inst`, read by `readop` (a COPY), is really splittable
@@ -395,12 +398,12 @@ impl PreferSplitManager {
         inst: &mut SplitInstance,
         readop: OpId,
         istemp: bool,
-    ) {
+    ) -> kuna_base::error::KunaResult<()> {
         let outvn = op_get_out(data, readop).expect("splitReadingCopy: no out");
         let mut outinst = SplitInstance::new(Some(outvn), inst.splitoffset);
         let bigendian = vn_space_is_big_endian(data, inst.vn.expect("splitReadingCopy"));
-        Self::fillin_instance(data, inst, bigendian, true, true);
-        Self::fillin_instance(data, &mut outinst, bigendian, true, true);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
+        Self::fillin_instance(data, &mut outinst, bigendian, true, true)?;
         // createCopyOps(inst,&outinst,readop,istemp): input is inst, output is outinst
         let in_copy = SplitInstance {
             splitoffset: inst.splitoffset,
@@ -408,7 +411,8 @@ impl PreferSplitManager {
             hi: inst.hi,
             lo: inst.lo,
         };
-        self.create_copy_ops(data, &in_copy, &outinst, readop, istemp);
+        self.create_copy_ops(data, &in_copy, &outinst, readop, istemp)?;
+        Ok(())
     }
 
     /// Check that `inst`, defined by ZEXT, is really splittable (C++ `testZext`).
@@ -431,7 +435,7 @@ impl PreferSplitManager {
     }
 
     /// C++ `splitZext`.
-    fn split_zext(&mut self, data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) {
+    fn split_zext(&mut self, data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) -> kuna_base::error::KunaResult<()> {
         let invn0 = op_get_in(data, op, 0);
         let mut ininst = SplitInstance::new(Some(invn0), inst.splitoffset);
         let vn = inst.vn.expect("splitZext");
@@ -455,8 +459,9 @@ impl PreferSplitManager {
             ininst.hi = Some(data.new_constant(hisize, 0));
         }
 
-        Self::fillin_instance(data, inst, bigendian, true, true);
-        self.create_copy_ops(data, &ininst, inst, op, false);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
+        self.create_copy_ops(data, &ininst, inst, op, false)?;
+        Ok(())
     }
 
     /// Check that `inst`, defined by PIECE, is really splittable (C++ `testPiece`).
@@ -472,18 +477,18 @@ impl PreferSplitManager {
     }
 
     /// C++ `splitPiece`.
-    fn split_piece(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) {
+    fn split_piece(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) -> kuna_base::error::KunaResult<()> {
         let mut loin = op_get_in(data, op, 1);
         let mut hiin = op_get_in(data, op, 0);
         let bigendian = vn_space_is_big_endian(data, inst.vn.expect("splitPiece"));
-        Self::fillin_instance(data, inst, bigendian, true, true);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
         let addr = op_get_addr(data, op);
         let hiop = data.new_op(1, addr.clone());
         let loop_ = data.new_op(1, addr);
         set_opcode(data, hiop, OpCode::CPUI_COPY);
         set_opcode(data, loop_, OpCode::CPUI_COPY);
-        data.op_set_output(hiop, inst.hi.expect("splitPiece: hi")).ok(); // Outputs are the pieces of the original
-        data.op_set_output(loop_, inst.lo.expect("splitPiece: lo")).ok();
+        data.op_set_output(hiop, inst.hi.expect("splitPiece: hi"))?; // Outputs are the pieces of the original
+        data.op_set_output(loop_, inst.lo.expect("splitPiece: lo"))?;
 
         data.op_insert_after(loop_, op);
         data.op_insert_after(hiop, op);
@@ -500,6 +505,7 @@ impl PreferSplitManager {
         }
         // Input for the COPY of the least significant part comes from low part of PIECE
         data.op_set_input(loop_, loin, 0).ok();
+        Ok(())
     }
 
     /// Check that `inst`, read by SUBPIECE, is really splittable
@@ -525,13 +531,13 @@ impl PreferSplitManager {
 
     /// Knowing `op` is a SUBPIECE that extracts a logical piece from `inst`,
     /// rewrite it to a copy (C++ `splitSubpiece`).
-    fn split_subpiece(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) {
+    fn split_subpiece(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) -> kuna_base::error::KunaResult<()> {
         let vn = inst.vn.expect("splitSubpiece");
         let suboff = vn_get_offset(data, op_get_in(data, op, 1)) as int4;
         let grabbinglo = suboff == 0;
 
         let bigendian = vn_space_is_big_endian(data, vn);
-        Self::fillin_instance(data, inst, bigendian, !grabbinglo, grabbinglo);
+        Self::fillin_instance(data, inst, bigendian, !grabbinglo, grabbinglo)?;
         set_opcode(data, op, OpCode::CPUI_COPY); // Change SUBPIECE to a copy
         data.op_remove_input(op, 1);
 
@@ -542,6 +548,7 @@ impl PreferSplitManager {
             inst.hi.expect("splitSubpiece: hi")
         };
         data.op_set_input(op, invn, 0).ok();
+        Ok(())
     }
 
     /// C++ `testLoad` (always true).
@@ -551,9 +558,9 @@ impl PreferSplitManager {
 
     /// Knowing `op` is a LOAD that defines the `inst` Varnode, split it into two
     /// pieces (C++ `splitLoad`).
-    fn split_load(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) {
+    fn split_load(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) -> kuna_base::error::KunaResult<()> {
         let bigendian = vn_space_is_big_endian(data, inst.vn.expect("splitLoad"));
-        Self::fillin_instance(data, inst, bigendian, true, true);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
         let addr = op_get_addr(data, op);
         let hiop = data.new_op(2, addr.clone()); // Create two new LOAD ops
         let loop_ = data.new_op(2, addr.clone());
@@ -576,8 +583,8 @@ impl PreferSplitManager {
         let c = data.new_constant(ptrvn_size, inst.splitoffset as uintb);
         data.op_set_input(addop, c, 1).ok();
 
-        data.op_set_output(hiop, inst.hi.expect("splitLoad: hi")).ok(); // Outputs are the pieces of the original
-        data.op_set_output(loop_, inst.lo.expect("splitLoad: lo")).ok();
+        data.op_set_output(hiop, inst.hi.expect("splitLoad: hi"))?; // Outputs are the pieces of the original
+        data.op_set_output(loop_, inst.lo.expect("splitLoad: lo"))?;
         let spaceid0 = op_get_in(data, op, 0);
         let spc = space_from_const(data, spaceid0);
         // Duplicate original spaceid into new LOADs
@@ -593,7 +600,7 @@ impl PreferSplitManager {
             // Don't read a free varnode twice
             let space = vn_get_space(data, ptrvn);
             let off = vn_get_offset(data, ptrvn);
-            ptrvn = data.new_varnode_space_off(ptrvn_size, space, off);
+            ptrvn = data.new_varnode_space_off(ptrvn_size, space, off)?;
         }
 
         if spc.is_big_endian() {
@@ -603,6 +610,7 @@ impl PreferSplitManager {
             data.op_set_input(hiop, addvn, 1).ok();
             data.op_set_input(loop_, ptrvn, 1).ok();
         }
+        Ok(())
     }
 
     /// C++ `testStore` (always true).
@@ -611,9 +619,9 @@ impl PreferSplitManager {
     }
 
     /// Knowing `op` stores the value `inst`, split it in two (C++ `splitStore`).
-    fn split_store(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) {
+    fn split_store(data: &mut Funcdata, inst: &mut SplitInstance, op: OpId) -> kuna_base::error::KunaResult<()> {
         let bigendian = vn_space_is_big_endian(data, inst.vn.expect("splitStore"));
-        Self::fillin_instance(data, inst, bigendian, true, true);
+        Self::fillin_instance(data, inst, bigendian, true, true)?;
         let addr = op_get_addr(data, op);
         let hiop = data.new_op(3, addr.clone()); // Create 2 new STOREs
         let loop_ = data.new_op(3, addr.clone());
@@ -654,7 +662,7 @@ impl PreferSplitManager {
             // Don't read a free varnode twice
             let space = vn_get_space(data, ptrvn);
             let off = vn_get_offset(data, ptrvn);
-            ptrvn = data.new_varnode_space_off(ptrvn_size, space, off);
+            ptrvn = data.new_varnode_space_off(ptrvn_size, space, off)?;
         }
         if spc.is_big_endian() {
             data.op_set_input(hiop, ptrvn, 1).ok();
@@ -663,84 +671,85 @@ impl PreferSplitManager {
             data.op_set_input(hiop, addvn, 1).ok();
             data.op_set_input(loop_, ptrvn, 1).ok();
         }
+        Ok(())
     }
 
     /// Test if the instance Varnode can be readily split; if so, do the split
     /// (C++ `splitVarnode`).
-    fn split_varnode(&mut self, data: &mut Funcdata, inst: &mut SplitInstance) -> bool {
+    fn split_varnode(&mut self, data: &mut Funcdata, inst: &mut SplitInstance) -> kuna_base::error::KunaResult<bool> {
         let vn = inst.vn.expect("splitVarnode: null vn");
         if vn_is_written(data, vn) {
             if !vn_has_no_descend(data, vn) {
-                return false; // Already linked in
+                return Ok(false); // Already linked in
             }
             let op = vn_get_def(data, vn).expect("splitVarnode: written but no def");
             match op_code(data, op) {
                 OpCode::CPUI_COPY => {
                     let (ok, istemp) = self.test_defining_copy(data, inst, op);
                     if !ok {
-                        return false;
+                        return Ok(false);
                     }
-                    self.split_defining_copy(data, inst, op, istemp);
+                    self.split_defining_copy(data, inst, op, istemp)?;
                 }
                 OpCode::CPUI_PIECE => {
                     if !Self::test_piece(data, inst, op) {
-                        return false;
+                        return Ok(false);
                     }
-                    Self::split_piece(data, inst, op);
+                    Self::split_piece(data, inst, op)?;
                 }
                 OpCode::CPUI_LOAD => {
                     if !Self::test_load(data, inst, op) {
-                        return false;
+                        return Ok(false);
                     }
-                    Self::split_load(data, inst, op);
+                    Self::split_load(data, inst, op)?;
                 }
                 OpCode::CPUI_INT_ZEXT => {
                     if !Self::test_zext(data, inst, op) {
-                        return false;
+                        return Ok(false);
                     }
-                    self.split_zext(data, inst, op);
+                    self.split_zext(data, inst, op)?;
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
-            data.op_destroy(op);
+            data.op_destroy(op)?;
         } else {
             if !vn_is_free(data, vn) {
-                return false; // Make sure vn is not already a marked input
+                return Ok(false); // Make sure vn is not already a marked input
             }
             let op = match lone_descend(data, vn) {
-                None => return false, // vn must be read exactly once
+                None => return Ok(false), // vn must be read exactly once
                 Some(o) => o,
             };
             match op_code(data, op) {
                 OpCode::CPUI_COPY => {
                     let (ok, istemp) = self.test_reading_copy(data, inst, op);
                     if !ok {
-                        return false;
+                        return Ok(false);
                     }
-                    self.split_reading_copy(data, inst, op, istemp);
+                    self.split_reading_copy(data, inst, op, istemp)?;
                 }
                 OpCode::CPUI_SUBPIECE => {
                     if !Self::test_subpiece(data, inst, op) {
-                        return false;
+                        return Ok(false);
                     }
-                    Self::split_subpiece(data, inst, op);
-                    return true; // Do not destroy op, it has been transformed
+                    Self::split_subpiece(data, inst, op)?;
+                    return Ok(true); // Do not destroy op, it has been transformed
                 }
                 OpCode::CPUI_STORE => {
                     if !Self::test_store(data, inst, op) {
-                        return false;
+                        return Ok(false);
                     }
-                    Self::split_store(data, inst, op);
+                    Self::split_store(data, inst, op)?;
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
-            data.op_destroy(op); // Original op is now dead
+            data.op_destroy(op)?; // Original op is now dead
         }
-        true
+        Ok(true)
     }
 
     /// Split every applicable Varnode matching a given record (C++ `splitRecord`).
-    fn split_record(&mut self, data: &mut Funcdata, rec: &PreferSplitRecord) {
+    fn split_record(&mut self, data: &mut Funcdata, rec: &PreferSplitRecord) -> kuna_base::error::KunaResult<()> {
         let addr = rec.storage.get_addr();
         let size = rec.storage.size as int4;
 
@@ -754,12 +763,13 @@ impl PreferSplitManager {
             pos += 1;
             inst.lo = None;
             inst.hi = None;
-            if self.split_varnode(data, &mut inst) {
+            if self.split_varnode(data, &mut inst)? {
                 // If we found something, regenerate iterators, as they may be stale
                 worklist = data.vbank().iter_loc_size_addr(size, &addr).collect();
                 pos = 0;
             }
         }
+        Ok(())
     }
 
     /// Check that the temporary `inst` (and all of its readers) is splittable
@@ -804,13 +814,13 @@ impl PreferSplitManager {
     }
 
     /// Split the temporary `inst` (C++ `splitTemporary`).
-    fn split_temporary(&mut self, data: &mut Funcdata, inst: &mut SplitInstance) {
+    fn split_temporary(&mut self, data: &mut Funcdata, inst: &mut SplitInstance) -> kuna_base::error::KunaResult<()> {
         let vn = inst.vn.expect("splitTemporary: null vn");
         let op = vn_get_def(data, vn).expect("splitTemporary: no def");
         match op_code(data, op) {
-            OpCode::CPUI_PIECE => Self::split_piece(data, inst, op),
-            OpCode::CPUI_LOAD => Self::split_load(data, inst, op),
-            OpCode::CPUI_INT_ZEXT => self.split_zext(data, inst, op),
+            OpCode::CPUI_PIECE => Self::split_piece(data, inst, op)?,
+            OpCode::CPUI_LOAD => Self::split_load(data, inst, op)?,
+            OpCode::CPUI_INT_ZEXT => self.split_zext(data, inst, op)?,
             _ => {}
         }
 
@@ -824,11 +834,11 @@ impl PreferSplitManager {
             };
             match op_code(data, readop) {
                 OpCode::CPUI_SUBPIECE => {
-                    Self::split_subpiece(data, inst, readop);
+                    Self::split_subpiece(data, inst, readop)?;
                 }
                 OpCode::CPUI_STORE => {
-                    Self::split_store(data, inst, readop);
-                    data.op_destroy(readop);
+                    Self::split_store(data, inst, readop)?;
+                    data.op_destroy(readop)?;
                 }
                 _ => {
                     // C++ default: break out of switch but loop continues; without
@@ -838,7 +848,8 @@ impl PreferSplitManager {
                 }
             }
         }
-        data.op_destroy(op);
+        data.op_destroy(op)?;
+        Ok(())
     }
 
     /// Find the split record that applies to `vn`, otherwise return `None`
@@ -873,17 +884,21 @@ impl PreferSplitManager {
     }
 
     /// Run the split over all records (C++ `split`).
-    pub fn split(&mut self, data: &mut Funcdata) {
+    pub fn split(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         let recs = std::mem::take(&mut self.records);
-        for rec in &recs {
-            self.split_record(data, rec);
-        }
+        let result = (|| {
+            for rec in &recs {
+                self.split_record(data, rec)?;
+            }
+            Ok(())
+        })();
         self.records = recs;
+        result
     }
 
     /// Clean up temporaries produced by [`Self::split`] that need a further
     /// split (C++ `splitAdditional`).
-    pub fn split_additional(&mut self, data: &mut Funcdata) {
+    pub fn split_additional(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         let mut defops: Vec<OpId> = Vec::new();
         let tempsplits = std::mem::take(&mut self.tempsplits);
         for &op in &tempsplits {
@@ -929,7 +944,7 @@ impl PreferSplitManager {
                 };
                 let mut inst = SplitInstance::new(Some(vn), splitoff);
                 if self.test_temporary(data, &inst) {
-                    self.split_temporary(data, &mut inst);
+                    self.split_temporary(data, &mut inst)?;
                 }
             } else if op_code(data, op) == OpCode::CPUI_SUBPIECE {
                 let vn = op_get_in(data, op, 0);
@@ -948,10 +963,11 @@ impl PreferSplitManager {
                 };
                 let mut inst = SplitInstance::new(Some(vn), splitoff);
                 if self.test_temporary(data, &inst) {
-                    self.split_temporary(data, &mut inst);
+                    self.split_temporary(data, &mut inst)?;
                 }
             }
         }
+        Ok(())
     }
 }
 

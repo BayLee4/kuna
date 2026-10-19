@@ -46,7 +46,7 @@ fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
 
 fn unwritten(fd: &mut Funcdata, off: u64, sz: int4) -> VarnodeId {
     let r = ram(fd);
-    fd.new_varnode(sz, &Address::new(r, off), None)
+    fd.new_varnode(sz, &Address::new(r, off), None).unwrap()
 }
 
 /// A model-less fixture cannot claim any storage is parameter storage, so the
@@ -150,7 +150,7 @@ fn reg(fd: &Funcdata, off: u64) -> Address {
 }
 
 fn input(fd: &mut Funcdata, off: u64) -> VarnodeId {
-    let vn = fd.new_varnode(4, &reg(fd, off), None);
+    let vn = fd.new_varnode(4, &reg(fd, off), None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }
 
@@ -171,7 +171,7 @@ fn copy_at(fd: &mut Funcdata, pc: u64, src: VarnodeId, out: &Address) -> Varnode
 
 /// `sp = sp + 8` made by the instruction at `pc`.
 fn sp_write_at(fd: &mut Funcdata, pc: u64) {
-    let cur = fd.new_varnode(4, &reg(fd, SP), None);
+    let cur = fd.new_varnode(4, &reg(fd, SP), None).unwrap();
     let eight = fd.new_constant(4, 8);
     let out = reg(fd, SP);
     def_at(fd, pc, kuna_num::opcodes::OpCode::CPUI_INT_ADD, &[cur, eight], &out);
@@ -279,7 +279,7 @@ fn a_self_or_and_an_add_of_zero_are_moves() {
 #[test]
 fn the_record_is_per_register() {
     let mut fd = build_reg_fd();
-    let ret = ret_op(&mut fd);
+    ret_op(&mut fd);
     let (r0a, r1a) = (reg(&fd, R0), reg(&fd, R1));
     fd.kuna_set_moved_back_returns(vec![(r1a.clone(), 4)]);
     assert!(is_moved_back(&fd, &r1a, 4));

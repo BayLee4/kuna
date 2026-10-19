@@ -295,7 +295,7 @@ fn call_position_cache_keeps_real_crossings_and_removed_call_controls() {
         ));
     });
     fd.delete_call_specs(crossing);
-    fd.op_destroy(crossing);
+    fd.op_destroy(crossing).unwrap();
     fd.with_covermerge(|merge, data| {
         assert!(!crate::merge::MergeIntersect::intersection(
             data,
@@ -485,7 +485,7 @@ fn op_unlink_severs_io_and_removes_from_block() {
     let v0 = mk_vn(&mut fd, 0x10);
     fd.op_set_input(op, v0, 0).unwrap();
     fd.op_insert(op, bl, None);
-    fd.op_unlink(op);
+    fd.op_unlink(op).unwrap();
     // input severed, op back on dead list, no parent.
     assert!(fd.vbank().get(v0).unwrap().has_no_descend());
     assert!(fd.obank().get(op).unwrap().is_dead());
@@ -503,7 +503,7 @@ fn op_destroy_unsets_inputs_and_marks_dead() {
     fd.op_set_input(op, v0, 0).unwrap();
     fd.op_set_input(op, v1, 1).unwrap();
     fd.op_insert(op, bl, None);
-    fd.op_destroy(op);
+    fd.op_destroy(op).unwrap();
     assert!(fd.vbank().get(v0).unwrap().has_no_descend());
     assert!(fd.vbank().get(v1).unwrap().has_no_descend());
     assert!(fd.obank().get(op).unwrap().is_dead());
@@ -771,7 +771,7 @@ fn mk_op_flags(
 /// Attach a fresh output Varnode (at `off`, size 4) to an op via op_set_output.
 fn give_out(fd: &mut Funcdata, op: OpId, off: u64) -> VarnodeId {
     let ram = ram_space(fd);
-    let vn = fd.new_varnode(4, &Address::new(ram, off), Some(dt(4)));
+    let vn = fd.new_varnode(4, &Address::new(ram, off), Some(dt(4))).unwrap();
     fd.op_set_output(op, vn).unwrap();
     op_out(fd, op)
 }
@@ -1311,7 +1311,7 @@ fn isolated_local_type_lock_follows_its_definition_without_typing_register_reuse
     scope.set_attribute(symbol, crate::varnode::varnode_flags::typelock);
     scope.set_symbol_isolated(symbol, true);
 
-    let input = fd.new_varnode(4, &storage, None);
+    let input = fd.new_varnode(4, &storage, None).unwrap();
     let input = fd.set_input_varnode(input).unwrap();
     assert!(!fd.vbank().get(input).unwrap().is_type_lock());
 

@@ -25,6 +25,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::{calc_mask, sign_extend, uintb_negate};
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, uint4, uintb};
 use kuna_num::opcodes::OpCode;
@@ -92,22 +93,25 @@ pub struct AddTreeState<'a> {
 
 impl<'a> AddTreeState<'a> {
     /// C++ `AddTreeState::AddTreeState(Funcdata&, PcodeOp*, int4)`.
-    pub fn new(data: &'a mut Funcdata, op: OpId, slot: int4) -> Option<AddTreeState<'a>> {
+    /// A non-pointer declines with `None`; facing-type acquisition errors propagate.
+    pub fn new(data: &'a mut Funcdata, op: OpId, slot: int4) -> KunaResult<Option<AddTreeState<'a>>> {
         let base_op = op;
         let base_slot = slot;
-        let ptr = data.obank().get(op)?.get_in(slot)?;
+        let Some(ptr) = data.obank().get(op).and_then(|o| o.get_in(slot)) else { return Ok(None) };
         // (route through the Funcdata facing accessor so a union/relative-pointer
         // resolves against the in-flow union cache; C++ Varnode::getTypeReadFacing.)
-        let ct = data.vn_type_read_facing(ptr, op);
-        let ptrsize = data.vbank().get(ptr)?.get_size();
+        let ct = data.vn_type_read_facing(ptr, op)?;
+        let Some(ptrsize) = data.vbank().get(ptr).map(|v| v.get_size()) else { return Ok(None) };
         let ptrmask = calc_mask(ptrsize);
-        let mut base_type = ct.get_ptr_to()?;
+        let Some(mut base_type) = ct.get_ptr_to() else { return Ok(None) };
         let mut nonmultsum: uintb = 0;
         let mut p_rel_type: Option<Rc<Datatype>> = None;
         if ct.is_formal_pointer_rel() {
             p_rel_type = Some(Rc::clone(&ct));
-            base_type = ct.get_rel_parent()?;
-            nonmultsum = (ct.get_address_offset()? as uintb) & ptrmask;
+            let Some(parent) = ct.get_rel_parent() else { return Ok(None) };
+            base_type = parent;
+            let Some(offset) = ct.get_address_offset() else { return Ok(None) };
+            nonmultsum = (offset as uintb) & ptrmask;
         }
         let word_size = ct.get_word_size().unwrap_or(1);
         let size: int8 = if base_type.is_variable_length() {
@@ -118,7 +122,7 @@ impl<'a> AddTreeState<'a> {
         let unitsize = AddrSpace::address_to_byte_int(1, word_size);
         let align = base_type.get_align_size();
         let is_degenerate = (align as i64) <= unitsize && align > 0;
-        Some(AddTreeState {
+        Ok(Some(AddTreeState {
             data,
             base_op,
             base_slot,
@@ -143,7 +147,7 @@ impl<'a> AddTreeState<'a> {
             valid: true,
             is_distribute_used: false,
             prevent_distribution: false,
-        })
+        }))
     }
 
     /// C++ `AddTreeState::clear()`.
@@ -227,21 +231,17 @@ impl<'a> AddTreeState<'a> {
     /// `Datatype` method cannot reach — see [`ScopeLocal::spacebase_get_sub_type`]).
     /// Returns `(Some(type), newoff)`; for a spacebase the type is always non-null
     /// (C++ falls back to `TYPE_UNKNOWN(1)`), matching `hasMatchingSubType`.
-    fn base_get_sub_type(&self, off: int8) -> (Option<Rc<Datatype>>, int8) {
+    fn base_get_sub_type(&self, off: int8) -> KunaResult<(Option<Rc<Datatype>>, int8)> {
         if self.base_type.get_metatype() == type_metatype::TYPE_SPACEBASE {
             if let (Some(lm), Some(types)) =
                 (self.data.get_scope_local(), self.data.get_arch().types_rc())
             {
-                if let Ok((t, newoff)) = lm.spacebase_get_sub_type(off, types.as_ref()) {
-                    return (Some(t), newoff);
-                }
+                let (t, newoff) = lm.spacebase_get_sub_type(off, types.as_ref())?;
+                return Ok((Some(t), newoff));
             }
-            return (None, off);
+            return Ok((None, off));
         }
-        match self.base_type.get_sub_type(off) {
-            Ok((t, newoff)) => (t, newoff),
-            Err(_) => (None, off),
-        }
+        self.base_type.get_sub_type(off)
     }
 
     /// `base_type->nearestArrayedComponentBackward(off, max)`, with the
@@ -272,48 +272,48 @@ impl<'a> AddTreeState<'a> {
 
     /// C++ `AddTreeState::hasMatchingSubType(off, arrayHint, &newoff)`.
     /// C++ `arrayHint` is `uint4` (ruleaction.hh:69).
-    fn has_matching_sub_type(&self, off: int8, array_hint: uint4) -> (bool, int8) {
+    fn has_matching_sub_type(&self, off: int8, array_hint: uint4) -> KunaResult<(bool, int8)> {
         if array_hint == 0 {
-            return match self.base_get_sub_type(off) {
+            return Ok(match self.base_get_sub_type(off)? {
                 (Some(_), newoff) => (true, newoff),
                 _ => (false, 0),
-            };
+            });
         }
         let (type_before, off_before, el_size_before) = self.base_nearest_backward(off, 128);
         let (type_after, off_after, el_size_after) = self.base_nearest_forward(off, 128);
         if type_before < 0 && type_after < 0 {
-            return match self.base_get_sub_type(off) {
+            return Ok(match self.base_get_sub_type(off)? {
                 (Some(_), newoff) => (true, newoff),
                 _ => (false, 0),
-            };
+            });
         }
         if type_before < 0 {
-            return (true, off_after); // Only array is after
+            return Ok((true, off_after)); // Only array is after
         }
         if type_after < 0 {
-            return (true, off_before); // Only array is before
+            return Ok((true, off_before)); // Only array is before
         }
         if off_after == off_before {
-            return (true, off_after);
+            return Ok((true, off_after));
         }
         // Array before and after the offset point.
         if array_hint != 1 && el_size_before != el_size_after {
             if el_size_before == array_hint as int8 {
-                return (true, off_before);
+                return Ok((true, off_before));
             }
             if el_size_after == array_hint as int8 {
-                return (true, off_after);
+                return Ok((true, off_after));
             }
         }
-        if let (Some(_), newoff) = self.base_get_sub_type(off) {
+        if let (Some(_), newoff) = self.base_get_sub_type(off)? {
             if newoff == off_before || newoff == off_after {
-                return (true, newoff); // Offset is contained in an arrayed component
+                return Ok((true, newoff)); // Offset is contained in an arrayed component
             }
         }
         let dist_before = if off_before < 0 { (-off_before) as uintb } else { off_before as uintb };
         let dist_after = if off_after < 0 { (-off_after) as uintb } else { off_after as uintb };
         let newoff = if dist_after < dist_before { off_after } else { off_before };
-        (true, newoff)
+        Ok((true, newoff))
     }
 
     /// C++ `AddTreeState::checkMultTerm(vn, op, treeCoeff)`.
@@ -461,7 +461,7 @@ impl<'a> AddTreeState<'a> {
     }
 
     /// C++ `AddTreeState::calcSubtype()`.
-    fn calc_subtype(&mut self) {
+    fn calc_subtype(&mut self) -> KunaResult<()> {
         let tmpoff = self.multsum.wrapping_add(self.nonmultsum) & self.ptrmask;
         if self.size == 0 || tmpoff < self.size as uintb {
             self.offset = tmpoff;
@@ -485,15 +485,15 @@ impl<'a> AddTreeState<'a> {
         if self.nonmult.is_empty() {
             if self.multsum == 0 && self.multiple.is_empty() {
                 self.valid = false;
-                return;
+                return Ok(());
             }
             self.is_subtype = false;
         } else if self.base_type.get_metatype() == type_metatype::TYPE_SPACEBASE {
             let offsetbytes = AddrSpace::address_to_byte_int(self.offset as i64, word_size);
-            let (matched, extra) = self.has_matching_sub_type(offsetbytes, self.biggest_non_mult_coeff);
+            let (matched, extra) = self.has_matching_sub_type(offsetbytes, self.biggest_non_mult_coeff)?;
             if !matched {
                 self.valid = false;
-                return;
+                return Ok(());
             }
             let extra = AddrSpace::byte_to_address(extra as u64, word_size);
             self.offset = self.offset.wrapping_sub(extra) & self.ptrmask;
@@ -502,12 +502,12 @@ impl<'a> AddTreeState<'a> {
         } else if self.base_type.get_metatype() == type_metatype::TYPE_STRUCT {
             let soffset = sign_extend(self.offset as i64, self.ptrsize * 8 - 1);
             let offsetbytes = AddrSpace::address_to_byte_int(soffset, word_size);
-            let (matched, mut extra) = self.has_matching_sub_type(offsetbytes, self.biggest_non_mult_coeff);
+            let (matched, mut extra) = self.has_matching_sub_type(offsetbytes, self.biggest_non_mult_coeff)?;
             if !matched {
                 // Compare as bytes, not address units.
                 if offsetbytes < 0 || offsetbytes >= self.base_type.get_size() as int8 {
                     self.valid = false;
-                    return;
+                    return Ok(());
                 }
                 extra = 0; // No field, pretend there is something there
             }
@@ -519,7 +519,7 @@ impl<'a> AddTreeState<'a> {
                     // Offset falls within basic ptrto.
                     if rel.evaluate_thru_parent(0) != Some(true) {
                         self.valid = false;
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -537,27 +537,26 @@ impl<'a> AddTreeState<'a> {
             self.offset = self.offset.wrapping_sub(ptr_off) & self.ptrmask;
             self.correct = self.correct.wrapping_sub(ptr_off) & self.ptrmask;
         }
+        Ok(())
     }
 
     /// C++ `AddTreeState::assignPropagatedType(op)`.  Propagate the input pointer's
     /// data-type to the output of the newly created PTRADD/PTRSUB.
-    fn assign_propagated_type(&mut self, op: OpId) {
+    fn assign_propagated_type(&mut self, op: OpId) -> KunaResult<()> {
         let vn = self.op_in(op, 0);
-        let in_type = self.data.vbank().get(vn).map(|v| v.get_type_read_facing(op).clone());
+        let in_type = self.data.vn_type_read_facing(vn, op)?;
         let out = match self.data.obank().get(op).and_then(|o| o.get_out()) {
             Some(o) => o,
-            None => return,
+            None => return Ok(()),
         };
-        if let Some(in_type) = in_type {
-            let new_type = crate::coreaction_infertypes::propagate_type_pub(
-                self.data, in_type, op, vn, out, 0, -1,
-            );
-            if let Some(nt) = new_type {
-                if let Some(v) = self.data.vbank_mut().get_mut(out) {
-                    v.update_type(nt);
-                }
-            }
+        let new_type = crate::coreaction_infertypes::propagate_type_pub(
+            self.data, in_type, op, vn, out, 0, -1,
+        )?;
+        if let Some(nt) = new_type {
+            self.data.vbank_mut().get_mut(out).expect("assign_propagated_type: stale out")
+                .update_type(nt);
         }
+        Ok(())
     }
 
     /// C++ `AddTreeState::buildMultiples()`.  Build the sub-expression summing to a
@@ -630,54 +629,49 @@ impl<'a> AddTreeState<'a> {
     }
 
     /// C++ `AddTreeState::buildDegenerate()`.
-    fn build_degenerate(&mut self) -> bool {
+    fn build_degenerate(&mut self) -> KunaResult<bool> {
         let word_size = self.ct.get_word_size().unwrap_or(1) as int4;
         if self.base_type.get_align_size() < word_size {
-            return false; // Probably padding; don't transform
+            return Ok(false); // Probably padding; don't transform
         }
         let out = match self.data.obank().get(self.base_op).and_then(|o| o.get_out()) {
             Some(o) => o,
-            None => return false,
+            None => return Ok(false),
         };
-        let out_meta = self
-            .data
-            .vbank()
-            .get(out)
-            .map(|v| v.get_type_def_facing().get_metatype())
-            .unwrap_or(type_metatype::TYPE_UNKNOWN);
+        let out_meta = self.data.vn_type_def_facing(out)?.get_metatype();
         if out_meta != type_metatype::TYPE_PTR {
-            return false;
+            return Ok(false);
         }
         let slot = self.data.obank().get(self.base_op).map(|o| o.get_slot(self.ptr)).unwrap_or(0);
         let other = self.op_in(self.base_op, 1 - slot);
         let one = self.data.new_constant(self.ct.get_size(), 1);
         let newparams = [self.ptr, other, one];
-        let _ = self.data.op_set_all_input(self.base_op, &newparams);
+        self.data.op_set_all_input(self.base_op, &newparams)?;
         self.data.op_set_opcode_code(self.base_op, OpCode::CPUI_PTRADD);
-        true
+        Ok(true)
     }
 
     /// C++ `AddTreeState::apply()`.
-    pub fn apply(&mut self) -> bool {
+    pub fn apply(&mut self) -> KunaResult<bool> {
         if self.is_degenerate {
             return self.build_degenerate();
         }
         self.span_add_tree(self.base_op, 1);
         if !self.valid {
-            return false;
+            return Ok(false);
         }
         if self.distribute_op.is_some() && !self.is_distribute_used {
             self.clear();
             self.prevent_distribution = true;
             self.span_add_tree(self.base_op, 1);
         }
-        self.calc_subtype();
+        self.calc_subtype()?;
         if !self.valid {
-            return false;
+            return Ok(false);
         }
         while self.valid && self.distribute_op.is_some() {
             let dop = self.distribute_op.expect("apply: distribute_op");
-            if !self.data.distribute_int_mult_add(dop).unwrap_or(false) {
+            if !self.data.distribute_int_mult_add(dop)? {
                 self.valid = false;
                 break;
             }
@@ -692,22 +686,22 @@ impl<'a> AddTreeState<'a> {
                 self.prevent_distribution = true;
                 self.span_add_tree(self.base_op, 1);
             }
-            self.calc_subtype();
+            self.calc_subtype()?;
         }
         if !self.valid {
             // STUB(print-markup): warningHeader emits a comment ("Problems
             // distributing in pointer arithmetic at <addr>"); the comment surface
             // is not part of the transform.  Only reachable on a distribution
             // failure (not exercised by the pointer/array/struct corpus).
-            return true;
+            return Ok(true);
         }
-        self.build_tree();
-        true
+        self.build_tree()?;
+        Ok(true)
     }
 
     /// C++ `AddTreeState::buildTree()`.  Rewrite the ADD tree as a pointer
     /// expression, preserving the original output Varnode.
-    fn build_tree(&mut self) {
+    fn build_tree(&mut self) -> KunaResult<()> {
         let mult_node = self.build_multiples();
         let extra_node = self.build_extra();
         let mut newop: Option<OpId> = None;
@@ -729,13 +723,13 @@ impl<'a> AddTreeState<'a> {
             if ptr_ty.needs_resolution() {
                 let ptrto_size = ptr_ty.get_ptr_to().map(|p| p.get_size());
                 if ptrto_size == Some(self.base_type.get_size()) {
-                    let _ = self.data.force_facing_type(ptr_ty, -1, op, 0);
+                    self.data.force_facing_type(ptr_ty, -1, op, 0)?;
                 } else {
                     self.data.inherit_union_field(&ptr_ty, op, 0, self.base_op, self.base_slot);
                 }
             }
             if self.data.is_type_recovery_exceeded() {
-                self.assign_propagated_type(op);
+                self.assign_propagated_type(op)?;
             }
             newop = Some(op);
             self.data.obank().get(op).and_then(|o| o.get_out()).expect("build_tree: ptradd out")
@@ -760,7 +754,7 @@ impl<'a> AddTreeState<'a> {
                 self.data.inherit_union_field(&mult_ty, op, 0, self.base_op, self.base_slot);
             }
             if self.data.is_type_recovery_exceeded() {
-                self.assign_propagated_type(op);
+                self.assign_propagated_type(op)?;
             }
             if self.size != 0 {
                 self.data.op_set_stop_type_propagation(op);
@@ -780,12 +774,13 @@ impl<'a> AddTreeState<'a> {
             None => {
                 // STUB(print-markup): data.warning("ptrarith problems", addr); comment
                 // emission only — never reached when a multiple/subtype/extra exists.
-                return;
+                return Ok(());
             }
         };
         let base_out = self.data.obank().get(self.base_op).and_then(|o| o.get_out())
             .expect("build_tree: base_op has output");
-        let _ = self.data.op_set_output(newop, base_out);
-        self.data.op_destroy(self.base_op);
+        self.data.op_set_output(newop, base_out)?;
+        self.data.op_destroy(self.base_op)?;
+        Ok(())
     }
 }

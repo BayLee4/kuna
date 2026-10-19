@@ -687,24 +687,21 @@ fn sites(data: &Funcdata, abi: &SyscallAbi) -> Vec<Site> {
 }
 
 /// Retarget one site's `CALLIND` onto a named syscall call spec.
-fn rewrite(data: &mut Funcdata, site: &Site, abi: &SyscallAbi) -> bool {
+fn rewrite(data: &mut Funcdata, site: &Site, abi: &SyscallAbi) -> kuna_base::error::KunaResult<bool> {
     use crate::dtype::type_metatype;
     use crate::fspec::ParameterPieces;
 
-    let Some(idx) = data.get_call_specs_index(site.callind) else { return false };
+    let Some(idx) = data.get_call_specs_index(site.callind) else { return Ok(false) };
     if data.get_call_specs(idx).has_funcdata() {
-        return false;
+        return Ok(false);
     }
-    let Some(types) = data.get_arch().types() else { return false };
-    let (Ok(void_ty), Ok(word_ty)) =
-        (types.get_type_void(), types.get_base(4, type_metatype::TYPE_UNKNOWN))
-    else {
-        return false;
-    };
+    let Some(types) = data.get_arch().types() else { return Ok(false) };
+    let void_ty = types.get_type_void()?;
+    let word_ty = types.get_base(4, type_metatype::TYPE_UNKNOWN)?;
     let Some(model) =
         data.get_arch().eval_fp_called().or_else(|| data.get_arch().default_fp()).cloned()
     else {
-        return false;
+        return Ok(false);
     };
     let entry = data.get_call_specs(idx).get_entry_address().clone();
     let name = format!("{SYSCALL_NAME_PREFIX}{}", site.name);
@@ -722,20 +719,16 @@ fn rewrite(data: &mut Funcdata, site: &Site, abi: &SyscallAbi) -> bool {
     let out = ParameterPieces { addr: abi.num.clone(), type_: Some(word_ty), flags: 0 };
     fc.proto_mut().set_output(&out);
     fc.proto_mut().set_output_lock(true);
-    if fc.set_funcdata(entry, &name).is_err() {
-        return false;
-    }
+    fc.set_funcdata(entry, &name)?;
 
     data.op_set_opcode_code(site.callind, OpCode::CPUI_CALL);
     let handle = crate::flow::next_fspec_handle();
     let style = data.get_arch().kuna_name_style();
     data.get_call_specs(idx).register_in_fspec_space(handle, style);
     let fspecvn = data.new_varnode_call_specs(handle);
-    if data.op_set_input(site.callind, fspecvn, 0).is_err() {
-        return false;
-    }
-    data.op_destroy(site.callother);
-    true
+    data.op_set_input(site.callind, fspecvn, 0)?;
+    data.op_destroy(site.callother)?;
+    Ok(true)
 }
 
 /// (kuna) `ActionLinuxSyscall` — name Linux i386-ABI `int 0x80` sites, including
@@ -770,26 +763,26 @@ impl Action for ActionLinuxSyscall {
         }
         Some(Box::new(ActionLinuxSyscall { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !data.get_arch().linux_syscall || data.num_calls() == 0 {
-            return 0;
+            return Ok(0);
         }
-        let Some(abi) = resolve_abi(data) else { return 0 };
+        let Some(abi) = resolve_abi(data) else { return Ok(0) };
         let found = sites(data, &abi);
         if found.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let mut changed = 0;
         for site in &found {
-            if rewrite(data, site, &abi) {
+            if rewrite(data, site, &abi)? {
                 changed += 1;
             }
         }
-        if changed != 0 {
+        Ok(if changed != 0 {
             1
         } else {
             0
-        }
+        })
     }
 }
 

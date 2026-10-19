@@ -40,6 +40,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::{calc_mask, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, uintb};
 
@@ -186,9 +187,9 @@ impl StackSolver {
 
     /// C++ `StackSolver::build` (`coreaction.cc:162`): collect spacebase
     /// references as variables and derive the equations from their defs.
-    fn build(&mut self, data: &Funcdata, id: &Rc<AddrSpace>, spcbase: int4) -> Result<(), ()> {
-        let point = id.get_spacebase(spcbase).map_err(|_| ())?;
-        let point_space = point.space.clone().ok_or(())?;
+    fn build(&mut self, data: &Funcdata, id: &Rc<AddrSpace>, spcbase: int4) -> KunaResult<bool> {
+        let point = id.get_spacebase(spcbase)?;
+        let Some(point_space) = point.space.clone() else { return Ok(false) };
         let spacebase = Address::new(point_space, point.offset);
         let point_size = point.size as int4;
 
@@ -204,11 +205,11 @@ impl StackSolver {
         }
         self.missedvariables = 0;
         if self.vnlist.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if !data.vbank().get(self.vnlist[0]).map(|v| v.is_input()).unwrap_or(false) {
             // C++ throw LowlevelError("Input value of stackpointer is not used")
-            return Err(());
+            return Ok(false);
         }
 
         for i in 1..self.vnlist.len() {
@@ -339,7 +340,7 @@ impl StackSolver {
                             } else if data.get_arch().callee_pop_slot {
                                 let (guess, settles) = crate::kuna_calleepopslot::guess_extra_pop(
                                     data, &spacebase, &entry, sp, out, &self.settled,
-                                );
+                                )?;
                                 rhs = guess;
                                 if settles {
                                     self.settled.insert(out, guess);
@@ -347,7 +348,7 @@ impl StackSolver {
                             } else {
                                 rhs = crate::kuna_calleepop::guess_extra_pop(
                                     data, &spacebase, &entry, sp, out,
-                                );
+                                )?;
                             }
                         }
                     }
@@ -401,7 +402,7 @@ impl StackSolver {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     fn is_const(data: &Funcdata, vn: Option<VarnodeId>) -> bool {
@@ -701,7 +702,7 @@ pub(crate) fn analyze_extra_pop(
     data: &mut Funcdata,
     stackspace: &Rc<AddrSpace>,
     spcbase: int4,
-) -> int4 {
+) -> KunaResult<int4> {
     use crate::fspec::EXTRAPOP_UNKNOWN;
 
     // C++ `ActionStackPtrFlow::analyzeExtraPop` (coreaction.cc:279-282).
@@ -715,20 +716,18 @@ pub(crate) fn analyze_extra_pop(
         .map(|m| m.get_extra_pop());
     if let Some(ep) = myfp_extrapop {
         if ep != EXTRAPOP_UNKNOWN {
-            return 0;
+            return Ok(0);
         }
     }
 
     let mut solver = StackSolver::new();
-    // C++ wraps build() in try/catch and warns (`warningHeader`) on a malformed
-    // stack frame; an Err here mirrors that LowlevelError -> early return.  The
-    // cosmetic warning text is routed through the action context elsewhere and is
-    // not load-bearing for the analysis result, so it is omitted here.
-    if solver.build(data, stackspace, spcbase).is_err() {
-        return 0;
+    // An unusable frame leaves the solve unchanged; acquisition failures must
+    // instead reach the action root.
+    if !solver.build(data, stackspace, spcbase)? {
+        return Ok(0);
     }
     if solver.vnlist.is_empty() {
-        return 0;
+        return Ok(0);
     }
     solver.solve();
 
@@ -787,5 +786,5 @@ pub(crate) fn analyze_extra_pop(
             changed += 1;
         }
     }
-    changed
+    Ok(changed)
 }

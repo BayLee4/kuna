@@ -1661,6 +1661,15 @@ impl VarnodeBank {
         self.arena.get_mut(id)
     }
 
+    pub(crate) fn retire_local_symbol(&mut self, symbol: crate::database::SymbolId) {
+        for (_, value) in self.arena.iter_mut() {
+            if value.kuna_symbol_entry == Some(symbol) {
+                value.kuna_symbol_entry = None;
+                value.flags &= !varnode_flags::mapped;
+            }
+        }
+    }
+
     /// Create a \e free Varnode in the location tree (C++ `create`).
     pub fn create(&mut self, s: int4, m: Address, ct: Rc<Datatype>) -> VarnodeId {
         let lk = LocKey::new(

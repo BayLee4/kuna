@@ -36,14 +36,12 @@
 //! providers issue the getPcode/getBytes/… queries nested in the still-open
 //! decompileAt response), and emits the `<doc>` response — `Funcdata::encode`'s
 //! `<function>`/`<ast>` plus the Clang-markup `<function>` — the first real C
-//! from kuna in ghidra mode.  A decompile failure degrades to the C++
-//! `!fd->isProcComplete()` incomplete-function shape (empty 14/15 payload +
-//! warning) so it never desyncs the GUI.  `flushNative` has no engine
-//! caches to clear yet.  `structureGraph` and the four signature commands are
-//! deliberately NOT registered: the unknown-command response
-//! `{6}{16}"Bad command: <name>"{17}{7}` (ghidra_process.cc:476-484) is the
-//! exact graceful-degradation shape the Java side expects
-//! (DecompInterface.java:341-347).
+//! from kuna in ghidra mode. Acquisition, action and emission errors return
+//! through the command error boundary before any result payload is opened;
+//! recoverable errors use the native-message channel, while terminal transport
+//! errors stop the connection. Native graph
+//! and signature commands share the canonical engine codecs; body-derived
+//! evidence is detached at host flush and eligible configuration changes.
 
 use std::cell::RefCell;
 use std::io::{Read, Write};
@@ -57,6 +55,7 @@ use kuna_base::space::AddrSpaceManager;
 use kuna_decomp::architecture::Architecture;
 use kuna_decomp::funcdata::Funcdata;
 use kuna_decomp::options::OptionDatabase;
+use kuna_decomp::resulttypes::{ResultTypeTable, RESULT_VERSION};
 
 use crate::client::GhidraClient;
 use crate::provider::GhidraRemoteFetch;
@@ -95,12 +94,8 @@ struct Session {
     send_c_code: bool,
     /// setAction "parammeasures"/"noparammeasures" (default false).
     send_param_measures: bool,
-    /// setAction "jumpload"/"nojumpload" (C++ `FlowInfo::record_jumploads`
-    /// in `ghidra->flowoptions`, default off).
-    record_jumploads: bool,
-    /// The current root action (C++ `allacts.setCurrent`; default
-    /// "decompile").
-    current_action: String,
+    /// Explicit enhanced result-definition protocol, zero for stock peers.
+    result_version: u32,
 }
 
 impl Session {
@@ -114,8 +109,7 @@ impl Session {
             send_syntax_tree: true,
             send_c_code: true,
             send_param_measures: false,
-            record_jumploads: false,
-            current_action: "decompile".to_string(),
+            result_version: 0,
         }
     }
 
@@ -132,8 +126,6 @@ impl Session {
     }
 }
 
-/// Which registered command is executing (the C++ `commandmap` keys,
-/// ghidra_process.cc:496-506, minus structureGraph — see module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandKind {
     RegisterProgram,
@@ -142,6 +134,12 @@ enum CommandKind {
     DecompileAt,
     SetAction,
     SetOptions,
+    StructureGraph,
+    GenerateSignatures,
+    DebugSignatures,
+    GetSignatureSettings,
+    SetSignatureSettings,
+    PrepareSelectedRoots,
 }
 
 /// Per-command scratch state (the C++ `GhidraCommand` subclass members).
@@ -167,8 +165,6 @@ struct CommandState {
     /// decompileAt param: the decoded entry address (None if the engine is
     /// unavailable), driving the [`decompile_func`] build.
     addr: Option<Address>,
-    /// decompileAt param: the rendered form of `addr` for warning messages.
-    addr_text: Option<String>,
     /// setOptions param: the raw packed `<optionslist>` (applied in rawAction).
     optionslist: Option<Vec<u8>>,
 }
@@ -186,7 +182,6 @@ impl CommandState {
             actionstring: Vec::new(),
             printstring: Vec::new(),
             addr: None,
-            addr_text: None,
             optionslist: None,
         }
     }
@@ -302,12 +297,12 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             "decompileAt" => CommandKind::DecompileAt,
             "setAction" => CommandKind::SetAction,
             "setOptions" => CommandKind::SetOptions,
-            // structureGraph, generateSignatures, debugSignatures,
-            // getSignatureSettings, setSignatureSettings are deliberately
-            // unregistered in phase 1: this response — with NO payload
-            // burst and NO command-close read — is the exact
-            // graceful-degradation contract the Java side expects
-            // (ghidra_process.cc:476-484; DecompInterface.java:341-347).
+            "structureGraph" => CommandKind::StructureGraph,
+            "generateSignatures" => CommandKind::GenerateSignatures,
+            "debugSignatures" => CommandKind::DebugSignatures,
+            "getSignatureSettings" => CommandKind::GetSignatureSettings,
+            "setSignatureSettings" => CommandKind::SetSignatureSettings,
+            "prepareSelectedRoots" => CommandKind::PrepareSelectedRoots,
             _ => {
                 write_burst(self.client.borrow_mut().sout_mut(), BURST_RESPONSE_OPEN)?;
                 write_burst(self.client.borrow_mut().sout_mut(), BURST_MESSAGE_OPEN)?;
@@ -343,6 +338,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             Ok(()) => {}
             // Pipe/IO failures propagate to the process loop (C++ exit(1))
             Err(e @ (WireError::PipeClosed | WireError::Io(_))) => return Err(e),
+            Err(WireError::Kuna(e @ KunaError::Transport { .. })) => return Err(e.into()),
             // catch(JavaError): pass the exception, abort sending results
             Err(WireError::Kuna(KunaError::Java { type_name, explain })) => {
                 pass_java_exception(self.client.borrow_mut().sout_mut(), &type_name, &explain)?;
@@ -442,14 +438,14 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 cmd.slot = Some(slot);
                 Ok(())
             }
-            CommandKind::FlushNative => {
+            CommandKind::FlushNative | CommandKind::GetSignatureSettings => {
                 let slot = self.bind_session("Expecting arch id start", "Expecting arch id end")?;
                 cmd.slot = Some(slot);
                 Ok(())
             }
             // DecompileAt::loadParameters (ghidra_process.cc:284-291): base,
             // then the packed <addr> ingested and decoded
-            CommandKind::DecompileAt => {
+            CommandKind::DecompileAt | CommandKind::GenerateSignatures | CommandKind::DebugSignatures => {
                 let slot = self.bind_session("Expecting arch id start", "Expecting arch id end")?;
                 cmd.slot = Some(slot);
                 let raw = read_string_stream_optional(self.client.borrow_mut().sin_mut())?;
@@ -459,7 +455,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         let mut decoder = PackedDecode::new(manager);
                         decoder.ingest_stream(&bytes).map_err(WireError::Kuna)?;
                         let addr = Address::decode(&mut decoder).map_err(WireError::Kuna)?;
-                        cmd.addr_text = Some(render_address(&addr));
                         cmd.addr = Some(addr);
                     }
                     (None, Some(_bytes)) => {
@@ -467,7 +462,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         // but cannot be decoded (the session already carries the
                         // construction-failure warning on its 16/17 frame).
                         cmd.addr = None;
-                        cmd.addr_text = None;
                     }
                     (_, None) => {
                         // Missing payload: C++ Address::decode on the empty
@@ -489,7 +483,8 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             }
             // SetOptions::loadParameters (ghidra_process.cc:418-426): base,
             // then the packed <optionslist> string stream
-            CommandKind::SetOptions => {
+            CommandKind::SetOptions | CommandKind::StructureGraph | CommandKind::SetSignatureSettings
+                | CommandKind::PrepareSelectedRoots => {
                 let slot = self.bind_session("Expecting arch id start", "Expecting arch id end")?;
                 cmd.slot = Some(slot);
                 cmd.optionslist =
@@ -509,6 +504,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             CommandKind::RegisterProgram => {
                 let [pspec, cspec, tspec, corespec] =
                     cmd.specs.take().expect("registerProgram params");
+                let result_version = negotiated_result_version(&corespec)?;
                 let mut open: Option<usize> = None;
                 for (i, s) in self.archlist.iter().enumerate() {
                     if s.is_none() {
@@ -527,6 +523,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 };
                 cmd.slot = Some(slot);
                 cmd.archid = slot as i32;
+                self.archlist[slot].as_mut().expect("bound session").result_version = result_version;
                 // Build the live engine over the four wire specs.  This issues
                 // the init-time queries (the getUserOpName probe loop, C++
                 // `userops.initialize`) on the shared client — nested inside the
@@ -537,7 +534,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 // registration failure (DecompInterface.java:291-294; the C++
                 // `RegisterProgram::rawAction` assigns `ghidra` before `init` for
                 // exactly this reason, ghidra_process.cc:176-201).
-                match self.build_architecture(cmd.archid, &pspec, &cspec, &tspec, &corespec) {
+                match self.build_architecture(cmd.archid, &pspec, &cspec, &tspec, &corespec, result_version) {
                     Ok(arch) => {
                         self.archlist[slot]
                             .as_mut()
@@ -545,6 +542,9 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                             .architecture = Some(arch);
                     }
                     Err(e) => {
+                        if matches!(e, KunaError::Transport { .. }) {
+                            return Err(e.into());
+                        }
                         self.print_message(
                             cmd.slot,
                             &format!(
@@ -594,27 +594,18 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             // command response), then emit the `<doc>` between the 14/15 burst —
             // `fd.encode` (the `<function>`/`<ast>` syntax tree) plus, when C is
             // requested for the `decompile` action, the Clang-markup `<function>`
-            // spliced into the SAME `<doc>` stream.  Any decompile failure
-            // degrades to the C++ `!fd->isProcComplete()` incomplete-function
-            // shape (empty 14/15 payload + a 16/17 warning) so a failure never
-            // desyncs the GUI.
-            CommandKind::DecompileAt => {
+            // spliced into the SAME `<doc>` stream. Exceptions propagate before
+            // the result stream opens, preserving their native diagnostic.
+            CommandKind::DecompileAt | CommandKind::GenerateSignatures | CommandKind::DebugSignatures => {
                 let slot = cmd.slot.expect("bound session");
-                // The entry address decoded in loadParameters.  `None` ⇒ engine
-                // construction failed (no manager) — degrade to the
-                // incomplete-function shape (the construction-failure warning is
-                // already on the session's 16/17 frame).
+                // A failed registration has no manager. Return through the
+                // ordinary command error boundary without opening a result.
                 let addr = match cmd.addr.clone() {
                     Some(a) => a,
                     None => {
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_OPEN)?;
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_CLOSE)?;
-                        self.print_message(
-                            cmd.slot,
-                            "kuna ghidra-mode: engine unavailable; \
-                             function at (address not decoded) not decompiled",
-                        );
-                        return Ok(());
+                        return Err(KunaError::lowlevel(
+                            "decompiler engine unavailable; function address could not be decoded",
+                        ).into());
                     }
                 };
 
@@ -631,7 +622,10 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                     .as_ref()
                     .and_then(|s| s.architecture.as_ref())
                     .and_then(|a| a.remote_scope.clone());
-                let facts = remote.as_ref().and_then(|r| r.function_at(&addr));
+                let facts = match &remote {
+                    Some(r) => r.function_at(&addr).map_err(WireError::from)?,
+                    None => None,
+                };
                 // The RAW `Function.getName()` is the Funcdata identity (the
                 // HighFunction.decode name echo compares against it); the
                 // label, when the host sent one (TemplateSimplifier), is only
@@ -639,18 +633,10 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 let (
                     name,
                     display_name,
-                    pending_pieces,
-                    host_locals,
-                    host_model,
-                    host_param_storage,
                 ) = match facts {
                     Some(f) => (
                         f.name,
                         f.display_name,
-                        f.pieces,
-                        f.locals,
-                        f.model,
-                        f.param_storage,
                     ),
                     None => {
                         let label = self.client.borrow_mut().get_code_label(&addr);
@@ -658,9 +644,10 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                             Ok(l) if !l.is_empty() => {
                                 String::from_utf8_lossy(&l).into_owned()
                             }
+                            Err(e) => return Err(e),
                             _ => format!("FUN_{:08x}", addr.get_offset()),
                         };
-                        (n.clone(), n, None, Vec::new(), None, Vec::new())
+                        (n.clone(), n)
                     }
                 };
 
@@ -687,7 +674,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         if let Some(remote) = &remote {
                             let filter = arch.printer_comment_filter();
                             let sink = &mut arch.commentdb;
-                            let _ = remote.fill_comments(&addr, filter, sink);
+                            remote.fill_comments(&addr, filter, sink).map_err(WireError::from)?;
                         }
                     }
                 }
@@ -699,7 +686,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 // Register Value') reach ActionConstbase.  Cached in the
                 // provider until flushNative.
                 if let Some(remote) = &remote {
-                    if let Some(wire_set) = remote.tracked_at(&addr) {
+                    if let Some(wire_set) = remote.tracked_at(&addr).map_err(WireError::from)? {
                         // Write when the wire reports values OR a previous
                         // epoch merged here (the revert case: the host STOPPED
                         // reporting a value, so the pristine layer must be
@@ -744,13 +731,13 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 }
 
                 // Snapshot the render flags before taking `&mut Architecture`.
-                let (send_syntax_tree, send_c_code, send_param_measures, current_action) = {
+                let (send_syntax_tree, send_c_code, send_param_measures, result_version) = {
                     let session = self.archlist[slot].as_ref().expect("bound session");
                     (
                         session.send_syntax_tree,
                         session.send_c_code,
                         session.send_param_measures,
-                        session.current_action.clone(),
+                        session.result_version,
                     )
                 };
 
@@ -767,134 +754,42 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         .architecture
                         .as_mut()
                         .expect("addr decoded ⇒ engine present");
-                    // Phase 4: the session's jumpload toggle reaches the
-                    // flow-following engine as the upstream flowoptions bit
-                    // (SetAction "jumpload" → `ghidra->flowoptions |=
-                    // FlowInfo::record_jumploads`, ghidra_process.cc:398-401).
-                    // Applied per-decompile so the setOptions reset-then-apply
-                    // baseline restore can never strand the toggle.
-                    if session.record_jumploads {
-                        arch.flowoptions |= kuna_decomp::flow::flow_flags::record_jumploads;
-                    } else {
-                        arch.flowoptions &= !kuna_decomp::flow::flow_flags::record_jumploads;
+                    let saved_root = arch.allacts.get_current_name().to_string();
+                    let signature = matches!(cmd.kind, CommandKind::GenerateSignatures | CommandKind::DebugSignatures);
+                    if signature {
+                        arch.allacts.set_current("normalize").map_err(WireError::from)?;
                     }
-                    // Phase 3: a LOCKED host signature (typelocked params /
-                    // locked-void input) seeds the fresh Funcdata's prototype —
-                    // the C++ queryFunction handing DecompileAt the decoded
-                    // `<prototype>`+`<localdb>`.  An unlocked signature stays
-                    // None and kuna recovers parameters itself (the CLI-path
-                    // behavior for undeclared functions).
-                    //
-                    // Phase 4: the host-committed LOCALS from the function's
-                    // `<localdb>` seed the fresh local scope through the same
-                    // per-function seeding path the console symbols use — the
-                    // upstream `Funcdata::decode` localmap restore.  This is
-                    // what makes a GUI rename/retype (a DB write followed by
-                    // an event-driven re-decompile) SURVIVE the re-decompile.
-                    // An entry with a first-use address seeds usepoint-scoped
-                    // (register locals); an empty uselimit seeds addr-tied
-                    // (stack locals).  A namelocked-but-NOT-typelocked local
-                    // (a GUI rename of an untyped variable) is NOT a symbol
-                    // seed — such symbols never survive restructure's
-                    // clearUnlockedCategory(-1) — it stages as a NAME
-                    // RECOMMENDATION, exactly the C++ ScopeLocal::nameRecommend
-                    // identity `recoverNameRecommendationsForSymbols` applies.
-                    let mut seed_mapped: Vec<(
-                        String,
-                        std::rc::Rc<kuna_decomp::dtype::Datatype>,
-                        Address,
-                        u32,
-                    )> = Vec::new();
-                    let mut seed_usepoint: Vec<(
-                        String,
-                        std::rc::Rc<kuna_decomp::dtype::Datatype>,
-                        Address,
-                        u32,
-                        Address,
-                        bool,
-                    )> = Vec::new();
-                    let mut name_recs: Vec<(String, Address, Address, i32)> = Vec::new();
-                    let mut dyn_recs: Vec<(String, Address, u64)> = Vec::new();
-                    let mut seed_dynamic: Vec<kuna_decomp::database::DynamicSymbolSpec> =
-                        Vec::new();
-                    for l in &host_locals {
-                        let typelocked = (l.flags
-                            & kuna_decomp::varnode::varnode_flags::typelock)
-                            != 0;
-                        // A DYNAMIC (hash) local addresses a VALUE, not a
-                        // storage location — the class Java writes for every
-                        // `requiresDynamicStorage` variable (unique-space
-                        // representatives, `splitOutMergeGroup` products).  It
-                        // travels through the dynamic channels: a rename as a
-                        // `dynRecommend`, a retype as a dynamic Symbol seed.
-                        if l.hash != 0 {
-                            if typelocked {
-                                seed_dynamic.push(kuna_decomp::database::DynamicSymbolSpec {
-                                    name: l.name.clone(),
-                                    dtype: std::rc::Rc::clone(&l.dtype),
-                                    flags: kuna_decomp::varnode::varnode_flags::namelock
-                                        | kuna_decomp::varnode::varnode_flags::typelock,
-                                    addr: l.addr.clone(),
-                                    hash: l.hash,
-                                    category: -1,
-                                    dispflags: 0,
-                                    equate_value: None,
-                                    union_facet: None,
-                                });
-                            } else {
-                                dyn_recs.push((l.name.clone(), l.addr.clone(), l.hash));
-                            }
-                            continue;
-                        }
-                        if !typelocked {
-                            name_recs.push((
-                                l.name.clone(),
-                                l.addr.clone(),
-                                l.usepoint.clone(),
-                                l.dtype.get_size(),
-                            ));
-                        } else if l.usepoint.is_invalid() {
-                            seed_mapped.push((
-                                l.name.clone(),
-                                std::rc::Rc::clone(&l.dtype),
-                                l.addr.clone(),
-                                l.flags,
-                            ));
-                        } else {
-                            seed_usepoint.push((
-                                l.name.clone(),
-                                std::rc::Rc::clone(&l.dtype),
-                                l.addr.clone(),
-                                l.flags,
-                                l.usepoint.clone(),
-                                false,
-                            ));
-                        }
+                    let requested_callable = arch.call_target_type;
+                    if arch.call_target_publication == kuna_decomp::kuna_calltargettype::CallTargetPublication::PerCallOnly
+                        && (!send_c_code || arch.print().options.nocasts
+                            || arch.print().out_lang() != kuna_decomp::kuna_lang::OutLang::C
+                            || arch.allacts.get_current_name() != "decompile")
+                    {
+                        arch.call_target_type = false;
                     }
-                    arch.kuna_pending_name_recs = name_recs;
-                    arch.kuna_pending_dyn_recs = dyn_recs;
-                    // The host's declared convention: parameter storage must be
-                    // assigned under the SAME model the database committed, or
-                    // Java's checkFullCommit rewrites the user's signature on
-                    // the first rename.
-                    arch.kuna_pending_proto_model = host_model
-                        .as_deref()
-                        .and_then(|m| arch.get_model(m).cloned());
-                    match kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
+                    let driven = kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
                         arch,
                         &name,
                         addr.clone(),
                         0,
-                        &seed_mapped,
-                        &seed_usepoint,
-                        &seed_dynamic,
-                        pending_pieces.as_ref(),
+                        &[],
+                        &[],
+                        &[],
+                        None,
                         &[],
                         &[],
                         // The host's EXACT committed parameter storage (empty
                         // for an unlocked signature — kuna recovers those).
-                        &host_param_storage,
-                    ) {
+                        &[],
+                    );
+                    // Restore the user's option before either Result path or
+                    // any fallible root restoration. The Funcdata context
+                    // already owns the request's projection.
+                    arch.call_target_type = requested_callable;
+                    if signature {
+                        arch.allacts.set_current(&saved_root).map_err(WireError::from)?;
+                    }
+                    match driven {
                         Ok(mut fd) => {
                             // The printed signature/tokens use the display
                             // form; fd.encode's ATTRIB_NAME stays the RAW name
@@ -902,6 +797,17 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                             if display_name != name {
                                 fd.set_display_name(&display_name);
                             }
+                            if signature {
+                                let mut bytes = Vec::new();
+                                let mut encoder = PackedEncode::new(&mut bytes);
+                                if cmd.kind == CommandKind::DebugSignatures {
+                                    kuna_decomp::signature::debug_signature(&fd, &mut encoder)?;
+                                } else {
+                                    kuna_decomp::signature::simple_signature(&fd, &mut encoder)?;
+                                }
+                                Ok(bytes)
+                            } else {
+                            let current_action = arch.allacts.get_current_name().to_string();
                             build_decompile_at_doc(
                                 arch,
                                 &mut fd,
@@ -909,54 +815,27 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                                 send_c_code,
                                 send_param_measures,
                                 &current_action,
+                                result_version,
                             )
+                            }
                         }
                         Err(e) => Err(e),
                     }
                 };
 
-                // Surface (once) any provider wire/decoder failures the lazy
-                // queries swallowed into negative caches — each line begins
-                // "Warning:" so DecompInterface.isErrorMessage stays non-fatal.
-                if let Some(remote) = &remote {
-                    for w in remote.drain_warnings() {
-                        self.print_message(cmd.slot, &w);
-                    }
-                }
-
-                match doc {
-                    // C++ `isProcComplete` branch: the `<doc>` inside the 14/15
-                    // burst.
-                    Ok(bytes) => {
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_OPEN)?;
-                        self.client
-                            .borrow_mut()
-                            .sout_mut()
-                            .write_all(&bytes)
-                            .map_err(WireError::Io)?;
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_CLOSE)?;
-                    }
-                    // A decompile failure (a decode error, an un-ported stub that
-                    // `decompile_func` caught, or a Java exception a provider
-                    // surfaced) degrades to the SAME clean incomplete-function
-                    // shape — empty 14/15 payload + a 16/17 warning naming the
-                    // address.  DELIBERATE DIVERGENCE from the C++
-                    // passJavaException abort: a failure never desyncs the GUI
-                    // (the phase-1 stub's clean-error contract).
-                    Err(e) => {
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_OPEN)?;
-                        write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_CLOSE)?;
-                        let at = cmd.addr_text.clone().unwrap_or_else(|| "?".to_string());
-                        self.print_message(
-                            cmd.slot,
-                            &format!(
-                                "kuna ghidra-mode: could not decompile the function at {at} \
-                                 ({}); returning an incomplete function",
-                                e.explain()
-                            ),
-                        );
-                    }
-                }
+                // C++ performs the action before writing burst 14. A thrown
+                // error therefore sends only the command's diagnostic result,
+                // not an empty packed document. Opening and closing an empty
+                // PackedDecode buffer makes Java attempt <doc> decoding and
+                // overwrite the real diagnostic with a decoding error.
+                let bytes = doc.map_err(WireError::from)?;
+                write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_OPEN)?;
+                self.client
+                    .borrow_mut()
+                    .sout_mut()
+                    .write_all(&bytes)
+                    .map_err(WireError::Io)?;
+                write_burst(self.client.borrow_mut().sout_mut(), BURST_STRING_CLOSE)?;
                 Ok(())
             }
             // SetAction::rawAction (ghidra_process.cc:378-406)
@@ -966,23 +845,9 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 let printstring = String::from_utf8_lossy(&cmd.printstring).into_owned();
                 let session = self.archlist[slot].as_mut().expect("bound session");
                 if !actionstring.is_empty() {
-                    // allacts.setCurrent: the registered root actions
-                    // (ghidra_process.hh:190-196 plus the "universal" root
-                    // the ActionDatabase always defines)
-                    match actionstring.as_str() {
-                        "decompile" | "normalize" | "jumptable" | "paramid" | "register"
-                        | "firstpass" | "universal" => {
-                            session.current_action = actionstring;
-                        }
-                        _ => {
-                            // C++ setCurrent -> deriveAction -> getGroup(name), which
-                            // throws "Action group does not exist: <name>" for an
-                            // unregistered root (action.cc:1005-1013,1145-1158); match
-                            // its wording so the 16/17 warning the GUI shows is faithful.
-                            return Err(WireError::Kuna(KunaError::lowlevel(format!(
-                                "Action group does not exist: {actionstring}"
-                            ))));
-                        }
+                    if let Some(arch) = session.architecture.as_mut() {
+                        arch.allacts.set_current(&actionstring).map_err(WireError::from)?;
+                        arch.print_mut().set_export_binding(None);
                     }
                 }
                 if !printstring.is_empty() {
@@ -993,8 +858,16 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         "noc" => session.send_c_code = false,
                         "parammeasures" => session.send_param_measures = true,
                         "noparammeasures" => session.send_param_measures = false,
-                        "jumpload" => session.record_jumploads = true,
-                        "nojumpload" => session.record_jumploads = false,
+                        "jumpload" | "nojumpload" => {
+                            if let Some(arch) = session.architecture.as_mut() {
+                                arch.print_mut().set_export_binding(None);
+                                if printstring == "jumpload" {
+                                    arch.flowoptions |= kuna_decomp::flow::flow_flags::record_jumploads;
+                                } else {
+                                    arch.flowoptions &= !kuna_decomp::flow::flow_flags::record_jumploads;
+                                }
+                            }
+                        }
                         _ => {
                             return Err(WireError::Kuna(KunaError::lowlevel(format!(
                                 "Unknown print action: {printstring}"
@@ -1012,8 +885,8 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             // unknown option element (-> response 'f' -> Java "Did not accept
             // decompiler options", killing the whole program open), so one
             // option from a newer Java vocabulary (12.2's `baddatacount`)
-            // bricks the decompiler view.  kuna applies every option it knows,
-            // skips the rest per-element, and always answers 't'.  Skipped
+            // bricks the decompiler view. Unknown IDs are skipped per-element;
+            // known option errors stop the list and answer 'f'. Skipped
             // elements are reported on the 16/17 frame with messages beginning
             // "Warning" — DecompInterface.isErrorMessage treats text containing
             // "warning" as non-fatal, so the note surfaces without failing the
@@ -1021,9 +894,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             CommandKind::SetOptions => {
                 let slot = cmd.slot.expect("bound session");
                 let mut warnings: Vec<String> = Vec::new();
-                if let (Some(bytes), Some(session)) =
-                    (cmd.optionslist.take(), self.archlist[slot].as_mut())
-                {
+                if let Some(session) = self.archlist[slot].as_mut() {
                     if let Some(arch) = session.architecture.as_mut() {
                         // The upstream reset-then-apply contract
                         // (ghidra_process.cc:435-445): Java delta-encodes the
@@ -1033,18 +904,17 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         // defaults, then the DIV-77 ghidra-mode preset layer),
                         // then let the deltas land on it.
                         arch.reset_wire_defaults();
-                        apply_ghidra_mode_defaults(arch);
+                        apply_ghidra_mode_defaults(arch, session.result_version);
+                        let bytes = cmd.optionslist.take()
+                            .ok_or_else(|| KunaError::decoder("missing <optionslist>"))?;
                         let manager = arch.translate().manager_rc();
                         let mut decoder = PackedDecode::new(&manager);
                         let outcome = decoder
                             .ingest_stream(&bytes)
-                            .and_then(|_| OptionDatabase::new().decode_lenient(&mut decoder, arch));
+                            .and_then(|_| OptionDatabase::new().decode_native(&mut decoder, arch));
                         match outcome {
                             Ok(w) => warnings = w,
-                            Err(e) => warnings.push(format!(
-                                "Warning: decompiler options not applied: {}",
-                                e.explain()
-                            )),
+                            Err(e) => return Err(e.into()),
                         }
                     }
                 }
@@ -1052,6 +922,84 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                     self.print_message(cmd.slot, w);
                 }
                 cmd.ok = true;
+                Ok(())
+            }
+            CommandKind::PrepareSelectedRoots => {
+                let slot = cmd.slot.expect("bound session");
+                let session = self.archlist[slot].as_mut().expect("bound session");
+                let arch = session.architecture.as_mut()
+                    .ok_or_else(|| KunaError::lowlevel("decompiler engine unavailable"))?;
+                // A failed replacement must not publish an older invocation's
+                // decisions. The physical-publication owner alone holds roots
+                // and computed bindings; command routing has no second cache.
+                arch.print_mut().set_export_binding(None);
+                if session.result_version != RESULT_VERSION {
+                    return Err(KunaError::recov("selected-root preparation requires the negotiated result protocol").into());
+                }
+                let bytes = cmd.optionslist.take()
+                    .ok_or_else(|| KunaError::decoder("missing selected-root address stream"))?;
+                // Command-specific collection: canonical <addr/> and <string>
+                // content siblings in ONE packed stream, no new envelope.
+                // Strings reserve the invocation's existing output namespace;
+                // they do not select additional roots. Decode the entire
+                // packet before exposing the reservations to preparation.
+                let mut roots = Vec::new();
+                let mut reserved = std::collections::BTreeSet::new();
+                if !bytes.is_empty() {
+                    let manager = arch.translate().manager_rc();
+                    let mut decoder = PackedDecode::new(&manager);
+                    decoder.ingest_stream(&bytes)?;
+                    loop {
+                        let element = decoder.peek_element()?;
+                        if element == 0 {
+                            break;
+                        }
+                        if element == kuna_base::address::ELEM_ADDR.get_id() {
+                            roots.push(Address::decode(&mut decoder)?);
+                        } else if element == kuna_decomp::stringmanage::ELEM_STRING.get_id() {
+                            let id = decoder.open_element_id(&kuna_decomp::stringmanage::ELEM_STRING)?;
+                            let name = decoder.read_string_id(&kuna_base::marshal::ATTRIB_CONTENT)?;
+                            decoder.close_element(id)?;
+                            reserved.insert(String::from_utf8(name).map_err(|_| {
+                                KunaError::decoder("invalid UTF-8 in selected-root reserved identifier")
+                            })?);
+                        } else {
+                            return Err(KunaError::decoder("expected selected-root address or reserved identifier").into());
+                        }
+                    }
+                }
+                arch.print_mut().set_reserved_identifiers(Rc::new(reserved));
+                let binding = kuna_decomp::kuna_exportcall::prepare_addresses(arch, &roots)?;
+                arch.print_mut().set_export_binding(Some(Rc::new(binding)));
+                let mut acknowledgment = Vec::new();
+                ResultTypeTable::encode_prelude_packed(
+                    &ResultTypeTable::shared(), &mut acknowledgment,
+                )?;
+                write_string_stream(self.client.borrow_mut().sout_mut(), &acknowledgment)?;
+                Ok(())
+            }
+            CommandKind::StructureGraph | CommandKind::GetSignatureSettings | CommandKind::SetSignatureSettings => {
+                let slot = cmd.slot.expect("bound session");
+                let session = self.archlist[slot].as_mut().expect("bound session");
+                let arch = session.architecture.as_mut()
+                    .ok_or_else(|| KunaError::lowlevel("decompiler engine unavailable"))?;
+                if cmd.kind == CommandKind::SetSignatureSettings {
+                    let raw = cmd.optionslist.take().ok_or_else(|| KunaError::decoder("missing signature settings"))?;
+                    let settings = parse_signature_settings(&raw)?;
+                    cmd.ok = kuna_decomp::signature::try_set_settings(settings);
+                } else {
+                    let mut bytes = Vec::new();
+                    let mut encoder = PackedEncode::new(&mut bytes);
+                    if cmd.kind == CommandKind::StructureGraph {
+                        let raw = cmd.optionslist.take().ok_or_else(|| KunaError::decoder("missing graph"))?;
+                        let mut decoder = PackedDecode::new(arch.manage());
+                        decoder.ingest_stream(&raw)?;
+                        kuna_decomp::blockaction::structure_graph(&mut decoder, &mut encoder)?;
+                    } else {
+                        kuna_decomp::signature::encode_settings(&mut encoder);
+                    }
+                    write_string_stream(self.client.borrow_mut().sout_mut(), &bytes)?;
+                }
                 Ok(())
             }
         }
@@ -1085,6 +1033,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
         cspec: &[u8],
         tspec: &[u8],
         corespec: &[u8],
+        result_version: u32,
     ) -> KunaResult<Architecture> {
         let registry = build_registry();
         let translate = GhidraTranslate::new(tspec, &registry, Rc::clone(&self.client))?;
@@ -1097,6 +1046,10 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
         // host's and every later <typeref>/getDataType exchange resolves.
         arch.set_coretypes_xml(corespec.to_vec());
         arch.init_post_engine()?;
+        // Native registration starts with the same sparse-wire printing
+        // defaults that a subsequent fresh DecompileOptions list restores.
+        // Standalone Architecture construction retains the CLI defaults.
+        arch.print_mut().reset_wire_option_defaults();
         // Phase 3 (DIV: ghidra-mode defaults): Ghidra-convention fallback
         // naming (FUN_/DAT_/LAB_ for address-derived placeholder names — what
         // Java's isDynamicSymbolName expects, ghidra_arch.cc:928-947) plus the
@@ -1113,7 +1066,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
         // fid, aif, ...) run over a real file in kuna-analysis and have no seam
         // here: their PRODUCTS are what the Phase-3 providers pull over the
         // wire instead.
-        apply_ghidra_mode_defaults(&mut arch);
+        apply_ghidra_mode_defaults(&mut arch, result_version);
         // Phase 3: install the lazy wire-backed providers (ScopeGhidra /
         // TypeFactoryGhidra) — after init (cspec <global> ranges + pspec
         // property paints are in, the lockDefaultProperties point), before the
@@ -1146,7 +1099,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                     cmd.res.to_string().as_bytes(),
                 )?;
             }
-            CommandKind::SetAction | CommandKind::SetOptions => {
+            CommandKind::SetAction | CommandKind::SetOptions | CommandKind::SetSignatureSettings => {
                 write_string_stream(
                     self.client.borrow_mut().sout_mut(),
                     if cmd.ok { b"t" } else { b"f" },
@@ -1154,7 +1107,9 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             }
             // DecompileAt writes its payload inside rawAction (or none at
             // all when rawAction was aborted) — nothing here
-            CommandKind::DecompileAt => {}
+            CommandKind::DecompileAt | CommandKind::StructureGraph | CommandKind::GenerateSignatures
+                | CommandKind::DebugSignatures | CommandKind::GetSignatureSettings
+                | CommandKind::PrepareSelectedRoots => {}
         }
         if let Some(slot) = cmd.slot {
             if let Some(session) = self.archlist[slot].as_ref() {
@@ -1207,17 +1162,19 @@ pub fn kuna_banner_text() -> String {
 /// every setOptions after `reset_wire_defaults` — the reset-then-apply
 /// contract): Ghidra-convention fallback naming plus the CLI `aggressive`
 /// ENGINE-TIER preset.  See the build_architecture doc comment for why.
-/// `calltargettype` stays off: its function-pointer types are anonymous
-/// `<type metatype="code">` elements, which `PcodeDataTypeManager.decodeDataType`
-/// reads back as `undefined1`, so a retyped local would reach the program as
-/// `undefined1 *` where it is `code *` today.
-fn apply_ghidra_mode_defaults(arch: &mut Architecture) {
+/// Enhanced receivers retain anonymous callable types. Ordinary receivers use
+/// the same original-phase admission but publish only a structural C spelling;
+/// their High types and source prototypes stay unchanged. Session negotiation
+/// is the sole authority, replayed after every reset before Java option deltas.
+fn apply_ghidra_mode_defaults(arch: &mut Architecture, result_version: u32) {
     arch.name_style_ghidra = true;
+    arch.call_target_publication = if result_version == RESULT_VERSION {
+        kuna_decomp::kuna_calltargettype::CallTargetPublication::Full
+    } else {
+        kuna_decomp::kuna_calltargettype::CallTargetPublication::PerCallOnly
+    };
     if let Some(overrides) = kuna_decomp::modes::mode_overrides("aggressive") {
         for (name, value) in overrides {
-            if *name == "calltargettype" {
-                continue;
-            }
             if kuna_decomp::options::KUNA_OPTION_NAMES.contains(name) {
                 // Engine-tier knob: apply.  Unknown/analysis-tier names have
                 // no engine seam in ghidra mode and are skipped.
@@ -1264,6 +1221,33 @@ fn parse_arch_id(payload: &[u8]) -> i32 {
     val.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+fn negotiated_result_version(corespec: &[u8]) -> KunaResult<u32> {
+    let mut store = kuna_base::xml::DocumentStorage::new();
+    let doc = store.parse_document(corespec)?;
+    let root = doc.get_root();
+    Ok(match root.get_attribute_value("kuna_result_version") {
+        Ok(value) if kuna_base::marshal::cxx_parse_unsigned(value) == u64::from(RESULT_VERSION) => RESULT_VERSION,
+        _ => 0,
+    })
+}
+
+/// C++ integer extraction with the base selected by the prefix. Invalid or
+/// overflowing settings are a recoverable command error, never a stale value.
+fn parse_signature_settings(raw: &[u8]) -> KunaResult<u32> {
+    let value = std::str::from_utf8(raw)
+        .map_err(|_| KunaError::parse("Invalid signature settings"))?.trim();
+    let value = value.strip_prefix('+').unwrap_or(value);
+    let (digits, radix) = if let Some(digits) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) {
+        (digits, 16)
+    } else if value.len() > 1 && value.starts_with('0') {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    u32::from_str_radix(digits, radix)
+        .map_err(|_| KunaError::parse("Invalid signature settings"))
+}
+
 /// Assemble the decompileAt response document (C++ `DecompileAt::rawAction`
 /// isProcComplete branch, `decompiler/cpp/ghidra_process.cc:293-335`):
 ///
@@ -1302,10 +1286,7 @@ fn parse_arch_id(payload: &[u8]) -> i32 {
 /// reorder.  Both documents are then spliced in the upstream order
 /// (`<function>` #1 first).
 ///
-/// kuna divergence (documented): under action `paramid` the C++ ran the reduced
-/// `paramid` action set; kuna's `decompile_func_full` runs the full decompile,
-/// so the measured prototype is the fully-recovered one — a superset of what
-/// the reduced pipeline exposes.
+/// The selected root comes exclusively from ActionDatabase, including paramid.
 fn build_decompile_at_doc(
     arch: &mut Architecture,
     fd: &mut Funcdata,
@@ -1313,14 +1294,17 @@ fn build_decompile_at_doc(
     send_c_code: bool,
     send_param_measures: bool,
     current_action: &str,
+    result_version: u32,
 ) -> KunaResult<Vec<u8>> {
+    use kuna_decomp::resulttypes::ResultTypeEncoder;
+    let result_types = (result_version == RESULT_VERSION).then(ResultTypeTable::shared);
     let mut buf: Vec<u8> = Vec::new();
     // The symbol-link pass, ahead of everything that reads its results (the
     // markup's `<vardecl symref>` and the `<localdb>`/`<highlist>` encode).
     if send_syntax_tree {
         fd.kuna_link_high_symbols();
     }
-    {
+    if result_types.is_none() {
         let mut enc = PackedEncode::new(&mut buf);
         enc.open_element(&ELEM_DOC);
     }
@@ -1329,12 +1313,20 @@ fn build_decompile_at_doc(
         // ConventionAnalysisDecompileConfigurer).
         let analysis = kuna_decomp::paramid::ParamIDAnalysis::new(fd, true)?;
         let mut enc = PackedEncode::new(&mut buf);
-        analysis.encode(&mut enc, true)?;
+        if let Some(types) = &result_types {
+            analysis.encode(&mut ResultTypeEncoder::new(&mut enc, types), true)?;
+        } else {
+            analysis.encode(&mut enc, true)?;
+        }
     } else {
         if send_param_measures {
             let analysis = kuna_decomp::paramid::ParamIDAnalysis::new(fd, false)?;
             let mut enc = PackedEncode::new(&mut buf);
-            analysis.encode(&mut enc, true)?;
+            if let Some(types) = &result_types {
+                analysis.encode(&mut ResultTypeEncoder::new(&mut enc, types), true)?;
+            } else {
+                analysis.encode(&mut enc, true)?;
+            }
         }
         // The dual <function>: the Clang token-markup document, rendered first
         // (see above), spliced after the syntax tree.  `doc_function_markup`
@@ -1342,52 +1334,70 @@ fn build_decompile_at_doc(
         // `print_c` split-borrow precedent), render, put it back.
         let markup: Option<Vec<u8>> = if send_c_code && current_action == "decompile" {
             let mut printer = arch.take_print();
-            // (kuna outlang) This document is consumed by Ghidra's Clang token
-            // model, whose token classes are C's. A non-C output language here
-            // would put Rust text into C token slots -- a GUI regression, not a
-            // feature -- so the markup path is pinned to C regardless of any
-            // `setlanguage` the client forwarded. The plain-text `print C`
-            // surfaces are unaffected.
-            let requested = printer.get_name().to_string();
-            printer.set_name("c-language");
-            let m = printer.doc_function_markup(fd, arch);
-            printer.set_name(&requested);
+            // Markup and ordinary C/Java presentation use the same selected
+            // language. Clang token identities do not require C spelling.
+            let m = if let Some(types) = &result_types {
+                printer.doc_function_markup_result(fd, arch, Rc::clone(types))
+            } else {
+                printer.doc_function_markup(fd, arch)
+            };
             arch.put_print(printer);
-            Some(m)
+            Some(m?)
         } else {
             None
         };
         {
             let mut enc = PackedEncode::new(&mut buf);
-            fd.encode(&mut enc, 0, send_syntax_tree)?;
+            if let Some(types) = &result_types {
+                fd.encode(&mut ResultTypeEncoder::new(&mut enc, types), 0, send_syntax_tree)?;
+            } else {
+                fd.encode(&mut enc, 0, send_syntax_tree)?;
+            }
         }
         if let Some(m) = markup {
+            if result_types.is_some() {
+                if let Some(publication) = arch.print().export_publication() {
+                    publication.encode(&mut PackedEncode::new(&mut buf))?;
+                }
+            }
             buf.extend_from_slice(&m);
         }
     }
-    {
+    if let Some(types) = result_types {
+        let mut doc = Vec::new();
+        PackedEncode::new(&mut doc).open_element(&ELEM_DOC);
+        ResultTypeTable::encode_prelude_packed(&types, &mut doc)?;
+        doc.extend_from_slice(&buf);
+        PackedEncode::new(&mut doc).close_element(&ELEM_DOC);
+        Ok(doc)
+    } else {
         let mut enc = PackedEncode::new(&mut buf);
         enc.close_element(&ELEM_DOC);
+        Ok(buf)
     }
-    Ok(buf)
-}
-
-/// Render an address for warning messages: the space shortcut plus the C++
-/// `printRaw` form (the shape of upstream's decompileAt/getBytes messages).
-fn render_address(addr: &Address) -> String {
-    let mut s = String::new();
-    if let Some(spc) = addr.get_space() {
-        s.push(spc.get_shortcut());
-    }
-    if addr.print_raw(&mut s).is_err() {
-        s.push_str("invalid_addr");
-    }
-    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_settings_parse_native_bases_without_stale_values() {
+        for value in [b"73".as_slice(), b"0x49", b"0111", b" +73 "] {
+            assert_eq!(parse_signature_settings(value).unwrap(), 73);
+        }
+        for value in [b"".as_slice(), b"garbage", b"-1", b"4294967296", b"0x"] {
+            assert!(parse_signature_settings(value).is_err());
+        }
+    }
+
+    #[test]
+    fn result_extension_requires_explicit_supported_offer() {
+        assert_eq!(negotiated_result_version(b"<coretypes/>").unwrap(), 0);
+        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"1\"/>").unwrap(), 1);
+        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"0x1\"/>").unwrap(), 1);
+        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"2\"/>").unwrap(), 0);
+    }
 
     #[test]
     fn test_parse_arch_id() {

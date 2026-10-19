@@ -158,7 +158,10 @@ pub struct FunctionXrefs {
 /// stays inside the function is control flow, and
 /// `XrefIndex::refs_from_function` leaves it out). Every list is in
 /// instruction order. Addresses are the program's byte addresses.
-pub fn function_xrefs(prog: &ConsoleProgram, file: &object::File, entry: u64) -> FunctionXrefs {
+///
+/// Register-query failures abort acquisition with their original error; no
+/// partial reference lists are returned.
+pub fn function_xrefs(prog: &ConsoleProgram, file: &object::File, entry: u64) -> kuna_base::error::KunaResult<FunctionXrefs> {
     use kuna_analysis::listing::xrefs::{self as xr, XrefKind};
     let entries = prog.function_entries_canonical();
     let names: BTreeMap<u64, String> =
@@ -167,7 +170,7 @@ pub fn function_xrefs(prog: &ConsoleProgram, file: &object::File, entry: u64) ->
         prog.global_data_symbols().into_iter().map(|(name, vma, _)| (vma, name)).collect();
     let inventory: Vec<u64> = names.keys().copied().collect();
     let seeds = xr::discovery_seeds(file, &inventory, prog.arch().analysis_funcstart_patterns);
-    let index = xr::build_with_focus(file, prog.arch(), prog.arch().translate(), &seeds, &[entry]);
+    let index = xr::build_with_focus(file, prog.arch(), prog.arch().translate(), &seeds, &[entry])?;
     let name_of = |vma: u64| names.get(&vma).or_else(|| data.get(&vma)).cloned();
     let mut out = FunctionXrefs::default();
     for r in index.refs_to_unified(entry) {
@@ -196,7 +199,7 @@ pub fn function_xrefs(prog: &ConsoleProgram, file: &object::File, entry: u64) ->
     out.callers.sort_by_key(|r| (r.site, r.address));
     out.callees.sort_by_key(|r| (r.site, r.address));
     out.data_refs.sort_by_key(|r| (r.site, r.address));
-    out
+    Ok(out)
 }
 
 /// One instruction that uses a string literal. `row` names the function the
@@ -220,10 +223,13 @@ pub struct StringUse {
 /// its strings there, used by address). The reference walk is the
 /// one behind [`function_xrefs`], built once for the whole set. Each list is in
 /// instruction order.
-pub fn string_uses(prog: &ConsoleProgram, file: &object::File, strings: &[(u64, u64)]) -> Vec<Vec<StringUse>> {
+///
+/// Register-query failures abort acquisition with their original error; no
+/// partial use lists are returned.
+pub fn string_uses(prog: &ConsoleProgram, file: &object::File, strings: &[(u64, u64)]) -> kuna_base::error::KunaResult<Vec<Vec<StringUse>>> {
     use kuna_analysis::listing::xrefs as xr;
     if strings.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let names: BTreeMap<u64, String> = prog
         .function_entries_canonical()
@@ -234,7 +240,7 @@ pub fn string_uses(prog: &ConsoleProgram, file: &object::File, strings: &[(u64, 
         prog.global_data_symbols().into_iter().map(|(name, vma, _)| (vma, name)).collect();
     let inventory: Vec<u64> = names.keys().copied().collect();
     let seeds = xr::discovery_seeds(file, &inventory, prog.arch().analysis_funcstart_patterns);
-    let index = xr::build(file, prog.arch(), prog.arch().translate(), &seeds);
+    let index = xr::build(file, prog.arch(), prog.arch().translate(), &seeds)?;
     let code: Vec<(u64, u64)> = {
         use object::{Object, ObjectSection, SectionKind};
         file.sections()
@@ -260,7 +266,7 @@ pub fn string_uses(prog: &ConsoleProgram, file: &object::File, strings: &[(u64, 
             via: via.map(|slot| (slot, data.get(&slot).cloned())),
         }
     };
-    strings
+    Ok(strings
         .iter()
         .map(|&(addr, len)| {
             let code_text = in_code(addr);
@@ -279,7 +285,7 @@ pub fn string_uses(prog: &ConsoleProgram, file: &object::File, strings: &[(u64, 
             uses.dedup_by_key(|u| (u.row.site, u.via.as_ref().map(|v| v.0)));
             uses
         })
-        .collect()
+        .collect())
 }
 
 /// The pointer-aligned words of `file`'s initialized data sections whose value

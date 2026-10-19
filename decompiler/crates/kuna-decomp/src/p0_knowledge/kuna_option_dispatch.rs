@@ -23,16 +23,30 @@ macro_rules! kuna_options {
                         Ok(format!(concat!($label, " turned {}"), if val { "on" } else { "off" }))
                     }};
                 }
-                match name {
+                let result = match name {
                     $($name => $apply,)*
                     other => Err(KunaError::parse(format!("Unknown kuna option: {other}"))),
+                };
+                if result.is_ok() {
+                    $this.print_mut().set_export_binding(None);
                 }
+                if result.is_ok() && matches!(name,
+                    "fastfailnoreturn" | "armfloatargs" | "armfloatreturn" | "bejoin" | "exportinline")
+                {
+                    $this.invalidate_body_caches();
+                }
+                result
             }
         }
     };
 }
 
 kuna_options! { self, p1;
+    "exportinline" => {
+        let value = on_or_off(p1)?;
+        self.export_inline = value;
+        Ok(format!("Export root inline preparation turned {}", if value { "on" } else { "off" }))
+    },
     "compareform" => {
         let (form, msg) = crate::kuna_compareform::parse_compare_form(p1)?;
         self.present_lessequal = form.present_lessequal();
@@ -753,6 +767,7 @@ kuna_options! { self, p1;
     "realtypes" => on_off!(realtypes, "Real-C-type rendering for unknowns"),
     "ctypes" => on_off!(ctypes, "valid-C core type spelling"),
     "indirectargs" => on_off!(indirect_args, "Indirect value-parameter rendering"),
+    "varargentry" => on_off!(vararg_entry, "First variadic signed-int entry capture"),
     "framelayout" => on_off!(framelayout, "recovered stack-frame reporting"),
     "bytehonest" => on_off!(byte_honest, "uncommitted-byte width reporting"),
     "slotptr" => on_off!(slot_ptr, "frame-slot pointer typing"),

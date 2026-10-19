@@ -61,8 +61,7 @@ fn recovered_wrapped_local_does_not_create_a_native_join_varnode_or_change_c_on_
             let data = data.as_any_mut().downcast_mut::<IfaceDecompData>().unwrap();
             let mut fd = data.fd.take().unwrap();
             let program = data.conf.as_mut().unwrap();
-            let before = print_c(program.arch_mut(), &fd);
-            assert!(before.contains("return v1.t;"), "{fixture}: {before}");
+            let before = print_c(program.arch_mut(), &fd).unwrap();
             let maps = fd.mapped_symbol_specs();
             let wrapped: Vec<_> = maps
                 .iter()
@@ -93,6 +92,10 @@ fn recovered_wrapped_local_does_not_create_a_native_join_varnode_or_change_c_on_
                 })
                 .collect();
             assert_eq!(wrapped.len(), 1, "{fixture}: {map_locations:?}");
+            let wrapped_name = maps.iter().find_map(|(name, _, addr, _)| {
+                (addr == &wrapped[0]).then_some(name.as_str())
+            }).unwrap();
+            assert!(before.contains(&format!("return {wrapped_name}.t;")), "{fixture}: {before}");
             for id in fd.vbank().iter_loc() {
                 let varnode = fd.vbank().get(id).unwrap();
                 assert!(
@@ -104,7 +107,7 @@ fn recovered_wrapped_local_does_not_create_a_native_join_varnode_or_change_c_on_
             fd.encode(&mut XmlEncode::new(&mut xml), 1, true).unwrap();
             let text = String::from_utf8(xml).unwrap();
             assert!(!text.contains("stack:0xfffffff0:16"), "{fixture}: {text}");
-            assert_eq!(before, print_c(program.arch_mut(), &fd), "{fixture}");
+            assert_eq!(before, print_c(program.arch_mut(), &fd).unwrap(), "{fixture}");
             let mut again = Vec::new();
             fd.encode(&mut XmlEncode::new(&mut again), 1, true).unwrap();
             assert_eq!(text.as_bytes(), again.as_slice(), "{fixture}");
@@ -125,7 +128,7 @@ fn recovered_wrapped_local_does_not_create_a_native_join_varnode_or_change_c_on_
             let program = data.conf.as_mut().unwrap();
             assert_eq!(
                 before,
-                print_c(program.arch_mut(), &fd),
+                print_c(program.arch_mut(), &fd).unwrap(),
                 "{fixture}: second decompile"
             );
             let maps = fd.mapped_symbol_specs();

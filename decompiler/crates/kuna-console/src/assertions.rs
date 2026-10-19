@@ -71,6 +71,11 @@
 //!   [`apply_symbol_scoped`] runs on the first pass's `Funcdata` and the caller
 //!   decompiles a second time with the mutated scope carried across — the same
 //!   shape the console's `decompile` / `rename` / `decompile` sequence has.
+//!   Private physical export formals are resolved in a bounded preparation pass
+//!   and frozen into the invocation binding before publication; only their
+//!   successful directive indexes are consumed, while locals still replay here.
+//!   Workers reparse the original final type declaration, and all formals still
+//!   pass the same final printed-signature verification.
 //!
 //! A directive that names no function binds to the function being decompiled.
 //! That is unambiguous for `kuna decompile`, which selects exactly one; on a
@@ -642,7 +647,7 @@ pub(crate) fn park_proto_pieces(
     prog: &mut ConsoleProgram,
     target: &ProtoTarget,
     pieces: &mut PrototypePieces,
-) {
+) -> kuna_base::error::KunaResult<()> {
     pieces.name = target.name().to_string();
     match target {
         ProtoTarget::Named(name) => {
@@ -662,10 +667,11 @@ pub(crate) fn park_prototype(
     target: &ProtoTarget,
     pieces: &mut PrototypePieces,
     model: Option<&Rc<ProtoModel>>,
-) {
-    park_proto_pieces(prog, target, pieces);
+) -> kuna_base::error::KunaResult<()> {
+    park_proto_pieces(prog, target, pieces)?;
     park_proto_model(prog, target, model);
     lock_prototype_on_symbol(prog, target, pieces, model);
+    Ok(())
 }
 
 /// `prototype <func> <C declaration>` — the in-process twin of `parse line
@@ -698,7 +704,8 @@ fn apply_prototype(prog: &mut ConsoleProgram, func: &str, decl: &str) -> Result<
         .ok_or_else(|| "not a function declaration".to_string())?;
     let target = resolve_proto_target(prog, func)?;
     let model = declared_model(prog, &model);
-    park_prototype(prog, &target, &mut pieces, model.as_ref());
+    park_prototype(prog, &target, &mut pieces, model.as_ref())
+        .map_err(|error| error.explain().to_string())?;
     prog.set_pending_prototype(target.name(), pieces);
     Ok(())
 }
@@ -706,7 +713,7 @@ fn apply_prototype(prog: &mut ConsoleProgram, func: &str, decl: &str) -> Result<
 /// The prototype-model names the loaded program's architecture has registered,
 /// as the C declaration parser needs them (`glb->hasModel`).
 pub(crate) fn model_names(prog: &ConsoleProgram) -> Vec<String> {
-    prog.arch().proto_model_names().map(str::to_string).collect()
+    prog.arch().proto_model_names().collect()
 }
 
 /// The calling convention a declaration named, resolved against the loaded
@@ -717,7 +724,7 @@ pub(crate) fn declared_model(prog: &ConsoleProgram, model: &str) -> Option<Rc<Pr
     if model.is_empty() {
         return None;
     }
-    prog.arch().get_model(model).cloned()
+    prog.arch().get_model(model)
 }
 
 /// Record the calling convention a `prototype` directive named, so the
@@ -851,7 +858,8 @@ fn apply_cross_function(
         }
         _ => return Err("internal: not a cross-function prototype directive".into()),
     }
-    park_proto_pieces(prog, &target, &mut pieces);
+    park_proto_pieces(prog, &target, &mut pieces)
+        .map_err(|error| error.explain().to_string())?;
     // The symbol retype (what lets a by-value struct argument be split) needs a
     // return type; `param` alone never declares one, and the storage assignment
     // behind `getTypeCode` dereferences `outtype` unconditionally.
@@ -1083,6 +1091,110 @@ pub fn has_symbol_scoped(prog: &ConsoleProgram, name: &str, single: bool) -> boo
         .any(|d| d.body.is_symbol_scoped() && binds_to(&d.body, name, single))
 }
 
+/// Resolve a private implementation's batch once, before publication. Locals
+/// participate in normal batch name resolution but are not consumed here.
+pub(crate) fn acquire_parameter_edits(
+    prog: &mut ConsoleProgram,
+    fd: &mut Funcdata,
+    name: &str,
+    single: bool,
+) -> kuna_base::error::KunaResult<Vec<(kuna_decomp::kuna_exportcall::ExportParameterEdit, Rc<Datatype>)>> {
+    use kuna_base::error::KunaError;
+    use kuna_decomp::kuna_exportcall::{ExportAddress, ExportParameterEdit};
+    let directives = prog.assertions().to_vec();
+    let mut touched = Vec::new();
+    for (index, directive) in directives.iter().enumerate() {
+        if directive.body.is_symbol_scoped() && binds_to(&directive.body, name, single) {
+            if let Ok((Some(symbol), retype)) = apply_one_symbol_scoped(prog, fd, &directive.body) {
+                touched.push((index, symbol, retype));
+            }
+        }
+    }
+    let mut edits = Vec::new();
+    for expected in expected_locals(fd, &touched).into_iter().filter(|expected| expected.parameter) {
+        let symbol = touched.iter().find(|(index, _, _)| expected.directives.contains(index))
+            .expect("expected parameter came from this batch").1;
+        let Some((slot, pieces)) = crate::kuna_paramasserts::capture(fd, symbol)
+            .map_err(KunaError::lowlevel)? else { continue };
+        let datatype = pieces.type_.ok_or_else(|| KunaError::lowlevel("Edited export parameter has no type"))?;
+        let edit = ExportParameterEdit {
+            entry: ExportAddress::new(fd.get_address()),
+            storage: ExportAddress::new(&pieces.addr),
+            size: datatype.get_size(), slot, name: expected.name,
+            printed: expected.printed,
+            directives: expected.directives,
+        };
+        for &index in &edit.directives {
+            prog.set_assertion_outcome(index, directives[index].applied());
+        }
+        edits.push((edit, datatype));
+    }
+    Ok(edits)
+}
+
+/// Rebind portable records through the same declaration parser as the original
+/// assertion batch. Neither a High identity nor a rediscovered name is a key.
+pub(crate) fn rebind_parameter_edits(
+    prog: &ConsoleProgram,
+    binding: &kuna_decomp::kuna_exportcall::ExportBinding,
+    edits: &[kuna_decomp::kuna_exportcall::ExportParameterEdit],
+) -> kuna_base::error::KunaResult<Vec<(kuna_decomp::kuna_exportcall::ExportParameterEdit, Rc<Datatype>)>> {
+    use kuna_base::error::KunaError;
+    use kuna_decomp::kuna_exportcall::ExportAddress;
+    edits.iter().map(|edit| {
+        let mut retype = None;
+        for &index in edit.directives.iter().rev() {
+            let directive = prog.assertions().get(index)
+                .ok_or_else(|| KunaError::lowlevel("Prepared parameter assertion index is unavailable"))?;
+            match &directive.body {
+                Body::Type { decl, .. } => {
+                    let (datatype, _) = crate::grammar::parse_type(decl, prog.arch().types(), data_org(prog))
+                        .map_err(|error| KunaError::lowlevel(error.explain()))?;
+                    retype = Some(datatype);
+                    break;
+                }
+                Body::Name { .. } => {}
+                _ => return Err(KunaError::lowlevel("Prepared parameter assertion is not symbol-scoped")),
+            }
+        }
+        let datatype = retype.or_else(|| {
+            let function = binding.function_at(&edit.entry)?;
+            let parameter = function.working.get_param(edit.slot)?;
+            (ExportAddress::new(&parameter.get_address()) == edit.storage && parameter.get_size() == edit.size)
+                .then(|| parameter.get_type().cloned()).flatten()
+        }).ok_or_else(|| KunaError::lowlevel("Prepared parameter storage/type is unavailable"))?;
+        Ok((edit.clone(), datatype))
+    }).collect()
+}
+
+fn frozen_parameter_expectations(prog: &mut ConsoleProgram, entry: &Address) -> Vec<Expected> {
+    let expected = prog.arch().print().export_binding()
+        .map(|binding| binding.parameter_edits(entry).map(|edit| {
+            let retyped = edit.directives.iter().any(|&index| {
+                prog.assertions().get(index).is_some_and(|directive| matches!(&directive.body, Body::Type { .. }))
+            });
+            let retype = retyped.then(|| {
+                binding.function_at(&edit.entry).expect("frozen export function")
+                    .working.get_param(edit.slot).expect("frozen export parameter")
+                    .get_type().expect("frozen export parameter type").clone()
+            });
+            Expected {
+                directives: edit.directives.clone(), printed: edit.printed.clone(),
+                name: edit.name.clone(), retype, parameter: true,
+            }
+        }).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for parameter in &expected {
+        for &index in &parameter.directives {
+            if let Some(directive) = prog.assertions().get(index) {
+                let outcome = directive.applied();
+                prog.set_assertion_outcome(index, outcome);
+            }
+        }
+    }
+    expected
+}
+
 /// Apply the symbol-scoped directives (`name`, `type`) to the first pass's
 /// `Funcdata`, and return whether any of them took.
 ///
@@ -1102,11 +1214,14 @@ pub fn apply_symbol_scoped(
     name: &str,
     single: bool,
 ) -> Option<Vec<Expected>> {
+    let mut expected = frozen_parameter_expectations(prog, fd.get_address());
     let directives = prog.assertions().to_vec();
     let mut applied_any = false;
     let mut touched: Vec<(usize, kuna_decomp::database::SymbolId, Option<Rc<Datatype>>)> = Vec::new();
     for (i, directive) in directives.iter().enumerate() {
-        if !directive.body.is_symbol_scoped() || !binds_to(&directive.body, name, single) {
+        if !directive.body.is_symbol_scoped() || !binds_to(&directive.body, name, single)
+            || expected.iter().any(|parameter| parameter.directives.contains(&i))
+        {
             continue;
         }
         let outcome = match apply_one_symbol_scoped(prog, fd, &directive.body) {
@@ -1119,7 +1234,10 @@ pub fn apply_symbol_scoped(
         };
         prog.set_assertion_outcome(i, outcome);
     }
-    applied_any.then(|| expected_locals(fd, &touched))
+    if applied_any {
+        expected.extend(expected_locals(fd, &touched));
+    }
+    (applied_any || !expected.is_empty()).then_some(expected)
 }
 
 fn apply_one_symbol_scoped(
@@ -1151,6 +1269,16 @@ pub struct Expected {
     name: String,
     retype: Option<Rc<Datatype>>,
     parameter: bool,
+}
+
+impl Expected {
+    pub(crate) fn is_parameter(&self) -> bool {
+        self.parameter
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 /// The [`Expected`] of each local the `touched` directives (index, Symbol,
@@ -1254,7 +1382,8 @@ pub fn check_printed(
             continue;
         }
         found[slot] = if local.parameter {
-            signature_declaration(code, &local.name).map(|decl| (local.name.clone(), decl))
+            let implementation = print.export_publication().map(|publication| publication.implementation.as_str());
+            signature_declaration(code, implementation, &local.name).map(|decl| (local.name.clone(), decl))
         } else {
             declared
                 .iter()
@@ -1302,10 +1431,29 @@ pub fn check_printed(
 }
 
 /// The type the signature printed in `code` declares the parameter `name`
-/// with, the name taken out (`char *` for `char *a0`).
-fn signature_declaration(code: &str, name: &str) -> Option<String> {
+/// with, the name taken out (`char *` for `char *a0`). Export helpers may precede
+/// the body, so select its emitted implementation identity, never their first
+/// signature or the canonical wrapper's signature.
+fn signature_declaration(code: &str, implementation: Option<&str>, name: &str) -> Option<String> {
     let lines: Vec<&str> = code.lines().collect();
-    let open = lines.iter().position(|line| line.trim_end() == "{")?;
+    let (open, parameter_open) = lines.iter().enumerate().find_map(|(index, line)| {
+        if line.trim_end() != "{" {
+            return None;
+        }
+        let signature = lines.get(index.checked_sub(1)?)?;
+        let parameter_open = match implementation {
+            Some(function) => Some(signature.match_indices(function).find_map(|(start, _)| {
+                let before = &signature[..start];
+                let after = &signature[start + function.len()..];
+                let parameters = after.trim_start();
+                (!before.chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && parameters.starts_with('('))
+                    .then_some(start + function.len() + after.len() - parameters.len())
+            })?),
+            None => None,
+        };
+        Some((index, parameter_open))
+    })?;
     let declares = |text: &str| -> Option<String> {
         let text = text.trim();
         let pointer = format!("(*{name})");
@@ -1323,20 +1471,36 @@ fn signature_declaration(code: &str, name: &str) -> Option<String> {
     };
     let signature = open.checked_sub(1).map_or("", |line| lines[line]);
     let signature = signature.split("//").next().unwrap_or(signature);
-    let stop = signature.rfind(')')?;
-    let mut depth = 0;
-    let start = signature[..stop].char_indices().rev().find_map(|(i, c)| match c {
-        ')' => {
-            depth += 1;
-            None
-        }
-        '(' if depth == 0 => Some(i),
-        '(' => {
-            depth -= 1;
-            None
-        }
-        _ => None,
-    })?;
+    let (start, stop) = if let Some(start) = parameter_open {
+        // A function-pointer return has another argument list after this one.
+        // Match the list attached to the implementation token, not the last ')'.
+        let mut depth = 0;
+        let stop = signature[start..].char_indices().find_map(|(index, c)| {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            (depth == 0).then_some(start + index)
+        })?;
+        (start, stop)
+    } else {
+        let stop = signature.rfind(')')?;
+        let mut depth = 0;
+        let start = signature[..stop].char_indices().rev().find_map(|(i, c)| match c {
+            ')' => {
+                depth += 1;
+                None
+            }
+            '(' if depth == 0 => Some(i),
+            '(' => {
+                depth -= 1;
+                None
+            }
+            _ => None,
+        })?;
+        (start, stop)
+    };
     let mut depth = 0;
     let mut piece = String::new();
     for c in signature[start + 1..stop].chars() {

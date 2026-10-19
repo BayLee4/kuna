@@ -37,6 +37,7 @@
 //!   loss.
 
 use kuna_base::address::{calc_mask, leastsigbit_set, signbit_negative, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::types::{int4, uintb, Wrap};
 use kuna_num::opcodes::OpCode;
 
@@ -83,10 +84,10 @@ fn new_unique_out(data: &mut Funcdata, s: int4, op: OpId) -> VarnodeId {
 /// `Funcdata::newVarnodeOut(s, m, op)` — create a storage-addressed output for
 /// the (freshly created) op `op`.  Like [`new_unique_out`] the output is brand
 /// new, so the def-rewiring is a no-op.  // STUB(W3)
-fn new_varnode_out(data: &mut Funcdata, s: int4, m: &Address, op: OpId) -> VarnodeId {
-    let tmp = data.new_varnode(s, m, None);
+fn new_varnode_out(data: &mut Funcdata, s: int4, m: &Address, op: OpId) -> KunaResult<VarnodeId> {
+    let tmp = data.new_varnode(s, m, None)?;
     set_fresh_output(data, op, tmp);
-    tmp
+    Ok(tmp)
 }
 
 /// Promote a brand-new (reader-less) free varnode to be the output of `op`.
@@ -245,14 +246,14 @@ impl Rule for RuleFloatRange {
         }
         Some(Box::new(RuleFloatRange))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = op_in(data, op, 0);
         if !vn_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let vn2 = op_in(data, op, 1);
         if !vn_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let mut cmp1 = vn_def(data, vn1).expect("cmp1 def");
         let mut cmp2 = vn_def(data, vn2).expect("cmp2 def");
@@ -278,7 +279,7 @@ impl Rule for RuleFloatRange {
         }
 
         if resultopc == OpCode::CPUI_COPY {
-            return 0;
+            return Ok(0);
         }
 
         // Make sure both operators are comparing the same things
@@ -288,18 +289,18 @@ impl Rule for RuleFloatRange {
             slot1 = 1;
             nvn1 = op_in(data, cmp1, slot1);
             if vn_constant(data, nvn1) {
-                return 0;
+                return Ok(0);
             }
         }
         if vn_free(data, nvn1) {
-            return 0;
+            return Ok(0);
         }
         let cvn1 = op_in(data, cmp1, 1 - slot1); // Set cvn1 to the "other" slot off of cmp1
         let slot2: int4;
         if nvn1 != op_in(data, cmp2, 0) {
             slot2 = 1;
             if nvn1 != op_in(data, cmp2, 1) {
-                return 0;
+                return Ok(0);
             }
         } else {
             slot2 = 0;
@@ -311,15 +312,15 @@ impl Rule for RuleFloatRange {
         #[allow(clippy::if_same_then_else)]
         if vn_constant(data, cvn1) {
             if !vn_constant(data, matchvn) {
-                return 0;
+                return Ok(0);
             }
             if vn_offset(data, matchvn) != vn_offset(data, cvn1) {
-                return 0;
+                return Ok(0);
             }
         } else if cvn1 != matchvn {
-            return 0;
+            return Ok(0);
         } else if vn_free(data, cvn1) {
-            return 0;
+            return Ok(0);
         }
 
         // Collapse the 2 comparisons into 1 comparison
@@ -331,7 +332,7 @@ impl Rule for RuleFloatRange {
         } else {
             data.op_set_input(op, cvn1, 1 - slot1).expect("set input");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -356,7 +357,7 @@ impl Rule for RuleAndCommute {
     // The `sa`/`opc` initializers are the C++ "Unnecessary initialization"
     // placeholders; each is overwritten before any read inside the loop.
     #[allow(unused_assignments)]
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Unnecessary C++ initializations are reflected as Option/placeholders.
         let mut orvn: Option<VarnodeId> = None;
         let mut othervn: Option<VarnodeId> = None;
@@ -366,7 +367,7 @@ impl Rule for RuleAndCommute {
 
         let size = vn_size(data, op_out(data, op));
         if size as usize > std::mem::size_of::<uintb>() {
-            return 0; // FIXME: uintb should be arbitrary precision
+            return Ok(0); // FIXME: uintb should be arbitrary precision
         }
         let fullmask = calc_mask(size);
         let mut i: int4 = 0;
@@ -487,7 +488,7 @@ impl Rule for RuleAndCommute {
             i += 1;
         }
         if i == 2 {
-            return 0;
+            return Ok(0);
         }
         let orvn = orvn.expect("orvn set");
         let othervn = othervn.expect("othervn set");
@@ -516,7 +517,7 @@ impl Rule for RuleAndCommute {
         data.op_set_input(op, savn, 1).expect("set input");
         op_set_opcode(data, op, opc);
 
-        1
+        Ok(1)
     }
 }
 
@@ -539,7 +540,7 @@ impl Rule for RuleAndPiece {
         }
         Some(Box::new(RuleAndPiece))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut highvn: Option<VarnodeId> = None;
         let mut lowvn: Option<VarnodeId> = None;
         let mut opc = OpCode::CPUI_PIECE; // Unnecessary initialization
@@ -599,7 +600,7 @@ impl Rule for RuleAndPiece {
             i += 1;
         }
         if i == 2 {
-            return 0;
+            return Ok(0);
         }
         let highvn = highvn.expect("highvn set");
         let lowvn = lowvn.expect("lowvn set");
@@ -621,7 +622,7 @@ impl Rule for RuleAndPiece {
         let newvn = new_unique_out(data, size, newop);
         data.op_insert_before(newop, op);
         data.op_set_input(op, newvn, i).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -643,14 +644,14 @@ impl Rule for RuleAndZext {
         }
         Some(Box::new(RuleAndZext))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let cvn1 = op_in(data, op, 1);
         if !vn_constant(data, cvn1) {
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0);
         if !vn_written(data, in0) {
-            return 0;
+            return Ok(0);
         }
         let otherop = vn_def(data, in0).expect("otherop def");
         let opc = op_code(data, otherop);
@@ -659,23 +660,23 @@ impl Rule for RuleAndZext {
         } else if opc == OpCode::CPUI_PIECE {
             op_in(data, otherop, 1)
         } else {
-            return 0;
+            return Ok(0);
         };
         let mask = calc_mask(vn_size(data, rootvn));
         if mask != vn_offset(data, cvn1) {
-            return 0;
+            return Ok(0);
         }
         if vn_free(data, rootvn) {
-            return 0;
+            return Ok(0);
         }
         if vn_size(data, rootvn) as usize > std::mem::size_of::<uintb>() {
             // FIXME: Should be arbitrary precision
-            return 0;
+            return Ok(0);
         }
         op_set_opcode(data, op, OpCode::CPUI_INT_ZEXT);
         data.op_remove_input(op, 1);
         data.op_set_input(op, rootvn, 0).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -697,28 +698,28 @@ impl Rule for RuleAndCompare {
         }
         Some(Box::new(RuleAndCompare))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !vn_constant(data, op_in(data, op, 1)) {
-            return 0;
+            return Ok(0);
         }
         if vn_offset(data, op_in(data, op, 1)) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         let andvn = op_in(data, op, 0);
         if !vn_written(data, andvn) {
-            return 0;
+            return Ok(0);
         }
         let andop = vn_def(data, andvn).expect("andop def");
         if op_code(data, andop) != OpCode::CPUI_INT_AND {
-            return 0;
+            return Ok(0);
         }
         if !vn_constant(data, op_in(data, andop, 1)) {
-            return 0;
+            return Ok(0);
         }
         let subvn = op_in(data, andop, 0);
         if !vn_written(data, subvn) {
-            return 0;
+            return Ok(0);
         }
         let subop = vn_def(data, subvn).expect("subop def");
         let basevn;
@@ -728,7 +729,7 @@ impl Rule for RuleAndCompare {
             OpCode::CPUI_SUBPIECE => {
                 basevn = op_in(data, subop, 0);
                 if vn_size(data, basevn) as usize > std::mem::size_of::<uintb>() {
-                    return 0;
+                    return Ok(0);
                 }
                 baseconst = vn_offset(data, op_in(data, andop, 1));
                 // shift count = SUBPIECE offset*8, can reach 64; x86-masked in C++ (ADR-0003).
@@ -739,14 +740,14 @@ impl Rule for RuleAndCompare {
                 baseconst = vn_offset(data, op_in(data, andop, 1));
                 andconst = baseconst & calc_mask(vn_size(data, basevn));
             }
-            _ => return 0,
+            _ => return Ok(0),
         }
 
         if baseconst == calc_mask(vn_size(data, andvn)) {
-            return 0; // Degenerate AND
+            return Ok(0); // Degenerate AND
         }
         if vn_free(data, basevn) {
-            return 0;
+            return Ok(0);
         }
 
         let constvn = data.new_constant(vn_size(data, basevn), andconst);
@@ -767,7 +768,7 @@ impl Rule for RuleAndCompare {
         data.op_set_input(op, newout, 0).expect("set input");
         let zero = data.new_constant(vn_size(data, basevn), 0);
         data.op_set_input(op, zero, 1).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -789,18 +790,18 @@ impl Rule for RuleDoubleSub {
         }
         Some(Box::new(RuleDoubleSub))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = op_in(data, op, 0);
         if !vn_written(data, vn) {
-            return 0;
+            return Ok(0);
         }
         let op2 = vn_def(data, vn).expect("op2 def");
         if op_code(data, op2) != OpCode::CPUI_SUBPIECE {
-            return 0;
+            return Ok(0);
         }
         let in_vn = op_in(data, op2, 0);
         if vn_free(data, in_vn) {
-            return 0;
+            return Ok(0);
         }
         let offset1 = vn_offset(data, op_in(data, op, 1)) as int4;
         let offset2 = vn_offset(data, op_in(data, op2, 1)) as int4;
@@ -808,7 +809,7 @@ impl Rule for RuleDoubleSub {
         data.op_set_input(op, in_vn, 0).expect("set input"); // Skip middleman
         let c = data.new_constant(4, (offset1 + offset2) as uintb);
         data.op_set_input(op, c, 1).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -836,17 +837,17 @@ impl Rule for RuleDoubleShift {
         }
         Some(Box::new(RuleDoubleShift))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let sa1: int4;
         let sa2: int4;
         let mut mask: uintb;
 
         if !vn_constant(data, op_in(data, op, 1)) {
-            return 0;
+            return Ok(0);
         }
         let secvn = op_in(data, op, 0);
         if !vn_written(data, secvn) {
-            return 0;
+            return Ok(0);
         }
         let secop = vn_def(data, secvn).expect("secop def");
         let mut opc2 = op_code(data, secop);
@@ -854,15 +855,15 @@ impl Rule for RuleDoubleShift {
             && (opc2 != OpCode::CPUI_INT_RIGHT)
             && (opc2 != OpCode::CPUI_INT_MULT)
         {
-            return 0;
+            return Ok(0);
         }
         if !vn_constant(data, op_in(data, secop, 1)) {
-            return 0;
+            return Ok(0);
         }
         let mut opc1 = op_code(data, op);
         let size = vn_size(data, secvn);
         if !vn_heritage_known(data, op_in(data, secop, 0)) {
-            return 0;
+            return Ok(0);
         }
 
         if opc1 == OpCode::CPUI_INT_MULT {
@@ -871,7 +872,7 @@ impl Rule for RuleDoubleShift {
             // sa1 == -1 when val == 0; C++ shifts by (-1 & 0x3f) == 63 via x86
             // masking — `wshr((sa1 as u32))` reproduces it (ADR-0003).
             if val.wshr(sa1 as u32) != 1u64 {
-                return 0; // Not multiplying by a power of 2
+                return Ok(0); // Not multiplying by a power of 2
             }
             opc1 = OpCode::CPUI_INT_LEFT;
         } else {
@@ -882,7 +883,7 @@ impl Rule for RuleDoubleShift {
             sa2 = leastsigbit_set(val);
             // sa2 == -1 when val == 0; see sa1 note (x86-masked, ADR-0003).
             if val.wshr(sa2 as u32) != 1u64 {
-                return 0; // Not multiplying by a power of 2
+                return Ok(0); // Not multiplying by a power of 2
             }
             opc2 = OpCode::CPUI_INT_LEFT;
         } else {
@@ -905,21 +906,21 @@ impl Rule for RuleDoubleShift {
         } else {
             // Shifts in opposite directions
             if size as usize > std::mem::size_of::<uintb>() {
-                return 0; // FIXME: precision
+                return Ok(0); // FIXME: precision
             }
             mask = calc_mask(size);
             let mut diffsa: int4; // Bits (to the left) after cancellation
             if opc1 == OpCode::CPUI_INT_LEFT {
                 // The INT_LEFT is highly likely to be a multiply
                 if data.lone_descend(secvn).is_none() {
-                    return 0;
+                    return Ok(0);
                 }
                 // sa2 is a raw constant shift amount, can be >=64; x86-masked in C++ (ADR-0003).
                 mask = mask.wshl(sa2 as u32) & mask; // Most significant bits remain after initial INT_RIGHT
                 diffsa = sa1 - sa2;
                 if diffsa != 0 {
                     // Don't collapse unless shift amounts are identical
-                    return 0;
+                    return Ok(0);
                 }
             } else {
                 // sa2 is a raw constant shift amount, can be >=64; x86-masked in C++ (ADR-0003).
@@ -953,7 +954,7 @@ impl Rule for RuleDoubleShift {
                 data.op_set_input(op, dc, 1).expect("set input");
             }
         }
-        1
+        Ok(1)
     }
 }
 
@@ -982,31 +983,31 @@ impl Rule for RuleDoubleArithShift {
         }
         Some(Box::new(RuleDoubleArithShift))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_d = op_in(data, op, 1);
         if !vn_constant(data, const_d) {
-            return 0;
+            return Ok(0);
         }
         let shiftin = op_in(data, op, 0);
         if !vn_written(data, shiftin) {
-            return 0;
+            return Ok(0);
         }
         let shift2op = vn_def(data, shiftin).expect("shift2op def");
         if op_code(data, shift2op) != OpCode::CPUI_INT_SRIGHT {
-            return 0;
+            return Ok(0);
         }
         let const_c = op_in(data, shift2op, 1);
         if !vn_constant(data, const_c) {
-            return 0;
+            return Ok(0);
         }
         let in_vn = op_in(data, shift2op, 0);
         if vn_free(data, in_vn) {
-            return 0;
+            return Ok(0);
         }
         let max = vn_size(data, op_out(data, op)) * 8 - 1; // This is maximum possible shift.
         let mut sa = vn_offset(data, const_c) as int4 + vn_offset(data, const_d) as int4;
         if sa <= 0 {
-            return 0; // Something is wrong
+            return Ok(0); // Something is wrong
         }
         if sa > max {
             sa = max; // Shift amount has saturated
@@ -1014,7 +1015,7 @@ impl Rule for RuleDoubleArithShift {
         data.op_set_input(op, in_vn, 0).expect("set input");
         let c = data.new_constant(4, sa as uintb);
         data.op_set_input(op, c, 1).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -1036,28 +1037,28 @@ impl Rule for RuleConcatShift {
         }
         Some(Box::new(RuleConcatShift))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !vn_constant(data, op_in(data, op, 1)) {
-            return 0;
+            return Ok(0);
         }
 
         let shiftin = op_in(data, op, 0);
         if !vn_written(data, shiftin) {
-            return 0;
+            return Ok(0);
         }
         let concat = vn_def(data, shiftin).expect("concat def");
         if op_code(data, concat) != OpCode::CPUI_PIECE {
-            return 0;
+            return Ok(0);
         }
 
         let mut sa = vn_offset(data, op_in(data, op, 1)) as int4;
         let leastsize = vn_size(data, op_in(data, concat, 1)) * 8;
         if sa < leastsize {
-            return 0; // Does shift throw away least sig part
+            return Ok(0); // Does shift throw away least sig part
         }
         let mainin = op_in(data, concat, 0);
         if vn_free(data, mainin) {
-            return 0;
+            return Ok(0);
         }
         sa -= leastsize;
         let extcode = if op_code(data, op) == OpCode::CPUI_INT_RIGHT {
@@ -1084,7 +1085,7 @@ impl Rule for RuleConcatShift {
             data.op_set_input(op, c, 1).expect("set input");
             data.op_insert_before(extop, op);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1106,52 +1107,52 @@ impl Rule for RuleLeftRight {
         }
         Some(Box::new(RuleLeftRight))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !vn_constant(data, op_in(data, op, 1)) {
-            return 0;
+            return Ok(0);
         }
 
         let shiftin = op_in(data, op, 0);
         if !vn_written(data, shiftin) {
-            return 0;
+            return Ok(0);
         }
         let leftshift = vn_def(data, shiftin).expect("leftshift def");
         if op_code(data, leftshift) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         if !vn_constant(data, op_in(data, leftshift, 1)) {
-            return 0;
+            return Ok(0);
         }
         let sa = vn_offset(data, op_in(data, op, 1));
         if vn_offset(data, op_in(data, leftshift, 1)) != sa {
-            return 0; // Left shift must be by same amount
+            return Ok(0); // Left shift must be by same amount
         }
 
         if (sa & 7) != 0 {
-            return 0; // Must be multiple of 8
+            return Ok(0); // Must be multiple of 8
         }
         let isa = (sa >> 3) as int4;
         let tsz = vn_size(data, shiftin) - isa;
         if (tsz != 1) && (tsz != 2) && (tsz != 4) && (tsz != 8) {
-            return 0;
+            return Ok(0);
         }
 
         if data.lone_descend(shiftin) != Some(op) {
-            return 0;
+            return Ok(0);
         }
         let mut addr = vn_addr(data, shiftin);
         if addr.is_big_endian() {
             addr = &addr + isa as i64;
         }
         data.op_unset_input(op, 0);
-        data.op_unset_output(leftshift);
+        data.op_unset_output(leftshift)?;
         // addr.renormalize(tsz): only acts on join addresses; the shift source
         // is a register/ram varnode, so this is a no-op here, but is invoked
         // faithfully.  The manager is read through a cloned `ArchHandle` (an Rc)
         // to avoid holding `&data` across the later `&mut data` calls.
         let arch = std::rc::Rc::clone(data.get_arch());
         addr.renormalize(tsz, arch.manage()).expect("renormalize");
-        let newvn = new_varnode_out(data, tsz, &addr, leftshift);
+        let newvn = new_varnode_out(data, tsz, &addr, leftshift)?;
         op_set_opcode(data, leftshift, OpCode::CPUI_SUBPIECE);
         let c = data.new_constant(vn_size(data, op_in(data, leftshift, 1)), 0);
         data.op_set_input(leftshift, c, 1).expect("set input");
@@ -1166,7 +1167,7 @@ impl Rule for RuleLeftRight {
                 OpCode::CPUI_INT_ZEXT
             },
         );
-        1
+        Ok(1)
     }
 }
 
@@ -1188,17 +1189,17 @@ impl Rule for RuleShiftCompare {
         }
         Some(Box::new(RuleShiftCompare))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut sa: int4;
         let isleft: bool;
 
         let shiftvn = op_in(data, op, 0);
         let constvn = op_in(data, op, 1);
         if !vn_constant(data, constvn) {
-            return 0;
+            return Ok(0);
         }
         if !vn_written(data, shiftvn) {
-            return 0;
+            return Ok(0);
         }
         let shiftop = vn_def(data, shiftvn).expect("shiftop def");
         let opc = op_code(data, shiftop);
@@ -1207,60 +1208,60 @@ impl Rule for RuleShiftCompare {
             isleft = true;
             savn = op_in(data, shiftop, 1);
             if !vn_constant(data, savn) {
-                return 0;
+                return Ok(0);
             }
             sa = vn_offset(data, savn) as int4;
         } else if opc == OpCode::CPUI_INT_RIGHT {
             isleft = false;
             savn = op_in(data, shiftop, 1);
             if !vn_constant(data, savn) {
-                return 0;
+                return Ok(0);
             }
             sa = vn_offset(data, savn) as int4;
             // We only apply when we know we will eliminate a variable
             if data.lone_descend(shiftvn) != Some(op) {
-                return 0;
+                return Ok(0);
             }
         } else if opc == OpCode::CPUI_INT_MULT {
             isleft = true;
             savn = op_in(data, shiftop, 1);
             if !vn_constant(data, savn) {
-                return 0;
+                return Ok(0);
             }
             let val = vn_offset(data, savn);
             sa = leastsigbit_set(val);
             // sa == -1 when val == 0; C++ shifts by (-1 & 0x3f) == 63 (x86, ADR-0003).
             if val.wshr(sa as u32) != 1u64 {
-                return 0; // Not multiplying by a power of 2
+                return Ok(0); // Not multiplying by a power of 2
             }
         } else if opc == OpCode::CPUI_INT_DIV {
             isleft = false;
             savn = op_in(data, shiftop, 1);
             if !vn_constant(data, savn) {
-                return 0;
+                return Ok(0);
             }
             let val = vn_offset(data, savn);
             sa = leastsigbit_set(val);
             // sa == -1 when val == 0; C++ shifts by (-1 & 0x3f) == 63 (x86, ADR-0003).
             if val.wshr(sa as u32) != 1u64 {
-                return 0; // Not dividing by a power of 2
+                return Ok(0); // Not dividing by a power of 2
             }
             if data.lone_descend(shiftvn) != Some(op) {
-                return 0;
+                return Ok(0);
             }
         } else {
-            return 0;
+            return Ok(0);
         }
 
         if sa == 0 {
-            return 0;
+            return Ok(0);
         }
         let mainvn = op_in(data, shiftop, 0);
         if vn_free(data, mainvn) {
-            return 0;
+            return Ok(0);
         }
         if vn_size(data, mainvn) as usize > std::mem::size_of::<uintb>() {
-            return 0; // FIXME: uintb should be arbitrary precision
+            return Ok(0); // FIXME: uintb should be arbitrary precision
         }
 
         let constval = vn_offset(data, constvn);
@@ -1272,7 +1273,7 @@ impl Rule for RuleShiftCompare {
         if isleft {
             newconst = constval.wshr(sa as u32);
             if newconst.wshl(sa as u32) != constval {
-                return 0; // Information lost in constval
+                return Ok(0); // Information lost in constval
             }
             let tmp = nzmask.wshl(sa as u32) & calc_mask(vn_size(data, shiftvn));
             if tmp.wshr(sa as u32) != nzmask {
@@ -1280,7 +1281,7 @@ impl Rule for RuleShiftCompare {
                 // We replace the LEFT with and AND mask
                 // This must be the lone use of the shift
                 if data.lone_descend(shiftvn) != Some(op) {
-                    return 0;
+                    return Ok(0);
                 }
                 sa = 8 * vn_size(data, shiftvn) - sa;
                 let tmp = (1u64).wshl(sa as u32).wrapping_sub(1);
@@ -1295,21 +1296,21 @@ impl Rule for RuleShiftCompare {
                 data.op_set_input(op, newtmpvn, 0).expect("set input");
                 let nc = data.new_constant(vn_size(data, constvn), newconst);
                 data.op_set_input(op, nc, 1).expect("set input");
-                return 1;
+                return Ok(1);
             }
         } else {
             if nzmask.wshr(sa as u32).wshl(sa as u32) != nzmask {
-                return 0; // Information is lost
+                return Ok(0); // Information is lost
             }
             newconst = constval.wshl(sa as u32) & calc_mask(vn_size(data, shiftvn));
             if newconst.wshr(sa as u32) != constval {
-                return 0; // Information is lost in constval
+                return Ok(0); // Information is lost in constval
             }
         }
         let newconstvn = data.new_constant(vn_size(data, constvn), newconst);
         data.op_set_input(op, mainvn, 0).expect("set input");
         data.op_set_input(op, newconstvn, 1).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -1331,14 +1332,14 @@ impl Rule for RuleLessEqual {
         }
         Some(Box::new(RuleLessEqual))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vnout1 = op_in(data, op, 0);
         if !vn_written(data, vnout1) {
-            return 0;
+            return Ok(0);
         }
         let vnout2 = op_in(data, op, 1);
         if !vn_written(data, vnout2) {
-            return 0;
+            return Ok(0);
         }
         let mut op_less = vn_def(data, vnout1).expect("op_less def");
         let mut opc = op_code(data, op_less);
@@ -1348,30 +1349,30 @@ impl Rule for RuleLessEqual {
             op_less = vn_def(data, vnout2).expect("op_less def");
             opc = op_code(data, op_less);
             if (opc != OpCode::CPUI_INT_LESS) && (opc != OpCode::CPUI_INT_SLESS) {
-                return 0;
+                return Ok(0);
             }
         } else {
             op_equal = vn_def(data, vnout2).expect("op_equal def");
         }
         let equalopc = op_code(data, op_equal);
         if (equalopc != OpCode::CPUI_INT_EQUAL) && (equalopc != OpCode::CPUI_INT_NOTEQUAL) {
-            return 0;
+            return Ok(0);
         }
 
         let compvn1 = op_in(data, op_less, 0);
         let compvn2 = op_in(data, op_less, 1);
         if !vn_heritage_known(data, compvn1) {
-            return 0;
+            return Ok(0);
         }
         if !vn_heritage_known(data, compvn2) {
-            return 0;
+            return Ok(0);
         }
         let eq0 = op_in(data, op_equal, 0);
         let eq1 = op_in(data, op_equal, 1);
         if (!varnodes_equiv(data, compvn1, eq0) || !varnodes_equiv(data, compvn2, eq1))
             && (!varnodes_equiv(data, compvn1, eq1) || !varnodes_equiv(data, compvn2, eq0))
         {
-            return 0;
+            return Ok(0);
         }
 
         if equalopc == OpCode::CPUI_INT_NOTEQUAL {
@@ -1393,7 +1394,7 @@ impl Rule for RuleLessEqual {
                 },
             );
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1415,15 +1416,15 @@ impl Rule for RuleLessNotEqual {
         }
         Some(Box::new(RuleLessNotEqual))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Convert [(s)lessequal AND notequal] to (s)less
         let vnout1 = op_in(data, op, 0);
         if !vn_written(data, vnout1) {
-            return 0;
+            return Ok(0);
         }
         let vnout2 = op_in(data, op, 1);
         if !vn_written(data, vnout2) {
-            return 0;
+            return Ok(0);
         }
         let mut op_less = vn_def(data, vnout1).expect("op_less def");
         let mut opc = op_code(data, op_less);
@@ -1433,29 +1434,29 @@ impl Rule for RuleLessNotEqual {
             op_less = vn_def(data, vnout2).expect("op_less def");
             opc = op_code(data, op_less);
             if (opc != OpCode::CPUI_INT_LESSEQUAL) && (opc != OpCode::CPUI_INT_SLESSEQUAL) {
-                return 0;
+                return Ok(0);
             }
         } else {
             op_equal = vn_def(data, vnout2).expect("op_equal def");
         }
         if op_code(data, op_equal) != OpCode::CPUI_INT_NOTEQUAL {
-            return 0;
+            return Ok(0);
         }
 
         let compvn1 = op_in(data, op_less, 0);
         let compvn2 = op_in(data, op_less, 1);
         if !vn_heritage_known(data, compvn1) {
-            return 0;
+            return Ok(0);
         }
         if !vn_heritage_known(data, compvn2) {
-            return 0;
+            return Ok(0);
         }
         let eq0 = op_in(data, op_equal, 0);
         let eq1 = op_in(data, op_equal, 1);
         if (!varnodes_equiv(data, compvn1, eq0) || !varnodes_equiv(data, compvn2, eq1))
             && (!varnodes_equiv(data, compvn1, eq1) || !varnodes_equiv(data, compvn2, eq0))
         {
-            return 0;
+            return Ok(0);
         }
 
         data.op_set_input(op, compvn1, 0).expect("set input");
@@ -1469,7 +1470,7 @@ impl Rule for RuleLessNotEqual {
                 OpCode::CPUI_INT_LESS
             },
         );
-        1
+        Ok(1)
     }
 }
 
@@ -1521,7 +1522,7 @@ impl Rule for RuleTrivialArith {
         }
         Some(Box::new(RuleTrivialArith))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // LOCAL STUB(jumptable-recovery): C++ keeps this fold active during the
         // dedicated jump-table recovery sub-pass (`isJumptableRecoveryOn`) and
         // relies on `ActionRestructureVarnode::protectSwitchPaths`
@@ -1536,20 +1537,20 @@ impl Rule for RuleTrivialArith {
         // self-op (the byte-deref / signed-compare cluster types `char`).  This
         // is a pass-context gate, not function/address/type-name special-casing.
         if data.is_jumptable_recovery_on() {
-            return 0;
+            return Ok(0);
         }
         if op_num_input(data, op) != 2 {
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0);
         let in1 = op_in(data, op, 1);
         if in0 != in1 {
             // Inputs must be identical
             if !vn_written(data, in0) {
-                return 0;
+                return Ok(0);
             }
             if !vn_written(data, in1) {
-                return 0;
+                return Ok(0);
             }
             // or constructed identically
             let def0 = vn_def(data, in0).expect("in0 def");
@@ -1557,7 +1558,7 @@ impl Rule for RuleTrivialArith {
             let o0 = data.obank().get(def0).expect("stale def op");
             let o1 = data.obank().get(def1).expect("stale def op");
             if !is_cse_match(o0, o1, data.vbank()) {
-                return 0;
+                return Ok(0);
             }
         }
         // vn: replacement input for COPY (None means "keep getIn(0)").
@@ -1582,7 +1583,7 @@ impl Rule for RuleTrivialArith {
             | OpCode::CPUI_BOOL_OR
             | OpCode::CPUI_INT_AND
             | OpCode::CPUI_INT_OR => None,
-            _ => return 0,
+            _ => return Ok(0),
         };
 
         data.op_remove_input(op, 1);
@@ -1590,7 +1591,7 @@ impl Rule for RuleTrivialArith {
         if let Some(vn) = vn {
             data.op_set_input(op, vn, 0).expect("set input");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1612,10 +1613,10 @@ impl Rule for RuleTrivialBool {
         }
         Some(Box::new(RuleTrivialBool))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vnconst = op_in(data, op, 1);
         if !vn_constant(data, vnconst) {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, vnconst);
 
@@ -1634,13 +1635,13 @@ impl Rule for RuleTrivialBool {
                 opc = OpCode::CPUI_COPY;
                 vn = if val == 1 { data.new_constant(1, 1) } else { op_in(data, op, 0) };
             }
-            _ => return 0,
+            _ => return Ok(0),
         }
 
         data.op_remove_input(op, 1);
         op_set_opcode(data, op, opc);
         data.op_set_input(op, vn, 0).expect("set input");
-        1
+        Ok(1)
     }
 }
 
@@ -1667,7 +1668,7 @@ impl Rule for RuleZextEliminate {
         }
         Some(Box::new(RuleZextEliminate))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // vn1 equals ZEXTed input; vn2 = other input
         let mut vn1 = op_in(data, op, 0);
         let mut vn2 = op_in(data, op, 1);
@@ -1683,18 +1684,18 @@ impl Rule for RuleZextEliminate {
         } else if !vn_written(data, vn1)
             || op_code(data, vn_def(data, vn1).expect("vn1 def")) != OpCode::CPUI_INT_ZEXT
         {
-            return 0;
+            return Ok(0);
         }
 
         if !vn_constant(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let zext = vn_def(data, vn1).expect("zext def");
         if !vn_heritage_known(data, op_in(data, zext, 0)) {
-            return 0;
+            return Ok(0);
         }
         if data.lone_descend(vn1) != Some(op) {
-            return 0; // Make sure extension is not used for anything else
+            return Ok(0); // Make sure extension is not used for anything else
         }
         let smallsize = vn_size(data, op_in(data, zext, 0));
         let val = vn_offset(data, vn2);
@@ -1711,10 +1712,10 @@ impl Rule for RuleZextEliminate {
             let zin0 = op_in(data, zext, 0);
             data.op_set_input(op, zin0, zextslot).expect("set input");
             data.op_set_input(op, newvn, otherslot).expect("set input");
-            return 1;
+            return Ok(1);
         }
         // Should have else for doing constant comparison here and now
-        0
+        Ok(0)
     }
 }
 
@@ -1736,14 +1737,14 @@ impl Rule for RuleSlessToLess {
         }
         Some(Box::new(RuleSlessToLess))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = op_in(data, op, 0);
         let sz = vn_size(data, vn);
         if signbit_negative(vn_nzmask(data, vn), sz) {
-            return 0;
+            return Ok(0);
         }
         if signbit_negative(vn_nzmask(data, op_in(data, op, 1)), sz) {
-            return 0;
+            return Ok(0);
         }
 
         if op_code(data, op) == OpCode::CPUI_INT_SLESS {
@@ -1751,7 +1752,7 @@ impl Rule for RuleSlessToLess {
         } else {
             op_set_opcode(data, op, OpCode::CPUI_INT_LESSEQUAL);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1772,7 +1773,7 @@ impl Rule for RuleZextSless {
         }
         Some(Box::new(RuleZextSless))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut vn1 = op_in(data, op, 0);
         let mut vn2 = op_in(data, op, 1);
         let mut zextslot: int4 = 0;
@@ -1787,15 +1788,15 @@ impl Rule for RuleZextSless {
         } else if !vn_written(data, vn1)
             || op_code(data, vn_def(data, vn1).expect("vn1 def")) != OpCode::CPUI_INT_ZEXT
         {
-            return 0;
+            return Ok(0);
         }
 
         if !vn_constant(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let zext = vn_def(data, vn1).expect("zext def");
         if !vn_heritage_known(data, op_in(data, zext, 0)) {
-            return 0;
+            return Ok(0);
         }
 
         let smallsize = vn_size(data, op_in(data, zext, 0));
@@ -1805,7 +1806,7 @@ impl Rule for RuleZextSless {
         // a wider ZEXT input would push the count past 63; `wshr` (ADR-0003)
         // replicates the x86 shift-count masking and is `>>` for count<64.
         if val.wshr((8 * smallsize - 1) as u32) != 0 {
-            return 0; // Is zero extension unnecessary, sign bit must also be 0
+            return Ok(0); // Is zero extension unnecessary, sign bit must also be 0
         }
 
         let newvn = data.new_constant(smallsize, val);
@@ -1821,7 +1822,7 @@ impl Rule for RuleZextSless {
                 OpCode::CPUI_INT_LESSEQUAL
             },
         );
-        1
+        Ok(1)
     }
 }
 
@@ -1843,36 +1844,36 @@ impl Rule for RuleBitUndistribute {
         }
         Some(Box::new(RuleBitUndistribute))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn1 = op_in(data, op, 0);
         let vn2 = op_in(data, op, 1);
         let in1;
         let in2;
 
         if !vn_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         if !vn_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
 
         let opc = op_code(data, vn_def(data, vn1).expect("vn1 def"));
         if op_code(data, vn_def(data, vn2).expect("vn2 def")) != opc {
-            return 0;
+            return Ok(0);
         }
         match opc {
             OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_SEXT => {
                 // Test for full equality of extension operation
                 in1 = op_in(data, vn_def(data, vn1).expect("vn1 def"), 0);
                 if vn_free(data, in1) {
-                    return 0;
+                    return Ok(0);
                 }
                 in2 = op_in(data, vn_def(data, vn2).expect("vn2 def"), 0);
                 if vn_free(data, in2) {
-                    return 0;
+                    return Ok(0);
                 }
                 if vn_size(data, in1) != vn_size(data, in2) {
-                    return 0;
+                    return Ok(0);
                 }
                 data.op_remove_input(op, 1);
             }
@@ -1883,28 +1884,28 @@ impl Rule for RuleBitUndistribute {
                 let vnextra;
                 if vn_constant(data, s1) && vn_constant(data, s2) {
                     if vn_offset(data, s1) != vn_offset(data, s2) {
-                        return 0;
+                        return Ok(0);
                     }
                     vnextra = data.new_constant(vn_size(data, s1), vn_offset(data, s1));
                 } else if s1 != s2 {
-                    return 0;
+                    return Ok(0);
                 } else {
                     if vn_free(data, s1) {
-                        return 0;
+                        return Ok(0);
                     }
                     vnextra = s1;
                 }
                 in1 = op_in(data, vn_def(data, vn1).expect("vn1 def"), 0);
                 if vn_free(data, in1) {
-                    return 0;
+                    return Ok(0);
                 }
                 in2 = op_in(data, vn_def(data, vn2).expect("vn2 def"), 0);
                 if vn_free(data, in2) {
-                    return 0;
+                    return Ok(0);
                 }
                 data.op_set_input(op, vnextra, 1).expect("set input");
             }
-            _ => return 0,
+            _ => return Ok(0),
         }
 
         let addr = op_addr(data, op);
@@ -1918,7 +1919,7 @@ impl Rule for RuleBitUndistribute {
         op_set_opcode(data, op, opc);
         data.op_set_input(op, smalllogic, 0).expect("set input");
         data.op_insert_before(newext, op);
-        1
+        Ok(1)
     }
 }
 
@@ -1984,24 +1985,24 @@ impl Rule for RuleBooleanUndistribute {
         }
         Some(Box::new(RuleBooleanUndistribute))
     }
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn0 = op_in(data, op, 0);
         if !vn_written(data, vn0) {
-            return 0;
+            return Ok(0);
         }
         let vn1 = op_in(data, op, 1);
         if !vn_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let op0 = vn_def(data, vn0).expect("op0 def");
         let opc0 = op_code(data, op0);
         if opc0 != OpCode::CPUI_BOOL_AND && opc0 != OpCode::CPUI_BOOL_OR {
-            return 0;
+            return Ok(0);
         }
         let op1 = vn_def(data, vn1).expect("op1 def");
         let opc1 = op_code(data, op1);
         if opc1 != OpCode::CPUI_BOOL_AND && opc1 != OpCode::CPUI_BOOL_OR {
-            return 0;
+            return Ok(0);
         }
         let ins: [VarnodeId; 4] =
             [op_in(data, op0, 0), op_in(data, op0, 1), op_in(data, op1, 0), op_in(data, op1, 1)];
@@ -2010,7 +2011,7 @@ impl Rule for RuleBooleanUndistribute {
             || vn_free(data, ins[2])
             || vn_free(data, ins[3])
         {
-            return 0;
+            return Ok(0);
         }
         let mut isflipped = [false; 4];
         let mut central_equal = op_code(data, op) == OpCode::CPUI_INT_EQUAL;
@@ -2039,10 +2040,10 @@ impl Rule for RuleBooleanUndistribute {
             left_slot = 1;
             right_slot = 3;
         } else {
-            return 0;
+            return Ok(0);
         }
         if isflipped[left_slot] != isflipped[right_slot] {
-            return 0;
+            return Ok(0);
         }
         let combine_opc;
         if central_equal {
@@ -2077,7 +2078,7 @@ impl Rule for RuleBooleanUndistribute {
         op_set_opcode(data, op, combine_opc);
         data.op_set_input(op, tmp1, 1).expect("set input");
         data.op_set_input(op, final_a, 0).expect("set input");
-        1
+        Ok(1)
     }
 }
 

@@ -117,7 +117,7 @@ fn conditional_noreturn_blx_preserves_the_not_taken_path() {
     assert_eq!(tmode_at(&program, 0x40100a), 1, "the reachable return is Thumb");
     assert_eq!(tmode_at(&program, 0x401010), 0, "the BLX callee stays A32");
     let entry = program.find_entry_at(0x401000).unwrap();
-    let results = decompile_targets(&mut program, vec![entry], true, false, false);
+    let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     let code = results[0].code.as_deref().unwrap();
     assert!(code.contains("if (") && code.contains("exit(") && code.contains("return 7;"), "{code}");
@@ -162,7 +162,7 @@ fn disabled_noreturn_known_does_not_cut_off_thumb_flow() {
             );
             assert_eq!(tmode_at(&program, 0x401004), 1, "disabled facts must not stop the walk");
             let entry = program.find_entry_at(0x401000).unwrap();
-            let results = decompile_targets(&mut program, vec![entry], true, false, false);
+            let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
             assert!(results[0].error.is_none(), "{:?}", results[0].error);
             let code = results[0].code.clone().unwrap();
             assert!(code.contains("fastfail(") && code.contains("return 7;"), "{code}");
@@ -209,7 +209,7 @@ fn non_arm_override_preserves_odd_pe_entries() {
                 assert_eq!(entries[0].addr.get_offset(), entry, "selected x86 entry remains odd");
                 assert_eq!(entries[0].name, format!("sub_{entry:x}"));
                 assert_eq!(program.image_metadata().unwrap().entry, Some(entry));
-                let results = decompile_targets(&mut program, entries, true, false, false);
+                let results = decompile_targets(&mut program, entries, true, false, false).unwrap();
                 assert!(results[0].error.is_none(), "{:?}", results[0].error);
                 assert!(results[0].code.as_deref().unwrap().contains("return 7;"), "{:?}", results[0].code);
             }
@@ -234,7 +234,7 @@ fn arm_override_normalizes_the_pe_entry_before_naming_it() {
     assert_eq!(entries[0].addr.get_offset(), 0x401000);
     assert_eq!(entries[0].name, "sub_401000");
     assert_eq!(program.image_metadata().unwrap().entry, Some(0x401000));
-    let results = decompile_targets(&mut program, entries, true, false, false);
+    let results = decompile_targets(&mut program, entries, true, false, false).unwrap();
     assert!(results[0].error.is_none(), "{:?}", results[0].error);
     assert!(results[0].code.as_deref().unwrap().contains("return 7;"), "{:?}", results[0].code);
     let _ = std::fs::remove_file(fixture);

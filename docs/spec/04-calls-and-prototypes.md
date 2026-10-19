@@ -211,6 +211,14 @@ fixation runs in the tail. Option metadata lives in the generated catalog,
 
 ## 4.1 Prototype models
 
+DWARF function definitions supply their actual formal types and names as entry
+authority, also used by direct callers. An old-style C definition therefore
+retains its known formals even without `DW_AT_prototyped`; this does not invent
+that attribute or turn a separate unprototyped callback type into a prototype.
+An explicitly open logical C callback declaration prints `()`, while an
+explicitly closed empty declaration prints `(void)`. Source-less synthetic
+callable spelling is unchanged.
+
 ### The model
 
 A `ProtoModel` (`decompiler/crates/kuna-decomp/src/p4_calls/fspec.rs
@@ -310,8 +318,14 @@ its registered models for evaluating a function's own unlocked prototype:
 `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_evalcurrentproto.rs
 (eval_current_model_name)`). The nominated model is looked up at
 `<default_proto>` time and handed to each function through the arch handle, where
-`ActionPrototypeTypes` installs it on any prototype that is not model-locked —
-the C++ `evalfp_current` slot. Six vendored specs nominate one, always a merged
+`ActionPrototypeTypes` installs it on an eligible model-unlocked prototype —
+the C++ `evalfp_current` slot. A closed working input list already assigned
+under a concrete model retains that model, even under explicit `protoeval`:
+changing only its model would detach it from the fixed storage, and locked inputs
+do not run merged-model recovery. This operational constraint does not add an
+authored model lock to the independent source declaration. Pending or unassigned
+storage, merged models, open inputs and output-only declarations retain their
+existing evaluation paths. Six vendored specs nominate one, always a merged
 model: `x86win` (`__fastcall/__thiscall/__stdcall`), `x86borland`, `x86gcc`
 (`__cdecl/__regparm`), `CR16`, `HCS12` and `HCS12X`; every other language leaves
 the slot empty and evaluates with `<default_proto>` as before. Nominating a model
@@ -1087,9 +1101,25 @@ copies a callee's pieces into the call site, so a DWARF-described callee typed
 its arguments correctly at every call while its own decompile ignored the
 signature and re-derived it from data flow. Applying it to the function itself is
 the difference between `undefined16 main(uint4 a0, void *a1)` and
-`int main(int argc, char **argv)` on any `-g` binary. Storage assignment that
-hits an unported seam degrades gracefully — the prototype is dropped and the
-function decompiles unlocked, exactly as before.
+`int main(int argc, char **argv)` on any `-g` binary. Source declarations retain
+their complete `FuncProto`; the factory acquires an independent working copy
+and completes by-value layouts before assigning ABI storage. Acquisition and
+returned seeding errors propagate to the decompile boundary rather than
+silently discarding a declaration and analyzing the function unlocked.
+The existing `ParamUnassigned` input-error diagnostic remains distinct from
+those returned errors; neither that flag nor the model-less seed no-op proves
+that a declaration acquired usable physical storage.
+`TypeFactoryImpl::apply_source_prototype` preserves this bounded `setPieces` /
+`updateAllTypes` policy for a ready logical entry declaration without custom or
+explicit storage: assignment refusal resets only its working store and records
+`ERROR_INPUTPARAM`, leaving the canonical declaration intact. This includes a
+model returning success with missing required input or non-void output storage:
+none of that partial assignment is published. An empty assignment remains an
+error. Pending types and other errors still propagate. `acquire_working_proto`
+remains strict for physical entries, typed indirect callables, site storage and
+physical bindings.
+An entry snapshot carrying assignment diagnostics may follow its ordinary body
+route, but cannot certify a new or previously promised physical adapter.
 
 Locking the output is also what collapses the bogus wide return described under
 `ActionReturnRecovery` below: with no locked output, return recovery registers a
@@ -1116,10 +1146,12 @@ that machinery.
   in place of the model's.
 - **`ActionDefaultParams`** (`coreaction_protos.rs (ActionDefaultParams)`)
   gives every call spec a model: a callee with a source-declared prototype
-  gets a locked copy re-built from the pieces parked on its global symbol
-  (`decompiler/crates/kuna-decomp/src/infra/architecture.rs
-  (Architecture::callee_proto_pieces)`); everything else gets the
-  called-function evaluation model with a void internal store. (kuna) A
+  gets an independent working copy through
+  `ArchHandle::query_callee_proto` and
+  `TypeFactoryImpl::acquire_working_proto`; supplied locks, storage, roles and
+  effects remain independent of model-derived storage. A site prototype takes
+  precedence. Calls without a supplied prototype get the called-function
+  evaluation model with a void internal store. (kuna) A
   callee whose parked pieces contain *only* custom return storage — what the
   console `map return` plants — keeps model-driven input recovery and locks
   just the output on top. (kuna) The parked pieces describe *types*, and
@@ -1142,6 +1174,9 @@ that machinery.
   in the list, so a stack input that follows one overridden to a register keeps
   the stack offset it would have had. Pieces without explicit return storage
   allocate an indirect return as before.
+  Logical callable acquisition uses that same input-assignment helper before
+  applying the original storage overrides to its independent working copy;
+  retained source declarations and explicit result types remain unchanged.
   A CALLIND through a literal global slot has one additional early
   source: when input 0 is either the unwritten memory Varnode at that exact
   address or the result of exactly `LOAD(constant-space, constant-address)`,
@@ -1185,6 +1220,128 @@ that machinery.
   `noproto`): outputs are still guarded — otherwise callee return registers
   mis-heritage as locals — but no input recovery runs inside the reduced
   sub-decompilation.
+
+When neither the model nor `narrowext` supplies an output extension, an ordinary
+direct integer call may use a positive fact from the existing bounded
+`kuna_rustabi::probe_callee_return_writes` acquisition. A complete, straight-line
+leaf ending in a normal RETURN can prove that an actual processor-register
+ZEXT left every byte above the source result zero. Later writes invalidate
+overlapping zero bytes; low-byte writes leave higher zero bytes intact. Exact
+space identity and endian-justified low storage are required. Branches,
+calls, user operations, incomplete walks and stores into the register space
+supply no such proof. `ActionFuncLink` then inserts a post-call ZEXT to that
+proven physical container while retaining the source return type, width and
+locks. Custom or injected calls remain outside this inference. The driver
+acquires this evidence for narrow source returns, including declarations whose
+storage is still unassigned, independently of the Rust and preservation options.
+Existing may-write summaries keep their separate completeness semantics.
+
+For a locked ordinary direct call, source arity is not a negative body-read
+proof. Before heritage can discard register setup, `ActionFuncLink` also stages
+exact incoming reads proved by the existing bounded `CalleeEntryDead` producer
+and justified by an actual general-purpose register entry of the call's ABI.
+An exact containing range refines the existing operand and trial in place:
+source `DIL:1` and consumed `EDI:4` are one physical occurrence, not two raw
+arguments. Smaller reads of the same actual ABI container are coalesced with
+endian-aware containment. Aligned multi-slot entries retain their existing
+container boundaries, rather than treating the entire entry as one carrier.
+Disjoint consumed containers alone append another occurrence.
+Straddling or multiply overlapping source storage retains its existing
+occurrences; failure of optional body refinement is not an acquisition error
+or a decompilation-refusal policy. No union or missing bytes are invented.
+The real CALL operands, trials and finalized physical storage survive independently of
+the unchanged source formal list, datatype/name locks and source symbols.
+An unexplained register, incomplete read, or unsupported storage geometry adds
+nothing; this does not demand every register or invent missing formals.
+
+Ordinary direct-call C presentation may omit trailing physical dependencies only
+when both the locked callsite and the independently named target declaration
+justify the same nonvariadic source boundary. The acquired target prototype must
+satisfy existing prototype compatibility plus exact typed input/output carriers
+and roles; finalized operands must cover the source formals at the same justified
+origins. A callsite override does not replace the target's declaration. Actual
+source-query or working-acquisition errors are printing errors; an error-marked
+working prototype from bounded assignment refusal cannot authorize shortening.
+Absence keeps every operand. This presentation policy does not mutate source
+formals, callsite overrides, physical CALL/High inputs or prepared private export
+bindings, and does not certify ordinary diagnostic C as a closed physical
+executable unit.
+
+Prepared direct export delivery distinguishes the actual supplied operand from
+the bytes needed by the selected implementation. When one same-width integer
+expression contains a single proven unsigned implementation input at its
+least-significant end, the binding retains that smaller input: the existing
+typed conversion evaluates the actual operand once and delivers its low bits.
+The containment check respects register endianness; the lowest address alone
+is not sufficient. Independent supplied operands remain present. Pointer,
+floating, Boolean and unknown expressions, multiple overlapping requirements,
+non-low slices and authored sites retain their existing acquisition/merging
+policy. The direct adapter's final exact-range check is unchanged. This does not
+widen source formals, rewrite source types or names, or alter CALL operands and
+High storage; a public narrow source wrapper remains distinct from the private
+physical implementation.
+
+An instruction-local projection can require fewer bytes than its raw register
+read: an eight-byte LEA temporary truncated to four bytes does not consume the
+incoming upper half. The producer shares COPY/ADD/SUB/MULT/SUBPIECE bit-transfer
+policy with the existing dead-code owner and follows only exact local unique
+definitions. Architectural writes, flags, stores, addresses and control operands
+remain full-demand roots. Internal branches, ambiguous temporaries, unsupported
+widths or exhausted inline bounds retain raw demand. Unsupported operations
+retain every input, including a userop whose output is unused. The positive
+low-byte cover is projected with register endianness; raw read/dead evidence is unchanged.
+This adds no cross-instruction liveness or source-formal width assumption, and a
+partial operand supplies no whole-width integer-kind proof.
+
+The producer distinguishes physical consumption from preservation bookkeeping
+inside its existing pushed-private-spill owner. Exact single-use LOAD/COPY
+restoration to the same incoming register is not an argument use. External
+STORE values, pointer/address uses, arithmetic, reloads elsewhere, and stack
+values proved forwarded to another call remain consumers. Exact negative
+private STORE/LOAD saves use the architecture's existing stack-base storage;
+single-use store temporaries defer classification until that store rather than
+turning every register copy into a parameter. They also retain the existing
+store-only versus non-store distinction for convention-specific variadic-save
+policies; copying into a STORE temporary does not bypass those policies.
+An exact restore retains
+entry provenance so later uses of the restored value still count.
+An unrecognized SP assignment invalidates entry-relative frame authority;
+later constant arithmetic cannot recover privacy for an incoming-pointer store.
+Partial reloads cannot certify consumption of all saved bytes. Unknown stack argument
+counts and unresolved spill geometry are not positive consumption evidence.
+Partial saved-memory reloads use byte-address displacement and the actual
+STORE/LOAD memory-space layout. Same-endian saves preserve address order even
+on big-endian registers; only a known mixed-endian layout reverses it.
+Logical site arity, names and types remain source facts; the mere presence of a
+site override does not disprove a separately observed physical input. Its actual
+ABI model still bounds every admitted range. Explicit custom/JOIN/hidden/indirect
+storage and injection assembly retain their existing authority rather than being
+expanded as ordinary inferred inputs. Declared site arguments are never removed
+because the body does not read them.
+Nondestructive reloads retain saved-cell provenance until an actual overwrite
+or frame release, including a second reload after a preservation-only restore.
+
+Physical binding consumers read the finalized actual slot storage even for a
+locked source prototype. A narrow BOOL/enum/source slice is not a whole-carrier
+type vote or cast requirement when the proven physical geometry is wider;
+otherwise an inferred conversion could erase the very upper bits being retained.
+The original source type remains authoritative for its own exact storage and
+same-width call occurrences.
+For a wider carrier of a plain integer's least-significant source slice, the
+existing body summary can retain an anonymous whole-width integer vote: one
+actual raw operand must read every incoming byte under its slot-specific integer
+policy, and the caller's nonzero-bit mask must prove all extra upper bits zero.
+The vote is advisory, not a declared cast requirement, and competing uses follow
+the existing type order. A fitting constant alone, partial reads accumulated
+across writes, BOOL/enum/pointer slices and unknown upper bits supply no such
+authority.
+
+The query-bearing body probe, cached acquisition and forwarding readers return
+typed errors. A transport failure stops acquisition before inserting a cached
+summary; ordinary unavailable/undecodable instructions retain conservative
+unknown evidence. Cached proof predicates themselves remain ordinary Boolean
+reads. These physical operands do not turn ordinary diagnostic C or exporter
+completion into an ambient-state executable-equivalence promise.
 
 ### Trials are populated by heritage
 
@@ -1692,6 +1849,13 @@ classified:
   A register the callee only pushes above a call's stack arguments -- an
   alignment pad -- is no read either (`pushpadread`, default-on,
   `decompiler/crates/kuna-decomp/src/p4_calls/kuna_calleedeadarg.rs (at_call)`).
+  This is an exclusion over live reads, not additional argument authority:
+  saved-cell reload provenance cannot re-admit a store-only register on a
+  convention that does not mark variadic calls.
+  Conversely, a recognized push keeps its deferred push-read provenance:
+  recovering the same COPY again as ordinary STORE evidence would bypass
+  padding exclusion on conventions that do admit stores. Ordinary direct and
+  copied stores retain their existing convention policy and physical effects.
   x86 compilers align an odd number of stack arguments by pushing whatever
   register is at hand before them: gcc 9 at -O2 and gcc 11 at -Os push an `rdx`
   the body never set ahead of three bytes for `__snprintf_chk`. The push copies
@@ -2272,6 +2436,25 @@ between return recovery and dead-code elimination, **`ActionRestrictLocal`**
 unaffected-register save slots as not-mapped so the local-variable phase
 (chapter 06) cannot claim them.
 
+An unsupplied 32-bit callee-cleanup input contract has one additional physical
+witness. The existing `CalleeEntryDead` entry walk retains a uniform SP delta
+only when its complete normal returns agree. Projecting that delta additionally
+requires each raw RETURN's exact target to come from the untouched incoming
+caller-return slot; call-next's local continuation is not that slot. Unknown or
+overlapping stores, partial/unsupported SP writes, width wrapping, inconsistent
+merge states, internal flow, opaque exits and incomplete paths decline the proof.
+The working extra-pop fact is independent of ProgramDB/source declarations.
+
+After ordinary model/map derivation, `ActionInputPrototype` can complete the
+proved cleanup footprint from the resolved model's actual stack-entry geometry.
+Only uncovered slots become **unreferenced and used**, never active/body reads;
+the existing creation, ordering and type-publication path retains real input
+types and source authority. Supplied input/model contracts and custom, variadic,
+injected, inline or indirect-result interfaces are not rewritten. The inferred
+carriers describe ABI storage, not additional source values or proof of memory
+access equivalence: an O0 compiler may load otherwise unused argument storage.
+Executable consumers must still qualify their actual stack/value domain.
+
 Two registered passes are **documented no-ops** in the current port, kept in
 the schedule so the materialized tree stays byte-equal to the upstream oracle
 (00 §0.6): `ActionParamDouble` (double-precision split/join of call arguments;
@@ -2318,6 +2501,13 @@ chapter 01 §1.7, the lift-time behavior chapter 02 §2.4). Because that overrid
 already gives the call spec a model, the later exact-slot query in
 `ActionDefaultParams` declines, preserving the per-call-site priority for both
 direct and indirect calls.
+
+For an ordinary non-inline call with no modeled site override, acquiring the
+callee's complete type retains a true no-return verdict already established by
+the existing flow hook. A type source lacking that effect does not retract it.
+This preserves the normal return of an untyped function when its canary-failure
+callee has a library `void(void)` signature but independent no-return authority;
+it neither infers no-return from `void` nor relaxes return-trial ancestry.
 
 ### Effect lists
 
@@ -2506,8 +2696,9 @@ and a locked variadic prototype misreads the arguments past such storage: a
 floating-point return drops the floating-point arguments recovered past the
 fixed ones (x86-64 `xmm0`, AArch64 `d0`), and a register-pair parameter prints
 a stale value for one of its words (32-bit ARM, PowerPC, RISC-V and MIPS).
-A return value narrower than the register entry that holds it (a `char`,
-`short` or `bool`, or an `int` on a 64-bit RISC-V) is forced only where the
+When a call needs return storage beyond the declaration, a return value narrower
+than the register entry that holds it (a `char`, `short` or `bool`, or an `int`
+on a 64-bit RISC-V) is forced only where the
 caller extends it itself (x86, and AArch64 other than Apple's), the model's
 output entry extends it by its type (`extension="inttype"`: ARM, PowerPC), or
 `narrowext` states its extension (§4.4): RISC-V and LoongArch by default, MIPS
@@ -2526,6 +2717,19 @@ MIPS model states no extension, so the rest of `v0` would print as an
 unassigned piece of the result, and the RISC-V model and Apple's AArch64 one
 state zero extension, which turns a negative `signed char`, `short` or 64-bit
 RISC-V `int` result into a large positive one.
+
+The containing register's width is not itself a wider return use. Once the
+actual call's output recovery is inactive, an output whose entire physical
+range lies within the declared return storage does not depend on extension
+outside that storage, provided every retained live return trial is also
+covered by that output. The inactive flag alone does not certify consolidation
+of multiple trials. Such a call may use the declaration even when no image
+identity establishes a caller-extension rule. An active output recovery, a
+wider output, or different storage supplies no such proof; floating-point and
+variadic/JOIN admission checks remain independent. This also applies to the
+ordinary Ghidra bridge, whose numeric program/session handle is not a SLEIGH
+language/compiler identity. No target identity is inferred from that handle,
+register spellings, or assembly-rating properties.
 
 **Declared prototypes on a soft-float image.** A declaration that names no
 convention — a `--assert prototype` / `map prototype` / `parse line extern`
@@ -2547,6 +2751,10 @@ canonical-storage checks `protoorder` and `callbacktype` compare a recovered or
 declared list against, so a list is only stated to callers where they will
 read it back at the same storage. A prototype without a floating-point or
 aggregate type keeps the default model, whose storage for it is the same.
+Recovered publication uses that same effective model when constructing the
+working Code prototype; it does not reassign a validated core-register result
+under the factory's default floating-point convention. The inferred Code remains
+separate from authored source authority.
 
 Floating-point hardware comes from the same attributes: `Tag_FP_arch`,
 `Tag_Advanced_SIMD_arch` or `Tag_MVE_arch` naming an architecture
@@ -2585,7 +2793,21 @@ core registers, a structure over four bytes through a hidden pointer, and a
 homogeneous floating-point aggregate from the core registers
 (`decompiler/crates/kuna-decomp/src/p4_calls/kuna_vfpvariadic.rs (model)`). The
 derived model is chosen at the same four places as the soft-float one, so the
-function's own decompile, its callers and the console's code type agree. A
+function's own decompile, its callers and the console's code type agree.
+Canonical source publication retains that effective model's exact `Rc`, not
+just its name: the derived output rules share the default model's spelling.
+An undeclared convention stays model-unlocked; explicitly selected models
+retain their own identity and lock authority. Complete source declarations
+use the same publication policy as pieces: only an unplaced, model-unlocked
+logical declaration is eligible. An exact-entry declared model takes
+precedence over a name declaration, followed by the existing undeclared-model
+policy. A nameless prototype child uses its resolved Symbol's name; an existing
+qualified producer name is retained. A changed model or explicit authority
+copies the complete source once, preserving independent parameter/output locks,
+supplied extra-pop, usepoints,
+effects and injection; unchanged declarations retain their original owner.
+Custom storage, supplied physical placement and locked models are not
+reinterpreted by this policy. A
 non-variadic declaration, and a variadic one returning an integer or nothing,
 keep the default model, whose storage for them is the same.
 
@@ -2828,6 +3050,14 @@ latches a stack pointer too high into every later reference. The option asks
 the model states no extrapop of its own; a model that states one already has the
 exact value and is left alone, so `__cdecl`, x86-64 and every RISC spec are
 inert.
+The inference requires assigned input storage. An unassigned logical parameter
+is not evidence for an argument-less call: cleanup remains unknown until the
+existing working-ABI acquisition has supplied its physical address.
+A still-unknown working extrapop under a fixed model is completed from that
+model instead of entering the 32-bit inference. Existing numeric site facts
+win even when they differ from the model; the retained source declaration,
+including an explicitly unknown extrapop, is not rewritten. Fixed-model
+completion does not infer argument storage or alter source locks and effects.
 
 The same park is read a second time, at de-indirection. `ActionDefaultParams`
 runs once at the head of the function, when a `call dword ptr [IAT slot]` is
@@ -2895,6 +3125,12 @@ the call takes the full declaration, the class an `undefined` of the slot's widt
 (an `undefined1` array past 8 bytes), locked under the call's own `__cdecl`
 model, before `ActionFuncLink` reads it. The size is the call site's, not the
 import's; a call with no such cleanup keeps the open tail.
+Eligibility follows the exact generated source owner, recorded weakly when the
+open declaration is published. An authored replacement, even with identical
+types, retires that eligibility. Site overrides, explicit storage and a changed
+model are not completed from the old declaration. A successful completion
+extends only the generated input tail: existing prefix facts, output, cleanup,
+model, effects, injection and no-return status remain on the working owner.
 
 `k` by itself over-counts: a compiler may fold padding above the arguments, a
 local, or an earlier call's deferred pop into the same `add esp`, and any of
@@ -6138,7 +6374,9 @@ on other paths holds a frame address and is dereferenced there, which made
 of the engine's `PTRADD`/`PTRSUB` (`dereferenced`; an add of two variables
 carries nothing, since either operand could be the base); it is computed from
 the stack pointer by copies and literal offsets alone (`frame_address`);
-it is a string literal (`kuna_charptr::constant_is_string`) -- any other
+it is a string literal, including a same-width `COPY` of the literal constant
+without joining constants into the shared value family
+(`kuna_charptr::constant_is_string`) -- any other
 constant is a number as often as an address, and coreutils -O0 `tr` passes
 `squeeze_filter` the buffer size `0x2000`, which is also the address of
 `.init`; it is the result of a call whose declared prototype returns a pointer
@@ -6237,10 +6475,12 @@ return on the same callee-first surface (`decompile-all`, `decompile-project`).
 `park_recovered_proto` is set), `record` keeps the function's recovered return
 value — storage, width and type — on `Architecture::kuna_callret_types`, keyed
 by its entry, and a later decompile of the same function replaces it. Nothing
-is kept for a function with a declared prototype (libc, `libctypes`, DWARF,
-`--assert`: its callers already hold a locked output), for a `void` or
-storage-less return, for a type other than a pointer, an integer wider than a
-byte or a float (an unknown of its width is not a statement, and whether a byte
+is kept for a function with a canonical authored prototype (libc, `libctypes`,
+DWARF, `--assert`: its callers already hold the source output authority).
+An inferred `protoorder lock` parameter floor is not an authored declaration
+and does not suppress the independent recovered-return statement. Nothing is
+kept for a `void` or storage-less return, for a type other than a pointer, an
+integer wider than a byte or a float (an unknown of its width is not a statement, and whether a byte
 is a `bool` or a character is the caller's own call, `boolbyte` and `charbyte`),
 for a pointer deeper than the inferred pointer cap, or when some live RETURN hands back a value the function never
 computed (`kuna_returnuncomputed::every_return_computes_with`: a caller's
@@ -6542,7 +6782,10 @@ wrapper whose other path returns a sign-extended value, keeps the whole
 register: a narrow or `bool` type on that variable would print the other values
 converted (`return (bool)add(..)`, `return (bool)2`). When it passes, the CALL
 is made to write the narrow Varnode and a new `INT_ZEXT` after it writes the old
-output. Every reader reads the same bits it read before, now defined as the
+output. Fallible output/input mutations propagate their original typed error
+through `ActionActiveReturn`, which restores its detached call specifications
+before returning the error; a partially rewritten graph is not published as a
+successful decompilation. Every reader reads the same bits it read before, now defined as the
 extension the callee performed, which is what the locked-output path
 (`commitNewOutputs`, `narrowext`) builds for a declared narrow return; the new
 narrow Varnode is a write heritage ignores (`set_write_mask`), read only by the
@@ -7286,3 +7529,7 @@ require every reachable predecessor, including loop entry paths, to agree.
 Return recovery withdraws an unlocked ST0 trial only when every remaining
 ordinary return has that proof. Explicit and caller-forced results take priority.
 Restarting analysis clears and rebuilds the evidence.
+Function construction resolves the optional x87 storage before building its
+context. Ordinary low-level capability failures decline the proof; malformed
+replies and terminal host-transport failures propagate immediately rather than
+masquerading as absent storage.

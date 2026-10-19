@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/ForceUnionAction.java
++++ b/ghidra/app/plugin/core/decompile/actions/ForceUnionAction.java
+@@ -279,6 +279,7 @@
+ 		}
+ 		int transaction = program.startTransaction("Force Union");
+ 		try {
++			HighFunctionDBUtil.requireSourceAuthority(highFunction, parentDt);
+ 			HighFunctionDBUtil.writeUnionFacet(function, parentDt, fieldNumber, pcAddr,
+ 				dhash.getHash(), SourceType.USER_DEFINED);
+ 		}

@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
@@ -19,21 +20,21 @@ pub(super) fn build(
     bounds: &std::collections::HashMap<OpId, (u64, int4)>,
     guards: &mut Vec<(OpId, OpId)>,
     writes: &mut Vec<VarnodeId>,
-) {
+) -> KunaResult<()> {
     if stores.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(stack) = fd.get_arch().manage().get_stack_space().cloned() else {
-        return;
+        return Ok(());
     };
     if stack.get_word_size() != 1 {
-        return;
+        return Ok(());
     }
     if addr
         .get_space()
         .is_none_or(|space| !Rc::ptr_eq(space, &stack))
     {
-        return;
+        return Ok(());
     }
     for &store in stores {
         let space = fd
@@ -67,7 +68,7 @@ pub(super) fn build(
                 continue;
             }
         }
-        let indirect = fd.new_indirect_op(store, addr, size, pcodeop_flags::indirect_store);
+        let indirect = fd.new_indirect_op(store, addr, size, pcodeop_flags::indirect_store)?;
         let op = fd.obank().get(indirect).expect("spill store guard");
         let input = op.get_in(0).expect("spill store input");
         let output = op.get_out().expect("spill store output");
@@ -82,6 +83,7 @@ pub(super) fn build(
         writes.push(output);
         guards.push((indirect, store));
     }
+    Ok(())
 }
 
 /// Limit guard construction only in a closed frame with immutable pointer slots.
@@ -261,12 +263,12 @@ fn overlaps(
         || stack.wrap_offset(b.wrapping_sub(a)) < a_size as u64
 }
 
-pub(super) fn prune(fd: &mut Funcdata, guards: &[(OpId, OpId)]) {
+pub(super) fn prune(fd: &mut Funcdata, guards: &[(OpId, OpId)]) -> KunaResult<()> {
     if guards.is_empty() {
-        return;
+        return Ok(());
     }
     let Some(stack) = fd.get_arch().manage().get_stack_space().cloned() else {
-        return;
+        return Ok(());
     };
     let mut stores = Vec::new();
     let mut grouped = std::collections::HashMap::<OpId, Vec<OpId>>::new();
@@ -319,7 +321,7 @@ pub(super) fn prune(fd: &mut Funcdata, guards: &[(OpId, OpId)]) {
                     continue;
                 };
                 if !overlaps(&stack, start, size, out.get_offset(), out.get_size()) {
-                    remove(fd, indirect);
+                    remove(fd, indirect)?;
                 }
             }
         }
@@ -329,23 +331,24 @@ pub(super) fn prune(fd: &mut Funcdata, guards: &[(OpId, OpId)]) {
     }
     for &(indirect, store) in guards {
         if !resolved.contains_key(&store) {
-            remove(fd, indirect);
+            remove(fd, indirect)?;
         }
     }
+    Ok(())
 }
 
-fn remove(fd: &mut Funcdata, indirect: OpId) {
+fn remove(fd: &mut Funcdata, indirect: OpId) -> KunaResult<()> {
     let Some(op) = fd.obank().get(indirect) else {
-        return;
+        return Ok(());
     };
     if op.is_dead() || op.code() != OpCode::CPUI_INDIRECT {
-        return;
+        return Ok(());
     }
     let input = op.get_in(0).expect("spill store input");
     let output = op.get_out().expect("spill store output");
-    fd.total_replace(output, input)
-        .expect("remove spill store guard");
-    fd.op_destroy(indirect);
+    fd.total_replace(output, input)?;
+    fd.op_destroy(indirect)?;
+    Ok(())
 }
 
 fn offset(

@@ -191,7 +191,7 @@ fn w10bfa_insert_and_full_mask_absorbs() {
     set_def(&mut fd, andout, andop);
 
     let ins = mk_insert(&mut fd, 0x300, cont, andout, 0, 8);
-    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd), 1, "full mask must absorb");
+    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(), 1, "full mask must absorb");
     // INSERT value input is now `x` directly (the AND is gone).
     assert_eq!(in_of(&fd, ins, 1), x, "INSERT now feeds x directly");
 }
@@ -212,7 +212,7 @@ fn w10bfa_insert_and_partial_mask_does_not_absorb() {
     set_def(&mut fd, andout, andop);
 
     let ins = mk_insert(&mut fd, 0x300, cont, andout, 0, 8);
-    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd), 0, "partial mask must NOT absorb");
+    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(), 0, "partial mask must NOT absorb");
     assert_eq!(in_of(&fd, ins, 1), andout, "INSERT still feeds the AND output");
     assert_eq!(code_of(&fd, andop), OpCode::CPUI_INT_AND, "AND survives");
 }
@@ -268,7 +268,7 @@ fn w10bfa_shiftadd_poweroftwo_absorbs() {
     let k = 1u64 << sa; // 16
     let (mut fd, ins, a, b) = shiftadd_fixture(k, k, sa, 4);
     let rsh = fd.vbank().get(in_of(&fd, ins, 1)).unwrap().get_def().unwrap();
-    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd), 1, "power-of-two multiplies must absorb");
+    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(), 1, "power-of-two multiplies must absorb");
     // The right-shift op was rewritten to INT_ADD(a, b).
     assert_eq!(code_of(&fd, rsh), OpCode::CPUI_INT_ADD, "shift rewritten to ADD");
     assert_eq!(in_of(&fd, rsh, 0), a);
@@ -286,7 +286,7 @@ fn w10bfa_shiftadd_nonpoweroftwo_does_not_absorb() {
     let (mut fd, ins, _a, _b) = shiftadd_fixture(good, bad, sa, 4);
     let rsh = fd.vbank().get(in_of(&fd, ins, 1)).unwrap().get_def().unwrap();
     assert_eq!(
-        RuleInsertAbsorb.apply_op(ins, &mut fd),
+        RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(),
         0,
         "non-power-of-two multiply must NOT absorb"
     );
@@ -325,7 +325,7 @@ fn rightleft_fixture(c: u64, numbits: u64) -> (Funcdata, OpId, VarnodeId) {
 fn w10bfa_rightleft_narrow_field_absorbs() {
     // container in(1) = 4 bytes = 32 bits; c=8 => preserved = 24 bits; numbits=8 <= 24
     let (mut fd, ins, x) = rightleft_fixture(8, 8);
-    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd), 1, "narrow field must cancel shifts");
+    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(), 1, "narrow field must cancel shifts");
     assert_eq!(in_of(&fd, ins, 1), x, "INSERT now feeds x directly");
 }
 
@@ -335,7 +335,7 @@ fn w10bfa_rightleft_wide_field_does_not_absorb() {
     let (mut fd, ins, _x) = rightleft_fixture(8, 25);
     let before = in_of(&fd, ins, 1);
     assert_eq!(
-        RuleInsertAbsorb.apply_op(ins, &mut fd),
+        RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(),
         0,
         "field wider than preserved bits must NOT cancel"
     );
@@ -373,7 +373,7 @@ fn w10bfa_nestedand_contiguous_lsb_mask_absorbs() {
     // mask 0xff = contiguous LSB run, popcount 8 >= numbits 4 => absorb
     let (mut fd, ins, x) = nestedand_fixture(0xff, 4);
     let add = fd.vbank().get(in_of(&fd, ins, 1)).unwrap().get_def().unwrap();
-    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd), 1, "contiguous LSB mask must absorb");
+    assert_eq!(RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(), 1, "contiguous LSB mask must absorb");
     assert_eq!(in_of(&fd, add, 0), x, "ADD now feeds x directly (AND dropped)");
 }
 
@@ -383,7 +383,7 @@ fn w10bfa_nestedand_noncontiguous_mask_does_not_absorb() {
     // also (mask & 1)==0 — either guard rejects it.
     let (mut fd, ins, _x) = nestedand_fixture(0xf0, 4);
     assert_eq!(
-        RuleInsertAbsorb.apply_op(ins, &mut fd),
+        RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(),
         0,
         "non-contiguous / non-LSB mask must NOT absorb"
     );
@@ -395,7 +395,7 @@ fn w10bfa_nestedand_mask_narrower_than_field_does_not_absorb() {
     // effect on bit 3, so it must NOT be absorbed.
     let (mut fd, ins, _x) = nestedand_fixture(0x7, 4);
     assert_eq!(
-        RuleInsertAbsorb.apply_op(ins, &mut fd),
+        RuleInsertAbsorb.apply_op(ins, &mut fd).unwrap(),
         0,
         "mask popcount < bitsize must NOT absorb"
     );
@@ -429,7 +429,7 @@ fn ext_fixture(pull: OpCode, ext: OpCode) -> (Funcdata, OpId, OpId) {
 fn w10bfa_ext_matching_sign_absorbs() {
     // SEXT over SPULL => fold (the EXT becomes a PULL).
     let (mut fd, pullop, extop) = ext_fixture(OpCode::CPUI_SPULL, OpCode::CPUI_INT_SEXT);
-    assert_eq!(RulePullAbsorb.apply_op(pullop, &mut fd), 1, "SEXT/SPULL must fold");
+    assert_eq!(RulePullAbsorb.apply_op(pullop, &mut fd).unwrap(), 1, "SEXT/SPULL must fold");
     assert_eq!(code_of(&fd, extop), OpCode::CPUI_SPULL, "EXT rewritten to SPULL");
 }
 
@@ -438,7 +438,7 @@ fn w10bfa_ext_mismatched_sign_does_not_absorb() {
     // SEXT over ZPULL => signedness mismatch, MUST NOT fold.
     let (mut fd, pullop, extop) = ext_fixture(OpCode::CPUI_ZPULL, OpCode::CPUI_INT_SEXT);
     assert_eq!(
-        RulePullAbsorb.apply_op(pullop, &mut fd),
+        RulePullAbsorb.apply_op(pullop, &mut fd).unwrap(),
         0,
         "SEXT over ZPULL signedness mismatch must NOT fold"
     );

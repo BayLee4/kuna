@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import traceback
 
-from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, selected_core, start_ghidra, test_cores
 from error_recovery import field
 
 
@@ -72,7 +72,8 @@ def main():
             parser.dispose()
         assert int(factory.getSettings()) == 73
         stock = {}
-        for core, exe in (("stock", None), ("kuna", KUNA_GHIDRA)):
+        native_cases = (("stock", None), ("kuna", KUNA_GHIDRA)) if "kuna" in test_cores() else (("stock", None),)
+        for core, exe in native_cases:
             with selected_core(exe):
                 interface = DecompInterface()
                 try:
@@ -81,7 +82,9 @@ def main():
                     native = native_field.get(process_field.get(interface))
                     initial_pid = int(native.pid())
                     def check(name, invoke):
-                        row = {"core": core, "case": name}
+                        row = {"core": core, "case": name,
+                               "role": "cross-core reference input" if core == "stock" and "kuna" in test_cores()
+                                       else "product" if core == "kuna" else "stock control"}
                         report["rows"].append(row)
                         try:
                             row["value"] = invoke()

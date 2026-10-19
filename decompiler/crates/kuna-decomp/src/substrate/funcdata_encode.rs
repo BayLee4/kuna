@@ -156,7 +156,7 @@ impl Funcdata {
         // store-less proto (a partial/jump-table-recovery clone) has nothing
         // encodable; `<prototype>` is optional to HighFunction.decode.
         if self.get_func_proto().has_store() {
-            self.get_func_proto().encode(enc)?;
+            self.get_func_proto().encode_with_context(enc, crate::fspec::PrototypeEncoding::LocalDbEntry)?;
         }
         // v1.1: localoverride.encode(encoder,name)  (<override>) — Java skips it.
         enc.close_element(&ELEM_FUNCTION);
@@ -308,26 +308,32 @@ impl Funcdata {
             }
             let mut symbol_offset: i64 = -1;
             let symref: Option<u64> = if is_global_class {
-                // The global-scope symbol id + partial-offset resolution.
-                let rep_vn = self.vbank().get(rep).expect("encode_high: stale rep");
-                let rep_addr = rep_vn.get_addr().clone();
-                let rep_size = rep_vn.get_size();
-                match self.get_arch().query_container_global(
-                    &rep_addr,
-                    1,
-                    &kuna_base::address::Address::new_invalid(),
-                ) {
-                    Some(gc) if gc.symbol_id != 0 => {
-                        let delta = rep_addr.get_offset().wrapping_sub(
-                            gc.entry_addr.get_offset(),
-                        ) as i64;
-                        if delta != 0 || gc.symbol_offset != 0 {
-                            symbol_offset = delta + gc.symbol_offset as i64;
-                        }
-                        let _ = rep_size;
-                        Some(gc.symbol_id)
+                let binding = self.high_bank().get(high).expect("encode_high: stale high");
+                if let Some(symbol) = binding.kuna_global_symbol_id() {
+                    // Preserve the source binding which supplied this High's
+                    // name/type, including its original width-sensitive alias.
+                    if binding.get_symbol_offset() > 0 {
+                        symbol_offset = i64::from(binding.get_symbol_offset());
                     }
-                    _ => None,
+                    Some(symbol)
+                } else {
+                    let rep_vn = self.vbank().get(rep).expect("encode_high: stale rep");
+                    match self.get_arch().query_container_global(
+                        rep_vn.get_addr(),
+                        1,
+                        &kuna_base::address::Address::new_invalid(),
+                    )? {
+                        Some(gc) if gc.symbol_id != 0 => {
+                            let delta = rep_vn.get_addr().get_offset().wrapping_sub(
+                                gc.entry_addr.get_offset(),
+                            ) as i64;
+                            if delta != 0 || gc.symbol_offset != 0 {
+                                symbol_offset = delta + gc.symbol_offset as i64;
+                            }
+                            Some(gc.symbol_id)
+                        }
+                        _ => None,
+                    }
                 }
             } else {
                 // C++ `HighVariable::symboloffset` — written only when >= 0
@@ -428,13 +434,12 @@ impl Funcdata {
             if has_symbol || !named || self.kuna_wire_symbol_for_high.contains_key(&high) {
                 continue;
             }
-            let (rep, spacebase, implied, persist, constant, dtype) =
+            let (rep, implied, persist, constant, dtype) =
                 self.with_high_split(|hb, ctx| {
                     let h = hb.get_mut(high).expect("link_high_symbols: stale high");
                     let rep = h.get_name_representative(ctx);
                     (
                         rep,
-                        h.is_spacebase(ctx),
                         h.is_implied(ctx),
                         h.is_persist(ctx),
                         h.is_constant(ctx),
@@ -443,8 +448,11 @@ impl Funcdata {
                 });
             // Only local (non-persist) nameable storage acquires a Symbol —
             // the C++ `if (!vn->isPersist())` create guard; constants take the
-            // equate path, spacebase/implied never carry symbols.
-            if persist || constant || spacebase || implied {
+            // equate path, implied expressions do not need declarations.
+            // A named, explicit spacebase-register value is still a local:
+            // ActionNameVars::linkSymbols calls linkSymbol for it after the
+            // separate linkSpacebaseSymbol reference walk (coreaction.cc:2999).
+            if persist || constant || implied {
                 continue;
             }
             let rep_vn = match self.vbank().get(rep) {
@@ -497,7 +505,7 @@ impl Funcdata {
             // while `DynamicEntry.decode` has no size check at all.  (The
             // `is_encodable` filter on the encode is the backstop if the hash
             // also fails.)
-            let hash = if covered || dtype.get_size() < 1 {
+            let (hash, usepoint) = if covered || dtype.get_size() < 1 {
                 // The collision budget is pinned at the UPSTREAM 8 on the wire
                 // path: Java computes its own hash for the same variable with a
                 // hardcoded `maxduplicates = 8` (`DynamicHash.java:440`), and a
@@ -506,11 +514,11 @@ impl Funcdata {
                 // value must match what Java recomputes, not what kuna's own
                 // analysis is configured for.
                 match crate::dynamic::dynamic_unique_hash(rep, 8, self) {
-                    Ok((h, _)) if h != 0 => h,
+                    Ok((h, anchor)) if h != 0 => (h, anchor),
                     _ => continue, // no unique hash: stay symbol-less
                 }
             } else {
-                0
+                (0, usepoint)
             };
             let Some(id) = self
                 .get_scope_local_mut()
@@ -597,7 +605,7 @@ impl Funcdata {
     /// The **full** `<addr>` form under `<varnodes>` carries space, offset, size,
     /// ref, and the guarded flag attributes.  Do NOT use `Address::encode_sized`
     /// — it closes the element before ref/flags can be written.
-    fn encode_varnode(&self, enc: &mut dyn Encoder, vn: VarnodeId) -> KunaResult<()> {
+    pub(crate) fn encode_varnode(&self, enc: &mut dyn Encoder, vn: VarnodeId) -> KunaResult<()> {
         let v = self.vbank().get(vn).expect("encode_varnode: stale Varnode");
         enc.open_element(&ELEM_ADDR);
         v.get_space().encode_attributes_sized(enc, v.get_offset(), v.get_size())?;
@@ -630,7 +638,7 @@ impl Funcdata {
     ///
     /// `<op code>` + `<seqnum>` + the output (`<addr ref>` or `<void>`) + each
     /// input by the four-way rule (op.cc:426-462).
-    fn encode_op(&self, enc: &mut dyn Encoder, op: OpId) -> KunaResult<()> {
+    pub(crate) fn encode_op(&self, enc: &mut dyn Encoder, op: OpId) -> KunaResult<()> {
         let o = self.obank().get(op).expect("encode_op: stale op");
         let code = o.code();
         enc.open_element(&ELEM_OP);
@@ -757,7 +765,7 @@ mod tests {
         let emit = |fd: &mut Funcdata, opcode, pc, offset, inputs: &[VarnodeId]| {
             let op = new_op(fd, inputs.len() as int4, opcode, pc);
             for (slot, input) in inputs.iter().enumerate() { fd.op_set_input(op, *input, slot as int4).unwrap(); }
-            let output = fd.new_varnode(8, &Address::new(Rc::clone(&memory), offset), Some(dtype.clone()));
+            let output = fd.new_varnode(8, &Address::new(Rc::clone(&memory), offset), Some(dtype.clone())).unwrap();
             fd.op_set_output(op, output).unwrap();
             fd.op_insert_end(op, block);
             output
@@ -1019,17 +1027,17 @@ mod tests {
         // (2) A binary op with two real refs in + a ref out — normal-ref inputs
         //     and a ref output.
         let add_op = new_op(&mut fd, 2, OpCode::CPUI_INT_ADD, 0x2004);
-        let a0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None);
-        let a1 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x108), None);
-        let ao = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x110), None);
+        let a0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None).unwrap();
+        let a1 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x108), None).unwrap();
+        let ao = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x110), None).unwrap();
         fd.op_set_input(add_op, a0, 0).unwrap();
         fd.op_set_input(add_op, a1, 1).unwrap();
         fd.op_set_output(add_op, ao).unwrap();
 
         // (3) An op with a null input slot — the void INPUT branch.
         let void_op = new_op(&mut fd, 2, OpCode::CPUI_INT_ADD, 0x2008);
-        let v0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x118), None);
-        let vo = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x120), None);
+        let v0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x118), None).unwrap();
+        let vo = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x120), None).unwrap();
         fd.op_set_input(void_op, v0, 0).unwrap();
         // slot 1 left null on purpose.
         fd.op_set_output(void_op, vo).unwrap();
@@ -1038,8 +1046,8 @@ mod tests {
         //     the <spaceid> branch.
         let load_op = new_op(&mut fd, 2, OpCode::CPUI_LOAD, 0x200c);
         let space_const = fd.new_constant(8, 4); // 4 == ram's manager index
-        let ptr = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x128), None);
-        let lo = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x130), None);
+        let ptr = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x128), None).unwrap();
+        let lo = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x130), None).unwrap();
         fd.op_set_input(load_op, space_const, 0).unwrap();
         fd.op_set_input(load_op, ptr, 1).unwrap();
         fd.op_set_output(load_op, lo).unwrap();
@@ -1048,9 +1056,9 @@ mod tests {
         //     The iop annotation Varnode is in IPTR_IOP space and must be filtered
         //     out of <varnodes>.
         let ind_op = new_op(&mut fd, 2, OpCode::CPUI_INDIRECT, 0x2010);
-        let i0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x138), None);
+        let i0 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x138), None).unwrap();
         let iop_vn = fd.new_varnode_iop(ref_op);
-        let io = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x140), None);
+        let io = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x140), None).unwrap();
         fd.op_set_input(ind_op, i0, 0).unwrap();
         fd.op_set_input(ind_op, iop_vn, 1).unwrap();
         fd.op_set_output(ind_op, io).unwrap();

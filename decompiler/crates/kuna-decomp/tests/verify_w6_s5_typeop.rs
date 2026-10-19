@@ -43,6 +43,34 @@ fn factory() -> TypeFactoryImpl {
     f
 }
 
+#[test]
+fn effective_java_metadata_reaches_context_and_ir_descriptor() {
+    use kuna_decomp::context::ArchContext;
+    use kuna_decomp::kuna_lang::OutLang;
+    use kuna_decomp::typeop::effective_type_op_info;
+    let mut context = ArchContext::new(kuna_base::space::AddrSpaceManager::new());
+    context.out_lang = OutLang::Java;
+    let mut table = register_instructions();
+    select_java_operators(&mut table, true);
+    for opcode in [OpCode::CPUI_INT_ZEXT, OpCode::CPUI_INT_NEGATE,
+        OpCode::CPUI_INT_XOR, OpCode::CPUI_INT_OR, OpCode::CPUI_INT_AND,
+        OpCode::CPUI_INT_RIGHT, OpCode::CPUI_INT_SRIGHT] {
+        let local = context.type_op_info(opcode);
+        let descriptor = local.to_type_op();
+        let installed = table[opcode as usize].unwrap();
+        assert_eq!(local.metain, installed.metain);
+        assert_eq!(local.metaout, installed.metaout);
+        assert_eq!(descriptor.metain, installed.metain);
+        assert_eq!(descriptor.metaout, installed.metaout);
+        assert_eq!(descriptor.get_flags(), type_op_info(opcode).opflags);
+        assert_eq!(effective_type_op_info(opcode, OutLang::Rust).metain,
+            type_op_info(opcode).metain);
+    }
+    context.out_lang = OutLang::C;
+    assert_eq!(context.type_op_info(OpCode::CPUI_INT_RIGHT).metaout, TYPE_UINT);
+    assert_eq!(context.type_op_info(OpCode::CPUI_INT_RIGHT).name, ">>");
+}
+
 /// Walk every discriminant 0..CPUI_MAX via `OpCode::try_from(u32)` and assert the
 /// `register_instructions` slot is non-null iff that discriminant is a real,
 /// registered op-code.  This is derived from the opcode enum alone (the C++

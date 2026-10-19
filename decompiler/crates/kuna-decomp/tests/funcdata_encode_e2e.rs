@@ -542,7 +542,7 @@ fn decode_markup_refs(
 /// resulting clang `<function>` into its `(oprefs, varrefs)` sets.
 fn markup_refs_for(base: &mut Architecture, fd: &Funcdata) -> (BTreeSet<u64>, BTreeSet<u64>) {
     let mut printer = base.take_print();
-    let bytes = printer.doc_function_markup(fd, base);
+    let bytes = printer.doc_function_markup(fd, base).unwrap();
     base.put_print(printer);
     assert!(!bytes.is_empty(), "doc_function_markup produced no bytes");
     decode_markup_refs(fd.get_arch().manage(), &bytes).expect("decode markup <function>")

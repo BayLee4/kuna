@@ -35,6 +35,35 @@ impl Funcdata {
         Rc::new(Datatype::new(s, type_metatype::TYPE_UNKNOWN))
     }
 
+    /// Rebind only this fresh export's parameter symbols when its independently
+    /// acquired machine carriers differ from the source entry. The remote/source
+    /// parameter records and ordinary editable Funcdata are not modified.
+    pub(crate) fn acquire_export_working_proto(&mut self,working:&crate::fspec::FuncProto) -> KunaResult<()> {
+        let mut replace = Vec::new();
+        if let Some(scope) = self.get_scope_local() {
+            for slot in 0..self.get_func_proto().num_params().max(working.num_params()) {
+                let Some(id) = scope.parameter_symbol(slot) else { continue; };
+                let symbol = scope.database().symbol(id);
+                let same = working.get_param(slot).is_some_and(|parameter| {
+                    let typed = parameter.get_type().zip(symbol.dtype.as_ref()).is_some_and(|(new,old)|
+                        Rc::ptr_eq(new,old) || new.type_order(old).is_ok_and(|order| order == 0));
+                    typed && symbol.get_name() == parameter.get_name()
+                        && symbol.mapentry.iter().any(|&reference| {
+                        let entry = scope.database().entry(symbol.scope,reference);
+                        entry.get_addr() == &parameter.get_address() && entry.get_size() == parameter.get_size()
+                    })
+                });
+                if !same { replace.push(id); }
+            }
+        }
+        if let Some(scope) = self.get_scope_local_mut() {
+            for id in replace { scope.remove_symbol(id); }
+        }
+        self.get_func_proto_mut().copy(working);
+        self.kuna_export_working = true;
+        self.link_proto_params()
+    }
+
     /// Materialize the function's recovered/locked input parameters as Symbols in
     /// the local scope, the symbol-creation `ProtoStoreSymbol::setInput` performs
     /// (`fspec.cc:3174`) that the kuna `ProtoStoreInternal` skips.
@@ -50,14 +79,14 @@ impl Funcdata {
     /// `name_for_varnode`/`linkSymbol` resolution binds `ptr`/`a`/`b` uniformly
     /// with mapped and promoted locals.  Idempotent (see
     /// [`crate::varmap::ScopeLocal::add_param_symbol`]).
-    pub fn link_proto_params(&mut self) {
+    pub fn link_proto_params(&mut self) -> KunaResult<()> {
         if self.get_scope_local().is_none() {
-            return;
+            return Ok(());
         }
         let num = self.get_func_proto().num_params();
         // Gather (slot, name, type, addr) first; `get_param` borrows the proto and
         // `add_param_symbol` borrows the scope (both on &mut self).
-        let mut specs: Vec<(int4, String, Rc<Datatype>, Address)> = Vec::new();
+        let mut specs: Vec<(int4, String, Rc<Datatype>, Address, Address, uint4, bool)> = Vec::new();
         for i in 0..num {
             let param = match self.get_func_proto().get_param(i) {
                 Some(p) => p,
@@ -87,7 +116,12 @@ impl Funcdata {
                 i,
                 param.get_name(),
             );
-            specs.push((i, name, ty, addr));
+            let mut locks = 0;
+            if param.is_name_locked() { locks |= varnode_flags::namelock; }
+            if param.is_type_locked() { locks |= varnode_flags::typelock; }
+            if param.is_indirect_storage() { locks |= varnode_flags::indirectstorage; }
+            if param.is_hidden_return() { locks |= varnode_flags::hiddenretparm; }
+            specs.push((i, name, ty, addr, param.get_usepoint(), locks, param.is_this_pointer()));
         }
         // C++ `funcp.setScope(localmap, baseaddr + -1)` (funcdata.cc:69): the
         // function's `restricted_usepoint` is the entry address minus one, used by
@@ -95,16 +129,25 @@ impl Funcdata {
         // any scope (e.g. a register).
         let restricted_usepoint = &self.get_address().clone() + -1;
         let stack_views = self.get_arch().stack_views;
-        for (i, name, ty, addr) in specs {
-            let rup = restricted_usepoint.clone();
+        for (i, name, ty, addr, usepoint, locks, this_pointer) in specs {
+            let rup = if usepoint.is_invalid() { &restricted_usepoint } else { &usepoint };
             if let Some(lm) = self.get_scope_local_mut() {
-                if stack_views {
-                    let _ = lm.add_param_symbol_for_stack_reuse(i, &name, ty, &addr, &rup);
+                if let Some(sym) = lm.parameter_symbol(i) {
+                    lm.update_parameter_type(sym, ty)?;
+                    lm.set_parameter_attributes(sym, locks, this_pointer);
+                    continue;
+                }
+                let created = if stack_views {
+                    lm.add_param_symbol_for_stack_reuse(i, &name, ty, &addr, rup)?
                 } else {
-                    let _ = lm.add_param_symbol(i, &name, ty, &addr, &rup);
+                    lm.add_param_symbol(i, &name, ty, &addr, rup)?
+                };
+                if let Some(sym) = created.or_else(|| lm.parameter_symbol(i)) {
+                    lm.set_parameter_attributes(sym, locks, this_pointer);
                 }
             }
         }
+        Ok(())
     }
 
     /// If HighVariables are enabled, make sure the given Varnode has one assigned
@@ -308,20 +351,17 @@ impl Funcdata {
     ///
     /// `ct == None` means "use the unknown base of size `s`".
     ///
-    /// STUB(W4): the C++ then runs `localmap->queryProperties` to seed boolean
-    /// flags/type from a symbol entry; the W3 `localmap` placeholder reports no
-    /// entry, so [`Funcdata::set_varnode_properties`] (the merged `funcdata.rs`
-    /// W4 no-op) is called instead, preserving the call cadence.
-    pub fn new_varnode(&mut self, s: int4, m: &Address, ct: Option<Rc<Datatype>>) -> VarnodeId {
+    /// Resolve scope properties before returning the free Varnode; remote
+    /// acquisition failures propagate without exposing an unannotated value.
+    pub fn new_varnode(&mut self, s: int4, m: &Address, ct: Option<Rc<Datatype>>) -> KunaResult<VarnodeId> {
         let ct = ct.unwrap_or_else(|| Self::type_base_unknown(s));
         let vn = self.vbank_mut().create(s, m.clone(), ct);
         self.assign_high(vn);
         if s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
-        // uint4 vflags=0; entry = localmap->queryProperties(...); ...  -- STUB(W4)
-        self.set_varnode_properties(vn);
-        vn
+        self.set_varnode_properties_at(vn, Address::new_invalid())?;
+        Ok(vn)
     }
 
     /// Create a new free Varnode from a base space and offset
@@ -329,7 +369,7 @@ impl Funcdata {
     /// `funcdata_varnode.cc:241`).
     ///
     /// A thin wrapper over [`Funcdata::new_varnode`] that builds the Address.
-    pub fn new_varnode_space_off(&mut self, s: int4, base: Rc<AddrSpace>, off: uintb) -> VarnodeId {
+    pub fn new_varnode_space_off(&mut self, s: int4, base: Rc<AddrSpace>, off: uintb) -> KunaResult<VarnodeId> {
         let m = Address::new(base, off);
         self.new_varnode(s, &m, None)
     }
@@ -449,7 +489,7 @@ impl Funcdata {
         let func_addr = self.get_address().clone();
         let ct = types.get_type_spacebase(Rc::clone(id), &func_addr)?;
         let ptr = types.get_type_pointer(point.size as int4, ct, id.get_word_size())?;
-        let space_ptr = self.new_varnode(point.size as int4, &point_addr, Some(Rc::clone(&ptr)));
+        let space_ptr = self.new_varnode(point.size as int4, &point_addr, Some(Rc::clone(&ptr)))?;
         let space_ptr = self.set_input_varnode(space_ptr)?;
         {
             let v = self
@@ -573,7 +613,7 @@ impl Funcdata {
         if laned && s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
-        self.set_varnode_properties(vn);
+        self.set_varnode_properties(vn)?;
         Ok(vn)
     }
 
@@ -712,7 +752,7 @@ impl Funcdata {
         // First check if it overlaps any other varnode (the pure vbank read).
         if let Some(invn) = self.find_input_overlap(vn)? {
             // Identical pre-existing input: discard the candidate, return invn.
-            self.kuna_inherit_storage(invn, vn);
+            self.kuna_inherit_storage(invn, vn)?;
             return Ok(invn);
         }
         // Split-borrow both banks for the xref callback.
@@ -723,7 +763,7 @@ impl Funcdata {
             vbank.set_input(vn, &mut replace)?
         };
         self.kuna_rekey_storage_sources(original_vn, vn);
-        self.set_varnode_properties(vn);
+        self.set_varnode_properties(vn)?;
         self.apply_input_effect_marking(vn);
         Ok(vn)
     }
@@ -791,39 +831,46 @@ impl Funcdata {
     /// readonly, persist, addrtied, addrforce, indirect_creation, incidental_copy,
     /// volatil, mapped).  Used by [`Funcdata::clone_op`] when building the partial
     /// jump-table-recovery clone.
-    pub fn clone_varnode(&mut self, vn: VarnodeId) -> VarnodeId {
+    ///
+    /// Register-query failures propagate without retaining a partial cloned Varnode.
+    pub fn clone_varnode(&mut self, vn: VarnodeId) -> KunaResult<VarnodeId> {
         let (size, addr, ct, flags) = {
             let v = self.vbank().get(vn).expect("clone_varnode: stale vn");
             (v.get_size(), v.get_addr().clone(), Rc::clone(v.get_type()), v.get_flags())
         };
+        let transport = self.kuna_is_call_transport(vn)?;
         let cloned = self.clone_varnode_fields(size, addr, ct, flags);
-        let transport = self.kuna_is_call_transport(vn);
-        self.kuna_inherit_storage(cloned, vn);
+        if let Err(error) = self.kuna_inherit_storage(cloned, vn) {
+            self.delete_varnode(cloned).expect("clone_varnode: fresh clone");
+            return Err(error);
+        }
         if transport {
             self.kuna_mark_call_transport(cloned);
         }
         if let Some(size) = self.kuna_call_transport_projection_size(vn) {
             self.kuna_mark_call_transport_projection(cloned, size);
         }
-        cloned
+        Ok(cloned)
     }
 
     /// Clone a Varnode from a \e different function's bank into \b this one (the
     /// cross-function variant of [`clone_varnode`] used by `truncatedFlow`).
-    pub fn clone_varnode_from(&mut self, src: &Funcdata, vn: VarnodeId) -> VarnodeId {
+    /// Query source transport status before allocating the destination clone.
+    pub fn clone_varnode_from(&mut self, src: &Funcdata, vn: VarnodeId) -> KunaResult<VarnodeId> {
         let (size, addr, ct, flags) = {
             let v = src.vbank().get(vn).expect("clone_varnode_from: stale src vn");
             (v.get_size(), v.get_addr().clone(), Rc::clone(v.get_type()), v.get_flags())
         };
+        let transport = src.kuna_is_call_transport(vn)?;
         let cloned = self.clone_varnode_fields(size, addr, ct, flags);
         self.kuna_extend_storage_sources(cloned, src.kuna_storage_sources(vn).iter().cloned());
-        if src.kuna_is_call_transport(vn) {
+        if transport {
             self.kuna_mark_call_transport(cloned);
         }
         if let Some(size) = src.kuna_call_transport_projection_size(vn) {
             self.kuna_mark_call_transport_projection(cloned, size);
         }
-        cloned
+        Ok(cloned)
     }
 
     /// Shared body of [`clone_varnode`]/[`clone_varnode_from`]: create the new
@@ -912,7 +959,7 @@ impl Funcdata {
         }
         if let Some(defop) = def {
             let mut scratch: Vec<OpId> = Vec::new();
-            self.op_destroy_recursive(defop, &mut scratch);
+            self.op_destroy_recursive(defop, &mut scratch)?;
         }
         Ok(())
     }
@@ -1124,7 +1171,7 @@ impl Funcdata {
     /// takes.  Shared by [`link_symbol_reference`] (the attach) and
     /// [`name_undefined_spacebase_symbols`] (the namerec rename pre-pass) so the two
     /// passes resolve the identical address.
-    fn resolve_spacebase_ref_addr(&mut self, off_vn: VarnodeId) -> Option<Address> {
+    pub(crate) fn resolve_spacebase_ref_addr(&self, off_vn: VarnodeId) -> Option<Address> {
         // The PTRSUB this constant feeds.
         let op = self.lone_descend(off_vn)?;
         // The spacebase varnode.
@@ -1152,12 +1199,12 @@ impl Funcdata {
         sb.spacebase_get_address(off_const, in0_size, &op_addr, manager)
     }
 
-    fn link_symbol_reference(&mut self, off_vn: VarnodeId) -> bool {
+    fn link_symbol_reference(&mut self, off_vn: VarnodeId) -> KunaResult<bool> {
         // Resolve the referenced stack-frame address
         // (the spacebase-PTRSUB prefix shared with the rename pre-pass).
         let addr = match self.resolve_spacebase_ref_addr(off_vn) {
             Some(a) => a,
-            None => return false,
+            None => return Ok(false),
         };
         // off = (addr - entry.addr) + entry.offset.  `query_container_for_link`
         // performs exactly this lookup and offset arithmetic and returns the
@@ -1172,7 +1219,7 @@ impl Funcdata {
         // same `findContainer` + `(addr-entryAddr)+entryOffset` geometry restricted
         // to the global scope) so a mapped global array (`map addr r0x601060 int4
         // myarray[3][5]`) binds its name onto the offset constant's HighVariable.
-        // `(display_name, sym_off, sym_type, is_name_undefined)` from whichever
+        // `(display_name, sym_off, sym_type, is_name_undefined, global_symbol_id)` from whichever
         // scope contains `addr` (local stack frame first, then the global scope).
         // `info_is_global` is `true` when the `&symbol` reference resolved through the
         // GLOBAL scope (`sb->getMap()` returns `glb->getGlobalScope()` for a ram
@@ -1190,23 +1237,23 @@ impl Funcdata {
                 .and_then(|lm| lm.query_container_for_link(&addr, &sb_usepoint)));
         let info_is_global = local_hit.is_none();
         let local_sid = local_hit.as_ref().map(|i| i.symbol);
-        let resolved: Option<(String, int4, Option<Rc<Datatype>>, bool)> = match local_hit {
-            Some(i) => Some((i.display_name, i.sym_off, i.sym_type, i.is_name_undefined)),
+        let resolved: Option<(String, int4, Option<Rc<Datatype>>, bool, u64)> = match local_hit {
+            Some(i) => Some((i.display_name, i.sym_off, i.sym_type, i.is_name_undefined, 0)),
             None => {
                 // Global-scope fallback: glb->getGlobalScope()->queryContainer.  A
                 // global `map addr` symbol always has a defined name.
                 let invalid = Address::new_invalid();
                 self.get_arch()
-                    .name_for_global_varnode(&addr, 1, &invalid)
-                    .map(|(display_name, sym_off, sym_type)| {
-                        (display_name, sym_off, sym_type, false)
+                    .name_for_global_varnode(&addr, 1, &invalid)?
+                    .map(|(display_name, sym_off, sym_type, symbol_id)| {
+                        (display_name, sym_off, sym_type, false, symbol_id)
                     })
             }
         };
-        let (info_display_name, info_sym_off, info_sym_type, info_is_name_undefined) =
+        let (info_display_name, info_sym_off, info_sym_type, info_is_name_undefined, global_symbol_id) =
             match resolved {
                 Some(i) => i,
-                None => return false,
+                None => return Ok(false),
             };
         // C++ `linkSpacebaseSymbol` (coreaction.cc:3015) attaches the reference even
         // for an undefined-named Symbol, then records the offVn in `namerec` so
@@ -1222,12 +1269,12 @@ impl Funcdata {
         // A *mapped* Symbol (`map addr ... a[1]`) always has a defined name, so this
         // never suppresses the `&a` / `&myval.b` payoff.
         if info_is_name_undefined {
-            return false;
+            return Ok(false);
         }
         // Parked on the constant's HighVariable.
         let high = match self.vbank().get(off_vn).and_then(|v| v.get_high()) {
             Some(h) => h,
-            None => return false,
+            None => return Ok(false),
         };
         if let Some(h) = self.high_bank_mut().get_mut(high) {
             h.set_kuna_name(info_display_name);
@@ -1235,6 +1282,7 @@ impl Funcdata {
             if let Some(t) = info_sym_type {
                 h.set_symbol_type(t);
             }
+            h.set_kuna_global_symbol_id(global_symbol_id);
             // A reference resolved through the global scope is not a local symbol;
             // mark it so the printer's local decl loop renders it by name only.
             h.set_kuna_global(info_is_global);
@@ -1251,7 +1299,7 @@ impl Funcdata {
                 h.set_kuna_ref_symbol(sid);
             }
         }
-        true
+        Ok(true)
     }
 
     /// C++ `ActionNameVars::linkSpacebaseSymbol` (`coreaction.cc:3005`): look for
@@ -1262,13 +1310,13 @@ impl Funcdata {
     /// so the `isNameUndefined()` namerec arm — which would route an unnamed
     /// spacebase symbol through `buildDefaultName` — is a no-op for the corpus and
     /// is intentionally not reproduced (no symbol reaching here is name-undefined).
-    pub fn link_spacebase_symbol(&mut self, vn: VarnodeId) {
+    pub fn link_spacebase_symbol(&mut self, vn: VarnodeId) -> KunaResult<()> {
         let (is_const, is_input) = match self.vbank().get(vn) {
             Some(v) => (v.is_constant(), v.is_input()),
-            None => return,
+            None => return Ok(()),
         };
         if !is_const && !is_input {
-            return;
+            return Ok(());
         }
         // Snapshot the descend list (the body does not mutate it, but a snapshot
         // keeps the borrow short while link_symbol_reference takes &mut self).
@@ -1281,8 +1329,9 @@ impl Funcdata {
                 None => continue,
             };
             // namerec arm omitted (see doc).
-            let _ = self.link_symbol_reference(off_vn);
+            self.link_symbol_reference(off_vn)?;
         }
+        Ok(())
     }
 
     /// C++ `ActionNameVars::linkSpacebaseSymbol`'s namerec arm (coreaction.cc:3016)
@@ -1484,7 +1533,7 @@ impl Funcdata {
     /// distinct single-arena borrow, so the whole rewiring sequences cleanly
     /// without the `(vbank,obank)` split.
     pub fn total_replace(&mut self, vn: VarnodeId, newvn: VarnodeId) -> KunaResult<()> {
-        self.kuna_inherit_storage(newvn, vn);
+        self.kuna_inherit_storage(newvn, vn)?;
         // Snapshot the descend list (we mutate it as we go, mirroring `*iter++`).
         let readers = self.descend_snapshot(vn);
         for op in readers {
@@ -1603,7 +1652,7 @@ impl Funcdata {
         let out_size = hi_size + lo_size;
         self.delete_varnode(vn_hi)?;
         self.delete_varnode(vn_lo)?;
-        let in_vn = self.new_varnode(out_size, &addr, None);
+        let in_vn = self.new_varnode(out_size, &addr, None)?;
         let in_vn = self.set_input_varnode(in_vn)?;
         for &piece in &piece_list {
             self.op_set_input(piece, in_vn, 0)?;
@@ -1682,7 +1731,7 @@ impl Funcdata {
         }
 
         // Now create the new whole input.
-        let invn = self.new_varnode(sz, addr, None);
+        let invn = self.new_varnode(sz, addr, None)?;
         let invn = self.set_input_varnode(invn)?;
         // The new input may cause new heritage / "Heritage AFTER dead removal"
         // errors, so tell heritage to ignore it.
@@ -3303,6 +3352,77 @@ mod tests {
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
     }
 
+    #[test]
+    fn free_construction_does_not_acquire_input_or_later_definition_locks() {
+        let mut manager = build_manager();
+        let ram = Rc::clone(manager.get_space_by_name("ram").unwrap());
+        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
+            "stack", 5, 8, &ram, 1, true, false,
+        ))).unwrap();
+        let entry = Address::new(Rc::clone(&ram), 0x1000);
+        let storage = Address::new(Rc::clone(&ram), 0x38);
+        let input_usepoint = &entry + -1;
+        let later_usepoint = Address::new(Rc::clone(&ram), 0x1020);
+        let mut fd = Funcdata::new(
+            "func", "func", Rc::new(ArchContext::new(manager)), entry, 0x10000000, 0x40,
+        ).unwrap();
+        let scope = fd.get_scope_local_mut().unwrap();
+        let input_symbol = scope.add_symbol(
+            "counter", Rc::new(Datatype::new(4, type_metatype::TYPE_INT)),
+            &storage, &input_usepoint,
+        ).unwrap();
+        let later_symbol = scope.add_symbol(
+            "later_value", Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)),
+            &storage, &later_usepoint,
+        ).unwrap();
+        let locks = varnode_flags::namelock | varnode_flags::typelock;
+        scope.set_attribute(input_symbol, locks);
+        scope.set_attribute(later_symbol, locks);
+
+        let free_input = fd.new_varnode(4, &storage, None).unwrap();
+        assert!(fd.vbank().get(free_input).unwrap().is_free());
+        assert!(!fd.vbank().get(free_input).unwrap().is_mapped());
+        assert!(!fd.vbank().get(free_input).unwrap().is_name_lock());
+        let input = fd.set_input_varnode(free_input).unwrap();
+        assert!(fd.vbank().get(input).unwrap().is_name_lock());
+        assert_eq!(fd.vn_container_entry_key(input).unwrap().0, input_symbol);
+
+        let later = fd.new_varnode(4, &storage, None).unwrap();
+        assert!(!fd.vbank().get(later).unwrap().is_name_lock());
+        let definition = fd.new_op(0, later_usepoint);
+        fd.op_set_output(definition, later).unwrap();
+        assert!(fd.vbank().get(later).unwrap().is_name_lock());
+        assert_eq!(fd.vn_container_entry_key(later).unwrap().0, later_symbol);
+
+        let unrelated = fd.new_varnode(4, &storage, None).unwrap();
+        let definition = fd.new_op(0, Address::new(Rc::clone(&ram), 0x1030));
+        fd.op_set_output(definition, unrelated).unwrap();
+        assert!(!fd.vbank().get(unrelated).unwrap().is_mapped());
+        assert!(!fd.vbank().get(unrelated).unwrap().is_name_lock());
+        let wide_storage = Address::new(Rc::clone(&ram), 0x80);
+        let scope = fd.get_scope_local_mut().unwrap();
+        let wide = scope.add_symbol(
+            "wide_value", Rc::new(Datatype::new(8, type_metatype::TYPE_UINT)),
+            &wide_storage, &input_usepoint,
+        ).unwrap();
+        scope.set_attribute(wide, locks);
+        let upper = fd.new_varnode(4, &(&wide_storage + 4), None).unwrap();
+        assert!(!fd.vbank().get(upper).unwrap().is_mapped());
+        let definition = fd.new_op(0, Address::new(Rc::clone(&ram), 0x1040));
+        fd.op_set_output(definition, upper).unwrap();
+        assert!(!fd.vbank().get(upper).unwrap().is_name_lock());
+        let tied_storage = Address::new(ram, 0x48);
+        let scope = fd.get_scope_local_mut().unwrap();
+        let tied = scope.add_symbol("whole_scope", unk(4), &tied_storage, &Address::new_invalid()).unwrap();
+        scope.set_attribute(tied, locks);
+        let free = fd.new_varnode(4, &tied_storage, None).unwrap();
+        assert!(fd.vbank().get(free).unwrap().is_mapped());
+        assert!(fd.vbank().get(free).unwrap().is_name_lock());
+        let scope = fd.get_scope_local().unwrap();
+        assert!(scope.database().symbol(input_symbol).is_type_locked());
+        assert!(scope.database().symbol(later_symbol).is_type_locked());
+    }
+
     fn ram(fd: &Funcdata) -> Rc<AddrSpace> {
         Rc::clone(fd.get_arch().manage().get_space_by_name("ram").unwrap())
     }
@@ -3424,7 +3544,7 @@ mod tests {
         let mut fd = build_fd();
         let r = ram(&fd);
         let m = Address::new(r, 0x80);
-        let vn = fd.new_varnode(4, &m, None);
+        let vn = fd.new_varnode(4, &m, None).unwrap();
         let v = fd.vbank().get(vn).unwrap();
         assert!(v.is_free());
         assert_eq!(v.get_addr().get_offset(), 0x80);
@@ -3435,7 +3555,7 @@ mod tests {
     fn new_varnode_space_off_matches_new_varnode() {
         let mut fd = build_fd();
         let r = ram(&fd);
-        let vn = fd.new_varnode_space_off(2, Rc::clone(&r), 0x200);
+        let vn = fd.new_varnode_space_off(2, Rc::clone(&r), 0x200).unwrap();
         let v = fd.vbank().get(vn).unwrap();
         assert_eq!(v.get_size(), 2);
         assert_eq!(v.get_offset(), 0x200);
@@ -3481,7 +3601,7 @@ mod tests {
     fn delete_varnode_removes_free() {
         let mut fd = build_fd();
         let r = ram(&fd);
-        let vn = fd.new_varnode(4, &Address::new(r, 0x40), None);
+        let vn = fd.new_varnode(4, &Address::new(r, 0x40), None).unwrap();
         assert_eq!(fd.num_varnodes(), 1);
         fd.delete_varnode(vn).unwrap();
         assert_eq!(fd.num_varnodes(), 0);
@@ -3495,7 +3615,7 @@ mod tests {
         let mut fd = build_fd();
         let r = ram(&fd);
         fd.set_high_level();
-        let vn = fd.new_varnode(4, &Address::new(r, 0x40), None);
+        let vn = fd.new_varnode(4, &Address::new(r, 0x40), None).unwrap();
         let high = fd
             .vbank()
             .get(vn)
@@ -3585,7 +3705,7 @@ mod tests {
         }
 
         if has_definition {
-            fd.op_unset_output(op);
+            fd.op_unset_output(op).unwrap();
         } else {
             fd.op_unset_input(op, 0);
         }
@@ -3627,7 +3747,7 @@ mod tests {
         let mut fd = build_fd();
         let r = ram(&fd);
         // Free varnode read by one op.
-        let vn = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x40), None);
+        let vn = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x40), None).unwrap();
         let pc = Address::new(Rc::clone(&r), 0x1000);
         let op = fd.obank_mut().create_at(2, pc);
         fd.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
@@ -3647,7 +3767,7 @@ mod tests {
     /// `setInputVarnode` needs and is the seam owner's — see module doc).
     fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        let vn = fd.new_varnode(size, &Address::new(r, off), None);
+        let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
         fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
     }
 
@@ -3711,13 +3831,13 @@ mod tests {
         let inp = make_input(&mut fd, 0x100, 4);
         // A fresh free candidate at the same (addr,size) overlaps an identical
         // input -> returns that input.
-        let cand = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None);
+        let cand = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x100), None).unwrap();
         assert_eq!(fd.find_input_overlap(cand).unwrap(), Some(inp));
         // A non-overlapping candidate -> None.
-        let cand2 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x200), None);
+        let cand2 = fd.new_varnode(4, &Address::new(Rc::clone(&r), 0x200), None).unwrap();
         assert_eq!(fd.find_input_overlap(cand2).unwrap(), None);
         // An overlapping-but-not-identical candidate -> error.
-        let cand3 = fd.new_varnode(2, &Address::new(r, 0x101), None);
+        let cand3 = fd.new_varnode(2, &Address::new(r, 0x101), None).unwrap();
         assert!(fd.find_input_overlap(cand3).is_err());
     }
 
@@ -3730,7 +3850,7 @@ mod tests {
         let pc = Address::new(Rc::clone(&r), off);
         let defop = fd.obank_mut().create_at(1, pc);
         fd.obank_mut().change_opcode(defop, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
-        let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+        let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
         // Promote vn to written (output of defop) via the bank set_def path.
         let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
         let info = DefOpInfo { id: defop, seqnum: seq };
@@ -3769,15 +3889,109 @@ mod tests {
     }
 
     #[test]
+    fn clone_and_storage_inheritance_preserve_register_query_errors() {
+        use std::cell::Cell;
+        use kuna_base::space::{RegisterLookup, VarnodeStorage};
+
+        struct Registers {
+            successes: Cell<usize>,
+        }
+
+        impl RegisterLookup for Registers {
+            fn get_register(&self, _: &str) -> KunaResult<VarnodeStorage> {
+                Err(KunaError::lowlevel("test registers resolve by storage"))
+            }
+
+            fn get_register_name(&self, _: &Rc<AddrSpace>, _: u64, _: int4) -> KunaResult<String> {
+                let remaining = self.successes.get();
+                if remaining == 0 {
+                    return Err(KunaError::Java {
+                        type_name: "RegisterQueryRefused".into(),
+                        explain: "register query refused".into(),
+                    });
+                }
+                self.successes.set(remaining - 1);
+                Ok("test_register".into())
+            }
+
+            fn get_exact_register_name(&self, base: &Rc<AddrSpace>, off: u64, size: int4) -> KunaResult<String> {
+                self.get_register_name(base, off, size)
+            }
+        }
+
+        fn assert_query_error(error: KunaError) {
+            assert!(matches!(error, KunaError::Java { type_name, explain }
+                if type_name == "RegisterQueryRefused" && explain == "register query refused"));
+        }
+
+        let lookup = Rc::new(Registers { successes: Cell::new(0) });
+        let mut manager = build_manager();
+        manager.set_register_lookup(lookup.clone());
+        let mut context = ArchContext::new(manager);
+        context.name_style_angr = true;
+        let memory = context.manage().get_space_by_name("ram").unwrap().clone();
+        let mut fd = Funcdata::new(
+            "func", "func", Rc::new(context), Address::new(memory.clone(), 0x1000),
+            0x10000000, 0x40,
+        ).unwrap();
+        let original = fd.vbank_mut().create(4, Address::new(memory, 0x80), unk(4));
+        let original_nodes: Vec<_> = fd.vbank().iter_loc().collect();
+        for successful_queries in [0, 1] {
+            lookup.successes.set(successful_queries);
+            assert_query_error(fd.clone_varnode(original).unwrap_err());
+            assert_eq!(fd.vbank().iter_loc().collect::<Vec<_>>(), original_nodes);
+            assert!(fd.kuna_storage_sources(original).is_empty());
+        }
+
+        lookup.successes.set(0);
+        let replacement = fd.new_unique(4, None);
+        assert_query_error(fd.kuna_inherit_storage(replacement, original).unwrap_err());
+        assert!(fd.kuna_storage_sources(replacement).is_empty());
+
+        let mut destination = build_fd();
+        let destination_nodes: Vec<_> = destination.vbank().iter_loc().collect();
+        assert_query_error(destination.clone_varnode_from(&fd, original).unwrap_err());
+        assert_eq!(destination.vbank().iter_loc().collect::<Vec<_>>(), destination_nodes);
+        assert!(fd.vbank().get(original).is_some());
+
+        let extension = fd.new_op(1, fd.get_address().clone());
+        fd.op_set_opcode_code(extension, OpCode::CPUI_INT_ZEXT);
+        fd.op_set_input(extension, original, 0).unwrap();
+        let wide = fd.new_unique_out(8, extension).unwrap();
+        for operation in 0..4 {
+            let error = match operation {
+                0 => fd.op_unset_output(extension).unwrap_err(),
+                1 => fd.op_destroy(extension).unwrap_err(),
+                2 => fd.op_unlink(extension).unwrap_err(),
+                _ => fd.op_destroy_recursive(extension, &mut Vec::new()).unwrap_err(),
+            };
+            assert_query_error(error);
+            assert_eq!(fd.obank().get(extension).unwrap().get_out(), Some(wide));
+            assert_eq!(fd.obank().get(extension).unwrap().get_in(0), Some(original));
+            assert_eq!(fd.vbank().get(wide).unwrap().get_def(), Some(extension));
+            assert_eq!(fd.descend_snapshot(original), vec![extension]);
+        }
+
+        let target = fd.new_op(1, fd.get_address().clone());
+        fd.op_set_opcode_code(target, OpCode::CPUI_COPY);
+        let target_output = fd.new_unique_out(8, target).unwrap();
+        assert_query_error(fd.op_set_output(target, wide).unwrap_err());
+        assert_eq!(fd.obank().get(target).unwrap().get_out(), Some(target_output));
+        assert_eq!(fd.vbank().get(target_output).unwrap().get_def(), Some(target));
+        assert_eq!(fd.obank().get(extension).unwrap().get_out(), Some(wide));
+        assert_eq!(fd.vbank().get(wide).unwrap().get_def(), Some(extension));
+    }
+
+    #[test]
     fn storage_sources_survive_replacements_clones_and_source_deletion() {
         let mut fd = build_fd();
-        let original = fd.new_varnode(4, &Address::new(ram(&fd), 0x80), None);
+        let original = fd.new_varnode(4, &Address::new(ram(&fd), 0x80), None).unwrap();
         let first = fd.new_unique(4, None);
         fd.total_replace(original, first).unwrap();
         fd.delete_varnode(original).unwrap();
         let second = fd.new_unique(4, None);
         fd.total_replace(first, second).unwrap();
-        let cloned = fd.clone_varnode(second);
+        let cloned = fd.clone_varnode(second).unwrap();
         for vn in [first, second, cloned] {
             let sources = fd.kuna_storage_sources(vn);
             assert_eq!(sources.len(), 1);
@@ -3795,17 +4009,17 @@ mod tests {
     #[test]
     fn storage_sources_skip_constants_and_unspecified_width_changes() {
         let mut fd = build_fd();
-        let original = fd.new_varnode(4, &Address::new(ram(&fd), 0x80), None);
+        let original = fd.new_varnode(4, &Address::new(ram(&fd), 0x80), None).unwrap();
         let constant = fd.new_constant(4, 7);
         let temp = fd.new_unique(4, None);
         fd.total_replace(original, constant).unwrap();
-        fd.kuna_inherit_storage(temp, constant);
+        fd.kuna_inherit_storage(temp, constant).unwrap();
         assert!(fd.kuna_storage_sources(constant).is_empty());
         assert!(fd.kuna_storage_sources(temp).is_empty());
         let narrow = fd.new_unique(1, None);
-        fd.kuna_inherit_storage(narrow, original);
+        fd.kuna_inherit_storage(narrow, original).unwrap();
         assert!(fd.kuna_storage_sources(narrow).is_empty());
-        fd.kuna_inherit_storage_slice(narrow, original, 4, 1);
+        fd.kuna_inherit_storage_slice(narrow, original, 4, 1).unwrap();
         assert!(fd.kuna_storage_sources(narrow).is_empty());
     }
 
@@ -3818,7 +4032,7 @@ mod tests {
             "func", "func", Rc::new(context), Address::new(space.clone(), 0x1000),
             0x10000000, 0x40,
         ).unwrap();
-        let original = fd.new_varnode(4, &Address::new(space, 0x80), None);
+        let original = fd.new_varnode(4, &Address::new(space, 0x80), None).unwrap();
         let replacement = fd.new_unique(4, None);
         fd.total_replace(original, replacement).unwrap();
         assert!(fd.kuna_storage_sources(replacement).is_empty());
@@ -3827,19 +4041,19 @@ mod tests {
     #[test]
     fn storage_sources_slice_each_home_from_its_significance_offset() {
         let mut fd = build_fd();
-        let little = fd.new_varnode(8, &Address::new(ram(&fd), 0x80), None);
+        let little = fd.new_varnode(8, &Address::new(ram(&fd), 0x80), None).unwrap();
         let big_space = Rc::new(AddrSpace::new(
             spacetype::IPTR_PROCESSOR, "bigreg", true, 8, 1, 5,
             addrspace_flags::hasphysical, 1, 1,
         ));
-        let big = fd.new_varnode(8, &Address::new(big_space, 0x100), None);
+        let big = fd.new_varnode(8, &Address::new(big_space, 0x100), None).unwrap();
         let temp = fd.new_unique(8, None);
-        fd.kuna_inherit_storage(temp, little);
-        fd.kuna_inherit_storage(temp, big);
-        fd.kuna_inherit_storage(temp, little);
+        fd.kuna_inherit_storage(temp, little).unwrap();
+        fd.kuna_inherit_storage(temp, big).unwrap();
+        fd.kuna_inherit_storage(temp, little).unwrap();
         assert_eq!(fd.kuna_storage_sources(temp).len(), 2);
         let slice = fd.new_unique(2, None);
-        fd.kuna_inherit_storage_slice(slice, temp, 1, 2);
+        fd.kuna_inherit_storage_slice(slice, temp, 1, 2).unwrap();
         let sources = fd.kuna_storage_sources(slice);
         assert_eq!(sources.len(), 2);
         assert_eq!(sources[0].address.get_offset(), 0x81);
@@ -3862,7 +4076,7 @@ mod tests {
                 let constant = fd.new_constant(size, 1);
                 fd.op_set_input(op, constant, 1).unwrap();
             }
-            fd.op_destroy(op);
+            fd.op_destroy(op).unwrap();
             let sources = fd.kuna_storage_sources(input);
             if opcode == OpCode::CPUI_INT_ADD {
                 assert!(sources.is_empty());
@@ -3966,7 +4180,7 @@ mod tests {
         // lo is a real input at 0x100 size 4; hi is a *free* varnode at 0x104.
         let lo = make_input(&mut fd, 0x100, 4);
         let r = ram(&fd);
-        let hi = fd.new_varnode(4, &Address::new(r, 0x104), None);
+        let hi = fd.new_varnode(4, &Address::new(r, 0x104), None).unwrap();
         let before = fd.num_varnodes();
         let res = fd.combine_input_varnodes(hi, lo);
         assert!(res.is_err(), "non-input hi must be rejected (cc:386-387)");

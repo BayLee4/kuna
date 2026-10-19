@@ -101,6 +101,12 @@
 //! (AArch64 `adrp`+`add`, MIPS `lui`+`addiu`) states nothing: the
 //! cross-reference walk the driver asks cannot see the address taken, so the
 //! "reaches nowhere else" question has no answer and the refusal stands.
+//!
+//! Refusal is not acquisition failure. [`park`] returns a semantic [`Decline`]
+//! inside its outer [`KunaResult`]; failed host queries abort the caller before
+//! publication rather than becoming a refusal or an absent body fact. Ordinary
+//! unavailable/undecodable instructions retain the conservative policies above.
+//! [`record`] likewise finishes acquisition before changing the callback ledger.
 
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -496,38 +502,43 @@ pub fn is_callback_slot(name: &str, index: usize) -> bool {
 }
 
 /// Build the kuna [`Datatype`] for a [`Ty`].
-fn build_ty(t: Ty, arch: &Architecture) -> Option<Rc<Datatype>> {
+fn build_ty(t: Ty, arch: &Architecture) -> KunaResult<Option<Rc<Datatype>>> {
     let types = arch.types();
     let ptr = types.get_size_of_pointer();
-    let word = arch.manage().get_default_code_space()?.get_word_size();
-    match t {
-        Ty::Void => types.get_type_void().ok(),
-        Ty::Int => types.get_base(4, type_metatype::TYPE_INT).ok(),
+    let Some(space) = arch.manage().get_default_code_space() else { return Ok(None) };
+    let word = space.get_word_size();
+    Ok(Some(match t {
+        Ty::Void => types.get_type_void()?,
+        Ty::Int => types.get_base(4, type_metatype::TYPE_INT)?,
         Ty::VoidPtr => {
-            let v = types.get_type_void().ok()?;
-            types.get_type_pointer(ptr, v, word).ok()
+            let v = types.get_type_void()?;
+            types.get_type_pointer(ptr, v, word)?
         }
         Ty::CharPtr => {
-            let c = types.get_type_char(types.get_size_of_char()).ok()?;
-            types.get_type_pointer(ptr, c, word).ok()
+            let c = types.get_type_char(types.get_size_of_char())?;
+            types.get_type_pointer(ptr, c, word)?
         }
-    }
+    }))
 }
 
 /// The [`PrototypePieces`] a signature declares, named `name`.
-fn pieces_of(sig: &Sig, name: &str, arch: &Architecture) -> Option<PrototypePieces> {
+fn pieces_of(sig: &Sig, name: &str, arch: &Architecture) -> KunaResult<Option<PrototypePieces>> {
     let mut intypes = Vec::with_capacity(sig.params.len());
     for t in sig.params {
-        intypes.push(build_ty(*t, arch)?);
+        let Some(ty) = build_ty(*t, arch)? else { return Ok(None) };
+        intypes.push(ty);
     }
     // Unnamed, so each parameter takes the default name every other function's
     // parameters get, on every surface that prints one.
     let innames = vec![String::new(); intypes.len()];
     let outtype = match sig.ret {
         Ty::Void => None,
-        other => Some(build_ty(other, arch)?),
+        other => {
+            let Some(ty) = build_ty(other, arch)? else { return Ok(None) };
+            Some(ty)
+        }
     };
-    Some(PrototypePieces {
+    Ok(Some(PrototypePieces {
         name: name.to_string(),
         outtype,
         intypes,
@@ -538,15 +549,15 @@ fn pieces_of(sig: &Sig, name: &str, arch: &Architecture) -> Option<PrototypePiec
         output_storage: None,
         input_storage: Vec::new(),
         kuna_library_names: None,
-    })
+    }))
 }
 
 /// The storage the prototype model gives the library entry point's own
 /// parameters, so a callback slot's argument register is read from the
 /// program's convention rather than from an architecture table.
-fn slot_storage(e: &Entry, arch: &Architecture) -> Option<Vec<(Address, int4)>> {
+fn slot_storage(e: &Entry, arch: &Architecture) -> KunaResult<Option<Vec<(Address, int4)>>> {
     let sig = Sig { ret: Ty::Int, params: e.params };
-    let pieces = pieces_of(&sig, e.name, arch)?;
+    let Some(pieces) = pieces_of(&sig, e.name, arch)? else { return Ok(None) };
     crate::kuna_protoorder::model_storage(&pieces, arch)
 }
 
@@ -561,8 +572,8 @@ fn key_of(a: &Address) -> Option<(int4, uintb)> {
 /// again, replacing what the earlier one said, and adds its direct calls to the
 /// earlier ones: whichever body the driver keeps, every call it prints is among
 /// them. The own-facts row is written once, by the first decompile.
-pub fn record(arch: &mut Architecture, entry: &Address, fd: &Funcdata) {
-    let Some(me) = key_of(entry) else { return };
+pub fn record(arch: &mut Architecture, entry: &Address, fd: &Funcdata) -> KunaResult<()> {
+    let Some(me) = key_of(entry) else { return Ok(()) };
     let mut found: Vec<Fact> = Vec::new();
     let mut accounted: std::collections::HashSet<(crate::context::OpId, int4)> =
         std::collections::HashSet::new();
@@ -573,7 +584,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &Funcdata) {
         };
         let Some(e) = entry_for(&name) else { continue };
         let storage = fd.get_call_specs(i).final_input_storage().to_vec();
-        let Some(model) = slot_storage(e, arch) else {
+        let Some(model) = slot_storage(e, arch)? else {
             if trace() {
                 eprintln!("[callbacktype] {name}: no model storage");
             }
@@ -629,7 +640,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &Funcdata) {
             inputs,
             output,
             output_set,
-            call_return: if computes { None } else { call_return(fd, arch) },
+            call_return: if computes { None } else { call_return(fd, arch)? },
             noreturn_calls: noreturn_calls(fd),
             printed: printed_sig(proto),
         })
@@ -652,6 +663,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, fd: &Funcdata) {
     if let Some(own) = own {
         ledger.own.insert(me, own);
     }
+    Ok(())
 }
 
 /// What every direct call in this body reads of its callee's return: the low
@@ -916,7 +928,7 @@ impl Ledger {
 /// constant spacebase a `&DAT_3a72` is built as, and the copies and casts
 /// between them. Anything else -- a load, a phi, arithmetic on a base -- is not
 /// one address and answers `None`.
-fn code_address(fd: &Funcdata, vn: VarnodeId, depth: u32) -> Option<uintb> {
+pub(crate) fn code_address(fd: &Funcdata, vn: VarnodeId, depth: u32) -> Option<uintb> {
     if depth > 6 {
         return None;
     }
@@ -986,37 +998,40 @@ fn set_part(storage: Range, bits: uintb, big_endian: bool) -> Option<Range> {
 /// `strcmp` left in the register, whether the call is a `jmp` (the CALL and the
 /// RETURN are one instruction) or `call strcmp; leave; ret`. `None` when any
 /// RETURN is reached otherwise or its callee declares nothing.
-fn call_return(fd: &Funcdata, arch: &Architecture) -> Option<Range> {
+fn call_return(fd: &Funcdata, arch: &Architecture) -> KunaResult<Option<Range>> {
     let mut out: Option<Range> = None;
     for ret in fd.obank().iter_code(OpCode::CPUI_RETURN).collect::<Vec<_>>() {
         let Some(r) = fd.obank().get(ret) else { continue };
         if r.is_dead() || r.get_halt_type() != 0 {
             continue;
         }
-        let call = crate::kuna_passthrough::producing_call(fd, ret)?;
-        let c = fd.obank().get(call)?;
-        let i = (0..fd.num_calls()).find(|&i| fd.get_call_specs(i).get_op() == call)?;
+        let Some(call) = crate::kuna_passthrough::producing_call(fd, ret) else { return Ok(None) };
+        let Some(c) = fd.obank().get(call) else { return Ok(None) };
+        let Some(i) = (0..fd.num_calls()).find(|&i| fd.get_call_specs(i).get_op() == call) else {
+            return Ok(None);
+        };
         let proto = fd.get_call_specs(i).proto();
         let declared = proto
             .get_output_type()
             .is_some_and(|t| t.get_metatype() != type_metatype::TYPE_VOID);
         if !proto.is_output_locked() || !declared {
-            return None;
+            return Ok(None);
         }
         let param = proto.get_output();
         let addr = param.get_address();
-        let here = (addr.get_space()?.get_index(), addr.get_offset(), param.get_size());
-        if !straight_to_return(arch, c.get_addr(), r.get_addr(), here) {
-            return None;
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        let here = (space.get_index(), addr.get_offset(), param.get_size());
+        if !straight_to_return(arch, c.get_addr(), r.get_addr(), here)? {
+            return Ok(None);
         }
         out = Some(match out {
             None => here,
             Some(o) if contains(o, here) => here,
             Some(o) if contains(here, o) => o,
-            Some(_) => return None,
+            Some(_) => return Ok(None),
         });
     }
-    out
+    Ok(out)
 }
 
 /// How many instructions [`straight_to_return`] reads before giving up.
@@ -1034,9 +1049,9 @@ const STRAIGHT_PATH_INSTRUCTIONS: usize = 16;
 /// that returns nothing has already dropped a write to the return register as
 /// dead. An unconditional jump is followed; a `jmp` to another function is the
 /// CALL and the RETURN at one instruction, which is the empty path.
-fn straight_to_return(arch: &Architecture, call: &Address, ret: &Address, value: Range) -> bool {
+fn straight_to_return(arch: &Architecture, call: &Address, ret: &Address, value: Range) -> KunaResult<bool> {
     if call == ret {
-        return true;
+        return Ok(true);
     }
     let tr = arch.translate();
     let mut at = call.clone();
@@ -1044,7 +1059,8 @@ fn straight_to_return(arch: &Architecture, call: &Address, ret: &Address, value:
         let mut emit = RawEmit::default();
         let len = match tr.one_instruction(&mut emit, &at) {
             Ok(n) if n > 0 => n,
-            _ => return false,
+            Err(error @ KunaError::Transport { .. }) => return Err(error),
+            _ => return Ok(false),
         };
         let mut next = &at + len as i64;
         for (opc, out, ins) in &emit.ops {
@@ -1056,7 +1072,7 @@ fn straight_to_return(arch: &Architecture, call: &Address, ret: &Address, value:
                 Some((sp.get_index(), o.offset, o.size as int4))
             });
             if wrote.is_some_and(|w| overlaps(w, value)) {
-                return false;
+                return Ok(false);
             }
             match opc {
                 OpCode::CPUI_CALL
@@ -1064,27 +1080,27 @@ fn straight_to_return(arch: &Architecture, call: &Address, ret: &Address, value:
                 | OpCode::CPUI_CALLOTHER
                 | OpCode::CPUI_CBRANCH
                 | OpCode::CPUI_BRANCHIND
-                | OpCode::CPUI_RETURN => return false,
+                | OpCode::CPUI_RETURN => return Ok(false),
                 // A store through the register space is an indexed register
                 // file: which register it writes is not known.
                 OpCode::CPUI_STORE if ins.first().is_some_and(|v| v.offset as int4 == value.0) => {
-                    return false
+                    return Ok(false)
                 }
                 OpCode::CPUI_BRANCH => match ins.first().and_then(|v| v.space.clone()) {
                     Some(sp) if sp.get_type() == spacetype::IPTR_PROCESSOR => {
                         next = Address::new(sp, ins[0].offset);
                     }
-                    _ => return false,
+                    _ => return Ok(false),
                 },
                 _ => {}
             }
         }
         if next == *ret {
-            return true;
+            return Ok(true);
         }
         at = next;
     }
-    false
+    Ok(false)
 }
 
 /// The raw p-code of one machine instruction.
@@ -1254,9 +1270,10 @@ fn write_zero(code: OpCode, out: &Raw, ins: &[Raw], st: &mut ZeroState, window: 
 /// ends the path. `None` when the walk cannot finish: an indirect branch, an
 /// instruction it cannot decode, more than [`ZERO_WALK_INSTRUCTIONS`], or no
 /// RETURN at all.
-fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, stop_at: &[uintb]) -> Option<u32> {
+fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, stop_at: &[uintb]) -> KunaResult<Option<u32>> {
     let tr = arch.translate();
-    let be = entry.get_space()?.is_big_endian();
+    let Some(space) = entry.get_space() else { return Ok(None) };
+    let be = space.is_big_endian();
     let mut seen: HashMap<uintb, u32> = HashMap::new();
     let mut work: Vec<(Address, u32)> = vec![(entry.clone(), 0)];
     let mut at_return: Option<u32> = None;
@@ -1268,11 +1285,13 @@ fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, sto
             None => incoming,
         };
         seen.insert(at.get_offset(), state);
-        budget = budget.checked_sub(1)?;
+        let Some(remaining) = budget.checked_sub(1) else { return Ok(None) };
+        budget = remaining;
         let mut emit = RawEmit::default();
         let len = match tr.one_instruction(&mut emit, &at) {
             Ok(n) if n > 0 => n,
-            _ => return None,
+            Err(error @ KunaError::Transport { .. }) => return Err(error),
+            _ => return Ok(None),
         };
         let next = &at + len as i64;
         let relative = |v: &Vec<VarnodeData>| {
@@ -1285,7 +1304,7 @@ fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, sto
         let mut falls_through = true;
         for (opc, out, ins) in &emit.ops {
             match opc {
-                OpCode::CPUI_BRANCHIND => return None,
+                OpCode::CPUI_BRANCHIND => return Ok(None),
                 OpCode::CPUI_RETURN => {
                     at_return = Some(at_return.map_or(st.window, |m| m & st.window));
                     falls_through = false;
@@ -1299,7 +1318,7 @@ fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, sto
                     }
                 }
                 OpCode::CPUI_BRANCH | OpCode::CPUI_CBRANCH if !relative(ins) => {
-                    let sp = ins.first().and_then(|t| t.space.clone())?;
+                    let Some(sp) = ins.first().and_then(|t| t.space.clone()) else { return Ok(None) };
                     work.push((Address::new(sp, ins[0].offset), st.window));
                     if *opc == OpCode::CPUI_BRANCH {
                         falls_through = false;
@@ -1321,7 +1340,7 @@ fn zero_at_every_return(arch: &Architecture, entry: &Address, window: Range, sto
             work.push((next, st.window));
         }
     }
-    at_return
+    Ok(at_return)
 }
 
 /// `(declared, value)` when the body computes a return narrower than the
@@ -1346,17 +1365,17 @@ fn rest_is_zero(declared: Range, value: Range, zero: Option<u32>) -> bool {
 }
 
 /// The storage the prototype model gives a declared return value.
-fn output_storage(pieces: &PrototypePieces, arch: &Architecture) -> Option<Range> {
-    let dfp = crate::kuna_typedcallabi::undeclared_model_for(arch, pieces)
-        .or_else(|| arch.default_fp().cloned())?;
-    let void_ty = arch.types().get_type_void().ok()?;
+fn output_storage(pieces: &PrototypePieces, arch: &Architecture) -> KunaResult<Option<Range>> {
+    let Some(dfp) = crate::kuna_typedcallabi::undeclared_model_for(arch, pieces)
+        .or_else(|| arch.default_fp().cloned()) else { return Ok(None) };
+    let void_ty = arch.types().get_type_void()?;
     let types_only =
         PrototypePieces { input_storage: Vec::new(), output_storage: None, ..pieces.clone() };
     let mut fp = FuncProto::new();
-    fp.seed_locked_from_pieces(&types_only, dfp, void_ty, arch.types(), arch.manage()).ok()?;
+    fp.seed_locked_from_pieces(&types_only, dfp, void_ty, arch.types(), arch.manage())?;
     let out = fp.get_output();
     let addr = out.get_address();
-    Some((addr.get_space()?.get_index(), addr.get_offset(), out.get_size()))
+    Ok(addr.get_space().map(|space| (space.get_index(), addr.get_offset(), out.get_size())))
 }
 
 /// Does the body's own recovery contradict the declaration `sig`?
@@ -1459,46 +1478,54 @@ pub struct ImageFacts {
 }
 
 /// Park the declared prototype of the callback slot `value` was handed to.
+///
+/// A semantic refusal is the inner result; acquisition or publication errors
+/// leave through the outer channel without declaring or withdrawing a prototype.
 pub fn park(
     arch: &mut Architecture,
     entry: &Address,
     name: &str,
     image: ImageFacts,
-) -> Result<PrototypePieces, Decline> {
+) -> KunaResult<Result<PrototypePieces, Decline>> {
     let Some(row) = arch.kuna_callbacktype.decided().remove(&entry.get_offset()) else {
-        return Err(Decline::NotATarget);
+        return Ok(Err(Decline::NotATarget));
     };
     if !image.is_target {
-        return Err(Decline::NotATarget);
+        return Ok(Err(Decline::NotATarget));
     }
     if row.conflict {
-        return Err(Decline::Conflict);
+        return Ok(Err(Decline::Conflict));
     }
     if image.escapes || row.other_use {
-        return Err(Decline::Escapes);
+        return Ok(Err(Decline::Escapes));
     }
     if arch.symboltab.function_proto_pieces_across_scopes(entry).is_some() {
-        return Err(Decline::Declared);
+        return Ok(Err(Decline::Declared));
     }
-    let key = key_of(entry).ok_or(Decline::StorageUnderivable)?;
-    let own = arch.kuna_callbacktype.own.get(&key).cloned().ok_or(Decline::BodyNotSeen)?;
-    let pieces = pieces_of(&row.sig, name, arch).ok_or(Decline::StorageUnderivable)?;
-    let storage =
-        crate::kuna_protoorder::model_storage(&pieces, arch).ok_or(Decline::StorageUnderivable)?;
+    let Some(key) = key_of(entry) else { return Ok(Err(Decline::StorageUnderivable)) };
+    let Some(own) = arch.kuna_callbacktype.own.get(&key).cloned() else {
+        return Ok(Err(Decline::BodyNotSeen));
+    };
+    let Some(pieces) = pieces_of(&row.sig, name, arch)? else {
+        return Ok(Err(Decline::StorageUnderivable));
+    };
+    let Some(storage) = crate::kuna_protoorder::model_storage(&pieces, arch)? else {
+        return Ok(Err(Decline::StorageUnderivable));
+    };
     if storage.len() != pieces.intypes.len() {
-        return Err(Decline::StorageUnderivable);
+        return Ok(Err(Decline::StorageUnderivable));
     }
     let declared_in: Vec<Range> = storage.iter().map(|(a, size)| range_of(a, *size)).collect();
-    let declared_out = output_storage(&pieces, arch);
+    let declared_out = output_storage(&pieces, arch)?;
     if let Some(why) =
         body_contradicts(&own, &row.sig, image.called_directly, &declared_in, declared_out)
     {
-        return Err(why);
+        return Ok(Err(why));
     }
     if arch.kuna_callbacktype.reads_of(entry.get_offset()).any(|read| {
         declared_out.is_none_or(|declared| !contains(declared, read))
     }) {
-        return Err(Decline::CallerReadsAWiderReturn);
+        return Ok(Err(Decline::CallerReadsAWiderReturn));
     }
     if image.called_directly {
         let returns = row.sig.ret != Ty::Void;
@@ -1507,25 +1534,29 @@ pub fn park(
         if let Some(why) =
             ledger.direct_calls_disagree(entry.get_offset(), callers, pieces.intypes.len(), returns)
         {
-            return Err(why);
+            return Ok(Err(why));
         }
     }
     if let Some((declared, value)) = narrower_output(&own, &row.sig, declared_out) {
-        let zero = zero_at_every_return(arch, entry, declared, &own.noreturn_calls);
+        let zero = zero_at_every_return(arch, entry, declared, &own.noreturn_calls)?;
         if !rest_is_zero(declared, value, zero) {
-            return Err(Decline::NarrowerOutputThanDeclared);
+            return Ok(Err(Decline::NarrowerOutputThanDeclared));
         }
     }
     if trace() && row.sig.ret != Ty::Void && !own.returns_a_value {
         eprintln!("[callbacktype] {name}: the return is a call's declared value");
     }
-    if crate::kuna_protoorder::reads_past_the_list(arch, entry, &pieces, &storage) {
-        return Err(Decline::ReadsPastTheList);
+    if crate::kuna_protoorder::reads_past_the_list(arch, entry, &pieces, &storage)? {
+        return Ok(Err(Decline::ReadsPastTheList));
     }
     if agrees(own.printed.as_ref(), &pieces) {
-        return Err(Decline::Agrees);
+        return Ok(Err(Decline::Agrees));
     }
-    arch.set_function_prototype_pieces_at(entry, pieces.clone());
+    match arch.set_recovered_function_prototype_pieces_at(entry, pieces.clone()) {
+        Ok(()) => {}
+        Err(error @ KunaError::Transport { .. }) => return Err(error),
+        Err(_) => return Ok(Err(Decline::StorageUnderivable)),
+    }
     // The declaration replaces what the run recovered: `protoorder`'s
     // statement and `calleevote`'s decision would otherwise still type the
     // parameters, and a parked callback that calls another reads both.
@@ -1534,7 +1565,7 @@ pub fn park(
         arch.kuna_calleevote.forget(key);
         arch.kuna_calleevote.own.remove(&key);
     }
-    Ok(pieces)
+    Ok(Ok(pieces))
 }
 
 #[cfg(test)]

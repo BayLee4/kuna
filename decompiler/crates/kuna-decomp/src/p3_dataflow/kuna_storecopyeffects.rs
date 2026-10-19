@@ -4,10 +4,11 @@
 
 use crate::context::{OpId, VarnodeId};
 use crate::funcdata::Funcdata;
+use kuna_base::error::KunaResult;
 use kuna_base::space::spacetype;
 use kuna_num::opcodes::OpCode;
 
-pub(crate) fn collapse(data: &mut Funcdata, copy: OpId) {
+pub(crate) fn collapse(data: &mut Funcdata, copy: OpId) -> KunaResult<()> {
     let mut effects = Vec::new();
     let mut prev = data.op_previous_op(copy);
     while let Some(op) = prev {
@@ -26,11 +27,12 @@ pub(crate) fn collapse(data: &mut Funcdata, copy: OpId) {
         }
     }
     for effect in effects {
-        resolve(data, copy, effect);
+        resolve(data, copy, effect)?;
     }
+    Ok(())
 }
 
-fn resolve(data: &mut Funcdata, copy: OpId, effect: OpId) {
+fn resolve(data: &mut Funcdata, copy: OpId, effect: OpId) -> KunaResult<()> {
     let written = data
         .obank()
         .get(copy)
@@ -44,10 +46,9 @@ fn resolve(data: &mut Funcdata, copy: OpId, effect: OpId) {
     let v = data.vbank().get(out).unwrap();
     let overlap = w.characterize_overlap(v);
     if overlap == 0 {
-        data.total_replace(out, old)
-            .expect("storecopyeffects: disjoint effect");
-        data.op_destroy(effect);
-        return;
+        data.total_replace(out, old)?;
+        data.op_destroy(effect)?;
+        return Ok(());
     }
     if overlap == 2 {
         data.op_uninsert(effect);
@@ -56,7 +57,7 @@ fn resolve(data: &mut Funcdata, copy: OpId, effect: OpId) {
         data.op_remove_input(effect, 1);
         data.op_set_opcode(effect, crate::typeop::type_op_for(OpCode::CPUI_COPY));
         data.op_insert_after(effect, copy);
-        return;
+        return Ok(());
     }
     let big = w.get_space().is_big_endian();
     let wlo = w.get_offset();
@@ -118,6 +119,7 @@ fn resolve(data: &mut Funcdata, copy: OpId, effect: OpId) {
         }
     }
     data.op_insert_after(effect, anchor);
+    Ok(())
 }
 
 fn slice(

@@ -100,7 +100,7 @@ fn mk_op(fd: &mut Funcdata, bl: BlockId, off: u64, ninput: int4, opc: OpCode) ->
 
 /// The spacebase input Varnode at the SP register location.
 fn make_sp_in(fd: &mut Funcdata) -> VarnodeId {
-    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None);
+    let vn = fd.new_varnode(SP_SIZE, &reg_addr(fd, SP_OFF), None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }
 
@@ -122,7 +122,7 @@ fn is_stack_relative_recognizes_base_and_offset() {
     let c = fd.new_constant(SP_SIZE, 0xffff_ffff_ffff_fff0);
     fd.op_set_input(addop, sp_in, 0).unwrap();
     fd.op_set_input(addop, c, 1).unwrap();
-    let ptr = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x40), None);
+    let ptr = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x40), None).unwrap();
     fd.op_set_output(addop, ptr).unwrap();
 
     assert_eq!(
@@ -138,13 +138,13 @@ fn is_stack_relative_rejects_non_relative() {
     let sp_in = make_sp_in(&mut fd);
 
     // other = INT_ADD(notSp, const) — base is not the SP input.
-    let other = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x80), None);
+    let other = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x80), None).unwrap();
     let other_in = fd.set_input_varnode(other).unwrap();
     let addop = mk_op(&mut fd, bl, 0x14, 2, OpCode::CPUI_INT_ADD);
     let c = fd.new_constant(SP_SIZE, 0x10);
     fd.op_set_input(addop, other_in, 0).unwrap();
     fd.op_set_input(addop, c, 1).unwrap();
-    let outv = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x48), None);
+    let outv = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x48), None).unwrap();
     fd.op_set_output(addop, outv).unwrap();
 
     assert_eq!(super::is_stack_relative(&fd, sp_in, outv), None);
@@ -153,7 +153,7 @@ fn is_stack_relative_rejects_non_relative() {
     let addop2 = mk_op(&mut fd, bl, 0x18, 2, OpCode::CPUI_INT_ADD);
     fd.op_set_input(addop2, sp_in, 0).unwrap();
     fd.op_set_input(addop2, other_in, 1).unwrap();
-    let outv2 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x50), None);
+    let outv2 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, 0x50), None).unwrap();
     fd.op_set_output(addop2, outv2).unwrap();
     assert_eq!(super::is_stack_relative(&fd, sp_in, outv2), None);
 }
@@ -175,12 +175,12 @@ fn stacksolver_solves_add_chain() {
     let c8 = fd.new_constant(SP_SIZE, 8);
     fd.op_set_input(add1, sp_in, 0).unwrap();
     fd.op_set_input(add1, c8, 1).unwrap();
-    let v1 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let v1 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(add1, v1).unwrap();
 
     let stackspc = stack_space(&fd);
     let mut solver = super::StackSolver::new();
-    assert!(solver.build(&fd, &stackspc, 0).is_ok());
+    assert!(solver.build(&fd, &stackspc, 0).unwrap());
     // Two spacebase references: the input (var0) and v1 (var1).
     assert_eq!(solver.vnlist.len(), 2);
     solver.solve();
@@ -203,12 +203,12 @@ fn stacksolver_propagate_uses_guess_for_indirect() {
     // (the call-spec lookup is the seam — no fc found -> guess path).
     let iop = fd.new_constant(SP_SIZE, 0);
     fd.op_set_input(indop, iop, 1).unwrap();
-    let ind = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let ind = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(indop, ind).unwrap();
 
     let stackspc = stack_space(&fd);
     let mut solver = super::StackSolver::new();
-    assert!(solver.build(&fd, &stackspc, 0).is_ok());
+    assert!(solver.build(&fd, &stackspc, 0).unwrap());
     assert_eq!(solver.vnlist.len(), 2);
     // No known equation for var1, only a guess (rhs=4) -> solve propagates it.
     solver.solve();
@@ -249,14 +249,14 @@ fn check_clog_folds_load_to_copy() {
     let sid_load = fd.new_constant(8, stack_idx);
     fd.op_set_input(loadop, sid_load, 0).unwrap();
     fd.op_set_input(loadop, sp_in, 1).unwrap();
-    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None);
+    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None).unwrap();
     fd.op_set_output(loadop, ld).unwrap();
 
     // newsp = INT_ADD(sp_in, ld)  output at the SP location.
     let addop = mk_op(&mut fd, bl, 0x18, 2, OpCode::CPUI_INT_ADD);
     fd.op_set_input(addop, sp_in, 0).unwrap();
     fd.op_set_input(addop, ld, 1).unwrap();
-    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(addop, newsp).unwrap();
 
     let repaired = super::check_clog(&mut fd, &stackspc, 0);
@@ -286,13 +286,13 @@ fn check_clog_no_store_is_noop() {
     let sid_load = fd.new_constant(8, stack_idx);
     fd.op_set_input(loadop, sid_load, 0).unwrap();
     fd.op_set_input(loadop, sp_in, 1).unwrap();
-    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None);
+    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None).unwrap();
     fd.op_set_output(loadop, ld).unwrap();
 
     let addop = mk_op(&mut fd, bl, 0x18, 2, OpCode::CPUI_INT_ADD);
     fd.op_set_input(addop, sp_in, 0).unwrap();
     fd.op_set_input(addop, ld, 1).unwrap();
-    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(addop, newsp).unwrap();
 
     let repaired = super::check_clog(&mut fd, &stackspc, 0);
@@ -360,12 +360,12 @@ fn adv_w10_stacksolver_negative_solution_sign_extends() {
     let cneg = fd.new_constant(SP_SIZE, 0xffff_ffff_ffff_ffe8); // -0x18 as uintb
     fd.op_set_input(add1, sp_in, 0).unwrap();
     fd.op_set_input(add1, cneg, 1).unwrap();
-    let v1 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let v1 = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(add1, v1).unwrap();
 
     let stackspc = stack_space(&fd);
     let mut solver = super::StackSolver::new();
-    assert!(solver.build(&fd, &stackspc, 0).is_ok());
+    assert!(solver.build(&fd, &stackspc, 0).unwrap());
     assert_eq!(solver.vnlist.len(), 2);
     solver.solve();
     // rhs was stored as the truncated int4 of -0x18; the solution is negative.
@@ -401,7 +401,7 @@ fn adv_w10_repair_overlapping_store_rejects_fold() {
     let c4 = fd.new_constant(SP_SIZE, 4);
     fd.op_set_input(add4, sp_in, 0).unwrap();
     fd.op_set_input(add4, c4, 1).unwrap();
-    let ptr4 = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x200), None);
+    let ptr4 = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x200), None).unwrap();
     fd.op_set_output(add4, ptr4).unwrap();
 
     let storeop = mk_op(&mut fd, bl, 0x10, 3, OpCode::CPUI_STORE);
@@ -416,14 +416,14 @@ fn adv_w10_repair_overlapping_store_rejects_fold() {
     let sid_load = fd.new_constant(8, stack_idx);
     fd.op_set_input(loadop, sid_load, 0).unwrap();
     fd.op_set_input(loadop, sp_in, 1).unwrap();
-    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None);
+    let ld = fd.new_varnode(SP_SIZE, &ram_addr(&fd, 0x100), None).unwrap();
     fd.op_set_output(loadop, ld).unwrap();
 
     // newsp = INT_ADD(sp_in, ld) at SP -> the clog driving check_clog.
     let addop = mk_op(&mut fd, bl, 0x18, 2, OpCode::CPUI_INT_ADD);
     fd.op_set_input(addop, sp_in, 0).unwrap();
     fd.op_set_input(addop, ld, 1).unwrap();
-    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None);
+    let newsp = fd.new_varnode(SP_SIZE, &reg_addr(&fd, SP_OFF), None).unwrap();
     fd.op_set_output(addop, newsp).unwrap();
 
     let repaired = super::check_clog(&mut fd, &stackspc, 0);
@@ -507,7 +507,7 @@ fn adv_w10_rspelim_analyze_extrapop_known_defaultfp_suppresses_solve() {
 
     let stackspc = stack_space(&fd);
     let before = fd.obank().iter_all().count();
-    let r = super::analyze_extra_pop(&mut fd, &stackspc, 0);
+    let r = super::analyze_extra_pop(&mut fd, &stackspc, 0).unwrap();
     let after = fd.obank().iter_all().count();
     assert_eq!(r, 0, "known defaultfp extrapop suppresses the solve (returns 0)");
     assert_eq!(before, after, "suppressed path must create no ops / touch nothing");
@@ -541,9 +541,9 @@ fn adv_w10_rspelim_analyze_extrapop_unknown_defaultfp_does_not_suppress() {
     let stackspc = stack_space(&fd);
     // Empty frame: the solver builds, finds no variables, returns 0 — but the
     // important fact is the guard did NOT early-return on the unknown model.
-    let r = super::analyze_extra_pop(&mut fd, &stackspc, 0);
+    let r = super::analyze_extra_pop(&mut fd, &stackspc, 0).unwrap();
     assert_eq!(r, 0, "empty frame yields no change regardless");
     // Re-running is idempotent (determinism on the unknown path).
-    let r2 = super::analyze_extra_pop(&mut fd, &stackspc, 0);
+    let r2 = super::analyze_extra_pop(&mut fd, &stackspc, 0).unwrap();
     assert_eq!(r, r2, "unknown-model path is deterministic across runs");
 }

@@ -49,6 +49,7 @@
 use kuna_base::address::mostsigbit_set;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uint4, uintb};
+use crate::comment::comment_type;
 
 /// Syntax-highlight class for an emitted token.
 ///
@@ -320,19 +321,23 @@ pub struct Atom {
     pub data: AtomData,
     /// The offset (within the parent structure) for a field token (C++ `offset`).
     pub offset: int4,
+    /// Exact datatype associated with this leaf, not the whole declarator.
+    pub datatype: Option<std::rc::Rc<crate::dtype::Datatype>>,
+    /// Exact type substring when surrounding compound-literal syntax shares an atom.
+    pub datatype_range: Option<std::ops::Range<usize>>,
 }
 
 impl Atom {
     /// Construct a token with no associated data-flow annotations
     /// (C++ `Atom(nm,t,hl)`, printlanguage.hh:225-226).
     pub fn syntax(name: impl Into<String>, tag: TagType, hl: SyntaxHighlight) -> Atom {
-        Atom { name: name.into(), tag, highlight: hl, op: None, data: AtomData::None, offset: 0 }
+        Atom { name: name.into(), tag, highlight: hl, op: None, data: AtomData::None, offset: 0, datatype: None, datatype_range: None }
     }
 
     /// Construct a token for a data-type name (C++ `Atom(nm,t,hl,c)`,
     /// printlanguage.hh:229-230).
     pub fn typed(name: impl Into<String>, tag: TagType, hl: SyntaxHighlight, ct: usize) -> Atom {
-        Atom { name: name.into(), tag, highlight: hl, op: None, data: AtomData::Ct(ct), offset: 0 }
+        Atom { name: name.into(), tag, highlight: hl, op: None, data: AtomData::Ct(ct), offset: 0, datatype: None, datatype_range: None }
     }
 
     /// Construct a token for a field name (C++ `Atom(nm,t,hl,c,off,o)`,
@@ -352,6 +357,8 @@ impl Atom {
             op: Some(op),
             data: AtomData::Ct(ct),
             offset: off,
+            datatype: None,
+            datatype_range: None,
         }
     }
 
@@ -365,6 +372,8 @@ impl Atom {
             op: Some(op),
             data: AtomData::None,
             offset: 0,
+            datatype: None,
+            datatype_range: None,
         }
     }
 
@@ -384,6 +393,8 @@ impl Atom {
             op: Some(op),
             data: AtomData::Vn(vn),
             offset: 0,
+            datatype: None,
+            datatype_range: None,
         }
     }
 
@@ -403,6 +414,8 @@ impl Atom {
             op: Some(op),
             data: AtomData::Fd(fd),
             offset: 0,
+            datatype: None,
+            datatype_range: None,
         }
     }
 
@@ -419,7 +432,17 @@ impl Atom {
     ) -> Atom {
         let data =
             if tag == TagType::CaseToken { AtomData::IntValue(int_value) } else { AtomData::Vn(vn) };
-        Atom { name: name.into(), tag, highlight: hl, op: Some(op), data, offset: 0 }
+        Atom { name: name.into(), tag, highlight: hl, op: Some(op), data, offset: 0, datatype: None, datatype_range: None }
+    }
+
+    pub fn with_datatype(mut self, datatype: &std::rc::Rc<crate::dtype::Datatype>) -> Self {
+        self.datatype = Some(std::rc::Rc::clone(datatype));
+        self
+    }
+
+    pub fn with_datatype_range(mut self, range: std::ops::Range<usize>) -> Self {
+        self.datatype_range = Some(range);
+        self
     }
 }
 
@@ -427,21 +450,6 @@ impl Atom {
 pub const OPEN_PAREN: &str = "(";
 /// The `")"` token (C++ `PrintLanguage::CLOSE_PAREN`).
 pub const CLOSE_PAREN: &str = ")";
-
-/// Comment-type bits this base touches (C++ `Comment::*`, comment.hh).  Only the
-/// bits `resetDefaultsInternal` ORs together are needed here.  STUB(comment): the
-/// full set lives in the (stub) `comment` module.
-pub mod comment_type {
-    use super::uint4;
-    /// `Comment::warning` — an in-body warning comment.
-    pub const WARNING: uint4 = 2;
-    /// `Comment::user2` — a user instruction comment.
-    pub const USER2: uint4 = 4;
-    /// `Comment::header` — a function-header comment.
-    pub const HEADER: uint4 = 8;
-    /// `Comment::warningheader` — a warning in the function header.
-    pub const WARNINGHEADER: uint4 = 16;
-}
 
 /// The printing-context state shared by every back-end: the printing-modification
 /// stack, the symbol-scope stack, and the active mods word.
@@ -470,6 +478,8 @@ pub struct PrintContext {
     instr_comment_type: uint4,
     /// Type of header comments to display (C++ `head_comment_type`).
     head_comment_type: uint4,
+    /// Use C++ line comments rather than C block comments.
+    pub(crate) line_comment_style: bool,
     /// How namespace tokens are displayed (C++ `namespc_strategy`).
     namespc_strategy: NamespaceStrategy,
 }
@@ -493,6 +503,7 @@ impl PrintContext {
             line_commentindent: 0,
             instr_comment_type: 0,
             head_comment_type: 0,
+            line_comment_style: false,
             namespc_strategy: NamespaceStrategy::MinimalNamespaces,
         };
         ctx.reset_defaults_internal();
@@ -506,6 +517,18 @@ impl PrintContext {
         self.line_commentindent = 20;
         self.namespc_strategy = NamespaceStrategy::MinimalNamespaces;
         self.instr_comment_type = comment_type::USER2 | comment_type::WARNING;
+        self.line_comment_style = false;
+    }
+
+    pub(crate) fn document_checkpoint(&self) -> (usize, usize, Option<usize>, uint4) {
+        (self.modstack.len(), self.scopestack.len(), self.curscope, self.mods)
+    }
+
+    pub(crate) fn restore_document(&mut self, state: (usize, usize, Option<usize>, uint4)) {
+        self.modstack.truncate(state.0);
+        self.scopestack.truncate(state.1);
+        self.curscope = state.2;
+        self.mods = state.3;
     }
 
     // -- Routines consistent across languages (printlanguage.hh:285-291) -----

@@ -106,20 +106,21 @@ impl Rule for RuleRodataStringCopy {
         }))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if !self.enabled && !data.get_arch().rodata_string {
-            return 0;
+            return Ok(0);
         }
-        match try_recover(op, data) {
-            Some(seq) if seq.transform_rodata(data) => 1,
+        Ok(match try_recover(op, data)? {
+            Some(seq) if seq.transform_rodata(data)? => 1,
             _ => 0,
-        }
+        })
     }
 }
 
 /// Everything up to (but not including) the rewrite: validate `root` as a
 /// member of a read-only string block copy and assemble the sequence.
-fn try_recover(root: OpId, data: &mut Funcdata) -> Option<StringSequence> {
+fn try_recover(root: OpId, data: &mut Funcdata) -> KunaResult<Option<StringSequence>> {
+    let candidate = (|| {
     let block = data.obank().get(root)?.get_parent()?;
     let op_addr = data.obank().get(root)?.get_addr().clone();
 
@@ -146,9 +147,15 @@ fn try_recover(root: OpId, data: &mut Funcdata) -> Option<StringSequence> {
     if src_size != dst_size {
         return None;
     }
+    Some((block, op_addr, dst_addr, src_addr, src_size))
+    })();
+    let Some((block, op_addr, dst_addr, src_addr, src_size)) = candidate else { return Ok(None) };
 
     // --- the covering string symbol the string-literal analysis planted ---
-    let container = data.get_arch().query_container_global(&src_addr, src_size, &op_addr)?;
+    let Some(container) = data.get_arch().query_container_global(&src_addr, src_size, &op_addr)? else {
+        return Ok(None);
+    };
+    let plan = (|| {
     let sym_type = container.symbol_type.clone()?;
     if sym_type.get_metatype() != type_metatype::TYPE_ARRAY || sym_type.is_opaque_string() {
         return None;
@@ -195,12 +202,6 @@ fn try_recover(root: OpId, data: &mut Funcdata) -> Option<StringSequence> {
         return None;
     }
 
-    // --- the bytes themselves: exactly one NUL-terminated string ---
-    let bytes = read_image(data, &str_addr, str_len)?;
-    if bytes[str_len as usize - 1] != 0 || bytes[..str_len as usize - 1].contains(&0) {
-        return None;
-    }
-
     // The `char` the pointer-identity check in `selectStringCopyFunction` wants,
     // and a synthesized `char[n]` container so `constructTypedPointer` walks
     // straight down to a `char *` at `dst_start` (no PTRADD, no residual add).
@@ -228,9 +229,18 @@ fn try_recover(root: OpId, data: &mut Funcdata) -> Option<StringSequence> {
             )
         })
         .collect();
-    Some(StringSequence::from_rodata_run(
+    Some((str_addr, str_len, char_type, entry, dst_start, move_ops))
+    })();
+    let Some((str_addr, str_len, char_type, entry, dst_start, move_ops)) = plan else { return Ok(None) };
+    // Validate the image bytes before rewriting; a failed acquisition is not a
+    // mismatch against the string pattern.
+    let bytes = read_image(data, &str_addr, str_len)?;
+    if bytes[str_len as usize - 1] != 0 || bytes[..str_len as usize - 1].contains(&0) {
+        return Ok(None);
+    }
+    Ok(Some(StringSequence::from_rodata_run(
         char_type, entry, root, block, dst_start, move_ops, bytes,
-    ))
+    )))
 }
 
 /// The COPY's source varnode, looked through any CAST, if it is a free
@@ -338,10 +348,10 @@ fn no_interference(data: &Funcdata, slices: &[Slice]) -> bool {
 }
 
 /// Read `len` bytes of the load image at `addr` (C++ `loader->loadFill`).
-fn read_image(data: &Funcdata, addr: &Address, len: int4) -> Option<Vec<u8>> {
+fn read_image(data: &Funcdata, addr: &Address, len: int4) -> KunaResult<Vec<u8>> {
     let mut buf = vec![0u8; len.max(0) as usize];
-    data.get_arch().loader_fill(&mut buf, addr).ok()?;
-    Some(buf)
+    data.get_arch().loader_fill(&mut buf, addr)?;
+    Ok(buf)
 }
 
 /// (kuna `rodatastring`) How read-only string block-copy recovery is toggled.

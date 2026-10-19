@@ -110,7 +110,7 @@ fn wire_input(
 ) -> VarnodeId {
     let r = ram(fd);
     let m = Address::new(r, off);
-    let vn = fd.new_varnode(size, &m, Some(ty));
+    let vn = fd.new_varnode(size, &m, Some(ty)).unwrap();
     fd.op_set_input(op, vn, slot).unwrap();
     vn
 }
@@ -119,7 +119,7 @@ fn wire_input(
 fn const_vn(fd: &mut Funcdata, val: uintb, size: int4) -> VarnodeId {
     let cspace = Rc::clone(fd.get_arch().manage().get_constant_space().unwrap());
     let m = Address::new(cspace, val);
-    fd.new_varnode(size, &m, None)
+    fd.new_varnode(size, &m, None).unwrap()
 }
 
 // ===========================================================================
@@ -153,7 +153,7 @@ fn w10_ptradd_up_ptr_field_scores_positive_like_cpp() {
     };
     let r = ram(&fd);
     let outm = Address::new(r, 0x500);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
+    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u))).unwrap();
     fd.op_set_output(op, out).unwrap();
 
     // Score the union against the WRITE edge (slot = -1): each field becomes an
@@ -200,7 +200,7 @@ fn w10_int_field_up_through_int_add_resolves_control() {
     let _b = wire_input(&mut fd, op, 1, 0x608, 8, Rc::clone(&int8t));
     let r = ram(&fd);
     let outm = Address::new(r, 0x700);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
+    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u))).unwrap();
     fd.op_set_output(op, out).unwrap();
 
     let result = {
@@ -233,7 +233,7 @@ fn w10_ptradd_up_missing_inputs_does_not_panic() {
     let _arrbase = wire_input(&mut fd, op, 0, 0x800, 8, Rc::clone(&u));
     let r = ram(&fd);
     let outm = Address::new(r, 0x900);
-    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u)));
+    let out = fd.new_varnode(8, &outm, Some(Rc::clone(&u))).unwrap();
     fd.op_set_output(op, out).unwrap();
 
     // Just must not panic.

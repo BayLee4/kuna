@@ -813,13 +813,13 @@ const TAIL_BLOCKS: usize = 4;
 /// with an instruction in between that writes a byte of the same join entry's
 /// second register and not its first ([`tail_pair`]), and the first register
 /// may be read only by a RETURN another rule planted.
-pub fn plant(data: &mut Funcdata) {
+pub fn plant(data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
     if data.num_calls() == 0
         || data.get_active_output().is_none()
         || !data.get_func_proto().has_model()
         || data.get_func_proto().is_output_locked()
     {
-        return;
+        return Ok(());
     }
     let rets: Vec<OpId> = data
         .obank()
@@ -828,28 +828,29 @@ pub fn plant(data: &mut Funcdata) {
         .collect();
     let pairs = join_pairs(data);
     if rets.is_empty() || pairs.is_empty() {
-        return;
+        return Ok(());
     }
     let mut pair: Option<usize> = None;
     for &r in &rets {
-        let Some(found) = tail_pair(data, &pairs, r) else { return };
+        let Some(found) = tail_pair(data, &pairs, r) else { return Ok(()) };
         if pair.is_some_and(|p| p != found) {
-            return;
+            return Ok(());
         }
         pair = Some(found);
     }
-    let Some(((first_addr, first_size), (second_addr, second_size))) = pair.map(|p| pairs[p].clone()) else { return };
+    let Some(((first_addr, first_size), (second_addr, second_size))) = pair.map(|p| pairs[p].clone()) else { return Ok(()) };
     if first_size != second_size || !only_returns_read(data, &first_addr, first_size) {
-        return;
+        return Ok(());
     }
     let plant_first = !crate::p4_calls::kuna_passthrough::touched(data, &first_addr, first_size);
     let plant_second = !named_whole(data, &second_addr, second_size);
     if plant_first {
-        crate::p4_calls::kuna_voidret::plant_piece(data, first_addr, first_size);
+        crate::p4_calls::kuna_voidret::plant_piece(data, first_addr, first_size)?;
     }
     if plant_second {
-        crate::p4_calls::kuna_voidret::plant_piece(data, second_addr, second_size);
+        crate::p4_calls::kuna_voidret::plant_piece(data, second_addr, second_size)?;
     }
+    Ok(())
 }
 
 /// Is `addr`/`size` in the second register of one of the model's join pairs

@@ -363,7 +363,7 @@ pub fn guard_memory(
     addr: &Address,
     size: int4,
     write: &mut Vec<crate::context::VarnodeId>,
-) {
+) -> KunaResult<()> {
     use crate::varnode::varnode_flags;
     use kuna_base::space::spacetype;
 
@@ -375,10 +375,10 @@ pub fn guard_memory(
                     .is_some_and(|ram| ram.get_index() == s.get_index())
         })
     {
-        return;
+        return Ok(());
     }
     for op in memory_calls(data) {
-        let guard = data.new_indirect_op(op, addr, size, 0);
+        let guard = data.new_indirect_op(op, addr, size, 0)?;
         if let Some(input) = data.obank().get(guard).and_then(|o| o.get_in(0)) {
             data.vbank_mut().get_mut(input)
                 .expect("syscall memory input").set_active_heritage();
@@ -392,6 +392,7 @@ pub fn guard_memory(
             write.push(output);
         }
     }
+    Ok(())
 }
 
 /// Give one matched `CALLOTHER` its ABI effects. Returns whether it changed.
@@ -410,7 +411,7 @@ fn rewrite(
     // Slot 0 is the user-op index and stays put; the effects follow it in ABI
     // order, which is the order they print in.
     for (i, reg) in reads.iter().enumerate() {
-        let vn = data.new_varnode(REGISTER_SIZE, reg, None);
+        let vn = data.new_varnode(REGISTER_SIZE, reg, None)?;
         data.op_insert_input(op, vn, (i + 1) as int4)?;
     }
     data.new_varnode_out(REGISTER_SIZE, &abi.num, op)?;
@@ -451,10 +452,10 @@ impl Action for ActionX64Syscall {
         }
         Some(Box::new(ActionX64Syscall { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let mode = data.get_arch().x64_syscall;
         if !mode.rewrites() || data.get_arch().x64_syscall_userops.is_empty() {
-            return 0;
+            return Ok(0);
         }
         // The op-bank scan is the cheap gate: a function with no `SYSCALL` never
         // reaches the register probes.
@@ -464,20 +465,20 @@ impl Action for ActionX64Syscall {
             .filter(|op| is_bare_syscall(data, *op))
             .collect();
         if found.is_empty() {
-            return 0;
+            return Ok(0);
         }
-        let Some(abi) = resolve_abi(data) else { return 0 };
+        let Some(abi) = resolve_abi(data) else { return Ok(0) };
         let mut changed = 0;
         for op in found {
             if rewrite(data, op, &abi, mode).unwrap_or(false) {
                 changed += 1;
             }
         }
-        if changed != 0 {
+        Ok(if changed != 0 {
             1
         } else {
             0
-        }
+        })
     }
 }
 

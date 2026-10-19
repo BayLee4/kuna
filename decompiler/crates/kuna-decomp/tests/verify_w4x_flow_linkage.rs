@@ -110,7 +110,7 @@ fn mk_op(fd: &mut Funcdata, inputs: int4, off: u64, opc: OpCode) -> OpId {
 /// A free RAM Varnode (the candidate for an op output).
 fn mk_free(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let ram = ram_space(fd);
-    fd.new_varnode_space_off(size, ram, off)
+    fd.new_varnode_space_off(size, ram, off).unwrap()
 }
 
 // ===========================================================================
@@ -349,7 +349,7 @@ fn w4x_flow_linkage_dump_constant_space_input_is_plain_constant_varnode() {
 
     let op = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_LOAD);
     // slot 0: spaceid constant (offset = some space index, here 3 = ram).
-    let vn_sp = fd.new_varnode_space_off(8, Rc::clone(&cspace), 3);
+    let vn_sp = fd.new_varnode_space_off(8, Rc::clone(&cspace), 3).unwrap();
     fd.op_set_input(op, vn_sp, 0).unwrap();
 
     let v = fd.vbank().get(vn_sp).unwrap();
@@ -375,7 +375,7 @@ fn w4x_flow_linkage_set_input_varnode_formalizes_and_dedups() {
     let ram = ram_space(&fd);
 
     // A free Varnode at ram:0x500, formalized as an input.
-    let f1 = fd.new_varnode_space_off(4, Rc::clone(&ram), 0x500);
+    let f1 = fd.new_varnode_space_off(4, Rc::clone(&ram), 0x500).unwrap();
     assert!(fd.vbank().get(f1).unwrap().is_free());
     let in1 = fd.set_input_varnode(f1).unwrap();
     assert_eq!(in1, f1, "the first free Varnode becomes the input");
@@ -387,7 +387,7 @@ fn w4x_flow_linkage_set_input_varnode_formalizes_and_dedups() {
 
     // A SECOND free Varnode at the SAME (size,address) hits the overlap pre-check
     // and returns the pre-existing input (the candidate is discarded for it).
-    let f2 = fd.new_varnode_space_off(4, Rc::clone(&ram), 0x500);
+    let f2 = fd.new_varnode_space_off(4, Rc::clone(&ram), 0x500).unwrap();
     let in2 = fd.set_input_varnode(f2).unwrap();
     assert_eq!(in2, in1, "identical candidate dedups onto the existing input");
 }

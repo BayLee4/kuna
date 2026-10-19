@@ -126,6 +126,19 @@ block and the walk stops at the first op that is not one), so it collects the ru
 off the block's intrusive op list rather than materializing every op of every
 successor once per CFG edge per pass.
 
+**Redundant PHIs.** `ActionMultiCse` compares the leading MULTIEQUALs in each
+basic block, allowing intervening COPYs, and repeats after every elimination.
+As in upstream `coreaction.cc:742-897`, each incoming value may be normalized
+through exactly one COPY before comparing matching predecessor slots with the
+existing functional-equivalence predicate. This is not commutative expression
+matching: swapping predecessor operands changes the value. COPY normalization
+does not move instructions or redirect edges; heritage's SSA invariant already
+requires each operand to be available on its own incoming edge. Width-changing
+COPYs and unequal PHI widths are not identity substitutions. The survivor
+preference is RETURN use, then address-tied storage, then non-unique storage;
+`total_replace` rewires all consumers before `op_destroy` removes the redundant
+definition, and the action's change count drives the enclosing fixed point.
+
 **Op properties on a heritage-created op.** The three op-codes heritage installs
 (the phi, the read-size SUBPIECE, the write-size PIECE) take their property flags
 from the same op-code table every other producer of p-code resolves through
@@ -2614,8 +2627,11 @@ call-site spacebase offset.
 pointer writes into a verified Win64 home area from external pointer publication.
 The callee summary retains each possible home escape and its full write footprint,
 even if later writes partially overwrite the pointer. The caller may discharge
-that escape only for the locked, non-variadic prototype model's exact `[8,40)`
-home interval, mapped wholly into its own negative local frame. The caller scan
+that escape only for an input-locked, non-variadic prototype's current concrete
+model's exact `[8,40)` home interval, mapped wholly into its own negative local
+frame. An authored convention lock is independent of this physical geometry:
+omitting a convention from a declaration does not invalidate its assigned
+working model. The caller scan
 must rule out reads and forwarding of the residual cell, including stack-value
 reads, pointer escapes and observations through other calls. The current
 callee's own home loads are expected and do not substitute for that caller proof.
@@ -2692,10 +2708,40 @@ user operations, indirect or internal p-code branches, unresolved memory
 addresses and exhausted budgets yield no proof. The initial bounds are 256
 instruction-state visits, 256 tracked values or effects, 64 spills or return
 states, and 64 KiB constant displacements. Only byte-addressed, negative-growth
-frames are supported. `const` and pointee layouts provide no memory-effect
+frames with one-to-eight-byte pointers are supported. Narrow signed displacements
+must be width-masked or canonically sign-extended; unrelated high bits cannot wrap
+into a proven private spill. `const` and pointee layouts provide no memory-effect
 evidence.
 Return-address rewriting and bodies consisting only of return machinery also
 decline a proof, so placeholder return stubs cannot narrow external-call effects.
+
+With `stackviews`, the same complete, nonempty normal-return snapshots also
+answer exact pointer-width register entry identity. Every normal exit must
+contain the identical incoming register at displacement zero to prove preservation;
+a known replacement on any path disproves universal identity, while a partial
+clobber or unknown value supplies no such evidence. This is not a partial-register
+proof or an exit-value interpreter. The existing actual-callsite return-slot,
+conditional home-write and negative private-spill disjointness obligations apply
+before these snapshots can be used. Thus a disjoint external store need not erase
+a restored register, while an overlapping or unresolved store cannot certify it.
+
+Heritage retains a call-effect dependency when a concrete normal-return
+replacement contradicts the default convention's unaffected register. The
+`calleepreserves` reader can also recognize a complete save/restore, rather than
+treat every transient raw write as a clobber. Unknown does not weaken an ABI
+promise or become proof of preservation. Authored effect lists, site overrides,
+custom storage, source/model results (including JOIN geometry), inline and
+injection contracts remain authoritative. An actually assigned result excludes
+its overlapping bytes even without a datatype lock; output-model capacity alone
+does not describe that assignment. JOIN results exclude their physical pieces,
+not unrelated registers that share no result storage.
+No additional source parameter or
+physical result value is invented, and ordinary diagnostic project/export status
+does not certify ambient-state-to-executable-C equivalence.
+
+Summary acquisition propagates transport failures through the driver's existing
+Result boundary without caching a fabricated incomplete body. Recoverable
+instruction decode failures retain their ordinary no-proof behavior.
 
 With `stackviews`, a complete summary can leave a caller frame range unaffected
 when none of its possible writes reaches that range. The range must lie above

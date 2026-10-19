@@ -19,6 +19,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, uintb};
 
 use kuna_num::opcodes::OpCode;
@@ -212,13 +213,14 @@ pub fn call_argument_vote(
     fc: &FuncCallSpecs,
     slot: int4,
     arg_size: int4,
-) -> Option<Rc<Datatype>> {
-    let ct = stated_argument_type(data, fc, slot)?;
-    if vote_holds(data, op, fc, slot, arg_size, ct)? {
-        return Some(Rc::clone(ct));
+) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let Some(ct) = stated_argument_type(data, fc, slot) else { return Ok(None) };
+    let Some(holds) = vote_holds(data, op, fc, slot, arg_size, ct)? else { return Ok(None) };
+    if holds {
+        return Ok(Some(Rc::clone(ct)));
     }
-    let bare = crate::kuna_structheadless::bare_pointer_for(data, ct)?;
-    vote_holds(data, op, fc, slot, arg_size, &bare)?.then_some(bare)
+    let Some(bare) = crate::kuna_structheadless::bare_pointer_for(data, ct) else { return Ok(None) };
+    Ok(vote_holds(data, op, fc, slot, arg_size, &bare)?.and_then(|holds| holds.then_some(bare)))
 }
 
 /// [`call_argument_vote`]'s refusals for one candidate type `ct`.
@@ -229,23 +231,23 @@ fn vote_holds(
     slot: int4,
     arg_size: int4,
     ct: &Rc<Datatype>,
-) -> Option<bool> {
+) -> kuna_base::error::KunaResult<Option<bool>> {
     if class_of(ct).is_none()
         || ct.get_size() > arg_size
         || crate::p5_types::kuna_ptrdepth::pointer_depth(ct, 3) > crate::p5_types::kuna_ptrdepth::MAX_INFERRED_PTR_DEPTH
     {
-        return Some(false);
+        return Ok(Some(false));
     }
-    let vn = data.obank().get(op)?.get_in(slot)?;
-    let (addr, size) = fc.final_input_storage().get((slot - 1) as usize)?;
-    Some(
+    let Some(vn) = data.obank().get(op).and_then(|op| op.get_in(slot)) else { return Ok(None) };
+    let Some((addr, size)) = fc.final_input_storage().get((slot - 1) as usize) else { return Ok(None) };
+    Ok(Some(
         !(addresses_a_frame_object(data, vn)
             || storage_disagrees(fc.proto(), addr, *size, ct)
-            || (class_of(ct) == Some(Class::Pointer) && points_into_code(data, op, vn))
+            || (class_of(ct) == Some(Class::Pointer) && points_into_code(data, op, vn)?)
             || (class_of(ct) == Some(Class::Float) && !prints_exactly_as_a_float(data, vn))
-            || family_refuses(data, vn, Reading::Argument(op, slot), ct)
+            || family_refuses(data, vn, Reading::Argument(op, slot), ct)?
             || crate::kuna_structheadless::yields_to_a_declared_pointer(data, vn, ct)),
-    )
+    ))
 }
 
 /// Does `vn`, if it is a constant, print as a float literal that compiles back
@@ -263,19 +265,21 @@ fn prints_exactly_as_a_float(data: &Funcdata, vn: VarnodeId) -> bool {
 /// Is `vn` a constant inside a function's code?  A data pointer there renders
 /// as a subscript of the function (`&sub_80014f4[1]` for the Thumb address
 /// `0x80014f5`), which is not C.
-fn points_into_code(data: &Funcdata, op: OpId, vn: VarnodeId) -> bool {
-    let Some(node) = data.vbank().get(vn).filter(|n| n.is_constant()) else { return false };
-    let Some(at) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return false };
+fn points_into_code(data: &Funcdata, op: OpId, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
+    let Some(node) = data.vbank().get(vn).filter(|n| n.is_constant()) else { return Ok(false) };
+    let Some(at) = data.obank().get(op).map(|o| o.get_addr().clone()) else { return Ok(false) };
     let glb = data.get_arch();
     let (value, size) = (node.get_offset(), node.get_size());
-    glb.infer_ptr_spaces().iter().filter(|spc| spc.get_addr_size() as int4 == size).any(|spc| {
+    for spc in glb.infer_ptr_spaces().iter().filter(|spc| spc.get_addr_size() as int4 == size) {
         let mut full = 0;
-        glb.resolve_constant(spc, value, size, &at, &mut full).ok().is_some_and(|ram| {
-            glb.query_container_global(&ram, 1, &Address::new_invalid()).is_some_and(|e| {
+        let ram = glb.resolve_constant(spc, value, size, &at, &mut full)?;
+        if glb.query_container_global(&ram, 1, &Address::new_invalid())?.is_some_and(|e| {
                 e.symbol_type.as_ref().is_some_and(|t| t.get_metatype() == type_metatype::TYPE_CODE)
-            })
-        })
-    })
+            }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn stated_argument_type<'a>(data: &'a Funcdata, fc: &FuncCallSpecs, slot: int4) -> Option<&'a Rc<Datatype>> {
@@ -480,27 +484,27 @@ enum Reading<'a> {
 /// outrank a caller's type `ct` for it?  The refusals a callee's vote meets at
 /// a call site, asked of the callee's own uses, and one more for a character
 /// pointer ([`splits_a_wide_constant`]).
-pub(crate) fn input_refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
-    class_of(ct).is_none()
-        || family_refuses(data, vn, Reading::Input, ct)
+pub(crate) fn input_refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
+    Ok(class_of(ct).is_none()
+        || family_refuses(data, vn, Reading::Input, ct)?
         || indexes_a_pointer(data, vn)
-        || splits_a_wide_constant(data, &value_family(data, vn), ct, 0)
+        || splits_a_wide_constant(data, &value_family(data, vn), ct, 0))
 }
 
 /// (kuna `callerptr`) [`input_refuses`], with the class a call reads the value as
 /// taken from a declared prototype only, never from another callee's recovery.
-pub(crate) fn input_refuses_declared(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
-    class_of(ct).is_none()
-        || family_refuses(data, vn, Reading::DeclaredInput, ct)
+pub(crate) fn input_refuses_declared(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
+    Ok(class_of(ct).is_none()
+        || family_refuses(data, vn, Reading::DeclaredInput, ct)?
         || indexes_a_pointer(data, vn)
-        || splits_a_wide_constant(data, &value_family(data, vn), ct, 0)
+        || splits_a_wide_constant(data, &value_family(data, vn), ct, 0))
 }
 
 /// (kuna `callrettype`) Does anything the caller does with the call result
 /// `vn` outrank the callee's stated return type `ct` for it?  The refusals a
 /// callee's vote meets at a call argument, asked of the result's own uses.
-pub(crate) fn output_refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> bool {
-    class_of(ct).is_none() || family_refuses(data, vn, Reading::Input, ct)
+pub(crate) fn output_refuses(data: &Funcdata, vn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
+    Ok(class_of(ct).is_none() || family_refuses(data, vn, Reading::Input, ct)?)
 }
 
 /// Is the value `vn` the index of a pointer addition (`((char *)0x1018)[a0]`,
@@ -582,7 +586,7 @@ fn splits_a_wide_constant(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, 
 /// `int *`.  So does a parameter of the caller's own in a register the
 /// convention never passes a float in, and, for a member, a load through
 /// another pointer that nothing reads as a float.
-fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatype) -> bool {
+fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
     let class = class_of(ct);
     let mut float_seen = false;
     let mut integer_seen = false;
@@ -603,24 +607,24 @@ fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatyp
             || inside_a_frame_aggregate(data, node, &mut regions, matches!(reading, Reading::DeclaredInput))
             || (v != vn && addresses_a_frame_object(data, v))
         {
-            return true;
+            return Ok(true);
         }
         if float_global {
             globals.push((node.get_addr().clone(), node.get_size()));
         }
         if float_vote && node.is_input() && !a_float_can_arrive_in(data, node) {
-            return true;
+            return Ok(true);
         }
         if let Some(def) = node.get_def() {
             let o = data.obank().get(def);
             if o.is_some_and(|o| {
                 o.code() == OpCode::CPUI_LOAD && (through_the_frame(data, o) || loaded_through_itself(data, o, &members))
             }) {
-                return true;
+                return Ok(true);
             }
             match o.map(|o| o.code()) {
                 Some(OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) => match writer_class(data, def) {
-                    Some(c) if Some(c) != class => return true,
+                    Some(c) if Some(c) != class => return Ok(true),
                     Some(_) => {}
                     None if float_vote => handed_on |= !in_a_float_register(call_model(data, def, false), node),
                     None => {}
@@ -641,7 +645,7 @@ fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatyp
             match o.code() {
                 OpCode::CPUI_STORE if o.get_in(2) == Some(v) => {
                     if through_the_frame(data, o) {
-                        return true;
+                        return Ok(true);
                     }
                     handed_on |= !own(r);
                 }
@@ -657,7 +661,7 @@ fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatyp
                             reader_class(data, r, s)
                         };
                         match read {
-                            Some(c) if Some(c) != class => return true,
+                            Some(c) if Some(c) != class => return Ok(true),
                             Some(_) => {}
                             None if float_vote => {
                                 handed_on |= !in_a_float_register(call_model(data, r, true), node)
@@ -674,17 +678,25 @@ fn family_refuses(data: &Funcdata, vn: VarnodeId, reading: Reading, ct: &Datatyp
             }
         }
     }
-    match class {
+    Ok(match class {
         Some(Class::Float) => {
-            integer_seen
+            if integer_seen
                 || bits_seen
                 || handed_on
                 || (loaded_elsewhere && !float_seen)
-                || globals.iter().any(|(at, size)| !crate::kuna_floatglobals::float_only(data, at, *size))
+            {
+                return Ok(true);
+            }
+            for (at, size) in globals {
+                if !crate::kuna_floatglobals::float_only(data, &at, size)? {
+                    return Ok(true);
+                }
+            }
+            false
         }
-        Some(Class::Pointer) => float_seen || integer_seen || pointee_refuses(data, &family, ct, 0),
+        Some(Class::Pointer) => float_seen || integer_seen || pointee_refuses(data, &family, ct, 0)?,
         _ => float_seen,
-    }
+    })
 }
 
 /// Could the calling convention pass a float in the register `node`, the caller's
@@ -987,13 +999,13 @@ fn member_at(ct: &Rc<Datatype>, off: i64, size: int4) -> Member {
 /// anything but a float, or hands on: the float-vote rule one level down, so
 /// `u->l[0] = v + 1` through a union a callee reads as `double *` does not print
 /// as `*a0 = (double)(a1 + 1)`.
-fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: u32) -> bool {
+fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: u32) -> kuna_base::error::KunaResult<bool> {
     let (pointee, base) = match ct.get_metatype() {
         type_metatype::TYPE_PTR => (ct.get_ptr_to(), 0),
         type_metatype::TYPE_PTRREL => (ct.get_rel_parent(), ct.get_byte_offset().unwrap_or(0) as i64),
-        _ => return false,
+        _ => return Ok(false),
     };
-    let Some(pointee) = pointee else { return false };
+    let Some(pointee) = pointee else { return Ok(false) };
     if matches!(
         pointee.get_metatype(),
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_BOOL | type_metatype::TYPE_PTR
@@ -1001,10 +1013,10 @@ fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: 
     {
         let width = pointee.get_align_size() as i64;
         let family = with_sibling_loads(data, family);
-        let Some((accesses, _)) = accesses_through(data, &family) else { return true };
-        return accesses.iter().any(|a| {
+        let Some((accesses, _)) = accesses_through(data, &family) else { return Ok(true) };
+        return Ok(accesses.iter().any(|a| {
             a.store && a.size as i64 > width && data.vbank().get(a.value).is_some_and(|n| n.is_constant())
-        });
+        }));
     }
     let float = pointee.get_metatype() == type_metatype::TYPE_FLOAT;
     if !float
@@ -1017,40 +1029,40 @@ fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: 
                 | type_metatype::TYPE_PARTIALUNION
         )
     {
-        return false;
+        return Ok(false);
     }
     let size = pointee.get_size() as i64;
     let family = with_sibling_loads(data, family);
-    let Some((accesses, places)) = accesses_through(data, &family) else { return true };
+    let Some((accesses, places)) = accesses_through(data, &family) else { return Ok(true) };
     if size <= 0 {
-        return !accesses.is_empty();
+        return Ok(!accesses.is_empty());
     }
     if !float
         && places.iter().any(|&(c, stride)| {
             if stride == 0 { !(0..=size).contains(&c.wrapping_add(base)) } else { stride.abs() != size }
         })
     {
-        return true;
+        return Ok(true);
     }
     let mut floats: Vec<(&Access, Rc<Datatype>)> = Vec::new();
     for a in &accesses {
         let at = a.at.wrapping_add(base);
         if a.stride % size != 0 || (!float && a.stride != 0 && a.stride.abs() != size) {
-            return true;
+            return Ok(true);
         }
         let off = if float || a.stride != 0 { at.rem_euclid(size) } else { at };
         if off < 0 || off + a.size as i64 > size {
-            return true;
+            return Ok(true);
         }
         match member_at(&pointee, off, a.size) {
-            Member::Split => return true,
+            Member::Split => return Ok(true),
             Member::Gap => {}
             Member::Exact(t) if t.get_metatype() == type_metatype::TYPE_FLOAT => floats.push((a, t)),
             Member::Exact(t) if depth < 2 && t.get_metatype() == type_metatype::TYPE_PTR => {
                 if !data.vbank().get(a.value).is_some_and(|n| n.is_constant())
-                    && pointee_refuses(data, &value_family(data, a.value), &t, depth + 1)
+                    && pointee_refuses(data, &value_family(data, a.value), &t, depth + 1)?
                 {
-                    return true;
+                    return Ok(true);
                 }
             }
             Member::Exact(t)
@@ -1058,18 +1070,20 @@ fn pointee_refuses(data: &Funcdata, family: &[VarnodeId], ct: &Datatype, depth: 
                     && crate::kuna_structheadless::types_a_pointer_as_a_word(data, ct, &t)
                     && accesses_through(data, &value_family(data, a.value)).is_some_and(|(acc, _)| !acc.is_empty()) =>
             {
-                return true;
+                return Ok(true);
             }
             Member::Exact(_) => {}
         }
     }
     let own: std::collections::HashSet<OpId> = floats.iter().map(|(a, _)| a.op).collect();
-    floats.iter().any(|(a, t)| {
+    for (a, t) in &floats {
         if a.store && data.vbank().get(a.value).is_some_and(|n| n.is_constant()) {
-            return !prints_exactly_as_a_float(data, a.value);
+            if !prints_exactly_as_a_float(data, a.value) { return Ok(true) }
+            continue;
         }
-        family_refuses(data, a.value, Reading::Member(&own), t)
-    })
+        if family_refuses(data, a.value, Reading::Member(&own), t)? { return Ok(true) }
+    }
+    Ok(false)
 }
 
 /// Does the RETURN `o` hand `node` back as anything but a float?  An undeclared
@@ -1462,33 +1476,33 @@ pub fn recovered_pieces(
 }
 
 /// The storage the prototype model would assign to `pieces`' types, or `None`
-/// when the assignment cannot be derived (no default model, no type factory, or
-/// an un-ported storage boundary).
+/// when no model or complete parameter assignment exists. Type acquisition and
+/// prototype-seeding failures retain the outer error channel.
 ///
 /// This is the same seam a caller takes: `ActionDefaultParams` builds the
 /// callee's `FuncProto` with `seed_locked_from_pieces`, and that is what decides
 /// where each parked type lands.
-pub fn model_storage(pieces: &PrototypePieces, arch: &Architecture) -> Option<Vec<(Address, int4)>> {
-    let dfp = crate::kuna_typedcallabi::undeclared_model_for(arch, pieces)
-        .or_else(|| arch.default_fp().cloned())?;
-    let void_ty = arch.types().get_type_void().ok()?;
+pub fn model_storage(pieces: &PrototypePieces, arch: &Architecture) -> KunaResult<Option<Vec<(Address, int4)>>> {
+    let Some(dfp) = crate::kuna_typedcallabi::undeclared_model_for(arch, pieces)
+        .or_else(|| arch.default_fp().cloned()) else { return Ok(None); };
+    let void_ty = arch.types().get_type_void()?;
     let mut fp = FuncProto::new();
     let types_only = PrototypePieces {
         input_storage: Vec::new(),
         output_storage: None,
         ..pieces.clone()
     };
-    fp.seed_locked_from_pieces(&types_only, dfp, void_ty, arch.types(), arch.manage()).ok()?;
+    fp.seed_locked_from_pieces(&types_only, dfp, void_ty, arch.types(), arch.manage())?;
     let n = fp.num_params();
     if n != pieces.intypes.len() as int4 {
-        return None;
+        return Ok(None);
     }
     let mut out = Vec::with_capacity(n as usize);
     for i in 0..n {
-        let param = fp.get_param(i)?;
+        let Some(param) = fp.get_param(i) else { return Ok(None); };
         out.push((param.get_address(), param.get_size()));
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// The callee-body entry-liveness summary for `entry`, cached on the
@@ -1504,10 +1518,12 @@ pub fn model_storage(pieces: &PrototypePieces, arch: &Architecture) -> Option<Ve
 fn entry_facts(
     arch: &mut Architecture,
     entry: &Address,
-) -> Option<Rc<crate::kuna_calleedeadarg::CalleeEntryDead>> {
-    let reg_idx = arch.manage().get_space_by_name("register").map(|s| s.get_index())?;
+) -> KunaResult<Option<Rc<crate::kuna_calleedeadarg::CalleeEntryDead>>> {
+    let Some(reg_idx) = arch.manage().get_space_by_name("register").map(|s| s.get_index()) else {
+        return Ok(None);
+    };
     if reg_idx < 0 {
-        return None;
+        return Ok(None);
     }
     crate::kuna_calleedeadarg::probe_cached(arch, entry, reg_idx)
 }
@@ -1519,13 +1535,13 @@ fn entry_facts(
 /// whatever the program's own calling convention says (`rsi` after `rdi` on
 /// SysV, `w1` after `w0` on AArch64, a stack slot once the register file runs
 /// out).
-fn next_slot_storage(pieces: &PrototypePieces, arch: &Architecture) -> Option<(Address, int4)> {
-    let ptr = arch.types().get_base(arch.types().get_size_of_pointer(), type_metatype::TYPE_UINT).ok()?;
+fn next_slot_storage(pieces: &PrototypePieces, arch: &Architecture) -> KunaResult<Option<(Address, int4)>> {
+    let ptr = arch.types().get_base(arch.types().get_size_of_pointer(), type_metatype::TYPE_UINT)?;
     let mut probe = pieces.clone();
     probe.intypes.push(ptr);
     probe.innames.push("next".to_string());
     probe.first_var_arg_slot = -1;
-    model_storage(&probe, arch)?.pop()
+    Ok(model_storage(&probe, arch)?.and_then(|mut storage| storage.pop()))
 }
 
 /// Drop the trailing parameters the callee's own body does not prove it
@@ -1673,6 +1689,9 @@ fn slot_is_read(
 /// `variables[]` arg rows either way) and deleted nineteen more arguments.  The
 /// callees that fabricate are the ones that call something, which is exactly
 /// where that walk stops.
+///
+/// Acquisition failures use the outer result; policy refusals remain
+/// [`Decline`] values in the inner result and do not publish recovered facts.
 pub fn park_recovered(
     arch: &mut Architecture,
     entry: &Address,
@@ -1680,13 +1699,16 @@ pub fn park_recovered(
     data: &crate::funcdata::Funcdata,
     proto: &FuncProto,
     mode: ProtoOrderMode,
-) -> Result<Recovered, Decline> {
+) -> KunaResult<Result<Recovered, Decline>> {
     if arch.symboltab.function_proto_pieces_across_scopes(entry).is_some() {
-        return Err(Decline::Declared);
+        return Ok(Err(Decline::Declared));
     }
-    let (mut pieces, mut storage) = recovered_pieces(proto, name)?;
+    let (mut pieces, mut storage) = match recovered_pieces(proto, name) {
+        Ok(pieces) => pieces,
+        Err(decline) => return Ok(Err(decline)),
+    };
     if mode.states_types_only() {
-        let arity_sound = arch.pass_through && arity_claim_sound(arch, entry, &pieces, &storage);
+        let arity_sound = arch.pass_through && arity_claim_sound(arch, entry, &pieces, &storage)?;
         let output = if arch.pass_through { recovered_output(proto, data) } else { None };
         let result = if arch.pass_through { recovered_result(proto) } else { None };
         let vararg_tail = if arch.pass_through {
@@ -1695,31 +1717,34 @@ pub fn park_recovered(
             Vec::new()
         };
         let stated = Stated { arity_sound, output, result, vararg_tail };
-        return state_recovered_types(arch, entry, pieces, storage, stated);
+        return Ok(state_recovered_types(arch, entry, pieces, storage, stated));
     }
     let mut trimmed = 0usize;
-    if let Some(facts) = entry_facts(arch, entry) {
+    if let Some(facts) = entry_facts(arch, entry)? {
         trimmed = trim_unjustified_tail(&mut pieces, &mut storage, &facts);
-        let next = next_slot_storage(&pieces, arch);
+        let next = next_slot_storage(&pieces, arch)?;
         if under_recovered(next.clone(), &facts) {
-            return Err(Decline::UnderRecovered);
+            return Ok(Err(Decline::UnderRecovered));
         }
         if ends_at_the_register_boundary(storage.last(), next) {
-            return Err(Decline::RegisterFileFull);
+            return Ok(Err(Decline::RegisterFileFull));
         }
     }
     if pieces.intypes.is_empty() && pieces.outtype.is_none() {
-        return Err(Decline::VoidVoid);
+        return Ok(Err(Decline::VoidVoid));
     }
     pieces.first_var_arg_slot = pieces.intypes.len() as int4;
-    match model_storage(&pieces, arch) {
-        None => return Err(Decline::StorageUnderivable),
-        Some(model) if model != storage => return Err(Decline::NonCanonicalStorage),
+    match model_storage(&pieces, arch)? {
+        None => return Ok(Err(Decline::StorageUnderivable)),
+        Some(model) if model != storage => return Ok(Err(Decline::NonCanonicalStorage)),
         Some(_) => {}
     }
     pieces.output_storage = crate::kuna_vfpvariadic::parked_output(data.get_arch(), &pieces);
-    arch.set_function_prototype_pieces_at(entry, pieces.clone());
-    Ok(Recovered { pieces, trimmed })
+    match arch.set_recovered_function_prototype_pieces_at(entry, pieces.clone()) {
+        Ok(_) => Ok(Ok(Recovered { pieces, trimmed })),
+        Err(err @ KunaError::Transport { .. }) => Err(err),
+        Err(_) => Ok(Err(Decline::StorageUnderivable)),
+    }
 }
 
 /// (kuna `callbacktype`) Does the body of `entry` read the argument register
@@ -1736,13 +1761,13 @@ pub fn reads_past_the_list(
     entry: &Address,
     pieces: &PrototypePieces,
     storage: &[(Address, int4)],
-) -> bool {
+) -> KunaResult<bool> {
     if !storage.iter().all(|(a, _)| crate::kuna_calleearitybody::is_register(a)) {
-        return false;
+        return Ok(false);
     }
-    let Some(next) = next_slot_storage(pieces, arch) else { return false };
-    let Some(facts) = entry_facts(arch, entry) else { return false };
-    facts.proves_input(&next.0, next.1)
+    let Some(next) = next_slot_storage(pieces, arch)? else { return Ok(false) };
+    let Some(facts) = entry_facts(arch, entry)? else { return Ok(false) };
+    Ok(facts.proves_input(&next.0, next.1))
 }
 
 /// Would [`park_recovered`]'s locking branch accept `storage` as a statement of
@@ -1768,19 +1793,19 @@ fn arity_claim_sound(
     entry: &Address,
     pieces: &PrototypePieces,
     storage: &[(Address, int4)],
-) -> bool {
+) -> KunaResult<bool> {
     let closed = crate::kuna_armfloatreturn::closed_recovery(arch, pieces);
     let pieces = &*closed;
-    let Some(facts) = entry_facts(arch, entry) else { return false };
+    let Some(facts) = entry_facts(arch, entry)? else { return Ok(false) };
     if !storage.iter().all(|(a, _)| crate::kuna_calleearitybody::is_register(a)) {
-        return false;
+        return Ok(false);
     }
-    let next = next_slot_storage(pieces, arch);
+    let next = next_slot_storage(pieces, arch)?;
     let next_read = next.as_ref().is_some_and(|(a, sz)| facts.proves_input(a, *sz));
     if next_read || ends_at_the_register_boundary(storage.last(), next) {
-        return false;
+        return Ok(false);
     }
-    matches!(model_storage(pieces, arch), Some(model) if model == storage)
+    Ok(matches!(model_storage(pieces, arch)?, Some(model) if model == storage))
 }
 
 /// What [`park_recovered`] states beside the parameter types.

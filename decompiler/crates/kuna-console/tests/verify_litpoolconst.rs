@@ -76,7 +76,7 @@ fn body(prog: &mut ConsoleProgram, vma: u64) -> String {
         &[],
     );
     let fd = step.result.expect("the function decompiles");
-    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)
+    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap()
 }
 
 /// The precondition: the loader reports `.text` as executable read-only memory,

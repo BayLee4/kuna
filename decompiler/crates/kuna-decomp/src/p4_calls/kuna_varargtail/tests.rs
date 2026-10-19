@@ -68,7 +68,7 @@ fn a_storage_with_no_input_varnode_is_not_vararg_tail() {
 fn a_copy_and_a_mask_hand_the_value_on_but_arithmetic_does_not() {
     let mut fd = build_fd();
     let r = ram(&fd);
-    let vn = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None);
+    let vn = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None).unwrap();
     let vn = fd.set_input_varnode(vn).expect("function input");
     let k = fd.new_constant(8, 0xffff_ffff);
     let copy = mk_def(&mut fd, OpCode::CPUI_COPY, &[vn], 0x3100);
@@ -89,8 +89,8 @@ fn a_copy_and_a_mask_hand_the_value_on_but_arithmetic_does_not() {
 fn a_mask_by_a_second_live_value_is_not_a_hand_on() {
     let mut fd = build_fd();
     let r = ram(&fd);
-    let vn = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None);
-    let other = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3008), None);
+    let vn = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3000), None).unwrap();
+    let other = fd.new_varnode(8, &Address::new(Rc::clone(&r), 0x3008), None).unwrap();
     let and = mk_def(&mut fd, OpCode::CPUI_INT_AND, &[vn, other], 0x3400);
     assert!(
         !moves_the_value(&fd, and, vn, OpCode::CPUI_INT_AND),

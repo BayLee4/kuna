@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use kuna_console::engine::{EntryProvenance, ObjectLocation};
 use kuna_console::project::FuncResult;
+use kuna_decomp::kuna_exportcall::ExportSpec;
 use kuna_decomp::kuna_structsynth::shard::{self, Replay, SynthRequest};
 
 mod scratch;
@@ -27,8 +28,8 @@ mod wire;
 use scratch::{pool_scratch, ScratchDir};
 use synth::{name_structs_serially, Named};
 pub(crate) use type_blocks::merge_type_definitions;
-use wire::{decode_results, encode_spec};
-pub(crate) use wire::{read_spec, ResultWriter};
+use wire::{decode_results, encode_export_spec, encode_spec};
+pub(crate) use wire::{read_export_spec, read_spec, ResultWriter};
 
 /// Ceiling on an automatically planned chunk, when `--jobs-chunk` is omitted.
 /// A chunk is only a scheduling unit here, so this exists to keep the tail of a
@@ -218,6 +219,9 @@ pub(crate) struct PoolConfig<'a> {
     /// (kuna `armframes`) The parent's frame-recovery record, which a worker
     /// replays instead of searching the image again.
     pub(crate) arm_frames: Option<String>,
+    /// One immutable, parent-prepared publication for the complete selected
+    /// invocation, shared by every worker and every replay phase.
+    pub(crate) export_spec: Option<ExportSpec>,
 }
 
 /// How many decode lanes `--jobs` asks the discovery walk for.
@@ -467,15 +471,22 @@ struct RetiredBlocks {
 impl Session {
     fn open(cfg: &PoolConfig, inventory: &[TargetSpec]) -> Result<Session, String> {
         let scratch = ScratchDir::create()?;
+        // Full-load workers still need the parent's canonical and alias
+        // spellings for invocation naming, even though they need no replay.
+        let path = scratch.path().join(INVENTORY_FILE);
+        std::fs::write(&path, encode_spec(inventory))
+            .map_err(|e| format!("cannot write the worker inventory {}: {e}", path.display()))?;
         if !cfg.full_load {
-            let path = scratch.path().join(INVENTORY_FILE);
-            std::fs::write(&path, encode_spec(inventory))
-                .map_err(|e| format!("cannot write the worker inventory {}: {e}", path.display()))?;
             if let Some(record) = &cfg.arm_frames {
                 let path = scratch.path().join(ARM_FRAMES_FILE);
                 std::fs::write(&path, record)
                     .map_err(|e| format!("cannot write the worker frame record {}: {e}", path.display()))?;
             }
+        }
+        if let Some(spec) = &cfg.export_spec {
+            let path = scratch.path().join(EXPORT_SPEC_FILE);
+            std::fs::write(&path, encode_export_spec(spec))
+                .map_err(|e| format!("cannot write export invocation {}: {e}", path.display()))?;
         }
         Ok(Session {
             scratch,
@@ -1596,6 +1607,7 @@ fn lost_chunk(chunk: &[TargetSpec], reason: &str) -> Vec<FuncResult> {
 
 fn lost_result(t: &TargetSpec, reason: &str) -> FuncResult {
     FuncResult {
+        type_bindings: Vec::new(),
         name: t.name.clone(),
         address: t.addr,
         byte_address: t.addr,
@@ -1716,6 +1728,9 @@ pub(crate) const INVENTORY_FILE: &str = "inventory.spec";
 /// The parent's `armframes` record, replayed by every worker that did not run
 /// its own discovery.
 pub(crate) const ARM_FRAMES_FILE: &str = "armframes.record";
+
+/// The complete parent's immutable publication, also used by full-load workers.
+pub(crate) const EXPORT_SPEC_FILE: &str = "export.spec";
 
 /// The replayed synthesized structures a [`SynthWorker::Force`] worker installs.
 pub(crate) const SYNTH_TABLE_FILE: &str = "synth.table";
@@ -2022,6 +2037,12 @@ mod tests {
 
     pub(super) fn sample_result() -> FuncResult {
         FuncResult {
+            type_bindings: vec![kuna_console::project::ResultTypeBinding {
+                id: 0x1234,
+                name: "mystruct".into(),
+                presentation: "mystruct__kuna_2".into(),
+                size: 4,
+            }],
             name: "main".into(),
             address: 0x401000,
             byte_address: 0x401000,
@@ -2087,8 +2108,10 @@ mod tests {
             // (kuna `globalref`) One global, so the codec's flag byte is exercised.
             globals: vec![GlobalInfo {
                 address: 0x404010,
+                space_index: 1,
                 name: "dat_404010".into(),
                 declaration: "struct_0 dat_404010".into(),
+                source_symbol: Some(0xfedc_ba98_7654_3210),
                 size: 16,
                 unknown: false,
                 direct: true,
@@ -2122,7 +2145,8 @@ mod tests {
     }
 
     fn same(a: &FuncResult, b: &FuncResult) -> bool {
-        a.name == b.name
+        a.type_bindings == b.type_bindings
+            && a.name == b.name
             && a.address == b.address
             && a.byte_address == b.byte_address
             && a.size == b.size
@@ -2174,6 +2198,29 @@ mod tests {
     }
 
     #[test]
+    fn project_globals_keep_source_authority_and_distinct_address_spaces() {
+        let mut result = sample_result();
+        let mut source = result.globals[0].clone();
+        source.name = "state".into();
+        source.declaration = "State state".into();
+        source.direct = true;
+        source.elem = false;
+        let mut inferred = source.clone();
+        inferred.source_symbol = None;
+        inferred.declaration = "int state".into();
+        let mut banked = source.clone();
+        banked.space_index += 1;
+        banked.source_symbol = Some(0xfedc_ba98_7654_3211);
+        banked.name = "io_state".into();
+        banked.declaration = "DeviceState io_state".into();
+        result.globals = vec![inferred, source, banked];
+        let header = kuna_console::project::build_header("source-roots", "", "", &[result]);
+        assert!(header.contains("extern State state;"), "{header}");
+        assert!(header.contains("extern DeviceState io_state;"), "{header}");
+        assert!(!header.contains("extern int state;"), "{header}");
+    }
+
+    #[test]
     fn result_frames_round_trip_byte_exactly() {
         let dir = ScratchDir::create().unwrap();
         let path = dir.path().join("r.bin").to_string_lossy().into_owned();
@@ -2192,6 +2239,7 @@ mod tests {
             }],
         });
         let b = FuncResult {
+            type_bindings: Vec::new(),
             name: "sub_1234".into(),
             address: 0x1234,
             byte_address: 0x1234,
@@ -2240,10 +2288,11 @@ mod tests {
     }
 
     #[test]
-    fn result_encoding_matches_the_version_seven_wire_layout() {
+    fn result_encoding_matches_the_version_eight_wire_layout() {
         let dir = ScratchDir::create().unwrap();
         let path = dir.path().join("wire.bin").to_string_lossy().into_owned();
         let result = FuncResult {
+            type_bindings: Vec::new(),
             name: "f".into(),
             address: 0x10,
             byte_address: 0x20,
@@ -2265,7 +2314,7 @@ mod tests {
             detail: None,
         };
         let expected = [
-            b"KUNAJOBRES07\x01\x48\0\0\0".as_slice(),
+            b"KUNAJOBRES09\x01\x4c\0\0\0".as_slice(),
             b"\x10\0\0\0\0\0\0\0\x20\0\0\0\0\0\0\0",
             b"\xff\xff\xff\xff\xff\xff\xff\xff",
             b"\x01\0\0\0f\0\x01\x01\0\0\0e\0\0",
@@ -2278,6 +2327,7 @@ mod tests {
             b"\0\0\0\0", // field calls
             b"\0\0\0\0", // callee hints
             b"\0\0", // synth and pointer arguments
+            b"\0\0\0\0", // retained nominal identities and spellings
         ]
         .concat();
         ResultWriter::create(&path).unwrap().push(&result).unwrap();
@@ -2648,6 +2698,7 @@ mod tests {
     #[test]
     fn worker_failures_are_counted_not_just_budget_trips() {
         let err = |e: &str| FuncResult {
+            type_bindings: Vec::new(),
             name: "f".into(),
             address: 0,
             byte_address: 0,
@@ -2709,6 +2760,7 @@ mod tests {
             serial_callee_first: false,
             elem_objects: false,
             arm_frames: None,
+            export_spec: None,
         }
     }
 

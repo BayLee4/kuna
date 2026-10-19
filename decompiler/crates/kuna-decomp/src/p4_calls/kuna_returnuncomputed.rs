@@ -98,6 +98,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::{spacetype, AddrSpace};
 use kuna_num::opcodes::OpCode;
 
@@ -364,7 +365,7 @@ fn zero_low_pair(data: &Funcdata, def: OpId) -> Option<(VarnodeId, i32, VarnodeI
 /// high half is uncomputed, as it is for any other literal.
 ///
 /// Returns `true` when a RETURN was rewritten.
-pub fn strip_uncomputed_return_piece(data: &mut Funcdata) -> bool {
+pub fn strip_uncomputed_return_piece(data: &mut Funcdata) -> KunaResult<bool> {
     // Collect first: the rewrite mutates the op bank.
     let mut fixes: Vec<(OpId, VarnodeId, OpId)> = Vec::new();
     let mut own_pairs: Vec<(OpId, VarnodeId, OpId)> = Vec::new();
@@ -465,7 +466,7 @@ pub fn strip_uncomputed_return_piece(data: &mut Funcdata) -> bool {
     }
 
     if fixes.is_empty() && drops.is_empty() && zeros.is_empty() {
-        return false;
+        return Ok(false);
     }
     for (retop, size, piece) in zeros {
         let zero = data.new_constant(size, 0);
@@ -476,7 +477,7 @@ pub fn strip_uncomputed_return_piece(data: &mut Funcdata) -> bool {
     for (retop, piece) in drops {
         data.op_remove_input(retop, 1);
         if data.obank().get(piece).and_then(|o| o.get_out()).and_then(|v| data.vbank().get(v)).is_some_and(|v| v.has_no_descend()) {
-            data.op_destroy_recursive(piece, &mut scratch);
+            data.op_destroy_recursive(piece, &mut scratch)?;
         }
     }
     for (retop, keep, piece) in fixes {
@@ -493,10 +494,10 @@ pub fn strip_uncomputed_return_piece(data: &mut Funcdata) -> bool {
             .map(|v| v.has_no_descend())
             .unwrap_or(false);
         if unused {
-            data.op_destroy_recursive(piece, &mut scratch);
+            data.op_destroy_recursive(piece, &mut scratch)?;
         }
     }
-    true
+    Ok(true)
 }
 
 #[cfg(test)]

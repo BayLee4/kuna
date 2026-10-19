@@ -140,7 +140,7 @@ fn rewrites_accumulator_as_counter_times_stride() {
         }
 
         let mut rule = RuleArrayStride::new(true);
-        assert_eq!(rule.apply_op(acc_phi, &mut fd), 1);
+        assert_eq!(rule.apply_op(acc_phi, &mut fd).unwrap(), 1);
 
         // The external reader now reads `INT_MULT(cnt, 0x10)`.
         let multout = fd.obank().get(reader).unwrap().get_in(0).unwrap();
@@ -167,7 +167,7 @@ fn gate_off_is_noop() {
     let mut fd = build_fd();
     let (acc_phi, _acc_out, _cnt_out, reader, _bl) = build_two_phis(&mut fd, 4, 0x10);
     let mut rule = RuleArrayStride::new(false);
-    assert_eq!(rule.apply_op(acc_phi, &mut fd), 0);
+    assert_eq!(rule.apply_op(acc_phi, &mut fd).unwrap(), 0);
     // phi still alive, reader still reads the accumulator output.
     assert!(fd.obank().get(acc_phi).is_some());
     assert_eq!(fd.obank().get(acc_phi).unwrap().code(), OpCode::CPUI_MULTIEQUAL);
@@ -180,7 +180,7 @@ fn unit_stride_declines() {
     let mut fd = build_fd();
     let (acc_phi, _a, _c, _r, _bl) = build_two_phis(&mut fd, 4, 1);
     let mut rule = RuleArrayStride::new(true);
-    assert_eq!(rule.apply_op(acc_phi, &mut fd), 0);
+    assert_eq!(rule.apply_op(acc_phi, &mut fd).unwrap(), 0);
     assert!(fd.obank().get(acc_phi).is_some());
 }
 
@@ -204,7 +204,7 @@ fn no_sibling_counter_declines() {
     fd.op_insert(acc_phi, bl, None);
 
     let mut rule = RuleArrayStride::new(true);
-    assert_eq!(rule.apply_op(acc_phi, &mut fd), 0);
+    assert_eq!(rule.apply_op(acc_phi, &mut fd).unwrap(), 0);
     assert!(fd.obank().get(acc_phi).is_some());
 }
 

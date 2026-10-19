@@ -9,6 +9,7 @@
 //! is enabled — see the downstream-compatibility note in
 //! `docs/missing-analyses.md`.
 
+use kuna_base::error::KunaResult;
 use kuna_decomp::architecture::Architecture;
 use kuna_decomp::kuna_symbolnamechars::symbolnamechars_mode;
 use kuna_sleigh::translate::Translate;
@@ -657,7 +658,7 @@ pub fn run_listing_consumers(
     committed_entries: &[u64],
     cold_entries: &[u64],
     plan: &crate::listing::WalkPlan,
-) -> Vec<(&'static str, AnalysisOutput)> {
+) -> KunaResult<Vec<(&'static str, AnalysisOutput)>> {
     run_listing_consumers_replaying(
         bytes, image, arch, translate, noreturn_seeds, callfixup_seeds, committed_entries, cold_entries,
         plan, None,
@@ -667,6 +668,7 @@ pub fn run_listing_consumers(
 /// [`run_listing_consumers`], with `frames_replay` standing in for the
 /// `armframes` search: a `--jobs` worker passes the parent's
 /// [`AnalysisOutput::arm_frames`] record and builds only its final Listing.
+/// Listing acquisition errors propagate unchanged in both paths.
 #[allow(clippy::too_many_arguments)]
 pub fn run_listing_consumers_replaying(
     bytes: &[u8],
@@ -679,9 +681,9 @@ pub fn run_listing_consumers_replaying(
     cold_entries: &[u64],
     plan: &crate::listing::WalkPlan,
     frames_replay: Option<&crate::aif::kuna_framereplay::ArmFrameReplay>,
-) -> Vec<(&'static str, AnalysisOutput)> {
+) -> KunaResult<Vec<(&'static str, AnalysisOutput)>> {
     let Ok(file) = crate::loadimage_object::parse_object(bytes) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // A relocatable object is laid out synthetically by the loader, so every
     // address this raw `object` view reports is a *pre-link*, section-relative
@@ -693,7 +695,7 @@ pub fn run_listing_consumers_replaying(
     // table the linker is about to consume — which the loader already registers,
     // rebased. See `reloc_object::is_synthetically_laid_out`.
     if crate::loader::reloc_object::is_synthetically_laid_out(&file) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut seeds = listing_seeds_for_language(&file, bytes, Some(arch.get_description()));
     let bracket_evidence = std::cell::OnceCell::new();
@@ -780,7 +782,7 @@ pub fn run_listing_consumers_replaying(
         &seed_names,
         detail,
         plan,
-    );
+    )?;
     if arch.analysis_fast_funcdisc
         && matches!(file.architecture(), object::Architecture::I386 | object::Architecture::X86_64)
     {
@@ -834,7 +836,7 @@ pub fn run_listing_consumers_replaying(
                 &seed_names,
                 detail,
                 plan,
-            );
+            )?;
         }
     }
     // (kuna `thunkentry`, `addrtakenentry`) Where the walk's own function set is
@@ -858,7 +860,7 @@ pub fn run_listing_consumers_replaying(
                 }
                 listing = listing.resume(
                     &file, arch, translate, &seeds, &funcsym_seeds, &seed_names, detail, plan,
-                );
+                )?;
             }
         }
     }
@@ -913,8 +915,8 @@ pub fn run_listing_consumers_replaying(
                     let listing = crate::listing::Listing::build_tracking_frames(
                         &file, image, arch, translate, &seeds, &funcsym_seeds,
                         &seed_names, detail, plan, Some(&mut modes), memo,
-                    );
-                    (seeds, listing, modes)
+                    )?;
+                    Ok::<_, kuna_base::error::KunaError>((seeds, listing, modes))
                 };
                 if let Some(replay) = frames_replay {
                     let frames = replay.frames.iter().copied().collect();
@@ -922,7 +924,7 @@ pub fn run_listing_consumers_replaying(
                     frame_aif = replay.aif.as_ref().map(crate::aif::kuna_framereplay::AifReplay::checked);
                     let frame_context = translate.context_scope();
                     let modes;
-                    (seeds, listing, modes) = build(&frames, frame_pointers.as_ref(), frame_aif.as_ref(), None);
+                    (seeds, listing, modes) = build(&frames, frame_pointers.as_ref(), frame_aif.as_ref(), None)?;
                     retained_entries.clone_from(&replay.retained);
                     inventory_context_paints = modes.decoded_paints();
                     if let Some(context) = frame_context {
@@ -936,7 +938,7 @@ pub fn run_listing_consumers_replaying(
                             &file, image, arch, translate, seeds, &funcsym_seeds, &seed_names, detail, plan,
                         ),
                         arch, translate, code_space, bracket(original.exec_ranges()), &memo,
-                    );
+                    )?;
                     let mut frames: std::collections::BTreeSet<u64> = frame_cache.roots.iter().copied().collect();
                     prior.restore(&mut frames, frame_cache);
                     let mut rejected = std::collections::BTreeSet::new();
@@ -944,7 +946,7 @@ pub fn run_listing_consumers_replaying(
                         let frame_context = translate.context_scope();
                         let modes;
                         (seeds, listing, modes) =
-                            build(&frames, frame_pointers.as_ref(), frame_aif.as_ref(), Some(&memo));
+                            build(&frames, frame_pointers.as_ref(), frame_aif.as_ref(), Some(&memo))?;
                         let mut replacements = crate::aif::arm_frame_prefixes(
                             frame_cache, &original, &listing, &frames, &[], frame_context.as_ref(),
                             arch, translate, std::rc::Rc::clone(code_space),
@@ -1041,7 +1043,7 @@ pub fn run_listing_consumers_replaying(
                     listing = crate::listing::Listing::build_with_meta_planned(
                         &file, image, arch, translate, &seeds, &funcsym_seeds,
                         &seed_names, detail, plan,
-                    );
+                    )?;
                 }
             }
         }
@@ -1087,7 +1089,7 @@ pub fn run_listing_consumers_replaying(
                         &seed_names,
                         detail,
                         plan,
-                    );
+                    )?;
                 }
             }
         }
@@ -1264,7 +1266,7 @@ pub fn run_listing_consumers_replaying(
         out.push(("armframes", modes));
     }
     sanitize_all_names(&mut out);
-    out
+    Ok(out)
 }
 
 /// Build an [`AnalysisCtx`] and run the **deferred** scalar/operand reference-markup
@@ -1388,16 +1390,17 @@ fn funcsym_names(file: &object::File) -> Vec<(u64, String)> {
 /// This keeps `object::File` an internal concern of `kuna-analysis` (the crate
 /// that already depends on `object`): the console hands in the image bytes, the
 /// opened [`ObjectLoadImage`], and the resolved [`Architecture`], and gets back
-/// flat facts to commit. A parse failure yields an empty output (the analyses
-/// are additive and never fail — the funcsym stream is committed separately).
+/// flat facts to commit. A parse failure yields an empty output (the funcsym
+/// stream is committed separately). Listing acquisition errors propagate without
+/// publishing partial analysis facts.
 pub fn run_default_analyses(
     bytes: &[u8],
     image: &ObjectLoadImage,
     arch: &Architecture,
     translate: &dyn Translate,
-) -> AnalysisOutput {
+) -> KunaResult<AnalysisOutput> {
     let Ok(raw) = crate::loadimage_object::parse_object(bytes) else {
-        return AnalysisOutput::default();
+        return Ok(AnalysisOutput::default());
     };
     // (kuna `relocrebase`, GH-289) A relocatable object is laid out synthetically
     // by the loader, so the raw view's addresses are pre-link ones. Re-present it
@@ -1416,7 +1419,8 @@ pub fn run_default_analyses(
     let seeds = listing_seeds_for_language(&file, bytes, Some(arch.get_description()));
     let listing = arch
         .analysis_listing
-        .then(|| crate::listing::Listing::build(&file, image, arch, translate, &seeds));
+        .then(|| crate::listing::Listing::build(&file, image, arch, translate, &seeds))
+        .transpose()?;
     let ctx = AnalysisCtx {
         file: &file,
         bytes,
@@ -1431,7 +1435,7 @@ pub fn run_default_analyses(
         crate::loader::kuna_relocrebase::retain_in_image(&mut out, view);
     }
     out.sanitize_names(symbolnamechars_mode());
-    out
+    Ok(out)
 }
 
 /// Like [`run_default_analyses`], but keep each pass's output keyed by its
@@ -1441,16 +1445,17 @@ pub fn run_default_analyses(
 /// load and commits only the **enabled** passes' facts at `read symbols` (after
 /// the per-pass `--option <id> on|off` flags have been applied). The id is the
 /// pass's `id()` string, which doubles as its settable-option name (`phases.toml`
-/// + `KUNA_OPTION_NAMES`). A parse failure yields an empty list (additive, never
-/// fails). Pairs preserve pass order so the commit order is deterministic.
+/// + `KUNA_OPTION_NAMES`). A parse failure yields an empty list; Listing
+/// acquisition errors propagate unchanged. Pairs preserve pass order so the
+/// commit order is deterministic.
 pub fn run_default_analyses_per_pass(
     bytes: &[u8],
     image: &ObjectLoadImage,
     arch: &Architecture,
     translate: &dyn Translate,
-) -> Vec<(&'static str, AnalysisOutput)> {
+) -> KunaResult<Vec<(&'static str, AnalysisOutput)>> {
     let Ok(raw) = crate::loadimage_object::parse_object(bytes) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     // (kuna `relocrebase`, GH-289) See `run_default_analyses`: a relocatable
     // object is re-presented in the loaded image's address space so every pass
@@ -1467,7 +1472,8 @@ pub fn run_default_analyses_per_pass(
     let seeds = listing_seeds_for_language(&file, bytes, Some(arch.get_description()));
     let listing = arch
         .analysis_listing
-        .then(|| crate::listing::Listing::build(&file, image, arch, translate, &seeds));
+        .then(|| crate::listing::Listing::build(&file, image, arch, translate, &seeds))
+        .transpose()?;
     let ctx = AnalysisCtx {
         file: &file,
         bytes,
@@ -1488,7 +1494,7 @@ pub fn run_default_analyses_per_pass(
         })
         .collect();
     sanitize_all_names(&mut split);
-    split
+    Ok(split)
 }
 
 /// (kuna `symbolnamechars`, GH-340) Sanitize every recovered NAME in a per-pass

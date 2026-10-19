@@ -31,9 +31,10 @@
 use std::rc::Rc;
 
 use kuna_base::types::{int4, uint4};
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
-use crate::cast::{CastStrategy, CastStrategyC, IntPromotionCode};
+use crate::cast::{CastStrategy, IntPromotionCode};
 use crate::context::{OpId, VarnodeId};
 use crate::coreaction_casts::FuncdataCastContext;
 use crate::dtype::{type_metatype, Datatype, TypeFactory};
@@ -41,69 +42,74 @@ use crate::funcdata::Funcdata;
 
 /// The cast a narrowed argument in `slot` of the CALL/CALLIND `op` needs so its C
 /// value matches the zero-extended value the binary passes, or `None`.
+/// Facing-type and promotion acquisition failures propagate to the cast action.
 pub(crate) fn narrowed_arg_cast(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     op: OpId,
     slot: int4,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     if slot < 1 {
-        return None;
+        return Ok(None);
     }
-    if !data.get_arch().int_promotion {
-        return None;
+    // This repair restores C unsigned-register promotion. Java has no unsigned
+    // byte/short conversion: a UINT cast would silently turn zext into sext.
+    // Java's explicit SUBPIECE/ZEXT operators retain their own cast policy.
+    if !data.get_arch().int_promotion || data.get_arch().out_lang == crate::kuna_lang::OutLang::Java {
+        return Ok(None);
     }
-    let o = data.obank().get(op)?;
+    let Some(o) = data.obank().get(op) else { return Ok(None) };
     if !matches!(o.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) {
-        return None;
+        return Ok(None);
     }
     let ninputs = o.num_input();
-    let invn = o.get_in(slot)?;
-    let vn = data.vbank().get(invn)?;
+    let Some(invn) = o.get_in(slot) else { return Ok(None) };
+    let Some(vn) = data.vbank().get(invn) else { return Ok(None) };
     let size = vn.get_size();
     if size > strat.promote_size() || vn.is_annotation() {
-        return None;
+        return Ok(None);
     }
-    let fc = data.get_call_specs(data.get_call_specs_index(op)?);
+    let Some(index) = data.get_call_specs_index(op) else { return Ok(None) };
+    let fc = data.get_call_specs(index);
     if !fc.is_zext_trimmed_input(slot, size, ninputs) {
-        return None;
+        return Ok(None);
     }
     if size == strat.promote_size() {
         return int_arg_cast(data, strat, op, slot, invn, size);
     }
     let is_const = vn.is_constant();
     if declared_param(data, op, slot) {
-        return None;
+        return Ok(None);
     }
-    let curtype = data.vn_high_type_read_facing(invn, op);
+    let curtype = data.vn_high_type_read_facing(invn, op)?;
     let mut meta = curtype.get_metatype();
     if !matches!(
         meta,
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN
     ) || curtype.is_enum_type()
     {
-        return None;
+        return Ok(None);
     }
-    let tlst = data.get_arch().types_rc()?;
+    let Some(tlst) = data.get_arch().types_rc() else { return Ok(None) };
     let char_ty = if data.get_arch().unknown_byte_is_char {
-        tlst.get_base(1, type_metatype::TYPE_INT).ok()
+        Some(tlst.get_base(1, type_metatype::TYPE_INT)?)
     } else {
         None
     };
     if char_ty.is_some() && size == 1 && meta == type_metatype::TYPE_UNKNOWN && !is_const {
         meta = type_metatype::TYPE_INT;
     }
-    if promotes_as_zext(data, strat, op, invn, meta, char_ty) {
-        return None;
+    if promotes_as_zext(data, strat, op, invn, meta, char_ty)? {
+        return Ok(None);
     }
     if fits_unsigned(data, invn, size) {
-        return None;
+        return Ok(None);
     }
-    let ct = tlst.get_base(size, type_metatype::TYPE_UINT).ok()?;
-    if retype_truncation(data, strat, invn, &ct) {
-        return None;
+    let ct = tlst.get_base(size, type_metatype::TYPE_UINT)?;
+    if retype_truncation(data, strat, invn, &ct)? {
+        return Ok(None);
     }
-    Some(ct)
+    Ok(Some(ct))
 }
 
 /// The cast an `int`-wide argument trimmed from a zero-extended register needs
@@ -114,27 +120,28 @@ pub(crate) fn narrowed_arg_cast(
 /// parameter or its value cannot be negative.
 fn int_arg_cast(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     op: OpId,
     slot: int4,
     invn: VarnodeId,
     size: int4,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     if declared_param(data, op, slot) || !callee_reads_wider(data, op, slot, size) {
-        return None;
+        return Ok(None);
     }
-    let v = data.vbank().get(invn)?;
+    let Some(v) = data.vbank().get(invn) else { return Ok(None) };
     if !kuna_base::address::signbit_negative(v.get_nz_mask(), size) {
-        return None;
+        return Ok(None);
     }
-    let signed = match crate::kuna_unsignedread::c_int(data, strat, invn, op) {
+    let signed = match crate::kuna_unsignedread::c_int(data, strat, invn, op)? {
         Some((unsigned, width)) => !unsigned && width == size,
-        None => data.vn_high_type_read_facing(invn, op).get_metatype() == type_metatype::TYPE_INT,
+        None => data.vn_high_type_read_facing(invn, op)?.get_metatype() == type_metatype::TYPE_INT,
     };
     if !signed {
-        return None;
+        return Ok(None);
     }
-    data.get_arch().types_rc()?.get_base(size, type_metatype::TYPE_UINT).ok()
+    let Some(types) = data.get_arch().types_rc() else { return Ok(None) };
+    Ok(Some(types.get_base(size, type_metatype::TYPE_UINT)?))
 }
 
 /// Does the callee's own recovery (stated by `protoorder`) read argument `slot`
@@ -200,15 +207,15 @@ pub(crate) fn note_trimmed_arg(data: &mut Funcdata, op: OpId, slot: int4, zext: 
 /// when every read of it is a call argument, each of which wants the same type.
 fn retype_truncation(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     invn: VarnodeId,
     ct: &Rc<Datatype>,
-) -> bool {
+) -> KunaResult<bool> {
     let Some(vn) = data.vbank().get(invn) else {
-        return false;
+        return Ok(false);
     };
     if !vn.is_implied() {
-        return false;
+        return Ok(false);
     }
     let reads = data.descend_snapshot(invn);
     if reads.is_empty()
@@ -219,28 +226,28 @@ fn retype_truncation(
             })
         })
     {
-        return false;
+        return Ok(false);
     }
     let Some(def) = vn.get_def() else {
-        return false;
+        return Ok(false);
     };
     let Some(d) = data.obank().get(def) else {
-        return false;
+        return Ok(false);
     };
     if d.code() != OpCode::CPUI_SUBPIECE || d.does_special_printing() {
-        return false;
+        return Ok(false);
     }
     let (Some(in0), Some(in1)) = (d.get_in(0), d.get_in(1)) else {
-        return false;
+        return Ok(false);
     };
     let off = data.vbank().get(in1).map(|v| v.get_offset()).unwrap_or(0) as uint4;
-    let intype = data.vn_high_type_read_facing(in0, def);
-    let outtype = data.vn_high_type_def_facing(invn);
+    let intype = data.vn_high_type_read_facing(in0, def)?;
+    let outtype = data.vn_high_type_def_facing(invn)?;
     if !strat.is_subpiece_cast(&outtype, &intype, off) || !strat.is_subpiece_cast(ct, &intype, off) {
-        return false;
+        return Ok(false);
     }
     data.vn_update_type(invn, Rc::clone(ct));
-    data.vbank().get(invn).is_some_and(|v| Rc::ptr_eq(v.get_type(), ct))
+    Ok(data.vbank().get(invn).is_some_and(|v| Rc::ptr_eq(v.get_type(), ct)))
 }
 
 /// Is parameter `slot` of the call fixed by a declared prototype?
@@ -260,12 +267,12 @@ fn declared_param(data: &Funcdata, op: OpId, slot: int4) -> bool {
 /// prints as, when that spelling is signed.
 fn promotes_as_zext(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     op: OpId,
     invn: VarnodeId,
     meta: type_metatype,
     char_ty: Option<Rc<Datatype>>,
-) -> bool {
+) -> KunaResult<bool> {
     use IntPromotionCode::*;
     let def_code = data
         .vbank()
@@ -274,16 +281,16 @@ fn promotes_as_zext(
         .and_then(|d| data.obank().get(d))
         .map(|d| d.code());
     if def_code == Some(OpCode::CPUI_INT_ZEXT) {
-        return true;
+        return Ok(true);
     }
     let mut ctx = FuncdataCastContext::new(data);
     if let Some(c) = char_ty {
         ctx = ctx.with_unknown_byte_as(c);
     }
     let vr = ctx.vn_ref(invn);
-    let mut ext = strat.int_promotion_type(&ctx, vr);
+    let mut ext = strat.int_promotion_type(&ctx, vr)?;
     if ext == NO_PROMOTION {
-        ext = strat.local_extension_type(&ctx, vr, Some(ctx.op_ref(op)));
+        ext = strat.local_extension_type(&ctx, vr, Some(ctx.op_ref(op)))?;
         if ext == UNKNOWN_PROMOTION {
             ext = if meta == type_metatype::TYPE_INT {
                 SIGNED_EXTENSION
@@ -292,7 +299,7 @@ fn promotes_as_zext(
             };
         }
     }
-    (ext.as_i32() & UNSIGNED_EXTENSION.as_i32()) != 0
+    Ok((ext.as_i32() & UNSIGNED_EXTENSION.as_i32()) != 0)
 }
 
 /// Does the printed expression `vn` provably evaluate, in C, to a value in

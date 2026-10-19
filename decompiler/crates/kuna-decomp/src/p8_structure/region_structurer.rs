@@ -1376,7 +1376,7 @@ impl<'a> RegionStructurer<'a> {
             graph_id,
             &cases,
             exitblock.is_some(),
-            jt_index,
+            Some(jt_index),
             &switch_case_edges,
         );
         self.switch_case_edges = switch_case_edges;

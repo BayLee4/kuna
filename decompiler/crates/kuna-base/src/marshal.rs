@@ -420,7 +420,7 @@ fn cxx_strtoull_core(bytes: &[u8]) -> (u64, usize, bool, bool) {
 /// `istringstream >> uintb` with `unsetf(ios::dec|ios::hex|ios::oct)`:
 /// strtoull semantics — overflow saturates to `u64::MAX`, a minus sign
 /// (wrapping-)negates the magnitude.
-pub(crate) fn cxx_parse_unsigned(bytes: &[u8]) -> u64 {
+pub fn cxx_parse_unsigned(bytes: &[u8]) -> u64 {
     let (val, _, neg, overflow) = cxx_strtoull_core(bytes);
     if overflow {
         return u64::MAX;
@@ -688,6 +688,24 @@ pub trait Decoder {
 /// AttributeId, which must be the last write*() call associated with the
 /// specific element.
 pub trait Encoder {
+    fn admits_result_types(&self) -> bool {
+        false
+    }
+
+    /// Negotiate an identity-scoped result type reference. Ordinary encoders do
+    /// not admit result-local types and retain their existing wire grammar.
+    fn register_result_type(
+        &mut self,
+        _key: usize,
+        _name: &str,
+        _id: u64,
+        _size: i32,
+        _meta: &str,
+        _describe: &mut dyn FnMut(&mut dyn Encoder) -> KunaResult<()>,
+    ) -> KunaResult<Option<u64>> {
+        Ok(None)
+    }
+
     /// \brief Begin a new element in the encoding
     ///
     /// The element will have the given ElementId annotation and becomes the

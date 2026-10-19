@@ -50,7 +50,7 @@ cases = [
  {'name':'join_return','bits':32,'code':'8b4424048b542408c3','prototype':'unsigned long long __cdecl subject(unsigned int low,unsigned int high)',
   'types':[('low',uint),('high',uint)],'result':wide,'extra':[], 'expected_params':[('low',4),('high',4)],
   'machine':[({'stack_arg0':lo,'stack_arg1':hi},(hi<<32)|lo) for lo,hi in [(0,7),(7,0),(0x12345678,0x76543210),(0xffffffff,0x80000000)]],
-  'driver':'const uint32_t pairs[][2]={{0,7},{7,0},{UINT32_C(0x12345678),UINT32_C(0x76543210)},{UINT32_MAX,UINT32_C(0x80000000)}}; for(unsigned i=0;i<4;++i) if(subject(pairs[i][0],pairs[i][1])!=(((uint64_t)pairs[i][1]<<32)|pairs[i][0])) return 4;'},
+  'driver':'static const uint32_t pairs[][2]={{0,7},{7,0},{UINT32_C(0x12345678),UINT32_C(0x76543210)},{UINT32_MAX,UINT32_C(0x80000000)}}; for(unsigned i=0;i<4;++i) if(subject(pairs[i][0],pairs[i][1])!=(((uint64_t)pairs[i][1]<<32)|pairs[i][0])) return 4;'},
 ]
 
 def original_machine(case, row):

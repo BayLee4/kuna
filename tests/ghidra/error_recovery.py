@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pyghidra
 
-from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra, test_cores
 
 
 def field(cls, name):
@@ -54,7 +54,7 @@ def main():
         finally:
             program.endTransaction(tx, True)
 
-        for core in ("stock", "kuna"):
+        for core in test_cores():
             exepath.set(None, KUNA_GHIDRA if core == "kuna" else None)
             interface = DecompInterface()
             options = DecompileOptions()

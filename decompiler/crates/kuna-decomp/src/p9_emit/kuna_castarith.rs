@@ -41,13 +41,20 @@
 //! constant that names a global or is
 //! address-like beside an integer cast to a pointer (`table[i]` compiles to the
 //! same `INT_ADD`, with the table as the constant).
+//!
+//! Planning returns semantic refusals separately from acquisition failures:
+//! a `Leave` keeps integer arithmetic, while a query error aborts the action.
 
 use std::rc::Rc;
+
+use kuna_base::error::{KunaError, KunaResult};
 
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 
-use crate::cast::{CastStrategy, CastStrategyC};
+use crate::cast::CastStrategy;
+#[cfg(test)]
+use crate::cast::CastStrategyC;
 use crate::context::{OpId, VarnodeId};
 use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::funcdata::Funcdata;
@@ -87,6 +94,30 @@ pub(crate) enum Leave {
     DiffResult,
     /// `castindex`: the subscript would spell as many casts as the integer form.
     NoCastSaved,
+}
+
+// Planning refusal is not an acquisition failure. Keep both channels distinct
+// until the public query boundary.
+#[derive(Debug)]
+enum PlanningError {
+    Leave(Leave),
+    Acquisition(KunaError),
+}
+
+impl From<Leave> for PlanningError {
+    fn from(value: Leave) -> Self { Self::Leave(value) }
+}
+
+impl From<KunaError> for PlanningError {
+    fn from(value: KunaError) -> Self { Self::Acquisition(value) }
+}
+
+fn planned<T>(result: Result<T, PlanningError>) -> KunaResult<Result<T, Leave>> {
+    match result {
+        Ok(value) => Ok(Ok(value)),
+        Err(PlanningError::Leave(reason)) => Ok(Err(reason)),
+        Err(PlanningError::Acquisition(error)) => Err(error),
+    }
 }
 
 /// How the `PTRADD` reaches a `T *` base.
@@ -132,8 +163,8 @@ fn signed_value(off: uintb, size: int4) -> i64 {
 /// The input of the implied cast `vn`, when it is an integer or a pointer a
 /// `(T *)` cast can read directly: converting it straight to `T *` keeps the
 /// bits the two casts would.
-fn implied_cast_source(data: &mut Funcdata, vn: VarnodeId) -> Option<VarnodeId> {
-    let (def, src) = {
+fn implied_cast_source(data: &mut Funcdata, vn: VarnodeId) -> KunaResult<Option<VarnodeId>> {
+    let Some((def, src)) = (|| {
         let v = data.vbank().get(vn)?;
         if !v.is_implied() || v.is_explicit() {
             return None;
@@ -143,20 +174,20 @@ fn implied_cast_source(data: &mut Funcdata, vn: VarnodeId) -> Option<VarnodeId> 
         if d.code() != OpCode::CPUI_CAST {
             return None;
         }
-        (def, d.get_in(0)?)
-    };
-    if data.vbank().get(src)?.is_constant() {
-        return None;
+        Some((def, d.get_in(0)?))
+    })() else { return Ok(None) };
+    if data.vbank().get(src).is_none_or(|v| v.is_constant()) {
+        return Ok(None);
     }
-    let t = data.vn_high_type_read_facing(src, def);
-    matches!(
+    let t = data.vn_high_type_read_facing(src, def)?;
+    Ok(matches!(
         t.get_metatype(),
         type_metatype::TYPE_INT
             | type_metatype::TYPE_UINT
             | type_metatype::TYPE_UNKNOWN
             | type_metatype::TYPE_PTR
     )
-    .then_some(src)
+    .then_some(src))
 }
 
 fn cast_def_read_only_here(data: &Funcdata, vn: VarnodeId, op: OpId) -> bool {
@@ -219,27 +250,27 @@ fn c_sizeof_is_size(types: &crate::dtype::TypeFactoryImpl, target: &Rc<Datatype>
 /// PTRADD input cast (its own type is `ptype`) and the declaration a reader sees
 /// -- a parameter's prototype type, or a local's declared type -- must point at
 /// the same element.
-fn declared_as(data: &Funcdata, vn: VarnodeId, op: OpId, ptype: &Rc<Datatype>) -> bool {
-    if !Rc::ptr_eq(&data.vn_type_read_facing(vn, op), ptype) {
-        return false;
+fn declared_as(data: &Funcdata, vn: VarnodeId, op: OpId, ptype: &Rc<Datatype>) -> KunaResult<bool> {
+    if !Rc::ptr_eq(&data.vn_type_read_facing(vn, op)?, ptype) {
+        return Ok(false);
     }
     let Some(decl) =
         crate::printc::declared_variable_type(data, data.get_arch().decl_high_type, vn)
     else {
-        return false;
+        return Ok(false);
     };
     let elem = |t: &Rc<Datatype>| t.get_ptr_to().map(strip_typedefs);
-    decl.get_metatype() == type_metatype::TYPE_PTR
+    Ok(decl.get_metatype() == type_metatype::TYPE_PTR
         && decl.get_size() == ptype.get_size()
-        && matches!((elem(&decl), elem(ptype)), (Some(a), Some(b)) if Rc::ptr_eq(&a, &b))
+        && matches!((elem(&decl), elem(ptype)), (Some(a), Some(b)) if Rc::ptr_eq(&a, &b)))
 }
 
 /// Is `vn` an integer the cast pass has already turned into a pointer?  With an
 /// address-like constant beside it, that is `table[i]`: the constant is the
 /// table and the "pointer" is the subscript.
-fn integer_made_pointer(data: &mut Funcdata, vn: VarnodeId) -> bool {
+fn integer_made_pointer(data: &mut Funcdata, vn: VarnodeId) -> KunaResult<bool> {
     let Some(def) = data.vbank().get(vn).and_then(|v| v.get_def()) else {
-        return false;
+        return Ok(false);
     };
     let Some(input) = data
         .obank()
@@ -247,9 +278,9 @@ fn integer_made_pointer(data: &mut Funcdata, vn: VarnodeId) -> bool {
         .filter(|o| o.code() == OpCode::CPUI_CAST)
         .and_then(|o| o.get_in(0))
     else {
-        return false;
+        return Ok(false);
     };
-    data.vn_high_type_read_facing(input, def).get_metatype() != type_metatype::TYPE_PTR
+    Ok(data.vn_high_type_read_facing(input, def)?.get_metatype() != type_metatype::TYPE_PTR)
 }
 
 /// Does the value of `out` stay inside this function?  A `void *` sum stepped in
@@ -282,30 +313,24 @@ fn stays_in_function(data: &Funcdata, out: VarnodeId) -> bool {
 /// Is the implied sum `out` read as an integer?  Integer arithmetic on it, or a
 /// store of it into an integer slot, converts it straight back with a `(long)`,
 /// which the integer form already folds into its one cast.
-fn read_as_integer(data: &mut Funcdata, out: VarnodeId) -> bool {
+fn read_as_integer(data: &mut Funcdata, out: VarnodeId) -> KunaResult<bool> {
     let readers: Vec<OpId> = match data.vbank().get(out) {
         Some(v) if !v.is_explicit() => v.descend_iter().collect(),
-        _ => return false,
+        _ => return Ok(false),
     };
-    readers.into_iter().any(|reader| {
-        let Some((code, slot, addr)) = data
-            .obank()
-            .get(reader)
-            .map(|r| (r.code(), r.get_slot(out), r.get_in(1)))
-        else {
-            return false;
-        };
-        match code {
-            OpCode::CPUI_STORE if slot == 2 => addr.is_some_and(|a| {
-                let at = data.vn_high_type_read_facing(a, reader);
+    for reader in readers {
+        let Some((code, slot, addr)) = data.obank().get(reader)
+            .map(|r| (r.code(), r.get_slot(out), r.get_in(1))) else { continue };
+        let integer = if code == OpCode::CPUI_STORE && slot == 2 {
+            if let Some(a) = addr {
+                let at = data.vn_high_type_read_facing(a, reader)?;
                 at.get_metatype() != type_metatype::TYPE_PTR
-                    || at.get_ptr_to().is_some_and(|p| {
-                        strip_typedefs(p).get_metatype() != type_metatype::TYPE_PTR
-                    })
-            }),
-            _ => integer_result(code) && !is_comparison(code),
-        }
-    })
+                    || at.get_ptr_to().is_some_and(|p| strip_typedefs(p).get_metatype() != type_metatype::TYPE_PTR)
+            } else { false }
+        } else { integer_result(code) && !is_comparison(code) };
+        if integer { return Ok(true); }
+    }
+    Ok(false)
 }
 
 /// Is `out` a variable the printed C declares as something other than a
@@ -373,19 +398,19 @@ enum Access {
     None,
 }
 
-fn access_type(data: &mut Funcdata, out: VarnodeId, op: OpId) -> Access {
+fn access_type(data: &mut Funcdata, out: VarnodeId, op: OpId) -> KunaResult<Access> {
     let Some(v) = data.vbank().get(out) else {
-        return Access::None;
+        return Ok(Access::None);
     };
     if v.is_explicit() || v.is_type_lock() {
-        return Access::None;
+        return Ok(Access::None);
     }
     let Some(reader) = data.lone_descend(out) else {
-        return Access::None;
+        return Ok(Access::None);
     };
     let (code, slot, value) = {
         let Some(r) = data.obank().get(reader) else {
-            return Access::None;
+            return Ok(Access::None);
         };
         let value = match r.code() {
             OpCode::CPUI_LOAD => r.get_out(),
@@ -393,26 +418,26 @@ fn access_type(data: &mut Funcdata, out: VarnodeId, op: OpId) -> Access {
             _ => None,
         };
         let Some(value) = value else {
-            return Access::None;
+            return Ok(Access::None);
         };
         (r.code(), r.get_slot(out), value)
     };
     if slot != 1 {
-        return Access::None;
+        return Ok(Access::None);
     }
     let t = if code == OpCode::CPUI_LOAD {
-        data.vn_high_type_def_facing(value)
+        data.vn_high_type_def_facing(value)?
     } else {
-        data.vn_high_type_read_facing(value, reader)
+        data.vn_high_type_read_facing(value, reader)?
     };
     let size = data.vbank().get(value).map(|v| v.get_size()).unwrap_or(0);
     if t.get_size() != size {
-        return Access::None;
+        return Ok(Access::None);
     }
     if code == OpCode::CPUI_STORE && !store_value_settled(data, value, op, &t) {
-        return Access::Unsettled;
+        return Ok(Access::Unsettled);
     }
-    Access::Value(t)
+    Ok(Access::Value(t))
 }
 
 /// Will the value a STORE writes still be of `t`'s kind when the STORE is cast?
@@ -518,20 +543,20 @@ fn element(
     op: OpId,
     out: VarnodeId,
     ptype: &Rc<Datatype>,
-) -> Result<(Rc<Datatype>, Rc<Datatype>, SumUse), Leave> {
+) -> Result<(Rc<Datatype>, Rc<Datatype>, SumUse), PlanningError> {
     let out_size = data.vbank().get(out).map(|v| v.get_size()).unwrap_or(0);
     if ptype.get_word_size() != Some(1) || ptype.get_size() != out_size {
-        return Err(Leave::WordAddressed);
+        return Err(Leave::WordAddressed.into());
     }
     let tlst = data.get_arch().types_rc().ok_or(Leave::WordAddressed)?;
-    let outty = data.vn_high_type_def_facing(out);
+    let outty = data.vn_high_type_def_facing(out)?;
     let out_pointee = (outty.get_metatype() == type_metatype::TYPE_PTR
         && outty.get_word_size() == Some(1)
         && outty.get_size() == out_size)
         .then(|| outty.get_ptr_to().map(strip_typedefs))
         .flatten();
-    let (target, target_ptr, used) = match access_type(data, out, op) {
-        Access::Unsettled => return Err(Leave::UnsettledStore),
+    let (target, target_ptr, used) = match access_type(data, out, op)? {
+        Access::Unsettled => return Err(Leave::UnsettledStore.into()),
         Access::Value(a) => {
             let a_elem = strip_typedefs(Rc::clone(&a));
             match out_pointee {
@@ -541,20 +566,20 @@ fn element(
                 _ => {
                     let ptr = tlst
                         .get_type_pointer(out_size, a, 1)
-                        .map_err(|_| Leave::Unsized)?;
+                        ?;
                     (a_elem, ptr, SumUse::Access)
                 }
             }
         }
         Access::None => {
             if outty.get_metatype() != type_metatype::TYPE_PTR {
-                return Err(Leave::OutNotPointer);
+                return Err(Leave::OutNotPointer.into());
             }
-            if read_as_integer(data, out) || declared_non_pointer(data, out) {
-                return Err(Leave::IntegerUse);
+            if read_as_integer(data, out)? || declared_non_pointer(data, out) {
+                return Err(Leave::IntegerUse.into());
             }
             if shared_address(data, out) {
-                return Err(Leave::SharedAddress);
+                return Err(Leave::SharedAddress.into());
             }
             let pointee = out_pointee.ok_or(Leave::WordAddressed)?;
             if pointee.get_metatype() != type_metatype::TYPE_VOID {
@@ -562,18 +587,18 @@ fn element(
             } else if stays_in_function(data, out) {
                 let byte = tlst
                     .get_base(1, type_metatype::TYPE_INT)
-                    .map_err(|_| Leave::VoidTarget)?;
+                    ?;
                 let ptr = tlst
                     .get_type_pointer(out_size, Rc::clone(&byte), 1)
-                    .map_err(|_| Leave::VoidTarget)?;
+                    ?;
                 (byte, ptr, SumUse::Bytes)
             } else {
-                return Err(Leave::VoidTarget);
+                return Err(Leave::VoidTarget.into());
             }
         }
     };
     if target.is_enum_type() {
-        return Err(Leave::EnumTarget);
+        return Err(Leave::EnumTarget.into());
     }
     match target.get_metatype() {
         type_metatype::TYPE_INT
@@ -582,12 +607,12 @@ fn element(
         | type_metatype::TYPE_FLOAT
         | type_metatype::TYPE_PTR
         | type_metatype::TYPE_UNKNOWN => {}
-        type_metatype::TYPE_VOID => return Err(Leave::VoidTarget),
-        _ => return Err(Leave::AggregateTarget),
+        type_metatype::TYPE_VOID => return Err(Leave::VoidTarget.into()),
+        _ => return Err(Leave::AggregateTarget.into()),
     }
     let elem = target.get_size();
     if elem <= 0 || elem != target.get_align_size() || !c_sizeof_is_size(&tlst, &target) {
-        return Err(Leave::Unsized);
+        return Err(Leave::Unsized.into());
     }
     Ok((target, target_ptr, used))
 }
@@ -604,11 +629,15 @@ enum SumUse {
 }
 
 /// Decide whether the `INT_ADD` `op` becomes pointer arithmetic.
-pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
+pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> KunaResult<Result<Plan, Leave>> {
+    planned(plan_inner(data, op))
+}
+
+fn plan_inner(data: &mut Funcdata, op: OpId) -> Result<Plan, PlanningError> {
     let (out, ins) = {
         let o = data.obank().get(op).ok_or(Leave::NoPointer)?;
         if o.code() != OpCode::CPUI_INT_ADD || o.num_input() != 2 {
-            return Err(Leave::NoPointer);
+            return Err(Leave::NoPointer.into());
         }
         let out = o.get_out().ok_or(Leave::NoPointer)?;
         (
@@ -632,7 +661,7 @@ pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
         {
             continue;
         }
-        let pt = data.vn_high_type_read_facing(vn, op);
+        let pt = data.vn_high_type_read_facing(vn, op)?;
         if pt.get_metatype() != type_metatype::TYPE_PTR {
             continue;
         }
@@ -649,8 +678,8 @@ pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
     }
     let (ptr_slot, ptype) = match found {
         Some(f) => f,
-        None if saw_pointer => return Err(Leave::NonConstant),
-        None => return Err(Leave::NoPointer),
+        None if saw_pointer => return Err(Leave::NonConstant.into()),
+        None => return Err(Leave::NoPointer.into()),
     };
     let (target, target_ptr, _) = element(data, op, out, &ptype)?;
     let elem = target.get_size();
@@ -663,28 +692,28 @@ pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
     };
     let k = signed_value(koff, ksize);
     if k % elem as i64 != 0 {
-        return Err(Leave::NonDividing);
+        return Err(Leave::NonDividing.into());
     }
     let index = k / elem as i64;
     if index < -(i32::MAX as i64) {
-        return Err(Leave::WideNegativeIndex);
+        return Err(Leave::WideNegativeIndex.into());
     }
     let cvn = ins[1 - ptr_slot as usize];
     let base_vn = ins[ptr_slot as usize];
-    if crate::kuna_ptrfromuse::constant_is_global_base(data, op, cvn)
-        || (integer_made_pointer(data, base_vn)
-            && crate::kuna_ptrfromuse::constant_may_be_global_base(data, op, cvn))
+    if crate::kuna_ptrfromuse::constant_is_global_base(data, op, cvn)?
+        || (integer_made_pointer(data, base_vn)?
+            && crate::kuna_ptrfromuse::constant_may_be_global_base(data, op, cvn)?)
     {
-        return Err(Leave::AddressLike);
+        return Err(Leave::AddressLike.into());
     }
     let pointee = ptype.get_ptr_to().map(strip_typedefs);
     let base = if pointee.is_some_and(|p| same_element(&p, &target))
-        && declared_as(data, base_vn, op, &ptype)
+        && declared_as(data, base_vn, op, &ptype)?
     {
         Base::Direct
     } else if cast_def_read_only_here(data, base_vn, op) {
         Base::Retype
-    } else if let Some(src) = implied_cast_source(data, base_vn) {
+    } else if let Some(src) = implied_cast_source(data, base_vn)? {
         Base::Recast(src)
     } else {
         Base::Cast
@@ -699,14 +728,14 @@ pub(crate) fn plan(data: &mut Funcdata, op: OpId) -> Result<Plan, Leave> {
 }
 
 /// Rewrite the `INT_ADD` `op` as the `PTRADD` `plan` describes.
-pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> Option<()> {
-    let (base_vn, addr, out) = {
+pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> KunaResult<Option<()>> {
+    let Some((base_vn, addr, ptrsize)) = (|| {
         let o = data.obank().get(op)?;
-        (o.get_in(plan.ptr_slot)?, o.get_addr().clone(), o.get_out()?)
-    };
-    let ptrsize = data.vbank().get(out)?.get_size();
-    let tlst = data.get_arch().types_rc()?;
-    let index_type = tlst.get_base(ptrsize, type_metatype::TYPE_INT).ok()?;
+        let out = o.get_out()?;
+        Some((o.get_in(plan.ptr_slot)?, o.get_addr().clone(), data.vbank().get(out)?.get_size()))
+    })() else { return Ok(None) };
+    let Some(tlst) = data.get_arch().types_rc() else { return Ok(None) };
+    let index_type = tlst.get_base(ptrsize, type_metatype::TYPE_INT)?;
     let base = match plan.base {
         Base::Direct => base_vn,
         Base::Retype => {
@@ -719,13 +748,13 @@ pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> Option<()> {
                 _ => base_vn,
             };
             let cast = data.new_op(1, addr);
-            let cvn = data.new_unique_out(ptrsize, cast).ok()?;
+            let cvn = data.new_unique_out(ptrsize, cast)?;
             let _ = data.vn_update_type(cvn, Rc::clone(&plan.target));
             if let Some(v) = data.vbank_mut().get_mut(cvn) {
                 v.set_implied();
             }
             data.op_set_opcode_code(cast, OpCode::CPUI_CAST);
-            data.op_set_input(cast, src, 0).ok()?;
+            data.op_set_input(cast, src, 0)?;
             data.op_insert_before(cast, op);
             cvn
         }
@@ -734,16 +763,16 @@ pub(crate) fn apply(data: &mut Funcdata, op: OpId, plan: &Plan) -> Option<()> {
     let index = data.new_constant(ptrsize, (plan.index as uintb) & mask);
     let _ = data.vn_update_type(index, index_type);
     let elem = data.new_constant(ptrsize, plan.elem as uintb);
-    data.op_set_all_input(op, &[base, index, elem]).ok()?;
+    data.op_set_all_input(op, &[base, index, elem])?;
     data.op_set_opcode_code(op, OpCode::CPUI_PTRADD);
-    Some(())
+    Ok(Some(()))
 }
 
 /// Turn a qualifying `INT_ADD` into pointer arithmetic; `true` if it did.
-pub(crate) fn rewrite(data: &mut Funcdata, op: OpId) -> bool {
-    match plan(data, op) {
-        Ok(p) => apply(data, op, &p).is_some(),
-        Err(_) => false,
+pub(crate) fn rewrite(data: &mut Funcdata, op: OpId) -> KunaResult<bool> {
+    match plan(data, op)? {
+        Ok(p) => Ok(apply(data, op, &p)?.is_some()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -798,25 +827,25 @@ fn scaled_index(data: &Funcdata, vn: VarnodeId, op: OpId) -> Option<Scaled> {
 /// type extends that way, and the pass casts the input where it does not); a
 /// pointer-width integer converts to itself.  A pointer, a float, a `bool`, an
 /// enum and a value the pass has already cast (`(long)p`) are not such indexes.
-fn integer_index(data: &mut Funcdata, vn: VarnodeId, op: OpId, width: int4) -> bool {
+fn integer_index(data: &mut Funcdata, vn: VarnodeId, op: OpId, width: int4) -> KunaResult<bool> {
     let Some(v) = data.vbank().get(vn) else {
-        return false;
+        return Ok(false);
     };
     if v.get_size() != width || v.is_constant() {
-        return false;
+        return Ok(false);
     }
     let cast_def = v
         .get_def()
         .and_then(|d| data.obank().get(d))
         .is_some_and(|d| d.code() == OpCode::CPUI_CAST);
     if cast_def {
-        return false;
+        return Ok(false);
     }
-    let t = data.vn_high_type_read_facing(vn, op);
-    matches!(
+    let t = data.vn_high_type_read_facing(vn, op)?;
+    Ok(matches!(
         t.get_metatype(),
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN
-    ) && !t.is_enum_type()
+    ) && !t.is_enum_type())
 }
 
 /// Is the sum `out` itself a subscript of another pointer?  It is then an
@@ -852,11 +881,11 @@ fn extension_saved(data: &Funcdata, index: VarnodeId) -> i32 {
 /// `(T *)p` otherwise; but a base that is an integer the pass already cast to a
 /// pointer costs the integer form nothing (its cast is retyped to the integer
 /// and vanishes) and the subscript one.
-fn base_saved(data: &mut Funcdata, base_vn: VarnodeId, op: OpId, base: &Base) -> i32 {
+fn base_saved(data: &mut Funcdata, base_vn: VarnodeId, op: OpId, base: &Base) -> KunaResult<i32> {
     let integer = |data: &mut Funcdata, vn: VarnodeId, reader: OpId| {
-        data.vn_high_type_read_facing(vn, reader).get_metatype() != type_metatype::TYPE_PTR
+        Ok::<bool, KunaError>(data.vn_high_type_read_facing(vn, reader)?.get_metatype() != type_metatype::TYPE_PTR)
     };
-    match *base {
+    Ok(match *base {
         Base::Direct => 1,
         Base::Cast => 0,
         Base::Retype => {
@@ -866,18 +895,18 @@ fn base_saved(data: &mut Funcdata, base_vn: VarnodeId, op: OpId, base: &Base) ->
                 .and_then(|v| v.get_def())
                 .and_then(|d| Some((d, data.obank().get(d)?.get_in(0)?)));
             match src {
-                Some((def, s)) if integer(data, s, def) => -1,
+                Some((def, s)) => if integer(data, s, def)? { -1 } else { 0 },
                 _ => 0,
             }
         }
         Base::Recast(src) => {
-            if integer(data, src, op) {
+            if integer(data, src, op)? {
                 -1
             } else {
                 0
             }
         }
-    }
+    })
 }
 
 /// The sum: the integer form converts it back to a pointer (a cast a consumer
@@ -889,38 +918,38 @@ fn base_saved(data: &mut Funcdata, base_vn: VarnodeId, op: OpId, base: &Base) ->
 /// (`castStandard` never casts to or from one) for a `void *` stepped in bytes.
 fn sum_saved(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     out: VarnodeId,
     target_ptr: &Rc<Datatype>,
     used: SumUse,
-) -> i32 {
+) -> KunaResult<i32> {
     if used == SumUse::Access {
-        return 1;
+        return Ok(1);
     }
     let (explicit, readers): (bool, Vec<OpId>) = match data.vbank().get(out) {
         Some(v) => (v.is_explicit(), v.descend_iter().collect()),
-        None => return 0,
+        None => return Ok(0),
     };
     if explicit {
-        let decl = data.vn_high_type_def_facing(out);
-        return i32::from(strat.cast_standard(&decl, target_ptr, false, true).is_none());
+        let decl = data.vn_high_type_def_facing(out)?;
+        return Ok(i32::from(strat.cast_standard(&decl, target_ptr, false, true).is_none()));
     }
     if readers.is_empty() {
-        return 0;
+        return Ok(0);
     }
     for r in readers {
         let Some(slot) = data.obank().get(r).map(|o| o.get_slot(out)) else {
-            return 0;
+            return Ok(0);
         };
         let takes = match used {
-            SumUse::Own => crate::coreaction_casts::get_input_cast(data, strat, r, slot).is_none(),
-            _ => bytes_taken(data, strat, r, slot, target_ptr),
+            SumUse::Own => crate::coreaction_casts::get_input_cast(data, strat, r, slot)?.is_none(),
+            _ => bytes_taken(data, strat, r, slot, target_ptr)?,
         };
         if !takes {
-            return 0;
+            return Ok(0);
         }
     }
-    1
+    Ok(1)
 }
 
 /// Does the reader `r` take a `char *` in `slot` with no cast: a copy into, a
@@ -928,11 +957,11 @@ fn sum_saved(
 /// converts from a `char *` for free?
 fn bytes_taken(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     r: OpId,
     slot: int4,
     byte_ptr: &Rc<Datatype>,
-) -> bool {
+) -> KunaResult<bool> {
     let Some((code, out, other, addr)) = data.obank().get(r).map(|o| {
         (
             o.code(),
@@ -941,28 +970,28 @@ fn bytes_taken(
             o.get_in(1),
         )
     }) else {
-        return false;
+        return Ok(false);
     };
     let req = match code {
         OpCode::CPUI_COPY => match out {
-            Some(o) => data.vn_high_type_def_facing(o),
-            None => return false,
+            Some(o) => data.vn_high_type_def_facing(o)?,
+            None => return Ok(false),
         },
         OpCode::CPUI_INT_EQUAL | OpCode::CPUI_INT_NOTEQUAL => match other {
-            Some(o) => data.vn_high_type_read_facing(o, r),
-            None => return false,
+            Some(o) => data.vn_high_type_read_facing(o, r)?,
+            None => return Ok(false),
         },
         OpCode::CPUI_STORE if slot == 2 => {
-            let Some(a) = addr else { return false };
-            match data.vn_high_type_read_facing(a, r).get_ptr_to() {
+            let Some(a) = addr else { return Ok(false) };
+            match data.vn_high_type_read_facing(a, r)?.get_ptr_to() {
                 Some(p) => strip_typedefs(p),
-                None => return false,
+                None => return Ok(false),
             }
         }
-        _ => return false,
+        _ => return Ok(false),
     };
-    req.get_metatype() == type_metatype::TYPE_PTR
-        && strat.cast_standard(&req, byte_ptr, false, true).is_none()
+    Ok(req.get_metatype() == type_metatype::TYPE_PTR
+        && strat.cast_standard(&req, byte_ptr, false, true).is_none())
 }
 
 /// The `PTRADD` an `INT_ADD` of a pointer and a variable index becomes.
@@ -980,15 +1009,19 @@ pub(crate) struct IndexPlan {
 /// subscript (`castindex`).  The element is chosen exactly as for a constant
 /// offset; the index is the variable when the element is one byte, or the `x`
 /// of an implied `x * sizeof(T)` the add alone reads.
-pub(crate) fn plan_index(
+pub(crate) fn plan_index(data: &mut Funcdata, strat: &dyn CastStrategy, op: OpId) -> KunaResult<Result<IndexPlan, Leave>> {
+    planned(plan_index_inner(data, strat, op))
+}
+
+fn plan_index_inner(
     data: &mut Funcdata,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     op: OpId,
-) -> Result<IndexPlan, Leave> {
+) -> Result<IndexPlan, PlanningError> {
     let (out, ins) = {
         let o = data.obank().get(op).ok_or(Leave::NoPointer)?;
         if o.code() != OpCode::CPUI_INT_ADD || o.num_input() != 2 {
-            return Err(Leave::NoPointer);
+            return Err(Leave::NoPointer.into());
         }
         let out = o.get_out().ok_or(Leave::NoPointer)?;
         (
@@ -1003,21 +1036,21 @@ pub(crate) fn plan_index(
     for (slot, &vn) in ins.iter().enumerate() {
         let v = data.vbank().get(vn).ok_or(Leave::NoPointer)?;
         if v.is_constant() || v.is_annotation() {
-            return Err(Leave::NoPointer);
+            return Err(Leave::NoPointer.into());
         }
-        let t = data.vn_high_type_read_facing(vn, op);
+        let t = data.vn_high_type_read_facing(vn, op)?;
         if t.get_metatype() == type_metatype::TYPE_PTR {
             pointers.push((slot as int4, t));
         }
     }
     let (ptr_slot, ptype) = match pointers.len() {
-        0 => return Err(Leave::NoPointer),
+        0 => return Err(Leave::NoPointer.into()),
         1 => pointers.pop().ok_or(Leave::NoPointer)?,
-        _ => return Err(Leave::TwoPointers),
+        _ => return Err(Leave::TwoPointers.into()),
     };
     let other = ins[1 - ptr_slot as usize];
     if subscripts_another(data, out) {
-        return Err(Leave::IntegerUse);
+        return Err(Leave::IntegerUse.into());
     }
     let (target, target_ptr, used) = element(data, op, out, &ptype)?;
     let elem = target.get_size();
@@ -1027,35 +1060,35 @@ pub(crate) fn plan_index(
         Some(s) => {
             let by = s.by.ok_or(Leave::ScaleMismatch)?;
             if !runs_before(data, by, op) {
-                return Err(Leave::ScaleUnsettled);
+                return Err(Leave::ScaleUnsettled.into());
             }
             (s.index, Some(by))
         }
         None if elem == 1 => (other, None),
-        None => return Err(Leave::ScaleMismatch),
+        None => return Err(Leave::ScaleMismatch.into()),
     };
     let reader = by.unwrap_or(op);
-    if !integer_index(data, index, reader, width) {
-        return Err(Leave::IndexNotInteger);
+    if !integer_index(data, index, reader, width)? {
+        return Err(Leave::IndexNotInteger.into());
     }
     let base_vn = ins[ptr_slot as usize];
     let pointee = ptype.get_ptr_to().map(strip_typedefs);
     let base = if pointee.is_some_and(|p| same_element(&p, &target))
-        && declared_as(data, base_vn, op, &ptype)
+        && declared_as(data, base_vn, op, &ptype)?
     {
         Base::Direct
     } else if cast_def_read_only_here(data, base_vn, op) {
         Base::Retype
-    } else if let Some(src) = implied_cast_source(data, base_vn) {
+    } else if let Some(src) = implied_cast_source(data, base_vn)? {
         Base::Recast(src)
     } else {
         Base::Cast
     };
     let saved = extension_saved(data, index)
-        + base_saved(data, base_vn, op, &base)
-        + sum_saved(data, strat, out, &target_ptr, used);
+        + base_saved(data, base_vn, op, &base)?
+        + sum_saved(data, strat, out, &target_ptr, used)?;
     if saved < 1 {
-        return Err(Leave::NoCastSaved);
+        return Err(Leave::NoCastSaved.into());
     }
     Ok(IndexPlan {
         ptr_slot,
@@ -1069,12 +1102,12 @@ pub(crate) fn plan_index(
 
 /// Rewrite the `INT_ADD` `op` as the subscript `plan` describes, dropping the
 /// scaling op it no longer reads.
-pub(crate) fn apply_index(data: &mut Funcdata, op: OpId, plan: &IndexPlan) -> Option<()> {
-    let (base_vn, addr, out) = {
+pub(crate) fn apply_index(data: &mut Funcdata, op: OpId, plan: &IndexPlan) -> KunaResult<Option<()>> {
+    let Some((base_vn, addr, ptrsize)) = (|| {
         let o = data.obank().get(op)?;
-        (o.get_in(plan.ptr_slot)?, o.get_addr().clone(), o.get_out()?)
-    };
-    let ptrsize = data.vbank().get(out)?.get_size();
+        let out = o.get_out()?;
+        Some((o.get_in(plan.ptr_slot)?, o.get_addr().clone(), data.vbank().get(out)?.get_size()))
+    })() else { return Ok(None) };
     let base = match plan.base {
         Base::Direct => base_vn,
         Base::Retype => {
@@ -1087,31 +1120,31 @@ pub(crate) fn apply_index(data: &mut Funcdata, op: OpId, plan: &IndexPlan) -> Op
                 _ => base_vn,
             };
             let cast = data.new_op(1, addr);
-            let cvn = data.new_unique_out(ptrsize, cast).ok()?;
+            let cvn = data.new_unique_out(ptrsize, cast)?;
             let _ = data.vn_update_type(cvn, Rc::clone(&plan.target));
             if let Some(v) = data.vbank_mut().get_mut(cvn) {
                 v.set_implied();
             }
             data.op_set_opcode_code(cast, OpCode::CPUI_CAST);
-            data.op_set_input(cast, src, 0).ok()?;
+            data.op_set_input(cast, src, 0)?;
             data.op_insert_before(cast, op);
             cvn
         }
     };
     let elem = data.new_constant(ptrsize, plan.elem as uintb);
-    data.op_set_all_input(op, &[base, plan.index, elem]).ok()?;
+    data.op_set_all_input(op, &[base, plan.index, elem])?;
     data.op_set_opcode_code(op, OpCode::CPUI_PTRADD);
     if let Some(by) = plan.by {
-        data.op_destroy(by);
+        data.op_destroy(by)?;
     }
-    Some(())
+    Ok(Some(()))
 }
 
 /// Turn a pointer plus a variable index into a subscript; `true` if it did.
-pub(crate) fn rewrite_index(data: &mut Funcdata, strat: &CastStrategyC, op: OpId) -> bool {
-    match plan_index(data, strat, op) {
-        Ok(p) => apply_index(data, op, &p).is_some(),
-        Err(_) => false,
+pub(crate) fn rewrite_index(data: &mut Funcdata, strat: &dyn CastStrategy, op: OpId) -> KunaResult<bool> {
+    match plan_index(data, strat, op)? {
+        Ok(p) => Ok(apply_index(data, op, &p)?.is_some()),
+        Err(_) => Ok(false),
     }
 }
 
@@ -1149,11 +1182,15 @@ fn operand_saved(data: &mut Funcdata, vn: VarnodeId, op: OpId, long: &Rc<Datatyp
 /// cast both operands to.  The cast pass then leaves both operands as they are,
 /// and casts the result from the returned token, that signed integer, exactly as
 /// it cast the integer form's.
-pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Datatype>, Leave> {
+pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> KunaResult<Result<Rc<Datatype>, Leave>> {
+    planned(pointer_difference_inner(data, op))
+}
+
+fn pointer_difference_inner(data: &mut Funcdata, op: OpId) -> Result<Rc<Datatype>, PlanningError> {
     let (out, a, b) = {
         let o = data.obank().get(op).ok_or(Leave::DiffNotPointers)?;
         if o.code() != OpCode::CPUI_INT_SUB || o.num_input() != 2 {
-            return Err(Leave::DiffNotPointers);
+            return Err(Leave::DiffNotPointers.into());
         }
         (
             o.get_out().ok_or(Leave::DiffNotPointers)?,
@@ -1166,11 +1203,11 @@ pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Dat
     let mut width = 0;
     for vn in [a, b] {
         if data.vbank().get(vn).is_none_or(|v| v.is_constant() || v.is_annotation()) {
-            return Err(Leave::DiffNotPointers);
+            return Err(Leave::DiffNotPointers.into());
         }
-        let t = data.vn_high_type_read_facing(vn, op);
+        let t = data.vn_high_type_read_facing(vn, op)?;
         if t.get_metatype() != type_metatype::TYPE_PTR || t.get_word_size() != Some(1) {
-            return Err(Leave::DiffNotPointers);
+            return Err(Leave::DiffNotPointers.into());
         }
         width = t.get_size();
         let p = t.get_ptr_to().map(strip_typedefs).ok_or(Leave::DiffPointee)?;
@@ -1181,11 +1218,11 @@ pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Dat
             && p.get_size() == 1
             && c_sizeof_is_size(&tlst, &p);
         if !byte || pointee.as_ref().is_some_and(|q| !Rc::ptr_eq(q, &p)) {
-            return Err(Leave::DiffPointee);
+            return Err(Leave::DiffPointee.into());
         }
         pointee = Some(p);
     }
-    let ot = data.vn_high_type_def_facing(out);
+    let ot = data.vn_high_type_def_facing(out)?;
     let osize = data.vbank().get(out).map(|v| v.get_size()).unwrap_or(0);
     if osize != width
         || !matches!(
@@ -1194,13 +1231,13 @@ pub(crate) fn pointer_difference(data: &mut Funcdata, op: OpId) -> Result<Rc<Dat
         )
         || ot.is_enum_type()
     {
-        return Err(Leave::DiffResult);
+        return Err(Leave::DiffResult.into());
     }
     let long = tlst
         .get_base(width, type_metatype::TYPE_INT)
-        .map_err(|_| Leave::DiffResult)?;
+        ?;
     if operand_saved(data, a, op, &long) + operand_saved(data, b, op, &long) < 1 {
-        return Err(Leave::NoCastSaved);
+        return Err(Leave::NoCastSaved.into());
     }
     Ok(long)
 }

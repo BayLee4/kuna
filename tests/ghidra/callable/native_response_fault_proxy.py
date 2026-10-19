@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 
 real, mode, config_path, log_path = sys.argv[1:]
@@ -42,6 +43,9 @@ def stop(*_):
 signal.signal(signal.SIGTERM, stop)
 
 def input_forward():
+    pending = bytearray()
+    command_prefix = b"\x00\x00\x01\x02\x00\x00\x01\x0e"
+    string_end = b"\x00\x00\x01\x0f"
     try:
         while True:
             data = os.read(0, 65536)
@@ -49,6 +53,19 @@ def input_forward():
                 break
             child.stdin.write(data)
             child.stdin.flush()
+            pending.extend(data)
+            while True:
+                start = pending.find(command_prefix)
+                if start < 0:
+                    pending[:] = pending[-(len(command_prefix) - 1):]
+                    break
+                end = pending.find(string_end, start + len(command_prefix))
+                if end < 0:
+                    del pending[:start]
+                    break
+                command = bytes(pending[start + len(command_prefix):end]).decode("ascii")
+                event("command", command=command)
+                del pending[:end + len(string_end)]
     except (BrokenPipeError, OSError):
         pass
     finally:
@@ -96,6 +113,7 @@ def forward(data):
 main_response = None
 query_depth = 0
 exception_depth = 0
+documents = 0
 try:
     for kind, token in tokens():
         if kind == "data":
@@ -124,13 +142,28 @@ try:
             payload = bytes(main_response)
             main_response = None
             if payload.startswith(opening) and payload.endswith(closing):
-                event("document" if mode == "pass" else "fault", pid=child.pid, native_doc_bytes=len(payload),
+                documents += 1
+                fault = mode != "pass" and documents > config.get("fault_after_documents", 0)
+                event("fault" if fault else "document", pid=child.pid, document=documents,
+                      native_doc_bytes=len(payload),
                       native_doc_sha256=hashlib.sha256(payload).hexdigest())
-                if mode == "crash":
+                if documents == 1 and config.get("hold_ready"):
+                    # Retain the genuine complete document while another public consumer edits
+                    # its source. No callback or result bytes are fabricated or changed here.
+                    Path(config["hold_ready"]).write_text(hashlib.sha256(payload).hexdigest())
+                    deadline = time.monotonic() + 30
+                    while not Path(config["hold_release"]).exists():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Native document delivery barrier was not released")
+                        time.sleep(0.01)
+                    event("released_unchanged", pid=child.pid,
+                          native_doc_sha256=hashlib.sha256(payload).hexdigest())
+                if fault and mode == "crash":
                     stop()
                 if mode not in ("malformed", "pass"):
-                    raise ValueError("Unknown fault mode")
-                if mode == "malformed":
+                    if mode != "crash":
+                        raise ValueError("Unknown fault mode")
+                if fault and mode == "malformed":
                     payload = payload[:-len(closing)] + injection + closing
             forward(payload)
         elif code in (7, 16) and main_response is not None:

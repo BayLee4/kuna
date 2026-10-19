@@ -305,16 +305,19 @@ fn console_retypes_survive_later_decompiles() {
         .map(|block| format!(" mix({}", block.find("\n}\n").map_or(block, |end| &block[..end + 2])))
         .collect();
     assert_eq!(printed.len(), 4, "{out}");
+    kuna_harness::c_behavior::assert_c_signed_integer_declaration(&printed[0], "v5", 8, "rax");
     let uncast = |code: &str| code.replace("(uint8)", "").replace("(int8)", "");
     let plain = lines_renamed(&uncast(&printed[0]), &[]);
-    for (code, decl, renames) in [
-        (&printed[1], "  uint8 v5;", &[][..]),
-        (&printed[2], "  uint8 v5;", &[][..]),
-        (&printed[3], "  uint8 hash;", &[("hash", "v5")][..]),
+    for (code, name, renames) in [
+        (&printed[1], "v5", &[][..]),
+        (&printed[2], "v5", &[][..]),
+        (&printed[3], "hash", &[("hash", "v5")][..]),
     ] {
-        assert!(code.contains(decl), "{decl}:\n{code}");
-        let code = uncast(&code.replacen(decl, &decl.replace("uint8", "int8"), 1));
-        assert_eq!(lines_renamed(&code, renames), plain, "{decl}:\n{}\n---\n{code}", printed[0]);
+        kuna_harness::c_behavior::assert_c_declaration(code, name, "unsigned long", "rax");
+        let declaration = code.lines().find(|line| line.trim().split_once(" // ").is_some_and(|(declaration, _)| declaration.ends_with(&format!(" {name};")))).unwrap();
+        let baseline = printed[0].lines().find(|line| line.trim().split_once(" // ").is_some_and(|(declaration, _)| declaration.ends_with(" v5;"))).unwrap();
+        let code = uncast(&code.replacen(declaration, &baseline.replace(" v5;", &format!(" {name};")), 1));
+        assert_eq!(lines_renamed(&code, renames), plain, "{name}:\n{}\n---\n{code}", printed[0]);
     }
 }
 
@@ -539,7 +542,8 @@ fn console_suffixed_names_reach_their_locals() {
         assert!(!out.contains(refusal), "{refusal}:\n{out}");
     }
     let last = out.rsplit("print C").next().unwrap();
-    assert!(last.contains("uint4 vowels; // r8d") && last.contains(" last; // r9 | rsi"), "{last}");
+    kuna_harness::c_behavior::assert_c_declaration(last, "vowels", "unsigned int", "r8d");
+    assert!(last.contains(" last; // r9 | rsi"), "{last}");
 }
 
 /// A stack local's retype to a scalar of another width is refused before it

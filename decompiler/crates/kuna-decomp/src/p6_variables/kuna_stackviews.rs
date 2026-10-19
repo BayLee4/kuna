@@ -43,36 +43,40 @@ impl OptionStackViews {
     }
 }
 
-pub(crate) fn declared_view(fd: &Funcdata, call: OpId, slot: i32) -> Option<Rc<Datatype>> {
+pub(crate) fn declared_view(fd: &Funcdata, call: OpId, slot: i32) -> KunaResult<Option<Rc<Datatype>>> {
     crate::p6_variables::kuna_stackuses::declared_view(fd, call, slot)
 }
 
-fn indexed_width(fd: &Funcdata, base: crate::context::VarnodeId) -> Option<i32> {
+fn indexed_width(fd: &Funcdata, base: crate::context::VarnodeId) -> KunaResult<Option<i32>> {
     let mut width = 0;
-    for id in fd.vbank().get(base)?.descend_iter() {
-        let op = fd.obank().get(id)?;
+    let Some(base_value) = fd.vbank().get(base) else { return Ok(None) };
+    for id in base_value.descend_iter() {
+        let Some(op) = fd.obank().get(id) else { return Ok(None) };
         if op.is_marker() {
             continue;
         }
         let access = match op.code() {
             OpCode::CPUI_LOAD if op.get_in(1) == Some(base) => {
-                fd.vbank().get(op.get_out()?)?.get_size()
+                let Some(value) = op.get_out().and_then(|id| fd.vbank().get(id)) else { return Ok(None) };
+                value.get_size()
             }
             OpCode::CPUI_STORE if op.get_in(1) == Some(base) && op.get_in(2) != Some(base) => {
-                fd.vbank().get(op.get_in(2)?)?.get_size()
+                let Some(value) = op.get_in(2).and_then(|id| fd.vbank().get(id)) else { return Ok(None) };
+                value.get_size()
             }
             OpCode::CPUI_CALL | OpCode::CPUI_CALLIND => {
                 for slot in 1..op.num_input() {
                     if op.get_in(slot) == Some(base) {
-                        width = width.max(declared_view(fd, id, slot)?.get_size());
+                        let Some(view) = declared_view(fd, id, slot)? else { return Ok(None) };
+                        width = width.max(view.get_size());
                     }
                 }
                 continue;
             }
             OpCode::CPUI_COPY => {
-                let out = fd.vbank().get(op.get_out()?)?;
+                let Some(out) = op.get_out().and_then(|id| fd.vbank().get(id)) else { return Ok(None) };
                 if out.is_persist() || out.is_stack_store() {
-                    return None;
+                    return Ok(None);
                 }
                 continue;
             }
@@ -81,11 +85,11 @@ fn indexed_width(fd: &Funcdata, base: crate::context::VarnodeId) -> Option<i32> 
             | OpCode::CPUI_PTRSUB
             | OpCode::CPUI_INT_ADD
             | OpCode::CPUI_INT_SUB => continue,
-            _ => return None,
+            _ => return Ok(None),
         };
         width = width.max(access);
     }
-    (width > 0).then_some(width)
+    Ok((width > 0).then_some(width))
 }
 
 fn insert_type(types: &mut Vec<Rc<Datatype>>, ty: Rc<Datatype>) {
@@ -334,12 +338,12 @@ fn backing_type(
 /// Add exact-size backing objects only where several declared pointee views
 /// conflict or intersect. Indexed references require a bounded byte extent;
 /// explicit user-locked layouts and unresolved extents remain unchanged.
-pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) {
+pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) -> KunaResult<()> {
     if !fd.get_arch().stack_views {
-        return;
+        return Ok(());
     }
     let Some(factory) = fd.get_arch().types_rc() else {
-        return;
+        return Ok(());
     };
     let checker = state.checker_mut();
     let refs: Vec<_> = checker
@@ -353,8 +357,10 @@ pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) {
     let mut unresolved_index = false;
     for (offset, reference) in &refs {
         if reference.index.is_some() {
-            let extent = crate::kuna_stackranges::frame_address(fd, reference.base)
-                .and_then(|address| address.extent(indexed_width(fd, reference.base)?));
+            let extent = match crate::kuna_stackranges::frame_address(fd, reference.base) {
+                Some(address) => indexed_width(fd, reference.base)?.and_then(|width| address.extent(width)),
+                None => None,
+            };
             if let Some((start, size)) = extent {
                 extents.push((start, size, Vec::new()));
             } else {
@@ -371,7 +377,7 @@ pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) {
             };
             for slot in 0..op.num_input() {
                 if op.get_in(slot) == Some(reference.base) {
-                    if let Some(view) = declared_view(fd, call, slot) {
+                    if let Some(view) = declared_view(fd, call, slot)? {
                         insert_type(groups.entry(*offset).or_default(), view);
                     }
                 }
@@ -480,7 +486,7 @@ pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) {
             && (views.iter().any(|view| matches!(view.datatype.get_metatype(),
                 type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION | type_metatype::TYPE_ARRAY
                 | type_metatype::TYPE_PTR | type_metatype::TYPE_FLOAT))
-                || crate::kuna_stackparamviews::needs_backing(fd, start, size))
+                || crate::kuna_stackparamviews::needs_backing(fd, start, size)?)
             && crate::kuna_stackparamviews::can_map_backing(fd, start, size);
         if parameter {
             for (offset, datatype) in crate::kuna_stackparamviews::parameter_types(fd, start, size) {
@@ -513,13 +519,14 @@ pub fn gather(fd: &mut Funcdata, state: &mut MapState, space: &Rc<AddrSpace>) {
             let other = Address::new(Rc::clone(space), h.start);
             address.overlap(0, &other, h.size) < 0 && other.overlap(0, &address, size) < 0
         });
-        seed_writes(fd, space, start, &union, factory.as_ref());
+        seed_writes(fd, space, start, &union, factory.as_ref())?;
         if parameter {
             crate::kuna_stackparamviews::map_backing(fd, start, union);
         } else {
             state.add_fixed_type_pub(start, union, SHARED_STORAGE, factory.as_ref());
         }
     }
+    Ok(())
 }
 
 /// Keep raw whole-word writes out of aggregate members. Pointer provenance
@@ -531,7 +538,7 @@ fn seed_writes(
     start: uintb,
     union: &Rc<Datatype>,
     factory: &dyn TypeFactory,
-) {
+) -> KunaResult<()> {
     let mut edges = Vec::new();
     for id in fd.vbank().loc_space_ids(space) {
         let Some(v) = fd.vbank().get(id) else {
@@ -549,7 +556,7 @@ fn seed_writes(
             continue;
         }
         let input = op.get_in(0).and_then(|id| fd.vbank().get(id));
-        let wanted = if pointer_origin(fd, id) {
+        let wanted = if pointer_origin(fd, id)? {
             type_metatype::TYPE_PTR
         } else if input.is_some_and(|v| v.get_type().get_metatype() == type_metatype::TYPE_FLOAT) {
             type_metatype::TYPE_FLOAT
@@ -622,19 +629,20 @@ fn seed_writes(
             );
         }
     }
+    Ok(())
 }
 
 /// Finalize write views after type propagation and symbol naming. Earlier
 /// reconstruction rounds may have seen incomplete source types.
-pub fn prepare_casts(fd: &mut Funcdata) {
+pub fn prepare_casts(fd: &mut Funcdata) -> KunaResult<()> {
     if !fd.get_arch().stack_views {
-        return;
+        return Ok(());
     }
     let Some(factory) = fd.get_arch().types_rc() else {
-        return;
+        return Ok(());
     };
     let Some(space) = fd.get_scope_local().map(|s| Rc::clone(s.get_space_id())) else {
-        return;
+        return Ok(());
     };
     let mut objects = BTreeMap::new();
     for id in fd.vbank().loc_space_ids(&space) {
@@ -655,14 +663,15 @@ pub fn prepare_casts(fd: &mut Funcdata) {
     }
     crate::p6_variables::kuna_stackvaluecopies::prepare(fd, factory.as_ref());
     for (start, backing) in objects {
-        seed_writes(fd, &space, start, &backing, factory.as_ref());
-        crate::kuna_stackobjectasserts::seed_writes(fd, start, &backing, factory.as_ref());
+        seed_writes(fd, &space, start, &backing, factory.as_ref())?;
+        crate::kuna_stackobjectasserts::seed_writes(fd, start, &backing, factory.as_ref())?;
     }
     crate::p6_variables::kuna_stackvalueviews::prepare(fd, factory.as_ref());
-    crate::kuna_stackobjects::finish(fd);
-    crate::kuna_stackparamviews::prepare_casts(fd);
-    crate::kuna_stackobjectasserts::prepare_casts(fd, factory.as_ref());
-    crate::p6_variables::kuna_stackuses::prepare_casts(fd, factory.as_ref());
+    crate::kuna_stackobjects::finish(fd)?;
+    crate::kuna_stackparamviews::prepare_casts(fd)?;
+    crate::kuna_stackobjectasserts::prepare_casts(fd, factory.as_ref())?;
+    crate::p6_variables::kuna_stackuses::prepare_casts(fd, factory.as_ref())?;
+    Ok(())
 }
 
 /// Casts must use the selected storage view, even if the SSA value's preferred
@@ -672,23 +681,23 @@ pub fn access_type(
     vn: crate::context::VarnodeId,
     op: OpId,
     slot: i32,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     if !fd.get_arch().stack_views {
-        return None;
+        return Ok(None);
     }
-    let v = fd.vbank().get(vn)?;
+    let Some(v) = fd.vbank().get(vn) else { return Ok(None) };
     if v.is_persist() {
         if let Some(global) = fd.get_arch().query_container_global(
             v.get_addr(),
             v.get_size(),
             &Address::new_invalid(),
-        ) {
+        )? {
             if let Some(ty) = global.symbol_type {
                 if scalar(&ty)
                     && ty.get_size() == v.get_size()
                     && global.entry_addr == *v.get_addr()
                 {
-                    return Some(ty);
+                    return Ok(Some(ty));
                 }
             }
         }
@@ -716,18 +725,18 @@ pub fn access_type(
             .starts_with("stack_views_")
             .then(|| (parent, ty.get_partial_offset().unwrap_or(0)))
     };
-    let (backing, offset) = from_edge
+    let Some((backing, offset)) = from_edge
         .or_else(|| from_high.filter(|(t, _)| t.get_name().starts_with("stack_views_")))
         .or_else(|| from_scope().filter(|(t, _)| t.get_name().starts_with("stack_views_")))
-        .or_else(from_type)?;
+        .or_else(from_type) else { return Ok(None) };
     if !backing.get_name().starts_with("stack_views_") {
-        return None;
+        return Ok(None);
     }
-    let resolution = fd.get_union_resolution(&backing, op, slot);
-    let index = resolution?.get_field_num();
-    let field = backing.get_field(index)?;
+    let Some(resolution) = fd.get_union_resolution(&backing, op, slot) else { return Ok(None) };
+    let index = resolution.get_field_num();
+    let Some(field) = backing.get_field(index) else { return Ok(None) };
     let offset = offset - field.offset;
-    scalar_piece(fd.get_arch().types()?, Rc::clone(&field.field_type), offset, v.get_size())
+    Ok(fd.get_arch().types().and_then(|factory| scalar_piece(factory, Rc::clone(&field.field_type), offset, v.get_size())))
 }
 
 pub(crate) fn scalar_piece(
@@ -759,36 +768,30 @@ fn contains(start: u64, size: i32, at: u64, width: i32) -> bool {
 
 /// Reinterpreting packed integer bytes as a pointer is not address provenance.
 /// Follow value copies to a literal or an actual address expression.
-pub(crate) fn pointer_origin(fd: &Funcdata, mut id: crate::context::VarnodeId) -> bool {
+pub(crate) fn pointer_origin(fd: &Funcdata, mut id: crate::context::VarnodeId) -> KunaResult<bool> {
     for _ in 0..32 {
         let Some(v) = fd.vbank().get(id) else {
-            return false;
+            return Ok(false);
         };
-        let literal = |offset| {
-            fd.get_arch()
-                .manage()
-                .get_default_data_space()
-                .is_some_and(|space| {
-                    fd.get_arch()
-                        .query_container_global(
+        let literal = |offset| -> KunaResult<bool> {
+            let Some(space) = fd.get_arch().manage().get_default_data_space() else { return Ok(false) };
+            Ok(fd.get_arch().query_container_global(
                             &Address::new(Rc::clone(space), offset),
                             1,
                             &Address::new_invalid(),
-                        )
-                        .is_some()
-                })
+                        )?.is_some())
         };
         if v.is_constant() {
-            return v.get_type().get_metatype() == type_metatype::TYPE_PTR
-                && literal(v.get_offset());
+            return Ok(v.get_type().get_metatype() == type_metatype::TYPE_PTR
+                && literal(v.get_offset())?);
         }
         let Some(op) = v.get_def().and_then(|op| fd.obank().get(op)) else {
-            return v.get_type().get_metatype() == type_metatype::TYPE_PTR;
+            return Ok(v.get_type().get_metatype() == type_metatype::TYPE_PTR);
         };
         match op.code() {
             OpCode::CPUI_COPY | OpCode::CPUI_CAST => {
                 let Some(input) = op.get_in(0) else {
-                    return false;
+                    return Ok(false);
                 };
                 id = input;
             }
@@ -798,21 +801,21 @@ pub(crate) fn pointer_origin(fd: &Funcdata, mut id: crate::context::VarnodeId) -
                     .and_then(|v| fd.vbank().get(v))
                     .is_some_and(|v| v.is_constant() && v.is_spacebase())
                 {
-                    return op
+                    let Some(displacement) = op
                         .get_in(1)
-                        .and_then(|v| fd.vbank().get(v))
-                        .is_some_and(|v| v.is_constant() && literal(v.get_offset()));
+                        .and_then(|v| fd.vbank().get(v)) else { return Ok(false) };
+                    return Ok(displacement.is_constant() && literal(displacement.get_offset())?);
                 }
-                return true;
+                return Ok(true);
             }
             OpCode::CPUI_PTRADD => {
                 let Some(input) = op.get_in(0) else {
-                    return false;
+                    return Ok(false);
                 };
                 id = input;
             }
-            _ => return false,
+            _ => return Ok(false),
         }
     }
-    false
+    Ok(false)
 }

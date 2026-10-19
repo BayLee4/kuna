@@ -11,8 +11,10 @@
 
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
+
 use crate::architecture::Architecture;
-use crate::cast::{CastContext, CastStrategy, CastStrategyC, IntPromotionCode, VnRef};
+use crate::cast::{CastContext, CastStrategy, IntPromotionCode, VnRef};
 use crate::context::OpId;
 use crate::dtype::{type_metatype, Datatype};
 use crate::funcdata::Funcdata;
@@ -22,33 +24,33 @@ use crate::funcdata::Funcdata;
 pub(crate) fn cast(
     fd: &Funcdata,
     arch: &Architecture,
-    strat: &CastStrategyC,
+    strat: &dyn CastStrategy,
     ctx: &dyn CastContext,
     vr: VnRef,
     op: OpId,
-) -> Option<Rc<Datatype>> {
-    let vn = fd.obank().get(op)?.get_in(0)?;
-    let v = fd.vbank().get(vn)?;
+) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(vn) = fd.obank().get(op).and_then(|o| o.get_in(0)) else { return Ok(None) };
+    let Some(v) = fd.vbank().get(vn) else { return Ok(None) };
     if v.is_constant() || v.is_explicit() || !v.is_written() || v.get_size() >= strat.promote_size() {
-        return None;
+        return Ok(None);
     }
-    let t = fd.vn_type_read_facing(vn, op);
+    let t = fd.vn_type_read_facing(vn, op)?;
     if t.is_enum_type() {
-        return None;
+        return Ok(None);
     }
     let natural = match t.get_metatype() {
         type_metatype::TYPE_INT => IntPromotionCode::SIGNED_EXTENSION,
         type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN => IntPromotionCode::UNSIGNED_EXTENSION,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let ext = strat.int_promotion_type(ctx, vr);
+    let ext = strat.int_promotion_type(ctx, vr)?;
     if ext == IntPromotionCode::NO_PROMOTION
         || (ext != IntPromotionCode::UNKNOWN_PROMOTION && ext.as_i32() & natural.as_i32() != 0)
     {
-        return None;
+        return Ok(None);
     }
     if t.get_metatype() == type_metatype::TYPE_UNKNOWN {
-        return arch.types().get_base(v.get_size(), type_metatype::TYPE_UINT).ok();
+        return Ok(Some(arch.types().get_base(v.get_size(), type_metatype::TYPE_UINT)?));
     }
-    Some(t)
+    Ok(Some(t))
 }

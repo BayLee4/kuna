@@ -89,7 +89,8 @@ pub fn truth_value_type(
     data: &Funcdata,
     vn: VarnodeId,
     cur: &Rc<Datatype>,
-) -> Option<Rc<Datatype>> {
+) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     if !data.get_arch().bool_byte {
         return None;
     }
@@ -122,14 +123,17 @@ pub fn truth_value_type(
     if v.is_input() && !data.get_func_proto().possible_input_param(&v.get_addr().clone(), 1) {
         return None;
     }
+    Some((cand, v))
+    })();
+    let Some((cand, v)) = candidate else { return Ok(None) };
     // A byte that is one element of a bigger declared object is not a
     // declaration of its own: the declaration that would change is the
     // container's.  cronie `crond` reads the first byte of a 131088-byte `fgets`
     // line buffer as the loop's terminator test, and typing that byte `bool`
     // retypes the whole buffer to `bool[131088]` while it is still handed to
     // `fgets`, `strlen` and `strcmp`.
-    if covered_by_larger_symbol(data, vn) {
-        return None;
+    if covered_by_larger_symbol(data, vn)? {
+        return Ok(None);
     }
     // A value written inside the function has to prove itself on the def side as
     // well.  The non-zero mask is the cheap half -- `ActionNonzeroMask` runs
@@ -143,13 +147,13 @@ pub fn truth_value_type(
     // is the whole of the evidence.
     if v.is_written() {
         if v.get_nz_mask() > 1 || !def_is_truth_valued(data, vn, 0) {
-            return None;
+            return Ok(None);
         }
     }
     if !walk_is_truth_valued(data, vn) {
-        return None;
+        return Ok(None);
     }
-    Some(cand)
+    Ok(Some(cand))
 }
 
 /// Whether the candidate `cand` is more specific than the current vote `cur`,
@@ -377,22 +381,22 @@ pub(crate) fn def_is_truth_valued(data: &Funcdata, vn: VarnodeId, depth: usize) 
 /// Is `vn` one byte of a mapped object bigger than one byte -- a stack array, a
 /// struct field's neighbour, a global buffer?  `ScopeLocal::findContainer` for
 /// the local frame, the global scope's snapshot for everything else.
-fn covered_by_larger_symbol(data: &Funcdata, vn: VarnodeId) -> bool {
+fn covered_by_larger_symbol(data: &Funcdata, vn: VarnodeId) -> kuna_base::error::KunaResult<bool> {
     let v = match data.vbank().get(vn) {
         Some(v) => v,
-        None => return false,
+        None => return Ok(false),
     };
     let addr = v.get_addr().clone();
     let usepoint = data.vn_use_point(vn);
     if let Some(entry) =
         data.get_scope_local().and_then(|lm| lm.query_container(&addr, 1, &usepoint))
     {
-        return entry.size > 1;
+        return Ok(entry.size > 1);
     }
-    data.get_arch()
-        .query_container_global(&addr, 1, &usepoint)
+    Ok(data.get_arch()
+        .query_container_global(&addr, 1, &usepoint)?
         .and_then(|g| g.symbol_type.as_ref().map(|t| t.get_size() > 1))
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 /// How a truncation into this rule's `bool` prints.

@@ -144,7 +144,7 @@ fn simple_signature_feature_vector_is_sorted_and_deterministic() {
     let bl = fd.bblocks_mut().new_block_basic(root);
     fd.bblocks_mut().set_start_block(root, bl);
 
-    let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+    let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
     let p = fd.set_input_varnode(p).unwrap();
     let c = fd.new_constant(4, 5);
     let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));
@@ -186,7 +186,7 @@ fn paramid_direct_read_hits_terminal_rank() {
     let bl = fd.bblocks_mut().new_block_basic(root);
     fd.bblocks_mut().set_start_block(root, bl);
 
-    let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+    let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
     let p = fd.set_input_varnode(p).unwrap();
     let add = add_op(&mut fd, bl, OpCode::CPUI_INT_ADD, 2, Address::new(Rc::clone(&rs), 0x1000));
     let _out = fd.new_varnode_out(4, &Address::new(Rc::clone(&rs), 0x200), add).unwrap();

@@ -158,7 +158,7 @@ fn verify_w6_s5_double_arith_whole_marking_restored() {
 
     // apply_op on the UNMARKED hi SUBPIECE drives attemptMarking.
     let mut rule = RuleDoubleIn::new("doubleprecis");
-    let res = rule.apply_op(subhi, &mut fd);
+    let res = rule.apply_op(subhi, &mut fd).unwrap();
 
     // C++ oracle (double.cc:3238-3256): INT_ADD is arithmetic -> mark + return 1.
     assert_eq!(
@@ -206,7 +206,7 @@ fn verify_w6_s5_double_free_whole_rejected_before_stub() {
 
     let mut rule = RuleDoubleIn::new("doubleprecis");
     assert_eq!(
-        rule.apply_op(subhi, &mut fd),
+        rule.apply_op(subhi, &mut fd).unwrap(),
         0,
         "free (non-written, non-input) whole rejected by the !isWritten guard \
          (double.cc:3232) — independent of the W6 stub"
@@ -254,7 +254,7 @@ fn verify_w6_s5_double_non_half_truncation_rejected() {
 
     let mut rule = RuleDoubleIn::new("doubleprecis");
     assert_eq!(
-        rule.apply_op(subhi, &mut fd),
+        rule.apply_op(subhi, &mut fd).unwrap(),
         0,
         "non-half truncation rejected by `offset*2 != whole.size` (double.cc:3228)"
     );

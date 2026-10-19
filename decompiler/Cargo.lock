@@ -319,6 +319,7 @@ dependencies = [
  "kuna-base",
  "kuna-console",
  "kuna-decomp",
+ "kuna-harness",
  "kuna-num",
  "kuna-sleigh",
 ]

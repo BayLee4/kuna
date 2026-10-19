@@ -197,10 +197,10 @@ fn test_full_session_byte_exact() {
         .command("flushNative")
         .string(b"0")
         .end_command()
-        // an unregistered (signature) command: archid param is sent by Java
+        // An unregistered command: archid param is sent by the caller
         // but never read by the Bad-command path — the next command's
         // burst-2 scan skips it (self-aligning)
-        .command("getSignatureSettings")
+        .command("unregisteredCommand")
         .string(b"0")
         .end_command()
         // deregisterProgram: archid; terminates the loop
@@ -253,7 +253,7 @@ fn test_full_session_byte_exact() {
         // Bad command: {6}{16}"Bad command: <name>"{17}{7}, no payload burst
         .burst(6)
         .burst(16)
-        .raw(b"Bad command: getSignatureSettings")
+        .raw(b"Bad command: unregisteredCommand")
         .burst(17)
         .burst(7)
         // deregisterProgram: "1", NO 16/17 frame (C++ nulls ghidra first)
@@ -294,7 +294,8 @@ fn test_unregistered_archid_passes_java_exception() {
 /// (the tspec drives `GhidraTranslate::new` / the `<sleigh>` decode, C++
 /// `buildTranslator`).  The failure is recorded as a warning on the 16/17
 /// frame — Java treats the non-empty nativeMessage as a registration failure —
-/// and decompileAt then reports the undecoded address (no engine manager).
+/// and decompileAt then reports an unavailable engine without a result payload.
+/// A following flushNative request still completes on this same connection.
 #[test]
 fn test_bad_tspec_is_lenient() {
     let input = Wire::new()
@@ -307,8 +308,12 @@ fn test_bad_tspec_is_lenient() {
         .command("decompileAt")
         .string(b"0")
         .string(b"\x50") // some nonzero payload standing in for the <addr>
+        .end_command()
+        .command("flushNative")
+        .string(b"0")
         .end_command();
     let mut process = GhidraProcess::new(Cursor::new(input.0), Vec::new());
+    assert_eq!(process.read_command().unwrap(), 0);
     assert_eq!(process.read_command().unwrap(), 0);
     assert_eq!(process.read_command().unwrap(), 0);
     let (_, out) = process.into_inner();
@@ -317,9 +322,41 @@ fn test_bad_tspec_is_lenient() {
         text.contains("could not build the decompiler engine from the registerProgram specs"),
         "missing engine-construction-failure warning in: {text}"
     );
+    let registration_end = out.windows(4).position(|bytes| bytes == [0, 0, 1, 7])
+        .expect("registration response must close") + 4;
     assert!(
-        text.contains("function at (address not decoded) not decompiled"),
-        "missing decompileAt warning in: {text}"
+        out.starts_with(&Wire::new().burst(6).string(b"0").0),
+        "lenient registration must return its architecture id"
+    );
+    let decompile_end = registration_end
+        + out[registration_end..].windows(4).position(|bytes| bytes == [0, 0, 1, 7])
+            .expect("failed decompile response must close") + 4;
+    let decompile_response = &out[registration_end..decompile_end];
+    assert!(
+        decompile_response.starts_with(&Wire::new().burst(6).burst(16).0)
+            && decompile_response.ends_with(&Wire::new().burst(17).burst(7).0),
+        "unavailable engine must return a native diagnostic in a complete response frame"
+    );
+    let diagnostic = String::from_utf8_lossy(
+        &decompile_response[8..decompile_response.len() - 8],
+    );
+    assert!(
+        diagnostic.contains("Low-level Error:") && diagnostic.contains("engine unavailable"),
+        "missing unavailable-engine failure diagnostic: {diagnostic}"
+    );
+    assert!(
+        !decompile_response.windows(4).any(|bytes| bytes == [0, 0, 1, 14]),
+        "engine-unavailable decompileAt must not publish a successful result payload"
+    );
+    let flush_response = Wire::new()
+        .burst(6)
+        .string(b"0")
+        .burst(16)
+        .burst(17)
+        .burst(7);
+    assert_eq!(
+        &out[decompile_end..], flush_response.0.as_slice(),
+        "the following request must complete with cleared warnings and intact framing"
     );
 }
 

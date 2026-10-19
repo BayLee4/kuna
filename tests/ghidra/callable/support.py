@@ -102,8 +102,6 @@ def require_absent_provider_body(path, name):
 def execute_i386_publication(row, directory, header, body, driver, default_stdcall, *, direct_call=None):
     """Compile untouched publication bytes and execute their actual i386 ABI."""
     from whole_calls_workers import ElfMachine
-    from java.math import BigInteger
-    from jpype import JArray, JByte
 
     def invoke(command):
         command = list(map(str, command))
@@ -135,6 +133,9 @@ def execute_i386_publication(row, directory, header, body, driver, default_stdca
         invoke([tool('llvm-objdump'), '-d', image])
         machine = ElfMachine(image, case)
         try:
+            from java.math import BigInteger
+            from jpype import JArray, JByte
+
             assert str(machine.program.getLanguageID()) == 'x86:LE:32:default'
             function = 'main' if direct_call is None else direct_call['function']
             symbols = list(machine.program.getSymbolTable().getSymbols(function))

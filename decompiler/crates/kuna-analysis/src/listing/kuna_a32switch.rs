@@ -29,6 +29,7 @@
 
 use std::rc::Rc;
 
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_num::opcodes::OpCode;
 use kuna_sleigh::translate::Translate;
@@ -76,6 +77,7 @@ impl<'a> A32Tables<'a> {
 
     /// The case blocks of the computed jump at `from` when it is a guarded A32
     /// `ldr pc,[pc,rN,lsl #2]` or `add pc,pc,rN,lsl #2`; nothing otherwise.
+    /// Register acquisition errors from the guard propagate unchanged.
     pub(crate) fn targets(
         &self,
         translate: &dyn Translate,
@@ -83,10 +85,10 @@ impl<'a> A32Tables<'a> {
         exec: &[(u64, u64)],
         decoded: &dyn Fn(u64) -> bool,
         from: u64,
-    ) -> Vec<u64> {
+    ) -> KunaResult<Vec<u64>> {
         let mut cap = FullCapture::default();
         if decode(translate, from, code_space, &mut cap) != Some(4) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let data = self.data_space.as_ref();
         let base = from + A32_PC_OFFSET;
@@ -102,22 +104,22 @@ impl<'a> A32Tables<'a> {
                 let words = match shape {
                     Some(Val::Entry { table, width: 4 }) if table == base => true,
                     Some(Val::Indexed(table)) if table == base => false,
-                    _ => return Vec::new(),
+                    _ => return Ok(Vec::new()),
                 };
-                let Some(index) = index else { return Vec::new() };
+                let Some(index) = index else { return Ok(Vec::new()) };
                 let Some(cases) = super::kuna_thumbswitch::guard_cases(
                     translate, code_space, data, decoded, from, index, predicated,
-                )
+                )?
                 .filter(|&n| n >= MIN_ENTRIES)
                 else {
-                    return Vec::new();
+                    return Ok(Vec::new());
                 };
                 let cases = cases.min(self.max_entries);
-                return if words {
+                return Ok(if words {
                     super::kuna_switchtable::targets(base, from, &self.pool, exec, Some(cases), cases)
                 } else {
                     branch_slots(base, cases, from, exec)
-                };
+                });
             }
             if index.is_none()
                 && matches!(op.opcode, OpCode::CPUI_INT_LEFT | OpCode::CPUI_INT_MULT | OpCode::CPUI_INT_ADD)
@@ -138,7 +140,7 @@ impl<'a> A32Tables<'a> {
                 }
             }
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 

@@ -92,7 +92,7 @@ fn redundbranch_does_not_splice_into_entry_point() {
 
     let size_before = fd.bblocks_get_size();
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // The `!isEntryPoint()` guard suppresses the splice -> no change, no removal.
     assert_eq!(act.base().count, 0, "splice into an entry point is forbidden");
@@ -119,7 +119,7 @@ fn redundbranch_does_not_splice_when_successor_has_two_in_edges() {
 
     let size_before = fd.bblocks_get_size();
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // `mid -> out` is single-out but out.sizeIn()==2 => no splice.
     // (`head -> mid` is also single-out, but mid.sizeIn()==1 and mid->out has a
@@ -167,7 +167,7 @@ fn redundbranch_scan_reset_collapses_full_chain_in_one_pass() {
 
     let size_before = fd.bblocks_get_size(); // 4
     let mut act = ActionRedundBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     let removed = size_before - fd.bblocks_get_size();
     // Each successful splice removes exactly one block and bumps count by one;
@@ -219,7 +219,7 @@ fn determinedbranch_skips_nonconstant_and_walks_mixed_graph() {
         let op = fd.new_op(2, pc);
         // slot-1 input is a plain (non-constant) varnode in ram.
         let vn_addr = ram_addr(&fd, 0x9000);
-        let vn = fd.new_varnode(1, &vn_addr, None);
+        let vn = fd.new_varnode(1, &vn_addr, None).unwrap();
         fd.op_set_input(op, vn, 1).unwrap();
         fd.op_set_opcode(op, TypeOp::new(OpCode::CPUI_CBRANCH, 0, "CPUI_CBRANCH"));
         fd.op_insert_end(op, nonconst);
@@ -240,7 +240,7 @@ fn determinedbranch_skips_nonconstant_and_walks_mixed_graph() {
     block_with_cbranch_cond(&mut fd, const1, 0x5000, Some(1));
 
     let mut act = ActionDeterminedBranch::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // The two constant-condition branches fold (removeBranch is now wired); the
     // non-constant block is *skipped* (no panic on getOffset of a non-constant).
@@ -266,7 +266,7 @@ fn starttypes_apply_counts_exactly_once_across_repeats() {
 
     assert!(!fd.has_type_recovery_started());
     for _ in 0..3 {
-        let res = act.apply(&mut fd, &mut ctx);
+        let res = act.apply(&mut fd, &mut ctx).unwrap();
         assert_eq!(res, 0);
     }
     assert!(fd.has_type_recovery_started(), "flag latches after first apply");
@@ -301,13 +301,13 @@ fn startcleanup_apply_snapshots_clean_up_index() {
     // Advance the varnode create index by allocating two free varnodes.
     let a0 = ram_addr(&fd, 0x40);
     let a1 = ram_addr(&fd, 0x44);
-    let _ = fd.new_varnode(4, &a0, None);
-    let _ = fd.new_varnode(4, &a1, None);
+    let _ = fd.new_varnode(4, &a0, None).unwrap();
+    let _ = fd.new_varnode(4, &a1, None).unwrap();
     let create_index_now = fd.get_clean_up_index(); // still 0 before the action
     assert_eq!(create_index_now, 0, "clean_up_index starts at 0");
 
     let mut act = ActionStartCleanUp::boxed("base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
 
     // C++ would now have clean_up_index == the current create index (> 0).

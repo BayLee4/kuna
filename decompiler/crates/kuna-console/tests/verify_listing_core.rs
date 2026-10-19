@@ -75,7 +75,7 @@ fn listing_build_recovers_instructions_flow_and_functions() {
 
     // The keystone: recursive-descent disassembly over the loadimage, seeded
     // from `seeds`, reusing the SLEIGH decoder + the lifted flow classifier.
-    let listing = Listing::build(&file, &image, arch, translate, &seeds);
+    let listing = Listing::build(&file, &image, arch, translate, &seeds).unwrap();
 
     // --- (a) instruction_at(entry) has a plausible len + non-empty mnemonic. --
     let entry = listing
@@ -225,7 +225,7 @@ fn listing_build_through_engine_driver_seeds() {
     let image = kuna_analysis::loadimage_object::ObjectLoadImage::from_bytes(&bin, &bytes)
         .expect("open loadimage");
 
-    let listing = Listing::build(&file, &image, arch, translate, &seeds);
+    let listing = Listing::build(&file, &image, arch, translate, &seeds).unwrap();
 
     // The build-through-engine path populates the model: at least the seeds
     // become functions, and the entry decodes to an instruction.

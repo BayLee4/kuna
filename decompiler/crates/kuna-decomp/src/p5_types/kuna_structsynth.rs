@@ -1422,14 +1422,14 @@ impl Action for ActionStructSynth {
         self.fired = false;
         self.requested = false;
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !data.get_arch().struct_synth.fires() || self.fired {
-            return 0;
+            return Ok(0);
         }
         if !self.requested && wants_settle_pass(data) {
             self.requested = true;
             self.base.count += 1;
-            return 0;
+            return Ok(0);
         }
         // A lattice that is still moving has not decided what is a pointer, and
         // one that never settled is not evidence at all.
@@ -1437,7 +1437,7 @@ impl Action for ActionStructSynth {
             || data.is_type_recovery_exceeded()
             || !data.kuna_infertypes_settled()
         {
-            return 0;
+            return Ok(0);
         }
         self.fired = true;
         if synthesize(data) {
@@ -1445,7 +1445,7 @@ impl Action for ActionStructSynth {
             // compares `lcount < count` and reads the result only for `res < 0`.
             self.base.count += 1;
         }
-        0
+        Ok(0)
     }
 }
 

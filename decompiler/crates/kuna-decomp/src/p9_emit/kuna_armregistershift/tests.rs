@@ -99,7 +99,7 @@ fn new_value(fd: &mut Funcdata, register: &Rc<AddrSpace>, offset: u64) -> Varnod
         4,
         &Address::new(Rc::clone(register), offset),
         Some(unknown4()),
-    )
+    ).unwrap()
 }
 
 fn ram(fd: &Funcdata) -> Rc<AddrSpace> {

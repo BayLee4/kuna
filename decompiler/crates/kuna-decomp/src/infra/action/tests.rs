@@ -66,7 +66,7 @@ mod config_ir_regressions {
         fd.new_unique_out(4, op).unwrap();
         let root = db.get_current_mut().expect("selected executable");
         root.reset(&mut fd);
-        root.perform(&mut fd, &mut ActionContext::new());
+        root.perform(&mut fd, &mut ActionContext::new()).unwrap();
         let result = fd.obank().get(op).unwrap();
         assert_eq!(result.code(), if transforms { OpCode::CPUI_COPY } else { OpCode::CPUI_INT_OR });
         assert_eq!(result.num_input(), if transforms { 1 } else { 2 });
@@ -91,6 +91,43 @@ mod config_ir_regressions {
         assert_eq!(arch.allacts.get_current_name(), "decompile");
         assert!(arch.allacts.get_group("custom").is_err());
         run_mask_root(&mut arch.allacts, true);
+    }
+
+    #[test]
+    fn native_sparse_bitfield_options_rebuild_all_six_cached_rules() {
+        use crate::options::register_option_elements;
+        use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+
+        let mut arch = mask_architecture();
+        crate::universalaction::install_universal(&mut arch.allacts, None, None, vec![]);
+        arch.allacts.set_current("decompile").unwrap();
+        let manager = build_manager();
+        let mut registry = IdRegistry::with_base_ids();
+        register_option_elements(&mut registry);
+        let options = OptionDatabase::new();
+        // DecompileOptions.encode sends only the false delta: true and fresh
+        // options both omit currentaction(bitfields). Every native request
+        // resets first, so cached roots must follow off/on/off/default.
+        for enabled in [false, true, false, true] {
+            arch.reset_wire_defaults();
+            let xml = if enabled {
+                "<optionslist/>"
+            } else {
+                "<optionslist><currentaction><param1>bitfields</param1><param2>off</param2></currentaction></optionslist>"
+            };
+            let mut decoder = XmlDecode::new(&manager, &registry);
+            decoder.ingest_stream(xml.as_bytes()).unwrap();
+            assert!(options.decode_native(&mut decoder, &mut arch).unwrap().is_empty());
+            assert_eq!(arch.allacts.get_current_name(), "decompile");
+            assert_eq!(arch.allacts.get_group("decompile").unwrap().contains("bitfields"), enabled);
+            let root = arch.allacts.get_current_mut().unwrap();
+            for name in ["bitfield_store", "bitfield_out", "bitfield_load", "bitfield_in", "pull_absorb", "insert_absorb"] {
+                assert_eq!(root.with_sub_rule(name, &mut |_| {}), enabled, "{name}");
+            }
+            // Disabling bitfield recognition does not disable ordinary
+            // arithmetic simplification in the same selected executable.
+            assert!(root.with_sub_rule("ormask", &mut |_| {}));
+        }
     }
 
     #[test]
@@ -183,10 +220,10 @@ struct LogRule {
 }
 
 impl Rule for LogRule {
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = data.obank().get(op).unwrap().code();
         self.log.borrow_mut().push(format!("{}:{:?}", self.tag, opc));
-        0
+        Ok(0)
     }
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
@@ -208,15 +245,15 @@ struct MorphRule {
 }
 
 impl Rule for MorphRule {
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = data.obank().get(op).unwrap().code();
         self.log.borrow_mut().push(format!("morph_sees:{opc:?}"));
         if opc == OpCode::CPUI_COPY && !*self.fired.borrow() {
             *self.fired.borrow_mut() = true;
             data.obank_mut().change_opcode(op, TypeOp::new(OpCode::CPUI_INT_ADD, 0, "INT_ADD"));
-            return 1; // changed the opcode -> must return non-zero
+            return Ok(1); // changed the opcode -> must return non-zero
         }
-        0
+        Ok(0)
     }
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_COPY, OpCode::CPUI_INT_ADD]
@@ -253,14 +290,14 @@ impl Action for CountdownAction {
     fn base_mut(&mut self) -> &mut ActionBase {
         &mut self.base
     }
-    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         self.log.borrow_mut().push(self.tag.clone());
         let mut b = self.budget.borrow_mut();
         if *b > 0 {
             *b -= 1;
             self.base.count += 1; // signal a change
         }
-        0
+        Ok(0)
     }
     fn clone_filtered(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Action>> {
         if grouplist.contains(&self.base.basegroup) {
@@ -291,14 +328,14 @@ impl Action for RestartOnceAction {
     fn base_mut(&mut self) -> &mut ActionBase {
         &mut self.base
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let n = *self.requests_left.borrow();
         self.log.borrow_mut().push(format!("restart_action(left={n})"));
         if n > 0 {
             *self.requests_left.borrow_mut() -= 1;
             data.set_restart_pending(true);
         }
-        0
+        Ok(0)
     }
     fn clone_filtered(&self, _g: &ActionGroupList) -> Option<Box<dyn Action>> {
         Some(Box::new(RestartOnceAction {
@@ -319,8 +356,8 @@ impl Action for RestartOnceAction {
 pub struct DummyConstFold;
 
 impl Rule for DummyConstFold {
-    fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> int4 {
-        0 // a real rule would fold and return 1
+    fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        Ok(0) // a real rule would fold and return 1
     }
     fn get_op_list(&self) -> Vec<OpCode> {
         vec![OpCode::CPUI_INT_ADD]
@@ -331,6 +368,66 @@ impl Rule for DummyConstFold {
         } else {
             None
         }
+    }
+}
+
+struct FailingRule {
+    error: KunaError,
+    log: Log,
+}
+
+impl Rule for FailingRule {
+    fn apply_op(&mut self, _op: OpId, _data: &mut Funcdata) -> KunaResult<int4> {
+        self.log.borrow_mut().push("failed query".into());
+        Err(self.error.clone())
+    }
+
+    fn get_op_list(&self) -> Vec<OpCode> {
+        vec![OpCode::CPUI_COPY]
+    }
+
+    fn clone_rule(&self, _groups: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        Some(Box::new(Self { error: self.error.clone(), log: self.log.clone() }))
+    }
+}
+
+#[test]
+fn rule_failure_stops_pool_group_and_restart_without_losing_error_category() {
+    for error in [KunaError::transport("host closed"), KunaError::lowlevel("bad query")] {
+        let mut fd = build_fd();
+        make_op(&mut fd, 0x1000, OpCode::CPUI_COPY);
+        make_op(&mut fd, 0x1004, OpCode::CPUI_COPY);
+        fd.set_restart_pending(true);
+        let log: Log = Rc::new(RefCell::new(Vec::new()));
+        let mut pool = ActionPool::new(ruleflags::rule_repeatapply, "pool");
+        pool.add_rule(
+            RuleState::new("analysis", 0, "failure"),
+            Box::new(FailingRule { error: error.clone(), log: log.clone() }),
+        );
+        pool.add_rule(
+            RuleState::new("analysis", 0, "not reached"),
+            Box::new(LogRule { tag: "not reached".into(), log: log.clone(), group: "analysis" }),
+        );
+        let mut root = ActionRestartGroup::new(ruleflags::rule_onceperfunc, "root", 3);
+        root.add_action(CountdownAction::boxed(
+            "analysis", "before", Rc::new(RefCell::new(1)), log.clone(),
+        ));
+        root.add_action(Box::new(pool));
+        root.add_action(CountdownAction::boxed(
+            "analysis", "after", Rc::new(RefCell::new(1)), log.clone(),
+        ));
+        let mut ctx = ActionContext::new();
+        assert_eq!(root.perform(&mut fd, &mut ctx), Err(error));
+        assert_eq!(*log.borrow(), vec!["before", "failed query"]);
+        assert_eq!(root.base().count, 1, "retain changes preceding the failure");
+        assert_eq!(root.curstart, 0, "do not start another restart iteration");
+        assert!(!ctx.reflow_requested, "do not request reflow after a failure");
+        assert!(fd.has_restart_pending(), "do not consume pending restart state");
+        let mut counts = None;
+        assert!(root.with_sub_rule("failure", &mut |state| {
+            counts = Some((state.count_tests, state.count_apply));
+        }));
+        assert_eq!(counts, Some((1, 0)), "failure is an attempt, not an application");
     }
 }
 
@@ -372,7 +469,7 @@ fn pool_dispatches_each_op_through_every_rule_in_order() {
         );
     }
     let mut ctx = ActionContext::new();
-    let res = pool.apply(&mut fd, &mut ctx);
+    let res = pool.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     // op1 (COPY): A then B; op2 (INT_ADD): A then B.
     assert_eq!(
@@ -403,7 +500,7 @@ fn opcode_change_rezeros_rule_index() {
     );
 
     let mut ctx = ActionContext::new();
-    assert_eq!(pool.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(pool.apply(&mut fd, &mut ctx).unwrap(), 0);
     // 1. morph sees COPY, rewrites -> INT_ADD, returns 1, rule_index reset to 0.
     // 2. morph sees INT_ADD (no change, fired latch set).
     // 3. log sees INT_ADD.
@@ -431,7 +528,7 @@ fn dead_op_is_skipped_and_destroyed() {
         Box::new(LogRule { tag: "A".into(), log: log.clone(), group: "analysis" }),
     );
     let mut ctx = ActionContext::new();
-    assert_eq!(pool.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(pool.apply(&mut fd, &mut ctx).unwrap(), 0);
     // Only the live INT_ADD was dispatched.
     assert_eq!(*log.borrow(), vec!["A:CPUI_INT_ADD"]);
     // The dead op was destroyed (opDeadAndGone removed it from the optree).
@@ -449,7 +546,7 @@ fn group_applies_actions_in_sequence() {
     group.add_action(CountdownAction::boxed("g", "three", budget.clone(), log.clone()));
 
     let mut ctx = ActionContext::new();
-    assert_eq!(group.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(group.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert_eq!(*log.borrow(), vec!["one", "two", "three"]);
 }
 
@@ -465,7 +562,7 @@ fn repeatapply_loops_until_no_change() {
     group.add_action(CountdownAction::boxed("g", "act", budget.clone(), log.clone()));
 
     let mut ctx = ActionContext::new();
-    let total = group.perform(&mut fd, &mut ctx);
+    let total = group.perform(&mut fd, &mut ctx).unwrap();
     assert_eq!(*log.borrow(), vec!["act", "act", "act", "act"]);
     // The group counts 3 changes (one per budget tick).
     assert_eq!(total, 3);
@@ -491,7 +588,7 @@ fn restart_group_reruns_on_restart_pending() {
     // availability; enable it (the decompile drive sets this when the flow
     // environment is threaded in).
     ctx.can_reflow = true;
-    assert_eq!(rg.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(rg.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert_eq!(
         *log.borrow(),
         vec![
@@ -523,7 +620,7 @@ fn restart_group_honors_maxrestarts() {
     // availability; enable it (the decompile drive sets this when the flow
     // environment is threaded in).
     ctx.can_reflow = true;
-    assert_eq!(rg.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(rg.apply(&mut fd, &mut ctx).unwrap(), 0);
     assert_eq!(log.borrow().len(), 3);
     assert!(ctx
         .warnings
@@ -673,7 +770,7 @@ fn run_and_collect(mut root: Box<dyn Action>, log: &Log) -> Vec<String> {
     make_op(&mut fd, 0x1000, OpCode::CPUI_INT_ADD); // a live INT_ADD for the rules
     let mut ctx = ActionContext::new();
     root.reset(&mut fd);
-    let _ = root.perform(&mut fd, &mut ctx);
+    let _ = root.perform(&mut fd, &mut ctx).unwrap();
     log.borrow().clone()
 }
 
@@ -696,7 +793,7 @@ fn set_current_caches_and_exposes_the_root() {
     {
         let act = db.get_current_mut().expect("current set");
         act.reset(&mut fd);
-        let _ = act.perform(&mut fd, &mut ctx);
+        let _ = act.perform(&mut fd, &mut ctx).unwrap();
     }
     // Only the gamma rule survived the filter, and it logs once per INT_ADD.
     assert!(log.borrow().iter().any(|n| n.starts_with("rule_gamma")));
@@ -740,7 +837,7 @@ fn repeatapply_deadline_bounds_nonconverging_action() {
 
     let mut ctx = ActionContext::new();
     ctx.deadline = Some(std::time::Instant::now()); // already expired
-    let total = group.perform(&mut fd, &mut ctx);
+    let total = group.perform(&mut fd, &mut ctx).unwrap();
     // The child applied at most twice (the group body may schedule the first
     // pass before probing, and the repeat gate stops the loop), not 2^30 times.
     assert!(

@@ -87,7 +87,7 @@ fn notype_memset_call_types_pointer_parameter_and_return() {
         let entry = program
             .resolve_entry(&EntrySelector::Name("clear".into()))
             .expect("clear entry");
-        let functions = decompile_targets(&mut program, vec![entry], false, false, false);
+        let functions = decompile_targets(&mut program, vec![entry], false, false, false).unwrap();
         let code = functions[0].code.as_ref().expect("decompiled code");
         let signature = code
             .lines()
@@ -111,5 +111,67 @@ fn notype_memset_call_types_pointer_parameter_and_return() {
                 .is_match(code),
             "return call result {architecture:?}: {code}"
         );
+    }
+}
+
+#[test]
+fn crt_import_convention_reaches_both_iat_and_thunk_source_owners() {
+    use kuna_base::address::Address;
+    use kuna_decomp::database::SymbolKind as DecompSymbolKind;
+    use kuna_decomp::dtype::type_metatype;
+    use std::rc::Rc;
+
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let specs = vec![root.join("specs").to_str().unwrap().to_string()];
+    let image = root.join("decompiler/crates/kuna-analysis/tests/fixtures/calleepopframe_pe_i386.exe");
+    let mut program = bootstrap_from_object(image.to_str().unwrap(), "", &specs).unwrap();
+    program.commit_pending_analysis().unwrap();
+    let arch = program.arch();
+    let cdecl = arch.function_prototype_model("memset").unwrap();
+    assert_eq!(cdecl.get_name(), "__cdecl");
+    assert_eq!(cdecl.get_extra_pop(), 4);
+    let iat_sid = arch.query_global_function("memset").unwrap();
+    let iat = match &arch.symboltab.symbol(iat_sid).kind {
+        DecompSymbolKind::Function { source_proto: Some(source), .. } => source,
+        _ => panic!("the original IAT entry must retain its complete source declaration"),
+    };
+    let thunk_entry = Address::new(Rc::clone(arch.manage().get_default_code_space().unwrap()), 0x4010d0);
+    let (thunk_sid, _) = arch.symboltab.find_function_across_scopes(&thunk_entry).unwrap();
+    assert_ne!(iat_sid, thunk_sid, "the original fixture has distinct import-word and code-veneer owners");
+    let thunk = arch.symboltab.function_source_proto_across_scopes(&thunk_entry).unwrap();
+    assert!(!Rc::ptr_eq(iat, thunk));
+
+    for source in [iat, thunk] {
+        assert!(Rc::ptr_eq(source.model(), cdecl));
+        assert_eq!(source.get_extra_pop(), 4);
+        assert!(source.is_input_locked() && source.is_output_locked() && source.is_model_locked());
+        assert_eq!(source.num_params(), 3);
+        assert_eq!(source.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_PTR);
+        assert_eq!(source.get_param(0).unwrap().get_type().unwrap().get_metatype(), type_metatype::TYPE_PTR);
+        assert_eq!(source.get_param(1).unwrap().get_type().unwrap().get_metatype(), type_metatype::TYPE_INT);
+        assert_eq!(source.get_param(2).unwrap().get_type().unwrap().get_metatype(), type_metatype::TYPE_UINT);
+        let mut working = arch.types_impl().acquire_working_proto(source).unwrap();
+        assert!(Rc::ptr_eq(working.model(), cdecl));
+        assert_eq!(working.get_extra_pop(), 4);
+        assert!(working.is_input_locked() && working.is_output_locked() && working.is_model_locked());
+        assert!(!working.has_input_errors() && !working.has_output_errors());
+        assert_eq!(working.num_params(), 3);
+        assert_eq!(working.effect_list(), source.effect_list());
+        assert_eq!(working.get_output().get_flags(), source.get_output().get_flags());
+        assert!(Rc::ptr_eq(working.get_output_type().unwrap(), source.get_output_type().unwrap()));
+        for slot in 0..3 {
+            let declared = source.get_param(slot).unwrap();
+            let allocated = working.get_param(slot).unwrap();
+            assert!(declared.get_address().is_invalid());
+            assert_eq!(declared.get_name(), "");
+            assert_eq!(allocated.get_name(), declared.get_name());
+            assert_eq!(allocated.get_flags(), declared.get_flags());
+            assert_eq!(allocated.get_usepoint(), declared.get_usepoint());
+            assert!(Rc::ptr_eq(allocated.get_type().unwrap(), declared.get_type().unwrap()));
+            assert_eq!(allocated.get_address().get_space().unwrap().get_name(), "stack");
+            assert_eq!(allocated.get_address().get_offset(), 4 + slot as u64 * 4);
+        }
+        working.set_extra_pop(8);
+        assert_eq!(source.get_extra_pop(), 4, "working cleanup edits must not alter the source owner");
     }
 }

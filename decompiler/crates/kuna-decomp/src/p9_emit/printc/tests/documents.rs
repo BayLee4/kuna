@@ -50,6 +50,12 @@ mod comment_consumers {
     }
 
     fn fixture() -> (Funcdata, Architecture, Address) {
+        fixture_with_source(None)
+    }
+
+    fn fixture_with_source(
+        source: Option<Rc<dyn crate::remote_provider::RemoteProviderFetch>>,
+    ) -> (Funcdata, Architecture, Address) {
         let mut arch = Architecture::new("comments",
             Sleigh::new(Box::new(Image), Box::new(ContextInternal::new())));
         arch.realtypes = false;
@@ -68,12 +74,26 @@ mod comment_consumers {
         let manager = Rc::new(manager);
         let mut model = ProtoModel::new(&manager);
         model.build_param_list("standard").unwrap();
+        let model = Rc::new(model);
+        let scope = source.map(|source| {
+            // Native installation snapshots the cspec global scope's owned
+            // ranges; only spaces present there are eligible for host queries.
+            let mut base = crate::context::GlobalQuery::default();
+            base.owned.insert_range(ram.clone(), 0, ram.get_highest());
+            Rc::new(crate::remote_provider::RemoteScope::new(
+                source, manager.clone(), types.clone(),
+                Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new())),
+                Some(model.clone()), base,
+            ))
+        });
         let mut context = ArchContext::new_shared(manager);
         context.types = Some(types.clone());
         context.global_query = Some(Rc::new(crate::context::GlobalQuery::default()));
+        context.remote_scope = scope.clone();
+        arch.remote_scope = scope;
         let mut fd = Funcdata::new("comments", "comments", Rc::new(context),
             Address::new(ram.clone(), 0x1000), 0x1000_0000, 0x40).unwrap();
-        fd.get_func_proto_mut().set_internal(Rc::new(model), types.get_type_void().unwrap());
+        fd.get_func_proto_mut().set_internal(model, types.get_type_void().unwrap());
         fd.set_high_level();
         let root = fd.bblocks_root_pub();
         let block = fd.bblocks_mut().new_block_basic(root);
@@ -90,6 +110,125 @@ mod comment_consumers {
         fd.op_insert_end(op, block);
         fd.seed_sblocks_copy();
         (fd, arch, address)
+    }
+
+    #[test]
+    fn document_query_failure_discards_partial_output_and_allows_same_session_retry() {
+        use crate::remote_provider::RemoteProviderFetch;
+        use kuna_base::marshal::Decoder;
+        use std::cell::Cell;
+
+        struct Source {
+            fail_next: Cell<bool>,
+            calls: Cell<usize>,
+        }
+        impl RemoteProviderFetch for Source {
+            fn fetch_mapped_symbols(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> {
+                self.calls.set(self.calls.get() + 1);
+                if self.fail_next.replace(false) {
+                    Err(KunaError::lowlevel("document prototype acquisition failed"))
+                } else {
+                    Ok(false)
+                }
+            }
+            fn fetch_namespace_path(&self, _: u64, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+            fn fetch_external_ref(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+            fn fetch_tracked_registers(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+            fn fetch_comments(&self, _: &Address, _: u32, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+        }
+
+        #[derive(Debug, PartialEq)]
+        enum Document {
+            Text(String),
+            Markup(Vec<u8>),
+            Provenance(crate::prettyprint::MarkupProvenance),
+            Tokens((crate::prettyprint::MarkupProvenance, Vec<crate::prettyprint::EmitToken>)),
+            Statements((String, crate::prettyprint::MarkupProvenance)),
+        }
+        fn render(root: usize, print: &mut PrintC, fd: &Funcdata, arch: &Architecture) -> KunaResult<Document> {
+            match root {
+                0 => print.doc_function_full(fd, arch).map(Document::Text),
+                1 => print.doc_function_markup(fd, arch).map(Document::Markup),
+                2 => print.doc_function_provenance(fd, arch).map(Document::Provenance),
+                3 => print.doc_function_tokens(fd, arch).map(Document::Tokens),
+                4 => print.doc_prototype(fd, arch).map(Document::Text),
+                5 => print.doc_function_full_with_statement_provenance(fd, arch).map(Document::Statements),
+                _ => unreachable!(),
+            }
+        }
+        fn configured(markup: bool) -> PrintC {
+            let mut print = PrintC::new();
+            print.set_name("c-language");
+            print.set_comment_style("cplusplus");
+            print.set_namespace_strategy(NamespaceStrategy::All);
+            print.set_max_line_size(72).unwrap();
+            print.set_line_comment_indent(5).unwrap();
+            print.set_markup(markup);
+            print.set_indent_increment(4);
+            print.emit.set_capture_tokens(true);
+            print.emit.set_plain_statement_provenance(true);
+            print
+        }
+
+        for markup in [false, true] {
+            for root in 0..6 {
+                let source = Rc::new(Source { fail_next: Cell::new(false), calls: Cell::new(0) });
+                let (fd, mut arch, address) = fixture_with_source(Some(source.clone()));
+                // Construction acquires source facts too. Keep it healthy and
+                // arm the existing provider seam only for the render below.
+                assert!(source.calls.get() > 0, "construction must reach the provider");
+                // Header and return-type emission precede the provider-backed
+                // prototype name query: rollback must discard a partial document.
+                arch.commentdb.add_comment(ct::HEADER, fd.get_address(), &address, "partial header");
+                let mut print = configured(markup);
+                let checkpoint = print.context.document_checkpoint();
+                let settings = format!("{:?}", print.context);
+                let max_line_size = print.emit.get_max_line_size();
+                let calls = source.calls.get();
+                source.fail_next.set(true);
+                assert_eq!(
+                    render(root, &mut print, &fd, &arch).unwrap_err(),
+                    KunaError::lowlevel("document prototype acquisition failed"),
+                    "root={root}, markup={markup}",
+                );
+                assert!(source.calls.get() > calls);
+                assert!(print.emit.output_str().is_empty());
+                assert!(print.emit.take_markup_bytes().is_empty());
+                assert!(print.emit.take_markup_tokens().is_empty());
+                assert!(print.emit.take_markup_provenance().associations.is_empty());
+                assert!(print.emit.take_plain_statement_provenance().associations.is_empty());
+                assert!(print.emit_fd.is_none());
+                assert!(print.is_stack_empty());
+                assert_eq!(print.context.document_checkpoint(), checkpoint);
+                assert_eq!(format!("{:?}", print.context), settings);
+                assert_eq!(print.get_name(), "c-language");
+                assert_eq!(print.emit.emits_markup(), markup);
+                assert_eq!(print.emit.get_indent_increment(), 4);
+                assert_eq!(print.emit.get_max_line_size(), max_line_size);
+                assert_eq!(print.emit.captures_plain_statement_provenance(), !markup);
+                // The failed acquisition must not install a negative cache entry.
+                let calls = source.calls.get();
+                let retried = render(root, &mut print, &fd, &arch).unwrap();
+                assert!(source.calls.get() > calls);
+                let mut clean = configured(markup);
+                let expected = render(root, &mut clean, &fd, &arch).unwrap();
+                match (&retried, &expected) {
+                    (Document::Markup(left), Document::Markup(right)) =>
+                        kuna_harness::packed_document::assert_eq_modulo_syntax_pair_ids(left, right),
+                    _ => assert_eq!(retried, expected),
+                }
+                assert_eq!(print.doc_function_full(&fd, &arch).unwrap(),
+                    clean.doc_function_full(&fd, &arch).unwrap());
+                assert_eq!(print.doc_function_tokens(&fd, &arch).unwrap(),
+                    clean.doc_function_tokens(&fd, &arch).unwrap());
+                if markup {
+                    // A direct leaf token proves capture remains enabled on
+                    // the original backend, not merely on a temporary sink.
+                    print.emit.print("capture retained", SyntaxHighlight::NoColor);
+                    assert!(!print.emit.take_markup_tokens().is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -115,7 +254,7 @@ mod comment_consumers {
             (NamespaceStrategy::All, "platform::intrinsic"),
         ] {
             printer.set_namespace_strategy(strategy);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             assert!(text.contains("builtin();"), "{text}");
             assert!(text.contains(&format!("{intrinsic}();")), "{text}");
             assert!(!text.contains("::builtin"), "{text}");
@@ -130,7 +269,7 @@ mod comment_consumers {
         let mut printer = PrintC::new();
         for enabled in [false, true, false] {
             printer.set_convention_printing(enabled);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             let declaration = if enabled {
                 "void __regparm3 comments(void)"
             } else {
@@ -145,9 +284,177 @@ mod comment_consumers {
         model.set_print_in_decl(false);
         fd.get_func_proto_mut().set_model(Some(Rc::new(model)));
         printer.set_convention_printing(true);
-        let text = printer.doc_function_full(&fd, &arch);
+        let text = printer.doc_function_full(&fd, &arch).unwrap();
         assert!(text.contains("void comments(void)"), "{text}");
         assert!(!text.contains("__regparm3"), "{text}");
+    }
+
+    #[test]
+    fn held_source_model_uses_live_default_visibility_without_abi_replacement() {
+        let (mut fd, mut arch, _) = fixture();
+        let first = Rc::new(ProtoModel::copy_named("__stdcall", fd.get_func_proto().model()));
+        let second = Rc::new(ProtoModel::copy_named("__regparm3", fd.get_func_proto().model()));
+        arch.register_model(second.clone());
+        arch.set_default_model_rc(first);
+        let held = arch.get_model("__stdcall").unwrap();
+        fd.get_func_proto_mut().set_model(Some(held.clone()));
+        let mut printer = PrintC::new();
+        let implicit = printer.doc_function_full(&fd, &arch).unwrap();
+        assert!(!implicit.contains("__stdcall"), "{implicit}");
+
+        arch.set_default_model_rc(second);
+        assert!(!held.print_in_decl(), "the source model snapshot was not mutated");
+        assert!(Rc::ptr_eq(fd.get_func_proto().model(), &held));
+        let explicit = printer.doc_function_full(&fd, &arch).unwrap();
+        assert!(explicit.contains("void __stdcall comments(void)"), "{explicit}");
+        assert!(explicit.contains("value = 7;"), "{explicit}");
+        printer.set_convention_printing(false);
+        let hidden = printer.doc_function_full(&fd, &arch).unwrap();
+        assert!(!hidden.contains("__stdcall"), "{hidden}");
+    }
+
+    #[test]
+    fn volatile_annotations_retain_exact_width_source_globals_and_callable_roots_without_highs() {
+        use crate::context::{GlobalEntry, GlobalQuery, TypeOp};
+        use crate::dtype::DatatypeKind;
+        use crate::fspec::{FuncProto, PrototypePieces};
+        use crate::varnode::varnode_flags;
+        use kuna_base::address::RangeList;
+        use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+        use kuna_base::partmap::PartMap;
+
+        for (qualified_source, widths) in [
+            (false, &[4, 8][..]), (false, &[8, 4][..]), (false, &[4][..]),
+            (true, &[4, 8][..]), (true, &[8, 4][..]), (true, &[4][..]),
+        ] {
+            let (template, mut arch, point) = fixture();
+            let manager = template.get_arch().manage.clone();
+            let ram = manager.get_space_by_name("ram").unwrap().clone();
+            let model = template.get_func_proto().model().clone();
+            let types = arch.types_rc();
+            let integer = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+            let result = types.get_typedef(&integer, "Result", 0, 0).unwrap();
+            let argument = types.get_typedef(&integer, "Argument", 0, 0).unwrap();
+            let pieces = PrototypePieces {
+                outtype: Some(result.clone()), intypes: vec![argument.clone()],
+                innames: vec!["value".into()], ..PrototypePieces::default()
+            };
+            let prototype = FuncProto::from_logical(&pieces, model.clone(), types.as_ref()).unwrap();
+            let mut code = Datatype::new(1, type_metatype::TYPE_CODE);
+            code.kind = DatatypeKind::Code { proto: Some(Rc::new(prototype)) };
+            let pointer = types.get_type_pointer(8, Rc::new(code), 1).unwrap();
+            let callback = types.get_typedef(&pointer, "Fn", 0, 0).unwrap();
+            let source_type = if qualified_source {
+                types.get_qualified_type(callback.clone(), crate::kuna_typequal::VOLATILE).unwrap()
+            } else {
+                callback.clone()
+            };
+            let byte = types.get_base(1, type_metatype::TYPE_UINT).unwrap();
+            let global = Address::new(ram.clone(), 0x2190);
+            let mut context = ArchContext::new_shared(manager.clone());
+            context.types = Some(types.clone());
+            context.global_query = Some(Rc::new(GlobalQuery::new(
+                [(1, "byte_alias", byte, 0x501), (8, "scalar_slot", source_type.clone(), 0x502)]
+                    .into_iter().map(|(size, name, ty, id)| GlobalEntry {
+                        space_index: ram.get_index(), first: 0x2190, last: 0x2190 + size as u64 - 1,
+                        size, all_flags: varnode_flags::persist | varnode_flags::addrtied
+                            | varnode_flags::volatil,
+                        addrtied: true, uselimit: RangeList::new(), symbol_name: name.into(),
+                        symbol_offset: 0, symbol_type: Some(ty), scope_path: Vec::new(),
+                        symbol_id: id, is_function: false, func_inject_id: -1, func_no_return: false,
+                    }).collect(),
+                RangeList::new(), PartMap::new(0),
+            )));
+            let mut registry = IdRegistry::with_base_ids();
+            crate::userop::register_ids(&mut registry);
+            let mut decoder = XmlDecode::new(manager.as_ref(), &registry);
+            decoder.ingest_stream(br#"<volatile inputop="read_volatile" outputop="write_volatile"/>"#).unwrap();
+            let element = decoder.open_element().unwrap();
+            Rc::make_mut(&mut arch.userops).decode_volatile(&mut decoder).unwrap();
+            decoder.close_element(element).unwrap();
+
+            let mut fd = Funcdata::new("annotation", "annotation", Rc::new(context),
+                template.get_address().clone(), 0x1000_0000, 0x40).unwrap();
+            fd.get_func_proto_mut().set_internal(model, types.get_type_void().unwrap());
+            let root = fd.bblocks_root_pub();
+            let block = fd.bblocks_mut().new_block_basic(root);
+            let mut values = Vec::new();
+            for &width in widths {
+                let read = fd.new_op(2, point.clone());
+                fd.op_set_opcode(read, TypeOp::new(OpCode::CPUI_CALLOTHER, 0, "CALLOTHER"));
+                let index = fd.new_constant(4, u64::from(crate::userop::BUILTIN_VOLATILE_READ));
+                fd.op_set_input(read, index, 0).unwrap();
+                let annotation = fd.new_code_ref(&global);
+                fd.vbank_mut().get_mut(annotation).unwrap().set_flags_pub(varnode_flags::volatil);
+                fd.op_set_input(read, annotation, 1).unwrap();
+                let output = fd.new_unique_out(width, read).unwrap();
+                fd.vbank_mut().get_mut(output).unwrap().set_explicit();
+                fd.op_insert_end(read, block);
+                values.push((annotation, output, width));
+            }
+            fd.set_high_level();
+            for (annotation, output, width) in values {
+                let high = fd.vbank().get(output).unwrap().get_high().unwrap();
+                fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name(format!("loaded_{width}"));
+                assert!(fd.vbank().get(annotation).unwrap().get_high().is_none());
+                assert_eq!(fd.vbank().get(annotation).unwrap().get_size(), 1);
+            }
+            fd.seed_sblocks_copy();
+            assert!(crate::kuna_structdefs::referenced_types(&fd, std::iter::empty()).is_empty());
+
+            arch.print_mut().options.set_global_ref(false);
+            arch.print_mut().options.set_struct_defs(true);
+            let text = crate::decompile_drive::print_c(&mut arch, &fd).unwrap();
+            let plan = arch.print().globalref_plan();
+            assert!(plan.minted.is_empty());
+            let emitted_widths: Vec<_> = plan.annotations().filter(|binding| binding.emitted)
+                .map(|binding| binding.size).collect();
+            assert_eq!(emitted_widths.as_slice(), widths);
+            let partial = plan.annotations().find(|binding| binding.emitted && binding.size == 4).unwrap();
+            let whole = plan.annotations().find(|binding| binding.emitted && binding.size == 8);
+            let held = whole.unwrap_or(partial);
+            let source = held.symbol.as_ref().unwrap();
+            assert_eq!(held.size, if whole.is_some() { 8 } else { 4 });
+            assert_eq!(held.address, global);
+            assert_eq!(source.name, "scalar_slot");
+            assert_eq!(source.id, 0x502);
+            assert!(Rc::ptr_eq(source.ty.as_ref().unwrap(), &source_type));
+            assert_eq!(crate::kuna_typequal::is_volatile(&held.declaration_type().unwrap()),
+                qualified_source || whole.is_some());
+            assert!(!partial.whole_object_volatile());
+            assert!(Rc::ptr_eq(partial.symbol.as_ref().unwrap().ty.as_ref().unwrap(), &source_type));
+            if !qualified_source {
+                assert!(!crate::kuna_typequal::is_volatile(&source_type));
+                assert!(Rc::ptr_eq(&partial.declaration_type().unwrap(), &source_type),
+                    "a partial volatile access must not qualify the whole source object");
+            }
+            let globals = crate::decompile_drive::extract_global_objects(&arch, &fd).unwrap();
+            assert_eq!(globals.len(), 1, "{globals:?}");
+            assert_eq!(globals[0].name, "scalar_slot");
+            assert_eq!(globals[0].source_symbol, Some(0x502));
+            assert_eq!(globals[0].space_index, ram.get_index());
+            assert_eq!(globals[0].address, 0x2190);
+            assert_eq!(globals[0].size, 8);
+            let declaration = held.declaration_type().unwrap();
+            let context = RealTypeCtx::from_arch(&arch, arch.print().out_lang(), arch.print().options.convention);
+            assert_eq!(globals[0].declaration, crate::printc::declaration_text_with_names(
+                &declaration, "scalar_slot", &context, None,
+            ));
+            let roots = arch.print().referenced_types(&fd);
+            assert_eq!(roots.len(), 3);
+            for (actual, expected) in roots.iter().zip([&result, &argument, &callback]) {
+                assert!(Rc::ptr_eq(actual, expected));
+            }
+            let definitions = crate::decompile_drive::extract_type_definitions(&arch, &fd);
+            assert_eq!(definitions.len(), 3);
+            for definition in &definitions {
+                assert!(text.contains(definition.definition.trim()), "{text}");
+            }
+            arch.print_mut().options.set_struct_defs(false);
+            let retained = arch.print().referenced_types(&fd);
+            assert_eq!(retained.len(), roots.len());
+            assert!(retained.iter().zip(&roots).all(|(a, b)| Rc::ptr_eq(a, b)));
+        }
     }
 
     #[test]
@@ -226,9 +533,10 @@ mod comment_consumers {
         let model = template.get_func_proto().model().clone();
         let scope = Rc::new(RemoteScope::new(
             Rc::new(NamespaceSource { function, namespace }), manager.clone(), types.clone(),
-            std::collections::BTreeMap::new(), Some(model.clone()), query,
+            Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new())),
+            Some(model.clone()), query,
         ));
-        let function_path = scope.function_at(&entry).unwrap().scope_path;
+        let function_path = scope.function_at(&entry).unwrap().unwrap().scope_path;
         assert_eq!(function_path, ["outer"]);
         let use_path: Vec<_> = function_path.iter().rev().cloned().collect();
         let mut context = ArchContext::new_shared(manager);
@@ -245,18 +553,20 @@ mod comment_consumers {
         fd.op_set_opcode(op, crate::context::TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
         let input = fd.new_constant(4, 7);
         fd.op_set_input(op, input, 0).unwrap();
-        let output = fd.new_varnode(4, &global, Some(int4));
+        let output = fd.new_varnode(4, &global, Some(int4)).unwrap();
         fd.op_set_output(op, output).unwrap();
         fd.vbank_mut().get_mut(output).unwrap().set_explicit();
         fd.op_insert_end(op, block);
-        ActionNameVars::boxed("analysis").apply(&mut fd, &mut ActionContext::new());
+        ActionNameVars::boxed("analysis").apply(&mut fd, &mut ActionContext::new()).unwrap();
         fd.seed_sblocks_copy();
         let high = fd.vbank().get(output).unwrap().get_high().unwrap();
         let bound_name = fd.high_bank().get(high).unwrap().kuna_name().unwrap().to_string();
         let source_name = fd.get_arch().name_for_global_varnode_scoped(
-            &global, 4, &Address::new_invalid()).unwrap();
+            &global, 4, &Address::new_invalid()).unwrap().unwrap();
         assert_eq!(source_name.0, "kept_alias");
         assert_eq!(source_name.3, ["inner", "outer"]);
+        assert_eq!(source_name.4, 0x501);
+        assert_eq!(fd.high_bank().get(high).unwrap().kuna_global_symbol_id(), Some(source_name.4));
         assert_eq!(scope.snapshot().entries_cloned().iter()
             .find(|e| e.first == 0x2000).unwrap().symbol_id, 0x501);
         let mut printer = PrintC::new();
@@ -267,11 +577,11 @@ mod comment_consumers {
             (NamespaceStrategy::Minimal, "inner::kept_alias", "outer::comments"),
         ] {
             printer.set_namespace_strategy(strategy);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             let prefix = crate::kuna_namespaces::scope_prefix(
                 printer.context.namespace_strategy(), &source_name.0,
-                &source_name.3, &use_path, &|_, _| false,
-            );
+                &source_name.3, &use_path, &|_, _| Ok(false),
+            ).unwrap();
             let source_spelling = prefix.into_iter().chain([source_name.0.clone()])
                 .collect::<Vec<_>>().join("::");
             assert_eq!(source_spelling, spelling);
@@ -279,15 +589,27 @@ mod comment_consumers {
             assert!(text.lines().any(|line| line.trim() == format!("{bound_name} = 7;")), "{text}");
             assert_eq!(fd.vbank().get(output).unwrap().get_high(), Some(high));
             assert_eq!(fd.high_bank().get(high).unwrap().kuna_name(), Some(bound_name.as_str()));
+            assert_eq!(fd.high_bank().get(high).unwrap().kuna_global_symbol_id(), Some(0x501));
             let preserved = fd.get_arch().name_for_global_varnode_scoped(
-                &global, 4, &Address::new_invalid()).unwrap();
+                &global, 4, &Address::new_invalid()).unwrap().unwrap();
             assert_eq!(preserved.0, "kept_alias");
             assert_eq!(preserved.3, ["inner", "outer"]);
+            assert_eq!(preserved.4, source_name.4);
         }
+        // Named source roots do not depend on the optional synthesized-address
+        // plan (the architecture printer has not even rendered this function).
+        let globals = crate::decompile_drive::extract_global_objects(&arch, &fd).unwrap();
+        assert_eq!(globals.len(), 1, "{globals:?}");
+        assert_eq!(globals[0].address, 0x2000);
+        assert_eq!(globals[0].space_index, ram.get_index());
+        assert_eq!(globals[0].name, bound_name);
+        assert!(globals[0].declaration.ends_with(&bound_name), "{globals:?}");
+        assert_eq!(globals[0].source_symbol, Some(0x501));
         // EC-0750: GlobalQuery retains the bare alias and separate path, but
-        // ActionNameVars publishes only qualified text to High, with no scope
-        // receipt/symbol id. Bare-High alias and emitted global strategy clauses
-        // are unrepresented; the source policy and function declaration are real.
+        // ActionNameVars publishes qualified text and the actual source Symbol
+        // identity to High, while the source query retains the separate scope
+        // path. Bare-High alias and emitted global strategy clauses remain
+        // unrepresented; the source policy and function declaration are real.
     }
 
     #[test]
@@ -302,7 +624,7 @@ mod comment_consumers {
             fd.get_address(), fd.get_address(), "headernote");
         arch.commentdb.add_comment(ct::WARNING,
             fd.get_address(), &address, "generated");
-        let text = printer.doc_function_full(&fd, &arch);
+        let text = printer.doc_function_full(&fd, &arch).unwrap();
         for note in ["instructionnote", "headernote"] {
             assert!(text.lines().any(|line| line.trim() == format!("/* {note} */")), "{text}");
             assert!(!text.contains(&format!("warn: {note}")), "{text}");
@@ -326,7 +648,7 @@ mod comment_consumers {
         printer.set_header_comment_flags(0);
         for selected in categories.iter().map(|(category, _)| *category).chain([0, ct::USER2]) {
             printer.set_instruction_comment_flags(selected);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             for (category, marker) in categories {
                 // Include delimiters so bodywarning cannot match bodywarningheader.
                 assert_eq!(text.contains(&format!("/* {marker} */")), selected & category != 0,
@@ -347,7 +669,7 @@ mod comment_consumers {
             printer.set_comment_style(style);
             printer.set_header_comment_flags(ct::HEADER | ct::WARNINGHEADER);
             printer.set_instruction_comment_flags(ct::USER2 | ct::WARNING);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             let prefix = if style == "c" { "/* " } else { "// " };
             assert!(text.contains(&format!("{prefix}plate")), "{text}");
             assert!(text.contains(&format!("{prefix}instruction")), "{text}");
@@ -355,10 +677,10 @@ mod comment_consumers {
             assert!(text.contains("// warn: bodyalert"), "{text}");
             printer.set_header_comment_flags(ct::HEADER);
             printer.set_instruction_comment_flags(ct::USER2);
-            let masked = printer.doc_function_full(&fd, &arch);
+            let masked = printer.doc_function_full(&fd, &arch).unwrap();
             assert!(!masked.contains("headeralert") && !masked.contains("bodyalert"), "{masked}");
             printer.set_header_comment_flags(ct::WARNINGHEADER);
-            let header_only = printer.doc_function_full(&fd, &arch);
+            let header_only = printer.doc_function_full(&fd, &arch).unwrap();
             assert!(!header_only.contains("plate") && header_only.contains("headeralert"), "{header_only}");
         }
     }
@@ -375,11 +697,11 @@ mod comment_consumers {
         arch.commentdb.add_comment(ct::USER2, fd.get_address(), &address,
             "first\nsecond */ escaped = 99; /*\nthird\\");
         let mut printer = PrintC::new();
-        let baseline = printer.doc_function_full(&fd, &arch);
+        let baseline = printer.doc_function_full(&fd, &arch).unwrap();
         for style in ["cplusplus", "c", "cplusplus"] {
             printer.set_line_comment_indent(6).unwrap();
             printer.set_comment_style(style);
-            let text = printer.doc_function_full(&fd, &arch);
+            let text = printer.doc_function_full(&fd, &arch).unwrap();
             let source = format!(
                 "#include <assert.h>\n\
                  int sentinel = -1, escaped = 0;\n\
@@ -394,9 +716,9 @@ mod comment_consumers {
                 assert!(text.contains(marker), "comment payload lost:\n{text}");
             }
             printer.set_comment_style("unknown");
-            assert_eq!(printer.doc_function_full(&fd, &arch), text);
+            assert_eq!(printer.doc_function_full(&fd, &arch).unwrap(), text);
             printer.context.reset_defaults_internal();
-            assert_eq!(printer.doc_function_full(&fd, &arch), baseline);
+            assert_eq!(printer.doc_function_full(&fd, &arch).unwrap(), baseline);
         }
     }
 }
@@ -586,7 +908,7 @@ mod comment_consumers {
                 fd.op_set_input(ret, output, 1).unwrap();
                 let mut print = PrintC::new();
                 if rust { print.set_name("rust-language"); }
-                let bytes = print.doc_function_markup(&fd, &arch);
+                let bytes = print.doc_function_markup(&fd, &arch).unwrap();
                 let tokens = host_type_tokens(&fd, &bytes);
                 // Check the consumer-visible binding at each semantic position,
                 // independently of C/Rust's differing prototype token order.
@@ -625,7 +947,7 @@ mod comment_consumers {
             model.output_mut().push_entry(ParamEntry::seed(0, type_class::TYPECLASS_GENERAL,
                 space, 0x200, 8, 1, 0, 0, true, false, &[], &manager).unwrap());
             model.output_mut().finish_decode();
-            types.set_proto_models(Some(Rc::new(model)), std::collections::BTreeMap::new());
+            types.set_proto_models(Some(Rc::new(model)), Rc::new(std::cell::RefCell::new(std::collections::BTreeMap::new())));
             types.set_proto_context(manager);
             let callable = |output: &Rc<Datatype>, inputs: Vec<Rc<Datatype>>| {
                 let code = types.get_type_code_proto(&PrototypePieces {
@@ -640,7 +962,7 @@ mod comment_consumers {
             fd.set_high_level();
             named_call_input(&mut fd, "callback", callback);
             named_call_input(&mut fd, "named_callback", alias);
-            let bytes = PrintC::new().doc_function_markup(&fd, &arch);
+            let bytes = PrintC::new().doc_function_markup(&fd, &arch).unwrap();
             let tokens = host_type_tokens(&fd, &bytes);
             let nominal: Vec<_> = tokens.iter()
                 .filter(|(at, name, _)| *at == TypePosition::Prototype
@@ -688,7 +1010,7 @@ mod comment_consumers {
                     assert!(Rc::ptr_eq(fd.vbank().get(output).unwrap().get_type(), &byte));
                     let mut print = PrintC::new();
                     if rust { print.set_name("rust-language"); }
-                    let bytes = print.doc_function_markup(&fd, &arch);
+                    let bytes = print.doc_function_markup(&fd, &arch).unwrap();
                     let nodes: Vec<_> = host_type_tokens(&fd, &bytes).into_iter()
                         .filter(|(at, name, _)| *at == TypePosition::Local && name == "Node")
                         .map(|(_, name, id)| (name, id)).collect();
@@ -743,7 +1065,7 @@ mod comment_consumers {
             // same block in the structured graph.
             let mut print = PrintC::new();
             print.set_name("rust-language");
-            let bytes = print.doc_function_markup(&fd, &arch);
+            let bytes = print.doc_function_markup(&fd, &arch).unwrap();
             let (text, fields) = host_document(&fd, &bytes);
             let compact = compact_c(&text);
             assert!(compact.contains("fncompute(") && compact.contains("node:*mutNode"), "{text}");
@@ -768,7 +1090,7 @@ mod comment_consumers {
             print.set_header_comment_flags(0);
             print.set_instruction_comment_flags(ct::USER2 | ct::WARNING);
             print.options.set_warn_inline(true);
-            let text = host_text(&fd, &print.doc_function_markup(&fd, &arch));
+            let text = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
             let block = text.split("/*").skip(1)
                 .filter_map(|block| block.split_once("*/").map(|(body, _)| body))
                 .find(|body| body.contains("ordinary")).unwrap();
@@ -786,9 +1108,10 @@ mod comment_consumers {
         fn host_width_and_indent_survive_sinks_without_moving_raw_source_maps() {
             let (fd, arch) = fixture();
             let mut print = PrintC::new();
-            let raw = print.doc_function_full(&fd, &arch);
-            let tokens = print.doc_function_tokens(&fd, &arch);
-            let wide = host_text(&fd, &print.doc_function_markup(&fd, &arch));
+            print.reset_wire_option_defaults();
+            let raw = print.doc_function_full(&fd, &arch).unwrap();
+            let tokens = print.doc_function_tokens(&fd, &arch).unwrap();
+            let wide = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
             assert_eq!(wide.split('{').next().unwrap().lines()
                 .filter(|line| !line.is_empty()).count(), 1, "{wide}");
 
@@ -796,23 +1119,23 @@ mod comment_consumers {
             print.set_indent_increment(4);
             print.set_markup(true);
             print.set_markup(false);
-            let narrow = host_text(&fd, &print.doc_function_markup(&fd, &arch));
+            let narrow = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
             assert_eq!(compact_c(&narrow), compact_c(&wide));
             let signature = narrow.split('{').next().unwrap();
             assert!(signature.lines().filter(|line| !line.is_empty()).count() > 1, "{narrow}");
             assert!(narrow.contains("\n    return 7;"), "{narrow}");
-            assert_eq!(print.doc_function_full(&fd, &arch).split('{').next(),
+            assert_eq!(print.doc_function_full(&fd, &arch).unwrap().split('{').next(),
                 raw.split('{').next(), "host wrapping must not reach raw C");
             print.set_indent_increment(2);
-            assert_eq!(print.doc_function_tokens(&fd, &arch), tokens);
-            assert_eq!(print.doc_function_full(&fd, &arch), raw);
+            assert_eq!(print.doc_function_tokens(&fd, &arch).unwrap(), tokens);
+            assert_eq!(print.doc_function_full(&fd, &arch).unwrap(), raw);
 
             print.reset_wire_option_defaults();
-            let reset = host_text(&fd, &print.doc_function_markup(&fd, &arch));
+            let reset = host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap());
             assert_eq!(reset, wide);
             assert!(print.set_max_line_size(19).is_err());
             assert!(print.set_max_line_size(10001).is_err());
-            assert_eq!(host_text(&fd, &print.doc_function_markup(&fd, &arch)), wide);
+            assert_eq!(host_text(&fd, &print.doc_function_markup(&fd, &arch).unwrap()), wide);
             print.set_max_line_size(20).unwrap();
             assert!(print.set_line_comment_indent(20).is_err());
             assert!(print.set_line_comment_indent(-1).is_err());
@@ -852,7 +1175,7 @@ mod host_field_metadata {
         ] {
             let mut fd = build_fd();
             let op = mk_op(&mut fd, 1, 0x1000, OpCode::CPUI_COPY);
-            let vn = fd.new_varnode(16, &Address::new(ram(&fd), 0x200), Some(parent.clone()));
+            let vn = fd.new_varnode(16, &Address::new(ram(&fd), 0x200), Some(parent.clone())).unwrap();
             fd.op_set_input(op, vn, 0).unwrap();
             let arch = bare_arch();
             let mut print = PrintC::new();
@@ -861,7 +1184,7 @@ mod host_field_metadata {
             let document = print.emit_mut().begin_function();
             assert!(print.push_partial_symbol_ir(
                 &fd, &arch, "node", parent, 8, 8, vn, op, 0, false,
-            ));
+            ).unwrap());
             print.recurse();
             print.emit_mut().end_function(document);
             let bytes = print.emit_mut().take_markup_bytes();

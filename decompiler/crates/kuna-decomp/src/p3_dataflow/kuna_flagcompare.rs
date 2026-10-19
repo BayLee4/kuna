@@ -72,61 +72,61 @@ impl Rule for RuleBoolSignLess {
     }
 
     /// C++ `RuleBoolSignLess::applyOp` (`kuna_flagcompare.cc:23`) — transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (kuna) gate (STUB(W4)).
         if !self.enabled && !data.get_arch().fold_flag_compare {
-            return 0;
+            return Ok(0);
         }
 
         // op = INT_SLESS(shiftout, 0)
         let zero = match op_in(data, op, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, zero) || vn_offset(data, zero) != 0 {
-            return 0;
+            return Ok(0);
         }
 
         let shiftout = match op_in(data, op, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_written(data, shiftout) {
-            return 0;
+            return Ok(0);
         }
         let leftshift = vn_def(data, shiftout).expect("shiftout written");
         if op_code(data, leftshift) != OpCode::CPUI_INT_LEFT {
-            return 0;
+            return Ok(0);
         }
         let ls1 = match op_in(data, leftshift, 1) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         if !vn_is_constant(data, ls1) {
-            return 0;
+            return Ok(0);
         }
         let sa: uintb = vn_offset(data, ls1);
         if sa == 0 {
-            return 0;
+            return Ok(0);
         }
 
         let boolvn = match op_in(data, leftshift, 0) {
             Some(v) => v,
-            None => return 0,
+            None => return Ok(0),
         };
         let width: int4 = vn_size(data, boolvn);
         if (width as uintb).wrapping_mul(8) <= sa {
-            return 0;
+            return Ok(0);
         }
         let signbitpos: int4 = width * 8 - 1 - (sa as int4);
         let relevant: uintb = 1u64 << signbitpos;
         // Mask of bits >= signbitpos.
         let above: uintb = !(relevant.wrapping_sub(1));
         if (vn_nzmask(data, boolvn) & above) != relevant {
-            return 0;
+            return Ok(0);
         }
         if vn_nzmask(data, boolvn) != relevant {
-            return 0;
+            return Ok(0);
         }
 
         // Rewrite `(b << sa) s< 0`  =>  `b != 0`.
@@ -137,7 +137,7 @@ impl Rule for RuleBoolSignLess {
         let z = data.new_constant(vn_size(data, boolvn), 0);
         data.op_set_input(op, z, 1)
             .expect("RuleBoolSignLess: opSetInput const (internal invariant)");
-        1
+        Ok(1)
     }
 }
 
@@ -179,28 +179,28 @@ impl Rule for RuleSborrowGe {
     }
 
     /// C++ `RuleSborrowGe::applyOp` (`kuna_flagcompare.cc:242`) — transcribed.
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (kuna) gate (STUB(W4)).
         if !self.enabled && !data.get_arch().fold_flag_compare {
-            return 0;
+            return Ok(0);
         }
 
         let (nflag, vflag) = if op_code(data, op) == OpCode::CPUI_BOOL_AND {
             match extract_and_of_ors(data, op) {
                 Some(p) => p,
-                None => return 0,
+                None => return Ok(0),
             }
         } else {
             // CPUI_BOOL_OR
             match extract_or_of_ands(data, op) {
                 Some(p) => p,
-                None => return 0,
+                None => return Ok(0),
             }
         };
 
         let (vbase, kval, sz) = match match_sborrow_ge(data, nflag, vflag) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
 
         // Rewrite the whole boolean tree to INT_SLESSEQUAL(K, V)  (K <= V).
@@ -211,7 +211,7 @@ impl Rule for RuleSborrowGe {
             .expect("RuleSborrowGe: opSetInput const (internal invariant)");
         data.op_set_input(op, vbase, 1)
             .expect("RuleSborrowGe: opSetInput vbase (internal invariant)");
-        1
+        Ok(1)
     }
 }
 

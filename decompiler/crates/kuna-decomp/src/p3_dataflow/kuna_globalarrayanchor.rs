@@ -11,7 +11,7 @@ use smallvec::{smallvec, SmallVec};
 
 /// Defer folding a negative element displacement into an exact array base used
 /// as a LOAD/STORE address. Other arithmetic and unmapped constants still fold.
-pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> bool {
+pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> kuna_base::error::KunaResult<bool> {
     if !data.get_arch().global_array_anchor
         || !data.get_arch().infer_pointers
         || !data.is_type_recovery_on()
@@ -19,13 +19,13 @@ pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> bool {
             .kuna_global_array_anchor_passes
             .is_none_or(|passes| passes >= 4)
     {
-        return false;
+        return Ok(false);
     }
     let Some((root, reader)) = memory_address_root(data, root) else {
-        return false;
+        return Ok(false);
     };
     let Some(terms) = address_terms(data, root) else {
-        return false;
+        return Ok(false);
     };
     let mut constants: SmallVec<[(VarnodeId, u64); 4]> = SmallVec::new();
     let mut variables: SmallVec<[VarnodeId; 4]> = SmallVec::new();
@@ -37,38 +37,38 @@ pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> bool {
         }
     }
     if variables.is_empty() || constants.len() < 2 {
-        return false;
+        return Ok(false);
     }
     let Some(output) = data.obank().get(root).and_then(|o| o.get_out()) else {
-        return false;
+        return Ok(false);
     };
     let Some(reader) = data.obank().get(reader) else {
-        return false;
+        return Ok(false);
     };
     if !matches!(reader.code(), OpCode::CPUI_LOAD | OpCode::CPUI_STORE)
         || reader.get_in(1) != Some(output)
     {
-        return false;
+        return Ok(false);
     }
     let arch = data.get_arch();
     let Some(space_id) = reader.get_in(0).and_then(|v| data.vbank().get(v)) else {
-        return false;
+        return Ok(false);
     };
     if !space_id.is_constant() || space_id.get_offset() >= arch.manage().num_spaces() as u64 {
-        return false;
+        return Ok(false);
     }
     let Some(space) = arch.manage().get_space(space_id.get_offset() as i32) else {
-        return false;
+        return Ok(false);
     };
     if space.get_word_size() != 1 {
-        return false;
+        return Ok(false);
     }
     if !arch
         .infer_ptr_spaces()
         .iter()
         .any(|s| s.get_index() == space.get_index())
     {
-        return false;
+        return Ok(false);
     }
     for (position, &(id, offset)) in constants.iter().enumerate() {
         let Some(value) = data.vbank().get(id) else {
@@ -112,7 +112,7 @@ pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> bool {
             continue;
         }
         let address = Address::new(space.clone(), space.wrap_offset(offset));
-        let Some(entry) = arch.query_container_global(&address, 1, &Address::new_invalid()) else {
+        let Some(entry) = arch.query_container_global(&address, 1, &Address::new_invalid())? else {
             continue;
         };
         if entry.entry_addr != address {
@@ -181,10 +181,10 @@ pub(crate) fn preserve_array_base(data: &Funcdata, root: OpId) -> bool {
             coefficient &= mask;
             coefficient != 0 && coefficient % size as uintb == 0
         }) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn literal_value(data: &Funcdata, id: VarnodeId, depth: u8) -> Option<u64> {
@@ -373,7 +373,7 @@ mod tests {
         .unwrap();
         data.set_type_recovery(true);
         data.kuna_global_array_anchor_passes = Some(0);
-        let index = data.new_varnode(8, &Address::new(ram, 0x100), None);
+        let index = data.new_varnode(8, &Address::new(ram, 0x100), None).unwrap();
         let two = data.new_constant(8, 2);
         let (_, scaled) = operation(&mut data, OpCode::CPUI_INT_MULT, &[index, two]);
         let base = data.new_constant(8, 0x400018);
@@ -390,10 +390,10 @@ mod tests {
     #[test]
     fn constant_inner_bias_survives_copies_then_folds_after_recovery_budget() {
         let (mut data, bias, _) = address_fixture();
-        assert!(preserve_array_base(&data, bias));
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 0);
+        assert!(preserve_array_base(&data, bias).unwrap());
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 0);
         data.kuna_global_array_anchor_passes = Some(4);
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 1);
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 1);
         let op = data.obank().get(bias).unwrap();
         assert_eq!(op.code(), OpCode::CPUI_COPY);
         assert_eq!(
@@ -408,22 +408,22 @@ mod tests {
     #[test]
     fn a_declined_pointer_check_or_disabled_types_releases_the_bias() {
         let (mut data, bias, base) = address_fixture();
-        assert!(preserve_array_base(&data, bias));
+        assert!(preserve_array_base(&data, bias).unwrap());
         data.set_type_recovery(false);
-        assert!(!preserve_array_base(&data, bias));
+        assert!(!preserve_array_base(&data, bias).unwrap());
         data.set_type_recovery(true);
         data.vbank_mut().get_mut(base).unwrap().set_ptr_check();
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 1);
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 1);
     }
 
     #[test]
     fn shared_address_temporary_does_not_hold_constants() {
         let (mut data, bias, _) = address_fixture();
-        assert!(preserve_array_base(&data, bias));
+        assert!(preserve_array_base(&data, bias).unwrap());
         let output = data.obank().get(bias).unwrap().get_out().unwrap();
         let space = data.new_constant(8, 2);
         operation(&mut data, OpCode::CPUI_LOAD, &[space, output]);
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 1);
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 1);
     }
 
     #[test]
@@ -431,8 +431,8 @@ mod tests {
         let (mut data, bias, _) = address_fixture();
         let output = data.obank().get(bias).unwrap().get_out().unwrap();
         operation(&mut data, OpCode::CPUI_COPY, &[output]);
-        assert!(preserve_array_base(&data, bias));
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 0);
+        assert!(preserve_array_base(&data, bias).unwrap());
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 0);
     }
 
     #[test]
@@ -442,13 +442,13 @@ mod tests {
         data.op_set_input(bias, literal, 0).unwrap();
         let other = data.new_constant(8, 8);
         operation(&mut data, OpCode::CPUI_INT_MULT, &[literal, other]);
-        assert!(!preserve_array_base(&data, bias));
+        assert!(!preserve_array_base(&data, bias).unwrap());
     }
 
     #[test]
     fn a_filtered_out_pointer_action_does_not_hold_the_bias() {
         let (mut data, bias, _) = address_fixture();
         data.kuna_global_array_anchor_passes = None;
-        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data), 1);
+        assert_eq!(RuleCollapseConstants.apply_op(bias, &mut data).unwrap(), 1);
     }
 }

@@ -370,11 +370,11 @@ impl MergeContext for Mock {
     fn high_is_name_lock(&mut self, _h: HighVariableId) -> bool {
         false
     }
-    fn bank_symbol(&self, _h: HighVariableId) -> Option<u64> {
-        None
+    fn bank_symbol(&self, _h: HighVariableId) -> kuna_base::error::KunaResult<Option<u64>> {
+        Ok(None)
     }
-    fn bank_symbol_offset(&self, _h: HighVariableId) -> int4 {
-        0
+    fn bank_symbol_offset(&self, _h: HighVariableId) -> kuna_base::error::KunaResult<int4> {
+        Ok(0)
     }
     fn bank_symbol_isolated(&self, _h: HighVariableId) -> bool {
         false
@@ -419,7 +419,7 @@ impl MergeContext for Mock {
         op_is_indirect_creation(OpId) -> bool;
         op_is_partial_root(OpId) -> bool;
         op_previous(OpId) -> Option<OpId>;
-        op_output_type_local(OpId) -> Rc<Datatype>;
+        op_output_type_local(OpId) -> kuna_base::error::KunaResult<Rc<Datatype>>;
         op_input_type_local(OpId, int4) -> Rc<Datatype>;
         op_cover_point(OpId) -> (int4, CoverPoint);
         indirect_effect_op(OpId) -> OpId;

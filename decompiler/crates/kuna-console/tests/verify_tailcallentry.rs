@@ -212,6 +212,7 @@ fn a_partition_only_listing_yields_no_tail_call_entries() {
 
     let build = |detail| {
         Listing::build_with_meta(&file, &image, arch, translate, &seeds, &seeds, &[], detail)
+            .unwrap()
     };
     let full = build(ListingDetail::FULL);
     let lean = build(ListingDetail::PARTITION_ONLY);

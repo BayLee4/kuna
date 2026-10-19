@@ -2235,7 +2235,7 @@ impl SubvariableFlow {
             if isinput {
                 self.replace_input(data, rvn)?; // Replace input to avoid overlap errors
             }
-            let repl = data.new_varnode(self.flowsize, &addr, None);
+            let repl = data.new_varnode(self.flowsize, &addr, None)?;
             self.rv_mut(rvn).replacement = Some(repl);
         } else {
             let repl = data.new_unique(self.flowsize, None);
@@ -2251,7 +2251,7 @@ impl SubvariableFlow {
         let mask = self.rv(rvn).mask;
         let shift = leastsigbit_set(mask);
         if shift >= 0 && shift % 8 == 0 && (mask >> shift) == calc_mask(self.flowsize) {
-            data.kuna_inherit_storage_slice(replacement, source, shift / 8, self.flowsize);
+            data.kuna_inherit_storage_slice(replacement, source, shift / 8, self.flowsize)?;
         }
         Ok(replacement)
     }
@@ -2697,21 +2697,21 @@ impl Rule for RuleSubvarAnd {
         Some(Box::new(RuleSubvarAnd::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let in1 = o.get_in(1).expect("in1");
         if !data.vbank().get(in1).expect("vn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let vn = o.get_in(0).expect("in0");
         let outvn = o.get_out().expect("out");
         let in1off = data.vbank().get(in1).expect("vn").get_offset();
         let outconsume = data.vbank().get(outvn).expect("vn").get_consume();
         if outconsume != in1off {
-            return 0;
+            return Ok(0);
         }
         if (outconsume & 1) == 0 {
-            return 0;
+            return Ok(0);
         }
         let cmask: uintb;
         if outconsume == 1u64 {
@@ -2731,12 +2731,12 @@ impl Rule for RuleSubvarAnd {
             cmask = m;
         }
         if cmask == 0 {
-            return 0;
+            return Ok(0);
         }
         if data.vbank().get(outvn).expect("vn").has_no_descend() {
-            return 0;
+            return Ok(0);
         }
-        run_subflow(data, vn, cmask, false, false, false)
+        Ok(run_subflow(data, vn, cmask, false, false, false))
     }
 }
 
@@ -2764,7 +2764,7 @@ impl Rule for RuleSubvarSubpiece {
         Some(Box::new(RuleSubvarSubpiece::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let vn = o.get_in(0).expect("in0");
         let outvn = o.get_out().expect("out");
@@ -2773,7 +2773,7 @@ impl Rule for RuleSubvarSubpiece {
         let sa = data.vbank().get(i1).expect("vn").get_offset() as int4;
         if (flowsize + sa) as u64 > std::mem::size_of::<uintb>() as u64 {
             // Mask must fit in precision
-            return 0;
+            return Ok(0);
         }
         let mut mask = calc_mask(flowsize);
         mask <<= 8 * sa;
@@ -2781,10 +2781,10 @@ impl Rule for RuleSubvarSubpiece {
         if !aggressive {
             let vnconsume = data.vbank().get(vn).expect("vn").get_consume();
             if (vnconsume & mask) != vnconsume {
-                return 0;
+                return Ok(0);
             }
             if data.vbank().get(outvn).expect("vn").has_no_descend() {
-                return 0;
+                return Ok(0);
             }
         }
         let mut big = false;
@@ -2795,7 +2795,7 @@ impl Rule for RuleSubvarSubpiece {
                 big = true;
             }
         }
-        run_subflow(data, vn, mask, aggressive, false, big)
+        Ok(run_subflow(data, vn, mask, aggressive, false, big))
     }
 }
 
@@ -2824,31 +2824,31 @@ impl Rule for RuleSubvarCompZero {
         Some(Box::new(RuleSubvarCompZero::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let in1 = o.get_in(1).expect("in1");
         if !data.vbank().get(in1).expect("vn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let vn = o.get_in(0).expect("in0");
         let mask = data.vbank().get(vn).expect("vn").get_nz_mask();
         let bitnum = leastsigbit_set(mask);
         if bitnum == -1 {
-            return 0;
+            return Ok(0);
         }
         if (mask >> bitnum) != 1 {
-            return 0; // Check if only one bit active
+            return Ok(0); // Check if only one bit active
         }
 
         // Check if the active bit is getting tested
         let in1off = data.vbank().get(in1).expect("vn").get_offset();
         if (in1off != mask) && (in1off != 0) {
-            return 0;
+            return Ok(0);
         }
 
         let outvn = o.get_out().expect("out");
         if data.vbank().get(outvn).expect("vn").has_no_descend() {
-            return 0;
+            return Ok(0);
         }
         // We do a basic check that the stream from which it looks like
         // the bit is getting pulled is not fully consumed
@@ -2856,13 +2856,13 @@ impl Rule for RuleSubvarCompZero {
             let andop = data.vbank().get(vn).expect("vn").get_def().expect("written vn def");
             let ao = data.obank().get(andop).expect("stale def");
             if ao.num_input() == 0 {
-                return 0;
+                return Ok(0);
             }
             let vn0 = ao.get_in(0).expect("in0");
             match ao.code() {
                 OpCode::CPUI_INT_AND | OpCode::CPUI_INT_OR | OpCode::CPUI_INT_RIGHT => {
                     if data.vbank().get(vn0).expect("vn").is_constant() {
-                        return 0;
+                        return Ok(0);
                     }
                     let mask0 = data.vbank().get(vn0).expect("vn").get_consume()
                         & data.vbank().get(vn0).expect("vn").get_nz_mask();
@@ -2870,17 +2870,17 @@ impl Rule for RuleSubvarCompZero {
                     let wholemask = calc_mask(vn0size) & mask0;
                     // We really need a popcnt here ...
                     if (wholemask & 0xff) == 0xff {
-                        return 0;
+                        return Ok(0);
                     }
                     if (wholemask & 0xff00) == 0xff00 {
-                        return 0;
+                        return Ok(0);
                     }
                 }
                 _ => {}
             }
         }
 
-        run_subflow(data, vn, mask, false, false, false)
+        Ok(run_subflow(data, vn, mask, false, false, false))
     }
 }
 
@@ -2908,28 +2908,28 @@ impl Rule for RuleSubvarShift {
         Some(Box::new(RuleSubvarShift::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let vn = o.get_in(0).expect("in0");
         if data.vbank().get(vn).expect("vn").get_size() != 1 {
-            return 0;
+            return Ok(0);
         }
         let in1 = o.get_in(1).expect("in1");
         if !data.vbank().get(in1).expect("vn").is_constant() {
-            return 0;
+            return Ok(0);
         }
         let sa = data.vbank().get(in1).expect("vn").get_offset() as int4;
         let mut mask = data.vbank().get(vn).expect("vn").get_nz_mask();
         if (mask >> sa) != 1u64 {
-            return 0; // Pulling out a single bit
+            return Ok(0); // Pulling out a single bit
         }
         mask = (mask >> sa) << sa;
         let outvn = o.get_out().expect("out");
         if data.vbank().get(outvn).expect("vn").has_no_descend() {
-            return 0;
+            return Ok(0);
         }
 
-        run_subflow(data, vn, mask, false, false, false)
+        Ok(run_subflow(data, vn, mask, false, false, false))
     }
 }
 
@@ -2957,7 +2957,7 @@ impl Rule for RuleSubvarZext {
         Some(Box::new(RuleSubvarZext::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let vn = o.get_out().expect("out");
         let invn = o.get_in(0).expect("in0");
@@ -2969,7 +2969,7 @@ impl Rule for RuleSubvarZext {
         if returned {
             crate::kuna_callrettype::note_returned_extension(data, false, invsize);
         }
-        applied
+        Ok(applied)
     }
 }
 
@@ -3000,7 +3000,7 @@ impl Rule for RuleSubvarSext {
         Some(Box::new(RuleSubvarSext::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let o = data.obank().get(op).expect("stale op");
         let vn = o.get_out().expect("out");
         let invn = o.get_in(0).expect("in0");
@@ -3011,7 +3011,7 @@ impl Rule for RuleSubvarSext {
         if returned {
             crate::kuna_callrettype::note_returned_extension(data, true, invsize);
         }
-        applied
+        Ok(applied)
     }
 
     fn reset(&mut self, _data: &mut Funcdata) {
@@ -3560,25 +3560,25 @@ impl Rule for RuleSplitFlow {
         Some(Box::new(RuleSplitFlow::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = data.obank().get(op).expect("stale op").get_in(1).expect("in1");
         let lo_size = data.vbank().get(in1).expect("stale in1").get_offset() as int4;
         if lo_size == 0 {
-            return 0; // Make sure SUBPIECE doesn't take least significant part
+            return Ok(0); // Make sure SUBPIECE doesn't take least significant part
         }
         let vn = data.obank().get(op).expect("stale op").get_in(0).expect("in0");
         let vv = data.vbank().get(vn).expect("stale vn");
         if !vv.is_written() {
-            return 0;
+            return Ok(0);
         }
         if vv.is_precis_lo() || vv.is_precis_hi() {
-            return 0;
+            return Ok(0);
         }
         let out = data.obank().get(op).expect("stale op").get_out().expect("out");
         let out_size = data.vbank().get(out).expect("stale out").get_size();
         let vn_size = data.vbank().get(vn).expect("stale vn").get_size();
         if out_size + lo_size != vn_size {
-            return 0; // Make sure SUBPIECE is taking most significant part
+            return Ok(0); // Make sure SUBPIECE is taking most significant part
         }
         let mut concat_op: Option<OpId> = None;
         let mut multi_op = data.vbank().get(vn).expect("stale vn").get_def().expect("vn def");
@@ -3586,7 +3586,7 @@ impl Rule for RuleSplitFlow {
             // PIECE may come through INDIRECT
             let tmpvn = data.obank().get(multi_op).expect("stale multi").get_in(0).expect("indirect in0");
             if !data.vbank().get(tmpvn).expect("stale tmpvn").is_written() {
-                return 0;
+                return Ok(0);
             }
             multi_op = data.vbank().get(tmpvn).expect("stale tmpvn").get_def().expect("tmpvn def");
         }
@@ -3613,22 +3613,22 @@ impl Rule for RuleSplitFlow {
         }
         let concat_op = match concat_op {
             Some(c) => c,
-            None => return 0, // Didn't find the concatenate
+            None => return Ok(0), // Didn't find the concatenate
         };
         let cin1 = data.obank().get(concat_op).expect("stale concat").get_in(1).expect("concat in1");
         if data.vbank().get(cin1).expect("stale cin1").get_size() != lo_size {
-            return 0;
+            return Ok(0);
         }
         let mut split_flow = SplitFlow::new(data, vn, lo_size);
         if !split_flow.do_trace(data) {
-            return 0;
+            return Ok(0);
         }
-        match split_flow.apply(data) {
+        Ok(match split_flow.apply(data) {
             Ok(()) => 1,
             // C++ apply() returns void; a structured error here (e.g. an iop/symbol
             // stub) is treated as "no change made" rather than aborting the pass.
             Err(_) => 0,
-        }
+        })
     }
 }
 
@@ -4069,7 +4069,7 @@ impl SplitDatatype {
             in_varnodes.push(out_vn);
             data.vbank_mut().get_mut(out_vn).expect("stale const").update_type(dt);
         }
-        data.op_destroy(op);
+        data.op_destroy(op)?;
         Ok(true)
     }
 
@@ -4149,7 +4149,7 @@ impl SplitDatatype {
             let off = self.data_type_pieces[i].offset;
             let mut addr = &base_addr + off as i64;
             addr.renormalize(dt.get_size(), data.get_arch().manage())?;
-            let out_vn = data.new_varnode(dt.get_size(), &addr, Some(dt));
+            let out_vn = data.new_varnode(dt.get_size(), &addr, Some(dt))?;
             out_varnodes.push(out_vn);
         }
         Ok(())
@@ -4422,7 +4422,7 @@ impl SplitDatatype {
             data.op_insert_before(new_copy_op, copy_op);
             // resolver.inheritResolution — no-op for non-union types.
         }
-        data.op_destroy(copy_op);
+        data.op_destroy(copy_op)?;
         Ok(true)
     }
 
@@ -4497,10 +4497,10 @@ impl SplitDatatype {
             data.op_insert_before(new_load_op, insert_point);
         }
         if let Some(cop) = copy_op {
-            data.op_destroy(cop);
+            data.op_destroy(cop)?;
         }
-        data.op_destroy(load_op);
-        root.free_pointer_chain(data);
+        data.op_destroy(load_op)?;
+        root.free_pointer_chain(data)?;
         Ok(true)
     }
 
@@ -4640,10 +4640,10 @@ impl SplitDatatype {
         }
 
         if let Some(lop) = load_op {
-            data.op_destroy(lop);
-            load_root.free_pointer_chain(data);
+            data.op_destroy(lop)?;
+            load_root.free_pointer_chain(data)?;
         }
-        store_root.free_pointer_chain(data);
+        store_root.free_pointer_chain(data)?;
         Ok(true)
     }
 
@@ -4841,7 +4841,7 @@ impl RootPointer {
 
     /// Remove the now-dead pointer chain (C++
     /// `SplitDatatype::RootPointer::freePointerChain`, subflow.cc:2199).
-    fn free_pointer_chain(&mut self, data: &mut Funcdata) {
+    fn free_pointer_chain(&mut self, data: &mut Funcdata) -> KunaResult<()> {
         let mut first = self.first_pointer.expect("firstPointer");
         while first != self.pointer
             && !data.vbank().get(first).expect("stale first").is_addr_tied()
@@ -4849,9 +4849,10 @@ impl RootPointer {
         {
             let tmp_op = data.vbank().get(first).expect("stale first").get_def().expect("first def");
             first = data.obank().get(tmp_op).expect("stale tmp").get_in(0).expect("tmp in0");
-            data.op_destroy(tmp_op);
+            data.op_destroy(tmp_op)?;
         }
         self.first_pointer = Some(first);
+        Ok(())
     }
 }
 
@@ -4879,7 +4880,7 @@ impl Rule for RuleSplitCopy {
         Some(Box::new(RuleSplitCopy::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in0 = data.obank().get(op).expect("stale op").get_in(0).expect("copy in0");
         let in_type = data.vbank().get(in0).expect("stale in0").get_type_read_facing(op).clone();
         let out = data.obank().get(op).expect("stale op").get_out().expect("copy out");
@@ -4893,13 +4894,10 @@ impl Rule for RuleSplitCopy {
             && metain != type_metatype::TYPE_STRUCT
             && metaout != type_metatype::TYPE_STRUCT
         {
-            return 0;
+            return Ok(0);
         }
         let mut splitter = SplitDatatype::from_funcdata(data);
-        match splitter.split_copy(data, op, &in_type, &out_type) {
-            Ok(true) => 1,
-            _ => 0,
-        }
+        Ok(if splitter.split_copy(data, op, &in_type, &out_type)? { 1 } else { 0 })
     }
 }
 
@@ -4927,25 +4925,22 @@ impl Rule for RuleSplitLoad {
         Some(Box::new(RuleSplitLoad::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let out = data.obank().get(op).expect("stale op").get_out().expect("out");
         let out_size = data.vbank().get(out).expect("stale out").get_size();
         let in_type = match SplitDatatype::get_value_datatype(data, op, out_size) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         let metain = in_type.get_metatype();
         if metain != type_metatype::TYPE_STRUCT
             && metain != type_metatype::TYPE_ARRAY
             && metain != type_metatype::TYPE_PARTIALSTRUCT
         {
-            return 0;
+            return Ok(0);
         }
         let mut splitter = SplitDatatype::from_funcdata(data);
-        match splitter.split_load(data, op, &in_type) {
-            Ok(true) => 1,
-            _ => 0,
-        }
+        Ok(if splitter.split_load(data, op, &in_type)? { 1 } else { 0 })
     }
 }
 
@@ -4973,25 +4968,22 @@ impl Rule for RuleSplitStore {
         Some(Box::new(RuleSplitStore::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in2 = data.obank().get(op).expect("stale op").get_in(2).expect("store in2");
         let in2_size = data.vbank().get(in2).expect("stale in2").get_size();
         let out_type = match SplitDatatype::get_value_datatype(data, op, in2_size) {
             Some(t) => t,
-            None => return 0,
+            None => return Ok(0),
         };
         let metain = out_type.get_metatype();
         if metain != type_metatype::TYPE_STRUCT
             && metain != type_metatype::TYPE_ARRAY
             && metain != type_metatype::TYPE_PARTIALSTRUCT
         {
-            return 0;
+            return Ok(0);
         }
         let mut splitter = SplitDatatype::from_funcdata(data);
-        match splitter.split_store(data, op, &out_type) {
-            Ok(true) => 1,
-            _ => 0,
-        }
+        Ok(if splitter.split_store(data, op, &out_type)? { 1 } else { 0 })
     }
 }
 
@@ -5024,11 +5016,8 @@ impl Rule for RuleDumptyHumpLate {
         Some(Box::new(RuleDumptyHumpLate::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
-        // The funcdata mutations (opSetInput/totalReplace) return KunaResult; the
-        // C++ applyOp is infallible, so we run the body and map any stub error to
-        // 0 (no change) at this boundary.
-        Self::apply_op_inner(op, data).unwrap_or(0)
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        Self::apply_op_inner(op, data)
     }
 }
 
@@ -5122,7 +5111,7 @@ impl RuleDumptyHumpLate {
         let rov = data.vbank().get(remove_out).expect("stale remove out");
         if rov.has_no_descend() && !rov.is_auto_live() {
             let mut scratch: Vec<OpId> = Vec::new();
-            data.op_destroy_recursive(remove_op, &mut scratch);
+            data.op_destroy_recursive(remove_op, &mut scratch)?;
         }
         Ok(1)
     }
@@ -6436,7 +6425,7 @@ impl Rule for RuleSubfloatConvert {
         Some(Box::new(RuleSubfloatConvert::new(self.group.clone())))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let invn = data.obank().get(op).expect("stale op").get_in(0).expect("in0");
         let outvn = data.obank().get(op).expect("stale op").get_out().expect("out");
         let insize = data.vbank().get(invn).expect("stale invn").get_size();
@@ -6445,25 +6434,25 @@ impl Rule for RuleSubfloatConvert {
             let mut subflow = SubfloatFlow::new(data, outvn, insize);
             match subflow.do_trace(data) {
                 Ok(true) => {}
-                _ => return 0,
+                _ => return Ok(0),
             }
             match subflow.apply(data) {
                 Ok(()) => {}
                 // C++ apply() returns void; a structured error -> "no change".
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             }
         } else {
             let mut subflow = SubfloatFlow::new(data, invn, outsize);
             match subflow.do_trace(data) {
                 Ok(true) => {}
-                _ => return 0,
+                _ => return Ok(0),
             }
             match subflow.apply(data) {
                 Ok(()) => {}
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             }
         }
-        1
+        Ok(1)
     }
 }
 
@@ -6659,7 +6648,7 @@ mod tests {
                         assert_eq!(before[0][1], before[8][1], "{code:?}: equal low bits");
                         assert_ne!(before[0][0], before[8][0], "{code:?}: high bits affect shift");
                     }
-                    let changed = RuleSubvarSubpiece::new("subvar").apply_op(projection, &mut fd);
+                    let changed = RuleSubvarSubpiece::new("subvar").apply_op(projection, &mut fd).unwrap();
                     assert_eq!(changed, i32::from(known_zero_high), "{code:?}");
                     let actual = fd.obank().get(shift).unwrap().get_in(1).unwrap();
                     assert_eq!(fd.vbank().get(actual).unwrap().get_size(), if known_zero_high { 4 } else { 8 });
@@ -6750,7 +6739,7 @@ mod tests {
     /// A register varnode at a ram address (free / "free"-like until wired).
     fn mk_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        fd.new_varnode(size, &Address::new(r, off), Some(unk(size)))
+        fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap()
     }
 
     /// A register varnode promoted to a function input (so it isn't \e free, the
@@ -6787,7 +6776,7 @@ mod tests {
                 let copy = mk_op(&mut fd, 0x1000, 1, OpCode::CPUI_COPY);
                 wire_in(&mut fd, copy, home, 0);
                 let root = wire_out(&mut fd, copy, root);
-                fd.kuna_inherit_storage(root, home);
+                fd.kuna_inherit_storage(root, home).unwrap();
                 let mut subflow = SubvariableFlow::new(&mut fd, root, mask, true, false, false).unwrap();
                 let rvn = subflow.varmap[&root];
                 let replacement = subflow.get_replace_varnode(&mut fd, rvn).unwrap();
@@ -7003,7 +6992,7 @@ mod tests {
         wire_in(&mut fd, andop, b, 1);
         let _outvn = wire_out(&mut fd, andop, outvn);
         let mut rule = RuleSubvarAnd::new("g");
-        assert_eq!(rule.apply_op(andop, &mut fd), 0);
+        assert_eq!(rule.apply_op(andop, &mut fd).unwrap(), 0);
     }
 
     #[test]
@@ -7018,7 +7007,7 @@ mod tests {
         wire_in(&mut fd, shr, c, 1);
         let _outvn = wire_out(&mut fd, shr, outvn);
         let mut rule = RuleSubvarShift::new("g");
-        assert_eq!(rule.apply_op(shr, &mut fd), 0);
+        assert_eq!(rule.apply_op(shr, &mut fd).unwrap(), 0);
     }
 
     #[test]
@@ -7159,7 +7148,7 @@ mod tests {
         wire_in(&mut fd, sub, zero, 1);
         let _outvn = wire_out(&mut fd, sub, outvn);
         let mut rule = RuleSplitFlow::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 0);
+        assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
     }
 
     #[test]
@@ -7179,7 +7168,7 @@ mod tests {
         wire_in(&mut fd, sub, four, 1);
         let _outvn = wire_out(&mut fd, sub, outvn);
         let mut rule = RuleSplitFlow::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 0);
+        assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
     }
 
     // ---- RuleDumptyHumpLate (subflow.cc:3021-3083) ------------------------
@@ -7209,7 +7198,7 @@ mod tests {
         wire_in(&mut fd, user, outvn, 0);
 
         let mut rule = RuleDumptyHumpLate::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 1);
+        assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 1);
         // The user now reads W directly (totalReplace).
         assert_eq!(fd.obank().get(user).unwrap().get_in(0), Some(w));
     }
@@ -7238,7 +7227,7 @@ mod tests {
         wire_in(&mut fd, user, outvn, 0);
 
         let mut rule = RuleDumptyHumpLate::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 1);
+        assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 1);
         // SUBPIECE now reads V (the most significant component) at truncation 2.
         assert_eq!(fd.obank().get(sub).unwrap().get_in(0), Some(v));
         assert_eq!(fd.obank().get(sub).unwrap().code(), OpCode::CPUI_SUBPIECE);
@@ -7262,7 +7251,7 @@ mod tests {
         wire_in(&mut fd, sub, zero, 1);
         let _outvn = wire_out(&mut fd, sub, outvn);
         let mut rule = RuleDumptyHumpLate::new("g");
-        assert_eq!(rule.apply_op(sub, &mut fd), 0);
+        assert_eq!(rule.apply_op(sub, &mut fd).unwrap(), 0);
     }
 
     // ---- SplitDatatype categorization (subflow.cc:2219-2384) --------------
@@ -7364,7 +7353,7 @@ mod tests {
         let _outvn = wire_out(&mut fd, load, outvn);
         assert!(SplitDatatype::get_value_datatype(&fd, load, 8).is_none());
         let mut rule = RuleSplitLoad::new("g");
-        assert_eq!(rule.apply_op(load, &mut fd), 0);
+        assert_eq!(rule.apply_op(load, &mut fd).unwrap(), 0);
     }
 
     #[test]
@@ -7378,7 +7367,7 @@ mod tests {
         wire_in(&mut fd, copyop, src, 0);
         let _outvn = wire_out(&mut fd, copyop, outvn);
         let mut rule = RuleSplitCopy::new("g");
-        assert_eq!(rule.apply_op(copyop, &mut fd), 0);
+        assert_eq!(rule.apply_op(copyop, &mut fd).unwrap(), 0);
     }
 
     // ---- SplitDatatype split build path (subflow.cc:2390-2954) -------------
@@ -7617,7 +7606,7 @@ mod tests {
         wire_in(&mut fd, f2f, invn, 0);
         let _outvn = wire_out(&mut fd, f2f, outvn);
         let mut rule = RuleSubfloatConvert::new("g");
-        assert_eq!(rule.apply_op(f2f, &mut fd), 0);
+        assert_eq!(rule.apply_op(f2f, &mut fd).unwrap(), 0);
     }
 
     // ---- tryReturnPull (subflow.cc:238-284) — verifier adversarial tests ----

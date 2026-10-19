@@ -71,7 +71,7 @@ fn caller_body(option_on: bool) -> String {
         &[],
     );
     let fd = step.result.expect("the caller decompiles");
-    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)
+    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap()
 }
 
 /// Default: the declared name carries its signature to every call site.
@@ -117,7 +117,7 @@ fn a_name_the_tables_do_not_know_parks_nothing() {
         &[],
     );
     let fd = step.result.expect("the caller decompiles");
-    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);
+    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap();
     assert!(body.contains("stage1("), "the declared name renders, got:\n{body}");
     assert!(
         !body.contains("NULL"),

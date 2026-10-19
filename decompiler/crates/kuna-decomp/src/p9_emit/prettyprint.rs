@@ -227,7 +227,20 @@ pub struct MarkupRef {
     pub type_id: Option<uintb>,
     /// `ct->getName()` for an associated `Datatype` (C++ `ATTRIB_NAME`).
     pub type_name: Option<String>,
+    /// Exact native owner, retained until all buffered tokens have been emitted.
+    pub datatype: Option<MarkupDatatype>,
 }
+
+#[derive(Debug, Clone)]
+pub struct MarkupDatatype(pub Rc<crate::dtype::Datatype>);
+
+impl PartialEq for MarkupDatatype {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for MarkupDatatype {}
 
 /// One source-line association captured while [`EmitMarkup`] serializes a
 /// function. Line numbers are 1-based after the leading newline emitted by
@@ -994,6 +1007,7 @@ pub struct EmitMarkup {
     line_number: usize,
     provenance: MarkupProvenance,
     capture: Option<TokenCapture>,
+    result_types: Option<crate::resulttypes::SharedResultTypes>,
 }
 
 impl Default for EmitMarkup {
@@ -1003,6 +1017,16 @@ impl Default for EmitMarkup {
 }
 
 impl EmitMarkup {
+    pub fn set_result_types(&mut self, types: crate::resulttypes::SharedResultTypes) {
+        self.result_types = Some(types);
+    }
+
+    fn local_type_handle(&self, markup: &MarkupRef) -> Option<u64> {
+        let types = self.result_types.as_ref()?;
+        let datatype = markup.datatype.as_ref()?;
+        types.borrow_mut().markup_handle(&datatype.0)
+    }
+
     /// C++ `EmitMarkup::EmitMarkup()`.  The upstream default encoder is
     /// `PackedEncode` (`setOutputStream`).
     pub fn new() -> Self {
@@ -1013,6 +1037,7 @@ impl EmitMarkup {
             line_number: 0,
             provenance: MarkupProvenance::default(),
             capture: None,
+            result_types: None,
         }
     }
 
@@ -1129,8 +1154,12 @@ impl EmitMarkup {
     /// `EmitMarkup::tagType`, prettyprint.cc).
     fn tag_type_single(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
         let tid = markup.type_id;
+        let local = self.local_type_handle(markup);
         self.with_encoder(|e| {
             e.open_element(&ids::ELEM_TYPE);
+            if let Some(handle) = local {
+                e.write_unsigned_integer(&crate::resulttypes::ATTRIB_KUNA_LOCAL, handle);
+            }
             if hl != SyntaxHighlight::NoColor {
                 e.write_unsigned_integer(&ids::ATTRIB_COLOR, hl.value());
             }
@@ -1346,24 +1375,33 @@ impl Emit for EmitMarkup {
         });
     }
     fn tag_type(&mut self, name: &str, hl: SyntaxHighlight, markup: &MarkupRef) {
-        // (kuna, Phase 4) Declarator-token fidelity: kuna's declarator builder
-        // hands the WHOLE rendered front ("unsigned long *") to one tag_type
-        // call, where upstream pushes only the base type name as the <type>
-        // token and the stars/spaces as separate syntax tokens.  A multi-word
-        // single token per-token-breaks the GUI's type semantics and — worse —
-        // Java's getC() path (PrettyPrinter + IllegalCharCppTransformer)
-        // rewrites every non-identifier character in a type token to '_', so
-        // scripts/exports receive `unsigned_long__a1`.  Split here, at the
-        // markup emitter (the flattened byte stream is unchanged, and the
-        // EmitNoMarkup/EmitPrettyPrint standalone paths never enter this
-        // code): identifier words stay <type> tokens, separator runs become
-        // <syntax> tokens.  Template payloads (`<…>`) stay inside their word
-        // (the Java transformer accepts them verbatim).
+        // A bound nominal leaf is one source datatype name even when that
+        // name contains punctuation (e.g. an automatic relative-pointer
+        // typedef). Its whole name must reach Java's type-token recipient.
+        // Legacy whole declarators and scalar keyword spellings still need
+        // syntax splitting; treating their operators as a name changes C.
+        let nominal_leaf = markup.datatype.as_ref().is_some_and(|binding| {
+            let datatype = &binding.0;
+            name == datatype.get_name()
+                && !name.is_empty()
+                && (datatype.get_typedef().is_some()
+                    || matches!(&datatype.kind,
+                        crate::dtype::DatatypeKind::Struct { .. }
+                        | crate::dtype::DatatypeKind::Union { .. }
+                        | crate::dtype::DatatypeKind::Enum { .. }
+                        | crate::dtype::DatatypeKind::Code { .. }
+                        | crate::dtype::DatatypeKind::Pointer { .. }
+                        | crate::dtype::DatatypeKind::PointerRel { .. }))
+        });
         self.capture(name, TokenKind::Type, hl, Some(markup), None);
         if let Some(c) = self.capture.as_mut() {
             c.mute += 1;
         }
-        self.tag_type_split(name, hl, markup);
+        if nominal_leaf {
+            self.tag_type_single(name, hl, markup);
+        } else {
+            self.tag_type_split(name, hl, markup);
+        }
         if let Some(c) = self.capture.as_mut() {
             c.mute -= 1;
         }
@@ -1372,8 +1410,12 @@ impl Emit for EmitMarkup {
         self.record_association(markup);
         self.capture(name, TokenKind::Field, hl, Some(markup), None);
         let (tname, tid, op) = (markup.type_name.clone(), markup.type_id, markup.opref);
+        let local = self.local_type_handle(markup);
         self.with_encoder(|e| {
             e.open_element(&ids::ELEM_FIELD);
+            if let Some(handle) = local {
+                e.write_unsigned_integer(&crate::resulttypes::ATTRIB_KUNA_LOCAL, handle);
+            }
             if hl != SyntaxHighlight::NoColor {
                 e.write_unsigned_integer(&ids::ATTRIB_COLOR, hl.value());
             }
@@ -1384,10 +1426,10 @@ impl Emit for EmitMarkup {
                         e.write_unsigned_integer(&ids::ATTRIB_ID, id);
                     }
                 }
-                e.write_signed_integer(&ids::ATTRIB_OFF, off as i64);
-                if let Some(o) = op {
-                    e.write_unsigned_integer(&ids::ATTRIB_OPREF, o);
-                }
+            }
+            e.write_signed_integer(&ids::ATTRIB_OFF, off as i64);
+            if let Some(o) = op {
+                e.write_unsigned_integer(&ids::ATTRIB_OPREF, o);
             }
             e.write_string(&ids::ATTRIB_CONTENT, name.as_bytes());
             e.close_element(&ids::ELEM_FIELD);
@@ -1397,8 +1439,12 @@ impl Emit for EmitMarkup {
         self.record_association(markup);
         self.capture(name, TokenKind::Field, hl, Some(markup), None);
         let (tname, tid, op) = (markup.type_name.clone(), markup.type_id, markup.opref);
+        let local = self.local_type_handle(markup);
         self.with_encoder(|e| {
             e.open_element(&ids::ELEM_BITFIELD);
+            if let Some(handle) = local {
+                e.write_unsigned_integer(&crate::resulttypes::ATTRIB_KUNA_LOCAL, handle);
+            }
             if hl != SyntaxHighlight::NoColor {
                 e.write_unsigned_integer(&ids::ATTRIB_COLOR, hl.value());
             }
@@ -1945,7 +1991,7 @@ impl TokenSplit {
         self.tagtype = TagType::TypeT;
         self.delimtype = PrintClass::TokenString;
         self.hl = h;
-        self.markup.type_id = markup.type_id;
+        self.markup.clone_from(markup);
     }
     /// C++ `tagField(name,h,ct,o,inOp)`.
     pub fn tag_field(&mut self, name: &str, h: SyntaxHighlight, o: int4, markup: &MarkupRef) {
@@ -1954,8 +2000,7 @@ impl TokenSplit {
         self.tagtype = TagType::FieldT;
         self.delimtype = PrintClass::TokenString;
         self.hl = h;
-        self.markup.type_id = markup.type_id;
-        self.markup.type_name = markup.type_name.clone();
+        self.markup.clone_from(markup);
         self.off = o as uintb;
         self.markup.opref = markup.opref;
     }
@@ -1966,8 +2011,7 @@ impl TokenSplit {
         self.tagtype = TagType::BitfieldT;
         self.delimtype = PrintClass::TokenString;
         self.hl = h;
-        self.markup.type_id = markup.type_id;
-        self.markup.type_name = markup.type_name.clone();
+        self.markup.clone_from(markup);
         self.off = id as uintb;
         self.markup.opref = markup.opref;
     }
@@ -2238,6 +2282,7 @@ impl LowLevel {
 ///
 /// The whole `scan`/`advanceleft`/`print`/`overflow` machinery is transcribed
 /// verbatim because the inserted breaks are part of the byte-exact C output.
+#[derive(Debug)]
 pub struct EmitPrettyPrint {
     base: EmitBase,
     lowlevel: LowLevel,
@@ -2257,6 +2302,8 @@ pub struct EmitPrettyPrint {
     commentmode: bool,
     /// Used to fill comments if line breaks are forced.
     commentfill: String,
+    /// Continuation selected by the currently printed (possibly queued) comment.
+    active_commentfill: String,
     /// References to current open and whitespace tokens.
     scanqueue: CircularQueue<int4>,
     /// The full stream of tokens.
@@ -2287,6 +2334,7 @@ impl EmitPrettyPrint {
             needbreak: false,
             commentmode: false,
             commentfill: String::new(),
+            active_commentfill: String::new(),
             scanqueue: CircularQueue::new(3 * 100),
             tokqueue: CircularQueue::new(3 * 100),
         };
@@ -2310,6 +2358,52 @@ impl EmitPrettyPrint {
     /// Mutably borrow the low-level back-end.
     pub fn lowlevel_mut(&mut self) -> &mut LowLevel {
         &mut self.lowlevel
+    }
+
+    /// Start a fresh document without losing the configured wrapping policy.
+    pub(crate) fn set_output_stream(&mut self) {
+        self.clear_pretty();
+        match &mut self.lowlevel {
+            LowLevel::NoMarkup(emit) => emit.set_output_stream(),
+            LowLevel::Markup(emit) => emit.set_output_stream(),
+        }
+    }
+
+    pub(crate) fn set_result_types(&mut self, types: crate::resulttypes::SharedResultTypes) {
+        if let LowLevel::Markup(emit) = &mut self.lowlevel {
+            emit.set_result_types(types);
+        }
+    }
+
+    pub(crate) fn admits_result_types(&self) -> bool {
+        matches!(&self.lowlevel, LowLevel::Markup(emit) if emit.result_types.is_some())
+    }
+
+    pub(crate) fn set_capture_tokens(&mut self, capture: bool) {
+        if let LowLevel::Markup(emit) = &mut self.lowlevel {
+            emit.set_capture_tokens(capture);
+        }
+    }
+
+    pub(crate) fn take_output(&mut self) -> Vec<u8> {
+        match &mut self.lowlevel {
+            LowLevel::Markup(emit) => emit.take_output(),
+            LowLevel::NoMarkup(_) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn take_provenance(&mut self) -> MarkupProvenance {
+        match &mut self.lowlevel {
+            LowLevel::Markup(emit) => emit.take_provenance(),
+            LowLevel::NoMarkup(_) => MarkupProvenance::default(),
+        }
+    }
+
+    pub(crate) fn take_tokens(&mut self) -> Vec<EmitToken> {
+        match &mut self.lowlevel {
+            LowLevel::Markup(emit) => emit.take_tokens(),
+            LowLevel::NoMarkup(_) => Vec::new(),
+        }
     }
 
     /// C++ `resetDefaultsPrettyPrint()`: `setMaxLineSize(100)`.
@@ -2354,7 +2448,7 @@ impl EmitPrettyPrint {
         if newspaceremain == self.spaceremain {
             return; // Line breaking doesn't give us any additional space
         }
-        if self.commentmode && (newspaceremain == self.spaceremain + self.commentfill.len() as int4)
+        if self.commentmode && (newspaceremain == self.spaceremain + self.active_commentfill.len() as int4)
         {
             return; // Line breaking doesn't give us any additional space
         }
@@ -2362,12 +2456,11 @@ impl EmitPrettyPrint {
         self.lowlevel
             .as_emit_mut()
             .tag_line_indent(self.maxlinesize - self.spaceremain);
-        if self.commentmode && !self.commentfill.is_empty() {
-            let fill = self.commentfill.clone();
+        if self.commentmode && !self.active_commentfill.is_empty() {
             self.lowlevel
                 .as_emit_mut()
-                .print(&fill, SyntaxHighlight::CommentColor);
-            self.spaceremain -= self.commentfill.len() as int4;
+                .print(&self.active_commentfill, SyntaxHighlight::CommentColor);
+            self.spaceremain -= self.active_commentfill.len() as int4;
         }
     }
 
@@ -2397,6 +2490,7 @@ impl EmitPrettyPrint {
                 self.commentmode = true;
                 // fallthru, treat as a group begin
                 let tok = self.tokqueue.get_ref(tok_ref).clone();
+                self.active_commentfill.clone_from(&tok.tok);
                 tok.print_to(self.lowlevel.as_emit_mut())?;
                 self.indentstack.push(self.spaceremain);
             }
@@ -2456,12 +2550,12 @@ impl EmitPrettyPrint {
                     self.lowlevel
                         .as_emit_mut()
                         .tag_line_indent(self.maxlinesize - self.spaceremain);
-                    if self.commentmode && !self.commentfill.is_empty() {
-                        let fill = self.commentfill.clone();
+                    if self.commentmode && !self.active_commentfill.is_empty() {
+                        let fill = self.active_commentfill.clone();
                         self.lowlevel
                             .as_emit_mut()
                             .print(&fill, SyntaxHighlight::CommentColor);
-                        self.spaceremain -= self.commentfill.len() as int4;
+                        self.spaceremain -= self.active_commentfill.len() as int4;
                     }
                 } else {
                     let num = tok.get_num_spaces();
@@ -2916,6 +3010,7 @@ impl EmitPrettyPrint {
         self.checkstart()?;
         let slot = self.tokqueue.push();
         let id = self.tokqueue.get_ref_mut(slot).start_comment();
+        self.tokqueue.get_ref_mut(slot).tok.clone_from(&self.commentfill);
         self.scan()?;
         Ok(id)
     }

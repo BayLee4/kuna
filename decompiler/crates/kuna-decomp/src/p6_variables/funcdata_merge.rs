@@ -18,11 +18,9 @@
 //!    `Funcdata::newOp`/`newUnique`/`opSet*`/`opInsert*` (`merge.cc:411-712`).
 //!
 //! ## Boundaries (documented losses, narrow on the merged-tree default)
-//!  * The W4 Symbol/ScopeLocal layer is not present (`localmap` is a unit stub):
-//!    `bank_symbol`/`multi_entry_symbols`/`symbol_*` return the un-recovered
-//!    default (no symbol, no multi-entry groups), so `mergeMultiEntry` is a true
-//!    no-op and merged locals are named directly on the HighVariable
-//!    (`kuna_naming`), not via a `Symbol` in the local scope.
+//!  * Symbol identity/offset reads retain genuine absence and propagate live
+//!    mapped-symbol query failures through the merge engine to its Action.
+//!    Query-free local scope and already-bound symbol reads remain direct.
 //!  * `addr_tied_ranges` (`Funcdata::overlapLoc`) and the union-resolution arms of
 //!    the trim COPYs are the conservative default (no addr-tied overlap groups, no
 //!    `needsResolution` types in the merged tree) — exact on boolless.
@@ -175,8 +173,10 @@ impl Funcdata {
     /// stack member is never global), the frozen global scope second.  Returns
     /// `(entry_addr, sym_off)` for the first member that maps, location-ordered (the
     /// C++ `updateSymbol` first-hit; members of one high share the same Symbol).
-    fn kuna_mapped_symbol_entry(&self, high: HighVariableId) -> Option<(Address, int4)> {
-        let h = self.high_bank().get(high)?;
+    fn kuna_mapped_symbol_entry(&self, high: HighVariableId) -> KunaResult<Option<(Address, int4)>> {
+        let Some(h) = self.high_bank().get(high) else {
+            return Ok(None);
+        };
         // (kuna perf) The scan below only ever accepts an address-tied member,
         // and a high's cached flag word is the OR of its members', so a clean
         // `addrtied == false` settles it without walking them.  `mergeTestRequired`
@@ -184,7 +184,7 @@ impl Funcdata {
         // it gets here, so the flags are clean by construction; a dirty word just
         // falls through to the scan.
         if h.kuna_addr_tied_if_clean() == Some(false) {
-            return None;
+            return Ok(None);
         }
         let invalid = Address::new_invalid();
         let n = h.num_instances();
@@ -215,38 +215,40 @@ impl Funcdata {
                 {
                     let delta =
                         addr.get_offset().wrapping_sub(entry_addr.get_offset()) as int4;
-                    return Some((entry_addr, delta.wrapping_add(entry_off)));
+                    return Ok(Some((entry_addr, delta.wrapping_add(entry_off))));
                 }
             }
             // Then the frozen global scope (`map addr r...`): the covering global Symbol.
-            if let Some(c) = self.get_arch().query_container_global(&addr, size, &invalid) {
+            if let Some(c) = self.get_arch().query_container_global(&addr, size, &invalid)? {
                 let delta = addr.get_offset().wrapping_sub(c.entry_addr.get_offset()) as int4;
-                return Some((c.entry_addr, delta.wrapping_add(c.symbol_offset)));
+                return Ok(Some((c.entry_addr, delta.wrapping_add(c.symbol_offset))));
             }
         }
-        None
+        Ok(None)
     }
 
     /// (kuna LOSS-229) The `map addr` Symbol id for the `bank_symbol` guard, keyed off
     /// the covering entry's storage address (a `map addr` Symbol has one storage),
     /// tagged into the mapped id-space so it never collides with a local slotmap key.
-    fn kuna_mapped_symbol_id(&self, high: HighVariableId) -> Option<u64> {
-        let (entry_addr, _off) = self.kuna_mapped_symbol_entry(high)?;
+    fn kuna_mapped_symbol_id(&self, high: HighVariableId) -> KunaResult<Option<u64>> {
+        let Some((entry_addr, _off)) = self.kuna_mapped_symbol_entry(high)? else {
+            return Ok(None);
+        };
         let off = entry_addr.get_offset();
         let space = entry_addr.get_space().map(|s| s.get_index() as u64).unwrap_or(0);
         // Combine space + offset into one id; clear the top bit of the payload then
         // tag the mapped id-space.  Two members of the same Symbol resolve to the same
         // entry_addr -> same id (the C++ `symbolIn == symbolOut`); space differentiates
         // a stack symbol from a global at the same numeric offset.
-        Some(SYM_ID_GLOBAL_TAG | (((space << 48) ^ off) & SYM_ID_LOCAL_MASK))
+        Ok(Some(SYM_ID_GLOBAL_TAG | (((space << 48) ^ off) & SYM_ID_LOCAL_MASK)))
     }
 
     /// (kuna LOSS-229) The in-symbol byte offset for a `map addr` access (C++
     /// `HighVariable::setSymbol`'s `symboloffset`, variable.cc:269: `(addr -
     /// entry_addr) + entry_offset`), used by the `mergeTestRequired` "different parts
     /// of same symbol" arm.
-    fn kuna_mapped_symbol_offset(&self, high: HighVariableId) -> Option<int4> {
-        self.kuna_mapped_symbol_entry(high).map(|(_addr, off)| off)
+    fn kuna_mapped_symbol_offset(&self, high: HighVariableId) -> KunaResult<Option<int4>> {
+        Ok(self.kuna_mapped_symbol_entry(high)?.map(|(_addr, off)| off))
     }
 
     /// Run a closure with the persistent merge engine and `self` as the
@@ -257,7 +259,8 @@ impl Funcdata {
     /// expresses the same self-mutation with a move-out / move-back), then moved
     /// back so its `copyTrims` accumulator persists across actions.  This is the
     /// faithful equivalent of the single `Funcdata::covermerge` member the C++
-    /// merge actions all share.
+    /// merge actions all share. Fallible closures return their `KunaResult`
+    /// unchanged only after the engine is restored, including on query failure.
     pub fn with_covermerge<R>(
         &mut self,
         f: impl FnOnce(&mut crate::merge::Merge, &mut Funcdata) -> R,
@@ -558,17 +561,19 @@ impl MergeContext for Funcdata {
         }
     }
 
-    // --- Symbol reads on a HighVariable (W4 surface; un-recovered default) ---
-    fn bank_symbol(&self, high: HighVariableId) -> Option<u64> {
+    // --- Symbol reads on a HighVariable -----------------------------------
+    fn bank_symbol(&self, high: HighVariableId) -> KunaResult<Option<u64>> {
         // (kuna LOSS-229) Expose the Symbol id bound to this high so
         // `Merge::mergeTestRequired` (merge.cc:157-164) keeps a dynamic temp distinct
         // from the storage it copies.  Equate symbols count too (same C++ guard).
         use slotmap::Key;
-        let h = self.high_bank().get(high)?;
+        let Some(h) = self.high_bank().get(high) else {
+            return Ok(None);
+        };
         if let Some(s) = h.kuna_dynamic_symbol().or_else(|| h.kuna_equate_symbol()) {
             // Tag with the top bit cleared so a slotmap ffi key never collides with a
             // mapped-Symbol id (which is keyed off the entry storage address + tag bit).
-            return Some(s.data().as_ffi() & SYM_ID_LOCAL_MASK);
+            return Ok(Some(s.data().as_ffi() & SYM_ID_LOCAL_MASK));
         }
         // C++ `HighVariable::getSymbol()` also resolves a `map addr` access to its
         // Symbol (the member Varnode carries the SymbolEntry, variable.cc:418-432).
@@ -584,24 +589,24 @@ impl MergeContext for Funcdata {
                 if v.is_free() || v.is_addr_tied() { continue }
                 if let Some((sym, addr, size, _)) = lm.container_symbol_link(v.get_addr(), &self.vn_use_point(vn)) {
                     if addr == *v.get_addr() && size == v.get_size() {
-                        return Some(sym.data().as_ffi() & SYM_ID_LOCAL_MASK);
+                        return Ok(Some(sym.data().as_ffi() & SYM_ID_LOCAL_MASK));
                     }
                 }
             }
         }
         self.kuna_mapped_symbol_id(high)
     }
-    fn bank_symbol_offset(&self, high: HighVariableId) -> int4 {
+    fn bank_symbol_offset(&self, high: HighVariableId) -> KunaResult<int4> {
         let h = match self.high_bank().get(high) {
             Some(h) => h,
-            None => return -1,
+            None => return Ok(-1),
         };
         // A dynamic/equate symbol parks its in-symbol offset on the high; a `map addr`
         // access reads the covering entry's `(addr - entry_addr) + entry_off`.
         if h.kuna_dynamic_symbol().is_some() || h.kuna_equate_symbol().is_some() {
-            return h.get_symbol_offset();
+            return Ok(h.get_symbol_offset());
         }
-        self.kuna_mapped_symbol_offset(high).unwrap_or_else(|| h.get_symbol_offset())
+        Ok(self.kuna_mapped_symbol_offset(high)?.unwrap_or_else(|| h.get_symbol_offset()))
     }
     fn bank_symbol_isolated(&self, high: HighVariableId) -> bool {
         // (kuna L2) C++ `Merge::mergeTestAdjacent` (merge.cc:196-205) bails out
@@ -868,7 +873,7 @@ impl MergeContext for Funcdata {
     fn op_previous(&self, op: OpId) -> Option<OpId> {
         self.op_previous_op(op)
     }
-    fn op_output_type_local(&self, op: OpId) -> Rc<Datatype> {
+    fn op_output_type_local(&self, op: OpId) -> KunaResult<Rc<Datatype>> {
         self.op_output_type_local_pub(op)
     }
     fn op_input_type_local(&self, op: OpId, slot: int4) -> Rc<Datatype> {
@@ -950,9 +955,16 @@ impl MergeContext for Funcdata {
         crate::p6_variables::kuna_pointeevalue::load_crosses_write(self, vn)
     }
     fn vn_load_crosses_global_write(&mut self, vn: VarnodeId, except: HighVariableId) -> bool {
-        let guarded = self.high_bank().get(except).is_some_and(|h| {
-            (0..h.num_instances()).any(|i| self.vbank().get(h.get_instance(i)).is_some_and(|v| v.is_persist() && self.global_store_guarded(v)))
-        });
+        let mut guarded = false;
+        if let Some(h) = self.high_bank().get(except) {
+            for i in 0..h.num_instances() {
+                let Some(v) = self.vbank().get(h.get_instance(i)) else { continue };
+                if v.is_persist() && self.global_store_guarded(v) {
+                    guarded = true;
+                    break;
+                }
+            }
+        }
         if !guarded {
             return false;
         }

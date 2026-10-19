@@ -40,7 +40,7 @@
   <com>quit</com>
 </script>
 <stringmatch name="CUSTOM-CALL-STORAGE #1: getter supplies the one-formal call across rebuilds" min="2" max="2">return mapper\(raw_type\);</stringmatch>
-<stringmatch name="CUSTOM-CALL-STORAGE #2: the callee has exactly one formal" min="1" max="1">^int4 mapper\(int4 raw_type\)$</stringmatch>
+<stringmatch name="CUSTOM-CALL-STORAGE #2: the callee has exactly one formal" min="1" max="1">^int4 MSABI mapper\(int4 raw_type\)$</stringmatch>
 <stringmatch name="CUSTOM-CALL-STORAGE #3: the callee reads its declared input" min="1" max="1">return raw_type \+ 3;</stringmatch>
 <stringmatch name="CUSTOM-CALL-STORAGE #4: the ordinary two-slot control passes getter as argument two" min="1" max="1">return mapper\(object,raw_type\);</stringmatch>
 <stringmatch name="CUSTOM-CALL-STORAGE #5: the custom call never reads the receiver as an integer" min="0" max="0">mapper\(\(int4\)object\)</stringmatch>

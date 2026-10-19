@@ -1,20 +1,27 @@
 //! Versioned worker records, independent of process scheduling.
 //!
-//! Specs carry the parent's resolved inventory. Results use length-prefixed,
+//! Specs carry the parent's resolved inventory. A session-level export record
+//! carries the complete immutable callable publication, independently of chunks;
+//! workers rebind its portable addresses through their existing architecture.
+//! Results use length-prefixed,
 //! little-endian frames flushed per function; decoding retains the complete
 //! prefix when a worker dies mid-write.
 
 use std::io::{BufWriter, Write};
 
 use kuna_console::engine::{EntryProvenance, ObjectLocation};
-use kuna_console::project::FuncResult;
+use kuna_console::project::{FuncResult, ResultTypeBinding};
 use kuna_decomp::decompile_drive::{GlobalInfo, LineMapping, TypeInfo, VarInfo};
+use kuna_decomp::kuna_exportcall::{
+    ExportAddress, ExportCallKey, ExportCallSpec, ExportFunctionSpec, ExportInputSpec, ExportParameterEdit, ExportSpec,
+};
 use kuna_decomp::kuna_structsynth::shard::FunctionRecord;
 
 use super::TargetSpec;
 
 const SPEC_MAGIC: &[u8; 12] = b"KUNAJOBSPEC3";
-pub(super) const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES07";
+const EXPORT_MAGIC: &[u8; 12] = b"KUNAEXPORT02";
+pub(super) const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES09";
 
 /// Result-stream frame kind.  One kind today; the envelope is what lets a
 /// truncated tail be dropped rather than guessed.
@@ -154,6 +161,172 @@ impl<'a> Reader<'a> {
 }
 
 // --- chunk spec (parent → worker) --------------------------------------------
+
+fn put_export_address(out: &mut Vec<u8>, address: &ExportAddress) {
+    put_str(out, &address.space);
+    put_u64(out, address.offset);
+}
+
+fn export_address(r: &mut Reader<'_>) -> Option<ExportAddress> {
+    Some(ExportAddress { space: r.string()?, offset: r.u64()? })
+}
+
+fn put_export_inputs(out: &mut Vec<u8>, inputs: &[ExportInputSpec]) {
+    put_u32(out, inputs.len() as u32);
+    for input in inputs {
+        put_export_address(out, &input.storage);
+        out.extend_from_slice(&input.size.to_le_bytes());
+        out.extend_from_slice(&input.source_slot.to_le_bytes());
+        out.push(u8::from(input.unsigned));
+        put_str(out, &input.name);
+    }
+}
+
+fn export_bool(r: &mut Reader<'_>) -> Option<bool> {
+    match r.u8()? {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+fn export_inputs(r: &mut Reader<'_>) -> Option<Vec<ExportInputSpec>> {
+    let n = r.u32()? as usize;
+    let mut inputs = r.sized(n);
+    for _ in 0..n {
+        inputs.push(ExportInputSpec {
+            storage: export_address(r)?,
+            size: i32::from_le_bytes(r.take(4)?.try_into().ok()?),
+            source_slot: i32::from_le_bytes(r.take(4)?.try_into().ok()?),
+            unsigned: export_bool(r)?,
+            name: r.string()?,
+        });
+    }
+    Some(inputs)
+}
+
+/// One invocation record per session, never a shard-derived signature or a
+/// second datatype codec. Canonical source references are rebound at bootstrap.
+pub(super) fn encode_export_spec(spec: &ExportSpec) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(EXPORT_MAGIC);
+    put_u32(&mut out,spec.selected.len() as u32);
+    for address in &spec.selected { put_export_address(&mut out,address); }
+    put_u32(&mut out, spec.functions.len() as u32);
+    for function in &spec.functions {
+        put_export_address(&mut out, &function.entry);
+        put_str(&mut out, &function.name);
+        put_str(&mut out, &function.implementation);
+        out.push(u8::from(function.private));
+        out.push(u8::from(function.wrapper));
+        put_export_inputs(&mut out, &function.inputs);
+    }
+    put_u32(&mut out, spec.calls.len() as u32);
+    for call in &spec.calls {
+        put_export_address(&mut out, &call.key.caller);
+        put_export_address(&mut out, &call.key.point);
+        put_u32(&mut out, call.key.ordinal);
+        match &call.direct {
+            Some(address) => {
+                out.push(1);
+                put_export_address(&mut out, address);
+            }
+            None => out.push(0),
+        }
+        put_u32(&mut out, call.targets.len() as u32);
+        for target in &call.targets {
+            put_export_address(&mut out, target);
+        }
+        put_export_inputs(&mut out, &call.inputs);
+        put_str(&mut out, &call.helper);
+    }
+    put_u32(&mut out, spec.failures.len() as u32);
+    for (address, error) in &spec.failures {
+        put_export_address(&mut out, address);
+        put_str(&mut out, error);
+    }
+    put_u32(&mut out,spec.parameter_edits.len() as u32);
+    for edit in &spec.parameter_edits {
+        put_export_address(&mut out,&edit.entry);
+        put_export_address(&mut out,&edit.storage);
+        put_u32(&mut out,edit.size as u32);
+        put_u32(&mut out,edit.slot as u32);
+        put_str(&mut out,&edit.name);
+        put_str(&mut out,&edit.printed);
+        put_u32(&mut out,edit.directives.len() as u32);
+        for &index in &edit.directives { put_u64(&mut out,index as u64); }
+    }
+    out
+}
+
+fn decode_export_spec(bytes: &[u8]) -> Option<ExportSpec> {
+    let mut r = Reader { bytes, pos: 0 };
+    if r.take(EXPORT_MAGIC.len())? != EXPORT_MAGIC {
+        return None;
+    }
+    let n = r.u32()? as usize;
+    let mut selected = r.sized(n);
+    for _ in 0..n { selected.push(export_address(&mut r)?); }
+    let n = r.u32()? as usize;
+    let mut functions = r.sized(n);
+    for _ in 0..n {
+        functions.push(ExportFunctionSpec {
+            entry: export_address(&mut r)?,
+            name: r.string()?,
+            implementation: r.string()?,
+            private: export_bool(&mut r)?,
+            wrapper: export_bool(&mut r)?,
+            inputs: export_inputs(&mut r)?,
+        });
+    }
+    let n = r.u32()? as usize;
+    let mut calls = r.sized(n);
+    for _ in 0..n {
+        let key = ExportCallKey {
+            caller: export_address(&mut r)?,
+            point: export_address(&mut r)?,
+            ordinal: r.u32()?,
+        };
+        let direct = match r.u8()? {
+            0 => None,
+            1 => Some(export_address(&mut r)?),
+            _ => return None,
+        };
+        let n = r.u32()? as usize;
+        let mut targets = r.sized(n);
+        for _ in 0..n {
+            targets.push(export_address(&mut r)?);
+        }
+        calls.push(ExportCallSpec { key, direct, targets, inputs: export_inputs(&mut r)?, helper: r.string()? });
+    }
+    let n = r.u32()? as usize;
+    let mut failures = r.sized(n);
+    for _ in 0..n {
+        failures.push((export_address(&mut r)?, r.string()?));
+    }
+    let n = r.u32()? as usize;
+    let mut parameter_edits = r.sized(n);
+    for _ in 0..n {
+        let entry = export_address(&mut r)?;
+        let storage = export_address(&mut r)?;
+        let size = r.u32()? as i32;
+        let slot = r.u32()? as i32;
+        let name = r.string()?;
+        let printed = r.string()?;
+        let n = r.u32()? as usize;
+        let mut directives = r.sized(n);
+        for _ in 0..n { directives.push(usize::try_from(r.u64()?).ok()?); }
+        parameter_edits.push(ExportParameterEdit {entry,storage,size,slot,name,printed,directives});
+    }
+    (r.pos == bytes.len()).then_some(ExportSpec { selected,functions, calls, failures,parameter_edits })
+}
+
+pub(crate) fn read_export_spec(path: &std::path::Path) -> Result<ExportSpec, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read export invocation {}: {e}", path.display()))?;
+    decode_export_spec(&bytes)
+        .ok_or_else(|| format!("malformed export invocation {}", path.display()))
+}
 
 pub(super) fn encode_spec(targets: &[TargetSpec]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 * targets.len() + SPEC_MAGIC.len() + 4);
@@ -329,10 +502,15 @@ impl ResultWriter {
         put_u32(&mut body, r.globals.len() as u32);
         for g in &r.globals {
             put_u64(&mut body, g.address);
+            body.extend_from_slice(&g.space_index.to_le_bytes());
             put_str(&mut body, &g.name);
             put_str(&mut body, &g.declaration);
             body.extend_from_slice(&g.size.to_le_bytes());
-            body.push(u8::from(g.unknown) | u8::from(g.direct) << 1 | u8::from(g.aggregate) << 2 | u8::from(g.elem) << 3);
+            body.push(u8::from(g.unknown) | u8::from(g.direct) << 1 | u8::from(g.aggregate) << 2 | u8::from(g.elem) << 3
+                | u8::from(g.source_symbol.is_some()) << 4);
+            if let Some(symbol) = g.source_symbol {
+                put_u64(&mut body, symbol);
+            }
         }
         // (kuna `calltargettype`) The calls through synthesized fields, for the
         // project header the parent writes.
@@ -357,6 +535,13 @@ impl ResultWriter {
             None => body.push(0),
         }
         put_pointerargs(&mut body, r.pointerargs.as_ref());
+        put_u32(&mut body, r.type_bindings.len() as u32);
+        for binding in &r.type_bindings {
+            put_u64(&mut body, binding.id);
+            put_str(&mut body, &binding.name);
+            put_str(&mut body, &binding.presentation);
+            body.extend_from_slice(&binding.size.to_le_bytes());
+        }
         self.frame(FRAME_RESULT, &body)
     }
 
@@ -486,14 +671,18 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
     let mut globals = r.sized(ng);
     for _ in 0..ng {
         let address = r.u64()?;
+        let space_index = r.u32()? as i32;
         let gname = r.string()?;
         let declaration = r.string()?;
         let gsize = r.i64()?;
         let bits = r.u8()?;
+        let source_symbol = if bits & 16 != 0 { Some(r.u64()?) } else { None };
         globals.push(GlobalInfo {
             address,
+            space_index,
             name: gname,
             declaration,
+            source_symbol,
             size: gsize,
             unknown: bits & 1 != 0,
             direct: bits & 2 != 0,
@@ -524,8 +713,19 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
         _ => return None,
     };
     let pointerargs = read_pointerargs(&mut r)?;
+    let nb = r.u32()? as usize;
+    let mut type_bindings = r.sized(nb);
+    for _ in 0..nb {
+        type_bindings.push(ResultTypeBinding {
+            id: r.u64()?,
+            name: r.string()?,
+            presentation: r.string()?,
+            size: r.i64()?,
+        });
+    }
     if r.pos != body.len() { return None; }
     Some(FuncResult {
+        type_bindings,
         name,
         address,
         byte_address,
@@ -617,4 +817,74 @@ fn read_pointerargs(r: &mut Reader<'_>) -> Option<Option<kuna_decomp::kuna_point
         });
     }
     Some(Some(Record { entry, parameters, calls }))
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn invocation_roundtrip_retains_complete_portable_plan() {
+        let caller = ExportAddress { space: "ram".into(), offset: 0x1000 };
+        let target = ExportAddress { space: "overlay".into(), offset: 0x1000 };
+        let input = ExportInputSpec {
+            storage: ExportAddress { space: "register".into(), offset: 8 },
+            size: 4,
+            source_slot: -1,
+            unsigned: true,
+            name: "raw_input".into(),
+        };
+        let spec = ExportSpec {
+            selected:vec![caller.clone(),target.clone()],
+            functions: vec![ExportFunctionSpec {
+                entry: caller.clone(),
+                name: "source_name".into(),
+                implementation: "physical_name".into(),
+                private: true,
+                wrapper: false,
+                inputs: vec![input.clone()],
+            }],
+            calls: vec![
+                ExportCallSpec {
+                    key: ExportCallKey {
+                        caller: caller.clone(),
+                        point: ExportAddress { space: "ram".into(), offset: 0x1010 },
+                        ordinal: 2,
+                    },
+                    direct: Some(target.clone()),
+                    targets: vec![target.clone(), caller.clone()],
+                    inputs: vec![input],
+                    helper: "kuna_call_ram_1000_ram_1010_2".into(),
+                },
+                ExportCallSpec {
+                    key: ExportCallKey {
+                        caller,
+                        point: ExportAddress { space: "ram".into(), offset: 0x1020 },
+                        ordinal: 0,
+                    },
+                    direct: None,
+                    targets: vec![target.clone()],
+                    inputs: Vec::new(),
+                    helper: "kuna_call_ram_1000_ram_1020_0".into(),
+                },
+            ],
+            parameter_edits:vec![ExportParameterEdit {
+                entry:target.clone(),storage:ExportAddress {space:"register".into(),offset:8},
+                size:4,slot:0,name:"observed".into(),printed:"value".into(),directives:vec![0,3],
+            }],
+            failures: vec![(target, "actual per-entry error".into())],
+        };
+        let bytes = encode_export_spec(&spec);
+        let decoded = decode_export_spec(&bytes).unwrap();
+        assert_eq!(encode_export_spec(&decoded), bytes);
+        assert_eq!(decoded.functions[0].inputs[0].source_slot, -1);
+        assert_eq!(decoded.calls[0].targets[0].space, "overlay");
+        assert_eq!(decoded.failures[0].1, "actual per-entry error");
+        for end in 0..bytes.len() {
+            assert!(decode_export_spec(&bytes[..end]).is_none());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_export_spec(&trailing).is_none());
+    }
 }

@@ -68,7 +68,7 @@ fn new_block(fd: &mut Funcdata, off: u64) -> BlockId {
 
 fn input(fd: &mut Funcdata, space: &str, off: u64, size: int4) -> VarnodeId {
     let a = addr(fd, space, off);
-    let vn = fd.new_varnode(size, &a, None);
+    let vn = fd.new_varnode(size, &a, None).unwrap();
     fd.set_input_varnode(vn).unwrap()
 }
 
@@ -497,7 +497,7 @@ fn the_check_is_inert_when_the_option_is_off() {
 
 fn free(fd: &mut Funcdata, space: &str, off: u64, size: int4) -> VarnodeId {
     let a = addr(fd, space, off);
-    fd.new_varnode(size, &a, None)
+    fd.new_varnode(size, &a, None).unwrap()
 }
 
 /// Append `CBRANCH dest, cond` at `at` and return the op.

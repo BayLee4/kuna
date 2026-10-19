@@ -150,25 +150,25 @@ impl Action for ActionIteBoolean {
         }
         Some(Box::new(ActionIteBoolean { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option iteboolean on|off`, carried on the Architecture
         // boundary.  Off => nothing marked => byte-identical output.
         if !data.get_arch().iteboolean {
-            return 0;
+            return Ok(0);
         }
         if data.sblocks_get_size() == 0 {
-            return 0; // not structured
+            return Ok(0); // not structured
         }
         let root = data.sblocks_root();
 
         let mut marks: Vec<OpId> = Vec::new();
         for n in collect_nodes(data, root) {
-            if let Some(m) = match_ite_boolean(data, n) {
+            if let Some(m) = match_ite_boolean(data, n)? {
                 marks.push(m.cbranch);
             }
         }
         if marks.is_empty() {
-            return 0;
+            return Ok(0);
         }
 
         let count = marks.len() as int4;
@@ -183,7 +183,7 @@ impl Action for ActionIteBoolean {
             "iteboolean: re-rolled {count} 0/1 select diamond(s) to a boolean assignment in {name}"
         ));
         self.base_mut().count += count;
-        0
+        Ok(0)
     }
 }
 
@@ -207,14 +207,15 @@ fn collect_nodes(data: &Funcdata, root: BlockId) -> Vec<BlockId> {
 ///
 /// Shared by [`ActionIteBoolean::apply`] (which marks the terminal `CBRANCH`) and
 /// the printer (which re-derives the same match), so the schema is defined once.
-pub fn match_ite_boolean(data: &Funcdata, n: BlockId) -> Option<IteBoolMatch> {
+/// A non-matching shape returns `None`; destination-facing acquisition can fail.
+pub fn match_ite_boolean(data: &Funcdata, n: BlockId) -> KunaResult<Option<IteBoolMatch>> {
     let g = data.sblocks_ref();
     let blk = g.block(n);
     if blk.get_type() != BlockType::If || blk.get_size() != 3 {
-        return None;
+        return Ok(None);
     }
     if blk.get_if_goto_target().is_some() {
-        return None;
+        return Ok(None);
     }
     let cond_block = blk.get_block(0);
     let true_clause = blk.get_block(1);
@@ -238,32 +239,32 @@ pub fn match_ite_boolean(data: &Funcdata, n: BlockId) -> Option<IteBoolMatch> {
     // leading components as ordinary statements.
     let cond_tail = crate::p8_structure::kuna_itecondlist::cond_list_tail(data, cond_block);
     if data.sblocks_ref().block(cond_tail).get_type() != BlockType::Condition {
-        return None;
+        return Ok(None);
     }
-    let cbranch = cond_terminal_cbranch(data, cond_tail, 0)?;
+    let Some(cbranch) = cond_terminal_cbranch(data, cond_tail, 0) else { return Ok(None) };
 
-    let (true_op, dest_true, val_true) = const_bool_arm(data, true_clause)?;
-    let (_else_op, dest_else, val_else) = const_bool_arm(data, else_clause)?;
+    let Some((true_op, dest_true, val_true)) = const_bool_arm(data, true_clause) else { return Ok(None) };
+    let Some((_else_op, dest_else, val_else)) = const_bool_arm(data, else_clause) else { return Ok(None) };
 
     // The two arms must write the SAME variable and DIFFERENT constants, so the
     // assignment has one well-defined destination and the condition's own truth
     // value is exactly what is stored.
     if !same_storage(data, dest_true, dest_else) || val_true == val_else {
-        return None;
+        return Ok(None);
     }
     // A pointer/float/aggregate destination would lose the constant's own rendering
     // (its cast) when the constants are replaced by the boolean expression.
-    if !integral_dest(data, dest_true) {
-        return None;
+    if !integral_dest(data, dest_true)? {
+        return Ok(None);
     }
 
-    Some(IteBoolMatch {
+    Ok(Some(IteBoolMatch {
         cond_block,
         cbranch,
         assign_op: true_op,
         dest: dest_true,
         negate: val_true == 0,
-    })
+    }))
 }
 
 /// The terminal `CBRANCH` of a condition component that is renderable as a pure
@@ -323,14 +324,14 @@ fn const_bool_arm(data: &Funcdata, id: BlockId) -> Option<(OpId, VarnodeId, u64)
 
 /// Does `vn` render as a plain integral scalar — the only destination for which
 /// replacing the constants `0`/`1` with a boolean expression is faithful?
-fn integral_dest(data: &Funcdata, vn: VarnodeId) -> bool {
-    matches!(
-        data.vn_type_def_facing(vn).get_metatype(),
+fn integral_dest(data: &Funcdata, vn: VarnodeId) -> KunaResult<bool> {
+    Ok(matches!(
+        data.vn_type_def_facing(vn)?.get_metatype(),
         type_metatype::TYPE_UNKNOWN
             | type_metatype::TYPE_INT
             | type_metatype::TYPE_UINT
             | type_metatype::TYPE_BOOL
-    )
+    ))
 }
 
 //===========================================================================

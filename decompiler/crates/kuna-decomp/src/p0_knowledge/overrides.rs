@@ -20,6 +20,11 @@
 //! a new command to fix a problem discovered too late and then force a restart
 //! via `Funcdata::setRestartPending()`.
 //!
+//! Typed-call restrictions also use the restart store. Their override bit
+//! prevents repeated prototype forcing; it does not establish authored-site
+//! authority. Keep their exact call occurrence beside the stored prototype,
+//! and discard that provenance when an authored override replaces it.
+//!
 //! ### Dead-code-delay bump (how `heritage.cc` consumes it)
 //!
 //! `Heritage::bumpDeadcodeDelay(spc)` (heritage.cc:2572) is the auto-bump:
@@ -213,6 +218,11 @@ impl FuncProtoOverride for PiecesProtoOverride {
 pub type ProtoDecoder<'a> =
     dyn FnMut(&mut dyn Decoder) -> KunaResult<Box<dyn FuncProtoOverride>> + 'a;
 
+struct ProtoOverrideRecord {
+    prototype: Box<dyn FuncProtoOverride>,
+    inferred_ordinal: Option<u32>,
+}
+
 // ---------------------------------------------------------------------------
 // Override (override.hh:50-92, override.cc:29-433)
 // ---------------------------------------------------------------------------
@@ -236,7 +246,7 @@ pub struct Override {
     /// Override indirect at \b call-point into direct to \b addr.
     indirectover: BTreeMap<Address, Address>,
     /// Override prototype at \b call-point (STUB(W4): boxed `FuncProto`).
-    protoover: BTreeMap<Address, Box<dyn FuncProtoOverride>>,
+    protoover: BTreeMap<Address, ProtoOverrideRecord>,
     /// Addresses of indirect jumps that need multistage recovery.
     multistagejump: Vec<Address>,
     /// Override the CALL <-> BRANCH interpretation of a branch instruction.
@@ -249,6 +259,30 @@ pub struct Override {
 }
 
 impl Override {
+    /// Independent working override state; source prototypes are never mutated.
+    pub fn working_copy(&self, types: &crate::dtype::TypeFactoryImpl) -> KunaResult<Self> {
+        let mut result = Self::new();
+        result.forcegoto = self.forcegoto.clone();
+        result.deadcodedelay = self.deadcodedelay.clone();
+        result.indirectover = self.indirectover.clone();
+        result.multistagejump = self.multistagejump.clone();
+        result.flowoverride = self.flowoverride.clone();
+        result.msvc_cookie_calls = self.msvc_cookie_calls.clone();
+        for (address, source) in &self.protoover {
+            let mut prototype: Box<dyn FuncProtoOverride> = if let Some(proto) = source.prototype.prototype() {
+                Box::new(types.acquire_working_proto(proto)?)
+            } else if let Some(pieces) = source.prototype.pieces() {
+                Box::new(PiecesProtoOverride { pieces: pieces.clone() })
+            } else {
+                return Err(KunaError::lowlevel("Override has no concrete prototype"));
+            };
+            prototype.set_override(true);
+            result.protoover.insert(address.clone(), ProtoOverrideRecord {
+                prototype, inferred_ordinal: source.inferred_ordinal,
+            });
+        }
+        Ok(result)
+    }
     /// Construct the empty override store (C++ default constructor).
     pub fn new() -> Override {
         Override::default()
@@ -335,7 +369,34 @@ impl Override {
     /// preserving the merge rule "newest override at a call point wins".
     pub fn insert_proto_override(&mut self, callpoint: Address, mut p: Box<dyn FuncProtoOverride>) {
         p.set_override(true); // Mark this as an override
-        self.protoover.insert(callpoint, p); // Takes ownership; drops any prior value
+        self.protoover.insert(callpoint, ProtoOverrideRecord {
+            prototype: p, inferred_ordinal: None,
+        }); // Takes ownership; drops any prior value and its inferred provenance
+    }
+
+    /// Retain an automatically recovered typed-call prototype across restart.
+    /// Keep the lifecycle override bit without granting authored-site authority.
+    pub fn insert_inferred_proto_override(&mut self, callpoint: Address, ordinal: u32, mut p: Box<dyn FuncProtoOverride>) {
+        p.set_override(true);
+        self.protoover.insert(callpoint, ProtoOverrideRecord {
+            prototype: p, inferred_ordinal: Some(ordinal),
+        });
+    }
+
+    /// Was this exact occurrence at the full call-point address inferred?
+    pub fn is_inferred_proto_override(&self, callpoint: &Address, ordinal: u32) -> bool {
+        self.protoover.get(callpoint).is_some_and(|record| record.inferred_ordinal == Some(ordinal))
+    }
+
+    /// Does this call point have an authored override, rather than a recovered
+    /// prototype retained solely to survive an analysis restart?
+    pub fn is_authored_proto_override(&self, callpoint: &Address) -> bool {
+        self.protoover.get(callpoint).is_some_and(|record| record.inferred_ordinal.is_none())
+    }
+
+    /// Does this function supply any authored call-site prototype?
+    pub fn has_authored_proto_overrides(&self) -> bool {
+        self.protoover.values().any(|record| record.inferred_ordinal.is_none())
     }
 
     /// Flag an indirect jump for multistage analysis
@@ -383,7 +444,7 @@ impl Override {
         if self.protoover.is_empty() {
             return None;
         }
-        self.protoover.get(callpoint).map(|b| b.as_ref())
+        self.protoover.get(callpoint).map(|record| record.prototype.as_ref())
     }
 
     /// Look up a destination override for an indirect call (C++
@@ -489,7 +550,7 @@ impl Override {
             let mut a = String::new();
             callpoint.print_raw(&mut a).expect("printRaw: proto callpoint");
             s.push_str(&format!("override prototype at {a} to "));
-            proto.print_raw(s);
+            proto.prototype.print_raw(s);
             s.push('\n');
         }
     }
@@ -556,7 +617,7 @@ impl Override {
         for (callpoint, proto) in &self.protoover {
             encoder.open_element(&ELEM_PROTOOVERRIDE);
             callpoint.encode(encoder)?;
-            proto.encode(encoder)?;
+            proto.prototype.encode(encoder)?;
             encoder.close_element(&ELEM_PROTOOVERRIDE);
         }
 

@@ -60,7 +60,7 @@ fn output(
 }
 
 fn partial(data: &mut Funcdata, addr: &Address) -> VarnodeId {
-    let old = data.new_varnode(8, addr, None);
+    let old = data.new_varnode(8, addr, None).unwrap();
     let old = data.set_input_varnode(old).unwrap();
     let offset = data.new_constant(4, 4);
     let high = output(
@@ -117,7 +117,7 @@ fn complete_doubles_and_mixed_exit_widths_do_not_narrow() {
         &addr,
     );
     assert!(partial_return(&data, merged, &addr, &mut 64));
-    let input = data.new_varnode(4, &addr, None);
+    let input = data.new_varnode(4, &addr, None).unwrap();
     let double = output(
         &mut data,
         OpCode::CPUI_FLOAT_FLOAT2FLOAT,
@@ -151,7 +151,7 @@ fn constants_loads_and_inputs_do_not_need_float_evidence() {
     let piece = data.vbank().get(opaque).unwrap().get_def().unwrap();
     let constant = data.new_constant(4, 0x3f800000);
     let input_addr = Address::new(addr.get_space().unwrap().clone(), addr.get_offset() + 8);
-    let input = data.new_varnode(4, &input_addr, None);
+    let input = data.new_varnode(4, &input_addr, None).unwrap();
     let input = data.set_input_varnode(input).unwrap();
     let copy = output(&mut data, OpCode::CPUI_COPY, &[input], 4, &addr);
     let space = data.new_constant(4, 2);
@@ -271,7 +271,7 @@ fn predicated_writes_can_carry_the_older_double_through_a_join() {
 #[test]
 fn a_double_input_read_only_in_halves_holds_two_floats() {
     let (mut data, addr) = function();
-    let whole = data.new_varnode(8, &addr, None);
+    let whole = data.new_varnode(8, &addr, None).unwrap();
     let whole = data.set_input_varnode(whole).unwrap();
     let zero = data.new_constant(4, 0);
     output(&mut data, OpCode::CPUI_SUBPIECE, &[whole, zero], 4, &addr);

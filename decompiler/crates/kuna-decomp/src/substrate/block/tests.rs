@@ -481,6 +481,156 @@ fn encode_decode_graph_roundtrip() {
     assert_edges_consistent(&g2, top2);
 }
 
+/// Read the canonical output grammar, including structured types that the
+/// native input factory does not construct (the consumer is Java BlockGraph).
+#[derive(Debug)]
+struct StructuredBlock {
+    kind: String,
+    index: i64,
+    original: Option<i64>,
+    children: Vec<StructuredBlock>,
+    targets: Vec<(i64, i64, Option<u64>)>,
+    edges: Vec<(i64, i64)>,
+}
+
+fn read_structured_block(decoder: &mut dyn Decoder, kind: String) -> StructuredBlock {
+    let element = decoder.open_element_id(&ELEM_BLOCK).unwrap();
+    let index = decoder.read_signed_integer_id(&ATTRIB_INDEX).unwrap();
+    let original = (kind == "copy")
+        .then(|| decoder.read_signed_integer_id(&ATTRIB_ALTINDEX).unwrap());
+    let mut headers = Vec::new();
+    while decoder.peek_element().unwrap() == ELEM_BHEAD.get_id() {
+        let header = decoder.open_element_id(&ELEM_BHEAD).unwrap();
+        let child_index = decoder.read_signed_integer_id(&ATTRIB_INDEX).unwrap();
+        let child_kind = String::from_utf8(decoder.read_string_id(&ATTRIB_TYPE).unwrap()).unwrap();
+        headers.push((child_index, child_kind));
+        decoder.close_element(header).unwrap();
+    }
+    let children = headers.into_iter().map(|(child_index, child_kind)| {
+        let child = read_structured_block(decoder, child_kind);
+        assert_eq!(child.index, child_index, "bhead and body indexes must agree");
+        child
+    }).collect();
+    let mut targets = Vec::new();
+    while decoder.peek_element().unwrap() == ELEM_TARGET.get_id() {
+        let target = decoder.open_element_id(&ELEM_TARGET).unwrap();
+        let target_index = decoder.read_signed_integer_id(&ATTRIB_INDEX).unwrap();
+        let depth = decoder.read_signed_integer_id(&ATTRIB_DEPTH).unwrap();
+        let branch_type = (kind != "multigoto")
+            .then(|| decoder.read_unsigned_integer_id(&ATTRIB_TYPE).unwrap());
+        targets.push((target_index, depth, branch_type));
+        decoder.close_element(target).unwrap();
+    }
+    let mut edges = Vec::new();
+    while decoder.peek_element().unwrap() == ELEM_EDGE.get_id() {
+        let edge = decoder.open_element_id(&ELEM_EDGE).unwrap();
+        edges.push((
+            decoder.read_signed_integer_id(&ATTRIB_END).unwrap(),
+            decoder.read_signed_integer_id(&ATTRIB_REV).unwrap(),
+        ));
+        decoder.close_element(edge).unwrap();
+    }
+    decoder.close_element(element).unwrap();
+    StructuredBlock { kind, index, original, children, targets, edges }
+}
+
+fn structure_packed_graph(g: &BlockGraph, root: BlockId) -> StructuredBlock {
+    let manager = build_manager();
+    let mut input = Vec::new();
+    g.encode(root, &mut PackedEncode::new(&mut input));
+    let mut decoder = PackedDecode::new(&manager);
+    decoder.ingest_stream(&input).unwrap();
+    let mut output = Vec::new();
+    crate::blockaction::structure_graph(&mut decoder, &mut PackedEncode::new(&mut output)).unwrap();
+    let mut decoder = PackedDecode::new(&manager);
+    decoder.ingest_stream(&output).unwrap();
+    let result = read_structured_block(&mut decoder, "graph".into());
+    assert_eq!(decoder.peek_element().unwrap(), 0);
+    result
+}
+
+#[test]
+fn canonical_structure_graph_preserves_diamond_copy_identity_and_polarity() {
+    let (mut graph, root, blocks) = build_graph(4);
+    for (index, &block) in blocks.iter().enumerate() {
+        graph.block_mut(block).set_index(index as int4);
+    }
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        graph.add_edge(blocks[from], blocks[to]);
+    }
+    let result = structure_packed_graph(&graph, root);
+    assert_eq!(result.children.len(), 1);
+    let sequence = &result.children[0];
+    assert_eq!(sequence.kind, "list");
+    assert_eq!(sequence.children.len(), 2);
+    let conditional = &sequence.children[0];
+    let join = &sequence.children[1];
+    assert_eq!(conditional.kind, "ifelse");
+    assert_eq!(join.original, Some(3));
+    assert_eq!(conditional.children.len(), 3);
+    assert_eq!(conditional.children[0].original, Some(0));
+    assert_eq!(conditional.children[1].original, Some(2), "true branch");
+    assert_eq!(conditional.children[2].original, Some(1), "false branch");
+    assert_eq!(join.edges, vec![(conditional.index, 0)], "collapsed join edge");
+}
+
+#[test]
+fn canonical_structure_graph_accepts_graph_only_switch_without_jump_table() {
+    let (mut graph, root, blocks) = build_graph(4);
+    for (index, &block) in blocks.iter().enumerate() {
+        graph.block_mut(block).set_index(index as int4);
+    }
+    for target in 1..4 {
+        graph.add_edge(blocks[0], blocks[target]);
+    }
+    let result = structure_packed_graph(&graph, root);
+    assert_eq!(result.children.len(), 1);
+    let switch = &result.children[0];
+    assert_eq!(switch.kind, "switch");
+    assert_eq!(switch.children[0].original, Some(0));
+    let mut cases: Vec<_> = switch.children[1..].iter().map(|case| case.original.unwrap()).collect();
+    cases.sort_unstable();
+    assert_eq!(cases, vec![1, 2, 3]);
+    for case in &switch.children[1..] {
+        assert_eq!(case.edges.len(), 1);
+        assert_eq!(case.edges[0].0, switch.children[0].index);
+    }
+    assert_eq!(
+        switch.children[1..].iter().map(|case| case.edges[0].1).collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "switch output edge order is the input order",
+    );
+}
+
+#[test]
+fn canonical_multigoto_codec_preserves_multiple_targets_and_nonzero_depth() {
+    let (mut graph, input, blocks) = build_graph(4);
+    for (index, &block) in blocks.iter().enumerate() {
+        graph.block_mut(block).set_index(index as int4);
+    }
+    graph.add_edge(blocks[0], blocks[1]);
+    graph.add_edge(blocks[0], blocks[3]);
+    graph.add_edge(blocks[1], blocks[2]);
+    let output = graph.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    graph.build_copy(output, input);
+    let copies = graph.block(output).get_list().to_vec();
+    graph.new_block_list(output, &[copies[1], copies[2]]).unwrap();
+    let goto = graph.new_block_multi_goto(output, copies[0], 0);
+    graph.new_block_multi_goto(output, goto, 0);
+
+    let manager = build_manager();
+    let mut encoded = Vec::new();
+    graph.encode(output, &mut PackedEncode::new(&mut encoded));
+    let mut decoder = PackedDecode::new(&manager);
+    decoder.ingest_stream(&encoded).unwrap();
+    let result = read_structured_block(&mut decoder, "graph".into());
+    let goto = result.children.iter().find(|block| block.kind == "multigoto").unwrap();
+    assert_eq!(goto.targets, vec![(1, 1, None), (3, 0, None)]);
+    assert_eq!(goto.children.len(), 1);
+    assert_eq!(goto.children[0].original, Some(0));
+    assert_eq!(result.children.iter().filter(|block| block.kind == "list").count(), 1);
+}
+
 #[test]
 fn block_edge_encode_decode_roundtrip() {
     let m = build_manager();
@@ -764,7 +914,7 @@ fn switch_case_goto_is_a_label_reference() {
             case_order(target, block_flags::f_goto_goto),
             case_order(structured, 0),
         ],
-        jt_index: 0,
+        jt_index: Some(0),
     }));
     g.add_block(root, sw);
 

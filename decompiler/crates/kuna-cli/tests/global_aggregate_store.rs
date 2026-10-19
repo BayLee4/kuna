@@ -73,15 +73,12 @@ fn check_record(members: &str, fields: &[&str]) {
         enabled["functions"][0]["code"]
     );
     let legacy = disabled["functions"][0]["code"].as_str().unwrap();
-    assert!(
-        legacy.contains("cache_") || legacy.contains("cache = v"),
-        "{legacy}"
-    );
     let body = document["functions"][0]["code"].as_str().unwrap();
+    let source = common::scratch_file("global-aggregate-store", "c");
+    for body in [legacy, body] {
     for member in fields {
         assert!(body.contains(&format!("cache.{member} =")), "{body}");
     }
-    let source = common::scratch_file("global-aggregate-store", "c");
     std::fs::write(&source, format!(r#"
 #include <stdint.h>
 #include <string.h>
@@ -135,6 +132,7 @@ int main(void) {{
             );
             let _ = std::fs::remove_file(exe);
         }
+    }
     }
     let _ = std::fs::remove_file(source);
     let _ = std::fs::remove_file(path);

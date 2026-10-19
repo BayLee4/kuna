@@ -102,21 +102,6 @@ fn instruction_end(addr: &Address, step: i32) -> Option<u64> {
     (end - 1 <= addr.get_space()?.get_highest()).then_some(end)
 }
 
-/// Refresh stale mapping warnings after replacement flow succeeds.
-pub(crate) fn clear_stale_warnings(db: &mut crate::architecture::CommentDatabase, entry: &Address) {
-    use crate::architecture::comment_type;
-    db.retain_comments(|comment| {
-        if &comment.func_addr != entry {
-            return true;
-        }
-        !((comment.tp == comment_type::warningheader
-            && comment.text == "WARNING: Function flows into unmapped memory")
-            || (comment.tp == comment_type::warning
-                && comment
-                    .text
-                    .starts_with("WARNING: Function flow reaches unmapped memory:")))
-    });
-}
 
 #[cfg(test)]
 mod tests {

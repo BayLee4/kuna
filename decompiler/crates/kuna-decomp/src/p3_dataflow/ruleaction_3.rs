@@ -154,24 +154,24 @@ impl Rule for RuleBooleanDedup {
         Some(Box::new(RuleBooleanDedup))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn0 = op_in(data, op, 0).expect("RuleBooleanDedup: null in0");
         if !vn_is_written(data, vn0) {
-            return 0;
+            return Ok(0);
         }
         let vn1 = op_in(data, op, 1).expect("RuleBooleanDedup: null in1");
         if !vn_is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let op0 = vn_def(data, vn0).expect("RuleBooleanDedup: vn0 written but no def");
         let opc0 = op_code(data, op0);
         if opc0 != OpCode::CPUI_BOOL_AND && opc0 != OpCode::CPUI_BOOL_OR {
-            return 0;
+            return Ok(0);
         }
         let op1 = vn_def(data, vn1).expect("RuleBooleanDedup: vn1 written but no def");
         let opc1 = op_code(data, op1);
         if opc1 != OpCode::CPUI_BOOL_AND && opc1 != OpCode::CPUI_BOOL_OR {
-            return 0;
+            return Ok(0);
         }
         let ins = [
             op_in(data, op0, 0).expect("RuleBooleanDedup: op0 in0"),
@@ -184,7 +184,7 @@ impl Rule for RuleBooleanDedup {
             || vn_is_free(data, ins[2])
             || vn_is_free(data, ins[3])
         {
-            return 0;
+            return Ok(0);
         }
         // `isMatch(left,right,isFlip)` == BooleanMatch::evaluate(left,right,1):
         //   same        => isFlip=false, true
@@ -212,7 +212,7 @@ impl Rule for RuleBooleanDedup {
         } else if let Some(f) = is_match(data, ins[1], ins[3]) {
             (f, ins[1], ins[3], ins[0], ins[2])
         } else {
-            return 0;
+            return Ok(0);
         };
         let central_opc = op_code(data, op);
         let bc_opc: OpCode;
@@ -228,7 +228,7 @@ impl Rule for RuleBooleanDedup {
                 data.op_remove_input(op, 1);
                 let zero = data.new_constant(1, 0);
                 data.op_set_input(op, zero, 0).expect("RuleBooleanDedup: opSetInput");
-                return 1;
+                return Ok(1);
             }
             if central_opc == OpCode::CPUI_BOOL_OR
                 && opc0 == OpCode::CPUI_BOOL_OR
@@ -239,7 +239,7 @@ impl Rule for RuleBooleanDedup {
                 data.op_remove_input(op, 1);
                 let one = data.new_constant(1, 1);
                 data.op_set_input(op, one, 0).expect("RuleBooleanDedup: opSetInput");
-                return 1;
+                return Ok(1);
             }
             if central_opc == OpCode::CPUI_BOOL_OR && opc0 != opc1 {
                 // (A || B) || (!A && C)
@@ -247,7 +247,7 @@ impl Rule for RuleBooleanDedup {
                 final_opc = OpCode::CPUI_BOOL_OR;
                 bc_opc = OpCode::CPUI_BOOL_OR;
             } else {
-                return 0;
+                return Ok(0);
             }
         } else if central_opc == opc0 && central_opc == opc1 {
             // (A && B) && (A && C)    or   (A || B) || (A || C)
@@ -260,7 +260,7 @@ impl Rule for RuleBooleanDedup {
             final_opc = opc0;
             bc_opc = central_opc;
         } else {
-            return 0;
+            return Ok(0);
         }
         let opaddr = data.obank().get(op).expect("RuleBooleanDedup: stale op").get_addr().clone();
         let bc_op = data.new_op(2, opaddr);
@@ -272,7 +272,7 @@ impl Rule for RuleBooleanDedup {
         set_opcode(data, op, final_opc);
         data.op_set_input(op, final_a, 0).expect("RuleBooleanDedup: opSetInput");
         data.op_set_input(op, tmp, 1).expect("RuleBooleanDedup: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -299,16 +299,16 @@ impl Rule for RuleBooleanNegate {
         Some(Box::new(RuleBooleanNegate))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = op_code(data, op);
         let constvn = op_in(data, op, 1).expect("RuleBooleanNegate: null in1");
         let subbool = op_in(data, op, 0).expect("RuleBooleanNegate: null in0");
         if !vn_is_constant(data, constvn) {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, constvn);
         if (val != 0) && (val != 1) {
-            return 0;
+            return Ok(0);
         }
         let mut negate = opc == OpCode::CPUI_INT_NOTEQUAL;
         if val == 0 {
@@ -316,7 +316,7 @@ impl Rule for RuleBooleanNegate {
         }
 
         if !vn_is_boolean_value(data, subbool, data.is_type_recovery_on()) {
-            return 0;
+            return Ok(0);
         }
 
         data.op_remove_input(op, 1); // Remove second parameter
@@ -326,7 +326,7 @@ impl Rule for RuleBooleanNegate {
         } else {
             set_opcode(data, op, OpCode::CPUI_COPY);
         }
-        1
+        Ok(1)
     }
 }
 
@@ -352,27 +352,27 @@ impl Rule for RuleBoolZext {
         Some(Box::new(RuleBoolZext))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let bool_vn1 = op_in(data, op, 0).expect("RuleBoolZext: null in0");
         if !vn_is_boolean_value(data, bool_vn1, data.is_type_recovery_on()) {
-            return 0;
+            return Ok(0);
         }
 
         let out0 = op_out(data, op).expect("RuleBoolZext: ZEXT has no output");
         let multop1 = match data.lone_descend(out0) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         if op_code(data, multop1) != OpCode::CPUI_INT_MULT {
-            return 0;
+            return Ok(0);
         }
         let m1in1 = op_in(data, multop1, 1).expect("RuleBoolZext: multop1 in1");
         if !vn_is_constant(data, m1in1) {
-            return 0;
+            return Ok(0);
         }
         let mut coeff = vn_offset(data, m1in1);
         if coeff != calc_mask(vn_size(data, m1in1)) {
-            return 0;
+            return Ok(0);
         }
         let m1out = op_out(data, multop1).expect("RuleBoolZext: multop1 has no output");
         let size = vn_size(data, m1out);
@@ -380,13 +380,13 @@ impl Rule for RuleBoolZext {
         // If we reached here, we are Multiplying extended boolean by -1
         let actionop = match data.lone_descend(m1out) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
-        match op_code(data, actionop) {
+        Ok(match op_code(data, actionop) {
             OpCode::CPUI_INT_ADD => {
                 let aoin1 = op_in(data, actionop, 1).expect("RuleBoolZext: actionop in1");
                 if !vn_is_constant(data, aoin1) {
-                    return 0;
+                    return Ok(0);
                 }
                 if vn_offset(data, aoin1) == 1 {
                     let opaddr = data.obank().get(op).expect("RuleBoolZext: stale op").get_addr().clone();
@@ -400,7 +400,7 @@ impl Rule for RuleBoolZext {
                     set_opcode(data, actionop, OpCode::CPUI_COPY);
                     let opout = op_out(data, op).expect("RuleBoolZext: op out");
                     data.op_set_input(actionop, opout, 0).expect("RuleBoolZext: opSetInput"); // propagate past the INT_MULT operator
-                    return 1;
+                    return Ok(1);
                 }
                 0
             }
@@ -409,7 +409,7 @@ impl Rule for RuleBoolZext {
                 let mut val = if vn_is_constant(data, aoin1) {
                     vn_offset(data, aoin1)
                 } else {
-                    return 0;
+                    return Ok(0);
                 };
 
                 // Change comparison of extended boolean to 0 or -1
@@ -417,7 +417,7 @@ impl Rule for RuleBoolZext {
                 if val == coeff {
                     val = 1;
                 } else if val != 0 {
-                    return 0; // Not comparing with 0 or -1
+                    return Ok(0); // Not comparing with 0 or -1
                 }
 
                 data.op_set_input(actionop, bool_vn1, 0).expect("RuleBoolZext: opSetInput");
@@ -444,30 +444,30 @@ impl Rule for RuleBoolZext {
                 };
                 let multop2 = match multop2 {
                     Some(o) => o,
-                    None => return 0,
+                    None => return Ok(0),
                 };
                 if op_code(data, multop2) != OpCode::CPUI_INT_MULT {
-                    return 0;
+                    return Ok(0);
                 }
                 let m2in1 = op_in(data, multop2, 1).expect("RuleBoolZext: multop2 in1");
                 if !vn_is_constant(data, m2in1) {
-                    return 0;
+                    return Ok(0);
                 }
                 coeff = vn_offset(data, m2in1);
                 if coeff != calc_mask(size) {
-                    return 0;
+                    return Ok(0);
                 }
                 let m2in0 = op_in(data, multop2, 0).expect("RuleBoolZext: multop2 in0");
                 let zextop2 = match vn_def(data, m2in0) {
                     Some(o) => o,
-                    None => return 0,
+                    None => return Ok(0),
                 };
                 if op_code(data, zextop2) != OpCode::CPUI_INT_ZEXT {
-                    return 0;
+                    return Ok(0);
                 }
                 let bool_vn2 = op_in(data, zextop2, 0).expect("RuleBoolZext: zextop2 in0");
                 if !vn_is_boolean_value(data, bool_vn2, data.is_type_recovery_on()) {
-                    return 0;
+                    return Ok(0);
                 }
 
                 // Do the boolean calculation on unextended boolean values
@@ -494,7 +494,7 @@ impl Rule for RuleBoolZext {
                 1
             }
             _ => 0,
-        }
+        })
     }
 }
 
@@ -521,27 +521,27 @@ impl Rule for RuleLogic2Bool {
         Some(Box::new(RuleLogic2Bool))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let bool_vn = op_in(data, op, 0).expect("RuleLogic2Bool: null in0");
         if !vn_is_boolean_value(data, bool_vn, data.is_type_recovery_on()) {
-            return 0;
+            return Ok(0);
         }
         let in1 = op_in(data, op, 1).expect("RuleLogic2Bool: null in1");
         if vn_is_constant(data, in1) {
             if vn_offset(data, in1) > 1u64 {
                 // If one side is a constant 0 or 1, this is boolean
-                return 0;
+                return Ok(0);
             }
         } else if !vn_is_boolean_value(data, in1, data.is_type_recovery_on()) {
-            return 0;
+            return Ok(0);
         }
         match op_code(data, op) {
             OpCode::CPUI_INT_AND => set_opcode(data, op, OpCode::CPUI_BOOL_AND),
             OpCode::CPUI_INT_OR => set_opcode(data, op, OpCode::CPUI_BOOL_OR),
             OpCode::CPUI_INT_XOR => set_opcode(data, op, OpCode::CPUI_BOOL_XOR),
-            _ => return 0,
+            _ => return Ok(0),
         }
-        1
+        Ok(1)
     }
 }
 
@@ -567,16 +567,16 @@ impl Rule for RuleIndirectCollapse {
         Some(Box::new(RuleIndirectCollapse))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = op_in(data, op, 1).expect("RuleIndirectCollapse: null in1");
         if data.vbank().get(in1).expect("RuleIndirectCollapse: stale in1").get_space().get_type()
             != spacetype::IPTR_IOP
         {
-            return 0;
+            return Ok(0);
         }
         let indop = match op_from_iop_const(data, in1) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
 
         // Is the indirect effect gone?
@@ -600,7 +600,7 @@ impl Rule for RuleIndirectCollapse {
                         data.op_remove_input(op, 1);
                         set_opcode(data, op, OpCode::CPUI_COPY);
                         data.op_insert_after(op, indop);
-                        return 1;
+                        return Ok(1);
                     }
                     let contains0 = {
                         let v1 = data.vbank().get(vn1).expect("RuleIndirectCollapse: stale vn1");
@@ -625,12 +625,12 @@ impl Rule for RuleIndirectCollapse {
                         data.op_set_input(op, tc, 1).expect("RuleIndirectCollapse: opSetInput");
                         set_opcode(data, op, OpCode::CPUI_SUBPIECE);
                         data.op_insert_after(op, indop);
-                        return 1;
+                        return Ok(1);
                     }
                     // STUB(W4): data.warning("Ignoring partial resolution of indirect", indop->getAddr())
                     // The comment database is the W4 console boundary; the message is
                     // dropped here.  The C++ then returns 0 (partial overlap).
-                    return 0; // Partial overlap, not sure what to do
+                    return Ok(0); // Partial overlap, not sure what to do
                 }
             } else if data
                 .vbank()
@@ -640,7 +640,7 @@ impl Rule for RuleIndirectCollapse {
             {
                 let o = data.obank().get(op).expect("RuleIndirectCollapse: stale op");
                 if o.is_indirect_creation() || o.no_indirect_collapse() {
-                    return 0;
+                    return Ok(0);
                 }
             } else if data.obank().get(indop).expect("RuleIndirectCollapse: stale indop").uses_spacebase_ptr()
             {
@@ -651,18 +651,18 @@ impl Rule for RuleIndirectCollapse {
                     // 0) when the STORE is guarded for op's address OR when there
                     // is no guard yet; with the hook unported the conservative
                     // outcome is identical (keep the INDIRECT).  Recorded as a loss.
-                    return 0;
+                    return Ok(0);
                 }
             } else {
-                return 0;
+                return Ok(0);
             }
         }
 
         let out = op_out(data, op).expect("RuleIndirectCollapse: op out");
         let in0 = op_in(data, op, 0).expect("RuleIndirectCollapse: op in0");
-        data.total_replace(out, in0).expect("RuleIndirectCollapse: totalReplace");
-        data.op_destroy(op); // Get rid of the INDIRECT
-        1
+        data.total_replace(out, in0)?;
+        data.op_destroy(op)?; // Get rid of the INDIRECT
+        Ok(1)
     }
 }
 
@@ -709,7 +709,7 @@ impl Rule for RuleMultiCollapse {
         Some(Box::new(RuleMultiCollapse))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // Verbatim port of C++ `RuleMultiCollapse::applyOp` (ruleaction.cc:3253).
         // Collapses a MULTIEQUAL whose inputs are all absolutely or functionally
         // equal (the latter via cseFindInBlock).  This is the keystone for
@@ -721,7 +721,7 @@ impl Rule for RuleMultiCollapse {
         for i in 0..numinput {
             let vi = op_in(data, op, i).expect("RuleMultiCollapse: null input");
             if !vn_is_heritage_known(data, vi) {
-                return 0; // Everything must be heritaged before collapse
+                return Ok(0); // Everything must be heritaged before collapse
             }
         }
 
@@ -836,8 +836,8 @@ impl Rule for RuleMultiCollapse {
                     if let Some(substitute) = substitute {
                         // Already copied: use the copy's output as substitute.
                         let subout = op_out(data, substitute).expect("substitute has no output");
-                        data.total_replace(copyr, subout).expect("RuleMultiCollapse: totalReplace");
-                        data.op_destroy(cur_op);
+                        data.total_replace(copyr, subout)?;
+                        data.op_destroy(cur_op)?;
                     } else {
                         // Otherwise, rewrite cur_op into a copy of newop.
                         let needsreinsert = op_code(data, cur_op) == OpCode::CPUI_MULTIEQUAL;
@@ -865,18 +865,18 @@ impl Rule for RuleMultiCollapse {
                 } else {
                     // We have absolute equality: replace all refs to copyr with
                     // defcopyr and destroy the MULTIEQUAL.
-                    data.total_replace(copyr, defcopyr).expect("RuleMultiCollapse: totalReplace");
-                    data.op_destroy(cur_op);
+                    data.total_replace(copyr, defcopyr)?;
+                    data.op_destroy(cur_op)?;
                 }
             }
-            return 1;
+            return Ok(1);
         }
 
         // Failure: clear out any marks we put down.
         for v in skiplist.iter().copied() {
             vn_clear_mark(data, v);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -902,7 +902,7 @@ impl Rule for RuleSborrow {
         Some(Box::new(RuleSborrow))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (svn/avn are dereferenced only in the descend loop below, so read them
         // after the trivial-case early-out — the C++ never touches getOut() on
         // the trivial path either.)
@@ -913,7 +913,7 @@ impl Rule for RuleSborrow {
             let z = data.new_constant(1, 0);
             data.op_set_input(op, z, 0).expect("RuleSborrow: opSetInput");
             data.op_remove_input(op, 1);
-            return 1;
+            return Ok(1);
         }
         let svn = op_out(data, op).expect("RuleSborrow: null out");
         let avn = op_in(data, op, 0).expect("RuleSborrow: null in0");
@@ -971,9 +971,9 @@ impl Rule for RuleSborrow {
                 data.op_set_input(compop, avn, zside).expect("RuleSborrow: opSetInput");
                 data.op_set_input(compop, bvn, 1 - zside).expect("RuleSborrow: opSetInput");
             }
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -999,7 +999,7 @@ impl Rule for RuleScarry {
         Some(Box::new(RuleScarry))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         // (svn is dereferenced only in the descend loop below, so read it after
         // the trivial-case early-out — the C++ never touches getOut() there.)
         let mut avn = op_in(data, op, 0).expect("RuleScarry: null in0");
@@ -1013,13 +1013,13 @@ impl Rule for RuleScarry {
             let z = data.new_constant(1, 0);
             data.op_set_input(op, z, 0).expect("RuleScarry: opSetInput");
             data.op_remove_input(op, 1);
-            return 1;
+            return Ok(1);
         }
         let svn = op_out(data, op).expect("RuleScarry: null out");
         // One side must be constant.
         if !vn_is_constant(data, bvn) {
             if !vn_is_constant(data, avn) {
-                return 0;
+                return Ok(0);
             }
             // Swap so bvn is the constant.
             avn = bvn;
@@ -1027,7 +1027,7 @@ impl Rule for RuleScarry {
             let mask = calc_mask(vn_size(data, bvn));
             let val = mask ^ (mask >> 1);
             if val == vn_offset(data, bvn) {
-                return 0; // Rule does not work if bvn is the integer minimum
+                return Ok(0); // Rule does not work if bvn is the integer minimum
             }
         }
         let descend: Vec<OpId> = data
@@ -1087,9 +1087,9 @@ impl Rule for RuleScarry {
                 data.op_set_input(compop, avn, zside).expect("RuleScarry: opSetInput");
                 data.op_set_input(compop, new_const, 1 - zside).expect("RuleScarry: opSetInput");
             }
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1115,26 +1115,26 @@ impl Rule for RuleTrivialShift {
         Some(Box::new(RuleTrivialShift))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let constvn = op_in(data, op, 1).expect("RuleTrivialShift: null in1");
         if !vn_is_constant(data, constvn) {
-            return 0; // Must shift by a constant
+            return Ok(0); // Must shift by a constant
         }
         let val = vn_offset(data, constvn);
         if val != 0 {
             let in0 = op_in(data, op, 0).expect("RuleTrivialShift: null in0");
             if val < (8 * vn_size(data, in0)) as uintb {
-                return 0;
+                return Ok(0);
             }
             if op_code(data, op) == OpCode::CPUI_INT_SRIGHT {
-                return 0; // Cant predict signbit
+                return Ok(0); // Cant predict signbit
             }
             let replace = data.new_constant(vn_size(data, in0), 0);
             data.op_set_input(op, replace, 0).expect("RuleTrivialShift: opSetInput");
         }
         data.op_remove_input(op, 1);
         set_opcode(data, op, OpCode::CPUI_COPY);
-        1
+        Ok(1)
     }
 }
 
@@ -1160,18 +1160,18 @@ impl Rule for RuleSignShift {
         Some(Box::new(RuleSignShift))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = op_in(data, op, 1).expect("RuleSignShift: null in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, const_vn);
         let in_vn = op_in(data, op, 0).expect("RuleSignShift: null in0");
         if val != (8 * vn_size(data, in_vn) - 1) as uintb {
-            return 0;
+            return Ok(0);
         }
         if vn_is_free(data, in_vn) {
-            return 0;
+            return Ok(0);
         }
 
         let mut do_conversion = false;
@@ -1196,7 +1196,7 @@ impl Rule for RuleSignShift {
             }
         }
         if !do_conversion {
-            return 0;
+            return Ok(0);
         }
         let opaddr = data.obank().get(op).expect("RuleSignShift: stale op").get_addr().clone();
         let shift_op = data.new_op(2, opaddr);
@@ -1209,7 +1209,7 @@ impl Rule for RuleSignShift {
         data.op_set_input(shift_op, in_vn, 0).expect("RuleSignShift: opSetInput");
         data.op_set_input(shift_op, const_vn, 1).expect("RuleSignShift: opSetInput");
         data.op_insert_before(shift_op, op);
-        1
+        Ok(1)
     }
 }
 
@@ -1251,20 +1251,20 @@ impl Rule for RuleTestSign {
         Some(Box::new(RuleTestSign))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let const_vn = op_in(data, op, 1).expect("RuleTestSign: null in1");
         if !vn_is_constant(data, const_vn) {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, const_vn);
         let in_vn = op_in(data, op, 0).expect("RuleTestSign: null in0");
         if val != (8 * vn_size(data, in_vn) - 1) as uintb {
-            return 0;
+            return Ok(0);
         }
         let out_vn = op_out(data, op).expect("RuleTestSign: op out");
 
         if vn_is_free(data, in_vn) {
-            return 0;
+            return Ok(0);
         }
         let mut compare_ops: Vec<OpId> = Vec::new();
         Self::find_comparisons(data, out_vn, &mut compare_ops);
@@ -1297,7 +1297,7 @@ impl Rule for RuleTestSign {
             }
             result_code = 1;
         }
-        result_code
+        Ok(result_code)
     }
 }
 
@@ -1331,32 +1331,32 @@ impl Rule for RuleIdentityEl {
         Some(Box::new(RuleIdentityEl))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let constvn = op_in(data, op, 1).expect("RuleIdentityEl: null in1");
         if !vn_is_constant(data, constvn) {
-            return 0;
+            return Ok(0);
         }
         let val = vn_offset(data, constvn);
         if (val == 0) && (op_code(data, op) != OpCode::CPUI_INT_MULT) {
             set_opcode(data, op, OpCode::CPUI_COPY);
             data.op_remove_input(op, 1); // Remove identity from operation
-            return 1;
+            return Ok(1);
         }
         if op_code(data, op) != OpCode::CPUI_INT_MULT {
-            return 0;
+            return Ok(0);
         }
         if val == 1 {
             set_opcode(data, op, OpCode::CPUI_COPY);
             data.op_remove_input(op, 1);
-            return 1;
+            return Ok(1);
         }
         if val == 0 {
             // Multiply by zero
             set_opcode(data, op, OpCode::CPUI_COPY);
             data.op_remove_input(op, 0);
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1382,17 +1382,17 @@ impl Rule for RuleShift2Mult {
         Some(Box::new(RuleShift2Mult))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut flag = 0;
         let vn = op_out(data, op).expect("RuleShift2Mult: op out");
         let constvn = op_in(data, op, 1).expect("RuleShift2Mult: null in1");
         if !vn_is_constant(data, constvn) {
-            return 0; // Shift amount must be a constant
+            return Ok(0); // Shift amount must be a constant
         }
         let val = vn_offset(data, constvn) as int4;
         if val >= 32 {
             // FIXME: arbitrary -- this big is probably not an arithmetic multiply
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0).expect("RuleShift2Mult: null in0");
         let mut arithop = vn_def(data, in0);
@@ -1418,12 +1418,12 @@ impl Rule for RuleShift2Mult {
         }
 
         if flag == 0 {
-            return 0;
+            return Ok(0);
         }
         let newconst = data.new_constant(vn_size(data, vn), 1u64 << val);
         data.op_set_input(op, newconst, 1).expect("RuleShift2Mult: opSetInput");
         set_opcode(data, op, OpCode::CPUI_INT_MULT);
-        1
+        Ok(1)
     }
 }
 
@@ -1450,101 +1450,101 @@ impl Rule for RuleShiftPiece {
         Some(Box::new(RuleShiftPiece))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let mut vn1 = op_in(data, op, 0).expect("RuleShiftPiece: null in0");
         if !vn_is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let mut vn2 = op_in(data, op, 1).expect("RuleShiftPiece: null in1");
         if !vn_is_written(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let mut shiftop = vn_def(data, vn1).expect("RuleShiftPiece: vn1 def");
         let mut zextloop = vn_def(data, vn2).expect("RuleShiftPiece: vn2 def");
         if op_code(data, shiftop) != OpCode::CPUI_INT_LEFT {
             if op_code(data, zextloop) != OpCode::CPUI_INT_LEFT {
-                return 0;
+                return Ok(0);
             }
             std::mem::swap(&mut zextloop, &mut shiftop);
         }
         let shin1 = op_in(data, shiftop, 1).expect("RuleShiftPiece: shiftop in1");
         if !vn_is_constant(data, shin1) {
-            return 0;
+            return Ok(0);
         }
         vn1 = op_in(data, shiftop, 0).expect("RuleShiftPiece: shiftop in0");
         if !vn_is_written(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let zexthiop = vn_def(data, vn1).expect("RuleShiftPiece: vn1 def");
         if op_code(data, zexthiop) != OpCode::CPUI_INT_ZEXT
             && op_code(data, zexthiop) != OpCode::CPUI_INT_SEXT
         {
-            return 0;
+            return Ok(0);
         }
         vn1 = op_in(data, zexthiop, 0).expect("RuleShiftPiece: zexthiop in0");
         if vn_is_constant(data, vn1) {
             if (vn_size(data, vn1) as usize) < std::mem::size_of::<uintb>() {
-                return 0; // Normally we let ZEXT of a constant collapse naturally
+                return Ok(0); // Normally we let ZEXT of a constant collapse naturally
             }
             // But if the ZEXTed constant is too big, this won't happen
         } else if vn_is_free(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let sa = vn_offset(data, shin1) as int4;
         let concatsize = sa + 8 * vn_size(data, vn1);
         let op_out_size = vn_size(data, op_out(data, op).expect("RuleShiftPiece: op out"));
         if op_out_size * 8 < concatsize {
-            return 0;
+            return Ok(0);
         }
         if op_code(data, zextloop) != OpCode::CPUI_INT_ZEXT {
             // Special case triggered by CDQ: IDIV (interacts with RuleSubZext)
             if !vn_is_written(data, vn1) {
-                return 0;
+                return Ok(0);
             }
             let r_shift_op = vn_def(data, vn1).expect("RuleShiftPiece: vn1 def");
             if op_code(data, r_shift_op) != OpCode::CPUI_INT_SRIGHT {
-                return 0;
+                return Ok(0);
             }
             let rsh1 = op_in(data, r_shift_op, 1).expect("RuleShiftPiece: rShiftOp in1");
             if !vn_is_constant(data, rsh1) {
-                return 0;
+                return Ok(0);
             }
             vn2 = op_in(data, r_shift_op, 0).expect("RuleShiftPiece: rShiftOp in0");
             if !vn_is_written(data, vn2) {
-                return 0;
+                return Ok(0);
             }
             let subop = vn_def(data, vn2).expect("RuleShiftPiece: vn2 def");
             if op_code(data, subop) != OpCode::CPUI_SUBPIECE {
-                return 0; // SUBPIECE connects high and low parts
+                return Ok(0); // SUBPIECE connects high and low parts
             }
             if vn_offset(data, op_in(data, subop, 1).expect("RuleShiftPiece: subop in1")) != 0 {
-                return 0; // (must be low part)
+                return Ok(0); // (must be low part)
             }
             let big_vn = op_out(data, zextloop).expect("RuleShiftPiece: zextloop out");
             if op_in(data, subop, 0) != Some(big_vn) {
-                return 0; // Verify we have link thru SUBPIECE with low part
+                return Ok(0); // Verify we have link thru SUBPIECE with low part
             }
             let rsa = vn_offset(data, rsh1) as int4;
             if rsa != vn_size(data, vn2) * 8 - 1 {
-                return 0; // Arithmetic shift must copy sign-bit thru whole high part
+                return Ok(0); // Arithmetic shift must copy sign-bit thru whole high part
             }
             if (vn_nzmask(data, big_vn) >> sa) != 0 {
-                return 0; // The original most significant bytes must be zero
+                return Ok(0); // The original most significant bytes must be zero
             }
             if sa != 8 * vn_size(data, vn2) {
-                return 0;
+                return Ok(0);
             }
             set_opcode(data, op, OpCode::CPUI_INT_SEXT); // Original op is sign extension of low part
             data.op_set_input(op, vn2, 0).expect("RuleShiftPiece: opSetInput");
             data.op_remove_input(op, 1);
-            return 1;
+            return Ok(1);
         }
         vn2 = op_in(data, zextloop, 0).expect("RuleShiftPiece: zextloop in0");
         if vn_is_free(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         if sa != 8 * vn_size(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         if concatsize == op_out_size * 8 {
             set_opcode(data, op, OpCode::CPUI_PIECE);
@@ -1564,7 +1564,7 @@ impl Rule for RuleShiftPiece {
             let newout = op_out(data, newop).expect("RuleShiftPiece: newop out");
             data.op_set_input(op, newout, 0).expect("RuleShiftPiece: opSetInput");
         }
-        1
+        Ok(1)
     }
 }
 
@@ -1588,18 +1588,18 @@ impl Rule for RuleCollapseConstants {
         Some(Box::new(RuleCollapseConstants))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let collapsible = {
             let o = data.obank().get(op).expect("RuleCollapseConstants: stale op");
             crate::op::is_collapsible(o, data.vbank())
         };
         if !collapsible {
-            return 0;
+            return Ok(0);
         }
         if op_code(data, op) == OpCode::CPUI_INT_ADD
-            && crate::kuna_globalarrayanchor::preserve_array_base(data, op)
+            && crate::kuna_globalarrayanchor::preserve_array_base(data, op)?
         {
-            return 0;
+            return Ok(0);
         }
         //   op->collapse() drives the OpBehavior emulation (executeSimple) on the
         //   op's constant inputs; getArch()->getConstant wraps the result in a
@@ -1610,13 +1610,13 @@ impl Rule for RuleCollapseConstants {
             None => {
                 // opMarkNoCollapse(op): don't know how / don't want to collapse.
                 data.op_mark_no_collapse(op);
-                return 0;
+                return Ok(0);
             }
         };
         let out_size =
             data.vbank().get(data.obank().get(op).unwrap().get_out().unwrap()).unwrap().get_size();
         let newval = data.get_arch().get_constant(collapsed);
-        let vn = data.new_varnode(out_size, &newval, None);
+        let vn = data.new_varnode(out_size, &newval, None)?;
         // collapseConstantSymbol(vn): when a constant input carried a bound
         // (dynamic) SymbolEntry, propagate the markup onto the new collapsed
         // constant (C++ `PcodeOp::collapseConstantSymbol`, op.cc:528).  This is
@@ -1636,7 +1636,7 @@ impl Rule for RuleCollapseConstants {
         }
         data.op_set_input(op, vn, 0).expect("RuleCollapseConstants: opSetInput");
         data.op_set_opcode(op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
-        1
+        Ok(1)
     }
 }
 
@@ -1768,18 +1768,39 @@ impl Rule for RuleTransformCpool {
         Some(Box::new(RuleTransformCpool))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         if data.obank().get(op).expect("RuleTransformCpool: stale op").is_cpool_transformed() {
-            return 0;
+            return Ok(0);
         }
-        // STUB(W4): data.opMarkCpoolTransformed(op) marks the visit, then the body
-        // looks up `data.getArch()->cpool->getRecord(refs)` and rewrites the op
-        // (COPY of the primitive, calculated-bool mark, or tag-append).  The
-        // constant-pool record store (`glb->cpool`, W4) and the
-        // updateType/markCalculatedBool surfaces are unported.  The
-        // already-visited guard is ported; the lookup/rewrite is deferred.
-        // returning 0 here avoids claiming a change we did not make.)
-        0
+        let refs: Vec<_> = (1..op_num_input(data, op))
+            .map(|slot| vn_offset(data, op_in(data, op, slot).expect("cpool input")))
+            .collect();
+        let record = data.get_arch().get_cpool_record(&refs)?;
+        data.obank_mut().get_mut(op).expect("cpool op")
+            .set_additional_flag(crate::op::pcodeop_addlflags::is_cpool_transformed);
+        if let Some(record) = record {
+            use crate::cpool::cpool_tag;
+            if record.get_tag() == cpool_tag::INSTANCE_OF {
+                data.op_mark_calculated_bool(op);
+            } else if record.get_tag() == cpool_tag::PRIMITIVE {
+                let out = op_out(data, op).expect("cpool output");
+                let size = vn_size(data, out);
+                let constant = data.new_constant(size, record.get_value() & calc_mask(size));
+                if let Some(dtype) = record.get_type() {
+                    data.vbank_mut().get_mut(constant).expect("cpool constant")
+                        .update_type_locked(std::rc::Rc::clone(dtype), true, true);
+                }
+                while op_num_input(data, op) > 1 {
+                    data.op_remove_input(op, op_num_input(data, op) - 1);
+                }
+                data.op_set_opcode_code(op, OpCode::CPUI_COPY);
+                data.op_set_input(op, constant, 0)?;
+                return Ok(1);
+            }
+            let tag = data.new_constant(4, record.get_tag() as uintb);
+            data.op_insert_input(op, tag, op_num_input(data, op))?;
+        }
+        Ok(1)
     }
 }
 
@@ -1803,14 +1824,14 @@ impl Rule for RulePropagateCopy {
         Some(Box::new(RulePropagateCopy))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let (return_copy, machine_read) = {
             let operation = data.obank().get(op).expect("RulePropagateCopy: stale op");
             (operation.is_return_copy(), operation.get_addlflags() & crate::op::pcodeop_addlflags::kuna_stack_read != 0)
         };
         if machine_read { crate::p3_dataflow::kuna_stackreadscope::record_current_read(data, op); }
         if return_copy {
-            return 0;
+            return Ok(0);
         }
         let n = op_num_input(data, op);
         for i in 0..n {
@@ -1916,11 +1937,11 @@ impl Rule for RulePropagateCopy {
                 }
             }
             crate::p3_dataflow::kuna_stackreadscope::record_propagated_read(data, copyop, invn);
-            data.kuna_inherit_storage(invn, vn);
+            data.kuna_inherit_storage(invn, vn)?;
             data.op_set_input(op, invn, i).expect("RulePropagateCopy: opSetInput"); // propagate just a single copy
-            return 1;
+            return Ok(1);
         }
-        0
+        Ok(0)
     }
 }
 
@@ -1946,12 +1967,12 @@ impl Rule for Rule2Comp2Mult {
         Some(Box::new(Rule2Comp2Mult))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         set_opcode(data, op, OpCode::CPUI_INT_MULT);
         let size = vn_size(data, op_in(data, op, 0).expect("Rule2Comp2Mult: null in0"));
         let negone = data.new_constant(size, calc_mask(size));
         data.op_insert_input(op, negone, 1).expect("Rule2Comp2Mult: opInsertInput");
-        1
+        Ok(1)
     }
 }
 
@@ -1977,14 +1998,14 @@ impl Rule for RuleCarryElim {
         Some(Box::new(RuleCarryElim))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn2 = op_in(data, op, 1).expect("RuleCarryElim: null in1");
         if !vn_is_constant(data, vn2) {
-            return 0;
+            return Ok(0);
         }
         let vn1 = op_in(data, op, 0).expect("RuleCarryElim: null in0");
         if vn_is_free(data, vn1) {
-            return 0;
+            return Ok(0);
         }
         let mut off = vn_offset(data, vn2);
         if off == 0 {
@@ -1993,7 +2014,7 @@ impl Rule for RuleCarryElim {
             let z = data.new_constant(1, 0);
             data.op_set_input(op, z, 0).expect("RuleCarryElim: opSetInput"); // boolean "false" as input to COPY
             set_opcode(data, op, OpCode::CPUI_COPY);
-            return 1;
+            return Ok(1);
         }
         // twos-complement
         off = off.wrapping_neg() & calc_mask(vn_size(data, vn2));
@@ -2002,7 +2023,7 @@ impl Rule for RuleCarryElim {
         data.op_set_input(op, vn1, 1).expect("RuleCarryElim: opSetInput"); // Move other input to second position
         let newc = data.new_constant(vn_size(data, vn1), off);
         data.op_set_input(op, newc, 0).expect("RuleCarryElim: opSetInput"); // new constant in first position
-        1
+        Ok(1)
     }
 }
 
@@ -2028,7 +2049,7 @@ impl Rule for RuleSub2Add {
         Some(Box::new(RuleSub2Add))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let vn = op_in(data, op, 1).expect("RuleSub2Add: null in1"); // Parameter being subtracted
         let opaddr = data.obank().get(op).expect("RuleSub2Add: stale op").get_addr().clone();
         let newop = data.new_op(2, opaddr);
@@ -2040,7 +2061,7 @@ impl Rule for RuleSub2Add {
         data.op_set_input(newop, negone, 1).expect("RuleSub2Add: opSetInput");
         set_opcode(data, op, OpCode::CPUI_INT_ADD);
         data.op_insert_before(newop, op);
-        1
+        Ok(1)
     }
 }
 
@@ -2066,42 +2087,42 @@ impl Rule for RuleXorCollapse {
         Some(Box::new(RuleXorCollapse))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let in1 = op_in(data, op, 1).expect("RuleXorCollapse: null in1");
         if !vn_is_constant(data, in1) {
-            return 0;
+            return Ok(0);
         }
         let in0 = op_in(data, op, 0).expect("RuleXorCollapse: null in0");
         let xorop = match vn_def(data, in0) {
             Some(o) => o,
-            None => return 0,
+            None => return Ok(0),
         };
         if op_code(data, xorop) != OpCode::CPUI_INT_XOR {
-            return 0;
+            return Ok(0);
         }
         if data.lone_descend(in0).is_none() {
-            return 0;
+            return Ok(0);
         }
         let coeff1 = vn_offset(data, in1);
         let xorvn = op_in(data, xorop, 1).expect("RuleXorCollapse: xorop in1");
         let xor0 = op_in(data, xorop, 0).expect("RuleXorCollapse: xorop in0");
         if vn_is_free(data, xor0) {
-            return 0; // This will be propagated
+            return Ok(0); // This will be propagated
         }
         if !vn_is_constant(data, xorvn) {
             if coeff1 != 0 {
-                return 0;
+                return Ok(0);
             }
             if vn_is_free(data, xorvn) {
-                return 0;
+                return Ok(0);
             }
             data.op_set_input(op, xorvn, 1).expect("RuleXorCollapse: opSetInput"); // Move term to other side
             data.op_set_input(op, xor0, 0).expect("RuleXorCollapse: opSetInput");
-            return 1;
+            return Ok(1);
         }
         let coeff2 = vn_offset(data, xorvn);
         if coeff2 == 0 {
-            return 0;
+            return Ok(0);
         }
         let constvn = data.new_constant(vn_size(data, in1), coeff1 ^ coeff2);
         // STUB(W6): constvn->copySymbolIfValid(xorvn) -- the symbol-entry copy is
@@ -2109,7 +2130,7 @@ impl Rule for RuleXorCollapse {
         // ported, the symbol annotation is skipped.  Recorded as a loss.
         data.op_set_input(op, constvn, 1).expect("RuleXorCollapse: opSetInput");
         data.op_set_input(op, xor0, 0).expect("RuleXorCollapse: opSetInput");
-        1
+        Ok(1)
     }
 }
 
@@ -2137,30 +2158,30 @@ impl Rule for RuleAddMultCollapse {
         Some(Box::new(RuleAddMultCollapse))
     }
 
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
         let opc = op_code(data, op);
         // Constant is in c[0], other is in sub
         let c0 = op_in(data, op, 1).expect("RuleAddMultCollapse: null in1");
         if !vn_is_constant(data, c0) {
-            return 0; // Neither input is a constant
+            return Ok(0); // Neither input is a constant
         }
         let sub = op_in(data, op, 0).expect("RuleAddMultCollapse: null in0");
         // Find other constant one level down
         if !vn_is_written(data, sub) {
-            return 0;
+            return Ok(0);
         }
         let subop = vn_def(data, sub).expect("RuleAddMultCollapse: sub def");
         if op_code(data, subop) != opc {
-            return 0; // Must be same exact operation
+            return Ok(0); // Must be same exact operation
         }
-        if opc == OpCode::CPUI_INT_ADD && crate::kuna_globalarrayanchor::preserve_array_base(data, op) {
-            return 0;
+        if opc == OpCode::CPUI_INT_ADD && crate::kuna_globalarrayanchor::preserve_array_base(data, op)? {
+            return Ok(0);
         }
         let mut c1 = op_in(data, subop, 1).expect("RuleAddMultCollapse: subop in1");
         if !vn_is_constant(data, c1) {
             // a = ((stackbase + c[1]) + othervn) + c[0] => (stackbase + c0 + c1) + othervn
             if opc != OpCode::CPUI_INT_ADD {
-                return 0;
+                return Ok(0);
             }
             for i in 0..2 {
                 let othervn = op_in(data, subop, i).expect("RuleAddMultCollapse: subop in");
@@ -2204,13 +2225,13 @@ impl Rule for RuleAddMultCollapse {
                 data.op_insert_before(newop, op);
                 data.op_set_input(op, newout, 0).expect("RuleAddMultCollapse: opSetInput");
                 data.op_set_input(op, othervn, 1).expect("RuleAddMultCollapse: opSetInput");
-                return 1;
+                return Ok(1);
             }
-            return 0;
+            return Ok(0);
         }
         let sub2 = op_in(data, subop, 0).expect("RuleAddMultCollapse: subop in0");
         if vn_is_free(data, sub2) {
-            return 0;
+            return Ok(0);
         }
 
         let c0sz = vn_size(data, c0);
@@ -2219,7 +2240,7 @@ impl Rule for RuleAddMultCollapse {
         // STUB(W6): copySymbolIfValid(c0 or c1) -- symbol-entry copy skipped.
         data.op_set_input(op, newvn, 1).expect("RuleAddMultCollapse: opSetInput"); // Replace c0 with c0(+|*)c1
         data.op_set_input(op, sub2, 0).expect("RuleAddMultCollapse: opSetInput"); // Replace sub with sub2
-        1
+        Ok(1)
     }
 }
 
@@ -2399,7 +2420,7 @@ mod tests {
     /// to a function input (so it is heritage-known and not free).
     fn make_input(fd: &mut Fd, off: u64, size: int4) -> VarnodeId {
         let r = ram(fd);
-        let vn = fd.new_varnode(size, &Address::new(r, off), None);
+        let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
         let mut no_replace = |_: &mut crate::varnode::VarnodeBank,
                               _: VarnodeId,
                               _: VarnodeId|
@@ -2416,7 +2437,7 @@ mod tests {
         use pcodeop_flags::*;
         match opc {
             OpCode::CPUI_COPY => unary | nocollapse,
-            OpCode::CPUI_LOAD => special | nocollapse,
+            OpCode::CPUI_LOAD | OpCode::CPUI_CPOOLREF => special | nocollapse,
             OpCode::CPUI_BOOL_NEGATE => unary | booloutput,
             OpCode::CPUI_BOOL_AND | OpCode::CPUI_BOOL_OR | OpCode::CPUI_BOOL_XOR => {
                 binary | commutative | booloutput
@@ -2475,6 +2496,34 @@ mod tests {
         (op, out)
     }
 
+    #[test]
+    fn cpool_transform_uses_shared_record_and_marks_once() {
+        use crate::cpool::{ConstantPool, cpool_tag};
+        for tag in [cpool_tag::PRIMITIVE, cpool_tag::INSTANCE_OF, cpool_tag::POINTER_FIELD] {
+            let mut fd = build_fd();
+            let dtype = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
+            fd.get_arch().cpool.borrow_mut()
+                .put_record(&[42, 7], tag, b"field", Rc::clone(&dtype)).unwrap();
+            let object = make_input(&mut fd, 0x100, 8);
+            let first = fd.new_constant(8, 42);
+            let second = fd.new_constant(8, 7);
+            let (op, _) = def_op(&mut fd, OpCode::CPUI_CPOOLREF, &[object, first, second], 4);
+            assert_eq!(RuleTransformCpool.apply_op(op, &mut fd).unwrap(), 1);
+            assert_eq!(RuleTransformCpool.apply_op(op, &mut fd).unwrap(), 0);
+            if tag == cpool_tag::PRIMITIVE {
+                assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
+                assert_eq!(op_num_input(&fd, op), 1);
+                let constant = op_in(&fd, op, 0).unwrap();
+                assert_eq!(vn_offset(&fd, constant), 0);
+                assert!(Rc::ptr_eq(fd.vbank().get(constant).unwrap().get_type(), &dtype));
+            } else {
+                assert_eq!(op_num_input(&fd, op), 4);
+                assert_eq!(vn_offset(&fd, op_in(&fd, op, 3).unwrap()), tag as u64);
+                assert_eq!(fd.obank().get(op).unwrap().is_calculated_bool(), tag == cpool_tag::INSTANCE_OF);
+            }
+        }
+    }
+
     // --- RuleBooleanNegate ------------------------------------------------
 
     #[test]
@@ -2491,7 +2540,7 @@ mod tests {
         wire(&mut fd, op, subbool, 0);
         wire(&mut fd, op, zero, 1);
 
-        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_BOOL_NEGATE);
         assert_eq!(op_num_input(&fd, op), 1);
         assert_eq!(op_in(&fd, op, 0), Some(subbool));
@@ -2509,7 +2558,7 @@ mod tests {
         wire(&mut fd, op, subbool, 0);
         wire(&mut fd, op, one, 1);
 
-        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
     }
@@ -2526,7 +2575,7 @@ mod tests {
         wire(&mut fd, op, subbool, 0);
         wire(&mut fd, op, one, 1);
 
-        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_BOOL_NEGATE);
     }
 
@@ -2541,14 +2590,14 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, op, sb, 0);
         wire(&mut fd, op, nonconst, 1);
-        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleBooleanNegate.apply_op(op, &mut fd).unwrap(), 0);
 
         // constant != {0,1} -> 0
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         let c2 = fd.new_constant(1, 2);
         wire(&mut fd, op2, sb, 0);
         wire(&mut fd, op2, c2, 1);
-        assert_eq!(RuleBooleanNegate.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleBooleanNegate.apply_op(op2, &mut fd).unwrap(), 0);
 
         // subbool is NOT a boolean value (a plain 4-byte input) -> 0
         let notbool = make_input(&mut fd, 0x300, 4);
@@ -2556,7 +2605,7 @@ mod tests {
         let z = fd.new_constant(4, 0);
         wire(&mut fd, op3, notbool, 0);
         wire(&mut fd, op3, z, 1);
-        assert_eq!(RuleBooleanNegate.apply_op(op3, &mut fd), 0);
+        assert_eq!(RuleBooleanNegate.apply_op(op3, &mut fd).unwrap(), 0);
     }
 
     // --- RuleLogic2Bool ---------------------------------------------------
@@ -2572,7 +2621,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_AND);
         wire(&mut fd, op, bx, 0);
         wire(&mut fd, op, by, 1);
-        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_BOOL_AND);
     }
 
@@ -2586,7 +2635,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_OR);
         wire(&mut fd, op, bx, 0);
         wire(&mut fd, op, one, 1);
-        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_BOOL_OR);
 
         // second input constant 2 -> rejected
@@ -2594,7 +2643,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_XOR);
         wire(&mut fd, op2, bx, 0);
         wire(&mut fd, op2, two, 1);
-        assert_eq!(RuleLogic2Bool.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleLogic2Bool.apply_op(op2, &mut fd).unwrap(), 0);
         assert_eq!(op_code(&fd, op2), OpCode::CPUI_INT_XOR);
     }
 
@@ -2606,7 +2655,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_AND);
         wire(&mut fd, op, nb, 0);
         wire(&mut fd, op, other, 1);
-        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleLogic2Bool.apply_op(op, &mut fd).unwrap(), 0);
     }
 
     // --- RuleTrivialShift -------------------------------------------------
@@ -2619,7 +2668,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_LEFT);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         assert_eq!(op_in(&fd, op, 0), Some(v));
@@ -2633,7 +2682,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_LEFT);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, big, 1);
-        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         // input replaced with a zero constant
@@ -2651,7 +2700,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_LEFT);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, amt, 1);
-        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleTrivialShift.apply_op(op, &mut fd).unwrap(), 0);
 
         // non-trivial (val < 32) -> 0
         let v2 = make_input(&mut fd, 0x200, 4);
@@ -2659,7 +2708,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_LEFT);
         wire(&mut fd, op2, v2, 0);
         wire(&mut fd, op2, small, 1);
-        assert_eq!(RuleTrivialShift.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleTrivialShift.apply_op(op2, &mut fd).unwrap(), 0);
 
         // oversized SRIGHT (cant predict signbit) -> 0
         let v3 = make_input(&mut fd, 0x300, 4);
@@ -2667,7 +2716,7 @@ mod tests {
         let op3 = mk_op(&mut fd, 2, OpCode::CPUI_INT_SRIGHT);
         wire(&mut fd, op3, v3, 0);
         wire(&mut fd, op3, big, 1);
-        assert_eq!(RuleTrivialShift.apply_op(op3, &mut fd), 0);
+        assert_eq!(RuleTrivialShift.apply_op(op3, &mut fd).unwrap(), 0);
     }
 
     // --- RuleIdentityEl ---------------------------------------------------
@@ -2680,7 +2729,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         assert_eq!(op_in(&fd, op, 0), Some(v));
@@ -2695,7 +2744,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_MULT);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, one, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_in(&fd, op, 0), Some(v));
 
@@ -2705,7 +2754,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_MULT);
         wire(&mut fd, op2, v2, 0);
         wire(&mut fd, op2, zero, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op2, &mut fd), 1);
+        assert_eq!(RuleIdentityEl.apply_op(op2, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op2), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op2), 1);
         let rem = op_in(&fd, op2, 0).unwrap();
@@ -2720,13 +2769,13 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_MULT);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, c, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleIdentityEl.apply_op(op, &mut fd).unwrap(), 0);
         // non-constant second operand -> 0
         let nc = make_input(&mut fd, 0x200, 4);
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op2, v, 0);
         wire(&mut fd, op2, nc, 1);
-        assert_eq!(RuleIdentityEl.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleIdentityEl.apply_op(op2, &mut fd).unwrap(), 0);
     }
 
     // --- RuleCarryElim ----------------------------------------------------
@@ -2739,7 +2788,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_CARRY);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleCarryElim.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleCarryElim.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         let in0 = op_in(&fd, op, 0).unwrap();
@@ -2757,7 +2806,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_CARRY);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, c, 1);
-        assert_eq!(RuleCarryElim.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleCarryElim.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_LESSEQUAL);
         assert_eq!(op_in(&fd, op, 1), Some(v));
         let in0 = op_in(&fd, op, 0).unwrap();
@@ -2775,7 +2824,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_CARRY);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, nc, 1);
-        assert_eq!(RuleCarryElim.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleCarryElim.apply_op(op, &mut fd).unwrap(), 0);
     }
 
     // --- Rule2Comp2Mult ---------------------------------------------------
@@ -2786,7 +2835,7 @@ mod tests {
         let v = make_input(&mut fd, 0x100, 4);
         let op = mk_op(&mut fd, 1, OpCode::CPUI_INT_2COMP);
         wire(&mut fd, op, v, 0);
-        assert_eq!(Rule2Comp2Mult.apply_op(op, &mut fd), 1);
+        assert_eq!(Rule2Comp2Mult.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_MULT);
         assert_eq!(op_num_input(&fd, op), 2);
         assert_eq!(op_in(&fd, op, 0), Some(v));
@@ -2809,7 +2858,7 @@ mod tests {
             if high {
                 fd.set_high_level();
             }
-            assert_eq!(RuleSub2Add.apply_op(op, &mut fd), 1);
+            assert_eq!(RuleSub2Add.apply_op(op, &mut fd).unwrap(), 1);
             assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_ADD);
             assert_eq!(op_in(&fd, op, 0), Some(a));
             let newvn = op_in(&fd, op, 1).unwrap();
@@ -2836,7 +2885,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, op, xorout, 0);
         wire(&mut fd, op, d, 1);
-        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd).unwrap(), 1);
         // slot0 becomes V, slot1 becomes constant 0x0f ^ 0x33.
         assert_eq!(op_in(&fd, op, 0), Some(v));
         let folded = op_in(&fd, op, 1).unwrap();
@@ -2855,7 +2904,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, op, xorout, 0);
         wire(&mut fd, op, zero, 1);
-        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd).unwrap(), 1);
         // slot1 := W (the xor's second term), slot0 := V (the xor's first term)
         assert_eq!(op_in(&fd, op, 0), Some(v));
         assert_eq!(op_in(&fd, op, 1), Some(w));
@@ -2872,7 +2921,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, op, xorout, 0);
         wire(&mut fd, op, dvar, 1);
-        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleXorCollapse.apply_op(op, &mut fd).unwrap(), 0);
 
         // slot0 not defined by an XOR -> 0
         let other = make_input(&mut fd, 0x300, 4);
@@ -2880,7 +2929,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, op2, other, 0);
         wire(&mut fd, op2, d, 1);
-        assert_eq!(RuleXorCollapse.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleXorCollapse.apply_op(op2, &mut fd).unwrap(), 0);
     }
 
     // --- RuleAddMultCollapse ---------------------------------------------
@@ -2896,7 +2945,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, innerout, 0);
         wire(&mut fd, op, c0, 1);
-        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd).unwrap(), 1);
         // slot0 := V (sub2), slot1 := const(30)
         assert_eq!(op_in(&fd, op, 0), Some(v));
         let folded = op_in(&fd, op, 1).unwrap();
@@ -2915,7 +2964,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_MULT);
         wire(&mut fd, op, innerout, 0);
         wire(&mut fd, op, c0, 1);
-        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_in(&fd, op, 0), Some(v));
         let folded = op_in(&fd, op, 1).unwrap();
         assert_eq!(vn_offset(&fd, folded), 21);
@@ -2930,7 +2979,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, nc, 1);
-        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd).unwrap(), 0);
 
         // inner op is a different opcode -> 0
         let c1 = fd.new_constant(4, 10);
@@ -2939,7 +2988,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD); // ADD over a MULT sub
         wire(&mut fd, op2, innerout, 0);
         wire(&mut fd, op2, c0, 1);
-        assert_eq!(RuleAddMultCollapse.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleAddMultCollapse.apply_op(op2, &mut fd).unwrap(), 0);
     }
 
     // --- RuleShift2Mult ---------------------------------------------------
@@ -2954,7 +3003,7 @@ mod tests {
         // descendant arithmetic op that reads shiftout
         let other = make_input(&mut fd, 0x200, 4);
         let _arith = def_op(&mut fd, OpCode::CPUI_INT_ADD, &[shiftout, other], 4);
-        assert_eq!(RuleShift2Mult.apply_op(shiftop, &mut fd), 1);
+        assert_eq!(RuleShift2Mult.apply_op(shiftop, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, shiftop), OpCode::CPUI_INT_MULT);
         let c = op_in(&fd, shiftop, 1).unwrap();
         assert!(vn_is_constant(&fd, c));
@@ -2968,7 +3017,7 @@ mod tests {
         let v = make_input(&mut fd, 0x100, 4);
         let two = fd.new_constant(4, 2);
         let (shiftop, _shiftout) = def_op(&mut fd, OpCode::CPUI_INT_LEFT, &[v, two], 4);
-        assert_eq!(RuleShift2Mult.apply_op(shiftop, &mut fd), 0);
+        assert_eq!(RuleShift2Mult.apply_op(shiftop, &mut fd).unwrap(), 0);
         assert_eq!(op_code(&fd, shiftop), OpCode::CPUI_INT_LEFT);
 
         // val >= 32 -> reject regardless of arithmetic.
@@ -2977,7 +3026,7 @@ mod tests {
         let (shiftop2, sout2) = def_op(&mut fd, OpCode::CPUI_INT_LEFT, &[v2, big], 4);
         let o2 = make_input(&mut fd, 0x400, 4);
         let _arith2 = def_op(&mut fd, OpCode::CPUI_INT_ADD, &[sout2, o2], 4);
-        assert_eq!(RuleShift2Mult.apply_op(shiftop2, &mut fd), 0);
+        assert_eq!(RuleShift2Mult.apply_op(shiftop2, &mut fd).unwrap(), 0);
     }
 
     // --- RuleSborrow / RuleScarry trivial cases (the ported half) ---------
@@ -2990,7 +3039,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_SBORROW);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleSborrow.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleSborrow.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         let in0 = op_in(&fd, op, 0).unwrap();
@@ -3000,7 +3049,7 @@ mod tests {
         let a = make_input(&mut fd, 0x200, 4);
         let b = make_input(&mut fd, 0x204, 4);
         let (op2, _sout) = def_op(&mut fd, OpCode::CPUI_INT_SBORROW, &[a, b], 1);
-        assert_eq!(RuleSborrow.apply_op(op2, &mut fd), 0);
+        assert_eq!(RuleSborrow.apply_op(op2, &mut fd).unwrap(), 0);
     }
 
     #[test]
@@ -3011,7 +3060,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_SCARRY);
         wire(&mut fd, op, v, 0);
         wire(&mut fd, op, z, 1);
-        assert_eq!(RuleScarry.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleScarry.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_COPY);
         assert_eq!(op_num_input(&fd, op), 1);
         // also fires when the *first* operand is the zero constant
@@ -3020,7 +3069,7 @@ mod tests {
         let op2 = mk_op(&mut fd, 2, OpCode::CPUI_INT_SCARRY);
         wire(&mut fd, op2, z2, 0);
         wire(&mut fd, op2, w, 1);
-        assert_eq!(RuleScarry.apply_op(op2, &mut fd), 1);
+        assert_eq!(RuleScarry.apply_op(op2, &mut fd).unwrap(), 1);
     }
 
     #[test]
@@ -3045,7 +3094,7 @@ mod tests {
         wire(&mut fd, cmp, sbout, 0);
         wire(&mut fd, cmp, slessout, 1);
 
-        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd), 1);
+        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd).unwrap(), 1);
         // The NOTEQUAL was rewritten in place to a simple INT_SLESS(a,b).
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESS);
         assert_eq!(op_in(&fd, cmp, 0).unwrap(), a);
@@ -3067,7 +3116,7 @@ mod tests {
         let cmp = mk_op(&mut fd, 2, OpCode::CPUI_INT_NOTEQUAL);
         wire(&mut fd, cmp, srout, 0);
         wire(&mut fd, cmp, zero, 1);
-        assert_eq!(RuleTestSign.apply_op(srop, &mut fd), 1);
+        assert_eq!(RuleTestSign.apply_op(srop, &mut fd).unwrap(), 1);
         // offset 0 => sgn=1, NOTEQUAL complements to -1 => SLESS: in0=V, in1=0.
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESS);
         assert_eq!(op_in(&fd, cmp, 0), Some(v));
@@ -3085,7 +3134,7 @@ mod tests {
         let cmp = mk_op(&mut fd, 2, OpCode::CPUI_INT_NOTEQUAL);
         wire(&mut fd, cmp, srout, 0);
         wire(&mut fd, cmp, zero, 1);
-        assert_eq!(RuleTestSign.apply_op(srop, &mut fd), 0);
+        assert_eq!(RuleTestSign.apply_op(srop, &mut fd).unwrap(), 0);
     }
 
     // --- RuleBoolZext (the EQUAL/NOTEQUAL branch is fully portable) --------
@@ -3111,7 +3160,7 @@ mod tests {
 
         // Apply on the ZEXT op.
         let zop = vn_def(&fd, zout).unwrap();
-        assert_eq!(RuleBoolZext.apply_op(zop, &mut fd), 1);
+        assert_eq!(RuleBoolZext.apply_op(zop, &mut fd).unwrap(), 1);
         // comparison's slot0 becomes the unextended boolean, slot1 the constant 1.
         assert_eq!(op_in(&fd, cmp, 0), Some(boolvn));
         let one = op_in(&fd, cmp, 1).unwrap();
@@ -3132,7 +3181,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, x, 0);
         wire(&mut fd, op, other, 1);
-        assert_eq!(RulePropagateCopy.apply_op(op, &mut fd), 1);
+        assert_eq!(RulePropagateCopy.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_in(&fd, op, 0), Some(y));
     }
 
@@ -3151,7 +3200,7 @@ mod tests {
             let consumer = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
             wire(&mut fd, consumer, copied, 0);
             wire(&mut fd, consumer, other, 1);
-            assert_eq!(RulePropagateCopy.apply_op(consumer, &mut fd), 1);
+            assert_eq!(RulePropagateCopy.apply_op(consumer, &mut fd).unwrap(), 1);
             assert_eq!(op_in(&fd, consumer, 0), Some(loaded));
         }
         let sources = fd.kuna_storage_sources(loaded);
@@ -3172,7 +3221,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_MULT);
         wire(&mut fd, op, addout, 0); // written by INT_ADD, not COPY
         wire(&mut fd, op, c, 1); // not written
-        assert_eq!(RulePropagateCopy.apply_op(op, &mut fd), 0);
+        assert_eq!(RulePropagateCopy.apply_op(op, &mut fd).unwrap(), 0);
         assert!(fd.kuna_storage_sources(addout).is_empty());
         assert!(fd.kuna_storage_sources(a).is_empty());
         assert!(fd.kuna_storage_sources(b).is_empty());
@@ -3205,7 +3254,7 @@ mod tests {
                 let (op, _) = def_op(&mut fd, OpCode::CPUI_INT_ADD, &[stored, zero], 8);
                 op
             };
-            assert_eq!(RulePropagateCopy.apply_op(consumer, &mut fd), expected);
+            assert_eq!(RulePropagateCopy.apply_op(consumer, &mut fd).unwrap(), expected);
             assert_eq!(op_in(&fd, consumer, 0), Some(if expected == 0 { stored } else { input }));
         }
     }
@@ -3222,7 +3271,7 @@ mod tests {
         v.update_type_locked(Rc::new(Datatype::new(8, type_metatype::TYPE_ARRAY)), true, true);
         let iop = fd.new_constant(8, 0);
         let (marker, _) = def_op(&mut fd, OpCode::CPUI_INDIRECT, &[stored, iop], 8);
-        assert_eq!(RulePropagateCopy.apply_op(marker, &mut fd), 1);
+        assert_eq!(RulePropagateCopy.apply_op(marker, &mut fd).unwrap(), 1);
         assert_eq!(op_in(&fd, marker, 0), Some(input));
     }
 
@@ -3304,7 +3353,7 @@ mod tests {
 
         // apply on the ZEXT(B1) op (the rule's entry opcode is INT_ZEXT)
         let z1op = vn_def(&fd, z1).unwrap();
-        assert_eq!(RuleBoolZext.apply_op(z1op, &mut fd), 1);
+        assert_eq!(RuleBoolZext.apply_op(z1op, &mut fd).unwrap(), 1);
 
         // The AND op is now INT_MULT(newzext, -1); newzext = ZEXT(BOOL_AND(B1,B2)).
         assert_eq!(op_code(&fd, andop), OpCode::CPUI_INT_MULT);
@@ -3338,7 +3387,7 @@ mod tests {
         let cmp = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, cmp, srout, 0);
         wire(&mut fd, cmp, minus1, 1);
-        assert_eq!(RuleTestSign.apply_op(srop, &mut fd), 1);
+        assert_eq!(RuleTestSign.apply_op(srop, &mut fd).unwrap(), 1);
         // sgn = -1 (offset==mask), EQUAL does NOT complement => SLESS: in0=V,in1=0.
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESS);
         assert_eq!(op_in(&fd, cmp, 0), Some(v));
@@ -3359,7 +3408,7 @@ mod tests {
         let cmp = mk_op(&mut fd, 2, OpCode::CPUI_INT_EQUAL);
         wire(&mut fd, cmp, srout, 0);
         wire(&mut fd, cmp, zero, 1);
-        assert_eq!(RuleTestSign.apply_op(srop, &mut fd), 1);
+        assert_eq!(RuleTestSign.apply_op(srop, &mut fd).unwrap(), 1);
         // sgn=1, EQUAL keeps sgn => SLESSEQUAL with in0=0, in1=V (0 s<= V).
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESSEQUAL);
         let in0 = op_in(&fd, cmp, 0).unwrap();
@@ -3389,7 +3438,7 @@ mod tests {
         let op = mk_op(&mut fd, 2, OpCode::CPUI_INT_ADD);
         wire(&mut fd, op, innerout, 0);
         wire(&mut fd, op, c0, 1);
-        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd), 0);
+        assert_eq!(RuleAddMultCollapse.apply_op(op, &mut fd).unwrap(), 0);
         // unchanged: still an INT_ADD with the inner sum in slot0 and c0 in slot1.
         assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_ADD);
         assert_eq!(op_in(&fd, op, 0), Some(innerout));
@@ -3414,7 +3463,7 @@ mod tests {
         wire(&mut fd, op, zw, 1);
         let _out = fd.fd.new_unique_out(4, op).expect("newUniqueOut");
 
-        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd).unwrap(), 1);
         // concatsize = 8 + 8 = 16 < 32 => op becomes ZEXT(newpiece), where
         // newpiece = PIECE(V, W) of size 16/8 = 2 bytes.
         assert_eq!(op_code(&fd, op), OpCode::CPUI_INT_ZEXT);
@@ -3449,7 +3498,7 @@ mod tests {
         let out = fd.fd.new_unique_out(4, op).expect("newUniqueOut");
         let _ = out;
 
-        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd).unwrap(), 1);
         // concatsize == 16 + 8*2 == 32 == out*8 => in-place PIECE(V, W).
         assert_eq!(op_code(&fd, op), OpCode::CPUI_PIECE);
         assert_eq!(op_in(&fd, op, 0), Some(v));
@@ -3474,7 +3523,7 @@ mod tests {
         wire(&mut fd, op, shout, 1);
         let _out = fd.fd.new_unique_out(4, op).expect("newUniqueOut");
 
-        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd), 1);
+        assert_eq!(RuleShiftPiece.apply_op(op, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, op), OpCode::CPUI_PIECE);
         assert_eq!(op_in(&fd, op, 0), Some(v));
         assert_eq!(op_in(&fd, op, 1), Some(w));
@@ -3506,7 +3555,7 @@ mod tests {
         wire(&mut fd, cmp, sbout, 0);
         wire(&mut fd, cmp, slessout, 1);
 
-        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd), 1);
+        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESSEQUAL);
         // zside==1: slot 1 = avn (a), slot 0 = bvn (b)
         assert_eq!(op_in(&fd, cmp, 1).unwrap(), a);
@@ -3531,7 +3580,7 @@ mod tests {
         wire(&mut fd, cmp, sbout, 0);
         wire(&mut fd, cmp, slessout, 1);
 
-        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd), 1);
+        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESS);
         // zside==0: slot 1 = avn (a), slot 0 = bvn (b)
         assert_eq!(op_in(&fd, cmp, 1).unwrap(), a);
@@ -3557,7 +3606,7 @@ mod tests {
         wire(&mut fd, cmp, sbout, 0);
         wire(&mut fd, cmp, slessout, 1);
 
-        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd), 0);
+        assert_eq!(RuleSborrow.apply_op(sbop, &mut fd).unwrap(), 0);
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_NOTEQUAL);
     }
 
@@ -3580,7 +3629,7 @@ mod tests {
         wire(&mut fd, cmp, scout, 0);
         wire(&mut fd, cmp, slessout, 1);
 
-        assert_eq!(RuleScarry.apply_op(scop, &mut fd), 1);
+        assert_eq!(RuleScarry.apply_op(scop, &mut fd).unwrap(), 1);
         assert_eq!(op_code(&fd, cmp), OpCode::CPUI_INT_SLESS);
         // zside==1: slot 1-zside(0) = avn (a), slot zside(1) = newConst
         assert_eq!(op_in(&fd, cmp, 0).unwrap(), a);

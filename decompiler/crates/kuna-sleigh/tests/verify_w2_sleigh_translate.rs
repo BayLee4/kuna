@@ -33,11 +33,11 @@ impl RegisterLookup for NoRegisters {
     fn get_register(&self, nm: &str) -> KunaResult<VarnodeStorage> {
         Err(KunaError::sleigh(format!("Unknown register name: {nm}")))
     }
-    fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> String {
-        String::new()
+    fn get_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> KunaResult<String> {
+        Ok(String::new())
     }
-    fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> String {
-        String::new()
+    fn get_exact_register_name(&self, _base: &Rc<AddrSpace>, _off: u64, _size: i32) -> KunaResult<String> {
+        Ok(String::new())
     }
 }
 
@@ -204,13 +204,13 @@ fn verify_w2translate_merge_sequence_spacebase_and_noname_join_oracle() {
         size,
     };
     let mut seq = vec![svn(4, 4), svn(0, 4)];
-    JoinRecord::merge_sequence(&mut seq, &NoRegisters);
+    JoinRecord::merge_sequence(&mut seq, &NoRegisters).unwrap();
     assert_eq!(seq.len(), 1, "spacebase pieces merge without a register name");
     assert_eq!((seq[0].offset, seq[0].size), (0, 8));
 
     let mut seq = vec![reg(&m, 6, 2), reg(&m, 4, 2)];
     let orig = seq.clone();
-    JoinRecord::merge_sequence(&mut seq, &NoRegisters);
+    JoinRecord::merge_sequence(&mut seq, &NoRegisters).unwrap();
     assert_eq!(seq, orig, "informal register merge keeps the original sequence");
 
     // contiguous registers, no parent name -> formal JoinRecord (offset 0

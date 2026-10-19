@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::spacetype;
 use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
@@ -267,7 +268,13 @@ impl kuna_sleigh::translate::PcodeEmit for Emit {
 fn signed(value: u64, size: u32) -> Option<i64> {
     let bits = size.checked_mul(8)?;
     match bits {
-        1..=63 => Some(((value << (64 - bits)) as i64) >> (64 - bits)),
+        1..=63 => {
+            let signed = ((value << (64 - bits)) as i64) >> (64 - bits);
+            // Raw machine constants may be width-masked or sign-extended.
+            // Reject other high bits rather than wrapping an out-of-width
+            // displacement into a small, apparently safe private-frame slot.
+            (value < (1u64 << bits) || value == signed as u64).then_some(signed)
+        }
         64 => Some(value as i64),
         _ => None,
     }
@@ -495,6 +502,9 @@ fn walk(
     memory_space: i32,
     link: Option<Storage>,
 ) -> Option<CalleeMemory> {
+    if !(1..=8).contains(&stack.size) {
+        return None;
+    }
     let mut result = CalleeMemory::default();
     let mut substantive = false;
     let mut initial = State::default();
@@ -645,15 +655,15 @@ fn walk(
     Some(result)
 }
 
-pub fn seed(arch: &mut crate::architecture::Architecture, fd: &mut Funcdata) {
+pub fn seed(arch: &mut crate::architecture::Architecture, fd: &mut Funcdata) -> KunaResult<()> {
     if !arch.stack_views && !arch.stack_alias_deadstore {
-        return;
+        return Ok(());
     }
     let Some(stack_space) = arch.manage().get_stack_space() else {
-        return;
+        return Ok(());
     };
     if !stack_space.stack_grows_negative() || stack_space.get_word_size() != 1 {
-        return;
+        return Ok(());
     }
     let Some(stack) = stack_space.get_spacebase(0).ok().and_then(|v| {
         v.space.map(|space| Storage {
@@ -662,20 +672,20 @@ pub fn seed(arch: &mut crate::architecture::Architecture, fd: &mut Funcdata) {
             size: v.size,
         })
     }) else {
-        return;
+        return Ok(());
     };
     let Some(register) = arch
         .manage()
         .get_space_by_name("register")
         .map(|s| s.get_index())
     else {
-        return;
+        return Ok(());
     };
     let Some(data_space) = arch.manage().get_default_data_space() else {
-        return;
+        return Ok(());
     };
     if data_space.get_word_size() != 1 {
-        return;
+        return Ok(());
     }
     let memory_space = data_space.get_index();
     let link = fd
@@ -686,16 +696,27 @@ pub fn seed(arch: &mut crate::architecture::Architecture, fd: &mut Funcdata) {
         .filter(|key| key.space == register);
     for i in 0..fd.num_calls() {
         let entry = fd.get_call_specs(i).get_entry_address().clone();
+        if !arch.is_body_entry(&entry) {
+            continue;
+        }
         let Some(space) = entry.get_space().filter(|_| !entry.is_invalid()) else {
             continue;
         };
         let key = (space.get_index(), entry.get_offset());
         if !arch.kuna_callee_memory_cache.contains_key(&key) {
             let translator = arch.translate();
+            let mut failure = None;
             let summary = walk(
                 |at| {
                     let mut emit = Emit::default();
-                    let length = translator.one_instruction(&mut emit, at).ok()?;
+                    let length = match translator.one_instruction(&mut emit, at) {
+                        Ok(length) => length,
+                        Err(err @ KunaError::Transport { .. }) => {
+                            failure = Some(err);
+                            return None;
+                        }
+                        Err(_) => return None,
+                    };
                     Some((length, emit.0))
                 },
                 &entry,
@@ -705,12 +726,16 @@ pub fn seed(arch: &mut crate::architecture::Architecture, fd: &mut Funcdata) {
                 link,
             )
             .unwrap_or_default();
+            if let Some(err) = failure {
+                return Err(err);
+            }
             arch.kuna_callee_memory_cache.insert(key, Rc::new(summary));
         }
         if let Some(summary) = arch.kuna_callee_memory_cache.get(&key) {
             fd.callee_memory.insert(key, Rc::clone(summary));
         }
     }
+    Ok(())
 }
 
 fn argument(
@@ -794,11 +819,9 @@ fn reaches(
 }
 
 /// Unknown code, aliases, returned pointers and escaped pointers remain observers.
-fn for_call<'a>(
+fn summary_for_call<'a>(
     fd: &'a Funcdata,
     call: &FuncCallSpecs,
-    start: u64,
-    size: i32,
 ) -> Option<&'a CalleeMemory> {
     if fd.obank().get(call.get_op())?.code() != OpCode::CPUI_CALL
         || !call.proto().has_store()
@@ -813,32 +836,8 @@ fn for_call<'a>(
     if !summary.complete || call.get_spacebase_offset() == OFFSET_UNKNOWN {
         return None;
     }
-    let space = fd.get_scope_local()?.get_space_id();
-    let mut floor = i64::from(crate::kuna_calleeprotostack::declared_caller_frame_floor(
-        true,
-        call.proto(),
-    )?);
-    for slot in 0..call.proto().num_params() {
-        let param = call.proto().get_param(slot)?;
-        let address = param.get_address();
-        if address.get_space().map(|s| s.get_index()) == Some(space.get_index()) {
-            let at = signed(address.get_offset(), space.get_addr_size())?;
-            if at < 0 || param.get_size() <= 0 {
-                return None;
-            }
-            floor = floor.max(at.checked_add(i64::from(param.get_size()))?);
-        }
-    }
-    let floor = i32::try_from(floor).ok()?;
-    if !crate::kuna_calleeprotostack::above_callee_frame(
-        space.wrap_offset(start.wrapping_sub(call.get_spacebase_offset())),
-        size,
-        space.get_addr_size() as i32,
-        floor,
-    ) {
-        return None;
-    }
     if summary.frame_return_read {
+        let space = fd.get_scope_local()?.get_space_id();
         let return_address = fd.get_arch().default_return_addr.as_ref()?;
         if !return_address
             .space
@@ -897,6 +896,150 @@ fn for_call<'a>(
         }
     }
     Some(summary)
+}
+
+/// The memory query additionally requires the caller bytes to be outside the
+/// callee's own frame and declared argument area.
+fn for_call<'a>(
+    fd: &'a Funcdata,
+    call: &FuncCallSpecs,
+    start: u64,
+    size: i32,
+) -> Option<&'a CalleeMemory> {
+    let summary = summary_for_call(fd, call)?;
+    let space = fd.get_scope_local()?.get_space_id();
+    let mut floor = i64::from(crate::kuna_calleeprotostack::declared_caller_frame_floor(
+        true,
+        call.proto(),
+    )?);
+    for slot in 0..call.proto().num_params() {
+        let param = call.proto().get_param(slot)?;
+        let address = param.get_address();
+        if address.get_space().map(|s| s.get_index()) == Some(space.get_index()) {
+            let at = signed(address.get_offset(), space.get_addr_size())?;
+            if at < 0 || param.get_size() <= 0 {
+                return None;
+            }
+            floor = floor.max(at.checked_add(i64::from(param.get_size()))?);
+        }
+    }
+    if !crate::kuna_calleeprotostack::above_callee_frame(
+        space.wrap_offset(start.wrapping_sub(call.get_spacebase_offset())),
+        size,
+        space.get_addr_size() as i32,
+        i32::try_from(floor).ok()?,
+    ) {
+        return None;
+    }
+    Some(summary)
+}
+
+/// Body evidence is not a binary "was written" fact: a save/restore is an
+/// identity, a known replacement is not, and a lost value proves neither.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EntryIdentity {
+    Unknown,
+    Preserved,
+    Changed,
+}
+
+impl CalleeMemory {
+    fn entry_identity(&self, raw: &VarnodeData, stack: Storage) -> EntryIdentity {
+        let Some(storage) = Storage::raw(raw) else {
+            return EntryIdentity::Unknown;
+        };
+        if !self.complete || self.returns.is_empty() || !(1..=8).contains(&stack.size) || raw.size != stack.size
+            || storage.space != stack.space || storage.overlaps(stack)
+        {
+            return EntryIdentity::Unknown;
+        }
+        let incoming = Value::Pointer(Origin::Register(storage), 0);
+        let mut unknown = false;
+        for state in &self.returns {
+            match state.read(raw, stack.space, stack) {
+                value if value == incoming => {}
+                Value::Unknown | Value::FrameFlag | Value::ReturnAddress => unknown = true,
+                _ => return EntryIdentity::Changed,
+            }
+        }
+        if unknown { EntryIdentity::Unknown } else { EntryIdentity::Preserved }
+    }
+}
+
+/// Exact-width physical entry identity at this actual direct call. The same
+/// conditional home/private-spill and return-slot alias obligations used by
+/// frame memory queries must be discharged before any snapshot is evidence.
+pub(crate) fn register_entry_identity(
+    fd: &Funcdata,
+    call: &FuncCallSpecs,
+    address: &Address,
+    size: i32,
+) -> EntryIdentity {
+    let proto = call.proto();
+    if !fd.get_arch().stack_views || size <= 0 || !proto.has_store() || !proto.has_model()
+        || proto.is_override() || proto.is_inline() || proto.is_no_return()
+        || proto.has_custom_storage() || proto.get_inject_id() >= 0
+        || proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0
+    {
+        return EntryIdentity::Unknown;
+    }
+    let Some(stack) = fd.get_arch().manage().get_stack_space()
+        .and_then(|space| space.get_spacebase(0).ok())
+        .and_then(|value| Some(Storage {
+            space: value.space?.get_index(),
+            offset: value.offset,
+            size: value.size,
+        }))
+    else {
+        return EntryIdentity::Unknown;
+    };
+    let raw = VarnodeData {
+        space: address.get_space().cloned(),
+        offset: address.get_offset(),
+        size: size as u32,
+    };
+    let Some(storage) = Storage::raw(&raw) else {
+        return EntryIdentity::Unknown;
+    };
+    if storage.space != stack.space || storage.size != stack.size || storage.overlaps(stack)
+        || proto.characterize_as_output(address, size) != crate::fspec::Containment::NoContainment
+    {
+        return EntryIdentity::Unknown;
+    }
+    // Model capacity is not the assigned result: characterize_as_output uses
+    // only the model when the output is unlocked. Concrete result storage must
+    // still remain a result, even when its datatype is not locked.
+    let output = proto.get_output();
+    let output_address = output.get_address();
+    if output.get_size() > 0 && !output_address.is_invalid() {
+        if output_address.is_join() {
+            let Ok(join) = fd.get_arch().manage().find_join(output_address.get_offset()) else {
+                return EntryIdentity::Unknown;
+            };
+            if (0..join.num_pieces()).any(|i| {
+                let piece = join.get_piece(i);
+                piece.size == 0 || piece.space.as_ref().is_none_or(|space| {
+                    storage.overlaps(Storage {
+                        space: space.get_index(), offset: piece.offset, size: piece.size,
+                    })
+                })
+            }) {
+                return EntryIdentity::Unknown;
+            }
+        } else if output_address.get_space().is_some_and(|space| {
+            storage.overlaps(Storage {
+                space: space.get_index(),
+                offset: output_address.get_offset(),
+                size: output.get_size() as u32,
+            })
+        }) {
+            return EntryIdentity::Unknown;
+        }
+    }
+    let Some(summary) = summary_for_call(fd, call) else {
+        return EntryIdentity::Unknown;
+    };
+    summary.entry_identity(&raw, stack)
 }
 
 #[cfg(test)]
@@ -1302,6 +1445,217 @@ mod tests {
             .is_none());
     }
 
+    fn test_stack() -> Storage {
+        Storage { space: 2, offset: 0x30, size: 8 }
+    }
+
+    #[test]
+    fn entry_identity_meets_every_normal_exit_without_inventing_unknown_values() {
+        let p = Program::new();
+        for (replacement, expected) in [
+            (p.reg(0x18), EntryIdentity::Preserved),
+            (p.c(7), EntryIdentity::Changed),
+            (p.reg(0x10), EntryIdentity::Changed),
+            (p.value(&p.unique, 0, 8), EntryIdentity::Unknown),
+        ] {
+            let summary = p.run(vec![
+                vec![p.op(OpCode::CPUI_CBRANCH, None, vec![
+                    p.value(&p.code, 2, 8), p.value(&p.register, 0x48, 1),
+                ])],
+                vec![p.op(OpCode::CPUI_COPY, Some(p.reg(0x18)), vec![p.reg(0x18)]), p.ret()],
+                vec![p.op(OpCode::CPUI_COPY, Some(p.reg(0x18)), vec![replacement]), p.ret()],
+            ]).unwrap();
+            assert_eq!(summary.returns.len(), 2);
+            assert_eq!(summary.entry_identity(&p.reg(0x18), test_stack()), expected);
+            assert_eq!(summary.entry_identity(&p.value(&p.register, 0x18, 4), test_stack()),
+                EntryIdentity::Unknown, "a full-width proof is not a fragment proof");
+            let mut incomplete = summary.clone();
+            incomplete.complete = false;
+            assert_eq!(incomplete.entry_identity(&p.reg(0x18), test_stack()), EntryIdentity::Unknown);
+            incomplete.complete = true;
+            incomplete.returns.clear();
+            assert_eq!(incomplete.entry_identity(&p.reg(0x18), test_stack()), EntryIdentity::Unknown);
+        }
+    }
+
+    fn saved_registers(p: &Program, overwrite: i64, width: u32) -> CalleeMemory {
+        let first = p.value(&p.unique, 0, 8);
+        let second = p.value(&p.unique, 8, 8);
+        let write = p.value(&p.unique, 16, 8);
+        p.run(vec![vec![
+            p.op(OpCode::CPUI_INT_ADD, Some(first.clone()), vec![p.reg(0x30), p.c((-8i64) as u64)]),
+            p.op(OpCode::CPUI_INT_ADD, Some(second.clone()), vec![p.reg(0x30), p.c((-24i64) as u64)]),
+            p.op(OpCode::CPUI_STORE, None, vec![p.c(1), first.clone(), p.reg(0x18)]),
+            p.op(OpCode::CPUI_STORE, None, vec![p.c(1), second.clone(), p.reg(0x10)]),
+            p.op(OpCode::CPUI_INT_ADD, Some(write.clone()), vec![p.reg(0x30), p.c(overwrite as u64)]),
+            p.op(OpCode::CPUI_STORE, None, vec![p.c(1), write, p.value(&p.constant, 7, width)]),
+            p.op(OpCode::CPUI_LOAD, Some(p.reg(0x18)), vec![p.c(1), first]),
+            p.op(OpCode::CPUI_LOAD, Some(p.reg(0x10)), vec![p.c(1), second]),
+            p.ret(),
+        ]]).unwrap()
+    }
+
+    #[test]
+    fn negative_saved_offsets_keep_disjoint_and_unrelated_restorations() {
+        let p = Program::new();
+        for (offset, width, expected) in [
+            (28, 16, EntryIdentity::Preserved),
+            (-16, 8, EntryIdentity::Preserved),
+            (-8, 4, EntryIdentity::Unknown),
+            (-4, 4, EntryIdentity::Unknown),
+            (-8, 8, EntryIdentity::Changed),
+        ] {
+            let summary = saved_registers(&p, offset, width);
+            assert_eq!(summary.entry_identity(&p.reg(0x18), test_stack()), expected,
+                "write {offset}:{width}");
+            assert_eq!(summary.entry_identity(&p.reg(0x10), test_stack()), EntryIdentity::Preserved,
+                "the separate -24 spill must survive write {offset}:{width}");
+        }
+    }
+
+    #[test]
+    fn actual_spill_walk_declines_bounded_machine_displacement_overflow() {
+        let p = Program::new();
+        for width in [4, 8, 9] {
+            for (offset, supported) in [
+                (-8i64, true),
+                (0x28, true),
+                (i64::MAX, false),
+                (0x7fff_ffff, false),
+                (-0x8000_0001, false),
+            ] {
+                let register = p.value(&p.register, 0x18, width);
+                let slot = p.value(&p.unique, 0, width);
+                let stack = Storage { space: 2, offset: 0x30, size: width };
+                let ops = vec![
+                    p.op(OpCode::CPUI_INT_ADD, Some(slot.clone()), vec![
+                        p.value(&p.register, 0x30, width),
+                        p.value(&p.constant, offset as u64, width),
+                    ]),
+                    p.op(OpCode::CPUI_STORE, None, vec![p.c(1), slot.clone(), register.clone()]),
+                    p.op(OpCode::CPUI_LOAD, Some(register.clone()), vec![p.c(1), slot]),
+                    p.op(OpCode::CPUI_RETURN, None, vec![p.value(&p.register, 0x40, width)]),
+                ];
+                let summary = walk(
+                    |_| Some((1, ops.clone())),
+                    &Address::new(Rc::clone(&p.code), 0),
+                    stack, 2, 1, Some(Storage { space: 2, offset: 0x40, size: width }),
+                );
+                assert_eq!(summary.is_some(), supported && width <= 8,
+                    "pointer width {width}, displacement {offset}");
+                if let Some(summary) = summary {
+                    assert_eq!(summary.entry_identity(&register, stack), EntryIdentity::Preserved);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn actual_preservation_consumer_requires_callsite_disjointness_and_source_authority() {
+        let p = Program::new();
+        let slot = p.value(&p.unique, 0, 8);
+        let summary = p.run(vec![vec![
+            p.op(OpCode::CPUI_INT_ADD, Some(slot.clone()), vec![p.reg(0x30), p.c((-16i64) as u64)]),
+            p.op(OpCode::CPUI_STORE, None, vec![p.c(1), slot.clone(), p.reg(0x18)]),
+            p.op(OpCode::CPUI_STORE, None, vec![p.c(1), p.reg(0x20), p.c(7)]),
+            p.op(OpCode::CPUI_LOAD, Some(p.reg(0x18)), vec![p.c(1), slot]),
+            p.ret(),
+        ]]).unwrap();
+        for (actual, expected) in [
+            (-64, EntryIdentity::Preserved),
+            (-116, EntryIdentity::Unknown),
+            (-112, EntryIdentity::Unknown),
+            (-104, EntryIdentity::Preserved),
+        ] {
+            let mut fx = Fx::with_stack_views();
+            let pointer = fx.frame_pointer(actual);
+            let call = make_call_site(&mut fx, pointer);
+            fx.fd.callee_memory.insert((fx.reg.get_index(), 0x2000), Rc::new(summary.clone()));
+            let index = fx.fd.get_call_specs_index(call).unwrap();
+            let entry = fx.fd.get_call_specs(index).get_entry_address().clone();
+            fx.fd.kuna_set_callee_ret_writes(&entry, Rc::new(
+                crate::kuna_rustabi::CalleeReturnWrites::from_parts(
+                    vec![(fx.reg.get_index(), 0x18, 8)], vec![], true,
+                ),
+            ));
+            let address = Address::new(Rc::clone(&fx.reg), 0x18);
+            assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8), expected);
+            assert_eq!(crate::p4_calls::kuna_calleepreserves::callee_preserves_range(
+                &fx.fd, fx.fd.get_call_specs(index), &address, 8),
+                expected == EntryIdentity::Preserved);
+            // Site authority must win even when the exact same body was proved.
+            fx.fd.get_call_specs_mut(index).proto_mut().set_override(true);
+            assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8),
+                EntryIdentity::Unknown);
+            fx.fd.get_call_specs_mut(index).proto_mut().set_override(false);
+            set_call_output_register(&mut fx, call, 0x18);
+            assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8),
+                EntryIdentity::Unknown, "an authored result is not a preservation fact");
+            for locked in [false, true] {
+                for (offset, width, overlaps) in [
+                    (0x14, 8, true), (0x1c, 4, true), (0x10, 8, false), (0x28, 4, false),
+                ] {
+                    let proto = fx.fd.get_call_specs_mut(index).proto_mut();
+                    proto.set_output(&ParameterPieces {
+                        addr: Address::new(Rc::clone(&fx.reg), offset),
+                        type_: Some(Rc::new(Datatype::new(width, type_metatype::TYPE_UINT))),
+                        flags: 0,
+                    });
+                    proto.set_output_lock(locked);
+                    assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8),
+                        if overlaps { EntryIdentity::Unknown } else { expected },
+                        "assigned output offset={offset:#x}, width={width}, locked={locked}");
+                }
+            }
+        }
+        for locked in [false, true] {
+            for overlaps in [false, true] {
+                let mut fx = Fx::with_stack_views_and_join();
+                let pointer = fx.frame_pointer(-64);
+                let call = make_call_site(&mut fx, pointer);
+                let index = fx.fd.get_call_specs_index(call).unwrap();
+                fx.fd.callee_memory.insert((fx.reg.get_index(), 0x2000), Rc::new(summary.clone()));
+                let join = fx.fd.get_arch().manage().find_add_join(&[
+                    kuna_base::space::VarnodeStorage {
+                        space: Some(Rc::clone(&fx.reg)), offset: if overlaps { 0x1c } else { 0x08 }, size: 4,
+                    },
+                    kuna_base::space::VarnodeStorage {
+                        space: Some(Rc::clone(&fx.reg)), offset: 0x40, size: 4,
+                    },
+                ], 0).unwrap();
+                let proto = fx.fd.get_call_specs_mut(index).proto_mut();
+                proto.set_output(&ParameterPieces {
+                    addr: join.get_unified().get_addr(),
+                    type_: Some(Rc::new(Datatype::new(8, type_metatype::TYPE_UINT))),
+                    flags: 0,
+                });
+                proto.set_output_lock(locked);
+                assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index),
+                    &Address::new(Rc::clone(&fx.reg), 0x18), 8),
+                    if overlaps { EntryIdentity::Unknown } else { EntryIdentity::Preserved },
+                    "JOIN result pieces, not its virtual address or lock, determine overlap");
+            }
+        }
+        let mut fx = Fx::with_stack_views();
+        let pointer = fx.frame_pointer(-64);
+        let call = make_call_site(&mut fx, pointer);
+        fx.fd.callee_memory.insert((fx.reg.get_index(), 0x2000), Rc::new(summary));
+        let index = fx.fd.get_call_specs_index(call).unwrap();
+        let address = Address::new(Rc::clone(&fx.reg), 0x18);
+        fx.fd.op_set_opcode_code(call, OpCode::CPUI_CALLIND);
+        assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8),
+            EntryIdentity::Unknown, "a direct target cache is not indirect-target authority");
+        fx.fd.op_set_opcode_code(call, OpCode::CPUI_CALL);
+        fx.fd.get_call_specs_mut(index).proto_mut().push_effect_override(
+            crate::fspec::EffectRecord::from_varnode(
+                VarnodeData { space: Some(Rc::clone(&fx.reg)), offset: 0x18, size: 8 },
+                crate::fspec::effect_type::KILLEDBYCALL,
+            ),
+        );
+        assert_eq!(register_entry_identity(&fx.fd, fx.fd.get_call_specs(index), &address, 8),
+            EntryIdentity::Unknown, "an authored effect wins over a restored body");
+    }
+
     #[test]
     fn pointer_stores_and_returns_retain_their_entry_identity() {
         let p = Program::new();
@@ -1599,7 +1953,7 @@ mod tests {
         let mut fx = Fx::new();
         let unknown = fx
             .fd
-            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None);
+            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None).unwrap();
         let call = make_call_site(&mut fx, unknown);
         fx.fd
             .callee_memory
@@ -1654,7 +2008,7 @@ mod tests {
         let mut fx = Fx::new();
         let unknown = fx
             .fd
-            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None);
+            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None).unwrap();
         let call = make_call_site(&mut fx, unknown);
         fx.fd
             .callee_memory
@@ -2092,7 +2446,7 @@ mod tests {
             8,
             &Address::new(Rc::clone(&fx.stack), (-56i64) as u64),
             None,
-        );
+        ).unwrap();
         let (_, placeholder) = fx.emit(OpCode::CPUI_COPY, &[stack_ref], Some(Out::Unique(8)));
         let placeholder = placeholder.unwrap();
         let target = fx.constant(8, 0x2000);
@@ -2204,7 +2558,7 @@ mod tests {
         let mut fx = Fx::new();
         let unresolved_actual = fx
             .fd
-            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None);
+            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None).unwrap();
         let call = install_call_summary(&mut fx, unresolved_actual);
         assert!(!test_call_summary_is_usable(&fx.fd, call, query, 8));
     }
@@ -2251,7 +2605,7 @@ mod tests {
         let mut fx = Fx::new();
         let unresolved_actual = fx
             .fd
-            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None);
+            .new_varnode(8, &Address::new(Rc::clone(&fx.reg), 0x88), None).unwrap();
         let call = install_call_summary_with_stack_base(&mut fx, unresolved_actual, 8);
         assert!(!test_call_summary_is_usable(&fx.fd, call, query, 8));
     }

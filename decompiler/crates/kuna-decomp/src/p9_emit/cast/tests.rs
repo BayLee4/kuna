@@ -123,6 +123,23 @@ fn strategy_java() -> CastStrategyJava {
     CastStrategyJava::new(Rc::new(f))
 }
 
+#[test]
+fn selected_strategy_uses_java_narrow_integer_extension_rules() {
+    let factory = TypeFactoryImpl::new();
+    factory.set_default_alignment_map();
+    factory.set_max_basetype_size(8);
+    factory.setup_sizes(Some(4), 8, 8);
+    let factory: Rc<dyn TypeFactory> = Rc::new(factory);
+    let short = factory.get_base(2, type_metatype::TYPE_UINT).unwrap();
+    let int = factory.get_base(4, type_metatype::TYPE_INT).unwrap();
+    let c = LanguageCastStrategy::new(Rc::clone(&factory), crate::kuna_lang::OutLang::C, false);
+    let rust = LanguageCastStrategy::new(Rc::clone(&factory), crate::kuna_lang::OutLang::Rust, false);
+    let java = LanguageCastStrategy::new(factory, crate::kuna_lang::OutLang::Java, false);
+    assert!(c.is_zext_cast(&int, &short));
+    assert!(rust.is_zext_cast(&int, &short));
+    assert!(!java.is_zext_cast(&int, &short), "A non-char Java short sign-extends even when p-code stores it as UINT");
+}
+
 /// `castPrinted(opc, t1, t2)` for the non-comparison ops drives
 /// `TypeOpCopy::getInputCast` (typeop.cc:398-404):
 /// `castStandard(reqtype=t1, curtype=t2, care_uint_int=false, care_ptr_uint=true)`.
@@ -394,7 +411,7 @@ fn mark_explicit_unsigned_basic() {
     let other = ctx.add_var(4, int_t(4));
     let out = ctx.add_var(4, int_t(4));
     let op = ctx.add_op(OpCode::CPUI_INT_OR, vec![cst, other], Some(out));
-    assert!(s.mark_explicit_unsigned(&mut ctx, op, 0));
+    assert!(s.mark_explicit_unsigned(&mut ctx, op, 0).unwrap());
     assert!(ctx.unsigned_marked(cst));
 
     // If the other side is UINT, the operation forces unsigned anyway -> not marked.
@@ -402,7 +419,7 @@ fn mark_explicit_unsigned_basic() {
     let cst2 = ctx2.add_const(4, 5, uint_t(4));
     let other2 = ctx2.add_var(4, uint_t(4));
     let op2 = ctx2.add_op(OpCode::CPUI_INT_OR, vec![cst2, other2], None);
-    assert!(!s.mark_explicit_unsigned(&mut ctx2, op2, 0));
+    assert!(!s.mark_explicit_unsigned(&mut ctx2, op2, 0).unwrap());
 }
 
 // -- int_promotion_type / local_extension_type (cast.cc:140-247) ------------
@@ -413,7 +430,7 @@ fn int_promotion_no_promotion_for_full_size() {
     let mut ctx = MockCtx::new();
     // size >= promoteSize(4) -> NO_PROMOTION regardless of contents.
     let v = ctx.add_var(4, int_t(4));
-    assert_eq!(s.int_promotion_type(&ctx, v), IntPromotionCode::NO_PROMOTION);
+    assert_eq!(s.int_promotion_type(&ctx, v).unwrap(), IntPromotionCode::NO_PROMOTION);
 }
 
 #[test]
@@ -423,7 +440,7 @@ fn int_promotion_explicit_small_is_no_promotion() {
     let v = ctx.add_var(2, int_t(2));
     ctx.set_explicit(v, true);
     // explicit small non-constant -> NO_PROMOTION
-    assert_eq!(s.int_promotion_type(&ctx, v), IntPromotionCode::NO_PROMOTION);
+    assert_eq!(s.int_promotion_type(&ctx, v).unwrap(), IntPromotionCode::NO_PROMOTION);
 }
 
 #[test]
@@ -433,13 +450,13 @@ fn local_extension_constant_high_bit_zero_is_either() {
     // small UINT constant, high bit clear -> EITHER_EXTENSION
     let c = ctx.add_const(2, 5, uint_t(2));
     assert_eq!(
-        s.local_extension_type(&ctx, c, None),
+        s.local_extension_type(&ctx, c, None).unwrap(),
         IntPromotionCode::EITHER_EXTENSION
     );
     // small INT constant, high bit set -> natural (SIGNED)
     let c2 = ctx.add_const(2, 0x8000, int_t(2));
     assert_eq!(
-        s.local_extension_type(&ctx, c2, None),
+        s.local_extension_type(&ctx, c2, None).unwrap(),
         IntPromotionCode::SIGNED_EXTENSION
     );
 }
@@ -634,8 +651,8 @@ impl CastContext for MockCtx {
     fn vn_high_type(&self, vn: VnRef) -> Rc<Datatype> {
         Rc::clone(&self.vns[vn.0].ty)
     }
-    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> Rc<Datatype> {
-        Rc::clone(&self.vns[vn.0].ty)
+    fn vn_high_type_read_facing(&self, vn: VnRef, _op: OpRef) -> KunaResult<Rc<Datatype>> {
+        Ok(Rc::clone(&self.vns[vn.0].ty))
     }
     fn op_inherits_sign(&self, op: OpRef) -> bool {
         crate::typeop::type_op_info(self.ops[op.0].code).inherits_sign()

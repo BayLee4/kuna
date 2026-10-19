@@ -317,7 +317,7 @@ fn action_inert_when_gate_off() {
     let blocks_before = fd.bblocks_get_size();
     let mut act = ActionStripStackGuard::new(false, "stackptrflow");
     let mut ctx = ActionContext::default();
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0, "gate off => inert");
     assert_eq!(fd.bblocks_get_size(), blocks_before, "CFG untouched");
 }
@@ -337,7 +337,7 @@ fn action_strips_canary_edge_when_on() {
     assert_eq!(fd.bblocks_ref().block(h).size_out(), 2, "header has both edges before strip");
     let mut act = ActionStripStackGuard::new(true, "stackptrflow");
     let mut ctx = ActionContext::default();
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 1, "strip applied => change reported");
     assert_eq!(
         fd.bblocks_ref().block(h).size_out(),

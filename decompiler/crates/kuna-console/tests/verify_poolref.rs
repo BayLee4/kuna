@@ -55,7 +55,7 @@ fn index() -> XrefIndex {
     let file = object::File::parse(&*bytes).expect("fixture parses");
     let seeds: Vec<u64> =
         prog.function_entries_canonical().iter().map(|e| e.addr.get_offset()).collect();
-    xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds)
+    xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap()
 }
 
 /// The defect: the literal is referenced from the instruction that loads its

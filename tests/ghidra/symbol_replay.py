@@ -9,7 +9,7 @@ import traceback
 
 import pyghidra
 
-from kuna_vs_stock import KUNA_GHIDRA, REPO, get_exepath_field, start_ghidra
+from kuna_vs_stock import KUNA_GHIDRA, REPO, get_exepath_field, start_ghidra, test_cores
 
 
 def main():
@@ -57,7 +57,7 @@ def main():
             with pyghidra.open_program(Path(REPO) / "tests/bug-repro/faillog", project_location=directory,
                                       project_name="symbols", analyze=True) as api:
                 program = api.getCurrentProgram()
-                for core in ("stock", "kuna"):
+                for core in test_cores():
                     field.set(None, KUNA_GHIDRA if core == "kuna" else None)
                     interface = DecompInterface()
                     interface.setOptions(DecompileOptions())
@@ -184,6 +184,8 @@ def main():
                                 rename = {"case": "committed_dynamic_rename", "core": core, "passed": False}
                                 rows.append(rename)
                                 try:
+                                    interface.flushCache()
+                                    high = decompile(interface, function).getHighFunction()
                                     symbols = [symbol for symbol in high.getLocalSymbolMap().getSymbols()
                                                if str(symbol.getName()) == "v1"]
                                     assert len(symbols) == 1, symbols

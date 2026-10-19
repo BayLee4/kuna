@@ -33,16 +33,15 @@
 //! member pointer arithmetic via the looping `downChain`), INT_XOR/INT_AND
 //! (enum + float sign-manipulation), INT_OR (enum only), PIECE/SUBPIECE
 //! (the `resizePointer`/`getSubType`/`findTruncation` composite/truncation arms),
-//! SEGMENT (`resizePointer`) and NEW (cpool result).  The remaining seams are the
-//! W8 union mid-flow resolution (`needsResolution`/`resolveInFlow`), the
-//! type-locked SymbolEntry `getExactPiece` seed, and the
-//! `propagateSpacebaseRef`/`applyTypeRecommendations` aliasing passes; those arms
-//! conservatively decline (return `None`/no-op), which is faithful — the C++ also
-//! returns null along those edges when the supporting surface doesn't apply.
+//! SEGMENT (`resizePointer`) and NEW (cpool result). Union mid-flow resolution
+//! and spacebase symbol acquisition propagate query errors to the inference
+//! Action; genuine non-propagating edges remain `Ok(None)`. The DFS releases
+//! its active Varnode marks before forwarding a failed acquisition.
 
 use std::rc::Rc;
 
 use kuna_base::address::{calc_mask, Address};
+use kuna_base::error::KunaResult;
 use kuna_base::space::AddrSpace;
 use kuna_base::types::{int4, int8, uintb};
 use kuna_num::opcodes::OpCode;
@@ -50,13 +49,13 @@ use kuna_num::opcodes::OpCode;
 use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::funcdata::Funcdata;
 use crate::context::{OpId, VarnodeId};
-use crate::typeop::type_op_info;
 
 /// Resolve `op->outputTypeLocal()` / `op->inputTypeLocal(slot)` faithfully via the
 /// W6 typeop inst table (`getOutputLocal`/`getInputLocal`).  Falls back to a
 /// size-correct `TYPE_UNKNOWN` if the factory query fails (the C++ getBase never
 /// fails for a valid size).
-pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
+pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> KunaResult<Rc<Datatype>> {
+    if let Some(ty) = data.cpool_output_type_local(op)? { return Ok(ty); }
     let arch = Rc::clone(data.get_arch());
     let o = data.obank().get(op).expect("output_type_local: stale op");
     let out_size = o
@@ -75,16 +74,25 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
             .and_then(|v| data.vbank().get(v))
             .map(|v| v.get_offset())
             .unwrap_or(0);
+        if o.does_special_propagation()
+            && o.get_out().is_some()
+            && arch.userops.get_op(in0_off as u32)
+                .is_some_and(|userop| userop.get_type() == crate::userop::userop_type::volatile_read)
+        {
+            if let Some(ty) = volatile_source_type(data, o, out_size)? {
+                return Ok(ty);
+            }
+        }
         if in0_off == crate::userop::BUILTIN_STRINGDATA as u64 {
             if let Some(out) = o.get_out().and_then(|v| data.vbank().get(v)) {
-                return Rc::clone(out.get_type());
+                return Ok(Rc::clone(out.get_type()));
             }
         }
         // (kuna strlenscan) `DatatypeUserOp::getOutputLocal` for the `strlen`
         // builtin: the length is an unsigned integer of the output's width.
         if in0_off == crate::userop::BUILTIN_STRLEN as u64 {
             if let Some(Ok(t)) = arch.types().map(|t| t.get_base(out_size, type_metatype::TYPE_UINT)) {
-                return t;
+                return Ok(t);
             }
         }
     }
@@ -95,20 +103,43 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> Rc<Datatype> {
     // known-proto function (e.g. `int4 *obtainPtr(char *)`) type its return Varnode
     // directly, so `ActionSetCasts` inserts no spurious `(int4 *)` cast.
     if o.code() == OpCode::CPUI_CALL || o.code() == OpCode::CPUI_CALLIND {
-        if let Some(ct) = call_output_type_local(data, op, o.code()) {
-            return ct;
+        if let Some(ct) = call_output_type_local(data, op, o.code())? {
+            return Ok(ct);
         }
     }
-    let info = type_op_info(o.code());
-    match arch.types() {
+    let info = arch.type_op_info(o.code());
+    Ok(match arch.types() {
         Some(tlst) => info
             .get_output_local(tlst, out_size)
             .unwrap_or_else(|_| Rc::new(Datatype::new(out_size, type_metatype::TYPE_UNKNOWN))),
         None => Rc::new(Datatype::new(out_size, type_metatype::TYPE_UNKNOWN)),
+    })
+}
+
+/// VolatileReadOp::getOutputLocal / VolatileWriteOp::getInputLocal use the
+/// operation's special-propagation authority, not SymbolEntry::updateType's
+/// additional Symbol typelock filter.
+fn volatile_source_type(
+    data: &Funcdata,
+    op: &crate::op::PcodeOp,
+    size: int4,
+) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(annotation) = op.get_in(1).and_then(|value| data.vbank().get(value))
+        .filter(|value| value.is_annotation()) else { return Ok(None) };
+    let arch = data.get_arch();
+    let Some(container) = arch.query_container_global(annotation.get_addr(), size, op.get_addr())?
+        else { return Ok(None) };
+    let Some(source) = container.symbol_type else { return Ok(None) };
+    let offset = (annotation.get_addr().get_offset()
+        .wrapping_sub(container.entry_addr.get_offset()) as int4)
+        .wrapping_add(container.symbol_offset);
+    match arch.types() {
+        Some(types) => types.get_exact_piece(source, offset, size),
+        None => Ok(None),
     }
 }
 
-pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Datatype> {
+pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> KunaResult<Rc<Datatype>> {
     input_type_local_with(data, op, slot, true)
 }
 
@@ -116,11 +147,11 @@ pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Data
 /// type a call argument is REQUIRED to have, which is what a cast is measured
 /// against.  A recovered type is a vote about the value, not a declaration the
 /// value must be converted to, so it never emits a cast.
-pub(crate) fn declared_input_type_local(data: &Funcdata, op: OpId, slot: int4) -> Rc<Datatype> {
+pub(crate) fn declared_input_type_local(data: &Funcdata, op: OpId, slot: int4) -> KunaResult<Rc<Datatype>> {
     input_type_local_with(data, op, slot, false)
 }
 
-fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool) -> Rc<Datatype> {
+fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool) -> KunaResult<Rc<Datatype>> {
     let arch = Rc::clone(data.get_arch());
     let o = data.obank().get(op).expect("input_type_local: stale op");
     let opcode = o.code();
@@ -130,14 +161,25 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
         .map(|v| v.get_size())
         .unwrap_or(1);
 
+    if opcode == OpCode::CPUI_CALLOTHER && slot == 2 && o.does_special_propagation()
+        && o.get_in(slot).is_some()
+        && o.get_in(0).and_then(|v| data.vbank().get(v))
+            .and_then(|index| arch.userops.get_op(index.get_offset() as u32))
+            .is_some_and(|userop| userop.get_type() == crate::userop::userop_type::volatile_write)
+    {
+        if let Some(ty) = volatile_source_type(data, o, in_size)? {
+            return Ok(ty);
+        }
+    }
+
     // C++ `TypeOpCall::getInputLocal` (typeop.cc:689) / `TypeOpCallind` (typeop.cc:763):
     // for a slot>0 whose in(0) is an fspec (CALL) / code-pointer (CALLIND) reference
     // with a recovered prototype, the suggested input type is the *callee's* locked
     // parameter type.  This is what flows a typed call argument (e.g. a `mystruct *`)
     // back onto the argument Varnode so the stack-frame member access is recovered.
     if (opcode == OpCode::CPUI_CALL || opcode == OpCode::CPUI_CALLIND) && slot > 0 {
-        if let Some(ct) = call_input_type_local(data, op, slot, opcode, recovered) {
-            return ct;
+        if let Some(ct) = call_input_type_local(data, op, slot, opcode, recovered)? {
+            return Ok(ct);
         }
     }
 
@@ -151,7 +193,7 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
         if let Some(tlst) = arch.types() {
             let ws = data.get_arch().manage().get_default_data_space().map(|s| s.get_word_size()).unwrap_or(1);
             if let Ok(ptr) = tlst.get_type_char(1).and_then(|c| tlst.get_type_pointer(in_size, c, ws)) {
-                return ptr;
+                return Ok(ptr);
             }
         }
     }
@@ -165,7 +207,7 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
         // (kuna `calltargettype`) A target cast at the call is cast to the
         // function-pointer type the call itself states.
         if let Some(ct) = data.kuna_call_target_type(op) {
-            return ct;
+            return Ok(ct);
         }
         if let Some(tlst) = arch.types() {
             let code = tlst.get_type_code().unwrap_or_else(|_| {
@@ -174,7 +216,7 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
             let spc = o.get_addr().get_space().cloned();
             let wordsize = spc.as_ref().map(|s| s.get_word_size()).unwrap_or(1);
             if let Ok(ptr) = tlst.get_type_pointer(in_size, code, wordsize) {
-                return ptr;
+                return Ok(ptr);
             }
         }
     }
@@ -192,18 +234,18 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
     if opcode == OpCode::CPUI_RETURN && slot >= 1 && data.get_func_proto().has_store() {
         if let Some(ct) = data.get_func_proto().get_output_type() {
             if ct.get_metatype() != type_metatype::TYPE_VOID && ct.get_size() == in_size {
-                return Rc::clone(ct);
+                return Ok(Rc::clone(ct));
             }
         }
     }
 
-    let info = type_op_info(opcode);
-    match arch.types() {
+    let info = arch.type_op_info(opcode);
+    Ok(match arch.types() {
         Some(tlst) => info
             .get_input_local(tlst, slot, in_size)
             .unwrap_or_else(|_| Rc::new(Datatype::new(in_size, type_metatype::TYPE_UNKNOWN))),
         None => Rc::new(Datatype::new(in_size, type_metatype::TYPE_UNKNOWN)),
-    }
+    })
 }
 
 /// The callee-parameter arm of `TypeOpCall::getInputLocal` / `TypeOpCallind::getInputLocal`
@@ -219,11 +261,13 @@ fn call_input_type_local(
     slot: int4,
     opcode: OpCode,
     recovered: bool,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     // C++: vn = op->getIn(0); for a CALL the prototype lives only when in(0) is an
     // fspec reference (CALLIND always consults the recovered spec).
     if opcode == OpCode::CPUI_CALL {
-        let in0 = data.obank().get(op)?.get_in(0)?;
+        let Some(in0) = data.obank().get(op).and_then(|operation| operation.get_in(0)) else {
+            return Ok(None);
+        };
         let is_fspec = data
             .vbank()
             .get(in0)
@@ -231,7 +275,7 @@ fn call_input_type_local(
             .map(|s| s.get_type() == kuna_base::space::spacetype::IPTR_FSPEC)
             .unwrap_or(false);
         if !is_fspec {
-            return None;
+            return Ok(None);
         }
     }
     // Resolve the FuncCallSpecs for this op (the C++ `getFspecFromConst` pointer
@@ -244,37 +288,99 @@ fn call_input_type_local(
             break;
         }
     }
-    let fc = fc?;
+    let Some(fc) = fc else { return Ok(None) };
     // param = fc->getParam(slot - 1)
     let proto = fc.proto();
-    let arg_size =
-        data.obank().get(op).and_then(|o| o.get_in(slot)).and_then(|v| data.vbank().get(v)).map(|v| v.get_size())?;
+    let Some(argument) =
+        data.obank().get(op).and_then(|o| o.get_in(slot)).and_then(|v| data.vbank().get(v))
+    else { return Ok(None) };
+    let arg_size = argument.get_size();
     if let Some(param) = proto.get_param(slot - 1) {
+        let source_assembly = proto.has_custom_storage() || proto.is_inline()
+            || proto.get_inject_id() >= 0
+            || (proto.has_model() && (proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0))
+            || param.is_hidden_return() || param.is_indirect_storage() || param.is_this_pointer()
+            || param.get_address().get_space().is_some_and(|space| {
+                space.get_type() == kuna_base::space::spacetype::IPTR_JOIN
+            });
+        let physical = fc.final_input_storage().get((slot - 1) as usize);
+        if !source_assembly && physical.is_some_and(|(physical, width)| {
+            *width == arg_size
+                && (*width != param.get_size() || *physical != param.get_address())
+        }) {
+            // A source formal can describe only a slice of the actual incoming
+            // carrier. Its BOOL/enum/narrow type is not a whole-carrier vote or
+            // cast requirement; doing so discards independently consumed bits.
+            // Preserve genuine whole-value integer evidence independently of
+            // that slice. A representable constant alone is not evidence: the
+            // exact callee operand must have read every incoming byte under an
+            // intrinsic integer policy, and the caller must prove zero upper
+            // bits of a plain integer's least-significant source slice.
+            let source_integer = param.get_type().is_some_and(|ty| {
+                matches!(ty.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT)
+                    && !ty.is_enum_type()
+            });
+            let current = argument.get_type();
+            if recovered && source_integer && (1..=8).contains(&arg_size)
+                && (1..arg_size).contains(&param.get_size())
+                && matches!(current.get_metatype(), type_metatype::TYPE_UNKNOWN
+                    | type_metatype::TYPE_INT | type_metatype::TYPE_UINT)
+                && !current.is_enum_type()
+                && argument.get_nz_mask() & !kuna_base::address::calc_mask(param.get_size()) == 0
+            {
+                let (address, width) = physical.expect("checked finalized physical input");
+                if address.justified_contain(*width, &param.get_address(), param.get_size(), false) == 0 {
+                    if let (Some(types), Some(body)) = (
+                        data.get_arch().types(), data.kuna_callee_entry_dead(fc.get_entry_address()),
+                    ) {
+                        let mut vote: Option<Rc<Datatype>> = None;
+                        for (opcode, input_slot) in body.input_type_hints(address, *width) {
+                            let candidate = data.get_arch().type_op_info(opcode)
+                                .get_input_local(types, input_slot, *width)?;
+                            if candidate.get_size() != arg_size || candidate.is_enum_type()
+                                || !matches!(candidate.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT)
+                            {
+                                continue;
+                            }
+                            let replace = match vote.as_ref() {
+                                Some(old) => candidate.type_order(old)? < 0,
+                                None => true,
+                            };
+                            if replace {
+                                vote = Some(candidate);
+                            }
+                        }
+                        return Ok(vote);
+                    }
+                }
+            }
+            return Ok(None);
+        }
         if param.is_type_locked() {
-            let ct = param.get_type()?;
+            let Some(ct) = param.get_type() else { return Ok(None) };
             // (ct->metatype != VOID) && (ct->size <= op->getIn(slot)->size)
             if ct.get_metatype() != type_metatype::TYPE_VOID && ct.get_size() <= arg_size {
                 // (kuna `libctypes`) A libc aggregate the caller reads past the end
                 // of is a larger object that starts with one; the vote (never the
                 // cast's required type) falls back to `void *`. See `kuna_libcfit`.
                 if recovered && crate::kuna_libcfit::overruns(data, op, slot, ct) {
-                    return crate::kuna_libcfit::width_stable_vote(data, ct);
+                    return Ok(crate::kuna_libcfit::width_stable_vote(data, ct));
                 }
-                return Some(Rc::clone(ct));
+                return Ok(Some(Rc::clone(ct)));
             }
-            return None;
+            return Ok(None);
         } else if param.is_this_pointer() {
             // Known "this" pointer is effectively typelocked: a struct pointer flows.
-            let ct = param.get_type()?;
+            let Some(ct) = param.get_type() else { return Ok(None) };
             if ct.get_metatype() == type_metatype::TYPE_PTR
                 && ct
                     .get_ptr_to()
                     .map(|p| p.get_metatype() == type_metatype::TYPE_STRUCT)
                     .unwrap_or(false)
             {
-                return Some(Rc::clone(ct));
+                return Ok(Some(Rc::clone(ct)));
             }
-            return None;
+            return Ok(None);
         }
     }
     let vararg = if recovered {
@@ -283,16 +389,18 @@ fn call_input_type_local(
         crate::kuna_varargfloat::argument_requirement(data, fc, op, slot)
     };
     if vararg.is_some() {
-        return vararg;
+        return Ok(vararg);
     }
     if !recovered {
-        return crate::kuna_floatreg::argument_requirement(data, fc, op, slot);
+        return Ok(crate::kuna_floatreg::argument_requirement(data, fc, op, slot));
     }
     if proto.is_input_locked() {
-        return None;
+        return Ok(None);
     }
-    crate::kuna_protoorder::call_argument_vote(data, op, fc, slot, arg_size)
-        .or_else(|| crate::kuna_floatreg::argument_vote(data, fc, op, slot))
+    match crate::kuna_protoorder::call_argument_vote(data, op, fc, slot, arg_size)? {
+        Some(vote) => Ok(Some(vote)),
+        None => crate::kuna_floatreg::argument_vote(data, fc, op, slot),
+    }
 }
 
 /// The locked-output arm of `TypeOpCall::getOutputLocal` (typeop.cc:722-738) /
@@ -300,11 +408,13 @@ fn call_input_type_local(
 /// for the CALL/CALLIND op and, if its output prototype is locked (committed) and
 /// non-VOID, return that return data-type.  `None` falls back to the generic
 /// size-only `getOutputLocal`.
-fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<Rc<Datatype>> {
+fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> KunaResult<Option<Rc<Datatype>>> {
     // C++ `TypeOpCall`: the prototype lives only when in(0) is an fspec reference;
     // a CALL whose in(0) is not an fspec falls through to the default.
     if opcode == OpCode::CPUI_CALL {
-        let in0 = data.obank().get(op)?.get_in(0)?;
+        let Some(in0) = data.obank().get(op).and_then(|operation| operation.get_in(0)) else {
+            return Ok(None);
+        };
         let is_fspec = data
             .vbank()
             .get(in0)
@@ -312,7 +422,7 @@ fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<R
             .map(|s| s.get_type() == kuna_base::space::spacetype::IPTR_FSPEC)
             .unwrap_or(false);
         if !is_fspec {
-            return None;
+            return Ok(None);
         }
     }
     // Resolve the FuncCallSpecs for this op (C++ `getFspecFromConst` for CALL /
@@ -325,35 +435,45 @@ fn call_output_type_local(data: &Funcdata, op: OpId, opcode: OpCode) -> Option<R
             break;
         }
     }
-    let fc = fc?;
+    let Some(fc) = fc else { return Ok(None) };
     let proto = fc.proto();
     if !proto.is_output_locked() {
-        let size = data.obank().get(op)?.get_out().and_then(|v| data.vbank().get(v)).map(|v| v.get_size())?;
-        return crate::p4_calls::kuna_passthrough::tail_return_type(data, op, size)
-            .or_else(|| crate::p4_calls::kuna_callrettype::stated_return_type(data, op, fc))
-            .or_else(|| crate::p4_calls::kuna_narrowret::stated_type(data, op, fc, size))
-            .or_else(|| crate::kuna_floatreg::jump_result_type(data, op, size));
+        let Some(size) = data.obank().get(op).and_then(|operation| operation.get_out())
+            .and_then(|v| data.vbank().get(v)).map(|v| v.get_size()) else {
+            return Ok(None);
+        };
+        let vote = match crate::p4_calls::kuna_passthrough::tail_return_type(data, op, size) {
+            Some(vote) => Some(vote),
+            None => crate::p4_calls::kuna_callrettype::stated_return_type(data, op, fc)?,
+        };
+        if let Some(vote) = vote {
+            return Ok(Some(vote));
+        }
+        if let Some(vote) = crate::p4_calls::kuna_narrowret::stated_type(data, op, fc, size) {
+            return Ok(Some(vote));
+        }
+        return crate::kuna_floatreg::jump_result_type(data, op, size);
     }
-    let ct = proto.get_output_type()?;
+    let Some(ct) = proto.get_output_type() else { return Ok(None) };
     if ct.get_metatype() == type_metatype::TYPE_VOID {
-        return None;
+        return Ok(None);
     }
-    Some(Rc::clone(ct))
+    Ok(Some(Rc::clone(ct)))
 }
 
 /// C++ `Varnode::getLocalType(bool &blockup)` (varnode.cc:919).  Determine an
 /// initial Datatype from the defining op's output and the reading ops' input
 /// requirements, picking the most-specific (`typeOrder`).  Returns the local type
 /// and whether up-propagation should be blocked (`def->stopsTypePropagation()`).
-fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
+fn get_local_type(data: &Funcdata, vn: VarnodeId) -> KunaResult<(Rc<Datatype>, bool)> {
     let v = data.vbank().get(vn).expect("get_local_type: stale vn");
     if v.is_type_lock() {
-        return (Rc::clone(v.get_type()), false);
+        return Ok((Rc::clone(v.get_type()), false));
     }
     let mut ct: Option<Rc<Datatype>> = None;
     let mut blockup = false;
     if let Some(def) = v.get_def() {
-        ct = Some(output_type_local(data, def));
+        ct = Some(output_type_local(data, def)?);
         let stops = data
             .obank()
             .get(def)
@@ -361,14 +481,14 @@ fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
             .unwrap_or(false);
         if stops {
             blockup = true;
-            return (ct.unwrap(), blockup);
+            return Ok((ct.unwrap(), blockup));
         }
     }
     // for each reading op: newct = op->inputTypeLocal(slot); pick the more specific.
     let descend: Vec<OpId> = v.descend_iter().collect();
     for op in descend {
         let slot = data.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(0);
-        let newct = input_type_local(data, op, slot);
+        let newct = input_type_local(data, op, slot)?;
         ct = Some(match ct {
             None => newct,
             Some(cur) => {
@@ -383,16 +503,16 @@ fn get_local_type(data: &Funcdata, vn: VarnodeId) -> (Rc<Datatype>, bool) {
     // C++ throws on a null local type; a live Varnode always has a def or a
     // descendant, but guard with a size-correct UNKNOWN to avoid a panic.
     let ct = ct.unwrap_or_else(|| Rc::new(Datatype::new(v.get_size(), type_metatype::TYPE_UNKNOWN)));
-    (ct, blockup)
+    Ok((ct, blockup))
 }
 
 /// C++ `ActionInferTypes::buildLocaltypes` (coreaction.cc:5262): seed each live
 /// Varnode's temp type from local info.  (The type-locked SymbolEntry piece path
 /// is a W4 surface — absent symbols fall through to the plain `getLocalType`.)
-fn build_localtypes(data: &mut Funcdata) {
+fn build_localtypes(data: &mut Funcdata) -> KunaResult<()> {
     let order: Vec<VarnodeId> = data.vbank().iter_loc().collect();
     let mut elem_cache = crate::kuna_elemptr::Cache::default();
-    let float_bits = crate::kuna_floatbits::Plan::of(data);
+    let float_bits = crate::kuna_floatbits::Plan::of(data)?;
     if float_bits.types_a_return() {
         data.kuna_note_float_bits_return();
     }
@@ -436,14 +556,14 @@ fn build_localtypes(data: &mut Funcdata) {
             // the C++ seed arm leaves `needsBlock` false).
             Some(ct) => (ct, false),
             // No type-locked cover, or the piece floated: fall back to getLocalType.
-            None => get_local_type(data, vn),
+            None => get_local_type(data, vn)?,
         };
         // (kuna `calleevote`) The type every caller passes for this input, where
         // the fold says no more than "a pointer-width value".  See `kuna_calleevote`.
         let ct = if from_seed {
             ct
         } else {
-            crate::kuna_calleevote::input_vote(data, vn, &ct).unwrap_or(ct)
+            crate::kuna_calleevote::input_vote(data, vn, &ct)?.unwrap_or(ct)
         };
         // (kuna `elfmain`) An executable's own `main` gives the runtime arguments
         // its body reads their runtime types, unlocked. See `kuna_elfmaindecl`.
@@ -467,7 +587,7 @@ fn build_localtypes(data: &mut Funcdata) {
             if ct.get_metatype() == type_metatype::TYPE_PTR {
                 ct
             } else {
-                match crate::kuna_ptrfromuse::pointer_from_use(data, vn, mode) {
+                match crate::kuna_ptrfromuse::pointer_from_use(data, vn, mode)? {
                     Some(cand) if crate::kuna_ptrfromuse::folds_over(&cand, &ct) => cand,
                     _ => ct,
                 }
@@ -485,7 +605,7 @@ fn build_localtypes(data: &mut Funcdata) {
             if from_seed {
                 ct
             } else {
-                match crate::kuna_charptr::char_pointer_from_evidence(data, vn, &ct, on) {
+                match crate::kuna_charptr::char_pointer_from_evidence(data, vn, &ct, on)? {
                     Some(cand)
                         if ct.get_metatype() == type_metatype::TYPE_PTR
                             || crate::kuna_charptr::folds_over(&cand, &ct) =>
@@ -503,7 +623,7 @@ fn build_localtypes(data: &mut Funcdata) {
         let ct = if from_seed {
             ct
         } else {
-            crate::kuna_elemptr::element_pointer(data, vn, &ct, &mut elem_cache).unwrap_or(ct)
+            crate::kuna_elemptr::element_pointer(data, vn, &ct, &mut elem_cache)?.unwrap_or(ct)
         };
         // (kuna `boolbyte`) A byte whose every read is a truth test has no `bool`
         // candidate in the fold above: `TYPE_BOOL` is only ever an op's OUTPUT type,
@@ -513,7 +633,7 @@ fn build_localtypes(data: &mut Funcdata) {
         // `SUB_UINT_PLAIN` 16) so a locked callee parameter type still wins.  See
         // `kuna_boolbyte`.
         let ct = if data.get_arch().bool_byte && vn_size == 1 && !from_seed {
-            match crate::kuna_boolbyte::truth_value_type(data, vn, &ct) {
+            match crate::kuna_boolbyte::truth_value_type(data, vn, &ct)? {
                 Some(cand) => cand,
                 None => ct,
             }
@@ -523,10 +643,11 @@ fn build_localtypes(data: &mut Funcdata) {
         let ct = if from_seed {
             ct
         } else {
-            crate::kuna_floatreg::float_register_vote(data, vn, &ct)
-                .or_else(|| crate::kuna_floatreg::float_input_vote(data, vn, &ct))
-                .or_else(|| float_bits.vote(data, vn, &ct))
-                .unwrap_or(ct)
+            let vote = match crate::kuna_floatreg::float_register_vote(data, vn, &ct)? {
+                Some(vote) => Some(vote),
+                None => crate::kuna_floatreg::float_input_vote(data, vn, &ct)?,
+            };
+            vote.or_else(|| float_bits.vote(data, vn, &ct)).unwrap_or(ct)
         };
         let ct = if from_seed {
             ct
@@ -545,6 +666,7 @@ fn build_localtypes(data: &mut Funcdata) {
     if data.kuna_elemptr_take_disputed() {
         data.set_restart_pending(true);
     }
+    Ok(())
 }
 
 /// C++ `ActionInferTypes::writeBack` (coreaction.cc:5297): copy each temp type to
@@ -605,17 +727,17 @@ fn edge_in_vn(data: &Funcdata, op: OpId, inslot: int4) -> Option<VarnodeId> {
 /// incoming Varnode's temp type across one PcodeOp edge onto the outgoing Varnode.
 /// Returns whether the outgoing temp type was updated *and* the outgoing Varnode is
 /// not yet marked (the propagateOneType DFS guard).
-fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int4) -> bool {
+fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int4) -> KunaResult<bool> {
     if inslot == outslot {
-        return false; // don't backtrack
+        return Ok(false); // don't backtrack
     }
     let invn = match edge_in_vn(data, op, inslot) {
         Some(v) => v,
-        None => return false,
+        None => return Ok(false),
     };
     let mut alttype = match data.vbank().get(invn).and_then(|v| v.get_temp_type().cloned()) {
         Some(t) => t,
-        None => return false,
+        None => return Ok(false),
     };
     let backing_store = crate::p5_types::kuna_stackwordtypes::backing_store(
         data, op, inslot, outslot, invn, &alttype,
@@ -625,10 +747,7 @@ fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int
     // but only adopt the resolved type for the propagation when `op` is not a MULTIEQUAL
     // marker (a marker keeps the unresolved union flowing through both edges).
     if alttype.needs_resolution() {
-        let res_type = match data.resolve_in_flow(&alttype, op, inslot) {
-            Ok(t) => t,
-            Err(_) => Rc::clone(&alttype),
-        };
+        let res_type = data.resolve_in_flow(&alttype, op, inslot)?;
         let is_marker = data.obank().get(op).map(|o| o.is_marker()).unwrap_or(false);
         if !is_marker {
             alttype = res_type;
@@ -642,38 +761,38 @@ fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int
     let outvn = if outslot < 0 {
         match data.obank().get(op).and_then(|o| o.get_out()) {
             Some(v) => v,
-            None => return false,
+            None => return Ok(false),
         }
     } else {
         match data.obank().get(op).and_then(|o| o.get_in(outslot)) {
             Some(v) => v,
-            None => return false,
+            None => return Ok(false),
         }
     };
 
     {
         let ov = match data.vbank().get(outvn) {
             Some(v) => v,
-            None => return false,
+            None => return Ok(false),
         };
         if outslot >= 0 && ov.is_annotation() {
-            return false;
+            return Ok(false);
         }
         if ov.is_type_lock() {
-            return false; // Can't propagate through typelock
+            return Ok(false); // Can't propagate through typelock
         }
         if ov.stops_up_propagation() && outslot >= 0 {
-            return false; // Propagation is blocked
+            return Ok(false); // Propagation is blocked
         }
         // alttype BOOL: only propagate if output can take only boolean values.
         if alttype.get_metatype() == type_metatype::TYPE_BOOL && ov.get_nz_mask() > 1 {
-            return false;
+            return Ok(false);
         }
     }
 
-    let newtype = match propagate_type(data, alttype, op, invn, outvn, inslot, outslot) {
+    let newtype = match propagate_type(data, alttype, op, invn, outvn, inslot, outslot)? {
         Some(t) => t,
-        None => return false,
+        None => return Ok(false),
     };
     // (kuna `ptrdepthcap`) Refuse a candidate that keeps deepening an already
     // unsatisfiable pointer equation -- see `kuna_ptrdepth`.
@@ -692,39 +811,39 @@ fn propagate_type_edge(data: &mut Funcdata, op: OpId, inslot: int4, outslot: int
 
     let cur = match data.vbank().get(outvn).and_then(|v| v.get_temp_type().cloned()) {
         Some(t) => t,
-        None => return false,
+        None => return Ok(false),
     };
-    crate::kuna_charbyte::note_edge(data, op, inslot, outslot, invn, outvn, &newtype, &cur); // (kuna `charbyte`)
+    crate::kuna_charbyte::note_edge(data, op, inslot, outslot, invn, outvn, &newtype, &cur)?; // (kuna `charbyte`)
     // (kuna `elemptr`) A value stored through a pointer `elemptr` typed keeps
     // its own sign; see `kuna_elemptr::keeps_stored_sign`.
     if crate::kuna_elemptr::keeps_stored_sign(data, op, inslot, outslot, &newtype, &cur) {
-        return false;
+        return Ok(false);
     }
     // (kuna `elfmain`) A runtime argument of an executable's own `main` keeps its
     // runtime type, without the type lock that would make it a realistic input
     // to the next call. See `kuna_elfmaindecl`.
     if crate::kuna_elfmaindecl::took_runtime_type(data, outvn, &cur) {
-        return false;
+        return Ok(false);
     }
     if 0 > newtype.type_order(&cur).unwrap_or(0) {
         // (kuna `libctypes`) A libc aggregate pointer is not carried onto a Varnode
         // the function reads past that aggregate's end. See `kuna_libcfit`.
         if crate::kuna_libcfit::refuses(data, outvn, &newtype) {
-            return false;
+            return Ok(false);
         }
         let is_mark = data.vbank().get(outvn).map(|v| v.is_mark()).unwrap_or(true);
         if let Some(v) = data.vbank_mut().get_mut(outvn) {
             v.set_temp_type(newtype);
         }
-        return !is_mark;
+        return Ok(!is_mark);
     }
-    false
+    Ok(false)
 }
 
 /// Build a spacebase code-pointer type `getTypePointer(altSize, getBase(1,UNKNOWN),
 /// defaultDataSpace.wordSize)` — the shared `invn->isSpacebase()` arm of COPY /
 /// MULTIEQUAL / INDIRECT / compare propagation.
-fn spacebase_pointer(data: &Funcdata, alt_size: int4) -> Option<Rc<Datatype>> {
+pub(crate) fn spacebase_pointer(data: &Funcdata, alt_size: int4) -> Option<Rc<Datatype>> {
     let arch = Rc::clone(data.get_arch());
     let tlst = arch.types()?;
     let spc = Rc::clone(arch.manage().get_default_data_space()?);
@@ -863,12 +982,13 @@ pub fn propagate_type_pub(
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     propagate_type(data, alttype, op, invn, outvn, inslot, outslot)
 }
 
 /// C++ per-op-code `TypeOp::propagateType` dispatch (typeop.cc).  Returns the
-/// outgoing data-type, or `None` (no propagation).
+/// outgoing data-type, or `Ok(None)` (no propagation). Live symbol acquisition
+/// failures are returned immediately rather than declining the type edge.
 fn propagate_type(
     data: &mut Funcdata,
     alttype: Rc<Datatype>,
@@ -877,15 +997,17 @@ fn propagate_type(
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
-    let code = data.obank().get(op)?.code();
+) -> KunaResult<Option<Rc<Datatype>>> {
+    let Some(code) = data.obank().get(op).map(|o| o.code()) else {
+        return Ok(None);
+    };
     let invn_is_spacebase = data.vbank().get(invn).map(|v| v.is_spacebase()).unwrap_or(false);
-    match code {
+    Ok(match code {
         // TypeOpCopy / TypeOpMulti / TypeOpIndirect: input <-> output, spacebase
         // produces a code pointer (typeop.cc:412, 1953, 2007).
         OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL => {
             if inslot != -1 && outslot != -1 {
-                return None; // Must propagate input <-> output
+                return Ok(None); // Must propagate input <-> output
             }
             if invn_is_spacebase {
                 spacebase_pointer(data, alttype.get_size())
@@ -897,13 +1019,13 @@ fn propagate_type(
             let is_creation =
                 data.obank().get(op).map(|o| o.is_indirect_creation()).unwrap_or(false);
             if is_creation {
-                return None;
+                return Ok(None);
             }
             if inslot == 1 || outslot == 1 {
-                return None;
+                return Ok(None);
             }
             if inslot != -1 && outslot != -1 {
-                return None;
+                return Ok(None);
             }
             if invn_is_spacebase {
                 spacebase_pointer(data, alttype.get_size())
@@ -931,15 +1053,15 @@ fn propagate_type(
         // propagateAcrossCompare).
         OpCode::CPUI_INT_SLESS | OpCode::CPUI_INT_SLESSEQUAL => {
             if inslot == -1 || outslot == -1 {
-                return None; // Must propagate input <-> input
+                return Ok(None); // Must propagate input <-> input
             }
             if alttype.get_metatype() != type_metatype::TYPE_INT {
-                return None; // Only propagate signed things
+                return Ok(None); // Only propagate signed things
             }
             Some(alttype)
         }
         // TypeOpIntAdd: pointer add / constant-folded int (typeop.cc:1183).
-        OpCode::CPUI_INT_ADD => propagate_int_add(data, alttype, op, outvn, inslot, outslot),
+        OpCode::CPUI_INT_ADD => propagate_int_add(data, alttype, op, outvn, inslot, outslot)?,
         // TypeOpLoad / TypeOpStore: propagate the pointed-to type through the
         // pointer's `*T` <-> the loaded/stored `T` (typeop.cc:488, 559).
         OpCode::CPUI_LOAD => {
@@ -953,10 +1075,10 @@ fn propagate_type(
         OpCode::CPUI_INT_XOR | OpCode::CPUI_INT_AND => {
             if !alttype.is_enum_type() {
                 if alttype.get_metatype() != type_metatype::TYPE_FLOAT {
-                    return None;
+                    return Ok(None);
                 }
                 if float_sign_manipulation(data, op) == OpCode::CPUI_MAX {
-                    return None;
+                    return Ok(None);
                 }
             }
             if invn_is_spacebase {
@@ -968,7 +1090,7 @@ fn propagate_type(
         // TypeOpIntOr: only propagate enums (typeop.cc:1490).
         OpCode::CPUI_INT_OR => {
             if !alttype.is_enum_type() {
-                return None;
+                return Ok(None);
             }
             if invn_is_spacebase {
                 spacebase_pointer(data, alttype.get_size())
@@ -988,68 +1110,75 @@ fn propagate_type(
         // (typeop.cc:2270, 2368).
         OpCode::CPUI_PTRADD => {
             if inslot == 2 || outslot == 2 {
-                return None; // Don't propagate along this edge
+                return Ok(None); // Don't propagate along this edge
             }
             if inslot != -1 && outslot != -1 {
-                return None; // Must propagate input <-> output
+                return Ok(None); // Must propagate input <-> output
             }
             if alttype.get_metatype() != type_metatype::TYPE_PTR {
-                return None;
+                return Ok(None);
             }
             if inslot == -1 {
                 None // Don't propagate pointer types this direction
             } else {
-                propagate_add_in2_out(data, alttype, op, inslot)
+                propagate_add_in2_out(data, alttype, op, inslot)?
             }
         }
         OpCode::CPUI_PTRSUB => {
             if inslot != -1 && outslot != -1 {
-                return None; // Must propagate input <-> output
+                return Ok(None); // Must propagate input <-> output
             }
             if alttype.get_metatype() != type_metatype::TYPE_PTR {
-                return None;
+                return Ok(None);
             }
             if inslot == -1 {
                 None // Don't propagate pointer types this direction
             } else {
-                propagate_add_in2_out(data, alttype, op, inslot)
+                propagate_add_in2_out(data, alttype, op, inslot)?
             }
         }
         // TypeOpSegment: propagate slot2 <-> output, resized (typeop.cc:2433).
         OpCode::CPUI_SEGMENTOP => {
             if inslot == 0 || inslot == 1 || outslot == 0 || outslot == 1 {
-                return None;
+                return Ok(None);
             }
             if invn_is_spacebase {
-                return None;
+                return Ok(None);
             }
             if alttype.get_metatype() != type_metatype::TYPE_PTR {
-                return None;
+                return Ok(None);
             }
-            let out_size = data.vbank().get(outvn).map(|v| v.get_size())?;
+            let Some(out_size) = data.vbank().get(outvn).map(|v| v.get_size()) else {
+                return Ok(None);
+            };
             let arch = Rc::clone(data.get_arch());
-            arch.types()?.resize_pointer(alttype, out_size).ok()
+            let Some(types) = arch.types() else { return Ok(None) };
+            types.resize_pointer(alttype, out_size).ok()
         }
         // TypeOpNew: propagate the cpool result as result of the new operator
         // (typeop.cc:2503).
         OpCode::CPUI_NEW => {
             if inslot != 0 || outslot != -1 {
-                return None;
+                return Ok(None);
             }
-            let vn0 = data.obank().get(op)?.get_in(0)?;
-            let v0 = data.vbank().get(vn0)?;
+            let Some(v0) = data.obank().get(op).and_then(|o| o.get_in(0))
+                .and_then(|vn| data.vbank().get(vn)) else {
+                return Ok(None);
+            };
             if !v0.is_written() {
-                return None;
+                return Ok(None);
             }
-            let def = v0.get_def()?;
-            let def_code = data.obank().get(def)?.code();
+            let Some(def_code) = v0.get_def().and_then(|def| data.obank().get(def))
+                .map(|o| o.code()) else {
+                return Ok(None);
+            };
             if def_code != OpCode::CPUI_CPOOLREF {
-                return None;
+                return Ok(None);
             }
             Some(alttype)
         }
         _ => None, // default TypeOp::propagateType: don't propagate
-    }
+    })
 }
 
 /// C++ `TypeOpLoad::propagateType` / `TypeOpStore::propagateType` (typeop.cc:488,
@@ -1285,11 +1414,11 @@ fn propagate_int_add(
     outvn: VarnodeId,
     inslot: int4,
     outslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     let invn_meta = alttype.get_metatype();
     if invn_meta != type_metatype::TYPE_PTR {
         if invn_meta != type_metatype::TYPE_INT && invn_meta != type_metatype::TYPE_UINT {
-            return None;
+            return Ok(None);
         }
         let in1_const = data
             .obank()
@@ -1299,16 +1428,16 @@ fn propagate_int_add(
             .map(|v| v.is_constant())
             .unwrap_or(false);
         if outslot != 1 || !in1_const {
-            return None;
+            return Ok(None);
         }
     } else if inslot != -1 && outslot != -1 {
-        return None; // Must propagate input <-> output for pointers
+        return Ok(None); // Must propagate input <-> output for pointers
     }
     let outvn_const = data.vbank().get(outvn).map(|v| v.is_constant()).unwrap_or(false);
     if outvn_const && alttype.get_metatype() != type_metatype::TYPE_PTR {
-        Some(alttype)
+        Ok(Some(alttype))
     } else if inslot == -1 {
-        None // Don't propagate pointer types output -> input
+        Ok(None) // Don't propagate pointer types output -> input
     } else {
         propagate_add_in2_out(data, alttype, op, inslot)
     }
@@ -1422,14 +1551,14 @@ fn propagate_add_in2_out(
     alttype: Rc<Datatype>,
     op: OpId,
     inslot: int4,
-) -> Option<Rc<Datatype>> {
+) -> KunaResult<Option<Rc<Datatype>>> {
     let arch = Rc::clone(data.get_arch());
-    let tlst = arch.types_impl()?;
-    let ptr_to = alttype.get_ptr_to()?;
+    let Some(tlst) = arch.types_impl() else { return Ok(None) };
+    let Some(ptr_to) = alttype.get_ptr_to() else { return Ok(None) };
     let align = ptr_to.get_align_size();
     let (command, offset) = propagate_add_pointer(data, op, inslot, align);
     if command == 2 {
-        return None; // Doesn't look like a good pointer add
+        return Ok(None); // Doesn't look like a good pointer add
     }
     let mut pointer: Option<Rc<Datatype>> = Some(Rc::clone(&alttype));
     let mut parent: Option<Rc<Datatype>> = None;
@@ -1439,7 +1568,9 @@ fn propagate_add_in2_out(
         // cast: `offset` is uintb (u64); C++ `addressToByteInt(uintb,...)` takes the
         // value reinterpreted as int8 — `offset as i64` is that same bit-reinterpret.
         let mut type_offset = AddrSpace::address_to_byte_int(offset as i64, word_size);
-        let op_code = data.obank().get(op)?.code();
+        let Some(op_code) = data.obank().get(op).map(|o| o.code()) else {
+            return Ok(None);
+        };
         let allow_wrap = op_code != OpCode::CPUI_PTRSUB;
         // C++ do { pointer = pointer->downChain(typeOffset,...); if (0) break; }
         while let Some(cur) = pointer.clone() {
@@ -1457,11 +1588,11 @@ fn propagate_add_in2_out(
                 .map(|p| p.get_metatype() == type_metatype::TYPE_SPACEBASE)
                 .unwrap_or(false);
             if cur_is_spacebase {
-                let sbptrto = cur.get_ptr_to()?;
+                let Some(sbptrto) = cur.get_ptr_to() else { return Ok(None) };
                 let cur_size = cur.get_size();
                 let cur_ws = cur.get_word_size().unwrap_or(1);
                 if let Some((subtype, residual)) =
-                    data.spacebase_get_sub_type(&sbptrto, type_offset)
+                    data.spacebase_get_sub_type(&sbptrto, type_offset)?
                 {
                     type_offset = residual;
                     // The spacebase is never an array/struct container itself, so
@@ -1475,8 +1606,10 @@ fn propagate_add_in2_out(
                 }
                 continue;
             }
-            let (next, new_off, par, par_off) =
-                tlst.down_chain(&cur, type_offset, allow_wrap).ok()?;
+            let Ok((next, new_off, par, par_off)) =
+                tlst.down_chain(&cur, type_offset, allow_wrap) else {
+                    return Ok(None);
+                };
             type_offset = new_off;
             // C++ downChain writes its `par`/`parOff` reference params ONLY on the
             // STRUCT/ARRAY arm (type.cc:1247-1250) and never resets them otherwise,
@@ -1498,8 +1631,14 @@ fn propagate_add_in2_out(
     if let Some(par) = parent {
         // Innermost containing object is a TYPE_STRUCT/TYPE_ARRAY: preserve it.
         let pt = match &pointer {
-            None => tlst.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?,
-            Some(p) => p.get_ptr_to()?,
+            None => match tlst.get_base(1, type_metatype::TYPE_UNKNOWN) {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            },
+            Some(p) => match p.get_ptr_to() {
+                Some(t) => t,
+                None => return Ok(None),
+            },
         };
         // cast: C++ `getTypePointerRel(parent, pt, parentOff)` takes an int4 offset;
         // `parentOff` is int8 there — this narrows int8->int4 exactly as the C++ call.
@@ -1509,9 +1648,9 @@ fn propagate_add_in2_out(
     let pointer = match pointer {
         None => {
             if command == 0 {
-                return Some(alttype);
+                return Ok(Some(alttype));
             }
-            return None;
+            return Ok(None);
         }
         Some(p) => p,
     };
@@ -1526,19 +1665,21 @@ fn propagate_add_in2_out(
     if in_is_spacebase {
         let pt_meta = pointer.get_ptr_to().map(|p| p.get_metatype());
         if pt_meta == Some(type_metatype::TYPE_SPACEBASE) {
-            let base = tlst.get_base(1, type_metatype::TYPE_UNKNOWN).ok()?;
+            let Ok(base) = tlst.get_base(1, type_metatype::TYPE_UNKNOWN) else {
+                return Ok(None);
+            };
             let ws = pointer.get_word_size().unwrap_or(1);
-            return tlst.get_type_pointer(pointer.get_size(), base, ws).ok();
+            return Ok(tlst.get_type_pointer(pointer.get_size(), base, ws).ok());
         }
     }
-    Some(pointer)
+    Ok(Some(pointer))
 }
 
 /// C++ `ActionInferTypes::propagateOneType` (coreaction.cc:5428): DFS push a
 /// Varnode's temp type as far as possible.  Mirrors the `PropagationState` stack
 /// walk (descendants then the def), visiting each Varnode at most once via the
 /// mark bit.
-fn propagate_one_type(data: &mut Funcdata, root: VarnodeId) {
+fn propagate_one_type(data: &mut Funcdata, root: VarnodeId) -> KunaResult<()> {
     // PropagationState: (vn, descend index, op, slot, inslot).
     struct PState {
         vn: VarnodeId,
@@ -1621,7 +1762,18 @@ fn propagate_one_type(data: &mut Funcdata, root: VarnodeId) {
         let op = top.op.unwrap();
         let inslot = top.inslot;
         let slot = top.slot;
-        if propagate_type_edge(data, op, inslot, slot) {
+        let propagated = match propagate_type_edge(data, op, inslot, slot) {
+            Ok(propagated) => propagated,
+            Err(error) => {
+                for state in &stack {
+                    if let Some(v) = data.vbank_mut().get_mut(state.vn) {
+                        v.clear_mark();
+                    }
+                }
+                return Err(error);
+            }
+        };
+        if propagated {
             let newvn = if slot == -1 {
                 data.obank().get(op).and_then(|o| o.get_out())
             } else {
@@ -1639,6 +1791,7 @@ fn propagate_one_type(data: &mut Funcdata, root: VarnodeId) {
             step(stack.last_mut().unwrap(), data);
         }
     }
+    Ok(())
 }
 
 /// C++ `ActionInferTypes::propagateRef` (coreaction.cc:5464): given a likely
@@ -1648,28 +1801,28 @@ fn propagate_one_type(data: &mut Funcdata, root: VarnodeId) {
 /// This is the pass that turns a typed stack-pointer (e.g. `mystruct *` from a
 /// call argument) into a typed stack *local* (`mystruct v1`): the pointee type
 /// is laid over every Varnode in the stack-frame slice the pointer addresses.
-fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
+fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) -> KunaResult<()> {
     // ct = vn->getTempType(); must be a pointer to a concrete (non-spacebase,
     // non-unknown) type.
     let ct = match data.vbank().get(vn).and_then(|v| v.get_temp_type().cloned()) {
         Some(t) => t,
-        None => return,
+        None => return Ok(()),
     };
     if ct.get_metatype() != type_metatype::TYPE_PTR {
-        return;
+        return Ok(());
     }
     let ct = match ct.get_ptr_to() {
         Some(p) => p,
-        None => return,
+        None => return Ok(()),
     };
     let ctmeta = ct.get_metatype();
     if ctmeta == type_metatype::TYPE_SPACEBASE || ctmeta == type_metatype::TYPE_UNKNOWN {
-        return; // Don't bother propagating this
+        return Ok(()); // Don't bother propagating this
     }
     let arch = Rc::clone(data.get_arch());
     let typegrp = match arch.types() {
         Some(t) => t,
-        None => return,
+        None => return Ok(()),
     };
 
     let off = addr.get_offset();
@@ -1747,31 +1900,32 @@ fn propagate_ref(data: &mut Funcdata, vn: VarnodeId, addr: &Address) {
             if let Some(v) = data.vbank_mut().get_mut(curvn) {
                 v.set_temp_type(Rc::clone(&lct));
             }
-            propagate_one_type(data, curvn);
+            propagate_one_type(data, curvn)?;
         }
     }
+    Ok(())
 }
 
 /// C++ `ActionInferTypes::propagateSpacebaseRef` (coreaction.cc:5521): look for
 /// ADD/PTRSUB/PTRADD/COPY off the spacebase (stack-pointer) input whose output
 /// has a known pointer type, and propagate that type into the stack frame at the
 /// corresponding offset (via [`propagate_ref`]).
-fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
+fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) -> KunaResult<()> {
     // spctype = spcvn->getType() (the absolute type, NOT temptype); must be
     // pointer-to-spacebase.
     let spctype = match data.vbank().get(spcvn).map(|v| Rc::clone(v.get_type())) {
         Some(t) => t,
-        None => return,
+        None => return Ok(()),
     };
     if spctype.get_metatype() != type_metatype::TYPE_PTR {
-        return;
+        return Ok(());
     }
     let sbtype = match spctype.get_ptr_to() {
         Some(p) => p,
-        None => return,
+        None => return Ok(()),
     };
     if sbtype.get_metatype() != type_metatype::TYPE_SPACEBASE {
-        return;
+        return Ok(());
     }
     let arch = Rc::clone(data.get_arch());
     let manager = arch.manage();
@@ -1780,7 +1934,7 @@ fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
     // propagate_ref does not add/remove descendants of spcvn).
     let descend: Vec<OpId> = match data.vbank().get(spcvn) {
         Some(v) => v.descend_iter().collect(),
-        None => return,
+        None => return Ok(()),
     };
     for op in descend {
         let (code, op_addr) = match data.obank().get(op) {
@@ -1796,7 +1950,7 @@ fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
                     sbtype.spacebase_get_address(0, sz, &op_addr, manager),
                     data.obank().get(op).and_then(|o| o.get_out()),
                 ) {
-                    propagate_ref(data, outvn, &addr);
+                    propagate_ref(data, outvn, &addr)?;
                 }
             }
             OpCode::CPUI_INT_ADD | OpCode::CPUI_PTRSUB => {
@@ -1811,7 +1965,7 @@ fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
                         sbtype.spacebase_get_address(voff, vsz, &op_addr, manager),
                         data.obank().get(op).and_then(|o| o.get_out()),
                     ) {
-                        propagate_ref(data, outvn, &addr);
+                        propagate_ref(data, outvn, &addr)?;
                     }
                 }
             }
@@ -1834,13 +1988,14 @@ fn propagate_spacebase_ref(data: &mut Funcdata, spcvn: VarnodeId) {
                         sbtype.spacebase_get_address(off, vsz, &op_addr, manager),
                         data.obank().get(op).and_then(|o| o.get_out()),
                     ) {
-                        propagate_ref(data, outvn, &addr);
+                        propagate_ref(data, outvn, &addr)?;
                     }
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// C++ `ActionInferTypes::canonicalReturnOp` (coreaction.cc:5567).
@@ -1881,26 +2036,26 @@ fn canonical_return_op(data: &Funcdata) -> Option<OpId> {
 
 /// C++ `ActionInferTypes::propagateAcrossReturns` (coreaction.cc:5598): share a
 /// single return data-type across multiple CPUI_RETURN inputs.
-fn propagate_across_returns(data: &mut Funcdata) {
+fn propagate_across_returns(data: &mut Funcdata) -> KunaResult<()> {
     if data.get_func_proto().is_output_locked() {
-        return;
+        return Ok(());
     }
     let canon = match canonical_return_op(data) {
         Some(op) => op,
-        None => return,
+        None => return Ok(()),
     };
     let base_vn = match data.obank().get(canon).and_then(|o| o.get_in(1)) {
         Some(v) => v,
-        None => return,
+        None => return Ok(()),
     };
     let (ct, base_size) = {
         let v = match data.vbank().get(base_vn) {
             Some(v) => v,
-            None => return,
+            None => return Ok(()),
         };
         let ct = match v.get_temp_type() {
             Some(t) => Rc::clone(t),
-            None => return,
+            None => return Ok(()),
         };
         (ct, v.get_size())
     };
@@ -1940,38 +2095,39 @@ fn propagate_across_returns(data: &mut Funcdata) {
         if let Some(v) = data.vbank_mut().get_mut(vn) {
             v.set_temp_type(Rc::clone(&ct));
         }
-        propagate_one_type(data, vn);
+        propagate_one_type(data, vn)?;
     }
+    Ok(())
 }
 
 /// C++ `ActionInferTypes::apply` body (coreaction.cc:5630), minus the localcount
 /// ceiling / `hasTypeRecoveryStarted` gate (kept in the wrapper).  Returns whether
 /// `writeBack` reported a data-type change (used by the wrapper to bump
 /// `localcount`).
-pub fn run_infer_types(data: &mut Funcdata) -> bool {
+pub fn run_infer_types(data: &mut Funcdata) -> KunaResult<bool> {
     // data.getScopeLocal()->applyTypeRecommendations(): lock any pending stack
     // input-Varnode type recommendations (the `this`-pointer collection is the
     // merged tree's only source; a no-op on a recommendation-free function).
     data.apply_type_recommendations();
     crate::kuna_stablenames::lock_retyped(data);
     crate::kuna_charbyte::begin(data);
-    build_localtypes(data);
-    propagate_all(data);
+    build_localtypes(data)?;
+    propagate_all(data)?;
     // (kuna `charbyte`) re-seed the bytes a `char *` reached and propagate again.
     if let Some(bytes) = crate::kuna_charbyte::take_noted() {
         let upstream = crate::kuna_charbyte::snapshot(data);
-        build_localtypes(data);
+        build_localtypes(data)?;
         crate::kuna_charbyte::seed_char(data, &bytes);
-        propagate_all(data);
+        propagate_all(data)?;
         crate::kuna_charbyte::keep_or_restore(data, upstream);
     }
-    write_back(data)
+    Ok(write_back(data))
 }
 
 /// The propagation half of C++ `ActionInferTypes::apply` (coreaction.cc:5640-5667):
 /// every live Varnode's temp type flows along its edges, then across returns and
 /// into the stack frame.
-fn propagate_all(data: &mut Funcdata) {
+fn propagate_all(data: &mut Funcdata) -> KunaResult<()> {
     let order: Vec<VarnodeId> = data.vbank().iter_loc().collect();
     for vn in order {
         {
@@ -1986,9 +2142,9 @@ fn propagate_all(data: &mut Funcdata) {
                 continue;
             }
         }
-        propagate_one_type(data, vn);
+        propagate_one_type(data, vn)?;
     }
-    propagate_across_returns(data);
+    propagate_across_returns(data)?;
     // C++ coreaction.cc:5663-5666 —
     // Flow the recovered pointer type (e.g. a `mystruct *` call argument) from the
     // spacebase-relative ADD/PTRSUB/PTRADD outputs into the stack-frame slice they
@@ -1996,9 +2152,10 @@ fn propagate_all(data: &mut Funcdata) {
     let spcid = data.get_scope_local().map(|sl| std::rc::Rc::clone(sl.get_space_id()));
     if let Some(spcid) = spcid {
         if let Some(spcvn) = data.find_spacebase_input(&spcid) {
-            propagate_spacebase_ref(data, spcvn);
+            propagate_spacebase_ref(data, spcvn)?;
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2017,6 +2174,146 @@ mod propagate_type_tests {
         f.set_default_alignment_map();
         f.set_max_basetype_size(8);
         f
+    }
+
+    #[test]
+    fn widened_integer_votes_require_full_operand_policy_and_zero_upper_bits() {
+        use kuna_base::address::Address;
+        use crate::context::ArchContext;
+        use crate::fspec::{FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::p3_dataflow::kuna_calleehomes::tests::Fx;
+        use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
+
+        let types = Rc::new(enum_factory());
+        let int4 = types.get_base(4, type_metatype::TYPE_INT).unwrap();
+        let enumeration = types.get_type_enum("CarrierEnum").unwrap();
+        let partial_enum = types.get_type_partial_enum(Rc::clone(&enumeration), 0, 1).unwrap();
+        assert!(enumeration.is_enum_type() && partial_enum.is_enum_type());
+        let mut ordered_votes = Vec::new();
+        for shape in ["integer", "site", "no_hint", "unknown_upper", "enum", "partial_enum",
+            "bool", "pointer", "upper_slice", "wrong_range", "wrong_width", "wrong_callee",
+            "insert_value", "insert_position", "signed_first", "unsigned_first"] {
+            let fixture = Fx::new();
+            let mut arch = ArchContext::new_shared(Rc::clone(&fixture.fd.get_arch().manage));
+            arch.types = Some(Rc::clone(&types));
+            let mut data = Funcdata::new("caller", "caller", Rc::new(arch),
+                fixture.fd.get_address().clone(), 0x1000_0000, 0x40).unwrap();
+            let address = Address::new(Rc::clone(&fixture.reg), 0x10);
+            let value = if shape == "unknown_upper" {
+                data.new_varnode(8, &address, None).unwrap()
+            } else {
+                data.new_constant(8, 11)
+            };
+            let target = data.new_constant(8, 0x2000);
+            let op = data.new_op(2, data.get_address().clone());
+            data.op_set_opcode_code(op, OpCode::CPUI_CALLIND);
+            data.op_set_input(op, target, 0).unwrap();
+            data.op_set_input(op, value, 1).unwrap();
+            let source_type = match shape {
+                "enum" => Rc::clone(&enumeration),
+                "partial_enum" => Rc::clone(&partial_enum),
+                "bool" => types.get_base(1, type_metatype::TYPE_BOOL).unwrap(),
+                "pointer" => types.get_type_pointer(4, Rc::clone(&int4), 1).unwrap(),
+                _ => Rc::clone(&int4),
+            };
+            let source_address = Address::new(Rc::clone(&fixture.reg),
+                if shape == "upper_slice" { 0x14 } else { 0x10 });
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(ProtoModel::new(data.get_arch().manage())),
+                Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            proto.set_param(0, "value", &ParameterPieces {
+                addr: source_address.clone(), type_: Some(Rc::clone(&source_type)), flags: 0,
+            });
+            proto.set_input_lock(true);
+            proto.set_override(shape == "site");
+            let entry = Address::new(Rc::clone(&fixture.reg), 0x2000);
+            let mut call = FuncCallSpecs::new(op, entry.clone());
+            call.proto_mut().copy(&proto);
+            call.set_final_input_storage(vec![(address.clone(), 8)]);
+            data.push_call_specs(call);
+            let mut body = CalleeEntryDead::from_parts(fixture.reg.get_index(),
+                vec![(fixture.reg.get_index(), 0x10, 8)], vec![vec![]], true);
+            if shape != "no_hint" {
+                let hint_address = Address::new(Rc::clone(&fixture.reg),
+                    if shape == "wrong_range" { 0x18 } else { 0x10 });
+                let hint_width = if shape == "wrong_width" { 4 } else { 8 };
+                let opcode = match shape {
+                    "insert_value" | "insert_position" => OpCode::CPUI_INSERT,
+                    "unsigned_first" => OpCode::CPUI_INT_LESS,
+                    _ => OpCode::CPUI_INT_ADD,
+                };
+                let slot = if shape == "insert_position" { 2 } else { 0 };
+                body = body.with_input_type_hint(&hint_address, hint_width, opcode, slot);
+                if matches!(shape, "signed_first" | "unsigned_first") {
+                    body = body.with_input_type_hint(&address, 8,
+                        if shape == "signed_first" { OpCode::CPUI_INT_LESS } else { OpCode::CPUI_INT_ADD }, 0);
+                }
+            }
+            let cached_entry = if shape == "wrong_callee" {
+                Address::new(Rc::clone(&fixture.reg), 0x2100)
+            } else { entry };
+            data.kuna_set_callee_entry_dead(&cached_entry, Rc::new(body));
+            let vote = call_input_type_local(&data, op, 1, OpCode::CPUI_CALLIND, true).unwrap();
+            if matches!(shape, "integer" | "site" | "insert_position" | "signed_first" | "unsigned_first") {
+                let vote = vote.expect(shape);
+                assert_eq!(vote.get_size(), 8);
+                assert!(matches!(vote.get_metatype(), type_metatype::TYPE_INT | type_metatype::TYPE_UINT));
+                assert!(!vote.is_enum_type());
+                if matches!(shape, "signed_first" | "unsigned_first") {
+                    ordered_votes.push(vote.get_metatype());
+                }
+            } else {
+                assert!(vote.is_none(), "{shape} must not invent whole-value integer authority");
+            }
+            assert!(call_input_type_local(&data, op, 1, OpCode::CPUI_CALLIND, false).unwrap().is_none(),
+                "an advisory whole-value vote never becomes a declared cast requirement");
+            let source = data.get_call_specs(0).proto().get_param(0).unwrap();
+            assert_eq!(source.get_address(), source_address);
+            assert_eq!(source.get_name(), "value");
+            assert_eq!(source.get_size(), source_type.get_size());
+            assert!(Rc::ptr_eq(source.get_type().unwrap(), &source_type));
+            assert_eq!(data.get_call_specs(0).proto().num_params(), 1);
+        }
+        assert_eq!(ordered_votes.len(), 2);
+        assert_eq!(ordered_votes[0], ordered_votes[1], "existing type order, not last opcode, resolves competing signs");
+    }
+
+    #[test]
+    fn a_locked_source_slice_does_not_type_or_cast_its_wider_physical_carrier() {
+        use kuna_base::address::Address;
+        use crate::fspec::{FuncCallSpecs, FuncProto, ParameterPieces, ProtoModel};
+        use crate::p3_dataflow::kuna_calleehomes::tests::Fx;
+        for (width, site_override) in [(1, false), (4, false), (1, true), (4, true)] {
+            let mut fx = Fx::new();
+            let address = Address::new(Rc::clone(&fx.reg), 0x10);
+            let value = fx.fd.new_varnode(width, &address, None).unwrap();
+            let target = fx.constant(8, 0x2000);
+            let op = fx.emit(OpCode::CPUI_CALLIND, &[target, value], None).0;
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(ProtoModel::new(fx.fd.get_arch().manage())),
+                Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            let source_type = Rc::new(Datatype::new(1, type_metatype::TYPE_BOOL));
+            proto.set_param(0, "flags", &ParameterPieces {
+                addr: address.clone(), type_: Some(Rc::clone(&source_type)), flags: 0,
+            });
+            proto.set_input_lock(true);
+            proto.set_override(site_override);
+            let mut call = FuncCallSpecs::new(op, Address::new(Rc::clone(&fx.reg), 0x2000));
+            call.proto_mut().copy(&proto);
+            call.set_final_input_storage(vec![(address, width)]);
+            fx.fd.push_call_specs(call);
+            for recovered in [false, true] {
+                let ty = call_input_type_local(&fx.fd, op, 1, OpCode::CPUI_CALLIND, recovered).unwrap();
+                if width == 1 {
+                    assert!(Rc::ptr_eq(&ty.unwrap(), &source_type), "ordinary authored BOOL remains authoritative");
+                } else {
+                    assert!(ty.is_none(), "a BOOL slice must not truncate the physical word");
+                }
+            }
+            assert_eq!(fx.fd.get_call_specs(0).proto().num_params(), 1);
+            assert_eq!(fx.fd.get_call_specs(0).proto().is_override(), site_override);
+            assert_eq!(fx.fd.get_call_specs(0).proto().get_param(0).unwrap().get_name(), "flags");
+        }
     }
 
     #[test]

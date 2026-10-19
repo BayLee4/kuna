@@ -46,6 +46,19 @@
 //! Ghidra's `BOOLEAN_XOR` is the invented C spelling `^^` at precedence 20,
 //! between `&&` and `||`. Rust has one `^` for both logical and bitwise xor, so
 //! the Rust token is `^` at the bitwise tier.
+//!
+//! Integer ADD/SUB/MULT are machine-width operations, not Rust's checked
+//! arithmetic. Their opcode dispatch uses the wrapping method tokens below,
+//! independently of optimization or overflow-check settings. They are not
+//! global token remaps: subtraction's C token also serves floating subtraction.
+//! Same-width signed/unsigned words are explicitly converted to the operation's
+//! integer type; Rust does not supply C's implicit arithmetic conversions.
+//!
+//! Raw PTRADD addresses use byte-pointer `wrapping_offset` with a product
+//! truncated at the p-code address width, not C indexing or Rust references.
+//! Array decay remains a raw pointer cast, so merely forming a one-past address
+//! neither dereferences it nor adds a bounds check. Unsupported storage-width
+//! combinations retain the functional operation and explicit LOAD/STORE deref.
 
 use crate::kuna_lang::{
     CastForm, CharForm, DeclForm, DoWhileForm, ForLoopForm, GotoForm, InfLoopForm, LabelForm, LangCaps,
@@ -206,6 +219,30 @@ pub mod rust_tokens {
         paren_before_angle: true,
         left_to_right_only: false,
     };
+
+    /// A machine-width binary operation, qualified by its output type:
+    /// `u8::wrapping_add(a, b)`. The explicit type also gives constant operands
+    /// their width without relying on the surrounding expression to infer it.
+    /// Postsurround retains grouping and single evaluation of both arguments.
+    const fn wrapping_method(print1: &'static str) -> OpToken {
+        OpToken {
+            print1,
+            print2: ")",
+            stage: 2,
+            precedence: rank(Prec::Postfix),
+            associative: false,
+            token_type: TokenType::Postsurround,
+            spacing: 0,
+            bump: 0,
+            negate: None,
+            paren_before_angle: false,
+            left_to_right_only: false,
+        }
+    }
+
+    pub static WRAPPING_ADD: OpToken = wrapping_method("::wrapping_add(");
+    pub static WRAPPING_SUB: OpToken = wrapping_method("::wrapping_sub(");
+    pub static WRAPPING_MUL: OpToken = wrapping_method("::wrapping_mul(");
 }
 
 /// Rust's token mapping: the ~40 tokens whose spelling AND rank are already
@@ -333,8 +370,9 @@ use crate::architecture::Architecture;
 use crate::context::BlockId;
 use crate::funcdata::Funcdata;
 use crate::prettyprint::{Emit, MarkupRef, SyntaxHighlight};
-use crate::printc::{declarator_parts, display_format, to_emit_brace, PrintC};
+use crate::printc::{declarator_parts, display_format, to_emit_brace, typed_declarator_parts, PrintC};
 use crate::printlanguage::modifiers;
+use kuna_base::error::KunaResult;
 
 impl PrintC {
     /// `unsafe fn name(mut a0: T, ...) -> R`, the Rust counterpart of
@@ -355,7 +393,7 @@ impl PrintC {
         markup: &MarkupRef,
     ) {
         let display = fd.get_display_name().to_string();
-        let rt = self.rt_ctx;
+        let rt = &self.rt_ctx;
         let ret_type = if fd.get_func_proto().has_store() {
             fd.get_func_proto()
                 .get_output_type()
@@ -404,7 +442,15 @@ impl PrintC {
             self.emit.print("->", SyntaxHighlight::NoColor);
             self.emit.spaces(1, 0);
             let idret = self.emit.begin_return_type(markup);
-            self.emit.tag_type(&ret_type, SyntaxHighlight::TypeColor, markup);
+            let typed = if self.uses_typed_declarators() {
+                fd.get_func_proto().get_output_type()
+                    .map(|ty| typed_declarator_parts(ty, &self.rt_ctx))
+            } else { None };
+            if let Some(spelling) = typed.as_ref() {
+                self.emit_typed_declarator_part(&spelling.front, &spelling.front_types, markup);
+            } else {
+                self.emit.tag_type(&ret_type, SyntaxHighlight::TypeColor, markup);
+            }
             self.emit.end_return_type(idret);
         }
         self.emit.end_func_proto(idp);
@@ -442,15 +488,26 @@ impl PrintC {
                 name = default_name.as_str();
             }
             let ty = match param.get_type() {
-                Some(ty) => declarator_parts(ty, self.rt_ctx).0,
+                Some(ty) => declarator_parts(ty, &self.rt_ctx).0,
                 None => "()".to_string(),
             };
+            let declaration = self.begin_parameter_decl(fd, i);
             self.emit.print("mut", SyntaxHighlight::KeywordColor);
             self.emit.spaces(1, 0);
             self.emit.tag_variable(name, SyntaxHighlight::VarColor, markup);
             self.emit.print(":", SyntaxHighlight::NoColor);
             self.emit.spaces(1, 0);
-            self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+            let typed = if self.uses_typed_declarators() {
+                param.get_type().map(|ty| typed_declarator_parts(ty, &self.rt_ctx))
+            } else { None };
+            if let Some(spelling) = typed.as_ref() {
+                self.emit_typed_declarator_part(&spelling.front, &spelling.front_types, markup);
+            } else {
+                self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+            }
+            if let Some(declaration) = declaration {
+                self.emit.end_var_decl(declaration);
+            }
         }
         if proto.is_dotdotdot() {
             if sz != 0 {
@@ -467,7 +524,7 @@ impl PrintC {
         fd: &Funcdata,
         arch: &Architecture,
         blk: BlockId,
-    ) {
+    ) -> KunaResult<()> {
         self.context.push_mod();
         self.context.unset_mod(modifiers::NO_BRANCH | modifiers::ONLY_BRANCH);
         self.emit_any_label_statement(fd, blk);
@@ -477,11 +534,12 @@ impl PrintC {
             self.emit.open_brace_indent(self.lang().kw_open_curly, to_emit_brace(self.options.brace_loop));
         let body = fd.sblocks_ref().block(blk).get_block(0);
         let id1 = self.emit.begin_block(0);
-        self.emit_block(fd, arch, body);
+        self.emit_block(fd, arch, body)?;
         self.emit.end_block(id1);
         self.emit.close_brace_indent(self.lang().kw_close_curly, id);
         self.flush_eol_warnings();
         self.context.pop_mod();
+        Ok(())
     }
 
     /// `loop { body; if !(cond) { break; } }` — Rust has no bottom-tested loop.
@@ -494,7 +552,7 @@ impl PrintC {
         fd: &Funcdata,
         arch: &Architecture,
         blk: BlockId,
-    ) {
+    ) -> KunaResult<()> {
         self.context.push_mod();
         self.context.unset_mod(modifiers::NO_BRANCH | modifiers::ONLY_BRANCH);
         self.emit_any_label_statement(fd, blk);
@@ -506,7 +564,7 @@ impl PrintC {
         self.context.push_mod();
         let id2 = self.emit.begin_block(0);
         self.context.set_mod(modifiers::NO_BRANCH);
-        self.emit_block(fd, arch, body);
+        self.emit_block(fd, arch, body)?;
         self.emit.end_block(id2);
         self.context.pop_mod();
 
@@ -518,7 +576,7 @@ impl PrintC {
         let idp = self.emit.open_paren(crate::printlanguage::OPEN_PAREN, 0);
         self.context.push_mod();
         self.context.set_mod(modifiers::ONLY_BRANCH);
-        self.emit_block(fd, arch, body);
+        self.emit_block(fd, arch, body)?;
         self.context.pop_mod();
         self.emit.close_paren(crate::printlanguage::CLOSE_PAREN, idp);
         let idb =
@@ -531,6 +589,7 @@ impl PrintC {
         self.emit.close_brace_indent(self.lang().kw_close_curly, id);
         self.flush_eol_warnings();
         self.context.pop_mod();
+        Ok(())
     }
 
     /// Rust has no statement labels, only loop labels, so a jump target is
@@ -561,11 +620,13 @@ impl PrintC {
     /// identifier: `decl_type` is already the Rust prefix spelling of the element
     /// type, so the count is wrapped around it here. This is the same inversion
     /// that makes `TypeSpeller::declarator` return an empty `back`.
+    /// Markup retains the selected element's typed leaves inside that wrapper.
     pub(crate) fn emit_var_decl_rust(
         &mut self,
         name: &str,
         decl_type: &str,
         array_count: Option<i32>,
+        typed: Option<&crate::kuna_langtypes::TypedDeclarator>,
         markup: &MarkupRef,
     ) {
         self.emit.print("let mut", SyntaxHighlight::KeywordColor);
@@ -573,12 +634,22 @@ impl PrintC {
         self.emit.tag_variable(name, SyntaxHighlight::VarColor, markup);
         self.emit.print(":", SyntaxHighlight::NoColor);
         self.emit.spaces(1, 0);
-        match array_count {
-            Some(n) => {
-                let ty = format!("[{decl_type}; {n}]");
-                self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+        if let Some(spelling) = typed {
+            if array_count.is_some() {
+                self.emit.print("[", SyntaxHighlight::NoColor);
             }
-            None => self.emit.tag_type(decl_type, SyntaxHighlight::TypeColor, markup),
+            self.emit_typed_declarator_part(&spelling.front, &spelling.front_types, markup);
+            if let Some(n) = array_count {
+                self.emit.print(&format!("; {n}]"), SyntaxHighlight::NoColor);
+            }
+        } else {
+            match array_count {
+                Some(n) => {
+                    let ty = format!("[{decl_type}; {n}]");
+                    self.emit.tag_type(&ty, SyntaxHighlight::TypeColor, markup);
+                }
+                None => self.emit.tag_type(decl_type, SyntaxHighlight::TypeColor, markup),
+            }
         }
     }
 }
@@ -657,7 +728,7 @@ impl PrintC {
         fd: &Funcdata,
         arch: &Architecture,
         blk: BlockId,
-    ) {
+    ) -> KunaResult<()> {
         self.context.push_mod();
         self.context.unset_mod(modifiers::NO_BRANCH | modifiers::ONLY_BRANCH);
         self.emit_any_label_statement(fd, blk);
@@ -671,14 +742,14 @@ impl PrintC {
                 .open_brace_indent(self.lang().kw_open_curly, to_emit_brace(self.options.brace_loop));
             self.context.push_mod();
             self.context.set_mod(modifiers::NO_BRANCH);
-            self.emit_block(fd, arch, cond_block);
+            self.emit_block(fd, arch, cond_block)?;
             self.context.pop_mod();
             self.emit.tag_line();
             self.emit.tag_op(self.lang().kw_if, SyntaxHighlight::KeywordColor, &MarkupRef::none());
             self.emit.spaces(1, 0);
             self.context.push_mod();
             self.context.set_mod(modifiers::ONLY_BRANCH);
-            self.emit_block(fd, arch, cond_block);
+            self.emit_block(fd, arch, cond_block)?;
             self.context.pop_mod();
             let idb = self
                 .emit
@@ -706,7 +777,7 @@ impl PrintC {
                     .open_brace_indent(self.lang().kw_open_curly, crate::prettyprint::BraceStyle::SameLine);
                 self.context.push_mod();
                 self.context.set_mod(modifiers::NO_BRANCH);
-                self.emit_block(fd, arch, cond_block);
+                self.emit_block(fd, arch, cond_block)?;
                 self.context.pop_mod();
                 self.emit.tag_line();
                 Some(id)
@@ -716,7 +787,7 @@ impl PrintC {
             let grp = self.emit.open_group();
             self.context.push_mod();
             self.context.set_mod(modifiers::ONLY_BRANCH);
-            self.emit_block(fd, arch, cond_block);
+            self.emit_block(fd, arch, cond_block)?;
             self.context.pop_mod();
             self.emit.close_group(grp);
             if let Some(id) = id1 {
@@ -729,10 +800,11 @@ impl PrintC {
         }
         self.context.set_mod(modifiers::NO_BRANCH);
         let id2 = self.emit.begin_block(0);
-        self.emit_block(fd, arch, fd.sblocks_ref().block(blk).get_block(1));
+        self.emit_block(fd, arch, fd.sblocks_ref().block(blk).get_block(1))?;
         self.emit.end_block(id2);
         self.emit.close_brace_indent(self.lang().kw_close_curly, indent);
         self.context.pop_mod();
+        Ok(())
     }
 }
 
@@ -767,21 +839,21 @@ impl PrintC {
         fd: &Funcdata,
         arch: &Architecture,
         blk: BlockId,
-    ) {
+    ) -> KunaResult<()> {
         let switch_block = fd.sblocks_ref().block(blk).get_block(0);
 
         self.context.push_mod();
         self.context.unset_mod(modifiers::NO_BRANCH | modifiers::ONLY_BRANCH);
         self.context.push_mod();
         self.context.set_mod(modifiers::NO_BRANCH);
-        self.emit_block(fd, arch, switch_block);
+        self.emit_block(fd, arch, switch_block)?;
         self.context.pop_mod();
         self.emit.tag_line();
         // The `match v` header: the BRANCHIND arm emits the keyword and, for a
         // language without parenthesised conditions, the bare scrutinee.
         self.context.push_mod();
         self.context.set_mod(modifiers::ONLY_BRANCH | modifiers::COMMA_SEPARATE);
-        self.emit_block(fd, arch, switch_block);
+        self.emit_block(fd, arch, switch_block)?;
         self.context.pop_mod();
         let brace_id = self
             .emit
@@ -795,10 +867,10 @@ impl PrintC {
                 default_case = Some(i);
                 continue;
             }
-            self.emit_match_arm_rust(fd, arch, blk, i);
+            self.emit_match_arm_rust(fd, arch, blk, i)?;
         }
         match default_case {
-            Some(i) => self.emit_match_arm_rust(fd, arch, blk, i),
+            Some(i) => self.emit_match_arm_rust(fd, arch, blk, i)?,
             None => {
                 // `match` on an integer is never exhaustive without a wildcard;
                 // falling out of the C switch is "continue past it", which is an
@@ -815,6 +887,7 @@ impl PrintC {
         self.emit.tag_line();
         self.emit.close_brace_indent(self.lang().kw_close_curly, brace_id);
         self.context.pop_mod();
+        Ok(())
     }
 
     /// One `A | B => { ... }` arm.
@@ -824,7 +897,7 @@ impl PrintC {
         arch: &Architecture,
         blk: BlockId,
         casenum: usize,
-    ) {
+    ) -> KunaResult<()> {
         let case = fd.sblocks_ref().block(blk).switch_caseblocks()[casenum].clone();
         let firstop = self.case_first_op(fd, case.block);
 
@@ -838,7 +911,7 @@ impl PrintC {
                     self.emit.print("|", SyntaxHighlight::NoColor);
                     self.emit.spaces(1, 0);
                 }
-                let (val, sz, signed) = self.switch_case_label(fd, arch, blk, &case, i);
+                let (val, sz, signed) = self.switch_case_label(fd, arch, blk, &case, i)?;
                 match firstop.or_else(|| self.any_op(fd, case.block)) {
                     Some(op) => {
                         if signed {
@@ -879,7 +952,7 @@ impl PrintC {
             self.emit.tag_line();
             self.emit_goto_statement(fd, blk, case.block, case.gototype);
         } else {
-            self.emit_block(fd, arch, case.block);
+            self.emit_block(fd, arch, case.block)?;
             // A genuine C fall-through: `grab_case_basic` records the case this
             // one falls INTO in `chain` (it is `-1` otherwise). Note this is NOT
             // the ordinary `case A: case B: body` shape -- that is one CaseOrder
@@ -896,6 +969,7 @@ impl PrintC {
         }
         self.emit.end_block(id2);
         self.emit.close_brace_indent(self.lang().kw_close_curly, id);
+        Ok(())
     }
 }
 

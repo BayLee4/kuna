@@ -255,7 +255,7 @@ impl<'a> EmulateFunction<'a> {
                 let flags = self
                     .fd
                     .get_arch()
-                    .query_global_properties(&addr, 1, &usepoint);
+                    .query_global_properties(&addr, 1, &usepoint)?;
                 if flags & crate::varnode::varnode_flags::readonly == 0
                     || flags & crate::varnode::varnode_flags::volatil != 0
                 {

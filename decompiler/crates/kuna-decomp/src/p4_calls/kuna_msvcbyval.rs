@@ -48,7 +48,7 @@
 //! `push ecx` stored to reserve the slot is dead.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use kuna_base::address::Address;
 use kuna_base::error::KunaResult;
@@ -85,6 +85,22 @@ impl OptionMsvcByval {
 pub struct ByvalDecl {
     pub pieces: PrototypePieces,
     pub at: usize,
+    generated_source: Weak<FuncProto>,
+}
+
+impl ByvalDecl {
+    pub fn new(pieces: PrototypePieces, at: usize) -> Self {
+        Self { pieces, at, generated_source: Weak::new() }
+    }
+
+    /// Bind only after the generated open declaration reaches its source owner.
+    pub fn bind_generated_source(&mut self, source: &Rc<FuncProto>) {
+        self.generated_source = Rc::downgrade(source);
+    }
+
+    fn matches_generated_source(&self, source: &Rc<FuncProto>) -> bool {
+        self.generated_source.as_ptr() == Rc::as_ptr(source)
+    }
 }
 
 /// Declarations by entry `(space index, offset)`.
@@ -145,13 +161,22 @@ pub fn size_slots(data: &mut Funcdata) {
     let Ok(void_ty) = types.get_type_void() else { return };
     let mut sites = Vec::new();
     for i in 0..data.num_calls() {
-        let Some(decl) = key(data.get_call_specs(i).get_entry_address())
-            .and_then(|k| arch.msvc_byval_decls.get(&k))
-        else {
-            continue;
-        };
+        let Some(entry) = key(data.get_call_specs(i).get_entry_address()) else { continue };
+        let Some(decl) = arch.msvc_byval_decls.get(&entry) else { continue };
+        let Some(source) = arch.global_query.as_ref().and_then(|query| query.source_protos.get(&entry)) else { continue };
+        if !decl.matches_generated_source(source) || !source.has_model() { continue; }
         let fc = data.get_call_specs(i);
-        if !fc.proto().has_model() || !fc.proto().is_input_locked() || !fc.proto().is_dotdotdot() {
+        if !fc.proto().has_model() || !fc.proto().has_store()
+            || !fc.proto().is_input_locked() || !fc.proto().is_dotdotdot()
+        {
+            continue;
+        }
+        if fc.proto().is_override() || fc.proto().has_custom_storage()
+            || !fc.proto().has_matching_model(source.model())
+            || fc.proto().num_params() as usize != decl.at
+            || fc.proto().logical_pieces().is_some_and(|pieces|
+                !pieces.input_storage.is_empty() || pieces.output_storage.is_some())
+        {
             continue;
         }
         if fc.proto().get_extra_pop() != 4 || decl.at >= decl.pieces.intypes.len() {
@@ -228,7 +253,13 @@ pub fn size_slots(data: &mut Funcdata) {
         if !laid_out(&fp, &layout) {
             continue;
         }
-        data.get_call_specs_mut(i).proto_mut().copy(&fp);
+        let prefix_matches = (0..fc.proto().num_params()).all(|index| {
+            fc.proto().get_param(index).zip(fp.get_param(index)).is_some_and(|(old, allocated)|
+                old.get_address() == allocated.get_address()
+                    && old.get_type().zip(allocated.get_type()).is_some_and(|(old, allocated)| Rc::ptr_eq(old, allocated)))
+        });
+        if !prefix_matches { continue; }
+        data.get_call_specs_mut(i).proto_mut().append_generated_inputs(&fp);
         let mapped =
             walk.builder.is_some() || walk.pointers.iter().any(|p| (lo..lo + slot).contains(p));
         sites.push(ByvalSite { call, param: decl.at, builder: walk.builder, mapped });

@@ -69,7 +69,7 @@ fn mk_op(fd: &mut Funcdata, ninput: int4, opc: OpCode) -> OpId {
 /// `RSP = RSP <opc> 8`.
 fn sp_adjust(fd: &mut Funcdata, opc: OpCode) -> OpId {
     let op = mk_op(fd, 2, opc);
-    let cur = fd.new_varnode(8, &reg(fd, RSP), None);
+    let cur = fd.new_varnode(8, &reg(fd, RSP), None).unwrap();
     let eight = fd.new_constant(8, 8);
     fd.op_set_input(op, cur, 0).unwrap();
     fd.op_set_input(op, eight, 1).unwrap();
@@ -82,8 +82,8 @@ fn sp_adjust(fd: &mut Funcdata, opc: OpCode) -> OpId {
 fn store_reg(fd: &mut Funcdata, off: u64, size: int4) -> OpId {
     let op = mk_op(fd, 3, OpCode::CPUI_STORE);
     let spaceid = fd.new_constant(4, 2);
-    let ptr = fd.new_varnode(8, &reg(fd, RSP), None);
-    let val = fd.new_varnode(size, &reg(fd, off), None);
+    let ptr = fd.new_varnode(8, &reg(fd, RSP), None).unwrap();
+    let val = fd.new_varnode(size, &reg(fd, off), None).unwrap();
     fd.op_set_input(op, spaceid, 0).unwrap();
     fd.op_set_input(op, ptr, 1).unwrap();
     fd.op_set_input(op, val, 2).unwrap();
@@ -94,7 +94,7 @@ fn store_reg(fd: &mut Funcdata, off: u64, size: int4) -> OpId {
 fn load_reg(fd: &mut Funcdata, off: u64, size: int4) -> OpId {
     let op = mk_op(fd, 2, OpCode::CPUI_LOAD);
     let spaceid = fd.new_constant(4, 2);
-    let ptr = fd.new_varnode(8, &reg(fd, RSP), None);
+    let ptr = fd.new_varnode(8, &reg(fd, RSP), None).unwrap();
     fd.op_set_input(op, spaceid, 0).unwrap();
     fd.op_set_input(op, ptr, 1).unwrap();
     let out = reg(fd, off);

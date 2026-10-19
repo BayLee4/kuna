@@ -93,7 +93,7 @@ fn wire_const(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_written(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     set_def(fd, vn, defop)
 }
 
@@ -155,7 +155,7 @@ fn collapses_ovless_idiom_to_sless() {
     let (op, vbase) = build_idiom(&mut fd, 4, 8); // K = 8
 
     let mut rule = RuleOvLessSimplify::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
 
     // op is now INT_SLESS(V, -8).
     let o = fd.obank().get(op).unwrap();
@@ -173,7 +173,7 @@ fn gate_off_is_noop() {
     let mut fd = build_fd();
     let (op, _v) = build_idiom(&mut fd, 4, 8);
     let mut rule = RuleOvLessSimplify::new(false);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_NOTEQUAL);
 }
 
@@ -194,7 +194,7 @@ fn non_matching_in1_declines() {
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleOvLessSimplify::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     let _ = wire_const; // silence unused in this test path
 }
 
@@ -219,7 +219,7 @@ fn mismatched_constants_decline() {
     let _ = set_def(&mut fd, out, op);
 
     let mut rule = RuleOvLessSimplify::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]

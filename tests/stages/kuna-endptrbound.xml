@@ -22,8 +22,8 @@
 
     [rbp+0x2f] is both one past the buffer and the address of s, so the frame
     model binds the bound to s: the loop renders `while (v3 != v2)`, the
-    walking pointer takes s's element type, and the buffer becomes an
-    `unsigned int` written through `_4_4_`.  With the option on, the walk
+    walking pointer takes s's element type, and the buffer remains a scalar
+    written through `_4_4_`.  With the option on, the walk
     (stack start, constant step, dereferenced with the step's width, compared
     against a stack address a whole number of steps later) makes [rbp+0x27,
     rbp+0x2f) one `char [8]`, and the bound is rebuilt on it as `&v1[8]`.
@@ -151,7 +151,7 @@
 <stringmatch name="ENDPTRBOUND #5: on, the call argument that means the neighbour still names it" min="2" max="2">^    push_back\(v2,\(uint1\)\*v3\);$</stringmatch>
 <stringmatch name="ENDPTRBOUND #6: both passes, a store straddling the walk's end vetoes the buffer" min="2" max="2">^  unsigned long long v3; // ([^\n]+ \| )?stack - 0x54( \| [^\n]+)?$</stringmatch>
 <stringmatch name="ENDPTRBOUND #7: both passes, a comparison that controls no loop exit keeps naming the neighbour" min="2" max="2">^    if \(v4 != v3\)$</stringmatch>
-<stringmatch name="ENDPTRBOUND #8: both passes, that comparison invents no buffer" min="2" max="2">^  unsigned int v2; // ([^\n]+ \| )?stack - 0x60( \| [^\n]+)?$</stringmatch>
+<stringmatch name="ENDPTRBOUND #8: both passes, that comparison invents no buffer" min="2" max="2">^  unsigned long long v2; // ([^\n]+ \| )?stack - 0x60( \| [^\n]+)?$</stringmatch>
 <stringmatch name="ENDPTRBOUND #9: both passes, a walk that reads past its end is not bounded on a buffer" min="2" max="2">^  \} while \(v3 != \(uint1 \*\)v2\);$</stringmatch>
 <stringmatch name="ENDPTRBOUND #10: both passes, a byte walk over an int array keeps the int array" min="2" max="2">^  int4 v1 \[4\]; // [^\n]+$</stringmatch>
 <stringmatch name="ENDPTRBOUND #11: both passes, that array keeps its int indexing" min="2" max="2">^    v1\[v[56]\] = v[56] \* 3 \+ v[23];$</stringmatch>

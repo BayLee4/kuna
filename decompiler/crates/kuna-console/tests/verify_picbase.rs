@@ -68,7 +68,7 @@ fn index(picbase: bool) -> (ConsoleProgram, Vec<u8>, XrefIndex) {
     let file = object::File::parse(&*bytes).expect("fixture parses");
     let seeds: Vec<u64> =
         prog.function_entries_canonical().iter().map(|e| e.addr.get_offset()).collect();
-    let idx = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds);
+    let idx = xrefs::build(&file, prog.arch(), prog.arch().translate(), &seeds).unwrap();
     (prog, bytes, idx)
 }
 

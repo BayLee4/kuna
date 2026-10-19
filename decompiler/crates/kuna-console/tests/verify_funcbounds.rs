@@ -81,7 +81,7 @@ fn body_at_entry(prog: &mut ConsoleProgram, name: &str) -> String {
         &[],
     );
     let fd = step.result.expect("the function decompiles");
-    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd)
+    kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap()
 }
 
 /// The inventory extent kuna reports for `ENTRY`.
@@ -153,7 +153,7 @@ fn a_declared_end_a_branch_targets_clips_instead_of_aborting() {
         &[],
     );
     let fd = step.result.expect("the clipped function decompiles");
-    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);
+    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap();
     assert!(body.contains("deregister"), "the declared name renders, got:\n{body}");
     assert!(
         body.contains("Function flows out of bounds"),
@@ -182,7 +182,7 @@ fn declaring_the_derived_extent_reproduces_the_undeclared_body() {
     let natural = decompile_one(prog.arch_mut(), "sub_1129", addr.clone(), 0, &seed, &[])
         .result
         .expect("the undeclared function decompiles");
-    let undeclared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &natural);
+    let undeclared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &natural).unwrap();
     assert!(
         undeclared.contains("return"),
         "the fixture's leaf really does return a value, got:\n{undeclared}"
@@ -193,7 +193,7 @@ fn declaring_the_derived_extent_reproduces_the_undeclared_body() {
     let bounded = decompile_one(prog.arch_mut(), "sub_1129", addr, size, &seed, &[])
         .result
         .expect("the declared function decompiles");
-    let declared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &bounded);
+    let declared = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &bounded).unwrap();
 
     assert_eq!(undeclared, declared, "asserting the derived extent is inert");
     assert!(
@@ -343,7 +343,7 @@ fn a_pcode_free_branch_resolves_at_a_discovered_funcbound_cutoff() {
         &[],
     );
     let fd = step.result.expect("the funcboundflow-clipped callback decompiles");
-    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd);
+    let body = kuna_decomp::decompile_drive::print_c(prog.arch_mut(), &fd).unwrap();
     assert!(
         body.contains("0x80492e3") && body.contains("0x8049301"),
         "both accepted and rejected report arms survive, got:\n{body}"

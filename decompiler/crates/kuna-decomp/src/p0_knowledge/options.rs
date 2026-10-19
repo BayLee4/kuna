@@ -104,6 +104,8 @@ pub const ELEM_JUMPTABLEMAX: ElementId = ElementId::new("jumptablemax", 271);
 pub const ELEM_NANIGNORE: ElementId = ElementId::new("nanignore", 272);
 /// Marshaling element `<braceformat>` (options.cc:85).
 pub const ELEM_BRACEFORMAT: ElementId = ElementId::new("braceformat", 284);
+/// Enhanced invocation-owned export option; never emitted by stock peers.
+pub const ELEM_EXPORTINLINE: ElementId = ElementId::new("exportinline", 4010);
 
 /// Every upstream option element id, in OptionDatabase-constructor registration
 /// order (options.cc:119-155).  Used to seed the dispatch map and to register
@@ -579,6 +581,10 @@ pub trait ArchOptionContext {
     /// `glb->setPrintLanguage(p1)` (options.cc:865).  // STUB(W8)
     fn set_print_language(&mut self, language: &str);
 
+    /// Establish the selected language's sparse native baseline before its
+    /// following rendering options, without changing console language selection.
+    fn reset_native_print_language_defaults(&mut self) {}
+
     // --- action database (STUB W5: action / coreaction) --------------------
 
     /// `glb->allacts.getCurrent()->setWarning(val,p1)`; `false` => bad
@@ -586,14 +592,14 @@ pub trait ArchOptionContext {
     fn set_action_warning(&mut self, val: bool, name: &str) -> bool;
     /// `glb->allacts.cloneGroup(p1,p2); setCurrent(p2)` (options.cc:682-683).
     /// // STUB(W5)
-    fn clone_action_group(&mut self, from: &str, to: &str);
+    fn clone_action_group(&mut self, from: &str, to: &str) -> KunaResult<()>;
     /// `glb->allacts.setCurrent(p1)` (options.cc:686/707).  // STUB(W5)
-    fn set_current_action(&mut self, name: &str);
+    fn set_current_action(&mut self, name: &str) -> KunaResult<()>;
     /// `glb->allacts.getCurrentName()` (options.cc:714/715).  // STUB(W5)
     fn current_action_name(&self) -> String;
     /// `glb->allacts.toggleAction(grp,sub,val)` (options.cc:709/714).
     /// // STUB(W5)
-    fn toggle_action(&mut self, group: &str, sub: &str, val: bool);
+    fn toggle_action(&mut self, group: &str, sub: &str, val: bool) -> KunaResult<()>;
     /// `root->enableRule(path)` on the current action (options.cc:938).
     /// // STUB(W5)
     fn enable_rule(&mut self, path: &str) -> bool;
@@ -608,6 +614,9 @@ pub trait ArchOptionContext {
 
     /// `glb->translate->allowContextSet(val)` (options.cc:732).  // STUB(W4)
     fn allow_context_set(&mut self, val: bool);
+    fn set_export_inline(&mut self, _val: bool) -> KunaResult<()> {
+        Err(KunaError::parse("Export inline preparation is not supported"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -634,6 +643,20 @@ pub trait ArchOption {
         p2: &str,
         p3: &str,
     ) -> KunaResult<String>;
+}
+
+struct OptionExportInline;
+
+impl ArchOption for OptionExportInline {
+    fn get_name(&self) -> &str { "exportinline" }
+    fn apply(&self, glb: &mut dyn ArchOptionContext, p1: &str, p2: &str, p3: &str) -> KunaResult<String> {
+        if !p2.is_empty() || !p3.is_empty() {
+            return Err(KunaError::parse("exportinline takes one on/off parameter"));
+        }
+        let value = on_or_off(p1)?;
+        glb.set_export_inline(value)?;
+        Ok(format!("Export root inline preparation turned {}", if value { "on" } else { "off" }))
+    }
 }
 
 /// Read a loader toggle, retaining its default for unknown or non-Unicode values.
@@ -1239,11 +1262,11 @@ impl ArchOption for OptionSetAction {
             return Err(KunaError::parse("Must specify preexisting action"));
         }
         if !p2.is_empty() {
-            glb.clone_action_group(p1, p2);
-            glb.set_current_action(p2);
+            glb.clone_action_group(p1, p2)?;
+            glb.set_current_action(p2)?;
             return Ok(format!("Created {p2} by cloning {p1} and made it current"));
         }
-        glb.set_current_action(p1);
+        glb.set_current_action(p1)?;
         Ok(format!("Set current action to {p1}"))
     }
 }
@@ -1268,14 +1291,14 @@ impl ArchOption for OptionCurrentAction {
         }
         let mut res = "Toggled ".to_string();
         if !p3.is_empty() {
-            glb.set_current_action(p1);
+            glb.set_current_action(p1)?;
             let val = on_or_off(p3)?;
-            glb.toggle_action(p1, p2, val);
+            glb.toggle_action(p1, p2, val)?;
             res += &format!("{p2} in action {p1}");
         } else {
             let val = on_or_off(p2)?;
             let cur = glb.current_action_name();
-            glb.toggle_action(&cur, p1, val);
+            glb.toggle_action(&cur, p1, val)?;
             res += &format!("{p1} in action {cur}");
         }
         Ok(res)
@@ -1713,12 +1736,12 @@ impl ArchOption for OptionSplitDatatypes {
 
         let cur = glb.current_action_name();
         if (config & (split_datatype::OPTION_STRUCT | split_datatype::OPTION_ARRAY)) == 0 {
-            glb.toggle_action(&cur, "splitcopy", false);
-            glb.toggle_action(&cur, "splitpointer", false);
+            glb.toggle_action(&cur, "splitcopy", false)?;
+            glb.toggle_action(&cur, "splitpointer", false)?;
         } else {
             let pointers = (config & split_datatype::OPTION_POINTER) != 0;
-            glb.toggle_action(&cur, "splitcopy", true);
-            glb.toggle_action(&cur, "splitpointer", pointers);
+            glb.toggle_action(&cur, "splitcopy", true)?;
+            glb.toggle_action(&cur, "splitpointer", pointers)?;
         }
 
         if old_config == config {
@@ -1811,6 +1834,7 @@ impl OptionDatabase {
     /// Kuna options dispatch by name through `Architecture::set_kuna_option`.
     pub fn new() -> Self {
         let mut db = OptionDatabase { optionmap: BTreeMap::new() };
+        db.register_option(ELEM_EXPORTINLINE, Box::new(OptionExportInline));
         // Registration order mirrors options.cc:119-155 exactly.
         db.register_option(ELEM_EXTRAPOP, Box::new(OptionExtraPop));
         db.register_option(ELEM_READONLY, Box::new(OptionReadOnly));
@@ -1889,36 +1913,37 @@ impl OptionDatabase {
     ///
     /// Reads `<name>` with optional `<param1>`/`<param2>`/`<param3>` children
     /// (or bare text content as param1) and dispatches to [`set`](Self::set).
+    /// Parameter children must be ordered, unique leaves. Validate the whole
+    /// option before applying it: XML close does not check unread children or
+    /// mismatched ids, unlike the packed decoder used by upstream native peers.
     pub fn decode_one(
         &self,
         decoder: &mut dyn Decoder,
         glb: &mut dyn ArchOptionContext,
     ) -> KunaResult<()> {
-        let mut p1 = String::new();
-        let mut p2 = String::new();
-        let mut p3 = String::new();
-
         let elem_id = decoder.open_element()?;
-        let mut sub_id = decoder.open_element()?;
-        if sub_id == ELEM_PARAM1 {
-            p1 = read_content_string(decoder)?;
-            decoder.close_element(sub_id)?;
-            sub_id = decoder.open_element()?;
-            if sub_id == ELEM_PARAM2 {
-                p2 = read_content_string(decoder)?;
-                decoder.close_element(sub_id)?;
-                sub_id = decoder.open_element()?;
-                if sub_id == ELEM_PARAM3 {
-                    p3 = read_content_string(decoder)?;
-                    decoder.close_element(sub_id)?;
-                }
-            }
-        } else if sub_id == 0 {
+        let mut params = [String::new(), String::new(), String::new()];
+        if decoder.peek_element()? == 0 {
             // No children: the content is param1.
-            p1 = read_content_string(decoder)?;
+            params[0] = read_content_string(decoder)?;
+        } else {
+            for (slot, expected) in params.iter_mut().zip([ELEM_PARAM1, ELEM_PARAM2, ELEM_PARAM3]) {
+                if decoder.peek_element()? == 0 {
+                    break;
+                }
+                let child = decoder.open_element_id(&expected)?;
+                if decoder.peek_element()? != 0 {
+                    return Err(KunaError::decoder("Option parameters must not contain child elements"));
+                }
+                *slot = read_content_string(decoder)?;
+                decoder.close_element(child)?;
+            }
+            if decoder.peek_element()? != 0 {
+                return Err(KunaError::decoder("Unexpected option parameter"));
+            }
         }
         decoder.close_element(elem_id)?;
-        self.set(glb, elem_id, &p1, &p2, &p3)?;
+        self.set(glb, elem_id, &params[0], &params[1], &params[2])?;
         Ok(())
     }
 
@@ -1968,6 +1993,34 @@ impl OptionDatabase {
                     "Warning: decompiler option {name} not applied: {}",
                     e.explain()
                 ));
+            }
+        }
+        decoder.close_element(elem_id)?;
+        Ok(warnings)
+    }
+
+    /// Native sessions tolerate newer unknown option IDs, but a known option
+    /// must pass the same strict grammar as [`decode_one`](Self::decode_one)
+    /// and apply successfully. Earlier options remain committed when a later
+    /// option fails, matching native sequential-prefix semantics.
+    pub fn decode_native(
+        &self,
+        decoder: &mut dyn Decoder,
+        glb: &mut dyn ArchOptionContext,
+    ) -> KunaResult<Vec<String>> {
+        let elem_id = decoder.open_element_id(&ELEM_OPTIONSLIST)?;
+        let mut warnings = Vec::new();
+        while decoder.peek_element()? != 0 {
+            let id = decoder.peek_element()?;
+            if !self.optionmap.contains_key(&id) {
+                let id = decoder.open_element()?;
+                decoder.close_element_skipping(id)?;
+                warnings.push(format!("Warning: unknown decompiler option element {id} skipped"));
+                continue;
+            }
+            self.decode_one(decoder, glb)?;
+            if id == ELEM_SETLANGUAGE {
+                glb.reset_native_print_language_defaults();
             }
         }
         decoder.close_element(elem_id)?;
@@ -2050,6 +2103,7 @@ fn read_content_string(decoder: &mut dyn Decoder) -> KunaResult<String> {
 /// names to the dispatch ids.  Mirrors the C++ global `ElementId` registration
 /// these options rely on.
 pub fn register_option_elements(reg: &mut IdRegistry) {
+    reg.register_element(&ELEM_EXPORTINLINE);
     for e in UPSTREAM_OPTION_ELEMENTS {
         reg.register_element(e);
     }

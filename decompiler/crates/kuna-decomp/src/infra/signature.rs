@@ -32,27 +32,19 @@
 //! (ADR 0003); the CRC mixing is `kuna_base::crc32::crc_update` (the W1 port of
 //! `crc32.hh`).
 //!
-//! # Boundaries
-//!
-//! Three pieces of the marshalling/print surface are not yet ported and are
-//! routed through `STUB` errors so the *algorithm* (the testable substance)
-//! transcribes cleanly:
-//!
-//!   * `Varnode::encode` / `PcodeOp::encode` / `Datatype` encode — the W8 marshal
-//!     surface; `VarnodeSignature::encode` / `BlockSignature::encode` defer.
-//!   * `FlowBlock::printHeader` / `getStart` — the W8 print surface
-//!     (`block.rs` `// STUB(W8)`); the feature `print_origin` / `BlockSignature`
-//!     paths defer.
-//!
-//! The [`Encoder`]-driven `Signature::encode` (a bare `<gensig hash=..>`) **is**
-//! ported because it only needs the marshal primitives that exist.
+//! Simple and debug encodings follow the stock Java signature consumers. Debug
+//! features retain their arena origins and use the same varnode and operation
+//! encoders as the function AST, including sequence numbers and block starts.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use kuna_base::crc32::crc_update;
 use kuna_base::error::{KunaError, KunaResult};
-use kuna_base::marshal::{AttributeId, ElementId, Encoder, ATTRIB_INDEX, ATTRIB_VAL};
+use kuna_base::marshal::{
+    AttributeId, ElementId, Encoder, ATTRIB_CONTENT, ATTRIB_INDEX, ATTRIB_OFFSET,
+    ATTRIB_SPACE, ATTRIB_VAL,
+};
 use kuna_num::opcodes::OpCode;
 
 use crate::funcdata::Funcdata;
@@ -75,16 +67,24 @@ pub const ELEM_BLOCKSIG: ElementId = ElementId::new("blocksig", 258);
 pub const ELEM_CALL: ElementId = ElementId::new("call", 259);
 /// Marshaling element `<gensig>` (signature.cc:32).
 pub const ELEM_GENSIG: ElementId = ElementId::new("gensig", 260);
+pub const ELEM_MAJOR: ElementId = ElementId::new("major", 261);
+pub const ELEM_MINOR: ElementId = ElementId::new("minor", 262);
 /// Marshaling element `<copysig>` (signature.cc:35).
 pub const ELEM_COPYSIG: ElementId = ElementId::new("copysig", 263);
+pub const ELEM_SETTINGS: ElementId = ElementId::new("settings", 264);
 /// Marshaling element `<sig>` (signature.cc:37).
 pub const ELEM_SIG: ElementId = ElementId::new("sig", 265);
 /// Marshaling element `<signaturedesc>` (signature.cc:38).
 pub const ELEM_SIGNATUREDESC: ElementId = ElementId::new("signaturedesc", 266);
 /// Marshaling element `<signatures>` (signature.cc:39).
 pub const ELEM_SIGNATURES: ElementId = ElementId::new("signatures", 267);
+pub const ELEM_SIGSETTINGS: ElementId = ElementId::new("sigsettings", 268);
 /// Marshaling element `<varsig>` (signature.cc:41).
 pub const ELEM_VARSIG: ElementId = ElementId::new("varsig", 269);
+
+/// Native interface version from `ArchitectureCapability` (architecture.cc).
+pub const SIGNATURE_MAJOR_VERSION: i32 = 6;
+pub const SIGNATURE_MINOR_VERSION: i32 = 1;
 
 /// Data-type for containing hash information (C++ `typedef uint8 hashword`,
 /// signature.hh:25).
@@ -143,6 +143,31 @@ pub(crate) static SETTINGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 /// `SigManager::setSettings`).
 pub fn set_settings(newvalue: u32) {
     SIG_SETTINGS.store(newvalue, Ordering::Relaxed);
+}
+
+/// Apply a native `setSignatureSettings` request without changing valid settings
+/// when the requested bits are unsupported.
+pub fn try_set_settings(newvalue: u32) -> bool {
+    if !GraphSigManager::test_settings(newvalue) {
+        return false;
+    }
+    set_settings(newvalue);
+    true
+}
+
+/// Encode the stock `getSignatureSettings` response, in Java's required order.
+pub fn encode_settings(encoder: &mut dyn Encoder) {
+    encoder.open_element(&ELEM_SIGSETTINGS);
+    encoder.open_element(&ELEM_MAJOR);
+    encoder.write_signed_integer(&ATTRIB_CONTENT, SIGNATURE_MAJOR_VERSION as i64);
+    encoder.close_element(&ELEM_MAJOR);
+    encoder.open_element(&ELEM_MINOR);
+    encoder.write_signed_integer(&ATTRIB_CONTENT, SIGNATURE_MINOR_VERSION as i64);
+    encoder.close_element(&ELEM_MINOR);
+    encoder.open_element(&ELEM_SETTINGS);
+    encoder.write_unsigned_integer(&ATTRIB_CONTENT, get_settings() as u64);
+    encoder.close_element(&ELEM_SETTINGS);
+    encoder.close_element(&ELEM_SIGSETTINGS);
 }
 
 // ===========================================================================
@@ -271,10 +296,8 @@ impl Signature {
     /// Encode the feature to the stream (C++ `Signature::encode` and the derived
     /// overrides, signature.cc:609-659).
     ///
-    /// The bare `<gensig>` / `<copysig>` forms port; the `<varsig>` / `<blocksig>`
-    /// forms need `Varnode::encode` / `PcodeOp::encode` / `Address::encode` of the
-    /// block start — the W8 marshal/print surface — and STUB out.
-    pub fn encode(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
+    /// Resolve feature origins against the function that generated them.
+    pub fn encode(&self, fd: &Funcdata, encoder: &mut dyn Encoder) -> KunaResult<()> {
         match self.kind {
             SignatureKind::Generic => {
                 // Signature::encode (signature.cc:609-615)
@@ -283,22 +306,43 @@ impl Signature {
                 encoder.close_element(&ELEM_GENSIG);
                 Ok(())
             }
-            SignatureKind::Copy(_) => {
+            SignatureKind::Copy(bl) => {
                 // CopySignature::encode (signature.cc:652-659)
                 encoder.open_element(&ELEM_COPYSIG);
                 encoder.write_unsigned_integer(&ATTRIB_HASH, self.get_hash() as u64);
-                // The block index (ATTRIB_INDEX) is written by the caller via encode_with_index.
+                encoder.write_signed_integer(
+                    &ATTRIB_INDEX, fd.bblocks_ref().block(bl).get_index() as i64,
+                );
                 encoder.close_element(&ELEM_COPYSIG);
                 Ok(())
             }
-            SignatureKind::Varnode(_) => Err(KunaError::lowlevel(
-                "kuna rust port: VarnodeSignature::encode needs Varnode::encode + \
-                 PcodeOp::encode (W8 marshal surface)",
-            )),
-            SignatureKind::Block { .. } => Err(KunaError::lowlevel(
-                "kuna rust port: BlockSignature::encode needs FlowBlock::getStart \
-                 + Address::encode of block start + PcodeOp::encode (W8)",
-            )),
+            SignatureKind::Varnode(vn) => {
+                encoder.open_element(&ELEM_VARSIG);
+                encoder.write_unsigned_integer(&ATTRIB_HASH, self.get_hash() as u64);
+                fd.encode_varnode(encoder, vn)?;
+                if let Some(op) = fd.vbank().get(vn).expect("signature origin").get_def() {
+                    fd.encode_op(encoder, op)?;
+                }
+                encoder.close_element(&ELEM_VARSIG);
+                Ok(())
+            }
+            SignatureKind::Block { bl, op1, op2 } => {
+                encoder.open_element(&ELEM_BLOCKSIG);
+                encoder.write_unsigned_integer(&ATTRIB_HASH, self.get_hash() as u64);
+                encoder.write_signed_integer(
+                    &ATTRIB_INDEX, fd.bblocks_ref().block(bl).get_index() as i64,
+                );
+                fd.bblocks_block_start(bl).encode(encoder)?;
+                // Java reads the primary operation before the preceding one.
+                if let Some(op) = op2 {
+                    fd.encode_op(encoder, op)?;
+                }
+                if let Some(op) = op1 {
+                    fd.encode_op(encoder, op)?;
+                }
+                encoder.close_element(&ELEM_BLOCKSIG);
+                Ok(())
+            }
         }
     }
 }
@@ -1510,10 +1554,10 @@ impl GraphSigManager {
 
     /// Encode all current features (C++ `SigManager::encode`,
     /// signature.cc:729-737).
-    pub fn encode(&self, encoder: &mut dyn Encoder) -> KunaResult<()> {
+    pub fn encode(&self, fd: &Funcdata, encoder: &mut dyn Encoder) -> KunaResult<()> {
         encoder.open_element(&ELEM_SIGNATUREDESC);
         for s in &self.sigs {
-            s.encode(encoder)?;
+            s.encode(fd, encoder)?;
         }
         encoder.close_element(&ELEM_SIGNATUREDESC);
         Ok(())
@@ -1546,10 +1590,15 @@ pub fn simple_signature(fd: &Funcdata, encoder: &mut dyn Encoder) -> KunaResult<
         encoder.write_unsigned_integer(&ATTRIB_VAL, f as u64);
         encoder.close_element(&ELEM_SIG);
     }
-    // The per-call <call> elements iterate `fd->numCalls()` /
-    // `fd->getCallSpecs(i)->getEntryAddress()` — the FuncCallSpecs list is the W4
-    // call-spec surface not yet threaded onto the W3 Funcdata.  STUB(W4).
-    let _ = (&ATTRIB_INDEX, &ELEM_CALL); // keep the call-element ids referenced
+    for i in 0..fd.num_calls() {
+        let addr = fd.get_call_specs(i).get_entry_address();
+        if !addr.is_invalid() {
+            encoder.open_element(&ELEM_CALL);
+            encoder.write_space(&ATTRIB_SPACE, addr.get_space().expect("valid call entry has a space"));
+            encoder.write_unsigned_integer(&ATTRIB_OFFSET, addr.get_offset());
+            encoder.close_element(&ELEM_CALL);
+        }
+    }
     encoder.close_element(&ELEM_SIGNATURES);
     Ok(())
 }
@@ -1557,14 +1606,13 @@ pub fn simple_signature(fd: &Funcdata, encoder: &mut dyn Encoder) -> KunaResult<
 /// Generate features (with full per-feature description) for a single function
 /// (C++ `debugSignature`, signature.cc:1137-1146).
 ///
-/// Defers on the `<varsig>`/`<blocksig>` encode (the W8 marshal surface); the
-/// `<gensig>`/`<copysig>` features encode fully.
+/// Includes each feature's original varnode, block, and defining operations.
 pub fn debug_signature(fd: &Funcdata, encoder: &mut dyn Encoder) -> KunaResult<()> {
     let mut sigmanager = GraphSigManager::new()?;
     sigmanager.set_current_function(fd)?;
     sigmanager.generate(fd);
     sigmanager.sort_by_hash();
-    sigmanager.encode(encoder)
+    sigmanager.encode(fd, encoder)
 }
 
 #[cfg(test)]
@@ -1666,7 +1714,7 @@ mod tests {
         let mut fd = build_fd();
         let rs = ramspace(&fd);
         // size-8 input varnode at ram:0x2000
-        let v8 = fd.new_varnode(8, &Address::new(Rc::clone(&rs), 0x2000), None);
+        let v8 = fd.new_varnode(8, &Address::new(Rc::clone(&rs), 0x2000), None).unwrap();
         let v8 = fd.set_input_varnode(v8).unwrap();
         // Without SIG_COLLAPSE_SIZE the raw size 8 is mixed; with it, clamps to 4.
         let raw = hash_size(&fd, v8, 0);
@@ -1688,7 +1736,7 @@ mod tests {
         fd.bblocks_mut().set_start_block(root, bl);
 
         // input param at ram:0x100, size 4.
-        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None);
+        let p = fd.new_varnode(4, &Address::new(Rc::clone(&rs), 0x100), None).unwrap();
         let p = fd.set_input_varnode(p).unwrap();
         // c = const 5 (size 4).
         let c = fd.new_constant(4, 5);
@@ -1705,6 +1753,11 @@ mod tests {
         fd.op_set_input(ret, iop, 0).unwrap();
         fd.op_set_input(ret, out, 1).unwrap();
 
+        // Real FlowInfo::split_basic publishes the machine-address range after
+        // assigning ops to a block. Debug block origins serialize this range,
+        // not an address inferred from whichever operation a feature selected.
+        fd.set_basic_block_range(bl, &Address::new(Rc::clone(&rs), 0x1000),
+            &Address::new(Rc::clone(&rs), 0x1004));
         // Recompute the basic-block structure (one block, start = bl).
         fd.structure_reset();
         (fd, bl)
@@ -1774,12 +1827,106 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let mut enc = XmlEncode::new(&mut buf);
-            s.encode(&mut enc).unwrap();
+            s.encode(&build_fd(), &mut enc).unwrap();
         }
         let xml = String::from_utf8(buf).unwrap();
         assert!(xml.contains("<gensig"), "got: {xml}");
         // sig truncates to the low 32 bits: 0x9abcdef0.
         assert!(xml.contains("0x9abcdef0") || xml.contains("9abcdef0"), "got: {xml}");
+    }
+
+    #[test]
+    fn debug_signature_encodes_original_feature_origins() {
+        let _guard = SETTINGS_LOCK.lock().unwrap();
+        set_settings(73);
+        let (fd, bl) = build_add_function();
+        let mut manager = GraphSigManager::new().unwrap();
+        manager.set_current_function(&fd).unwrap();
+        manager.generate(&fd);
+        manager.sort_by_hash();
+        let mut buf = Vec::new();
+        {
+            let mut enc = XmlEncode::new(&mut buf);
+            manager.encode(&fd, &mut enc).unwrap();
+        }
+        let xml = String::from_utf8(buf).unwrap();
+        let document = kuna_base::xml::xml_tree(xml.as_bytes()).unwrap();
+        assert_eq!(document.get_root().get_name(), "signaturedesc", "{xml}");
+        assert!(xml.contains("<varsig "), "{xml}");
+        assert!(xml.contains("<blocksig "), "{xml}");
+        assert!(xml.contains("<seqnum "), "{xml}");
+        for feature in &manager.sigs {
+            let mut buf = Vec::new();
+            {
+                let mut enc = XmlEncode::new(&mut buf);
+                feature.encode(&fd, &mut enc).unwrap();
+            }
+            let origin = String::from_utf8(buf).unwrap();
+            match feature.kind() {
+                SignatureKind::Varnode(vn) => {
+                    assert!(origin.contains("<addr "), "{origin}");
+                    assert!(origin.contains("size="), "{origin}");
+                    if fd.vbank().get(vn).unwrap().is_written() {
+                        assert!(origin.contains("<op "), "{origin}");
+                        assert!(origin.contains("<seqnum "), "{origin}");
+                    }
+                }
+                SignatureKind::Block { bl: origin_bl, op1, op2 } => {
+                    assert_eq!(origin_bl, bl);
+                    assert!(origin.contains("index="), "{origin}");
+                    assert!(origin.contains("<addr "), "{origin}");
+                    assert!(origin.contains("<addr space=\"ram\" offset=\"0x1000\""), "{origin}");
+                    assert_eq!(origin.matches("<op ").count(),
+                               usize::from(op1.is_some()) + usize::from(op2.is_some()));
+                }
+                SignatureKind::Copy(_) => assert!(origin.contains("index="), "{origin}"),
+                SignatureKind::Generic => {}
+            }
+        }
+        // Stand-alone COPY features must carry the block index even when this
+        // fixture does not produce a stand-alone COPY hash.
+        let mut buf = Vec::new();
+        {
+            let mut enc = XmlEncode::new(&mut buf);
+            Signature::new_copy(bl, 0x1234).encode(&fd, &mut enc).unwrap();
+        }
+        assert!(String::from_utf8(buf).unwrap().contains("index="));
+    }
+
+    #[test]
+    fn native_settings_encode_version_and_preserve_valid_state() {
+        use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
+        let _guard = SETTINGS_LOCK.lock().unwrap();
+        assert!(try_set_settings(73));
+        assert!(!try_set_settings(0));
+        assert!(!try_set_settings(0x8001));
+        assert_eq!(get_settings(), 73);
+        let mut buf = Vec::new();
+        {
+            let mut enc = XmlEncode::new(&mut buf);
+            encode_settings(&mut enc);
+        }
+        // Match DecompInterface.decodeVersionNumber's ordered numeric reads;
+        // neither XML indentation nor the integer's radix is the protocol.
+        let manager = build_manager();
+        let mut registry = IdRegistry::with_base_ids();
+        for element in [&ELEM_SIGSETTINGS, &ELEM_MAJOR, &ELEM_MINOR, &ELEM_SETTINGS] {
+            registry.register_element(element);
+        }
+        let mut decoder = XmlDecode::new(&manager, &registry);
+        decoder.ingest_stream(&buf).unwrap();
+        let root = decoder.open_element_id(&ELEM_SIGSETTINGS).unwrap();
+        let major = decoder.open_element_id(&ELEM_MAJOR).unwrap();
+        assert_eq!(decoder.read_signed_integer_id(&ATTRIB_CONTENT).unwrap(), 6);
+        decoder.close_element(major).unwrap();
+        let minor = decoder.open_element_id(&ELEM_MINOR).unwrap();
+        assert_eq!(decoder.read_signed_integer_id(&ATTRIB_CONTENT).unwrap(), 1);
+        decoder.close_element(minor).unwrap();
+        let settings = decoder.open_element_id(&ELEM_SETTINGS).unwrap();
+        assert_eq!(decoder.read_unsigned_integer_id(&ATTRIB_CONTENT).unwrap(), 73);
+        decoder.close_element(settings).unwrap();
+        assert_eq!(decoder.peek_element().unwrap(), 0);
+        decoder.close_element(root).unwrap();
     }
 
     #[test]

@@ -42,8 +42,8 @@ impl TypeFactoryAccess for NoTypes {
     }
 }
 impl TranslateAccess for AngrArch {
-    fn get_register_name(&self, _sp: &Rc<AddrSpace>, _off: uintb, _size: int4) -> String {
-        String::new() // no register backs any storage in these tests
+    fn get_register_name(&self, _sp: &Rc<AddrSpace>, _off: uintb, _size: int4) -> kuna_base::error::KunaResult<String> {
+        Ok(String::new()) // no register backs any storage in these tests
     }
 }
 impl DatabaseArch for AngrArch {

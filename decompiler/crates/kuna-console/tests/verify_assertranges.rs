@@ -76,7 +76,7 @@ fn decompile_with(target: &str, directives: Vec<Directive>) -> (String, Vec<Outc
     let entry = prog
         .resolve_entry(&EntrySelector::Name(target.to_string()))
         .expect("the fixture has this function");
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     (code, prog.assertion_outcomes())
 }
@@ -128,7 +128,7 @@ fn read_only_propagation_without_the_range_changes_nothing() {
     let entry = prog
         .resolve_entry(&EntrySelector::Name("sample".to_string()))
         .expect("the fixture has `sample`");
-    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false);
+    let funcs = decompile_targets(&mut prog, vec![entry], false, false, false).unwrap();
     let code = funcs[0].code.clone().unwrap_or_default();
     assert!(code.contains("scale"), "the option alone folded a .data load:\n{code}");
     assert!(code.contains("bias"), "the option alone folded a .data load:\n{code}");

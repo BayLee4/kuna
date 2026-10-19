@@ -351,16 +351,16 @@ impl<'a> ScoreUnionFields<'a> {
     // -- newTrialsDown / newTrials (unionresolve.cc:297-346) -------------------
 
     /// C++ `ScoreUnionFields::newTrialsDown` (unionresolve.cc:297-315).
-    fn new_trials_down(&mut self, vn: VarnodeId, ct: Rc<Datatype>, score_index: int4, max: int4) {
+    fn new_trials_down(&mut self, vn: VarnodeId, ct: Rc<Datatype>, score_index: int4, max: int4) -> KunaResult<()> {
         if !self.visited.insert(VisitMark(vn, score_index)) {
-            return; // Already visited this Varnode
+            return Ok(()); // Already visited this Varnode
         }
         let is_lock = self.data.vbank().get(vn).map(|v| v.is_type_lock()).unwrap_or(false);
         if is_lock {
-            let lock_type = self.data.vn_type_def_facing(vn);
+            let lock_type = self.data.vn_type_def_facing(vn)?;
             if !lock_type.needs_resolution() {
                 self.scores[score_index as usize] += score_locked_type(&ct, &lock_type);
-                return; // Don't propagate through locked Varnode
+                return Ok(()); // Don't propagate through locked Varnode
             }
         }
         let descends: Vec<OpId> = self
@@ -373,23 +373,24 @@ impl<'a> ScoreUnionFields<'a> {
             let slot = self.data.obank().get(op).map(|o| o.get_slot(vn)).unwrap_or(-1);
             self.trial_next.push(Trial::new_down(self.data, op, slot, Rc::clone(&ct), score_index, max));
         }
+        Ok(())
     }
 
     /// C++ `ScoreUnionFields::newTrials` (unionresolve.cc:323-346).
-    fn new_trials(&mut self, op: OpId, slot: int4, ct: Rc<Datatype>, score_index: int4, max: int4) {
+    fn new_trials(&mut self, op: OpId, slot: int4, ct: Rc<Datatype>, score_index: int4, max: int4) -> KunaResult<()> {
         let vn = match self.data.obank().get(op).and_then(|o| o.get_in(slot)) {
             Some(v) => v,
-            None => return,
+            None => return Ok(()),
         };
         if !self.visited.insert(VisitMark(vn, score_index)) {
-            return; // Already visited this Varnode
+            return Ok(()); // Already visited this Varnode
         }
         let is_lock = self.data.vbank().get(vn).map(|v| v.is_type_lock()).unwrap_or(false);
         if is_lock {
-            let lock_type = self.data.vn_type_read_facing(vn, op);
+            let lock_type = self.data.vn_type_read_facing(vn, op)?;
             if !lock_type.needs_resolution() {
                 self.scores[score_index as usize] += score_locked_type(&ct, &lock_type);
-                return; // Don't propagate through locked Varnode
+                return Ok(()); // Don't propagate through locked Varnode
             }
         }
         // trialNext.emplace_back(vn,ct,scoreIndex,max);  // Try to fit up
@@ -414,6 +415,7 @@ impl<'a> ScoreUnionFields<'a> {
                 max,
             ));
         }
+        Ok(())
     }
 
     // -- scoreTrialDown / scoreTrialUp (unionresolve.cc:355-921) ---------------
@@ -464,7 +466,7 @@ impl<'a> ScoreUnionFields<'a> {
                             score = dr.score;
                             if let Some(ptrto) = dr.res_type {
                                 if !last_level {
-                                    self.new_trials(op, 2, ptrto, trial.score_index, 0);
+                                    self.new_trials(op, 2, ptrto, trial.score_index, 0)?;
                                 }
                             }
                         }
@@ -474,7 +476,7 @@ impl<'a> ScoreUnionFields<'a> {
                         } else {
                             let in1 = self.data.obank().get(op).and_then(|o| o.get_in(1));
                             if let Some(in1vn) = in1 {
-                                let store_ptr = self.data.vn_type_read_facing(in1vn, op);
+                                let store_ptr = self.data.vn_type_read_facing(in1vn, op)?;
                                 if !last_level && store_ptr.get_metatype() == type_metatype::TYPE_PTR
                                 {
                                     let ws = store_ptr.get_word_size().unwrap_or(1);
@@ -489,7 +491,7 @@ impl<'a> ScoreUnionFields<'a> {
                                         ptr,
                                         trial.score_index,
                                         trial.fit_type.get_size(),
-                                    );
+                                    )?;
                                 }
                             }
                             score = 1;
@@ -562,7 +564,7 @@ impl<'a> ScoreUnionFields<'a> {
         if let Some(rt) = res_type {
             if !last_level {
                 if let Some(outvn) = self.data.obank().get(op).and_then(|o| o.get_out()) {
-                    self.new_trials_down(outvn, rt, trial.score_index, max_length);
+                    self.new_trials_down(outvn, rt, trial.score_index, max_length)?;
                 }
             }
         }
@@ -833,7 +835,7 @@ impl<'a> ScoreUnionFields<'a> {
         self.scores[trial.score_index as usize] += score;
         if let Some(rt) = res_type {
             if !last_level {
-                self.new_trials(def, newslot, rt, trial.score_index, max_length);
+                self.new_trials(def, newslot, rt, trial.score_index, max_length)?;
             }
         }
         Ok(())
@@ -1132,7 +1134,7 @@ impl<'a> ScoreUnionFields<'a> {
                 s.scores[(i + 1) as usize] = -10;
                 continue;
             }
-            s.new_trials_down(vn, field_type, i + 1, 0);
+            s.new_trials_down(vn, field_type, i + 1, 0)?;
         }
         std::mem::swap(&mut s.trial_current, &mut s.trial_next);
         s.trial_next.clear();

@@ -43,7 +43,7 @@ fn sparc_calls_and_split_immediates_resolve_to_their_targets() {
         /* no_vars= */ false,
         /* want_proto= */ false,
         /* want_provenance= */ false,
-    );
+    ).unwrap();
     let code_for = |function: &str| {
         output
             .iter()

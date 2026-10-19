@@ -95,7 +95,7 @@ fn make_op_n(fd: &mut Funcdata, off: u64, opc: OpCode, ninputs: int4, flags: u32
 /// Inputs are not `isFree()` and carry a full NZ mask, matching the typical
 /// operand the rules see in a heritaged function.
 fn make_reg(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -112,7 +112,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
     let defop = fd.obank_mut().create_at(2, pc);
     fd.obank_mut().mark_alive(defop);
     fd.obank_mut().change_opcode(defop, TypeOp::new(defopc, 0, format!("{defopc:?}")));
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -123,7 +123,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4, defopc: OpCode) -> (Var
 /// Attach an output varnode to an existing op (used after creating ops with
 /// `make_op`).  Returns the new output varnode id.
 fn give_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4) -> VarnodeId {
-    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(ram(fd), off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(op).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: op, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -192,7 +192,7 @@ fn bxor2notequal_rewrites_opcode() {
     let mut fd = build_fd();
     let op = make_op(&mut fd, 0x1000, OpCode::CPUI_BOOL_XOR);
     let mut r = RuleBxor2NotEqual::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_NOTEQUAL);
 }
 
@@ -214,7 +214,7 @@ fn termorder_swaps_constant_to_last() {
     wire_input(&mut fd, op, c, 0); // constant in slot 0
     wire_input(&mut fd, op, reg, 1); // reg in slot 1
     let mut r = RuleTermOrder::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // After swap: reg in slot 0, constant in slot 1.
     assert_eq!(in_of(&fd, op, 0), Some(reg));
     assert_eq!(in_of(&fd, op, 1), Some(c));
@@ -229,7 +229,7 @@ fn termorder_no_swap_when_const_already_last() {
     wire_input(&mut fd, op, reg, 0);
     wire_input(&mut fd, op, c, 1);
     let mut r = RuleTermOrder::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0); // no change
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0); // no change
     assert_eq!(in_of(&fd, op, 0), Some(reg));
     assert_eq!(in_of(&fd, op, 1), Some(c));
 }
@@ -244,7 +244,7 @@ fn termorder_no_swap_when_both_constant() {
     wire_input(&mut fd, op, c1, 1);
     let mut r = RuleTermOrder::new("analysis");
     // vn1 const && !vn2 const is false (vn2 also const) -> no swap.
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn piece2zext_removes_zero_high_and_zexts() {
     wire_input(&mut fd, op, zero, 0);
     wire_input(&mut fd, op, w, 1);
     let mut r = RulePiece2Zext::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_ZEXT);
     // slot 0 (the constant) is removed -> W is now slot 0.
     assert_eq!(numin(&fd, op), 1);
@@ -285,7 +285,7 @@ fn piece2zext_declines_nonzero_constant() {
     wire_input(&mut fd, op, nz, 0);
     wire_input(&mut fd, op, w, 1);
     let mut r = RulePiece2Zext::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_PIECE);
 }
 
@@ -298,7 +298,7 @@ fn piece2zext_declines_nonconstant_high() {
     wire_input(&mut fd, op, hi, 0);
     wire_input(&mut fd, op, w, 1);
     let mut r = RulePiece2Zext::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -319,7 +319,7 @@ fn piece2sext_matches_sign_extension() {
     wire_input(&mut fd, op, shiftout, 0);
     wire_input(&mut fd, op, x, 1);
     let mut r = RulePiece2Sext::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SEXT);
     assert_eq!(numin(&fd, op), 1);
     assert_eq!(in_of(&fd, op, 0), Some(x));
@@ -337,7 +337,7 @@ fn piece2sext_declines_wrong_shift_amount() {
     wire_input(&mut fd, op, shiftout, 0);
     wire_input(&mut fd, op, x, 1);
     let mut r = RulePiece2Sext::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_PIECE);
 }
 
@@ -362,7 +362,7 @@ fn ormask_full_mask_completes_copy_of_duplicated_constant() {
     wire_input(&mut fd, op, full, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1, "transform completes since the constant-dup guard");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "transform completes since the constant-dup guard");
     // op is now a single-input COPY of a constant equal to the full mask.
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1, "the slot-1 constant input was removed");
@@ -386,7 +386,7 @@ fn ormask_declines_partial_mask() {
     wire_input(&mut fd, op, partial, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_OR);
 }
 
@@ -405,7 +405,7 @@ fn orcollapse_collapses_to_constant() {
     wire_input(&mut fd, op, c, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrCollapse::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // opSetOpcode COPY; opRemoveInput(0) -> only the constant c remains in slot 0.
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1);
@@ -423,7 +423,7 @@ fn orcollapse_declines_when_in0_turns_on_other_bits() {
     wire_input(&mut fd, op, c, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrCollapse::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -436,7 +436,7 @@ fn orcollapse_declines_nonconstant_in1() {
     wire_input(&mut fd, op, w, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrCollapse::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -454,7 +454,7 @@ fn orconsume_drops_unconsumed_slot0() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4); // output consume default ~0
     let mut r = RuleOrConsume::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1);
     assert_eq!(in_of(&fd, op, 0), Some(b));
@@ -470,7 +470,7 @@ fn orconsume_declines_when_both_consumed() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleOrConsume::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -496,7 +496,7 @@ fn andmask_zero_nzmask_in0_becomes_copy_zero() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleAndMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1);
     // slot 0 is a fresh constant 0.
@@ -517,7 +517,7 @@ fn andmask_andmask_equals_mask1_with_const_in1_copies_in0() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleAndMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, op), 1);
     assert_eq!(in_of(&fd, op, 0), Some(a));
@@ -535,7 +535,7 @@ fn andmask_declines_when_andmask_is_mask1_but_in1_not_constant() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleAndMask::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
 }
 
@@ -558,7 +558,7 @@ fn andorlump_combines_and_constants() {
     wire_input(&mut fd, op, vn1, 0);
     wire_input(&mut fd, op, d, 1);
     let mut r = RuleAndOrLump::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // op now: base & (0xf0 & 0x3c == 0x30)
     assert_eq!(in_of(&fd, op, 0), Some(base));
     let nin1 = in_of(&fd, op, 1).unwrap();
@@ -579,7 +579,7 @@ fn andorlump_or_uses_or_combine() {
     wire_input(&mut fd, op, vn1, 0);
     wire_input(&mut fd, op, d, 1);
     let mut r = RuleAndOrLump::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     let nin1 = in_of(&fd, op, 1).unwrap();
     assert_eq!(off_of(&fd, nin1), 0xf0 | 0x0c);
 }
@@ -598,7 +598,7 @@ fn andorlump_declines_when_inner_op_differs() {
     wire_input(&mut fd, op, vn1, 0);
     wire_input(&mut fd, op, d, 1);
     let mut r = RuleAndOrLump::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -619,7 +619,7 @@ fn negateidentity_and_with_negation_becomes_zero() {
     wire_input(&mut fd, logic, v, 1);
     let _logicout = give_output(&mut fd, logic, 0x80, 4);
     let mut r = RuleNegateIdentity::new("analysis");
-    assert_eq!(r.apply_op(neg, &mut fd), 1);
+    assert_eq!(r.apply_op(neg, &mut fd).unwrap(), 1);
     // logicOp -> COPY of newConstant(size, 0) in slot 0, slot 1 removed.
     assert_eq!(code_of(&fd, logic), OpCode::CPUI_COPY);
     assert_eq!(numin(&fd, logic), 1);
@@ -640,7 +640,7 @@ fn negateidentity_or_with_negation_becomes_full_mask() {
     wire_input(&mut fd, logic, v, 1);
     let _logicout = give_output(&mut fd, logic, 0x80, 4);
     let mut r = RuleNegateIdentity::new("analysis");
-    assert_eq!(r.apply_op(neg, &mut fd), 1);
+    assert_eq!(r.apply_op(neg, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, logic), OpCode::CPUI_COPY);
     let in0 = in_of(&fd, logic, 0).unwrap();
     assert_eq!(off_of(&fd, in0), calc_mask(4)); // ~0 over 4 bytes
@@ -659,7 +659,7 @@ fn negateidentity_declines_when_other_input_not_v() {
     wire_input(&mut fd, logic, other, 1); // not V
     let _logicout = give_output(&mut fd, logic, 0x80, 4);
     let mut r = RuleNegateIdentity::new("analysis");
-    assert_eq!(r.apply_op(neg, &mut fd), 0);
+    assert_eq!(r.apply_op(neg, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -682,7 +682,7 @@ fn rightshiftand_bypasses_redundant_and() {
     wire_input(&mut fd, op, inv, 0);
     wire_input(&mut fd, op, sa, 1);
     let mut r = RuleRightShiftAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // op's slot 0 now bypasses the AND -> rootVn.
     assert_eq!(in_of(&fd, op, 0), Some(root));
 }
@@ -700,7 +700,7 @@ fn rightshiftand_declines_when_mask_mismatch() {
     wire_input(&mut fd, op, inv, 0);
     wire_input(&mut fd, op, sa, 1);
     let mut r = RuleRightShiftAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(in_of(&fd, op, 0), Some(inv));
 }
 
@@ -728,7 +728,7 @@ fn shiftbitops_and_shifted_away_becomes_zero() {
     wire_input(&mut fd, op, sa, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // INT_AND/INT_MULT case -> slot 0 becomes a fresh const 0.
     let in0 = in_of(&fd, op, 0).unwrap();
     assert!(is_const(&fd, in0));
@@ -751,7 +751,7 @@ fn shiftbitops_add_shifted_away_uses_other_operand() {
     wire_input(&mut fd, op, sa, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     // ADD case -> slot 0 = bitop->getIn(1-0) = keep.
     assert_eq!(in_of(&fd, op, 0), Some(keep));
 }
@@ -770,7 +770,7 @@ fn shiftbitops_declines_nonconstant_shift() {
     wire_input(&mut fd, op, sa, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -788,7 +788,7 @@ fn shiftbitops_add_with_right_shift_declines() {
     wire_input(&mut fd, op, sa, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleShiftBitops::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -817,7 +817,7 @@ fn highorderand_constant_branch_declines_until_nzmask_stub() {
     wire_input(&mut fd, op, cvn1, 1);
     let mut r = RuleHighOrderAnd::new("analysis");
     // mask1 (full 64-bit) & 0xfffffff0 != mask1 -> declines (no mutation).
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_AND);
 }
 
@@ -835,7 +835,7 @@ fn highorderand_declines_when_cvn1_not_clean_mask() {
     wire_input(&mut fd, op, addout, 0);
     wire_input(&mut fd, op, cvn1, 1);
     let mut r = RuleHighOrderAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -847,7 +847,7 @@ fn highorderand_declines_when_in1_not_constant() {
     wire_input(&mut fd, op, a, 0);
     wire_input(&mut fd, op, b, 1);
     let mut r = RuleHighOrderAnd::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -863,7 +863,7 @@ fn lessone_less_than_one_becomes_equal_zero() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, one, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     // val != 0 -> slot 1 replaced with fresh const 0.
     let nin1 = in_of(&fd, op, 1).unwrap();
@@ -880,7 +880,7 @@ fn lessone_lessequal_zero_becomes_equal_zero_without_replacing_const() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, zero, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     // val == 0 -> no input replacement; the original zero constant stays.
     assert_eq!(in_of(&fd, op, 1), Some(zero));
@@ -895,7 +895,7 @@ fn lessone_declines_less_than_two() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, two, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
 }
 
@@ -908,7 +908,7 @@ fn lessone_declines_nonconstant() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, w, 1);
     let mut r = RuleLessOne::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // -----------------------------------------------------------------------------
@@ -953,7 +953,7 @@ fn collectterms_lumps_two_nonzero_constants() {
     let _out = give_output(&mut fd, op, 0x80, 4);
 
     let mut r = RuleCollectTerms::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1, "two non-zero constants are lumped");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "two non-zero constants are lumped");
 
     // The two constant slots now hold {0, 8} in some order across the two ADDs —
     // the lumped 8 lands on the LAST constant in sorter order, the earlier one is
@@ -1046,7 +1046,7 @@ fn equality_defers_at_functional_equality_stub() {
     wire_input(&mut fd, op, b, 1);
     let mut r = RuleEquality::new("analysis");
     // functionalEquality is a stub -> rule declines without mutating.
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
 }
 
@@ -1062,7 +1062,7 @@ fn intlessequal_rewrites_x_le_c_to_x_lt_c_plus_1() {
     wire_input(&mut fd, op, c, 1);
     let _out = give_output(&mut fd, op, 0x80, 1);
     let mut r = RuleIntLessEqual::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 1, "replaceLessequal rewrites x<=c");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 1, "replaceLessequal rewrites x<=c");
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS, "LESSEQUAL -> LESS");
     assert_eq!(in_of(&fd, op, 0), Some(x), "x stays in slot 0");
     let newc = in_of(&fd, op, 1).expect("slot 1 set");
@@ -1085,7 +1085,7 @@ fn intlessequal_declines_unsigned_max_overflow() {
     wire_input(&mut fd, op, umax, 1);
     let _out = give_output(&mut fd, op, 0x80, 1);
     let mut r = RuleIntLessEqual::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0, "overflow -> declines");
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0, "overflow -> declines");
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESSEQUAL, "op unchanged");
 }
 
@@ -1099,7 +1099,7 @@ fn rangemeld_declines_when_inputs_not_bool_output() {
     wire_input(&mut fd, op, a, 0);
     wire_input(&mut fd, op, b, 1);
     let mut r = RuleRangeMeld::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1113,7 +1113,7 @@ fn pullsubmulti_declines_when_in0_not_multiequal() {
     wire_input(&mut fd, op, two, 1);
     let _out = give_output(&mut fd, op, 0x80, 2);
     let mut r = RulePullsubMulti::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1124,7 +1124,7 @@ fn pushmulti_declines_with_non_two_inputs() {
     let a = make_reg(&mut fd, 0x40, 4);
     wire_input(&mut fd, op, a, 0);
     let mut r = RulePushMulti::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1135,7 +1135,7 @@ fn notdistribute_declines_when_inner_not_bool_and_or() {
     let op = make_op(&mut fd, 0x1000, OpCode::CPUI_BOOL_NEGATE);
     wire_input(&mut fd, op, vn, 0);
     let mut r = RuleNotDistribute::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1149,7 +1149,7 @@ fn anddistribute_declines_when_no_or_input() {
     wire_input(&mut fd, op, b, 1);
     let _out = give_output(&mut fd, op, 0x80, 4);
     let mut r = RuleAndDistribute::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1160,7 +1160,7 @@ fn earlyremoval_declines_call_op() {
     let op = make_op_flags(&mut fd, 0x1000, OpCode::CPUI_CALL, pcodeop_flags::call);
     let mut r = RuleEarlyRemoval::new("analysis");
     // is_call() -> 0 immediately.
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -1183,7 +1183,7 @@ fn earlyremoval_destroys_unused_op() {
     // startProcessing before any rule runs; deadRemovalAllowedSeen indexes it.
     fd.ensure_heritage_info_list();
     let mut r = RuleEarlyRemoval::new("analysis");
-    let res = r.apply_op(op, &mut fd);
+    let res = r.apply_op(op, &mut fd).unwrap();
     if does_dead {
         // ram does deadcode -> deadRemovalAllowedSeen(ram) is false at pass 0
         // (pass <= deadcodedelay), so the op survives undestroyed.
@@ -1204,5 +1204,5 @@ fn selectcse_declines_at_csehash_stub() {
     wire_input(&mut fd, op, v, 0);
     wire_input(&mut fd, op, z, 1);
     let mut r = RuleSelectCse::new("analysis");
-    assert_eq!(r.apply_op(op, &mut fd), 0);
+    assert_eq!(r.apply_op(op, &mut fd).unwrap(), 0);
 }

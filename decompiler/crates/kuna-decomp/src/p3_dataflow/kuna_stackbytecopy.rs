@@ -303,12 +303,12 @@ fn expand(fd: &mut Funcdata, block: BlockId, count: usize) -> KunaResult<()> {
                 let value = if fd.vbank().get(input).unwrap().is_written() {
                     outputs.get(&input).copied().unwrap_or(input)
                 } else {
-                    fd.clone_varnode(input)
+                    fd.clone_varnode(input)?
                 };
                 fd.op_set_input(copy, value, slot as i32)?;
             }
             if let Some(output) = output {
-                let value = fd.clone_varnode(output);
+                let value = fd.clone_varnode(output)?;
                 fd.op_set_output(copy, value)?;
                 outputs.insert(output, value);
             }
@@ -324,7 +324,7 @@ fn expand(fd: &mut Funcdata, block: BlockId, count: usize) -> KunaResult<()> {
         .unwrap();
     fd.branch_remove_internal(block, self_edge)?;
     for &id in body {
-        fd.op_destroy(id);
+        fd.op_destroy(id)?;
     }
     fd.structure_reset();
     Ok(())
@@ -352,23 +352,23 @@ impl Action for ActionStackByteCopy {
     fn clone_filtered(&self, groups: &ActionGroupList) -> Option<Box<dyn Action>> {
         groups.contains(self.get_group()).then(|| Self::boxed())
     }
-    fn apply(&mut self, fd: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, fd: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !fd.stack_store_guard()
             || fd.get_arch().index_alias_guard == super::kuna_indexaliasguard::LEVEL_OFF
             || fd.get_heritage_pass() != 0
         {
-            return 0;
+            return Ok(0);
         }
         let mut changed = 0;
         for index in 0..fd.bblocks_get_size() {
             let block = fd.bblocks_get_block(index);
             if let Some(count) = trip_count(fd, block) {
-                expand(fd, block, count).expect("validated frame byte-copy loop");
+                expand(fd, block, count)?;
                 changed += 1;
             }
         }
         self.base.count += changed;
-        0
+        Ok(0)
     }
 }
 

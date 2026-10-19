@@ -51,30 +51,6 @@ pub struct SymFact {
     pub kind: SymKind,
 }
 
-/// A named data global: a symbol-table / DWARF data object at `addr` whose
-/// storage spans `size` bytes.
-///
-/// Distinct from a plain [`SymFact`]`{Data}`: it carries the object's **byte
-/// size** so the commit can map a covering `SymbolEntry` of the right extent.
-/// A `SymFact{Data}` is installed with a size-1 code type, so a 4-/8-byte
-/// memory access (`mov [max_width], eax`) queries `queryContainer(addr, 4)` and
-/// finds nothing — the global renders `dat_<addr>` instead of `max_width`. This
-/// fact maps the symbol with an `undefined<size>` type so the container query
-/// matches at the real access width. Matches how **IDA Pro / Ghidra** name data
-/// globals from the symbol table (`ApplyDataArchiveAnalyzer` / the symtab import).
-///
-/// Produced by the DWARF pass (top-level `DW_TAG_variable` with `DW_OP_addr`),
-/// which resolves the variable's `DW_AT_type` to its byte size.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DataObjectFact {
-    /// Virtual address of the data object.
-    pub addr: u64,
-    /// The recovered symbol name.
-    pub name: String,
-    /// Byte size of the object's storage (from `DW_AT_type`), `>= 1`.
-    pub size: u32,
-}
-
 /// A detected NUL-terminated string literal: a `char[len]` data object at `addr`.
 ///
 /// `len` is the byte length **including** the terminating NUL (visible chars + 1),
@@ -180,21 +156,25 @@ pub struct LocalFact {
 /// (kuna `libctypes`) A data symbol whose TYPE the analysis tier knows outright:
 /// the address, the name it is installed under, and the recovered type.
 ///
-/// The one producer today is
+/// Producers include DWARF declarations and
 /// [`crate::protos::kuna_libctypes::LibcTypesPass`]'s stdio-stream step. Where
-/// [`DataObjectFact`] and the loader's `.dynsym` data stream give an object a
-/// NAME and leave its type to propagation, a stream slot's type is a
+/// the loader's `.dynsym` data stream gives an object a
+/// NAME and leaves its type to propagation, a stream slot's type is a
 /// declaration: a `stdout` the dynamic linker fills is a `FILE *`, whatever the
 /// one function in front of the analyst happens to do with it.
 ///
 /// The commit (`engine.rs::commit_analysis_output`) maps each through
 /// `add_symbol_mapped` with `typelock | namelock`, ahead of the loader data
-/// stream so the typed claim wins the address and behind the DWARF globals and
-/// the string literals so a richer source keeps it.
+/// stream so the typed claim wins the address. Debug declarations publish before
+/// strings; non-debug library names remain behind strings and obey `datasyms`.
 #[derive(Clone, Debug)]
 pub struct TypedDataFact {
     /// Virtual address of the object.
     pub addr: u64,
+    /// Actual producer address space; absent for image-relative default data.
+    pub space: Option<std::rc::Rc<kuna_base::space::AddrSpace>>,
+    /// DWARF declarations are independent of the non-debug `datasyms` gate.
+    pub dwarf: bool,
     /// The name the symbol is installed under.
     pub name: String,
     /// The recovered kuna [`Datatype`](kuna_decomp::dtype::Datatype) for the
@@ -299,13 +279,10 @@ pub struct FidMatch {
 /// merging two outputs is concatenation (the driver dedups by address).
 #[derive(Default, Debug)]
 pub struct AnalysisOutput {
+    /// Complete debug source prototypes, retaining independent arity/model/effects.
+    pub source_prototypes: Vec<(u64, std::rc::Rc<kuna_decomp::fspec::FuncProto>)>,
     /// `(addr, name, kind)` -> seed `Database::add_function` / symbol map.
     pub symbols: Vec<SymFact>,
-    /// Named, sized data globals (the symbol-table / DWARF data objects). Mapped
-    /// into the global scope with an `undefined<size>` type so a memory access of
-    /// the object renders its NAME (`max_width`) not `dat_<addr>`. See
-    /// [`DataObjectFact`]. Produced by the DWARF pass; empty otherwise.
-    pub data_objects: Vec<DataObjectFact>,
     /// Discovered function entry points (for stripped targets).
     pub entries: Vec<u64>,
     /// (kuna) Function bodies that describe exactly one function, as `[start, end)`.
@@ -540,17 +517,20 @@ impl AnalysisOutput {
             p.innames.iter_mut().for_each(fix);
         };
         self.symbols.iter_mut().for_each(|s| fix(&mut s.name));
-        self.data_objects.iter_mut().for_each(|d| fix(&mut d.name));
         self.typed_data.iter_mut().for_each(|d| fix(&mut d.name));
         self.entry_names.iter_mut().for_each(|(_, n)| fix(n));
         self.locals.iter_mut().for_each(|l| fix(&mut l.name));
         self.fid_names.iter_mut().for_each(|f| fix(&mut f.name));
         self.prototypes.iter_mut().for_each(fix_proto);
         self.prototypes_at.iter_mut().for_each(|(_, p)| fix_proto(p));
+        self.source_prototypes.iter_mut().for_each(|(_, proto)|
+            std::rc::Rc::make_mut(proto).sanitize_source_names(mode));
         self.main_decl_at.iter_mut().for_each(|(_, p)| fix_proto(p));
         self.cpp_dwarf.symbols.iter_mut().for_each(|s| fix(&mut s.name));
         self.cpp_dwarf.locals.iter_mut().for_each(|l| fix(&mut l.name));
         self.cpp_dwarf.prototypes.iter_mut().for_each(|(_, p)| fix_proto(p));
+        self.cpp_dwarf.source_prototypes.iter_mut().for_each(|(_, proto)|
+            std::rc::Rc::make_mut(proto).sanitize_source_names(mode));
         self.cpp_sig.proven.iter_mut().for_each(|(_, p)| fix_proto(p));
         self.cpp_sig.inferred.iter_mut().for_each(|(_, p)| fix_proto(p));
         self.cpp_sig.msvc.iter_mut().for_each(|(_, p, _)| fix_proto(p));
@@ -609,6 +589,8 @@ pub struct CppSigFacts {
 /// `prototypes` through the address-keyed binding below.
 #[derive(Default, Debug)]
 pub struct CppDwarfFacts {
+    /// Complete source prototype counterparts of the gated C++ pieces.
+    pub source_prototypes: Vec<(u64, std::rc::Rc<kuna_decomp::fspec::FuncProto>)>,
     /// Function symbols for definition DIEs whose name lives on the linked
     /// declaration (an out-of-line member/namespace definition), carrying the
     /// namespace-qualified name (`Account::deposit`).
@@ -627,8 +609,8 @@ pub struct CppDwarfFacts {
 impl AnalysisOutput {
     /// Fold another output into this one (concatenation; dedup is the driver's job).
     pub fn merge(&mut self, other: AnalysisOutput) {
+        self.source_prototypes.extend(other.source_prototypes);
         self.symbols.extend(other.symbols);
-        self.data_objects.extend(other.data_objects);
         self.typed_data.extend(other.typed_data);
         self.entries.extend(other.entries);
         self.fde_bodies.extend(other.fde_bodies);
@@ -656,6 +638,7 @@ impl AnalysisOutput {
         self.fid_names.extend(other.fid_names);
         self.cpp_dwarf.symbols.extend(other.cpp_dwarf.symbols);
         self.cpp_dwarf.locals.extend(other.cpp_dwarf.locals);
+        self.cpp_dwarf.source_prototypes.extend(other.cpp_dwarf.source_prototypes);
         self.cpp_dwarf.prototypes.extend(other.cpp_dwarf.prototypes);
         self.cpp_sig.proven.extend(other.cpp_sig.proven);
         self.cpp_sig.inferred.extend(other.cpp_sig.inferred);

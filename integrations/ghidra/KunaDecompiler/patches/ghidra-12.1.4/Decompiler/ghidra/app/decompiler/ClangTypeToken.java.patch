@@ -1,0 +1,26 @@
+--- a/ghidra/app/decompiler/ClangTypeToken.java
++++ b/ghidra/app/decompiler/ClangTypeToken.java
+@@ -48,6 +48,7 @@
+ 	@Override
+ 	public void decode(Decoder decoder, PcodeFactory pfactory) throws DecoderException {
+ 		long id = 0;
++		long local = 0;
+ 		for (;;) {
+ 			int attribId = decoder.getNextAttributeId();
+ 			if (attribId == 0) {
+@@ -55,11 +56,13 @@
+ 			}
+ 			if (attribId == AttributeId.ATTRIB_ID.id()) {
+ 				id = decoder.readUnsignedInteger();
+-				break;
++			}
++			else if (attribId == PcodeDataTypeManager.ATTRIB_KUNA_LOCAL.id()) {
++				local = decoder.readUnsignedInteger();
+ 			}
+ 		}
+ 		decoder.rewindAttributes();
+ 		super.decode(decoder, pfactory);
+-		datatype = pfactory.getDataTypeManager().findBaseType(getText(), id);
++		datatype = pfactory.getDataTypeManager().findResultType(getText(), id, local);
+ 	}
+ }

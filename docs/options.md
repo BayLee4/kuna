@@ -62,6 +62,7 @@ Three tiers:
 | `tailcallframe: recovered tail call` on a `jmp` that follows `call f; add esp,N` | [`tailcallsaved`](#tailcallsaved) |
 | the tail of a cdecl function is emitted as a separate callee instead of inline | [`tailcallsaved`](#tailcallsaved) |
 | a function decompiled by address stops at an if/else join and calls sub_<join address> | [`tailcallsaved`](#tailcallsaved) |
+| an explicit selected export root loses physical entry dependencies across a mapped direct call | [`exportinline`](#exportinline) |
 | a store to a nonsense global (dat_<huge hex>) appears right after a call | [`calltrampoline`](#calltrampoline) |
 | the callee of a call starts with lea esp,[esp+4] / add esp,4 / pop reg and ends in a jmp back into the caller | [`calltrampoline`](#calltrampoline) |
 | the body after a call is decoded one byte out of phase with the disassembly | [`calltrampoline`](#calltrampoline) |
@@ -465,6 +466,8 @@ Three tiers:
 | numerical integer conversion is stored in a float local | [`fputruncviews`](#fputruncviews) |
 | short call argument uses inverse floating storage unions | [`fputruncviews`](#fputruncviews) |
 | one floating register carries both integers and genuine floating values | [`fputruncviews`](#fputruncviews) |
+| a variadic body reads an uninitialized first-tail signed-int local | [`varargentry`](#varargentry) |
+| want the raw entry-local presentation instead of va_arg(int) | [`varargentry`](#varargentry) |
 | puts/printf arguments untyped so string literals render as bare constants or dat_ addresses | [`libproto`](#libproto) |
 | imports carry no signatures and call arguments stay untyped | [`libproto`](#libproto) |
 | a caller's parameter is unsigned long where it is only ever passed to a libc function that takes a char */int | [`libcsigs`](#libcsigs) |
@@ -1370,6 +1373,14 @@ The control surface: each of these can make output worse on the wrong source sha
 - **Where / provenance:** P2/flow-classification · ida · correctness-fix · argument-cleanup-creates-false
 - **Example:** `option tailcallsaved off`
 
+### `exportinline` -- on | off, default `off`
+
+- **Symptoms:** an explicit selected export root loses physical entry dependencies across a mapped direct call.
+- **What it does:** Prepare explicitly selected enhanced export roots through existing inline flow before derived provider discovery. Available mapped callees retain physical entry dependencies while ordinary decompile interfaces remain unchanged.
+- **When to flip:** Opt in only for invocation-owned enhanced export interfaces. Authored inline, injection, callsite overrides and unavailable bodies retain their existing semantics. This is not publication of an inferred source signature.
+- **Where / provenance:** P2/inline-inject · kuna · opt-in-tool · ghidra-enhanced-export-roots
+- **Example:** `option exportinline on`
+
 ### `calltrampoline` -- on | off, default `on`
 
 - **Symptoms:** a store to a nonsense global (dat_<huge hex>) appears right after a call; the callee of a call starts with lea esp,[esp+4] / add esp,4 / pop reg and ends in a jmp back into the caller; the body after a call is decoded one byte out of phase with the disassembly; a protected PE emits garbage arithmetic on undefined registers after each call fragment.
@@ -2249,6 +2260,14 @@ The control surface: each of these can make output worse on the wrong source sha
 - **When to flip:** An integer conversion transported through floating registers is printed through inverse float/integer storage unions. Locked types and names remain authoritative; observable floating storage writes, clobbers and later floating uses are retained. Turn off to restore mixed storage-variable recovery.
 - **Where / provenance:** P6/variable-merging · kuna · transform · kuna-fputruncviews
 - **Example:** `option fputruncviews off`
+
+### `varargentry` -- on | off, default `on`
+
+- **Symptoms:** a variadic body reads an uninitialized first-tail signed-int local; want the raw entry-local presentation instead of va_arg(int).
+- **What it does:** Capture one recovered signed-int first variadic entry value with va_start, one va_arg(int), and immediate va_end, preserving its existing local and the authored fixed-parameter-plus-ellipsis signature. Require the complete locked fixed boundary, a known noncustom prototype model whose fixed-plus-one-int assignment matches the fixed storage and the genuine consumed SSA input, and an existing signed-int declaration. Capture either at an unconditional entry use before calls or control transfer, or inside one uniquely emitted terminal normal-return leaf containing every live read, with a pure prefix before the first use; non-consuming paths perform no acquisition. Additional unrepresented argument inputs, unknown or differently typed values, skipped tail positions, indirect roles and conditional-only uses outside that leaf case keep their ordinary rendering. This is a recovered promoted-int interpretation, not an authored optional-argument type or a guarantee for arbitrary pointer, wide or heterogeneous callers.
+- **When to flip:** On by default for a variadic body that consumes its first optional argument as a recovered signed int but otherwise prints an uninitialized local. Turn off to preserve the raw entry-local presentation or when the original optional argument had another source type sharing the same storage.
+- **Where / provenance:** P9/variadic-entry-values · kuna · presentation-default · finite-variadic-entry
+- **Example:** `option varargentry off`
 
 ## Analysis & loader passes
 
@@ -3533,7 +3552,7 @@ Part of the decompiler; not the control surface. Flip only to reproduce upstream
 ### `indirectargs` -- on | off, default `on`
 
 - **Symptoms:** a DWARF or asserted by-value struct parameter is declared as a pointer; calls pass &local to a function declared to take the struct by value; function pointer type spells T * for a by-value aggregate parameter; want the raw ABI pointer for a large struct parameter (flip off).
-- **What it does:** Print a parameter that the locked prototype declares by value but the ABI passes through a hidden pointer (a cspec convert_to_ptr or pointermax rule: AArch64, RISC-V and PowerPC aggregates over 16 bytes, MS x64 aggregates not 1/2/4/8 bytes and long double, SPARC aggregates) at its declared value type. The callee signature and function-pointer declarators spell `T v` instead of `T *v`; the callee reads the ABI pointer as `&v`, so field accesses print `v.f` and a pointer local `T *v_addr = &v` carries any update of the pointer register; a call against such a prototype passes the pointed-to value. Ordinary pointer parameters, hidden-return pointers and array parameters keep their pointer view. Off prints the ABI pointer everywhere, as upstream Ghidra does.
+- **What it does:** Print a parameter that the locked prototype declares by value but the ABI passes through a hidden pointer (a cspec convert_to_ptr or pointermax rule: AArch64, RISC-V and PowerPC aggregates over 16 bytes, MS x64 aggregates not 1/2/4/8 bytes and long double, SPARC aggregates) at its declared value type. The callee signature and function-pointer declarators spell `T v` instead of `T *v`; the callee reads the ABI pointer as `&v`, so field accesses print `v.f` and a pointer local `T *v_addr = &v` carries any update of the pointer register; a call against such a prototype passes the pointed-to value. A retained logical aggregate result with a proven ABI-added hidden pointer returns the aggregate in declarations and normal body returns; calls capture the destination once and assign the aggregate call value through it, separately retaining physical returned-pointer consumers. Ordinary pointer and array parameters, custom or injected storage contracts, and physical hidden pointers without logical result provenance keep their pointer view. Off prints the ABI pointer everywhere, as upstream Ghidra does.
 - **When to flip:** On (default) when the prototype comes from DWARF, a library seed or an --assert and you want the source-level signature. Flip off to see the ABI calling contract literally, for example when a hand-written caller passes aliased storage and the callee's writes through that pointer matter to the caller.
 - **Where / provenance:** P9/indirect-value-parameters · kuna · presentation-default · indirect-value-arguments
 - **Example:** `option indirectargs off`

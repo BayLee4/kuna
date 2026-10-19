@@ -750,6 +750,55 @@ fn soft_float_arm_lays_declared_prototypes_out_in_core_registers() {
 }
 
 #[test]
+fn soft_float_arm_keeps_recovered_return_storage_at_callers() {
+    use kuna_decomp::dtype::type_metatype;
+    use kuna_decomp::fspec::PrototypePieces;
+
+    let fixture = common::fixture("floatret_parse_armel.o");
+    let bytes = std::fs::read(&fixture).unwrap();
+    let specs = std::env::var_os("SLEIGHHOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| common::repo_root().join("specs"));
+    let mut program = kuna_console::engine::bootstrap_from_object(
+        &fixture, "", &[specs.to_string_lossy().into_owned()],
+    ).unwrap();
+    program.commit_pending_analysis().unwrap();
+    let entry = program.lookup_symbol("parsef").unwrap();
+    let caller = program.lookup_symbol("rpf").unwrap();
+    let arch = program.arch_mut();
+    let pieces = PrototypePieces {
+        name: "parsef".to_string(),
+        outtype: Some(arch.types().get_base(4, type_metatype::TYPE_FLOAT).unwrap()),
+        first_var_arg_slot: 0,
+        ..Default::default()
+    };
+    arch.set_recovered_function_prototype_pieces_at(&entry, pieces).unwrap();
+    assert!(arch.symboltab.function_source_proto_across_scopes(&entry).is_none());
+    let data = arch.new_funcdata("rpf", caller, 0).unwrap();
+    let published = data.get_arch().query_callee_proto(&entry).unwrap().unwrap();
+    let working = arch.types_impl().acquire_working_proto(&published).unwrap();
+    let r0 = arch.get_register_varnode(b"r0").unwrap();
+    assert_eq!(working.get_model_name(), "__stdcall_softfp");
+    assert_eq!(working.get_output().get_address(), r0.get_addr());
+    assert_eq!(working.get_output().get_size(), 4);
+    assert_eq!(working.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_FLOAT);
+
+    let text = decompile_args(
+        &bytes,
+        &["--option", "protoorder", "lock"],
+        &["prototype strtof float strtof(const char *s, char **end)".to_string()],
+    );
+    let parsef = function(&text, "parsef");
+    assert!(parsef.contains("return strtof("), "{parsef}");
+    let rpf = function(&text, "rpf");
+    assert!(rpf.contains("parsef("), "{rpf}");
+    assert!(
+        !rpf.lines().any(|line| line.trim_start().starts_with("parsef(")),
+        "discarded the core-register result before storing its bits: {rpf}"
+    );
+}
+
+#[test]
 fn hard_float_arm_lays_declared_prototypes_out_in_vfp_registers() {
     let text = decompile_with(&arm_direct(true), &direct_prototypes());
     assert!(function(&text, "s4").contains("return dmix(a,k << 1) * a;"), "{text}");

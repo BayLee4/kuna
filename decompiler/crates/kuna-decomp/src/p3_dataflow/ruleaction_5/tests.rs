@@ -161,7 +161,7 @@ fn boolnegate_flips_def_and_copies_negates() {
     fd.op_set_input(op2, vn, 0).unwrap();
 
     let mut rule = RuleBoolNegate::new("analysis");
-    let res = rule.apply_op(op, &mut fd);
+    let res = rule.apply_op(op, &mut fd).unwrap();
     assert_eq!(res, 1);
     // flip_op INT_EQUAL -> INT_NOTEQUAL (get_booleanflip, no reorder)
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_NOTEQUAL);
@@ -201,7 +201,7 @@ fn float_negation_requires_complete_matching_nan_guards() {
                 root = written(&mut fd, OpCode::CPUI_BOOL_OR, &[nan, root]).1;
             }
             let (negate, _) = written(&mut fd, OpCode::CPUI_BOOL_NEGATE, &[root]);
-            let result = RuleBoolNegate::new("analysis").apply_op(negate, &mut fd);
+            let result = RuleBoolNegate::new("analysis").apply_op(negate, &mut fd).unwrap();
             if guards == [0, 1] {
                 assert_eq!(result, 1);
                 let expected = if code == OpCode::CPUI_FLOAT_LESS && !equal {
@@ -244,7 +244,7 @@ fn float_negation_checks_the_unguarded_constant_for_nan() {
         let condition = fd.new_unique_out(1, or).unwrap();
         let negate = mk_op(&mut fd, 1, 0x100, OpCode::CPUI_BOOL_NEGATE);
         fd.op_set_input(negate, condition, 0).unwrap();
-        let result = RuleBoolNegate::new("analysis").apply_op(negate, &mut fd);
+        let result = RuleBoolNegate::new("analysis").apply_op(negate, &mut fd).unwrap();
         assert_eq!(result, if bits == 0x7fc12345 { 0 } else { 1 });
     }
 }
@@ -279,7 +279,7 @@ fn guarded_float_root_keeps_unordered_case_for_direct_readers() {
             fd.op_insert_end(op, block);
         }
         assert_eq!(
-            crate::p3_dataflow::kuna_floatnegation::fold_nan_consumers(&mut fd, nan_a),
+            crate::p3_dataflow::kuna_floatnegation::fold_nan_consumers(&mut fd, nan_a).unwrap(),
             folds
         );
         if !folds {
@@ -328,7 +328,7 @@ fn guarded_float_branch_preserves_polarity_and_shared_conditions() {
         }
         assert!(crate::p3_dataflow::kuna_floatnegation::fold_nan_consumers(
             &mut fd, nan
-        ));
+        ).unwrap());
         let branch_op = fd.obank().get(branch).unwrap();
         assert_eq!(branch_op.is_boolean_flip(), !flipped);
         assert_eq!(branch_op.get_in(0), Some(target));
@@ -355,7 +355,7 @@ fn boolnegate_negative_unwritten_input() {
     let op = mk_op(&mut fd, 1, 0x110, OpCode::CPUI_BOOL_NEGATE);
     fd.op_set_input(op, vn, 0).unwrap();
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -376,7 +376,7 @@ fn boolnegate_negative_non_negate_descendant() {
     fd.op_set_input(other, vn, 0).unwrap();
 
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     // unchanged
     assert_eq!(code_of(&fd, flip), OpCode::CPUI_INT_EQUAL);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_BOOL_NEGATE);
@@ -396,7 +396,7 @@ fn boolnegate_negative_unflippable_def() {
     let op = mk_op(&mut fd, 1, 0x110, OpCode::CPUI_BOOL_NEGATE);
     fd.op_set_input(op, vn, 0).unwrap();
     let mut rule = RuleBoolNegate::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_BOOL_NEGATE);
 }
 
@@ -413,7 +413,7 @@ fn less2zero_zero_lhs_becomes_notequal() {
     fd.op_set_input(op, zero, 0).unwrap();
     fd.op_set_input(op, v, 1).unwrap();
     let mut rule = RuleLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // 0 < V => 0 != V (opcode change only; inputs unchanged)
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_NOTEQUAL);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 2);
@@ -429,7 +429,7 @@ fn less2zero_mask_lhs_becomes_false_copy() {
     fd.op_set_input(op, mask, 0).unwrap();
     fd.op_set_input(op, v, 1).unwrap();
     let mut rule = RuleLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // ffff < V => false: COPY of const(1,0), 1 input
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
@@ -447,7 +447,7 @@ fn less2zero_zero_rhs_becomes_false_copy() {
     fd.op_set_input(op, v, 0).unwrap();
     fd.op_set_input(op, zero, 1).unwrap();
     let mut rule = RuleLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // V < 0 => false
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
@@ -463,7 +463,7 @@ fn less2zero_mask_rhs_becomes_notequal() {
     fd.op_set_input(op, v, 0).unwrap();
     fd.op_set_input(op, mask, 1).unwrap();
     let mut rule = RuleLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // V < ffff => V != ffff
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_NOTEQUAL);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 2);
@@ -478,7 +478,7 @@ fn less2zero_negative_nonextremal_constants() {
     fd.op_set_input(op, c, 0).unwrap();
     fd.op_set_input(op, v, 1).unwrap();
     let mut rule = RuleLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESS);
 }
 
@@ -495,7 +495,7 @@ fn lessequal2zero_zero_lhs_becomes_true_copy() {
     fd.op_set_input(op, zero, 0).unwrap();
     fd.op_set_input(op, v, 1).unwrap();
     let mut rule = RuleLessEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // 0 <= V => true: COPY of const(1,1)
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
@@ -511,7 +511,7 @@ fn lessequal2zero_mask_lhs_becomes_equal() {
     fd.op_set_input(op, mask, 0).unwrap();
     fd.op_set_input(op, v, 1).unwrap();
     let mut rule = RuleLessEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // ffff <= V => ffff == V
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 2);
@@ -526,7 +526,7 @@ fn lessequal2zero_zero_rhs_becomes_equal() {
     fd.op_set_input(op, v, 0).unwrap();
     fd.op_set_input(op, zero, 1).unwrap();
     let mut rule = RuleLessEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // V <= 0 => V == 0
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_EQUAL);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 2);
@@ -541,7 +541,7 @@ fn lessequal2zero_mask_rhs_becomes_true_copy() {
     fd.op_set_input(op, v, 0).unwrap();
     fd.op_set_input(op, mask, 1).unwrap();
     let mut rule = RuleLessEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // V <= ffff => true
     assert_eq!(code_of(&fd, op), OpCode::CPUI_COPY);
     assert_eq!(fd.obank().get(op).unwrap().num_input(), 1);
@@ -557,7 +557,7 @@ fn lessequal2zero_negative() {
     fd.op_set_input(op, v0, 0).unwrap();
     fd.op_set_input(op, v1, 1).unwrap();
     let mut rule = RuleLessEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_LESSEQUAL);
 }
 
@@ -581,7 +581,7 @@ fn sless2zero_negate_rhs_minus1() {
     fd.op_set_input(op, rvn, 1).unwrap();
 
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // op: avn s< 0   (input0=avn, input1=const 0); opcode stays INT_SLESS
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESS);
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(avn));
@@ -606,7 +606,7 @@ fn sless2zero_negate_lhs_zero() {
     fd.op_set_input(op, zero, 1).unwrap();
 
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // op: input1 = avn, input0 = const calc_mask(4) = -1
     assert_eq!(code_of(&fd, op), OpCode::CPUI_INT_SLESS);
     assert_eq!(fd.obank().get(op).unwrap().get_in(1), Some(avn));
@@ -634,7 +634,7 @@ fn sless2zero_subpiece_rhs_minus1() {
     fd.op_set_input(op, rvn, 1).unwrap();
 
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // input1 = avn, input0 = const calc_mask(8)
     assert_eq!(fd.obank().get(op).unwrap().get_in(1), Some(avn));
     let i0 = fd.obank().get(op).unwrap().get_in(0).unwrap();
@@ -658,7 +658,7 @@ fn sless2zero_subpiece_too_big_avn_rejected() {
     fd.op_set_input(op, m1, 0).unwrap();
     fd.op_set_input(op, rvn, 1).unwrap();
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -671,7 +671,7 @@ fn sless2zero_negative_unwritten_other_side() {
     fd.op_set_input(op, m1, 0).unwrap();
     fd.op_set_input(op, rvn, 1).unwrap();
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -688,7 +688,7 @@ fn sless2zero_negative_rhs_const_nonzero() {
     fd.op_set_input(op, lvn, 0).unwrap();
     fd.op_set_input(op, c, 1).unwrap();
     let mut rule = RuleSLess2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -713,7 +713,7 @@ fn equal2zero_const_form() {
     fd.op_set_input(op, addvn, 1).unwrap();
 
     let mut rule = RuleEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // op: input0 = posvn (V), input1 = unnegvn (new const = -(c-1)-1 = -c = uintb_negate(c-1,4))
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(v));
     let i1 = fd.obank().get(op).unwrap().get_in(1).unwrap();
@@ -747,7 +747,7 @@ fn equal2zero_mult_form() {
     fd.op_set_input(op, addvn, 1).unwrap();
 
     let mut rule = RuleEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // posvn = v (vn), unnegvn = w
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(v));
     assert_eq!(fd.obank().get(op).unwrap().get_in(1), Some(w));
@@ -774,7 +774,7 @@ fn equal2zero_negative_non_bool_descendant() {
     fd.op_set_input(cp, addvn, 0).unwrap();
 
     let mut rule = RuleEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
     // unchanged inputs
     assert_eq!(fd.obank().get(op).unwrap().get_in(1), Some(addvn));
 }
@@ -788,7 +788,7 @@ fn equal2zero_negative_no_zero_operand() {
     fd.op_set_input(op, v0, 0).unwrap();
     fd.op_set_input(op, v1, 1).unwrap();
     let mut rule = RuleEqual2Zero::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -813,7 +813,7 @@ fn equal2constant_add_form() {
     fd.op_set_input(op, d, 1).unwrap();
 
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     // op: input0 = V, input1 = const (10 - 4) = 6
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(v));
     let i1 = fd.obank().get(op).unwrap().get_in(1).unwrap();
@@ -837,7 +837,7 @@ fn equal2constant_negate_form() {
     fd.op_set_input(op, c, 1).unwrap();
 
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(v));
     let i1 = fd.obank().get(op).unwrap().get_in(1).unwrap();
     assert_eq!(off_of(&fd, i1), 0xffff_fffa);
@@ -861,7 +861,7 @@ fn equal2constant_mult_minus1_form() {
     fd.op_set_input(op, c, 1).unwrap();
 
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 1);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1);
     assert_eq!(fd.obank().get(op).unwrap().get_in(0), Some(v));
     let i1 = fd.obank().get(op).unwrap().get_in(1).unwrap();
     assert_eq!(off_of(&fd, i1), 0xffff_fffd);
@@ -883,7 +883,7 @@ fn equal2constant_negative_mult_not_minus1() {
     fd.op_set_input(op, lhs, 0).unwrap();
     fd.op_set_input(op, c, 1).unwrap();
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -901,7 +901,7 @@ fn equal2constant_negative_rhs_not_constant() {
     fd.op_set_input(op, lhs, 0).unwrap();
     fd.op_set_input(op, d, 1).unwrap();
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 #[test]
@@ -923,7 +923,7 @@ fn equal2constant_negative_other_descendant_wrong_form() {
     let cp = mk_op(&mut fd, 1, 0x120, OpCode::CPUI_COPY);
     fd.op_set_input(cp, lhs, 0).unwrap();
     let mut rule = RuleEqual2Constant::new("analysis");
-    assert_eq!(rule.apply_op(op, &mut fd), 0);
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 0);
 }
 
 // =============================================================================
@@ -984,8 +984,8 @@ fn pointer_rules_are_noop_stubs() {
     let v1 = mk_vn(&mut fd, 0x20, 8);
     fd.op_set_input(op, v0, 0).unwrap();
     fd.op_set_input(op, v1, 1).unwrap();
-    assert_eq!(RulePtrArith::new("typerecovery").apply_op(op, &mut fd), 0);
-    assert_eq!(RulePushPtr::new("typerecovery").apply_op(op, &mut fd), 0);
+    assert_eq!(RulePtrArith::new("typerecovery").apply_op(op, &mut fd).unwrap(), 0);
+    assert_eq!(RulePushPtr::new("typerecovery").apply_op(op, &mut fd).unwrap(), 0);
     let ld = mk_op(&mut fd, 2, 0x200, OpCode::CPUI_LOAD);
-    assert_eq!(RuleStructOffset0::new("typerecovery").apply_op(ld, &mut fd), 0);
+    assert_eq!(RuleStructOffset0::new("typerecovery").apply_op(ld, &mut fd).unwrap(), 0);
 }

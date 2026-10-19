@@ -64,7 +64,7 @@ pub struct PendingCallFixup {
 /// definitely-unused trial has its dataflow freed (`opSetInput` with a zero
 /// constant).  The `aliascheck` is the deferred-gather local alias checker
 /// (`AliasChecker::gather(..., defer=true)`), supplied by the caller.
-pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut AliasChecker) {
+pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut AliasChecker, source_inputs: Option<&crate::fspec::FuncProto>) -> kuna_base::error::KunaResult<()> {
     // INDEX-BASED (CORRECTION-7 #3): the call spec stays in `data.qlst` so the
     // ancestor walk (`ancestor_op_use` -> `only_op_use` -> `check_call_double_use`)
     // can look up the *other* call's spec via `get_call_specs_index(op)`.  We
@@ -77,7 +77,7 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
         // wrapper would surface it — here a dead call spec is simply skipped (the
         // recovery cannot mutate a dead op).  (Faithful: this op never reaches
         // here on the live path, as setupCallSpecs only runs on live CALLs.)
-        return;
+        return Ok(());
     }
 
     let maxancestor = data.get_arch().trim_recurse_max;
@@ -98,12 +98,12 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
     // (kuna) The registers a variadic call's caller counts as filled (`al`, CR6).
     let counted =
         crate::p4_calls::kuna_varargretreg::counted_float_arguments(data, data.get_call_specs(idx));
-    let format_arguments = crate::p4_calls::kuna_varargformat::arguments(data, data.get_call_specs(idx));
+    let format_arguments = crate::p4_calls::kuna_varargformat::arguments(data, data.get_call_specs(idx))?;
     let num_trials = data.get_call_specs_mut(idx).get_active_input().get_num_trials();
     for i in 0..num_trials {
         if data.get_call_specs(idx).active_input().get_trial(i).is_checked() {
             if !data.get_call_specs(idx).active_input().get_trial(i).is_active() {
-                crate::p4_calls::kuna_varargformat::activate_trial(data, idx, i, &format_arguments);
+                crate::p4_calls::kuna_varargformat::activate_trial(data, idx, i, &format_arguments, source_inputs);
             }
             continue;
         }
@@ -228,7 +228,8 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
                     slot,
                     t.get_address(),
                     t.get_size(),
-                )
+                    source_inputs,
+                )?
         } {
             let trial = data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i);
             trial.set_ancestor_realistic();
@@ -267,7 +268,7 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
                 if only {
                     data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i).mark_active();
                     crate::p4_calls::kuna_reloadarg::note(data, idx, i, ancestor.solid_loads());
-                    crate::p4_calls::kuna_varargforward::narrow_undeclared_upper(data, idx, i);
+                    crate::p4_calls::kuna_varargforward::narrow_undeclared_upper(data, idx, i, source_inputs);
                     if data
                         .get_call_specs_mut(idx)
                         .get_active_input()
@@ -277,13 +278,13 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
                         data.get_call_specs_mut(idx).get_active_input().mark_needs_final_check();
                     }
                 } else if !crate::p4_calls::kuna_varargformat::activate_trial(
-                    data, idx, i, &format_arguments,
+                    data, idx, i, &format_arguments, source_inputs,
                 ) {
                     data.get_call_specs_mut(idx).get_active_input().get_trial_mut(i).mark_inactive();
-                    crate::p4_calls::kuna_varargforward::narrow_undeclared_upper(data, idx, i);
+                    crate::p4_calls::kuna_varargforward::narrow_undeclared_upper(data, idx, i, source_inputs);
                 }
             } else if crate::p4_calls::kuna_varargformat::activate_trial(
-                data, idx, i, &format_arguments,
+                data, idx, i, &format_arguments, source_inputs,
             ) {
             } else if vn_is_input {
                 // Not likely a parameter but maybe
@@ -304,6 +305,7 @@ pub fn check_input_trial_use(idx: int4, data: &mut Funcdata, aliascheck: &mut Al
             let _ = data.op_set_input(op, c, slot);
         }
     }
+    Ok(())
 }
 
 /// C++ `FuncCallSpecs::finalInputCheck` (`fspec.cc:5571`).
@@ -351,7 +353,7 @@ pub fn final_input_check(fc: &mut FuncCallSpecs, data: &mut Funcdata) {
 pub fn build_input_from_trials(
     fc: &mut FuncCallSpecs,
     data: &mut Funcdata,
-) -> PendingCallFixup {
+) -> kuna_base::error::KunaResult<PendingCallFixup> {
     let op = fc.get_op();
     // (kuna) `passthrough`: capture the forwarded registers the call may still
     // take, and retire the trials the pass registered, before any other rule
@@ -413,7 +415,7 @@ pub fn build_input_from_trials(
             data.new_constant(sz, 0)
         } else if is_unref {
             // recovered unreferenced address as part of prototype: create the vn.
-            data.new_varnode(sz, &Address::new(spc.clone(), off), None)
+            data.new_varnode(sz, &Address::new(spc.clone(), off), None)?
         } else {
             let cur = match data.obank().get(op).and_then(|o| o.get_in(slot)) {
                 Some(v) => v,
@@ -434,10 +436,7 @@ pub fn build_input_from_trials(
                 } else {
                     cur_addr
                 };
-                let outvn = match data.new_varnode_out(sz, &outaddr, newop) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+                let outvn = data.new_varnode_out(sz, &outaddr, newop)?;
                 data.op_set_opcode_code(newop, OpCode::CPUI_SUBPIECE);
                 let _ = data.op_set_input(newop, cur, 0);
                 let zero = data.new_constant(1, 0);
@@ -485,7 +484,7 @@ pub fn build_input_from_trials(
         .collect();
     fc.set_final_input_storage(storage);
     fc.get_active_input().delete_unused_trials();
-    pending
+    Ok(pending)
 }
 
 /// C++ `FuncCallSpecs::collectOutputTrialVarnodes` (`fspec.cc:5543`).
@@ -561,11 +560,11 @@ pub fn build_output_from_trials(
     fc: &mut FuncCallSpecs,
     data: &mut Funcdata,
     trialvn: &[Option<VarnodeId>],
-) {
-    if crate::p4_calls::kuna_callretpair::build_partial_pair(fc, data, trialvn)
-        || crate::kuna_bejoin::build_high_read(fc, data, trialvn)
+) -> kuna_base::error::KunaResult<()> {
+    if crate::p4_calls::kuna_callretpair::build_partial_pair(fc, data, trialvn)?
+        || crate::kuna_bejoin::build_high_read(fc, data, trialvn)?
     {
-        return;
+        return Ok(());
     }
     let op = fc.get_op();
     let mut finalvn: Vec<VarnodeId> = Vec::new();
@@ -582,7 +581,7 @@ pub fn build_output_from_trials(
     fc.get_active_output().delete_unused_trials();
     let n = fc.get_active_output().get_num_trials();
     if n == 0 {
-        return; // Nothing is a formal output
+        return Ok(()); // Nothing is a formal output
     }
 
     let mut deletedops: Vec<OpId> = Vec::new();
@@ -592,7 +591,7 @@ pub fn build_output_from_trials(
         if let Some(indop) = data.vbank().get(finaloutvn).and_then(|v| v.get_def()) {
             deletedops.push(indop);
         }
-        let _ = data.op_set_output(op, finaloutvn);
+        data.op_set_output(op, finaloutvn)?;
     } else {
         // (kuna `rustabi`) The two-piece concat (fspec.cc:5813-5853). The blocker
         // the stub below records is stale -- `constructJoinAddress` IS reachable
@@ -611,13 +610,13 @@ pub fn build_output_from_trials(
             &finalvn,
             Some(&entry),
             order,
-        ) {
-            return;
+        )? {
+            return Ok(());
         }
         // STUB(W4 translate-on-handle): leave the trials in place rather than
         // fabricate a malformed concat (mirrors the same stub in
         // ActionReturnRecovery::build_return_output).
-        return;
+        return Ok(());
     }
 
     for dop in deletedops {
@@ -625,7 +624,7 @@ pub fn build_output_from_trials(
         // (fspec.cc:5857-5866).
         let in0 = data.obank().get(dop).and_then(|o| o.get_in(0));
         let in1 = data.obank().get(dop).and_then(|o| o.get_in(1));
-        data.op_destroy(dop);
+        data.op_destroy(dop)?;
         if let Some(v) = in0 {
             let _ = data.delete_varnode(v);
         }
@@ -633,4 +632,5 @@ pub fn build_output_from_trials(
             let _ = data.delete_varnode(v);
         }
     }
+    Ok(())
 }

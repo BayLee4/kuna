@@ -236,6 +236,9 @@ impl TypeFactory for VoidTypeFactory {
     fn get_type_struct(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
         unreached!()
     }
+    fn kuna_synthesized_record(&self, _n: &str) -> KunaResult<Rc<Datatype>> {
+        unreached!()
+    }
     fn get_type_partial_struct(
         &self,
         _contain: Rc<Datatype>,

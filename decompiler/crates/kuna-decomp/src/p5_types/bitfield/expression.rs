@@ -30,6 +30,7 @@
 use kuna_base::types::{int4, uintb};
 use kuna_num::opcodes::OpCode;
 use std::rc::Rc;
+use kuna_base::error::KunaResult;
 
 use super::BitRange;
 use crate::dtype::{type_metatype, Datatype, TypeBitField};
@@ -153,17 +154,22 @@ impl BitFieldExpression {
 ///
 /// A static helper used by the simplification rules to identify the bitfield a
 /// pull reads, independent of full [`PullExpression`] recovery.
-pub fn get_pull_field(data: &Funcdata, pull: OpId) -> Option<TypeBitField> {
+/// An unmatched expression is `Ok(None)`; facing-type acquisition failures propagate.
+pub fn get_pull_field(data: &Funcdata, pull: OpId) -> KunaResult<Option<TypeBitField>> {
     let mut expr = BitFieldExpression::default();
-    let o = data.obank().get(pull)?;
-    let in_vn = o.get_in(0)?;
-    let least_bit_off = data.vbank().get(o.get_in(1)?)?.get_offset() as int4;
-    let bit_size = data.vbank().get(o.get_in(2)?)?.get_offset() as int4;
-    let is_big = data.vbank().get(in_vn)?.get_space().is_big_endian();
-    let dt = data.vn_type_read_facing(in_vn, pull);
+    let Some((in_vn, least_bit_off, bit_size, is_big)) = (|| {
+        let o = data.obank().get(pull)?;
+        let in_vn = o.get_in(0)?;
+        let least_bit_off = data.vbank().get(o.get_in(1)?)?.get_offset() as int4;
+        let bit_size = data.vbank().get(o.get_in(2)?)?.get_offset() as int4;
+        let is_big = data.vbank().get(in_vn)?.get_space().is_big_endian();
+        Some((in_vn, least_bit_off, bit_size, is_big))
+    })() else { return Ok(None) };
+    let dt = data.vn_type_read_facing(in_vn, pull)?;
     expr.get_structures(&dt, 0, least_bit_off, is_big);
-    let the_struct = expr.the_struct.as_ref()?;
-    let in_size = data.vbank().get(in_vn)?.get_size();
+    let Some(the_struct) = expr.the_struct.as_ref() else { return Ok(None) };
+    let Some(in_node) = data.vbank().get(in_vn) else { return Ok(None) };
+    let in_size = in_node.get_size();
     let range = BitRange::new(
         expr.byte_range_offset - expr.offset_to_bit_struct,
         in_size,
@@ -171,7 +177,7 @@ pub fn get_pull_field(data: &Funcdata, pull: OpId) -> Option<TypeBitField> {
         bit_size,
         is_big,
     );
-    the_struct.find_matching_bit_field(&range)
+    Ok(the_struct.find_matching_bit_field(&range))
 }
 
 /// A write to a bitfield stored in an explicit Varnode (C++ `InsertExpression`,
@@ -267,65 +273,69 @@ pub struct InsertStoreExpression {
 impl InsertStoreExpression {
     /// Construct from a STORE (C++ `InsertStoreExpression::InsertStoreExpression`,
     /// expression.cc:522-549).
-    pub fn new(data: &Funcdata, store: OpId) -> InsertStoreExpression {
+    /// Unmatched expressions remain invalid; facing-type acquisition failures propagate.
+    pub fn new(data: &Funcdata, store: OpId) -> KunaResult<InsertStoreExpression> {
         let mut me = InsertStoreExpression {
             expr: BitFieldExpression::default(),
             insert_op: None,
             load_op: None,
             struct_ptr: None,
         };
-        me.recover(data, store);
-        me
+        me.recover(data, store)?;
+        Ok(me)
     }
 
-    fn recover(&mut self, data: &Funcdata, store: OpId) -> Option<()> {
-        let so = data.obank().get(store)?;
-        let value = so.get_in(2)?;
-        let val_v = data.vbank().get(value)?;
-        if !val_v.is_written() {
-            return None;
-        }
-        let insert_op = val_v.get_def()?;
-        if data.obank().get(insert_op)?.code() != OpCode::CPUI_INSERT {
-            return None;
-        }
-        self.insert_op = Some(insert_op);
-        let io = data.obank().get(insert_op)?;
-        // dest can either be a constant or LOAD.
-        let dest = io.get_in(0)?;
-        let dest_v = data.vbank().get(dest)?;
-        if dest_v.is_written() {
-            let load_op = dest_v.get_def()?;
-            if data.obank().get(load_op)?.code() != OpCode::CPUI_LOAD {
+    fn recover(&mut self, data: &Funcdata, store: OpId) -> KunaResult<Option<()>> {
+        let Some((value, val_size, spc, least_bit_off, bit_size)) = (|| {
+            let so = data.obank().get(store)?;
+            let value = so.get_in(2)?;
+            let val_v = data.vbank().get(value)?;
+            if !val_v.is_written() {
                 return None;
             }
-            self.load_op = Some(load_op);
-        } else if !dest_v.is_constant() {
-            return None;
-        }
-        // AddrSpace *spc = store->getIn(0)->getSpaceFromConst();
-        let spc = space_from_const(data, store, 0)?;
-        let least_bit_off = data.vbank().get(io.get_in(2)?)?.get_offset() as int4;
-        let bit_size = data.vbank().get(io.get_in(3)?)?.get_offset() as int4;
-        let def_facing = data.vn_type_def_facing(value);
+            let insert_op = val_v.get_def()?;
+            if data.obank().get(insert_op)?.code() != OpCode::CPUI_INSERT {
+                return None;
+            }
+            self.insert_op = Some(insert_op);
+            let io = data.obank().get(insert_op)?;
+            // dest can either be a constant or LOAD.
+            let dest = io.get_in(0)?;
+            let dest_v = data.vbank().get(dest)?;
+            if dest_v.is_written() {
+                let load_op = dest_v.get_def()?;
+                if data.obank().get(load_op)?.code() != OpCode::CPUI_LOAD {
+                    return None;
+                }
+                self.load_op = Some(load_op);
+            } else if !dest_v.is_constant() {
+                return None;
+            }
+            // AddrSpace *spc = store->getIn(0)->getSpaceFromConst();
+            let spc = space_from_const(data, store, 0)?;
+            let least_bit_off = data.vbank().get(io.get_in(2)?)?.get_offset() as int4;
+            let bit_size = data.vbank().get(io.get_in(3)?)?.get_offset() as int4;
+            Some((value, val_v.get_size(), spc, least_bit_off, bit_size))
+        })() else { return Ok(None) };
+        let def_facing = data.vn_type_def_facing(value)?;
         self.expr.get_structures(&def_facing, 0, least_bit_off, spc.is_big_endian());
         let the_struct = match &self.expr.the_struct {
             Some(s) => Rc::clone(s),
-            None => return None,
+            None => return Ok(None),
         };
         // structPtr = recoverStructurePointer(store->getIn(1), byteRangeOffset);
-        let store_ptr = data.obank().get(store)?.get_in(1)?;
+        let Some(store_ptr) = data.obank().get(store).and_then(|o| o.get_in(1)) else { return Ok(None) };
         self.struct_ptr = self.expr.recover_structure_pointer(data, store_ptr, self.expr.byte_range_offset);
-        self.struct_ptr?;
+        if self.struct_ptr.is_none() { return Ok(None) }
         let range = BitRange::new(
             self.expr.byte_range_offset - self.expr.offset_to_bit_struct,
-            val_v.get_size(),
+            val_size,
             least_bit_off,
             bit_size,
             spc.is_big_endian(),
         );
         self.expr.bitfield = the_struct.find_matching_bit_field(&range);
-        Some(())
+        Ok(Some(()))
     }
 
     /// Is this a valid bitfield STORE expression (C++ `isValid`).
@@ -357,7 +367,8 @@ pub struct PullExpression {
 impl PullExpression {
     /// Construct from a ZPULL or SPULL (C++ `PullExpression::PullExpression`,
     /// expression.cc:551-586).
-    pub fn new(data: &Funcdata, pull: OpId) -> PullExpression {
+    /// Unmatched expressions remain invalid; facing-type acquisition failures propagate.
+    pub fn new(data: &Funcdata, pull: OpId) -> KunaResult<PullExpression> {
         let mut me = PullExpression {
             expr: BitFieldExpression::default(),
             pull_op: pull,
@@ -365,49 +376,56 @@ impl PullExpression {
             struct_ptr: None,
             has_symbol: false,
         };
-        me.recover(data, pull);
-        me
+        me.recover(data, pull)?;
+        Ok(me)
     }
 
-    fn recover(&mut self, data: &Funcdata, pull: OpId) -> Option<()> {
-        let po = data.obank().get(pull)?;
-        let in_vn = po.get_in(0)?;
-        let in_v = data.vbank().get(in_vn)?;
+    fn recover(&mut self, data: &Funcdata, pull: OpId) -> KunaResult<Option<()>> {
+        let Some(po) = data.obank().get(pull) else { return Ok(None) };
+        let Some(in_vn) = po.get_in(0) else { return Ok(None) };
+        let Some(in_v) = data.vbank().get(in_vn) else { return Ok(None) };
         let dt: Rc<Datatype>;
         let offset: int4;
         let spc;
-        if in_v.is_written()
-            && data.obank().get(in_v.get_def()?).map(|o| o.code()) == Some(OpCode::CPUI_LOAD)
+        let def = if in_v.is_written() {
+            let Some(def) = in_v.get_def() else { return Ok(None) };
+            Some(def)
+        } else { None };
+        if def.and_then(|op| data.obank().get(op)).map(|o| o.code()) == Some(OpCode::CPUI_LOAD)
         {
-            let load_op = in_v.get_def()?;
+            let Some(load_op) = in_v.get_def() else { return Ok(None) };
             self.load_op = Some(load_op);
-            spc = space_from_const(data, load_op, 0)?;
-            dt = data.vn_type_read_facing(in_vn, pull);
+            let Some(load_space) = space_from_const(data, load_op, 0) else { return Ok(None) };
+            spc = load_space;
+            dt = data.vn_type_read_facing(in_vn, pull)?;
             offset = 0;
         } else {
             // symbol = inVn->getHigh()->getSymbol(); if null return.
-            let high = in_v.get_high()?;
-            let hb = data.high_bank().get(high)?;
-            let sym_type = hb.kuna_symbol_type()?;
+            let Some(high) = in_v.get_high() else { return Ok(None) };
+            let Some(hb) = data.high_bank().get(high) else { return Ok(None) };
+            let Some(sym_type) = hb.kuna_symbol_type() else { return Ok(None) };
             self.has_symbol = true;
             spc = Rc::clone(in_v.get_space());
             dt = Rc::clone(sym_type);
             offset = hb.kuna_symbol_offset();
         }
-        let least_bit_off = data.vbank().get(po.get_in(1)?)?.get_offset() as int4;
-        let bit_size = data.vbank().get(po.get_in(2)?)?.get_offset() as int4;
+        let Some(least_node) = po.get_in(1).and_then(|v| data.vbank().get(v)) else { return Ok(None) };
+        let least_bit_off = least_node.get_offset() as int4;
+        let Some(size_node) = po.get_in(2).and_then(|v| data.vbank().get(v)) else { return Ok(None) };
+        let bit_size = size_node.get_offset() as int4;
         self.expr.get_structures(&dt, offset, least_bit_off, spc.is_big_endian());
         let the_struct = match &self.expr.the_struct {
             Some(s) => Rc::clone(s),
-            None => return None,
+            None => return Ok(None),
         };
         if let Some(load_op) = self.load_op {
-            let load_ptr = data.obank().get(load_op)?.get_in(1)?;
+            let Some(load_ptr) = data.obank().get(load_op).and_then(|o| o.get_in(1)) else { return Ok(None) };
             self.struct_ptr =
                 self.expr.recover_structure_pointer(data, load_ptr, self.expr.byte_range_offset);
-            self.struct_ptr?;
+            if self.struct_ptr.is_none() { return Ok(None) }
         }
-        let in_size = data.vbank().get(in_vn)?.get_size();
+        let Some(in_node) = data.vbank().get(in_vn) else { return Ok(None) };
+        let in_size = in_node.get_size();
         let range = BitRange::new(
             self.expr.byte_range_offset - self.expr.offset_to_bit_struct,
             in_size,
@@ -416,7 +434,7 @@ impl PullExpression {
             spc.is_big_endian(),
         );
         self.expr.bitfield = the_struct.find_matching_bit_field(&range);
-        Some(())
+        Ok(Some(()))
     }
 
     /// Is this a valid bitfield read expression (C++ `isValid`).

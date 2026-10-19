@@ -14,7 +14,7 @@ fn fixture() -> (Funcdata, VarnodeStorage, VarnodeId) {
     let ctx = Rc::new(ArchContext::new(manage));
     let mut fd = Funcdata::new("frame", "frame", ctx, Address::new(Rc::clone(&ram), 0x1000), 0x10000000, 0x40).unwrap();
     let sp = VarnodeStorage { space: Some(Rc::clone(&ram)), offset: 0x80, size: 4 };
-    let base = fd.new_varnode(4, &Address::new(ram, 0x80), None);
+    let base = fd.new_varnode(4, &Address::new(ram, 0x80), None).unwrap();
     let base = fd.set_input_varnode(base).unwrap();
     (fd, sp, base)
 }
@@ -45,7 +45,7 @@ fn copied_frame_pointer_and_negative_displacement_keep_the_sp_origin() {
 fn unknown_bases_phi_nodes_width_changes_and_long_chains_are_declined() {
     let (mut fd, sp, base) = fixture();
     let ram = Rc::clone(sp.space.as_ref().unwrap());
-    let unknown = fd.new_varnode(4, &Address::new(ram, 0x90), None);
+    let unknown = fd.new_varnode(4, &Address::new(ram, 0x90), None).unwrap();
     assert_eq!(frame_slot(&fd, unknown, &sp), None);
     let phi = operation(&mut fd, OpCode::CPUI_MULTIEQUAL, &[base, unknown], 4);
     assert_eq!(frame_slot(&fd, phi, &sp), None);

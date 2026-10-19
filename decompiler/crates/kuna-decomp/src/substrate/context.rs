@@ -11,6 +11,7 @@
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use std::cell::RefCell;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::{AddrSpace, AddrSpaceManager};
 use kuna_base::types::{int4, uint4};
@@ -49,12 +50,19 @@ pub struct TypeOp {
     pub flags: uint4,
     /// Symbol denoting this operation (C++ `TypeOp::name`).
     pub name: String,
+    /// Effective language-selected local input and output metatypes.
+    pub metain: crate::dtype::type_metatype,
+    pub metaout: crate::dtype::type_metatype,
 }
 
 impl TypeOp {
     /// Construct an opcode descriptor.
     pub fn new(opcode: OpCode, flags: uint4, name: impl Into<String>) -> TypeOp {
-        TypeOp { opcode, flags, name: name.into() }
+        TypeOp {
+            opcode, flags, name: name.into(),
+            metain: crate::dtype::type_metatype::TYPE_UNKNOWN,
+            metaout: crate::dtype::type_metatype::TYPE_UNKNOWN,
+        }
     }
 
     /// Get the op-code value (C++ `TypeOp::getOpcode`).
@@ -162,6 +170,8 @@ pub struct GlobalEntry {
 /// `Funcdata` at [`build_arch_handle`](crate::architecture::Architecture::build_arch_handle).
 #[derive(Debug, Clone, Default)]
 pub struct GlobalQuery {
+    /// Immutable source prototypes on exact function entries, shared from FunctionSymbol.
+    pub(crate) source_protos: std::collections::BTreeMap<(int4, u64), Rc<crate::fspec::FuncProto>>,
     /// Every whole-and-piece mapped storage in the global scope, stably grouped
     /// by address-space index by [`GlobalQuery::new`].
     entries: Vec<GlobalEntry>,
@@ -293,6 +303,7 @@ impl GlobalQuery {
             entry_start = entry_end;
         }
         Self {
+            source_protos: std::collections::BTreeMap::new(),
             entries,
             space_indexes,
             owned,
@@ -514,30 +525,32 @@ impl GlobalQuery {
     /// `localmap->queryProperties` walks up to the global scope, returns the covering
     /// `SymbolEntry`, and `high->getSymbol()` then carries that Symbol's display name).
     ///
-    /// Returns `(display_name, symbol_offset, symbol_type)` where `symbol_offset` is
+    /// Returns `(display_name, symbol_offset, symbol_type, symbol_id)` where `symbol_offset` is
     /// the byte offset of the access within the Symbol (C++ `(addr - entry_addr) +
     /// entry_offset`; 0 for a whole-symbol/scalar global, > 0 for an array/struct
-    /// member).  `None` when no global Symbol covers `[addr, addr+size)`.
+    /// member). `symbol_id` is the selected source Symbol's identity (zero if
+    /// unavailable). `None` when no global Symbol covers `[addr, addr+size)`.
     pub fn name_for_varnode(
         &self,
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>)> {
+    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, u64)> {
         self.name_for_varnode_scoped(addr, size, usepoint)
-            .map(|(n, off, t, _)| (n, off, t))
+            .map(|(n, off, t, _, id)| (n, off, t, id))
     }
 
     /// Like [`name_for_varnode`](Self::name_for_varnode) but also returns the owning
     /// Symbol's scope-name chain (innermost first, global excluded) so the caller can
     /// apply the printer's namespace qualification (`pushSymbolScope`).  Empty chain
-    /// for a Symbol that lives directly in the global scope.
+    /// for a Symbol that lives directly in the global scope. The source identity
+    /// remains the final tuple field, after the scope chain.
     pub fn name_for_varnode_scoped(
         &self,
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, Vec<String>)> {
+    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, Vec<String>, u64)> {
         if addr.is_constant() {
             return None;
         }
@@ -547,7 +560,7 @@ impl GlobalQuery {
         // entry's starting offset (== entry addr offset).
         let sym_off = (addr.get_offset().wrapping_sub(e.first) as int4)
             .wrapping_add(e.symbol_offset);
-        Some((e.symbol_name.clone(), sym_off, e.symbol_type.clone(), e.scope_path.clone()))
+        Some((e.symbol_name.clone(), sym_off, e.symbol_type.clone(), e.scope_path.clone(), e.symbol_id))
     }
 
     /// The type-locked covering Symbol's sized geometry for a Varnode — the input
@@ -620,6 +633,12 @@ mod tests;
 /// the function and its analysis passes.
 pub struct ArchContext {
     pub x87_empty_storage: Option<crate::p4_calls::kuna_x87emptyreturn::Storage>,
+    /// Live payload/template/ID authority shared with the architecture.
+    pub injection_library: Option<Rc<RefCell<crate::inject_sleigh::PcodeInjectLibrarySleigh>>>,
+    /// Processor user-operation descriptions, including jump-assist scripts.
+    pub userops: Rc<crate::userop::UserOpManage>,
+    /// Selected output language, retained while the architecture printer is detached.
+    pub out_lang: crate::kuna_lang::OutLang,
     /// Shared spaces retain the pointer identities and indices used by lifted
     /// Varnodes. [`Self::new_shared`] accepts the engine's manager; [`Self::new`]
     /// wraps an owned manager for fixtures.
@@ -841,6 +860,8 @@ pub struct ArchContext {
     /// Read by
     /// [`ActionCallTargetType`](crate::kuna_calltargettype::ActionCallTargetType).
     pub call_target_type: bool,
+    /// Receiver projection copied from Architecture at this context's birth.
+    pub call_target_publication: crate::kuna_calltargettype::CallTargetPublication,
     /// (kuna `calltargettype`) C output: a parameter or global takes the call's
     /// type too, and a target whose uses disagree is cast at each call. The
     /// Rust speller spells every pointer to code `*const ()`, so neither changes
@@ -1521,6 +1542,8 @@ pub struct ArchContext {
     /// architecture.  `None` for hand-built fixtures (no internal strings).
     pub internal_strings:
         Option<Rc<std::cell::RefCell<crate::stringmanage::StringManagerUnicode>>>,
+    pub cpool: Rc<std::cell::RefCell<crate::cpool::ConstantPoolInternal>>,
+    pub native_fetch: Option<Rc<dyn crate::remote_provider::RemoteProviderFetch>>,
     /// Maximum number of entries in a single JumpTable (C++
     /// `Architecture::max_jumptable_size`), shared from the real architecture.
     /// Read by `JumpTable::recoverModel`.  `0` for hand-built fixtures.
@@ -1704,6 +1727,11 @@ pub struct ArchContext {
 }
 
 impl ArchContext {
+    /// Local metadata and instruction descriptors share the same language adjustment.
+    pub fn type_op_info(&self, opcode: OpCode) -> crate::typeop::TypeOpInfo {
+        crate::typeop::effective_type_op_info(opcode, self.out_lang)
+    }
+
     /// Construct a context from an owned [`AddrSpaceManager`].
     ///
     /// Used by hand-built test fixtures; the real path shares the engine's
@@ -1720,6 +1748,9 @@ impl ArchContext {
         // C++ default: getMinimumLanedRegisterSize() returns the configured
         // minimum; the upstream default when unset is 4.
         ArchContext {
+            injection_library: None,
+            userops: Rc::new(crate::userop::UserOpManage::new()),
+            out_lang: crate::kuna_lang::OutLang::C,
             manage,
             min_laned_register_size: 4,
             x87_empty_storage: None,
@@ -1805,6 +1836,7 @@ impl ArchContext {
             rodata_string: false,        // (kuna) rodatastring
             ptrdepthcap: false,          // (kuna) option ptrdepthcap
             call_target_type: false,     // (kuna) option calltargettype
+            call_target_publication: crate::kuna_calltargettype::CallTargetPublication::Full,
             call_target_c: false,        // (kuna) option calltargettype, C output
             float_globals: None,         // (kuna) option floatglobals
             float_globals_pending: false,
@@ -1984,6 +2016,8 @@ impl ArchContext {
             nan_ignore_all: false,
             types: None,
             internal_strings: None,
+            cpool: Rc::new(std::cell::RefCell::new(crate::cpool::ConstantPoolInternal::new())),
+            native_fetch: None,
             max_jumptable_size: 0,
             alias_block_level: 2, // Architecture default: block structs and arrays
             funcptr_align: 0,
@@ -2141,6 +2175,23 @@ impl ArchContext {
         self.types.as_deref().map(|t| t as &dyn crate::dtype::TypeFactory)
     }
 
+    pub fn get_cpool_record(&self, refs: &[u64]) -> kuna_base::error::KunaResult<Option<Rc<crate::cpool::CPoolRecord>>> {
+        let Some(types) = self.types.as_deref() else {
+            if self.native_fetch.is_some() {
+                return Err(kuna_base::error::KunaError::lowlevel(
+                    "Host constant-pool acquisition requires the architecture type factory",
+                ));
+            }
+            return Ok(self.get_cpool_record_cached(refs));
+        };
+        crate::cpool::acquire_record(&self.cpool, self.native_fetch.as_deref(), types, self.manage(), refs)
+    }
+
+    pub fn get_cpool_record_cached(&self, refs: &[u64]) -> Option<Rc<crate::cpool::CPoolRecord>> {
+        if refs.is_empty() { return None; }
+        self.cpool.borrow().get_record_shared(refs)
+    }
+
     /// Get the floating-point format for the given size in bytes, or `None` if
     /// the processor has no format of that size (C++
     /// `glb->translate->getFloatFormat`).  Reads the [`floatformats`](Self::floatformats)
@@ -2182,16 +2233,22 @@ impl ArchContext {
     pub fn callee_proto_model(
         &self,
         addr: &Address,
-    ) -> Option<std::rc::Rc<crate::fspec::ProtoModel>> {
+    ) -> KunaResult<Option<std::rc::Rc<crate::fspec::ProtoModel>>> {
         if let Some(remote) = &self.remote_scope {
-            return remote.callee_model_at(addr);
+            return Ok(remote.function_at(addr)?.and_then(|facts| facts.source_proto)
+                .filter(|proto| proto.has_model())
+                .map(|proto| Rc::clone(proto.model())));
         }
-        let space_index = addr.get_space()?.get_index();
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        let space_index = space.get_index();
         let offset = addr.get_offset();
-        self.callee_proto_models
+        if let Some(source) = self.global_query.as_ref().and_then(|query| query.source_protos.get(&(space_index, offset))) {
+            return Ok(source.has_model().then(|| Rc::clone(source.model())));
+        }
+        Ok(self.callee_proto_models
             .iter()
             .find(|(sp, off, _)| *sp == space_index && *off == offset)
-            .map(|(_, _, m)| std::rc::Rc::clone(m))
+            .map(|(_, _, m)| std::rc::Rc::clone(m)))
     }
 
     /// (kuna `libcnames`) The library names the prototype parked on the
@@ -2202,24 +2259,48 @@ impl ArchContext {
         }
         let space_index = addr.get_space()?.get_index();
         let offset = addr.get_offset();
+        if let Some(source) = self.global_query.as_ref().and_then(|query| query.source_protos.get(&(space_index, offset))) {
+            return source.logical_pieces().and_then(|pieces| pieces.kuna_library_names);
+        }
         self.callee_protos
             .iter()
             .find(|(si, off, _)| *si == space_index && *off == offset)
             .and_then(|(_, _, pieces)| pieces.kuna_library_names)
     }
 
-    pub fn callee_proto_pieces(&self, addr: &Address) -> Option<crate::fspec::PrototypePieces> {
+    pub fn callee_proto_pieces(&self, addr: &Address) -> KunaResult<Option<crate::fspec::PrototypePieces>> {
         if let Some(remote) = &self.remote_scope {
-            // (kuna, Phase 3) ghidra-mode: the locked callee signatures decoded
-            // from getMappedSymbols answers (query-through).
-            return remote.callee_pieces_at(addr);
+            return Ok(remote.function_at(addr)?.and_then(|facts| {
+                let proto = facts.source_proto?;
+                if !proto.is_input_locked() {
+                    return None;
+                }
+                let mut pieces = if let Some(logical) = proto.logical_pieces() {
+                    logical.clone()
+                } else {
+                    let mut pieces = crate::fspec::PrototypePieces::default();
+                    proto.get_pieces(&mut pieces);
+                    pieces
+                };
+                pieces.name = facts.display_name;
+                Some(pieces)
+            }));
         }
-        let space_index = addr.get_space()?.get_index();
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        let space_index = space.get_index();
         let offset = addr.get_offset();
-        self.callee_protos
+        if let Some(source) = self.global_query.as_ref().and_then(|query| query.source_protos.get(&(space_index, offset))) {
+            if let Some(pieces) = source.logical_pieces() {
+                return Ok(Some(pieces.clone()));
+            }
+            let mut pieces = crate::fspec::PrototypePieces::default();
+            source.get_pieces(&mut pieces);
+            return Ok(Some(pieces));
+        }
+        Ok(self.callee_protos
             .iter()
             .find(|(si, off, _)| *si == space_index && *off == offset)
-            .map(|(_, _, pieces)| pieces.clone())
+            .map(|(_, _, pieces)| pieces.clone()))
     }
 
     /// The current-evaluation model (C++ `glb->evalfp_current`), falling back to
@@ -2264,17 +2345,17 @@ impl ArchContext {
     /// global-mapped Varnode picks up `mapped | addrtied | persist` (and any
     /// `readonly`/`volatile` on the range) here, so `ActionDeadCode` keeps its
     /// store alive.
-    pub fn query_global_properties(&self, addr: &Address, size: int4, usepoint: &Address) -> uint4 {
-        match self.effective_global_query(addr) {
+    pub fn query_global_properties(&self, addr: &Address, size: int4, usepoint: &Address) -> KunaResult<uint4> {
+        Ok(match self.effective_global_query(addr)? {
             Some(gq) => gq.query_properties(addr, size, usepoint),
             None => 0,
-        }
+        })
     }
 
     /// Memory-range properties without a covering symbol's inherited flags.
-    pub(crate) fn query_global_range_properties(&self, addr: &Address) -> uint4 {
-        self.effective_global_query(addr)
-            .map_or(0, |gq| gq.get_property(addr))
+    pub(crate) fn query_global_range_properties(&self, addr: &Address) -> KunaResult<uint4> {
+        Ok(self.effective_global_query(addr)?
+            .map_or(0, |gq| gq.get_property(addr)))
     }
 
     /// The global-scope snapshot local-name allocation checks identifiers
@@ -2294,46 +2375,47 @@ impl ArchContext {
     /// [`GlobalQuery`] snapshot.  Every global read below resolves through
     /// this, so the remote seam is exactly the C++ `ScopeGhidra` overriding of
     /// the base `Scope` lookups.
-    fn effective_global_query(&self, addr: &Address) -> Option<Rc<GlobalQuery>> {
+    fn effective_global_query(&self, addr: &Address) -> KunaResult<Option<Rc<GlobalQuery>>> {
         if let Some(remote) = &self.remote_scope {
-            return Some(remote.query_snapshot(addr));
+            return Ok(Some(remote.query_snapshot(addr)?));
         }
-        self.global_query.clone()
+        Ok(self.global_query.clone())
     }
 
     /// Resolve the global Symbol covering a storage range for the naming pass (C++
     /// `Funcdata::linkSymbol`'s reach into the global scope; see
     /// [`GlobalQuery::name_for_varnode`]).  Returns `(display_name, symbol_offset,
-    /// symbol_type)`, or `None` when no global symbol table is shared (hand-built
+    /// symbol_type, symbol_id)`, or `None` when no global symbol table is shared (hand-built
     /// fixtures) or no global Symbol covers the range.
     pub fn name_for_global_varnode(
         &self,
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>)> {
-        self.effective_global_query(addr)
-            .and_then(|gq| gq.name_for_varnode(addr, size, usepoint))
+    ) -> KunaResult<Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, u64)>> {
+        Ok(self.effective_global_query(addr)?
+            .and_then(|gq| gq.name_for_varnode(addr, size, usepoint)))
     }
 
     /// The first offset and size of the smallest global Symbol whose storage
     /// holds `addr`, if any.
-    pub(crate) fn global_symbol_extent(&self, addr: &Address) -> Option<(u64, int4)> {
-        self.effective_global_query(addr)
-            .and_then(|gq| gq.find_container_entry(addr, 1, &Address::default()).map(|e| (e.first, e.size)))
+    pub(crate) fn global_symbol_extent(&self, addr: &Address) -> KunaResult<Option<(u64, int4)>> {
+        Ok(self.effective_global_query(addr)?
+            .and_then(|gq| gq.find_container_entry(addr, 1, &Address::default()).map(|e| (e.first, e.size))))
     }
 
     /// Like [`name_for_global_varnode`](Self::name_for_global_varnode) but also
     /// returns the owning Symbol's scope-name chain (innermost first, global
     /// excluded) for namespace-qualified rendering (`PrintC::pushSymbolScope`).
+    /// The source Symbol identity is appended after that chain.
     pub fn name_for_global_varnode_scoped(
         &self,
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, Vec<String>)> {
-        self.effective_global_query(addr)
-            .and_then(|gq| gq.name_for_varnode_scoped(addr, size, usepoint))
+    ) -> KunaResult<Option<(String, int4, Option<std::rc::Rc<crate::dtype::Datatype>>, Vec<String>, u64)>> {
+        Ok(self.effective_global_query(addr)?
+            .and_then(|gq| gq.name_for_varnode_scoped(addr, size, usepoint)))
     }
 
     /// The type-locked covering global Symbol's `(symbol_type, in_symbol_offset)`
@@ -2351,9 +2433,9 @@ impl ArchContext {
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<(std::rc::Rc<crate::dtype::Datatype>, int4)> {
-        self.effective_global_query(addr)
-            .and_then(|gq| gq.sized_type_geometry(addr, size, usepoint))
+    ) -> KunaResult<Option<(std::rc::Rc<crate::dtype::Datatype>, int4)>> {
+        Ok(self.effective_global_query(addr)?
+            .and_then(|gq| gq.sized_type_geometry(addr, size, usepoint)))
     }
 
     /// Get the minimum laned-register size (C++
@@ -2449,50 +2531,90 @@ impl ArchContext {
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<GlobalContainer> {
-        let gq = self.effective_global_query(addr)?;
-        let e = gq.find_container_entry(addr, size, usepoint)?;
-        let space = addr.get_space()?;
-        Some(GlobalContainer {
+    ) -> KunaResult<Option<GlobalContainer>> {
+        let Some(gq) = self.effective_global_query(addr)? else { return Ok(None) };
+        let Some(e) = gq.find_container_entry(addr, size, usepoint) else { return Ok(None) };
+        let Some(space) = addr.get_space() else { return Ok(None) };
+        Ok(Some(GlobalContainer {
             symbol_type: e.symbol_type.clone(),
             entry_addr: Address::new(Rc::clone(space), e.first),
             all_flags: e.all_flags,
             symbol_offset: e.symbol_offset,
             symbol_id: e.symbol_id,
-        })
+        }))
+    }
+
+    /// Apply independent FunctionSymbol flow facts without changing its source
+    /// declaration. Keep the original reader identity when no delta is needed.
+    fn with_callee_symbol_facts(
+        &self,
+        source: &Rc<crate::fspec::FuncProto>,
+        entry: &GlobalEntry,
+    ) -> Rc<crate::fspec::FuncProto> {
+        let inject = entry.func_inject_id >= 0 && source.get_inject_id() < 0;
+        let no_return = entry.func_no_return && self.peimportcall && !source.is_no_return();
+        if !inject && !no_return {
+            return Rc::clone(source);
+        }
+        let mut working = crate::fspec::FuncProto::new();
+        working.copy(source);
+        if inject {
+            if let Some(library) = &self.injection_library {
+                working.set_injection(entry.func_inject_id, Rc::clone(library));
+            } else {
+                working.set_inject_id(entry.func_inject_id);
+            }
+        }
+        if no_return {
+            working.set_no_return(true);
+        }
+        Rc::new(working)
     }
 
     /// C++ `data.getScopeLocal()->getParent()->queryFunction(entry)->getFuncProto()`
-    /// restricted to the global-scope snapshot: resolve the callee's recovered
-    /// prototype for a direct-call entry address.
+    /// restricted to the global-scope snapshot: resolve the callee's complete
+    /// source prototype, or its recovered Code prototype, for a direct-call entry.
     ///
     /// The frozen [`GlobalQuery`] carries every global SymbolEntry's `symbol_type`;
     /// for a FunctionSymbol that is a `TypeCode` whose `getPrototype()` returns the
     /// `FuncProto` the callee body would expose (a declared callee parks the locked
-    /// signature there — `TypeFactory::getTypeCode(PrototypePieces)`).  We match the
-    /// entry whose storage *starts* at `entry` (an exact function-entry hit) and
-    /// borrow its code prototype.  Generic over the callee signature: keyed only by
-    /// address, no name/value keying.  `None` when no global symbol table is shared
-    /// (hand-built fixtures), no entry starts at `entry`, or the entry's type is not
-    /// a code type with a prototype (an unknown callee).
+    /// signature there — `TypeFactory::getTypeCode(PrototypePieces)`). Complete
+    /// authored prototypes instead live in the snapshot's exact-entry source map.
+    /// We match the entry whose storage *starts* at `entry` (an exact function-entry
+    /// hit). Generic over the callee signature: keyed only by address, no
+    /// name/value keying. `None` when no global symbol table is shared (hand-built
+    /// fixtures), no entry starts at `entry`, or no complete prototype is present.
+    /// Independent FunctionSymbol flow facts are applied to a copy only when
+    /// missing from the selected prototype.
     pub fn query_callee_proto(
         &self,
         entry: &Address,
-    ) -> Option<std::rc::Rc<crate::fspec::FuncProto>> {
-        let gq = self.effective_global_query(entry)?;
-        let space_index = entry.get_space()?.get_index();
+    ) -> KunaResult<Option<std::rc::Rc<crate::fspec::FuncProto>>> {
+        if let Some(remote) = &self.remote_scope {
+            return Ok(remote.function_at(entry)?.and_then(|facts| facts.source_proto));
+        }
+        let Some(gq) = self.effective_global_query(entry)? else { return Ok(None) };
+        let Some(space) = entry.get_space() else { return Ok(None) };
+        let space_index = space.get_index();
         let start = entry.get_offset();
+        if let Some(source) = gq.source_protos.get(&(space_index, start)) {
+            let effective = gq.entries_for_space(space_index).iter()
+                .find(|entry| entry.first == start && entry.is_function)
+                .map(|entry| self.with_callee_symbol_facts(source, entry))
+                .unwrap_or_else(|| Rc::clone(source));
+            return Ok(Some(effective));
+        }
         for e in gq.entries_for_space(space_index) {
             if e.first != start {
                 continue;
             }
             if let Some(ct) = &e.symbol_type {
                 if let Some(proto) = ct.get_code_prototype() {
-                    return Some(std::rc::Rc::clone(proto));
+                    return Ok(Some(self.with_callee_symbol_facts(proto, e)));
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// Return the callable type attached to the exact global slot loaded as an
@@ -2502,9 +2624,9 @@ impl ArchContext {
         addr: &Address,
         size: int4,
         usepoint: &Address,
-    ) -> Option<IndirectSlotType> {
-        self.effective_global_query(addr)?
-            .indirect_slot_type(addr, size, usepoint)
+    ) -> KunaResult<Option<IndirectSlotType>> {
+        Ok(self.effective_global_query(addr)?
+            .and_then(|gq| gq.indirect_slot_type(addr, size, usepoint)))
     }
 
     /// C++ `Scope::queryFunction(addr)` (`database.cc:1292`) restricted to the
@@ -2521,9 +2643,16 @@ impl ArchContext {
     pub fn query_function(
         &self,
         entry: &Address,
-    ) -> Option<(String, Address, std::rc::Rc<crate::fspec::FuncProto>)> {
-        let gq = self.effective_global_query(entry)?;
-        let space = entry.get_space()?;
+    ) -> KunaResult<Option<(String, Address, std::rc::Rc<crate::fspec::FuncProto>)>> {
+        if let Some(remote) = &self.remote_scope {
+            if let Some(facts) = remote.function_at(entry)? {
+                if let Some(proto) = facts.source_proto {
+                    return Ok(Some((facts.display_name, entry.clone(), proto)));
+                }
+            }
+        }
+        let Some(gq) = self.effective_global_query(entry)? else { return Ok(None) };
+        let Some(space) = entry.get_space() else { return Ok(None) };
         let space_index = space.get_index();
         let start = entry.get_offset();
         for e in gq.entries_for_space(space_index) {
@@ -2540,6 +2669,9 @@ impl ArchContext {
                 continue;
             }
             let entry_addr = Address::new(std::rc::Rc::clone(space), e.first);
+            if let Some(source) = gq.source_protos.get(&(space_index, start)) {
+                return Ok(Some((e.symbol_name.clone(), entry_addr, self.with_callee_symbol_facts(source, e))));
+            }
             // Prefer a recovered code prototype when the type carries one (a
             // declared callee, e.g. `parse line extern void f(...)`); otherwise
             // hand back the default void proto the C++ funcsym's `getFuncProto`
@@ -2547,26 +2679,7 @@ impl ArchContext {
             if let Some(ct) = &e.symbol_type {
                 if ct.get_metatype() == crate::dtype::type_metatype::TYPE_CODE {
                     if let Some(proto) = ct.get_code_prototype() {
-                        // A declared callee already carries its model/params; but the
-                        // parked inject id (call-fixup) lives on the FunctionSymbol,
-                        // not the type — re-apply it so `deindirect` sees an inline
-                        // (inject-bearing) callee even for a typed prototype.
-                        if e.func_inject_id >= 0 && proto.get_inject_id() < 0 {
-                            let mut p = crate::fspec::FuncProto::new();
-                            p.copy(proto);
-                            p.set_inject_id(e.func_inject_id);
-                            if e.func_no_return && self.peimportcall {
-                                p.set_no_return(true);
-                            }
-                            return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(p)));
-                        }
-                        if e.func_no_return && self.peimportcall && !proto.is_no_return() {
-                            let mut p = crate::fspec::FuncProto::new();
-                            p.copy(proto);
-                            p.set_no_return(true);
-                            return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(p)));
-                        }
-                        return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::clone(proto)));
+                        return Ok(Some((e.symbol_name.clone(), entry_addr, self.with_callee_symbol_facts(proto, e))));
                     }
                 }
             }
@@ -2578,16 +2691,19 @@ impl ArchContext {
             // (hand-built fixtures), fall back to a bare proto.
             let mut proto = crate::fspec::FuncProto::new();
             if let (Some(model), Some(types)) = (self.default_fp(), self.types()) {
-                if let Ok(void) = types.get_type_void() {
-                    proto.set_internal(std::rc::Rc::clone(model), void);
-                }
+                let void = types.get_type_void()?;
+                proto.set_internal(std::rc::Rc::clone(model), void);
             }
             // C++ `IfcFixupApply`'s `setInjectId` also marks the funcsym proto
             // inline; carry that so `deindirect`'s `isInline()` test triggers the
             // restart that re-flows and injects the call-fixup at the now-direct
             // call site.
             if e.func_inject_id >= 0 {
-                proto.set_inject_id(e.func_inject_id);
+                if let Some(library) = &self.injection_library {
+                    proto.set_injection(e.func_inject_id, Rc::clone(library));
+                } else {
+                    proto.set_inject_id(e.func_inject_id);
+                }
             }
             // (kuna) The callee's no-return flow effect, gated by `peimportcall`:
             // `deindirect` skips its prototype merge for a no-return callee and
@@ -2595,9 +2711,9 @@ impl ArchContext {
             if e.func_no_return && self.peimportcall {
                 proto.set_no_return(true);
             }
-            return Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(proto)));
+            return Ok(Some((e.symbol_name.clone(), entry_addr, std::rc::Rc::new(proto))));
         }
-        None
+        Ok(None)
     }
 }
 
@@ -2663,10 +2779,10 @@ impl FuncProto {
 impl crate::database::TranslateAccess for ArchContext {
     /// C++ `Translate::getRegisterName(spc,off,sz)` — forward to the engine's
     /// register lookup installed on the shared `AddrSpaceManager`.
-    fn get_register_name(&self, space: &Rc<AddrSpace>, off: u64, size: int4) -> String {
+    fn get_register_name(&self, space: &Rc<AddrSpace>, off: u64, size: int4) -> KunaResult<String> {
         match self.manage.register_lookup() {
             Some(rl) => rl.get_register_name(space, off, size),
-            None => String::new(),
+            None => Ok(String::new()),
         }
     }
 }

@@ -476,8 +476,8 @@ impl Action for ActionPebNames {
         }
         Some(Box::new(ActionPebNames { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
-        let Some((layout, reg)) = resolve_register(data) else { return 0 };
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        let Some((layout, reg)) = resolve_register(data) else { return Ok(0) };
         let size = layout.ptr_size;
         let mapped = data.get_scope_local().and_then(|lm| {
             let (sym, ty) = lm.containing_symbol_for_storage(&reg)?;
@@ -494,24 +494,24 @@ impl Action for ActionPebNames {
                     lm.remove_symbol(sym);
                 }
             }
-            return 0;
+            return Ok(0);
         }
         if mapped.is_some() {
-            return 0;
+            return Ok(0);
         }
         let Some(ct) = data.get_arch().types().and_then(|t| teb_pointer_type(t, layout)) else {
-            return 0;
+            return Ok(0);
         };
         let usepoint = data.get_address() + -1;
-        let Some(lm) = data.get_scope_local_mut() else { return 0 };
+        let Some(lm) = data.get_scope_local_mut() else { return Ok(0) };
         let name = if lm.local_name_used(TEB_SYMBOL_NAME) { "" } else { TEB_SYMBOL_NAME };
-        let Ok(sym) = lm.add_symbol(name, ct, &reg, &usepoint) else { return 0 };
+        let Ok(sym) = lm.add_symbol(name, ct, &reg, &usepoint) else { return Ok(0) };
         let mut lock = varnode_flags::typelock;
         if !name.is_empty() {
             lock |= varnode_flags::namelock;
         }
         lm.set_attribute(sym, lock);
-        1
+        Ok(1)
     }
 }
 

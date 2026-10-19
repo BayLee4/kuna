@@ -123,7 +123,7 @@ fn neutralized_marker_keeps_its_instruction_start_without_a_trap_effect() {
     fd.op_set_input(producer, size, 1).unwrap();
     let output = fd.new_unique_out(4, producer).unwrap();
     let address = fd.vbank().get(output).unwrap().get_addr().clone();
-    let destination = fd.new_varnode(4, &address, None);
+    let destination = fd.new_varnode(4, &address, None).unwrap();
     let branch = make_op(&mut fd, OpCode::CPUI_BRANCHIND, 0x1000, 1, false);
     fd.op_set_input(branch, destination, 0).unwrap();
     assert!(kuna_sparc_struct_ret_trap_producer(&fd, branch, true, resolver).is_some());
@@ -179,7 +179,7 @@ fn shared_destination_does_not_override_the_userop_name() {
     set_const_input(&mut fd, other, 0, 9);
     fd.new_varnode_out(4, &address, other).unwrap();
     let branch = make_op(&mut fd, OpCode::CPUI_BRANCHIND, 0x1000, 1, false);
-    let destination = fd.new_varnode(4, &address, None);
+    let destination = fd.new_varnode(4, &address, None).unwrap();
     fd.op_set_input(branch, destination, 0).unwrap();
     assert_eq!(kuna_sparc_struct_ret_trap_producer(&fd, branch, true, resolver), Some(trap));
 }

@@ -261,7 +261,7 @@ impl SimOracle {
         let big_endian = sleigh.is_big_endian();
         let unique_base = sleigh.get_unique_base() as u64;
         let mut user_ops = Vec::new();
-        sleigh.get_user_op_names(&mut user_ops);
+        sleigh.get_user_op_names(&mut user_ops).expect("enumerate fixture userops");
         #[allow(clippy::mutable_key_type)] // AddrSpace interior mutability does not affect Ord
         let mut reglist: BTreeMap<VarnodeData, String> = BTreeMap::new();
         sleigh.get_all_registers(&mut reglist);
@@ -416,7 +416,7 @@ impl SimOracle {
         }
 
         let arch = self.prog.arch();
-        let id = arch.pcodeinjectlib.base.get_payload_id(ptype, &name);
+        let id = arch.pcodeinjectlib.borrow().base.get_payload_id(ptype, &name);
         if id < 0 {
             return not_found();
         }
@@ -434,8 +434,9 @@ impl SimOracle {
         };
         ctx.nextaddr = Some(&baseaddr + len as i64);
 
-        let payload = arch.pcodeinjectlib.get_payload(id);
-        let Some(tpl) = arch.pcodeinjectlib.get_tpl(id) else {
+        let library = arch.pcodeinjectlib.borrow();
+        let payload = library.get_payload(id);
+        let Some(tpl) = library.get_tpl(id) else {
             return resp_empty();
         };
         let engine = SleighInjectEngine::new(
@@ -1150,28 +1151,103 @@ impl SimOracle {
         }
     }
 
-    /// getStringData: NUL-scan program bytes (the Java side would charset-decode;
-    /// the vendored fixtures are ASCII/UTF-8) and frame with the biased
-    /// 2-byte size header + truncation flag + nibble-doubled payload.
+    /// Java DecompileCallback.getStringData prefers the Listing string's
+    /// encoding (including offcuts), otherwise the requested character type.
+    /// Its response is UTF-8, not bytes in that source encoding.
     fn answer_string_data(&mut self, dec: &mut PackedDecode) -> Vec<u8> {
-        let max_bytes = dec
+        let max_chars = usize::try_from(dec
             .read_signed_integer_id(&ATTRIB_MAXSIZE)
-            .expect("getStringData maxsize") as usize;
-        let _type_name = dec.read_string_id(&ATTRIB_TYPE).expect("type name");
-        let _type_id = dec.read_unsigned_integer_id(&ATTRIB_ID).expect("type id");
+            .expect("getStringData maxsize")).expect("nonnegative string limit");
+        let type_name = String::from_utf8(dec.read_string_id(&ATTRIB_TYPE).expect("type name"))
+            .expect("UTF-8 type name");
+        let type_id = dec.read_unsigned_integer_id(&ATTRIB_ID).expect("type id");
         let addr = Address::decode(dec).expect("getStringData <addr>");
-        let mut collected: Vec<u8> = Vec::new();
-        let mut truncated = true;
-        for i in 0..max_bytes.max(1) as u64 {
-            match self.prog.read_bytes(addr.get_offset() + i, 1) {
-                Some(b) if b[0] != 0 => collected.push(b[0]),
-                Some(_) => {
-                    truncated = false;
-                    break;
-                }
-                None => break, // ran off the image: serve what we have
-            }
+        let declared = self.string_symbols.range(..=addr.get_offset()).next_back()
+            .and_then(|(&start, (_, width, length))| {
+                let offset = addr.get_offset().checked_sub(start)?;
+                (offset < u64::try_from(*length).ok()?)
+                    .then_some((*width, usize::try_from(*length).ok()? - usize::try_from(offset).ok()?))
+            });
+        let requested = if declared.is_none() {
+            self.prog.arch().types().find_by_name(&type_name)
+                .expect("oracle character datatype")
+                .filter(|ty| type_id == 0 || ty.get_id() == type_id)
+                .map(|ty| ty.get_array_base().unwrap_or(ty).get_size())
+        } else {
+            None
+        };
+        let width = match declared.map(|(width, _)| width).or(requested) {
+            Some(2) => 2usize,
+            Some(4) => 4usize,
+            _ => 1usize,
+        };
+        // The raw-memory admission limit is source BYTES including the
+        // terminator (StringDataInstance.getStringLength), before the separate
+        // Java UTF-16-unit truncation of a declared Listing string.
+        let byte_limit = declared.map(|(_, remaining)| remaining)
+            .unwrap_or(max_chars - max_chars % width);
+        if byte_limit % width != 0 {
+            return resp_empty();
         }
+        let mut bytes = Vec::new();
+        let mut terminated = false;
+        for offset in (0..byte_limit).step_by(width) {
+            let Some(at) = addr.get_offset().checked_add(offset as u64) else {
+                return resp_empty();
+            };
+            let Some(unit) = self.prog.read_bytes(at, width) else {
+                return resp_empty();
+            };
+            if unit.iter().all(|&byte| byte == 0) {
+                terminated = true;
+                break;
+            }
+            bytes.extend_from_slice(&unit);
+        }
+        if !terminated && declared.is_none() {
+            return resp_empty();
+        }
+        let decoded = match width {
+            2 => {
+                let units = bytes.chunks_exact(2).map(|unit| {
+                    let pair = [unit[0], unit[1]];
+                    if self.big_endian { u16::from_be_bytes(pair) } else { u16::from_le_bytes(pair) }
+                });
+                char::decode_utf16(units).collect::<Result<String, _>>().ok()
+            }
+            4 => bytes.chunks_exact(4).map(|unit| {
+                let raw = [unit[0], unit[1], unit[2], unit[3]];
+                char::from_u32(if self.big_endian { u32::from_be_bytes(raw) } else { u32::from_le_bytes(raw) })
+            }).collect::<Option<String>>(),
+            _ => String::from_utf8(bytes).ok(),
+        };
+        let Some(mut text) = decoded.filter(|text| !text.contains('\u{fffd}')) else {
+            return resp_empty();
+        };
+        // Java String.length/substring count UTF-16 code units. If substring
+        // splits a surrogate pair, StandardCharsets.UTF_8 replaces it with '?'.
+        let mut units = 0usize;
+        let mut truncated = false;
+        let mut keep = text.len();
+        let mut split_surrogate = false;
+        for (offset, ch) in text.char_indices() {
+            let next = units + ch.len_utf16();
+            if next > max_chars {
+                if declared.is_none() {
+                    return resp_empty();
+                }
+                truncated = true;
+                keep = offset;
+                split_surrogate = units < max_chars;
+                break;
+            }
+            units = next;
+        }
+        text.truncate(keep);
+        if split_surrogate {
+            text.push('?');
+        }
+        let mut collected = text.into_bytes();
         collected.push(0); // upstream ships the NUL terminator, doubled too
         let mut raw = Vec::new();
         raw.extend_from_slice(&string_data_size_header(collected.len() as u32));
@@ -1251,7 +1327,7 @@ impl AnswerSource for SimOracle {
                     .as_sleigh()
                     .expect("oracle engine is a Sleigh");
                 match addr.get_space() {
-                    Some(spc) => sleigh.get_register_name(spc, addr.get_offset(), size),
+                    Some(spc) => sleigh.get_register_name(spc, addr.get_offset(), size).unwrap(),
                     None => String::new(),
                 }
             };
@@ -1499,5 +1575,5 @@ pub fn decompile_cli(prog: &mut ConsoleProgram, name: &str, addr: &Address) -> S
     )
     .result
     .unwrap_or_else(|e| panic!("CLI-path decompile of {name} failed: {}", e.explain()));
-    print_c(prog.arch_mut(), &fd)
+    print_c(prog.arch_mut(), &fd).unwrap()
 }

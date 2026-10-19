@@ -51,7 +51,7 @@ fn ptrrel(
 ) -> Datatype {
     let mut pr = Datatype::new_with_align(size, -1, type_metatype::TYPE_PTRREL);
     pr.submeta = sub_metatype::SUB_PTRREL;
-    pr.kind = DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset };
+    pr.kind = DatatypeKind::PointerRel { ptrto, wordsize, stripped, parent, offset, spaceid: None };
     pr
 }
 

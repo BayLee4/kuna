@@ -127,7 +127,7 @@ fn only_the_committed_entry_seeds_reach_the_validator() {
             seeds,
             &[],
             &kuna_analysis::listing::WalkPlan::serial(),
-        );
+        ).unwrap();
         let mut vmas: Vec<u64> = out
             .iter()
             .filter(|(id, _)| *id == "funcdisc_recursive")
@@ -187,7 +187,7 @@ fn a_committed_entry_outside_the_code_is_not_walked() {
         &[MAIN, 0x59684C],
         &[],
         &kuna_analysis::listing::WalkPlan::serial(),
-    );
+    ).unwrap();
     let vmas: Vec<u64> = out
         .iter()
         .filter(|(id, _)| *id == "funcdisc_recursive")

@@ -44,7 +44,7 @@ fn batch(
         single_target: targets.len() == 1,
         ..DecompileOptions::default()
     };
-    let out = decompile_targets_with(&mut prog, targets, &opts);
+    let out = decompile_targets_with(&mut prog, targets, &opts).unwrap();
     (prog, out)
 }
 
@@ -156,7 +156,7 @@ fn an_indent_increment_survives_every_render_of_a_batch() {
         prog.arch_mut().print_mut().set_indent_increment(4);
         let targets = prog.function_entries_executable();
         let opts = DecompileOptions { want_provenance, want_tokens, ..DecompileOptions::default() };
-        decompile_targets_with(&mut prog, targets, &opts)
+        decompile_targets_with(&mut prog, targets, &opts).unwrap()
     };
     let (plain, provenance, tokens) =
         (render(false, false), render(true, false), render(false, true));

@@ -223,34 +223,34 @@ impl Action for ActionOutline {
         }
         Some(Box::new(ActionOutline { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option outline <spec>`, carried on the Architecture boundary.
         let raw = data.get_arch().outline_spec.clone();
         if raw.is_empty() || raw == "off" {
-            return 0;
+            return Ok(0);
         }
         // The pre-SSA window: before heritage there are no MULTIEQUALs to patch.
         if data.get_heritage_pass() != 0 {
-            return 0;
+            return Ok(0);
         }
         if data.bblocks_get_size() < 2 {
-            return 0;
+            return Ok(0);
         }
         let spec = match OutlineSpec::parse(&raw) {
             Ok(s) => s,
-            Err(_) => return 0, // the option layer already reported the parse error
+            Err(_) => return Ok(0), // the option layer already reported the parse error
         };
         let entry = data.get_address().get_offset();
         let run = match spec.for_function(entry) {
             Some(r) => *r,
-            None => return 0, // an option value is global; this function is not the target
+            None => return Ok(0), // an option value is global; this function is not the target
         };
-        match outline_one(data, &run) {
+        Ok(match outline_one(data, &run) {
             Ok(true) => 1,
             // Declining is the designed behaviour for every precondition failure;
             // never fail a decompile over an outline request.
             Ok(false) | Err(_) => 0,
-        }
+        })
     }
 }
 
@@ -653,7 +653,7 @@ fn outline_one(data: &mut Funcdata, run: &OutlineRun) -> KunaResult<bool> {
     // The region's live-in storage becomes the call's arguments.
     for (slot, st) in live_in.iter().enumerate() {
         let ad = Address::new(st.space.clone(), st.offset);
-        let vn = data.new_varnode(st.size, &ad, None);
+        let vn = data.new_varnode(st.size, &ad, None)?;
         data.op_set_input(callop, vn, 1 + slot as int4)?;
     }
     // A single live-out becomes the call's return value.

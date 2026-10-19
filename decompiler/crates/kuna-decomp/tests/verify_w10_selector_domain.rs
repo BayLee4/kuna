@@ -155,7 +155,7 @@ fn decompile_dispatch(bytes: &[u8], readonly: bool) -> String {
             .set_property_range(varnode_flags::readonly, &start, &end);
     }
     let fd = decompile_func(arch, "dispatch", Address::new(ram, 0x401000), 0).unwrap();
-    print_c(arch, &fd)
+    print_c(arch, &fd).unwrap()
 }
 
 #[test]

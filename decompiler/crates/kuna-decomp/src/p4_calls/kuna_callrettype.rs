@@ -111,7 +111,7 @@ pub fn record(arch: &mut Architecture, entry: &Address, data: &Funcdata) {
         return;
     }
     let Some(k) = key(entry) else { return };
-    let stated = if arch.symboltab.function_proto_pieces_across_scopes(entry).is_some() {
+    let stated = if arch.symboltab.function_source_proto_across_scopes(entry).is_some() {
         None
     } else {
         recovered_return(data)
@@ -444,7 +444,8 @@ fn high_contradicts(data: &Funcdata, op: OpId, high: crate::context::HighVariabl
 
 /// The type the call `op` returns, as its callee stated it, when the call's
 /// output sits in exactly the storage and width the callee returns in.
-pub fn stated_return_type(data: &Funcdata, op: OpId, fc: &FuncCallSpecs) -> Option<Rc<Datatype>> {
+pub fn stated_return_type(data: &Funcdata, op: OpId, fc: &FuncCallSpecs) -> kuna_base::error::KunaResult<Option<Rc<Datatype>>> {
+    let candidate = (|| {
     let o = data.obank().get(op)?;
     if !matches!(o.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) || fc.proto().is_output_locked() {
         return None;
@@ -455,13 +456,16 @@ pub fn stated_return_type(data: &Funcdata, op: OpId, fc: &FuncCallSpecs) -> Opti
     if out.get_size() != stated.size || out.get_addr() != &stated.addr || stated.ct.get_size() != stated.size {
         return None;
     }
-    if crate::kuna_protoorder::output_refuses(data, outvn, &stated.ct)
-        || declared_contradicts(data, op, outvn, &stated.ct)
+    Some((outvn, stated))
+    })();
+    let Some((outvn, stated)) = candidate else { return Ok(None) };
+    if crate::kuna_protoorder::output_refuses(data, outvn, &stated.ct)?
+        || declared_contradicts(data, op, outvn, &stated.ct)?
         || accesses_disagree(data, outvn, &stated.ct)
     {
-        return None;
+        return Ok(None);
     }
-    Some(Rc::clone(&stated.ct))
+    Ok(Some(Rc::clone(&stated.ct)))
 }
 
 /// The type the call `op` hands `ActionSetCasts` when the caller keeps the
@@ -612,11 +616,11 @@ fn kept_in_memory(data: &mut Funcdata, vn: VarnodeId) -> bool {
 /// parameter, and a vote for one of them left a `PTRSUB` the printer cannot
 /// render as C).  A `void *` or a pointer to unknown bytes, on
 /// either side, says nothing about the pointee.
-fn declared_contradicts(data: &Funcdata, op: OpId, outvn: VarnodeId, ct: &Datatype) -> bool {
+fn declared_contradicts(data: &Funcdata, op: OpId, outvn: VarnodeId, ct: &Datatype) -> kuna_base::error::KunaResult<bool> {
     let want = ct.get_metatype();
     let integer = matches!(want, type_metatype::TYPE_INT | type_metatype::TYPE_UINT);
     if !integer && want != type_metatype::TYPE_PTR {
-        return false;
+        return Ok(false);
     }
     let other = |t: &Datatype| {
         if integer {
@@ -637,7 +641,7 @@ fn declared_contradicts(data: &Funcdata, op: OpId, outvn: VarnodeId, ct: &Dataty
     };
     let family = crate::kuna_protoorder::value_family(data, outvn);
     if integer && widened_at_other_sign(data, &family, ct) {
-        return true;
+        return Ok(true);
     }
     for v in family {
         let Some(node) = data.vbank().get(v) else { continue };
@@ -645,7 +649,7 @@ fn declared_contradicts(data: &Funcdata, op: OpId, outvn: VarnodeId, ct: &Dataty
             if data.obank().get(def).is_some_and(|o| matches!(o.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND))
                 && result_type(data, def).is_some_and(|t| other(&t) || differs_in_class(&t, ct))
             {
-                return true;
+                return Ok(true);
             }
         }
         for r in node.descend_iter() {
@@ -671,19 +675,19 @@ fn declared_contradicts(data: &Funcdata, op: OpId, outvn: VarnodeId, ct: &Dataty
                     continue;
                 }
                 let t = if sensitive {
-                    Some(crate::coreaction_infertypes::input_type_local(data, r, s))
+                    Some(crate::coreaction_infertypes::input_type_local(data, r, s)?)
                 } else if s > 0 && matches!(o.code(), OpCode::CPUI_CALL | OpCode::CPUI_CALLIND) {
                     declared_param_type(data, r, s)
                 } else {
                     None
                 };
                 if t.is_some_and(|t| other(&t)) {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
     }
-    false
+    Ok(false)
 }
 
 /// Does the result, or a value C computes from it at its width (a sum, a

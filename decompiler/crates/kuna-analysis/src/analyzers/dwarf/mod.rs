@@ -105,6 +105,7 @@
 //! (real source) prototype wins (last-write in `set_function_prototype_pieces`).
 
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use object::{Object, ObjectSection};
@@ -160,6 +161,28 @@ fn dwarf_section_data(file: &object::File, id: gimli::SectionId) -> Option<Vec<u
     None
 }
 
+/// Adjacent dSYM data is authoritative only for the exact Mach-O UUID. A same
+/// spelling, stale bundle or unrelated architecture must not supply source facts.
+fn companion_dwarf(ctx: &AnalysisCtx<'_>) -> Option<Vec<u8>> {
+    if ctx.file.format() != object::BinaryFormat::MachO
+        || dwarf_section_data(ctx.file, gimli::SectionId::DebugInfo).is_some()
+    {
+        return None;
+    }
+    let uuid = ctx.file.mach_uuid().ok()??;
+    let path = ctx.image_path?;
+    let basename = path.file_name()?;
+    let mut bundle = path.as_os_str().to_os_string();
+    bundle.push(".dSYM");
+    let companion = std::path::PathBuf::from(bundle)
+        .join("Contents/Resources/DWARF").join(basename);
+    let bytes = std::fs::read(companion).ok()?;
+    let file = object::File::parse(bytes.as_slice()).ok()?;
+    (file.mach_uuid().ok()? == Some(uuid)
+        && file.architecture() == ctx.file.architecture()
+        && file.is_little_endian() == ctx.file.is_little_endian()).then_some(bytes)
+}
+
 /// The per-architecture **static `call_frame_cfa` offset** — the constant that
 /// turns a `DW_AT_frame_base = DW_OP_call_frame_cfa` expression into a concrete
 /// stack offset (`DWARFExpressionEvaluator` pushes a stack varnode at this value
@@ -200,6 +223,17 @@ pub struct DwarfPass;
 /// forward, so a snapshot is the clean way to random-access type DIEs.
 #[derive(Clone)]
 struct DieSnap {
+    /// Producer coordinate, never a spelling/layout-derived nominal identity.
+    identity: u64,
+    language: Option<gimli::DwLang>,
+    producer: u64,
+    gnu_producer: bool,
+    signature_ref: Option<u64>,
+    calling_convention: Option<gimli::DwCc>,
+    no_return: bool,
+    /// A genuine typedef exposing an anonymous nominal DIE, discovered before
+    /// traversal. For enums this authorizes retention, never invents a tag.
+    nominal_alias: String,
     /// The DIE tag (`DW_TAG_*`).
     tag: gimli::DwTag,
     /// `DW_AT_name`, resolved through `.debug_str`/`.debug_line_str` (may be empty).
@@ -279,7 +313,22 @@ impl DieSnap {
     /// An empty snapshot for the given tag/depth (gimli's `DwTag` has no
     /// `Default`, so we cannot derive it).
     fn new(tag: gimli::DwTag, depth: isize) -> Self {
+        #[cfg(test)]
+        static SYNTHETIC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         DieSnap {
+            identity: {
+                #[cfg(test)]
+                { SYNTHETIC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) }
+                #[cfg(not(test))]
+                { 0 }
+            },
+            language: None,
+            producer: 0,
+            gnu_producer: false,
+            signature_ref: None,
+            calling_convention: None,
+            no_return: false,
+            nominal_alias: String::new(),
             tag,
             name: String::new(),
             low_pc: None,
@@ -357,8 +406,8 @@ fn snapshot_unit(
         for (attr, is_spec) in
             [(gimli::DW_AT_specification, true), (gimli::DW_AT_abstract_origin, false)]
         {
-            if let Some(gimli::AttributeValue::UnitRef(o)) = entry.attr_value(attr) {
-                snap.origin_ref = Some(o.0);
+            if let Some(value) = entry.attr_value(attr).and_then(snapshot_reference) {
+                snap.origin_ref = Some(value);
                 snap.origin_is_spec = is_spec;
                 break;
             }
@@ -376,9 +425,35 @@ fn snapshot_unit(
                 snap.low_pc = Some(a);
             }
         }
-        if let Some(gimli::AttributeValue::UnitRef(o)) = entry.attr_value(gimli::DW_AT_type) {
-            snap.type_ref = Some(o.0);
+        if let Some(value) = entry.attr_value(gimli::DW_AT_type) {
+            match value {
+                gimli::AttributeValue::UnitRef(o) => snap.type_ref = Some(o.0),
+                gimli::AttributeValue::DebugInfoRef(o) => {
+                    // Rebased below with unit-relative links; already absolute.
+                    snap.type_ref = Some(o.0 | ABSOLUTE_REFERENCE);
+                }
+                gimli::AttributeValue::DebugTypesRef(signature) => {
+                    snap.signature_ref = Some(signature.0);
+                }
+                _ => {}
+            }
         }
+        if let Some(gimli::AttributeValue::Language(language)) = entry.attr_value(gimli::DW_AT_language) {
+            snap.language = Some(language);
+        }
+        if let Some(value) = entry.attr_value(gimli::DW_AT_producer) {
+            if let Ok(value) = dwarf.attr_string(unit, value) {
+                snap.producer = nominal_id(value.slice());
+                snap.gnu_producer = value.slice().starts_with(b"GNU ");
+            }
+        }
+        if let Some(gimli::AttributeValue::CallingConvention(cc)) =
+            entry.attr_value(gimli::DW_AT_calling_convention)
+        {
+            snap.calling_convention = Some(cc);
+        }
+        snap.no_return =
+            matches!(entry.attr_value(gimli::DW_AT_noreturn), Some(gimli::AttributeValue::Flag(true)));
         if let Some(v) = entry.attr_value(gimli::DW_AT_byte_size) {
             snap.byte_size = v.udata_value();
         }
@@ -437,7 +512,7 @@ fn snapshot_unit(
         }
         if let Some(loc) = entry.attr_value(gimli::DW_AT_location) {
             snap.has_location = true;
-            snap.addr_location = simple_addr_location(&loc);
+            snap.addr_location = simple_addr_location_endian(&loc, dwarf, unit);
             snap.fbreg_location = simple_fbreg_location(&loc);
             snap.indirect_parameter = snap.tag == gimli::DW_TAG_formal_parameter
                 && kuna_dwarfbyref::is_fortran(language)
@@ -449,35 +524,88 @@ fn snapshot_unit(
             stack.push((off, depth));
         }
     }
+    let language = map.values().find_map(|die| die.language);
+    let (producer, gnu_producer) = map.values().find(|die| die.producer != 0)
+        .map(|die| (die.producer, die.gnu_producer)).unwrap_or_default();
+    let base = unit_key(&unit.header);
+    let rebase = |off: usize| {
+        if off & ABSOLUTE_REFERENCE != 0 { off & !ABSOLUTE_REFERENCE } else { base + off }
+    };
+    let mut map: BTreeMap<_, _> = map.into_iter().map(|(off, mut die)| {
+        die.language = language;
+        die.producer = producer;
+        die.gnu_producer = gnu_producer;
+        die.type_ref = die.type_ref.map(rebase);
+        die.discr_ref = die.discr_ref.map(rebase);
+        die.origin_ref = die.origin_ref.map(rebase);
+        die.parent = die.parent.map(rebase);
+        die.children.iter_mut().for_each(|off| *off = rebase(*off));
+        die.identity = nominal_id((base, off, &producer));
+        (base + off, die)
+    }).collect();
+    assign_nominal_aliases(&mut map);
     map
 }
 
-/// Decode a `DW_AT_location` that is a single `DW_OP_addr <vma>` expression (the
-/// only global-variable location form this pass handles), returning the VMA.
-/// Anything else (`DW_OP_fbreg`, register, multi-op) returns `None` — a
-/// `DW_OP_fbreg` stack local is handled separately by [`simple_fbreg_location`]
-/// (subtask 3); a register/multi-op location has no static address.
-fn simple_addr_location(loc: &gimli::AttributeValue<Reader<'_>>) -> Option<u64> {
-    let expr = match loc {
-        gimli::AttributeValue::Exprloc(e) => e.clone(),
-        gimli::AttributeValue::Block(b) => gimli::Expression(b.clone()),
-        _ => return None,
-    };
-    // A DW_OP_addr expression is the opcode 0x03 followed by an address-sized
-    // operand. Parse it with a temporary 64-bit encoding (address_size only
-    // affects DW_OP_addr operand width); we only accept the single-op case.
-    let bytes = expr.0.slice();
-    if bytes.first() != Some(&0x03) {
-        return None;
+fn assign_nominal_aliases(dies: &mut BTreeMap<usize, DieSnap>) {
+    let aliases: Vec<_> = dies.values().filter(|die| die.tag == gimli::DW_TAG_typedef && !die.name.is_empty())
+        .filter_map(|die| {
+            let off = die.type_ref?;
+            let target = dies.get(&off)?;
+            (target.name.is_empty()
+                && matches!(target.tag, gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type
+                    | gimli::DW_TAG_class_type | gimli::DW_TAG_enumeration_type))
+                .then(|| (off, die.name.clone()))
+        }).collect();
+    for (off, alias) in aliases {
+        let target = dies.get_mut(&off).unwrap();
+        if target.nominal_alias.is_empty() {
+            target.nominal_alias = alias;
+        }
     }
-    match bytes.len() {
-        5 => Some(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u64),
-        9 => Some(u64::from_le_bytes([
-            bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7], bytes[8],
-        ])),
+}
+
+const ABSOLUTE_REFERENCE: usize = 1usize << (usize::BITS - 1);
+const TYPES_SECTION: usize = 1usize << (usize::BITS - 2);
+
+fn unit_key(header: &gimli::UnitHeader<Reader<'_>>) -> usize {
+    let section = if header.section() == gimli::SectionId::DebugTypes { TYPES_SECTION } else { 0 };
+    section | header.offset().0
+}
+
+fn nominal_id(value: impl Hash) -> u64 {
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hash);
+    hash.finish().max(1)
+}
+
+fn snapshot_reference(value: gimli::AttributeValue<Reader<'_>>) -> Option<usize> {
+    match value {
+        gimli::AttributeValue::UnitRef(off) => Some(off.0),
+        gimli::AttributeValue::DebugInfoRef(off) => Some(off.0 | ABSOLUTE_REFERENCE),
         _ => None,
     }
 }
+
+fn simple_addr_location_endian(
+    loc: &gimli::AttributeValue<Reader<'_>>,
+    dwarf: &gimli::Dwarf<Reader<'_>>,
+    unit: &gimli::Unit<Reader<'_>>,
+) -> Option<u64> {
+    let expr = match loc {
+        gimli::AttributeValue::Exprloc(expr) => expr.clone(),
+        gimli::AttributeValue::Block(bytes) => gimli::Expression(bytes.clone()),
+        _ => return None,
+    };
+    let mut operations = expr.operations(unit.encoding());
+    let address = match operations.next().ok()?? {
+        gimli::Operation::Address { address } => address,
+        gimli::Operation::AddressIndex { index } => dwarf.address(unit, index).ok()?,
+        _ => return None,
+    };
+    operations.next().ok()?.is_none().then_some(address)
+}
+
 
 /// Decode a `DW_AT_location` that is a single `DW_OP_fbreg <sleb128>` expression
 /// (the frame-base-relative stack-local form — subtask 3), returning the SIGNED
@@ -578,18 +706,13 @@ fn build_datatype_at(
     cpp: bool,
 ) -> Option<Rc<Datatype>> {
     let die = dies.get(&off)?;
-    // Collapse the transparent qualifier hops before recursing: they carry no
-    // structure, and collapsing is what carries an anonymous aggregate's typedef
-    // name onto it (`mbstate_t`, not the shared `anon_struct`). Stripping cannot
-    // loop (the hop count is bounded) and leaves the cycle guard where it belongs,
-    // on the pointer/array/struct arms that actually recurse. (kuna `cppproto`
-    // introduced it for C++; `typedepth` extends it to the C callers.)
-    let (die, alias) =
-        if cpp || walk.collapse_qualifiers() { strip_qualifiers(die, dies) } else { (die, None) };
+    if die.language == Some(gimli::DW_LANG_Rust) && die.name == "!" {
+        return types.get_type_void().ok();
+    }
     let ptr = types.get_size_of_pointer();
     match die.tag {
         gimli::DW_TAG_base_type => {
-            let size = die.byte_size.unwrap_or(0) as i32;
+            let size = i32::try_from(die.byte_size?).ok()?;
             if size <= 0 {
                 return None;
             }
@@ -615,27 +738,73 @@ fn build_datatype_at(
             // makeDataTypeForPointer: pointer to the (possibly null=void) pointee.
             let pointee = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)
                 .or_else(|| types.get_type_void().ok())?;
-            let psize = die.byte_size.map(|b| b as i32).unwrap_or(ptr);
+            let psize = die.byte_size.map(i32::try_from).transpose().ok()?.unwrap_or(ptr);
             types.get_type_pointer(psize, pointee, word_size).ok()
         }
         gimli::DW_TAG_reference_type | gimli::DW_TAG_rvalue_reference_type if cpp => {
             let pointee = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)
                 .or_else(|| types.get_type_void().ok())?;
-            let psize = die.byte_size.map(|b| b as i32).unwrap_or(ptr);
+            let psize = die.byte_size.map(i32::try_from).transpose().ok()?.unwrap_or(ptr);
             types.get_type_pointer(psize, pointee, word_size).ok()
         }
-        // typedef/const/volatile/restrict: transparent — pass through to the
-        // underlying DW_AT_type (a null underlying => void).
-        gimli::DW_TAG_typedef
-        | gimli::DW_TAG_const_type
+        gimli::DW_TAG_typedef => {
+            if !cpp && !walk.collapse_qualifiers() {
+                // The original C OFF view follows transparent typedefs, counting
+                // every hop. It does not publish or borrow the alias spelling.
+                return build_datatype(die.type_ref, dies, types, word_size, walk, cpp);
+            }
+            let (target, alias) = strip_qualifiers(die, dies);
+            let built = if target.name.is_empty()
+                && matches!(target.tag, gimli::DW_TAG_structure_type | gimli::DW_TAG_union_type | gimli::DW_TAG_class_type)
+                && die.type_ref.and_then(|off| dies.get(&off)).is_some_and(|inner| std::ptr::eq(inner, target))
+            {
+                let aggregate = intern_aggregate(types, target, dies, alias, "anon_struct", walk, word_size, cpp,
+                    target.tag == gimli::DW_TAG_union_type)?;
+                // Do not reintroduce an alias whose name the aggregate's
+                // collision policy has already refused.
+                if aggregate.get_name() != die.name
+                    && types.find_by_name(&die.name).ok()?.is_some_and(|held| held.get_metatype() != aggregate.get_metatype())
+                {
+                    return Some(aggregate);
+                }
+                aggregate
+            } else {
+                build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?
+            };
+            if die.name.is_empty() || built.get_name() == die.name {
+                Some(built)
+            } else {
+                types.get_typedef(&built, &die.name, die.identity, 0).ok()
+            }
+        }
+        gimli::DW_TAG_const_type
         | gimli::DW_TAG_volatile_type
         | gimli::DW_TAG_restrict_type => {
-            build_datatype(die.type_ref, dies, types, word_size, walk, cpp)
+            let base = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?;
+            // GNU C represents the noreturn attribute as qualification of the
+            // FUNCTION, not of its pointer or object. Interpret it before normal
+            // qualifier construction; Clang's absent carrier stays absent.
+            if die.tag == gimli::DW_TAG_volatile_type
+                && die.gnu_producer
+                && die.language.is_some_and(c_language)
+                && base.get_metatype() == type_metatype::TYPE_CODE
+            {
+                let mut proto = base.get_code_prototype()?.as_ref().clone();
+                proto.set_no_return(true);
+                let shell = types.reserve_code("", die.identity).ok()?;
+                return types.complete_code(&shell, Rc::new(proto)).ok();
+            }
+            let qualifier = match die.tag {
+                gimli::DW_TAG_const_type => kuna_decomp::kuna_typequal::CONST,
+                gimli::DW_TAG_volatile_type => kuna_decomp::kuna_typequal::VOLATILE,
+                _ => kuna_decomp::kuna_typequal::RESTRICT,
+            };
+            types.get_qualified_type(base, qualifier).ok()
         }
         gimli::DW_TAG_array_type => {
             let elem = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?;
-            // The length lives on a DW_TAG_subrange_type child (`kuna_dwarfbounds`);
-            // fall back to 1 for a flexible/unknown array.
+            // Only a producer count (or an exact producer byte extent) supplies
+            // an array bound. An unknown bound must not become a one-element object.
             let count = die
                 .children
                 .iter()
@@ -643,28 +812,36 @@ fn build_datatype_at(
                 .find(|c| c.tag == gimli::DW_TAG_subrange_type)
                 .and_then(|c| c.array_count)
                 .or(die.array_count)
-                .unwrap_or(1);
+                .or_else(|| die.byte_size.filter(|_| elem.get_size() > 0)
+                    .filter(|size| size % elem.get_size() as u64 == 0)
+                    .map(|size| size / elem.get_size() as u64))?;
             let count = i32::try_from(count).ok()?;
-            types.get_type_array(count.max(1), elem).ok()
+            count.checked_mul(elem.get_size())?;
+            types.get_type_array(count, elem).ok()
         }
         // A `DW_TAG_class_type` is a structure with a default access specifier —
         // Ghidra's importer maps both through the same `makeDataTypeForStruct`
         // arm. Without it every `Foo *this` degraded to `void *`.
         gimli::DW_TAG_structure_type => {
-            intern_aggregate(types, die, dies, alias, "anon_struct", walk, word_size, cpp, false)
+            intern_aggregate(types, die, dies, None, "anon_struct", walk, word_size, cpp, false)
         }
         gimli::DW_TAG_class_type if cpp => {
-            intern_aggregate(types, die, dies, alias, "anon_class", walk, word_size, cpp, false)
+            intern_aggregate(types, die, dies, None, "anon_class", walk, word_size, cpp, false)
         }
         gimli::DW_TAG_union_type => {
-            intern_aggregate(types, die, dies, alias, "anon_union", walk, word_size, cpp, true)
+            intern_aggregate(types, die, dies, None, "anon_union", walk, word_size, cpp, true)
         }
         gimli::DW_TAG_enumeration_type => {
-            let size = die.byte_size.map(|b| b as i32).unwrap_or(4).max(1);
+            let size = die.byte_size.and_then(|size| i32::try_from(size).ok())
+                .or_else(|| die.type_ref.and_then(|off|
+                    build_datatype(Some(off), dies, types, word_size, walk, cpp)
+                        .map(|base| base.get_size())))?;
+            if size <= 0 { return None; }
             let signed = enum_signed(die, dies);
-            build_enum(die, dies, types, size, signed)
-                // Anonymous, memberless, or the wrong width for the factory's
-                // enum size: fall back to the plain underlying integer.
+            let exposed = (cpp || walk.collapse_qualifiers()) && !die.nominal_alias.is_empty();
+            build_enum(die, dies, types, size, signed, exposed)
+                // An unexposed anonymous enum, unusable members, or refused
+                // construction retains the plain underlying integer fallback.
                 .or_else(|| types.get_base(size, enum_fallback(size, signed)).ok())
         }
         gimli::DW_TAG_subroutine_type if kuna_decomp::kuna_calltargettype::dwarf_function_types() => {
@@ -720,12 +897,8 @@ fn intern_aggregate(
             types, die, dies, alias, fallback, walk, word_size, cpp, union,
         );
     }
-    let want =
-        if union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
-    let intern = |n: &str| {
-        let built = if union { types.get_type_union(n) } else { types.get_type_struct(n) };
-        built.ok().filter(|t| t.get_metatype() == want)
-    };
+    let alias = aggregate_alias(die, alias, walk, cpp);
+    let intern = |n: &str| intern_disabled_aggregate(types, die, n, union);
     let name = aggregate_name(die, alias, fallback);
     if let Some(t) = intern(name) {
         return Some(t);
@@ -734,6 +907,30 @@ fn intern_aggregate(
         return intern(fallback);
     }
     None
+}
+
+/// Finish the deliberately layout-disabled view of a producer definition.
+/// Its legacy zero-width geometry is intentional; unlike a forward declaration
+/// or an enabled recursive shell, no later member walk is pending for this view.
+fn intern_disabled_aggregate(
+    types: &dyn TypeFactory,
+    die: &DieSnap,
+    name: &str,
+    union: bool,
+) -> Option<Rc<Datatype>> {
+    let meta = if union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
+    if types.find_by_name(name).ok()?.is_some_and(|held| held.get_metatype() != meta) {
+        return None;
+    }
+    let shell = types.reserve_record(name, die.identity, union).ok()?;
+    if !shell.is_incomplete() || die.declaration || kuna_dwarfstructs::aggregate_size(die).is_none() {
+        return Some(shell);
+    }
+    if union {
+        types.set_fields_union_raw(&shell, Vec::new(), 0, 1).ok()
+    } else {
+        types.set_fields_struct_raw(&shell, Vec::new(), Vec::new(), 0, 1, 0).ok()
+    }
 }
 
 /// (kuna `cppproto`) Follow the transparent qualifier chain
@@ -776,6 +973,21 @@ fn strip_qualifiers<'a>(
 
 /// Bound on the [`strip_qualifiers`] walk (a real qualifier chain is 1-3 hops).
 const MAX_QUALIFIER_HOPS: u32 = 16;
+
+/// Snapshot aliases remain source facts even where the C OFF view does not
+/// select their spelling. C++ and the full-depth C view retain alias borrowing.
+fn aggregate_alias<'a>(
+    die: &'a DieSnap,
+    alias: Option<&'a str>,
+    walk: &TypeWalk,
+    cpp: bool,
+) -> Option<&'a str> {
+    if cpp || walk.collapse_qualifiers() {
+        (!die.nominal_alias.is_empty()).then_some(die.nominal_alias.as_str()).or(alias)
+    } else {
+        None
+    }
+}
 
 /// The interned name for an aggregate DIE: its own `DW_AT_name`, else the typedef
 /// it was reached through ([`strip_qualifiers`]), else `fallback`.
@@ -857,11 +1069,11 @@ fn enum_fallback(size: i32, signed: Option<bool>) -> type_metatype {
 /// integer, so `quotearg_style(shell_escape_always_quoting_style, ...)` printed
 /// `quotearg_style(4, ...)`.
 ///
-/// `None` (and the caller falls back to the plain integer) when the enum is
-/// anonymous, has no usable members, or is not the width the type factory builds
-/// enums at — a size mismatch would misdescribe the storage, and a wrong size is
-/// worse than a missing name. It is signed only when `signed` ([`enum_signed`])
-/// says so.
+/// `None` (and the caller falls back to the plain integer) when an anonymous
+/// enum has no eligible producer typedef exposing it, or has no usable members.
+/// A genuine typedef exposes the enum without supplying an enum tag: the underlying name
+/// stays empty, and the typedef retains its own name and nominal identity.
+/// Width is the producer's own, and signedness comes from [`enum_signed`].
 ///
 /// Member values are masked to the enum's width, matching how the printer looks a
 /// constant up: a `-1` member of a 4-byte enum is keyed `0xffffffff`, the value
@@ -872,8 +1084,9 @@ fn build_enum(
     types: &dyn TypeFactory,
     size: i32,
     signed: Option<bool>,
+    typedef_exposed: bool,
 ) -> Option<Rc<Datatype>> {
-    if die.name.is_empty() {
+    if die.name.is_empty() && !typedef_exposed {
         return None;
     }
     let mask: u64 = if size >= 8 { u64::MAX } else { (1u64 << (size * 8)) - 1 };
@@ -900,25 +1113,13 @@ fn build_enum(
     } else {
         type_metatype::TYPE_ENUM_UINT
     };
-    // The type factory interns by name, and a real program repeats the same enum
-    // definition in every compilation unit that includes its header. Constructing
-    // it a second time is an ERROR, not a no-op — the fresh (memberless) shell no
-    // longer matches the filled definition already installed — so look first and
-    // reuse. Guarded on shape: a same-named type that is not an enum of this width
-    // owns the name, and we do not fight it.
-    if let Ok(Some(existing)) = types.find_by_name(&die.name) {
-        return (existing.is_enum_type() && existing.get_size() == size).then_some(existing);
-    }
-    let ct = types.get_type_enum_sized(&die.name, size, meta).ok()?;
+    let ct = types.reserve_enum(&die.name, die.identity, size, meta).ok()?;
     types.set_enum_values(&ct, nmap).ok()
 }
 
-/// (kuna `calltargettype`) The function type a `DW_TAG_subroutine_type` declares,
-/// so a pointer to it is a function pointer C can call rather than `void *`.
-/// An unprototyped `int (*)()` states no parameters (C++ states none of its
-/// types prototyped), C cannot spell a `...` with no parameter before it, and a
-/// parameter whose type cannot be built leaves nothing to state, so each keeps
-/// the `void` pointee.
+/// Construct the exact logical function declaration before assigning any working
+/// ABI storage. C-open arity and language-authorized closed signatures remain
+/// independent from varargs, convention and no-return.
 fn build_subroutine(
     die: &DieSnap,
     dies: &BTreeMap<usize, DieSnap>,
@@ -927,9 +1128,27 @@ fn build_subroutine(
     walk: &mut TypeWalk,
     cpp: bool,
 ) -> Option<Rc<Datatype>> {
-    if !die.prototyped {
-        return None;
+    let shell = types.reserve_code("", die.identity).ok()?;
+    if shell.get_code_prototype().is_some() {
+        return Some(shell);
     }
+    if !walk.begin_aggregate(die.identity) {
+        return Some(shell);
+    }
+    let built = build_subroutine_proto(die, dies, types, word_size, walk, cpp);
+    walk.end_aggregate(die.identity);
+    let proto = built?;
+    types.complete_code(&shell, proto).ok()
+}
+
+fn build_subroutine_proto(
+    die: &DieSnap,
+    dies: &BTreeMap<usize, DieSnap>,
+    types: &dyn TypeFactory,
+    word_size: uint4,
+    walk: &mut TypeWalk,
+    cpp: bool,
+) -> Option<Rc<kuna_decomp::fspec::FuncProto>> {
     let mut pieces = PrototypePieces { first_var_arg_slot: -1, ..Default::default() };
     pieces.outtype = Some(build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?);
     for &coff in &die.children {
@@ -941,14 +1160,61 @@ fn build_subroutine(
                     return None;
                 }
                 pieces.intypes.push(ty);
-                pieces.innames.push(String::new());
+                pieces.innames.push(child.name.clone());
             }
-            gimli::DW_TAG_unspecified_parameters if pieces.intypes.is_empty() => return None,
-            gimli::DW_TAG_unspecified_parameters => pieces.first_var_arg_slot = pieces.intypes.len() as i32,
             _ => {}
         }
     }
-    types.get_type_code_proto(&pieces).ok()
+    pieces.first_var_arg_slot = source_var_arg_slot(die, dies, pieces.intypes.len());
+    let closed = closed_signature(die);
+    let model = source_convention(die)?;
+    let no_return = die.no_return || die.type_ref.and_then(|off| dies.get(&off))
+        .is_some_and(|result| result.language == Some(gimli::DW_LANG_Rust) && result.name == "!");
+    types.logical_proto(&pieces, model, closed, no_return).ok()
+}
+
+fn closed_signature(die: &DieSnap) -> bool {
+    // `cpp` in the type walk enables class/reference decoding; that traversal
+    // mode also visits C units and does not authorize closing an open C type.
+    die.prototyped || matches!(
+        die.language,
+        Some(gimli::DW_LANG_Rust | gimli::DW_LANG_C_plus_plus | gimli::DW_LANG_C_plus_plus_03
+            | gimli::DW_LANG_C_plus_plus_11 | gimli::DW_LANG_C_plus_plus_14
+            | gimli::DW_LANG_C_plus_plus_17 | gimli::DW_LANG_C_plus_plus_20
+            | gimli::DW_LANG_ObjC_plus_plus | gimli::DW_LANG_Go | gimli::DW_LANG_Java
+            | gimli::DW_LANG_Swift | gimli::DW_LANG_D)
+    )
+}
+
+/// A C nonprototype's unspecified parameter list is not an ellipsis. The
+/// attribute and source language distinguish it from a genuine variadic list.
+fn source_var_arg_slot(die: &DieSnap, dies: &BTreeMap<usize, DieSnap>, nparams: usize) -> i32 {
+    let c_nonprototype = die.language.is_some_and(c_language) && !die.prototyped && nparams == 0;
+    if !c_nonprototype && die.children.iter().filter_map(|off| dies.get(off))
+        .any(|child| child.tag == gimli::DW_TAG_unspecified_parameters)
+    {
+        nparams as i32
+    } else {
+        -1
+    }
+}
+
+fn c_language(language: gimli::DwLang) -> bool {
+    matches!(language, gimli::DW_LANG_C | gimli::DW_LANG_C89 | gimli::DW_LANG_C99
+        | gimli::DW_LANG_C11 | gimli::DW_LANG_C17)
+}
+
+fn source_convention(die: &DieSnap) -> Option<&'static str> {
+    Some(match die.calling_convention.map(|cc| cc.0) {
+        // DW_CC_normal has no independently authored ABI name.
+        None | Some(1) => "",
+        // LLVM BinaryFormat/Dwarf.def: the Borland Microsoft ABI codes.
+        Some(0xb1) => "__stdcall",
+        Some(0xb3) => "__fastcall",
+        Some(0xb5) => "__thiscall",
+        // Preserve an unknown convention as unavailable, never silently default.
+        Some(_) => return None,
+    })
 }
 
 /// Build [`PrototypePieces`] for a defined subprogram DIE (`DWARFFunction.read` +
@@ -965,11 +1231,10 @@ fn build_pieces(
 ) -> Option<PrototypePieces> {
     // Return type: a null DW_AT_type is `void` (build_datatype handles None).
     let mut walk = TypeWalk::new();
-    let outtype = build_datatype(sub.type_ref, dies, types, word_size, &mut walk, false);
+    let outtype = Some(build_datatype(sub.type_ref, dies, types, word_size, &mut walk, false)?);
 
     let mut intypes = Vec::new();
     let mut innames = Vec::new();
-    let mut first_var_arg_slot: i32 = -1;
 
     for &coff in &sub.children {
         let Some(child) = dies.get(&coff) else { continue };
@@ -980,14 +1245,11 @@ fn build_pieces(
                 intypes.push(ty);
                 innames.push(child.name.clone());
             }
-            gimli::DW_TAG_unspecified_parameters => {
-                // `...` — variadic from the current fixed-parameter count.
-                first_var_arg_slot = intypes.len() as i32;
-            }
             _ => {}
         }
     }
 
+    let first_var_arg_slot = source_var_arg_slot(sub, dies, intypes.len());
     Some(PrototypePieces {
         name: name.to_string(),
         outtype,
@@ -1061,6 +1323,9 @@ impl AnalysisPass for DwarfPass {
 
     fn run(&self, ctx: &AnalysisCtx) -> AnalysisOutput {
         let mut out = AnalysisOutput::default();
+        let companion = companion_dwarf(ctx);
+        let companion_file = companion.as_deref().and_then(|bytes| object::File::parse(bytes).ok());
+        let file = companion_file.as_ref().unwrap_or(ctx.file);
         // gimli is **format-neutral** — it parses the DWARF byte stream, not the
         // container. The only container coupling is the *section-name lookup*, and
         // that is delegated to `object`'s format-aware `section_by_name`
@@ -1076,11 +1341,11 @@ impl AnalysisPass for DwarfPass {
         // separate future work, not DWARF.)
         //
         // DWARFProgram.isDWARF: no `.debug_info` => not a DWARF program, empty out.
-        if dwarf_section_data(ctx.file, gimli::SectionId::DebugInfo).is_none() {
+        if dwarf_section_data(file, gimli::SectionId::DebugInfo).is_none() {
             return out;
         }
 
-        let endian = if ctx.file.is_little_endian() {
+        let endian = if file.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {
             gimli::RunTimeEndian::Big
@@ -1090,7 +1355,7 @@ impl AnalysisPass for DwarfPass {
         // missing section reads as empty (gimli treats that as "section absent").
         // [`dwarf_section_data`] does the per-format section-name resolution.
         let load = |id: gimli::SectionId| -> Result<Vec<u8>, gimli::Error> {
-            Ok(dwarf_section_data(ctx.file, id).unwrap_or_default())
+            Ok(dwarf_section_data(file, id).unwrap_or_default())
         };
         let Ok(sections) = gimli::DwarfSections::load(load) else {
             return out;
@@ -1107,16 +1372,48 @@ impl AnalysisPass for DwarfPass {
         let complex_max =
             kuna_dwarfcomplex::max_size(ctx.file.format(), ctx.file.architecture(), &ctx.arch.archid);
 
+        // Reference forms may cross compilation units or select a type unit.
+        // Acquire all producer coordinates before recursively constructing types.
+        let object_id = nominal_id((ctx.image_path, ctx.bytes, companion.as_deref()));
+        let mut dies = BTreeMap::new();
+        let mut signatures = BTreeMap::new();
         let mut units = dwarf.units();
         while let Ok(Some(header)) = units.next() {
             let Ok(unit) = dwarf.unit(header) else { continue };
-            let mut dies = snapshot_unit(&dwarf, &unit);
-            if complex_max > 0 {
-                for die in dies.values_mut() {
-                    die.complex_max_size = complex_max;
-                }
+            if let gimli::UnitType::Type { type_signature, type_offset } = unit.header.type_() {
+                signatures.insert(type_signature.0, unit_key(&unit.header) + type_offset.0);
             }
-
+            dies.extend(snapshot_unit(&dwarf, &unit));
+        }
+        let mut units = dwarf.type_units();
+        while let Ok(Some(header)) = units.next() {
+            let Ok(unit) = dwarf.unit(header) else { continue };
+            if let gimli::UnitType::Type { type_signature, type_offset } = unit.header.type_() {
+                signatures.insert(type_signature.0, unit_key(&unit.header) + type_offset.0);
+            }
+            dies.extend(snapshot_unit(&dwarf, &unit));
+        }
+        for (&off, die) in &mut dies {
+            die.complex_max_size = complex_max;
+            die.identity = nominal_id((object_id, off, die.identity));
+            if let Some(signature) = die.signature_ref {
+                die.type_ref = Some(signatures.get(&signature).copied().unwrap_or(usize::MAX));
+            }
+        }
+        let identities: BTreeMap<_, _> = dies.keys().map(|&off| {
+            let mut canonical = off;
+            for _ in 0..MAX_QUALIFIER_HOPS {
+                let Some(next) = dies.get(&canonical).and_then(|die| die.origin_ref) else { break };
+                if next == off || !dies.contains_key(&next) { break; }
+                canonical = next;
+            }
+            (off, dies[&canonical].identity)
+        }).collect();
+        for (&off, die) in &mut dies {
+            die.identity = identities[&off];
+        }
+        assign_nominal_aliases(&mut dies);
+        {
             for snap in dies.values() {
                 match snap.tag {
                     gimli::DW_TAG_subprogram => {
@@ -1125,6 +1422,12 @@ impl AnalysisPass for DwarfPass {
                         let Some(low_pc) = snap.low_pc else { continue };
                         if snap.declaration {
                             continue;
+                        }
+                        if snap.no_return {
+                            out.noreturn.push(crate::pass::NoReturnFact {
+                                addr: low_pc,
+                                name: snap.name.clone(),
+                            });
                         }
                         if !snap.name.is_empty() {
                             out.symbols.push(SymFact {
@@ -1137,6 +1440,16 @@ impl AnalysisPass for DwarfPass {
                             if let Some(pieces) =
                                 build_pieces(&snap.name, snap, &dies, types, word_size)
                             {
+                                // A definition supplies its actual formal list,
+                                // including K&R names/types without prototyped.
+                                // Callable-type openness is handled separately.
+                                if let Some(model) = source_convention(snap) {
+                                    if let Ok(proto) = types.logical_proto(
+                                        &pieces, model, true, snap.no_return,
+                                    ) {
+                                        out.source_prototypes.push((low_pc, proto));
+                                    }
+                                }
                                 out.prototypes.push(pieces);
                             }
                             // subtask 3: named, typed stack LOCALS. Each direct
@@ -1173,6 +1486,15 @@ impl AnalysisPass for DwarfPass {
                         if let Some(pieces) =
                             kuna_cppproto::build_pieces(&res, &dies, types, word_size)
                         {
+                            let declaration = snap.origin_ref.and_then(|off| dies.get(&off)).unwrap_or(snap);
+                            if let Some(model) = source_convention(declaration) {
+                                if let Ok(proto) = types.logical_proto(
+                                    &pieces, model, true,
+                                    snap.no_return || declaration.no_return,
+                                ) {
+                                    out.cpp_dwarf.source_prototypes.push((low_pc, proto));
+                                }
+                            }
                             out.cpp_dwarf.prototypes.push((low_pc, pieces));
                         }
                         if res.chased {
@@ -1197,28 +1519,26 @@ impl AnalysisPass for DwarfPass {
                             continue;
                         }
                         if let Some(addr) = snap.addr_location {
-                            // Resolve the variable's DW_AT_type to its byte size so
-                            // the commit maps a covering SymbolEntry of the right
-                            // extent (a size-1 code type would miss a 4-/8-byte
-                            // memory access and leave the global `dat_<addr>`). A
-                            // type that cannot be sized falls back to 1 (the prior
-                            // behavior for the 1-byte globals).
-                            let size = build_datatype(
+                            // Keep the declaration itself, including every
+                            // qualifier layer and its complete object extent.
+                            // Missing sizing facts do not invent a byte object.
+                            let type_ = build_datatype(
                                 snap.type_ref,
                                 &dies,
                                 types,
                                 word_size,
                                 &mut TypeWalk::new(),
                                 false,
-                            )
-                                .map(|t| t.get_size())
-                                .filter(|&s| s >= 1)
-                                .unwrap_or(1) as u32;
-                            out.data_objects.push(crate::pass::DataObjectFact {
-                                addr,
-                                name: snap.name.clone(),
-                                size,
-                            });
+                            );
+                            if let Some(type_) = type_.filter(|t| t.get_size() > 0) {
+                                out.typed_data.push(crate::pass::TypedDataFact {
+                                    addr,
+                                    space: ctx.arch.manage().get_default_data_space().cloned(),
+                                    dwarf: true,
+                                    name: snap.name.clone(),
+                                    type_,
+                                });
+                            }
                         }
                     }
                     _ => {}

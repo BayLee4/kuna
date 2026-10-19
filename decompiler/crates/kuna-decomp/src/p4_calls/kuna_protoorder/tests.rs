@@ -518,3 +518,20 @@ fn a_statement_naming_a_superseded_structure_is_recognised_through_pointers() {
     assert!(!names_type(&int8(), &stale));
     assert!(!names_type(&ptr_to(named_struct("struct_1")), &[]));
 }
+
+#[test]
+fn entry_fact_acquisition_preserves_terminal_failure_without_caching() {
+    let (mut arch, entry, calls) = crate::engine_translate::test_support::failure_arch(true);
+    let err = entry_facts(&mut arch, &entry).unwrap_err();
+    assert!(matches!(err, KunaError::Transport { .. }));
+    assert_eq!(calls.get(), 1);
+    assert!(arch.kuna_callee_dead_cache.is_empty());
+}
+
+#[test]
+fn recoverable_entry_decode_remains_conservatively_unknown() {
+    let (mut arch, entry, calls) = crate::engine_translate::test_support::failure_arch(false);
+    let facts = entry_facts(&mut arch, &entry).unwrap().unwrap();
+    assert!(!facts.is_complete());
+    assert_eq!(calls.get(), 1);
+}

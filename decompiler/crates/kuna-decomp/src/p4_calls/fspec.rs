@@ -73,6 +73,7 @@
 //! Integer model per ADR 0003: `uintb->u64`, `intb->i64`, `int4->i32`,
 //! `uint4->u32`; arithmetic that the C++ relies on wrapping uses [`Wrap`].
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use kuna_base::address::{Address, RangeList};
@@ -83,6 +84,9 @@ use kuna_num::opcodes::OpCode;
 use kuna_num::pcoderaw::VarnodeData;
 
 use crate::dtype::{metatype2typeclass, type_class, type_metatype, Datatype, TypeFactory};
+
+mod prototype_codec;
+pub use prototype_codec::{PrototypeDecoding, PrototypeEncoding};
 
 // -----------------------------------------------------------------------------
 // Wire marshaling ids owned by fspec (upstream numbers, fspec.cc:40-51;
@@ -1763,7 +1767,7 @@ impl ParameterPieces {
             .collect();
         if let Some(lookup) = manager.register_lookup() {
             let lookup = Rc::clone(lookup);
-            JoinRecord::merge_sequence(&mut seq, lookup.as_ref());
+            JoinRecord::merge_sequence(&mut seq, lookup.as_ref())?;
         }
         if seq.len() == 1 {
             let p = &seq[0];
@@ -4427,6 +4431,17 @@ impl ProtoModel {
         } else {
             self.output().assign_map(proto, typefactory, res, manager)?;
         }
+        self.assign_input_storage(proto, res, typefactory, manager)
+    }
+
+    /// Finish allocation after the output list has established any hidden input.
+    pub(crate) fn assign_input_storage(
+        &self,
+        proto: &PrototypePieces,
+        res: &mut Vec<ParameterPieces>,
+        typefactory: &dyn TypeFactory,
+        manager: &AddrSpaceManager,
+    ) -> KunaResult<()> {
         self.input().assign_map(proto, typefactory, res, manager)?;
 
         if self.has_this && res.len() > 1 {
@@ -4759,7 +4774,8 @@ impl ProtoModel {
         self.internalstorage.push(vd);
         self.internalstorage.sort_unstable();
     }
-    /// Set the inject ids (test/builder hook).
+    /// Bind the entry/return CALLMECHANISM ids registered by prototype decoding.
+    /// A missing role is represented by -1.
     pub fn set_inject_ids(&mut self, upon_entry: int4, upon_return: int4) {
         self.inject_upon_entry = upon_entry;
         self.inject_upon_return = upon_return;
@@ -4915,6 +4931,8 @@ impl ScoreProtoModel {
 /// kuna trait carries the shared query surface, and [`ParameterBasic`] is the
 /// stand-alone (no backing symbol) implementation.
 pub trait ProtoParameter {
+    fn get_usepoint(&self) -> Address { Address::new_invalid() }
+    fn set_usepoint(&mut self, _usepoint: Address) {}
     /// Get the name of the parameter ("" for return value) (C++ `getName`).
     fn get_name(&self) -> &str;
     /// Get the data-type associated with this (C++ `getType`); `None` is the
@@ -4972,6 +4990,7 @@ pub fn proto_parameter_eq(a: &dyn ProtoParameter, b: &dyn ProtoParameter) -> boo
 /// `fspec.hh:1163-1191`).
 #[derive(Debug, Clone)]
 pub struct ParameterBasic {
+    usepoint: Address,
     /// Name, "" for undefined or return-value parameters (C++ `name`).
     name: String,
     /// Storage address (C++ `addr`).
@@ -4986,13 +5005,17 @@ impl ParameterBasic {
     /// Construct from components (C++
     /// `ParameterBasic(const string&,const Address&,Datatype*,uint4)`).
     pub fn new(name: &str, addr: Address, type_: Rc<Datatype>, flags: uint4) -> ParameterBasic {
-        ParameterBasic { name: name.to_string(), addr, type_: Some(type_), flags }
+        let flags = if flags & parameter_pieces_flags::TYPELOCK != 0 && type_.get_metatype() == type_metatype::TYPE_UNKNOWN {
+            flags | parameter_pieces_flags::SIZELOCK
+        } else { flags };
+        ParameterBasic { usepoint: Address::new_invalid(), name: name.to_string(), addr, type_: Some(type_), flags }
     }
 
     /// Construct a void parameter (C++ `ParameterBasic(Datatype *tp)`).  The
     /// C++ leaves `addr` default-constructed (invalid).
     pub fn new_void(type_: Rc<Datatype>) -> ParameterBasic {
         ParameterBasic {
+            usepoint: Address::new_invalid(),
             name: String::new(),
             addr: Address::new_invalid(),
             type_: Some(type_),
@@ -5002,6 +5025,8 @@ impl ParameterBasic {
 }
 
 impl ProtoParameter for ParameterBasic {
+    fn get_usepoint(&self) -> Address { self.usepoint.clone() }
+    fn set_usepoint(&mut self, usepoint: Address) { self.usepoint = usepoint; }
     fn get_name(&self) -> &str {
         &self.name
     }
@@ -5271,6 +5296,7 @@ pub struct FuncProto {
     store: Option<Box<dyn ProtoStore>>,
     /// Extra bytes popped from stack (C++ `extrapop`).
     extrapop: int4,
+    supplied_extrapop: bool,
     /// Boolean properties (C++ `flags`).
     flags: uint4,
     /// Side-effects associated with non-parameter storage (C++ `effectlist`).
@@ -5283,6 +5309,15 @@ pub struct FuncProto {
     /// Number of bytes of return value consumed by callers (0 = all) (C++
     /// `returnBytesConsumed`).
     return_bytes_consumed: int4,
+    /// Unlowered declaration, present only for model-derived callable storage.
+    logical: Option<PrototypePieces>,
+    /// Resolved weak-completion targets owned by this independent reader.
+    resolved_dependencies: RefCell<Vec<Rc<Datatype>>>,
+    inject_name: Option<String>,
+    declared_model: String,
+    first_var_arg_slot: Option<int4>,
+    /// Live authority for `injectid`, retained only by injection-bearing prototypes.
+    injection_origin: Option<Rc<RefCell<crate::inject_sleigh::PcodeInjectLibrarySleigh>>>,
 }
 
 impl std::fmt::Debug for FuncProto {
@@ -5306,6 +5341,14 @@ impl Default for FuncProto {
     }
 }
 
+impl Clone for FuncProto {
+    fn clone(&self) -> Self {
+        let mut result = Self::new();
+        result.copy(self);
+        result
+    }
+}
+
 impl FuncProto {
     /// Construct an empty prototype (C++ `FuncProto(void)`).
     pub fn new() -> FuncProto {
@@ -5313,11 +5356,18 @@ impl FuncProto {
             model: None,
             store: None,
             extrapop: 0,
+            supplied_extrapop: false,
             flags: 0,
             effectlist: Vec::new(),
             likelytrash: Vec::new(),
             injectid: -1,
             return_bytes_consumed: 0,
+            logical: None,
+            resolved_dependencies: RefCell::new(Vec::new()),
+            inject_name: None,
+            declared_model: String::new(),
+            first_var_arg_slot: None,
+            injection_origin: None,
         }
     }
 
@@ -5325,11 +5375,19 @@ impl FuncProto {
     pub fn copy(&mut self, op2: &FuncProto) {
         self.model = op2.model.clone();
         self.extrapop = op2.extrapop;
+        self.supplied_extrapop = op2.supplied_extrapop;
         self.flags = op2.flags;
         self.store = op2.store.as_ref().map(|s| s.clone_box());
         self.effectlist = op2.effectlist.clone();
         self.likelytrash = op2.likelytrash.clone();
         self.injectid = op2.injectid;
+        self.return_bytes_consumed = op2.return_bytes_consumed;
+        self.logical = op2.logical.clone();
+        self.resolved_dependencies = op2.resolved_dependencies.clone();
+        self.inject_name = op2.inject_name.clone();
+        self.declared_model = op2.declared_model.clone();
+        self.first_var_arg_slot = op2.first_var_arg_slot;
+        self.injection_origin = op2.injection_origin.clone();
     }
 
     /// Copy properties that affect data-flow (C++ `copyFlowEffects`).
@@ -5337,6 +5395,8 @@ impl FuncProto {
         self.flags &= !(func_proto_flags::IS_INLINE | func_proto_flags::NO_RETURN);
         self.flags |= op2.flags & (func_proto_flags::IS_INLINE | func_proto_flags::NO_RETURN);
         self.injectid = op2.injectid;
+        self.inject_name = op2.inject_name.clone();
+        self.injection_origin = op2.injection_origin.clone();
     }
 
     /// If the model is a merged model, decide which one of the merged models
@@ -5452,6 +5512,9 @@ impl FuncProto {
     pub fn set_param(&mut self, i: int4, name: &str, piece: &ParameterPieces) {
         self.store_mut().set_input(i, name, piece);
     }
+    pub fn set_param_usepoint(&mut self, i: int4, usepoint: Address) {
+        if let Some(param) = self.store_mut().get_input_mut(i) { param.set_usepoint(usepoint); }
+    }
     /// Remove the i-th input parameter (C++ `removeParam`).
     pub fn remove_param(&mut self, i: int4) {
         self.store_mut().clear_input(i);
@@ -5561,7 +5624,7 @@ impl FuncProto {
         if val {
             self.flags |= func_proto_flags::MODELLOCK; // Locking input locks the model
         }
-        let num = self.num_params();
+        let num = self.store.as_ref().map_or(0, |store| store.get_num_inputs());
         if num == 0 {
             self.flags = if val {
                 self.flags | func_proto_flags::VOIDINPUTLOCK
@@ -5758,6 +5821,8 @@ impl FuncProto {
     pub fn get_comparable_flags(&self) -> uint4 {
         self.flags
             & (func_proto_flags::DOTDOTDOT
+                | func_proto_flags::NO_RETURN
+                | func_proto_flags::VOIDINPUTLOCK
                 | func_proto_flags::IS_CONSTRUCTOR
                 | func_proto_flags::IS_DESTRUCTOR
                 | func_proto_flags::HAS_THISPTR)
@@ -5852,13 +5917,56 @@ impl FuncProto {
         if id < 0 {
             self.cancel_inject_id();
         } else {
+            if self.injectid != id {
+                self.inject_name = None;
+                self.injection_origin = None;
+            }
             self.injectid = id;
             self.flags |= func_proto_flags::IS_INLINE;
         }
     }
+    /// Bind an injection id to the live library that assigned it.
+    pub fn set_injection(
+        &mut self,
+        id: int4,
+        origin: Rc<RefCell<crate::inject_sleigh::PcodeInjectLibrarySleigh>>,
+    ) {
+        self.set_inject_id(id);
+        if id >= 0 {
+            self.injection_origin = Some(origin);
+        }
+    }
+
+    /// Resolve the actual call-fixup name without retaining a library borrow
+    /// across recursive prototype/type encoding.
+    pub fn injection_name(&self) -> KunaResult<Option<String>> {
+        if self.injectid >= 0 {
+            if let Some(origin) = &self.injection_origin {
+                let library = origin.try_borrow().map_err(|_| {
+                    KunaError::lowlevel("Injection library is mutably borrowed during prototype encoding")
+                })?;
+                let name = library.base.get_call_fixup_name(self.injectid);
+                if name.is_empty() {
+                    return Err(KunaError::lowlevel(format!(
+                        "Unknown call-fixup id {} in originating library", self.injectid
+                    )));
+                }
+                return String::from_utf8(name)
+                    .map(Some)
+                    .map_err(|_| KunaError::lowlevel("Call-fixup name is not UTF-8"));
+            }
+            if self.inject_name.is_none() {
+                return Err(KunaError::lowlevel("Injection id has no originating library or source name"));
+            }
+        }
+        Ok(self.inject_name.clone())
+    }
+
     /// Turn-off any in-lining for this function (C++ `cancelInjectId`).
     pub fn cancel_inject_id(&mut self) {
         self.injectid = -1;
+        self.inject_name = None;
+        self.injection_origin = None;
         self.flags &= !func_proto_flags::IS_INLINE;
     }
 
@@ -5899,7 +6007,7 @@ impl FuncProto {
                 pieces.innames.push(param.get_name().to_string());
             }
         }
-        pieces.first_var_arg_slot = if self.is_dotdotdot() { num } else { -1 };
+        pieces.first_var_arg_slot = self.get_first_var_arg_slot();
     }
 
     /// The full prototype is (re)set from a model, names, and data-types (C++
@@ -6020,12 +6128,17 @@ impl FuncProto {
         // unconditionally, so those pieces aborted the process the moment the
         // function was decompiled. The declared type IS the return type — adopt it
         // and the model has something to assign against, after which `set_pieces`
-        // replaces the derived storage with the explicit one as before.
+        // replaces the derived storage with the explicit one as before. With no
+        // authored formals, this output-only edit must leave input recovery open.
         if pieces.outtype.is_none() {
             if let Some(declared) = pieces.output_storage.as_ref().and_then(|p| p.type_.clone()) {
                 let mut typed = pieces.clone();
                 typed.outtype = Some(declared);
-                return self.set_pieces(&typed, Some(defaultfp), typefactory, manager);
+                self.set_pieces(&typed, Some(defaultfp), typefactory, manager)?;
+                if pieces.intypes.is_empty() {
+                    self.set_input_lock(false);
+                }
+                return Ok(());
             }
         }
         self.set_pieces(pieces, Some(defaultfp), typefactory, manager)
@@ -6042,6 +6155,8 @@ impl FuncProto {
         typefactory: &dyn TypeFactory,
         manager: &AddrSpaceManager,
     ) -> KunaResult<()> {
+        self.logical = None;
+        self.first_var_arg_slot = Some(proto.first_var_arg_slot);
         self.set_model(self.model.clone()); // This resets extrapop
         self.store_mut().clear_all_inputs();
         self.store_mut().clear_output();
@@ -6573,14 +6688,6 @@ impl FuncProto {
             "STUB(w6-fspec-2) FuncProto::updateOutputNoTypes: needs Funcdata/Varnode trials",
         ))
     }
-    /// Restore this from a `<prototype>` element (C++ `decode`).
-    /// STUB(w6-fspec-2): needs the marshaling Decoder + Architecture registry.
-    pub fn decode(&mut self) -> KunaResult<()> {
-        Err(KunaError::lowlevel(
-            "STUB(w6-fspec-2) FuncProto::decode: needs marshaling + Architecture registry",
-        ))
-    }
-
     /// Encode this to a `<prototype>` element (C++ `FuncProto::encode`,
     /// fspec.cc:4625-4668): the model + extrapop + boolean flags, the
     /// `<returnsym>` (storage + type of the output parameter), the effect /
@@ -6589,12 +6696,18 @@ impl FuncProto {
     /// through `glb->pcodeinjectlib`, which the kuna `FuncProto` cannot
     /// reach — the caller resolves it).
     ///
-    /// The C++ tail calls `store->encode` — `ProtoStoreSymbol::encode`
-    /// (fspec.cc:3293) writes NOTHING, and upstream's decompileAt path always
-    /// has the symbol-backed store, so the wire shape omits `<internallist>`;
-    /// kuna's internal store follows the wire shape (input parameters travel
-    /// as `<localdb>` category-0 symbols, `LocalSymbolMap.decodeSymbolList`).
+    /// Internal callables and site prototypes are self-contained. Entry results
+    /// explicitly select `LocalDbEntry`, whose inputs already travel in localdb.
     pub fn encode(&self, encoder: &mut dyn kuna_base::marshal::Encoder) -> KunaResult<()> {
+        self.encode_with_context(encoder, PrototypeEncoding::Internal)
+    }
+
+    pub fn encode_with_context(
+        &self,
+        encoder: &mut dyn kuna_base::marshal::Encoder,
+        context: PrototypeEncoding,
+    ) -> KunaResult<()> {
+        let logical = (context == PrototypeEncoding::LogicalCallable).then_some(self.logical.as_ref()).flatten();
         use kuna_base::marshal::{
             ATTRIB_CONSTRUCTOR, ATTRIB_DESTRUCTOR, ATTRIB_MODEL, ATTRIB_TYPELOCK,
         };
@@ -6648,8 +6761,13 @@ impl FuncProto {
         if outparam.is_type_locked() {
             encoder.write_bool(&ATTRIB_TYPELOCK, true);
         }
-        outparam.get_address().encode_sized(encoder, outparam.get_size())?;
-        match outparam.get_type() {
+        let logical_output = logical.and_then(|p| p.outtype.as_ref().or_else(|| p.output_storage.as_ref().and_then(|p| p.type_.as_ref())));
+        if logical.is_some() {
+            Address::new_invalid().encode_sized(encoder, logical_output.map_or(0, |t| t.get_size()))?;
+        } else {
+            outparam.get_address().encode_sized(encoder, outparam.get_size())?;
+        }
+        match logical_output.or_else(|| outparam.get_type()) {
             Some(t) => t.encode_ref(encoder)?,
             None => {
                 // A type-less output is the void state (C++ outparam type is
@@ -6661,9 +6779,14 @@ impl FuncProto {
         encoder.close_element(&ELEM_RETURNSYM);
         self.encode_effect(encoder)?;
         self.encode_likely_trash(encoder)?;
-        // <inject>: only when the caller resolved the fixup name (injectid>=0).
-        // Without the resolver the id is silently dropped, matching a fixup-less
-        // proto (Java skips the element anyway).
+        if let Some(name) = self.injection_name()? {
+            encoder.open_element(&crate::pcodeinject::ELEM_INJECT);
+            encoder.write_string(&kuna_base::marshal::ATTRIB_CONTENT, name.as_bytes());
+            encoder.close_element(&crate::pcodeinject::ELEM_INJECT);
+        }
+        if context != PrototypeEncoding::LocalDbEntry {
+            self.encode_internal(encoder, logical)?;
+        }
         encoder.close_element(&ELEM_PROTOTYPE);
         Ok(())
     }
@@ -7183,6 +7306,10 @@ impl FuncCallSpecs {
     pub fn get_active_output(&mut self) -> &mut ParamActive {
         &mut self.activeoutput
     }
+    /// Immutable view of retained return-value recovery trials.
+    pub fn active_output(&self) -> &ParamActive {
+        &self.activeoutput
+    }
 
     /// The relative offset of the stack pointer at this call site (C++
     /// `stackoffset`; the `buildInputFromTrials` spacebase-parameter translation
@@ -7409,12 +7536,9 @@ impl FuncCallSpecs {
         newinput: &mut Vec<Option<VarnodeId>>,
         newoutput: &mut Vec<VarnodeId>,
     ) -> KunaResult<bool> {
-        if !self.proto.has_model() {
-            self.proto.copy(restricted_proto);
-            return Ok(true);
-        }
-
-        if !self.proto.is_compatible(restricted_proto) {
+        if self.proto.has_model()
+            && (!restricted_proto.has_model() || !self.proto.is_compatible(restricted_proto))
+        {
             return Ok(false);
         }
         if restricted_proto.is_dotdotdot() && !self.isinputactive {
@@ -7515,20 +7639,31 @@ impl FuncCallSpecs {
     /// (`insertProtoOverride`), tries `lateRestriction`, commits or schedules a
     /// restart, then locks the input. Preserve the full prototype in the override
     /// store: rebuilding from types alone would lose its calling convention.
+    /// `ordinal` identifies this call among same-address occurrences in call-spec
+    /// order, before the caller removes this specification for mutation.
     pub fn force_set(
         &mut self,
         data: &mut Funcdata,
         fp: &FuncProto,
+        ordinal: u32,
         restartlog: &mut RestartLog,
     ) -> KunaResult<()> {
+        if self.proto.is_override() {
+            return Ok(());
+        }
         let mut newinput: Vec<Option<VarnodeId>> = Vec::new();
         let mut newoutput: Vec<VarnodeId> = Vec::new();
 
         let site = self.op_addr(data);
         let mut saved = FuncProto::new();
         saved.copy(fp);
-        data.get_override_mut().insert_proto_override(site.clone(), Box::new(saved));
+        data.get_override_mut().insert_inferred_proto_override(site.clone(), ordinal, Box::new(saved));
 
+        if self.proto.is_input_locked() {
+            data.set_restart_pending(true);
+            restartlog.record_at(data, KunaRestartReason::ProtoForced, &site);
+            return Ok(());
+        }
         if self.late_restriction(data, fp, &mut newinput, &mut newoutput)? {
             self.commit_new_inputs(data, &mut newinput)?;
             self.commit_new_outputs(data, &mut newoutput)?;
@@ -7694,7 +7829,7 @@ impl FuncCallSpecs {
                 .expect("resolveSpacebaseRelative: stale call op")
                 .get_in(self.stack_placeholder_slot);
             if in_at_slot == Some(phvn) {
-                self.abort_spacebase_relative(data);
+                self.abort_spacebase_relative(data)?;
                 return Ok(());
             }
         }
@@ -7738,7 +7873,7 @@ impl FuncCallSpecs {
     ///
     /// Removes any stack-pointer placeholder input, and the op producing it if
     /// it is a dead internal write.
-    pub fn abort_spacebase_relative(&mut self, data: &mut Funcdata) {
+    pub fn abort_spacebase_relative(&mut self, data: &mut Funcdata) -> KunaResult<()> {
         if self.stack_placeholder_slot >= 0 {
             let slot = self.stack_placeholder_slot;
             let vn = data
@@ -7762,11 +7897,12 @@ impl FuncCallSpecs {
                 };
                 if no_descend && internal && written {
                     if let Some(def_op) = def {
-                        data.op_destroy(def_op);
+                        data.op_destroy(def_op)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 
     // -- locked-parameter transfer helpers (fspec.cc:5043-5144) -------------
@@ -7774,31 +7910,40 @@ impl FuncCallSpecs {
     /// Get the index of the CALL input Varnode matching `param`, or the encoded
     /// slot (C++ `FuncCallSpecs::transferLockedInputParam`, `fspec.cc:5043`).
     ///
-    /// Returns `0` if the Varnode can't be built, `slot#` (>0) to reuse an
-    /// input, or `-1` to build from the stack.
-    fn transfer_locked_input_param(&self, param: &dyn ProtoParameter) -> int4 {
+    /// Returns the operand slot and least-significant byte offset, or `-1`
+    /// for a stack load. An unavailable physical occurrence returns `None`.
+    fn transfer_locked_input_param(
+        &self,
+        data: &Funcdata,
+        param_addr: &Address,
+        param_size: int4,
+    ) -> KunaResult<Option<(int4, int4)>> {
         let numtrials = self.activeinput.get_num_trials();
-        let startaddr = param.get_address().clone();
-        let sz = param.get_size();
-        let lastaddr = &startaddr + ((sz - 1) as i64);
         for i in 0..numtrials {
             let curtrial = self.activeinput.get_trial(i);
-            if startaddr < *curtrial.get_address() {
+            let Some(offset) = storage_slice_offset(
+                curtrial.get_address(), curtrial.get_size(), param_addr, param_size,
+            )? else {
                 continue;
+            };
+            let slot = curtrial.get_slot();
+            if curtrial.is_definitely_not_used()
+                || slot <= 0
+                || slot == self.stack_placeholder_slot
+            {
+                return Ok(None);
             }
-            let trialend = curtrial.get_address() + ((curtrial.get_size() - 1) as i64);
-            if trialend < lastaddr {
-                continue;
-            }
-            if curtrial.is_definitely_not_used() {
-                return 0; // Trial has already been stripped
-            }
-            return curtrial.get_slot();
+            let operand = data.obank().get(self.op)
+                .and_then(|op| op.get_in(slot))
+                .and_then(|vn| data.vbank().get(vn));
+            return Ok(operand
+                .filter(|vn| vn.get_size() >= curtrial.get_size())
+                .map(|_| (slot, offset)));
         }
-        if startaddr.get_space().map(|s| s.get_type()) == Some(spacetype::IPTR_SPACEBASE) {
-            return -1;
+        if param_addr.get_space().map(|s| s.get_type()) == Some(spacetype::IPTR_SPACEBASE) {
+            return Ok(Some((-1, 0)));
         }
-        0
+        Ok(None)
     }
 
     /// List and/or create a Varnode for each input parameter matching a source
@@ -7820,16 +7965,20 @@ impl FuncCallSpecs {
             .get(self.op)
             .expect("transferLockedInput: stale call op")
             .get_in(0);
+        if in0.is_none() {
+            return Ok(false);
+        }
         newinput.push(in0);
         let numparams = source.num_params();
         let mut stackref: Option<VarnodeId> = None;
         let mut stackref_resolved = false;
         for i in 0..numparams {
             let param = source.get_param(i).expect("transferLockedInput: source param missing");
-            let reuse = self.transfer_locked_input_param(param);
-            if reuse == 0 {
+            let Some((reuse, _)) = self.transfer_locked_input_param(
+                data, &param.get_address(), param.get_size(),
+            )? else {
                 return Ok(false);
-            }
+            };
             if reuse > 0 {
                 let vn = data
                     .obank()
@@ -7863,13 +8012,34 @@ impl FuncCallSpecs {
         if param.get_type().map(|t| t.get_metatype()) == Some(type_metatype::TYPE_VOID) {
             return Ok(true);
         }
+        let address = param.get_address();
+        if address.get_space().is_some_and(|space| space.get_type() == spacetype::IPTR_SPACEBASE)
+            && (!self.is_stack_output_lock()
+                || !self.proto.is_output_locked()
+                || self.proto.get_output().get_address() != address
+                || self.proto.get_output().get_size() != param.get_size())
+        {
+            return Ok(false);
+        }
         // transferLockedOutputParam(param, newoutput): the CALL's current output
         // Varnode (op->getOut()) plus any leading INDIRECT-creation outputs that the
         // (locked) return-value param justifiably contains, or that contain the
         // param.  Before output recovery runs there is no output Varnode yet (the
         // common deindirect case): the list comes back empty and the result is still
         // accurate (the C++ always returns true).
-        self.transfer_locked_output_param(data, param, newoutput);
+        self.transfer_locked_output_param(data, param, newoutput)?;
+        for &out in newoutput.iter() {
+            let Some(vn) = data.vbank().get(out) else {
+                return Ok(false);
+            };
+            if vn.get_size() > param.get_size()
+                && (!source.has_model()
+                    || vn.get_addr().get_space().is_some_and(|s| s.get_type() == spacetype::IPTR_JOIN)
+                    || param.get_address().get_space().is_some_and(|s| s.get_type() == spacetype::IPTR_JOIN))
+            {
+                return Ok(false);
+            }
+        }
         Ok(true)
     }
 
@@ -7880,15 +8050,15 @@ impl FuncCallSpecs {
         data: &Funcdata,
         param: &dyn ProtoParameter,
         newoutput: &mut Vec<VarnodeId>,
-    ) {
+    ) -> KunaResult<()> {
         let paddr = param.get_address();
         let psize = param.get_size();
         if let Some(out) = data.obank().get(self.op).and_then(|o| o.get_out()) {
             if let Some(vn) = data.vbank().get(out) {
                 let vaddr = vn.get_addr();
                 let vsize = vn.get_size();
-                if paddr.justified_contain(psize, vaddr, vsize, false) >= 0
-                    || vaddr.justified_contain(vsize, &paddr, psize, false) >= 0
+                if storage_slice_offset(&paddr, psize, vaddr, vsize)?.is_some()
+                    || storage_slice_offset(vaddr, vsize, &paddr, psize)?.is_some()
                 {
                     newoutput.push(out);
                 }
@@ -7908,8 +8078,8 @@ impl FuncCallSpecs {
                     let vn = data.vbank().get(out).expect("transferLockedOutputParam: stale out");
                     let vaddr = vn.get_addr();
                     let vsize = vn.get_size();
-                    if paddr.justified_contain(psize, vaddr, vsize, false) >= 0
-                        || vaddr.justified_contain(vsize, &paddr, psize, false) >= 0
+                    if storage_slice_offset(&paddr, psize, vaddr, vsize)?.is_some()
+                        || storage_slice_offset(vaddr, vsize, &paddr, psize)?.is_some()
                     {
                         newoutput.push(out);
                     }
@@ -7917,6 +8087,7 @@ impl FuncCallSpecs {
             }
             indop = data.op_previous_op(io);
         }
+        Ok(())
     }
 
     /// Build the Varnode matching a (locked) input parameter from existing
@@ -7953,7 +8124,9 @@ impl FuncCallSpecs {
             Some(v) => v,
         };
         let vsize = data.vbank().get(vn).expect("buildParam: stale input vn").get_size();
-        if vsize == param_size {
+        let (_, offset) = self.transfer_locked_input_param(data, param_addr, param_size)?
+            .ok_or_else(|| KunaError::lowlevel("Locked input storage is no longer available"))?;
+        if vsize == param_size && offset == 0 {
             return Ok(vn);
         }
         let newop = data.new_op(2, opaddr);
@@ -7965,14 +8138,14 @@ impl FuncCallSpecs {
             let v = data.vbank().get(vn).expect("buildParam: stale input vn");
             if v.is_free() && !v.is_constant() && !v.has_no_descend() {
                 let (sz, addr) = (v.get_size(), v.get_addr().clone());
-                data.new_varnode(sz, &addr, None)
+                data.new_varnode(sz, &addr, None)?
             } else {
                 vn
             }
         };
         data.op_set_input(newop, use_vn, 0)?;
-        let c0 = data.new_constant(4, 0);
-        data.op_set_input(newop, c0, 1)?;
+        let displacement = data.new_constant(4, offset as uintb);
+        data.op_set_input(newop, displacement, 1)?;
         data.op_insert_before(newop, self.op);
         Ok(newout)
     }
@@ -8001,10 +8174,7 @@ impl FuncCallSpecs {
         };
         let mut noplacehold = true;
 
-        // Clear activeinput and old placeholder.
-        self.stack_placeholder_slot = -1;
         let num_passes = self.activeinput.get_num_passes();
-        self.activeinput.clear();
 
         let numparams = self.proto.num_params();
         for i in 0..numparams {
@@ -8019,8 +8189,6 @@ impl FuncCallSpecs {
             };
             let vn = self.build_param(data, newinput[(1 + i) as usize], &paddr, psize, stackref)?;
             newinput[(1 + i) as usize] = Some(vn);
-            self.activeinput.register_trial(&paddr, psize);
-            self.activeinput.get_trial_mut(i).mark_active(); // not optional
             if noplacehold && pspace_is_spacebase {
                 // A locked stack parameter: use it to recover the stack offset.
                 data.vbank_mut()
@@ -8030,6 +8198,13 @@ impl FuncCallSpecs {
                 noplacehold = false;
                 placeholder = None; // with a locked stack param, no placeholder needed
             }
+        }
+        self.stack_placeholder_slot = -1;
+        self.activeinput.clear();
+        for i in 0..numparams {
+            let param = self.proto.get_param(i).expect("commitNewInputs: source param missing");
+            self.activeinput.register_trial(&param.get_address(), param.get_size());
+            self.activeinput.get_trial_mut(i).mark_active();
         }
         for (mut trial, vn) in variadic {
             trial.set_slot(newinput.len() as int4);
@@ -8048,6 +8223,10 @@ impl FuncCallSpecs {
         let all: Vec<VarnodeId> =
             newinput.iter().map(|v| v.expect("commitNewInputs: null input after build")).collect();
         data.op_set_all_input(self.op, &all)?;
+        self.final_input_storage = (0..self.activeinput.get_num_trials()).map(|i| {
+            let trial = self.activeinput.get_trial(i);
+            (trial.get_address().clone(), trial.get_size())
+        }).collect();
         if !self.is_dotdotdot() {
             self.clear_active_input();
         } else if num_passes > 0 {
@@ -8103,12 +8282,12 @@ impl FuncCallSpecs {
                 // -op- must currently have no output.
                 data.op_set_output(self.op, em)?;
                 if let Some(io) = ind_op {
-                    data.op_unlink(io); // an indirect creation no longer used
+                    data.op_unlink(io)?; // an indirect creation no longer used
                 }
             }
             em
         } else {
-            data.op_unset_output(self.op);
+            data.op_unset_output(self.op)?;
             data.new_varnode_out(psize, &paddr, self.op)?
         };
 
@@ -8140,10 +8319,8 @@ impl FuncCallSpecs {
                     data.op_set_output(nop, old_out)?; // move oldOut from op to nop
                     nop
                 };
-                let overlap = {
-                    let ov = data.vbank().get(old_out).expect("commitNewOutputs: stale oldOut");
-                    overlap_addr(ov.get_addr(), ov.get_size(), &realout_addr, realout_size)
-                };
+                let overlap = storage_slice_offset(&realout_addr, realout_size, &oldaddr, oldsize)?
+                    .ok_or_else(|| KunaError::lowlevel("Locked output storage is no longer available"))?;
                 data.op_set_input(sub, real_out, 0)?;
                 let c = data.new_constant(4, overlap as uintb);
                 data.op_set_input(sub, c, 1)?;
@@ -8192,7 +8369,7 @@ impl FuncCallSpecs {
                 } else {
                     // Concatenate extra bytes from something indirectly created.
                     if let Some(io) = ind_op {
-                        data.op_unlink(io);
+                        data.op_unlink(io)?;
                     }
                     let most_sig_size = oldsize - overlap - realout_size;
                     let mut last_op = self.op;
@@ -8204,7 +8381,7 @@ impl FuncCallSpecs {
                         } else {
                             oldaddr.clone()
                         };
-                        let new_ind = data.new_indirect_creation(self.op, &lo_addr, overlap, true);
+                        let new_ind = data.new_indirect_creation(self.op, &lo_addr, overlap, true)?;
                         let new_ind_out = data
                             .obank()
                             .get(new_ind)
@@ -8230,7 +8407,7 @@ impl FuncCallSpecs {
                             oldaddr.clone()
                         };
                         let new_ind =
-                            data.new_indirect_creation(self.op, &hi_addr, most_sig_size, true);
+                            data.new_indirect_creation(self.op, &hi_addr, most_sig_size, true)?;
                         let new_ind_out = data
                             .obank()
                             .get(new_ind)
@@ -8257,22 +8434,56 @@ impl FuncCallSpecs {
     }
 }
 
-/// Relative point of overlap of `[addr, addr+size)` against another range
-/// (C++ `Varnode::overlap(const Address&,int4)` little-endian path,
-/// `varnode.cc`).  The deindirect commit only runs on processor (non-join)
-/// addresses; the big-endian justification is handled by the caller's address
-/// arithmetic, matching `Address::overlap`.
-fn overlap_addr(addr: &Address, size: int4, op: &Address, opsize: int4) -> int4 {
-    if !addr.is_big_endian() {
-        addr.overlap(0, op, opsize)
-    } else {
-        let over = addr.overlap(size - 1, op, opsize);
-        if over != -1 {
-            opsize - 1 - over
-        } else {
-            -1
-        }
+fn storage_slice_offset(
+    container: &Address,
+    size: int4,
+    part: &Address,
+    part_size: int4,
+) -> KunaResult<Option<int4>> {
+    if size <= 0 || part_size <= 0 || part_size > size {
+        return Ok(None);
     }
+    let Some(space) = container.get_space() else {
+        return Ok(None);
+    };
+    if space.get_type() == spacetype::IPTR_JOIN
+        && part.get_space().is_some_and(|s| s.get_type() != spacetype::IPTR_JOIN)
+    {
+        let record = space.find_join(container.get_offset())?;
+        let mut skipped = 0;
+        let Some(data_offset) = container.get_offset().checked_sub(record.get_unified().offset) else {
+            return Ok(None);
+        };
+        let Some(remaining) = (record.get_unified().size as uintb).checked_sub(data_offset) else {
+            return Ok(None);
+        };
+        if size as uintb > remaining {
+            return Ok(None);
+        }
+        let base = if space.is_big_endian() {
+            remaining - size as uintb
+        } else {
+            data_offset
+        };
+        for i in (0..record.num_pieces()).rev() {
+            let piece = record.get_piece(i);
+            if let Some(local) = storage_slice_offset(&piece.get_addr(), piece.size as int4, part, part_size)? {
+                let offset = skipped as i64 + local as i64 - base as i64;
+                return Ok((offset >= 0 && offset + part_size as i64 <= size as i64)
+                    .then_some(offset as int4));
+            }
+            skipped += piece.size as int4;
+        }
+        return Ok(None);
+    }
+    if container.get_space().map(Rc::as_ptr) != part.get_space().map(Rc::as_ptr)
+        || container.get_offset().checked_add(size as uintb - 1).is_none()
+        || part.get_offset().checked_add(part_size as uintb - 1).is_none()
+    {
+        return Ok(None);
+    }
+    let offset = container.justified_contain(size, part, part_size, false);
+    Ok((offset >= 0).then_some(offset))
 }
 
 #[cfg(test)]

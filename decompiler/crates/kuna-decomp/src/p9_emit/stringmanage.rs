@@ -620,13 +620,24 @@ fn get_char(content: &[u8], pos: &mut usize) -> i32 {
 ///
 /// Understands UTF-8, UTF-16, and UTF-32 encodings.  It reports a string if it
 /// sees a valid encoding that is null-terminated.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct StringManagerUnicode {
     /// The shared cache + limits (C++ base `StringManager`).
     pub base: StringManager,
     /// Temporary buffer for pulling in loadimage bytes (C++ `testBuffer`, an
     /// array of `maximumChars` bytes).
     test_buffer: Vec<uint1>,
+    remote_fetch: Option<std::rc::Rc<dyn crate::remote_provider::RemoteProviderFetch>>,
+    host_keys: BTreeMap<Address, (u64, String, int4)>,
+}
+
+impl std::fmt::Debug for StringManagerUnicode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StringManagerUnicode")
+            .field("base", &self.base)
+            .field("host_backed", &self.remote_fetch.is_some())
+            .finish()
+    }
 }
 
 impl StringManagerUnicode {
@@ -638,7 +649,24 @@ impl StringManagerUnicode {
         StringManagerUnicode {
             base: StringManager::new(max),
             test_buffer: vec![0u8; max.max(0) as usize],
+            remote_fetch: None,
+            host_keys: BTreeMap::new(),
         }
+    }
+
+    pub fn set_remote_fetch(
+        &mut self,
+        fetch: Option<std::rc::Rc<dyn crate::remote_provider::RemoteProviderFetch>>,
+    ) {
+        self.base.clear();
+        self.host_keys.clear();
+        self.remote_fetch = fetch;
+    }
+
+    /// Flush program facts while retaining the installed acquisition authority.
+    pub fn clear(&mut self) {
+        self.base.clear();
+        self.host_keys.clear();
     }
 
     /// C++ `StringManagerUnicode::getStringData` (stringmanage.cc:427-475).
@@ -656,7 +684,7 @@ impl StringManagerUnicode {
         char_type: &Datatype,
         loader: &mut dyn LoadImage,
         is_trunc: &mut bool,
-    ) -> &[uint1] {
+    ) -> KunaResult<&[uint1]> {
         let charsize = char_type.get_size();
         let decode_key = StringDecodeKey {
             char_size: charsize,
@@ -667,10 +695,35 @@ impl StringManagerUnicode {
             .string_map
             .get(addr)
             .is_some_and(|data| data.decode_key == Some(decode_key))
+            && (addr.is_constant() || self.remote_fetch.is_none()
+                || self.host_keys.get(addr).is_some_and(|(id, name, max)| {
+                    *id == char_type.get_id() && name == char_type.get_name()
+                        && *max == self.base.maximum_chars
+                }))
         {
             let d = &self.base.string_map[addr];
             *is_trunc = d.is_truncated;
-            return &self.base.string_map[addr].byte_data;
+            return Ok(&self.base.string_map[addr].byte_data);
+        }
+
+        // Ghidra supplies already translated UTF-8. Query before installing a
+        // cache entry so errors remain retryable rather than becoming refusals.
+        if !addr.is_constant() {
+            if let Some(fetch) = &self.remote_fetch {
+                let (bytes, truncated) = fetch.fetch_string_data(
+                    addr, self.base.maximum_chars, char_type,
+                )?;
+                self.base.string_map.insert(addr.clone(), StringData {
+                    byte_data: bytes,
+                    is_truncated: truncated,
+                    decode_key: Some(decode_key),
+                });
+                self.host_keys.insert(addr.clone(), (
+                    char_type.get_id(), char_type.get_name().to_owned(), self.base.maximum_chars,
+                ));
+                *is_trunc = truncated;
+                return Ok(&self.base.string_map[addr].byte_data);
+            }
         }
 
         // Allocate the map entry (initially empty).
@@ -684,9 +737,10 @@ impl StringManagerUnicode {
 
         if char_type.is_opaque_string() {
             // Cannot currently test for an opaque encoding — return empty buffer.
-            return &self.base.string_map[addr].byte_data;
+            return Ok(&self.base.string_map[addr].byte_data);
         }
 
+        self.test_buffer.resize(self.base.maximum_chars.max(0) as usize, 0);
         let mut cur_buffer_size: int4 = 0;
         // A non-closure transcription of the C++ do/while: the `'fill` block
         // mirrors the `try` body, returning the load_fill Result so the
@@ -705,7 +759,7 @@ impl StringManagerUnicode {
                     // checkCharacters/assignStringData run. Return the empty cached
                     // buffer directly; do NOT fall through to the
                     // check_characters/assign_string_data path below.
-                    return &self.base.string_map[addr].byte_data;
+                    return Ok(&self.base.string_map[addr].byte_data);
                 }
             }
             let fill_addr = addr + cur_buffer_size as i64;
@@ -728,12 +782,11 @@ impl StringManagerUnicode {
         match result {
             Ok(()) => {}
             Err(KunaError::DataUnavail { .. }) => {
-                return &self.base.string_map[addr].byte_data;
+                return Ok(&self.base.string_map[addr].byte_data);
             }
-            // No other error is expected from load_fill; propagate by treating
-            // it as "no string" (empty buffer), matching the DataUnavail path.
-            Err(_) => {
-                return &self.base.string_map[addr].byte_data;
+            Err(error) => {
+                self.base.string_map.remove(addr);
+                return Err(error);
             }
         }
 
@@ -745,13 +798,12 @@ impl StringManagerUnicode {
         );
         if num_chars < 0 {
             // Return the empty buffer (invalid encoding)
-            return &self.base.string_map[addr].byte_data;
+            return Ok(&self.base.string_map[addr].byte_data);
         }
         let mut data = std::mem::take(self.base.string_map.get_mut(addr).unwrap());
-        let buf = self.test_buffer.clone();
         self.base.assign_string_data(
             &mut data,
-            &buf,
+            &self.test_buffer,
             cur_buffer_size,
             charsize,
             num_chars,
@@ -759,7 +811,7 @@ impl StringManagerUnicode {
         );
         *is_trunc = data.is_truncated;
         self.base.string_map.insert(addr.clone(), data);
-        &self.base.string_map[addr].byte_data
+        Ok(&self.base.string_map[addr].byte_data)
     }
 }
 

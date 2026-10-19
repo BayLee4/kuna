@@ -708,7 +708,7 @@ fn apply_returns_zero_and_leaves_count_untouched() {
     let mut ctx = ActionContext::new();
 
     let mut act = ActionLowerSwitchDetect::new(true, "base");
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0, "apply returns 0 to quiesce the loop");
     assert_eq!(act.base().count, 0, "apply does not count a change");
     // The record was still stored and the restart requested.
@@ -960,7 +960,7 @@ fn install_apply_leaves_count_zero() {
     let rec = sample_record(&fd);
     act.store_mut().borrow_mut().push(&fd, rec);
     let mut ctx = ActionContext::default();
-    let res = act.apply(&mut fd, &mut ctx);
+    let res = act.apply(&mut fd, &mut ctx).unwrap();
     assert_eq!(res, 0);
     assert_eq!(act.base().count, 0, "no install => count untouched");
 }

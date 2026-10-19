@@ -27,6 +27,11 @@
 //! mirror was write-only, and — because `RangeList` merges overlapping but not
 //! *adjacent* ranges — a straight-line instruction run cost one B-tree node per
 //! decoded instruction.
+//!
+//! Decoder-backed constructors and resumed walks return [`KunaResult`]. A
+//! register acquisition failure aborts the build and preserves its original
+//! error category; no partially walked Listing is published. Partition-only
+//! constructors and cached model accessors do not acquire register facts.
 
 pub mod classify;
 mod kuna_compactrefs;
@@ -70,6 +75,7 @@ use std::ops::Bound;
 use std::rc::Rc;
 
 use kuna_base::space::AddrSpace;
+use kuna_base::error::KunaResult;
 use kuna_decomp::architecture::Architecture;
 use kuna_sleigh::translate::Translate;
 use object::Object;
@@ -145,13 +151,14 @@ impl Listing {
     /// is recorded for every seed listed in `funcsym_seeds`.
     ///
     /// Captures assembly text (see [`Listing::build_with_meta`]'s `want_assembly`).
+    /// Register acquisition errors from the walk are returned unchanged.
     pub fn build(
         file: &object::File,
         _image: &ObjectLoadImage,
         arch: &Architecture,
         translate: &dyn Translate,
         seeds: &[u64],
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         Self::build_with_meta(file, _image, arch, translate, seeds, &[], &[], ListingDetail::FULL)
     }
 
@@ -219,7 +226,7 @@ impl Listing {
         funcsym_seeds: &[u64],
         seed_names: &[(u64, String)],
         detail: ListingDetail,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         Self::build_with_meta_planned(
             file,
             _image,
@@ -250,7 +257,7 @@ impl Listing {
         seed_names: &[(u64, String)],
         detail: ListingDetail,
         plan: &WalkPlan,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         Self::build_tracking_frames(file, _image, arch, translate, seeds, funcsym_seeds,
             seed_names, detail, plan, None, None)
     }
@@ -268,7 +275,7 @@ impl Listing {
         plan: &WalkPlan,
         frames: Option<&mut kuna_framemode::FrameModes>,
         memo: Option<&kuna_decodememo::DecodeMemo>,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         Self::build_resuming(file, arch, translate, seeds, funcsym_seeds, seed_names, detail, plan,
             frames, None, memo)
     }
@@ -289,7 +296,7 @@ impl Listing {
         seed_names: &[(u64, String)],
         detail: ListingDetail,
         plan: &WalkPlan,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         let prior = walk::WalkState {
             insns: self.insns,
             refs: self.refs.into_edges(),
@@ -314,7 +321,7 @@ impl Listing {
         frames: Option<&mut kuna_framemode::FrameModes>,
         resumed: Option<walk::WalkState>,
         memo: Option<&kuna_decodememo::DecodeMemo>,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         debug_assert!(
             plan.built_from(arch),
             "the plan's decode recipe was captured from another architecture than {}",
@@ -336,7 +343,7 @@ impl Listing {
                 // There was no walk, so there is no reference model whatever the
                 // caller asked for: `has_refs` reports what was built, not what
                 // was requested.
-                return Listing {
+                return Ok(Listing {
                     insns: kuna_insnstore::InstructionStore::default(),
                     refs: kuna_compactrefs::ReferenceIndex::default(),
                     funcs: BTreeMap::new(),
@@ -346,7 +353,7 @@ impl Listing {
                     stack_callback_refs: Vec::new(),
                     mode_runs: Vec::new(),
                     a32_extents: Vec::new(),
-                };
+                });
             }
         };
 
@@ -418,11 +425,11 @@ impl Listing {
             tables.as_ref(),
             a32_tables.as_ref(),
             memo,
-        );
+        )?;
 
         let refs = kuna_compactrefs::ReferenceIndex::new(st.refs);
 
-        Listing {
+        Ok(Listing {
             insns: st.insns,
             refs,
             funcs: st.funcs,
@@ -436,7 +443,7 @@ impl Listing {
                 .collect(),
             mode_runs: st.mode_runs,
             a32_extents: painter.a32_extents().to_vec(),
-        }
+        })
     }
 
     /// (kuna `rawdiscover`) Build a Listing for a **headerless** image, from
@@ -449,8 +456,7 @@ impl Listing {
     /// `--isa arm|thumb` has already painted any whole-image claim), and the
     /// PPC64 local-entry fold is empty. The walk itself is the same one.
     ///
-    /// Returns an empty Listing when the architecture publishes no default code
-    /// space, matching the object-backed constructor.
+    /// Register acquisition errors from the walk are returned unchanged.
     pub fn build_raw(
         arch: &Architecture,
         translate: &dyn Translate,
@@ -458,7 +464,7 @@ impl Listing {
         exec_ranges: &[(u64, u64)],
         seeds: &[u64],
         detail: ListingDetail,
-    ) -> Listing {
+    ) -> KunaResult<Listing> {
         let mut exec_ranges: Vec<(u64, u64)> = exec_ranges.to_vec();
         exec_ranges.sort_unstable();
         let seed_funcs: BTreeMap<u64, DiscoveredFunction> = seeds
@@ -496,9 +502,9 @@ impl Listing {
             None,
             None,
             None,
-        );
+        )?;
         let refs = kuna_compactrefs::ReferenceIndex::new(st.refs);
-        Listing {
+        Ok(Listing {
             insns: st.insns,
             refs,
             funcs: st.funcs,
@@ -508,7 +514,7 @@ impl Listing {
             stack_callback_refs: Vec::new(),
             mode_runs: Vec::new(),
             a32_extents: Vec::new(),
-        }
+        })
     }
 
     /// Test-only: a Listing over exactly `insns`, with no xrefs, no discovered

@@ -197,6 +197,8 @@ fn a_table_rebuilds_the_same_structures_in_another_factory() {
         assert_eq!(ledger::layout_of(&a), ledger::layout_of(&b), "{name}");
         assert_eq!(ledger::members_of(&a), ledger::members_of(&b), "{name}");
         assert_eq!(a.get_size(), b.get_size());
+        assert_eq!(ledger::minted_number(&a), ledger::minted_number(&b), "{name}");
+        assert!(ledger::minted_number(&b).is_some(), "replay retains inferred ownership: {name}");
     }
     // A second install finds its names taken.
     assert!(install_table(&other, &table).is_err());

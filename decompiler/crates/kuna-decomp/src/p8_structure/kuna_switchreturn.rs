@@ -105,10 +105,10 @@ impl Action for ActionSwitchReturn {
         }
         Some(Box::new(ActionSwitchReturn { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         // P0 assertion `option switchreturn on|off`, carried on the Architecture boundary.
         if !data.get_arch().switch_return {
-            return 0;
+            return Ok(0);
         }
         let changes = data.switchreturn_apply(MAX_SWITCHRETURN_SPLITS, MAX_SWITCHRETURN_INEDGES);
         if changes > 0 {
@@ -118,7 +118,7 @@ impl Action for ActionSwitchReturn {
             ));
         }
         self.base_mut().count += changes;
-        0
+        Ok(0)
     }
 }
 

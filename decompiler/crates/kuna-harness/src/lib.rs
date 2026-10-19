@@ -33,5 +33,6 @@ pub mod c_behavior;
 pub mod corpus;
 pub mod dwarf_fixture;
 pub mod liftdiff;
+pub mod packed_document;
 pub mod testfunction;
 pub mod unittest;

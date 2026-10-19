@@ -7,20 +7,10 @@
 //! the SLEIGH-backed concrete payloads/library that drive the W2 kuna-sleigh
 //! `PcodeSnippet`/`EmulateSnippet` machinery.
 //!
-//! ## Boundaries
-//!
-//! Several C++ collaborators of `pcodeinject.cc` belong to later waves; this
-//! file carries minimal local boundary surfaces for exactly the members the C++
-//! reaches, each annotated `// STUB`:
-//!   - [`InjectArchitecture`] — the `Architecture *glb` slice
-//!     `ExecutablePcode::build`/`evaluate` and `PcodeInjectLibrary` touch
-//!     (`getUniqueSpace`, etc.). `Architecture` is W4/W6.
-//!   - The actual SLEIGH **emit** path (`InjectPayload::inject`, the emulator
-//!     wiring inside `ExecutablePcode::build`) needs kuna-sleigh's
-//!     `SleighBuilder`/`PcodeCacher`/`ParserWalkerChange`/`ParserContext`
-//!     mutators, which are **private** to `kuna-sleigh`'s `sleigh.rs`. They are
-//!     abstracted behind the [`InjectEngine`] trait here; `inject_sleigh.rs`
-//!     records the precise missing-public-API note (LOSS reported in output).
+//! [`InjectArchitecture`] supplies the snippet layout spaces and
+//! [`InjectPcodeResolver`] supplies host-generated executable operations.
+//! Concrete compilation, emission and build-once execution live in
+//! `inject_sleigh.rs`, using the existing SLEIGH snippet compiler and emulator.
 //!
 //! Per ADR 0004 fallible decode/registration returns `Result<_, KunaError>`;
 //! per ADR 0002 the name->id namespaces are `BTreeMap` keyed on the C++
@@ -430,17 +420,25 @@ pub trait InjectPayload {
 // InjectArchitecture boundary (the `Architecture *glb` slice this file uses)
 // ---------------------------------------------------------------------------
 
-/// STUB(W4/W6): the slice of the C++ `Architecture *glb` that
-/// `ExecutablePcode::build`/`evaluate` and `PcodeInjectLibrary` reach.
-///
-/// `Architecture` is W4/W6; this minimal trait mirrors exactly the spaces the
-/// injection framework touches when laying out a snippet's temporary
-/// inputs/outputs.
+/// The architecture spaces used when laying out executable temporary inputs
+/// and outputs, shared by the architecture and the executable runtime.
 pub trait InjectArchitecture {
     /// C++ `glb->getDefaultCodeSpace()`.
     fn get_default_code_space(&self) -> Rc<AddrSpace>;
     /// C++ `glb->getUniqueSpace()`.
     fn get_unique_space(&self) -> Rc<AddrSpace>;
+}
+
+/// Host emission capability retained by the architecture, not by payload caches.
+/// Calls must be made without an injection-library borrow.
+pub trait InjectPcodeResolver {
+    fn fetch_inject_pcode(
+        &self,
+        name: &[u8],
+        ptype: int4,
+        context: &InjectContext,
+        emit: &mut dyn PcodeEmit,
+    ) -> KunaResult<()>;
 }
 
 // ---------------------------------------------------------------------------

@@ -356,29 +356,29 @@ impl Action for ActionRemoveCleanupCode {
         }
         Some(Box::new(ActionRemoveCleanupCode { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if !data.get_arch().remove_cleanup_code {
-            return 0;
+            return Ok(0);
         }
         // The pre-SSA window: no INDIRECT call effects to unpick, and the
         // argument setup still dies to the following dead-code fixpoint.
         if data.get_heritage_pass() != 0 || data.num_calls() == 0 {
-            return 0;
+            return Ok(0);
         }
         // Never gut the glue itself: a cleanup routine's body is calls to other
         // cleanup routines, and that IS its content.
         if is_cleanup_call_name(data.get_name()) {
-            return 0;
+            return Ok(0);
         }
         let victims = cleanup_call_ops(data);
         if victims.is_empty() {
-            return 0;
+            return Ok(0);
         }
         for op in victims {
             data.delete_call_specs(op);
-            data.op_destroy(op);
+            data.op_destroy(op)?;
         }
-        1
+        Ok(1)
     }
 }
 

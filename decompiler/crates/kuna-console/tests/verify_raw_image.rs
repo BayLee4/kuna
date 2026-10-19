@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use kuna_base::address::Address;
+use kuna_base::marshal::Decoder;
 use kuna_console::assertions::{self, Body, Directive};
 use kuna_console::engine::{bootstrap_from_raw, ArmIsa};
 use kuna_console::project::decompile_targets;
@@ -56,6 +57,231 @@ fn source_state_program(fixture: &RawFixture, entries: &[u64]) -> kuna_console::
         .expect("real x86 fixture and built specification");
     program.commit_pending_analysis().unwrap();
     program
+}
+
+#[test]
+fn global_presentation_keeps_alias_identity_and_body_header_values() {
+    use std::rc::Rc;
+    use kuna_console::project::{build_header, render_c};
+    use kuna_decomp::decompile_drive::{print_c_recompile_prelude, print_c_types};
+    use kuna_decomp::dtype::{type_metatype, TypeFactory};
+
+    // mov eax,[0x1040]; movzx ecx,byte [0x1052]; add eax,ecx; add eax,edi; ret
+    let mut image = vec![0; 0xc0];
+    image[..18].copy_from_slice(&[
+        0x8b, 0x05, 0x3a, 0, 0, 0, 0x0f, 0xb6, 0x0d, 0x45, 0, 0, 0,
+        0x01, 0xc8, 0x01, 0xf8, 0xc3,
+    ]);
+    image[0x40..0x44].copy_from_slice(&7u32.to_le_bytes());
+    image[0x52] = 5;
+    let fixture = RawFixture::new("global-presentation-values", &image);
+    let mut program = source_state_program(&fixture, &[0x1000]);
+    let entry = program.find_entry_at(0x1000).unwrap();
+    let function = entry.name.clone();
+    program.set_assertions(vec![Directive {
+        raw: "source parameter spelling reservation".into(),
+        body: Body::Prototype {
+            func: function.clone(),
+            decl: format!("uint4 {function}(uint4 completed_0__kuna_2)"),
+        },
+    }]);
+    assertions::apply_program_scoped(&mut program);
+    let integer = program.arch().types().get_base(4, type_metatype::TYPE_INT).unwrap();
+    let character = program.arch().types().get_type_char(1).unwrap();
+    let array = program.arch().types().get_type_array(32, character).unwrap();
+    let global = program.arch().symboltab.get_global_scope().unwrap();
+    let data_space = program.arch().manage().get_default_data_space().unwrap().clone();
+    let spaces = program.arch().manage().num_spaces();
+    let namespace = program.arch_mut().symboltab
+        .find_create_scope(0x7799, "other", Some(global), spaces).unwrap();
+    let mut sources = Vec::new();
+    for (scope, name, address, datatype) in [
+        (global, "completed.0", 0x1040, integer.clone()),
+        (global, "b.1", 0x1050, array.clone()),
+        (global, "b+1", 0x1050, array.clone()),
+        (global, "b_1", 0x1080, integer.clone()),
+        (global, "b_1__kuna_2", 0x1088, integer),
+        (namespace, "b.1", 0x10a0, array),
+    ] {
+        let (id, _) = program.arch_mut().symboltab.add_symbol_mapped(
+            scope, name, datatype.clone(), &Address::new(data_space.clone(), address),
+            &Address::new_invalid(),
+        ).unwrap();
+        let symbol = program.arch().symboltab.symbol(id);
+        sources.push((id, symbol.get_id(), name.to_owned(), datatype));
+    }
+
+    let results = decompile_targets(&mut program, vec![entry], false, true, false).unwrap();
+    let result = &results[0];
+    assert!(result.error.is_none(), "{:?}", result.error);
+    let body = result.code.as_deref().unwrap();
+    let scalar = result.globals.iter().find(|g| g.address == 0x1040 && g.source_symbol.is_some()).unwrap();
+    let bytes = result.globals.iter().find(|g| g.address == 0x1050 && g.source_symbol.is_some()).unwrap();
+    assert_eq!(scalar.name, "completed.0");
+    assert!(["b.1", "b+1"].contains(&bytes.name.as_str()));
+    assert_eq!((scalar.size, bytes.size), (4, 32));
+    let print = program.arch().print();
+    let scalar_name = print.global_presentation_name(scalar.source_symbol.unwrap(), &scalar.name);
+    let array_name = print.global_presentation_name(bytes.source_symbol.unwrap(), &bytes.name);
+    assert_ne!(scalar_name, scalar.name);
+    assert_ne!(scalar_name, "completed_0__kuna_2", "source parameter owns its spelling");
+    assert_ne!(array_name, "b_1");
+    assert_ne!(array_name, "b_1__kuna_2", "unreferenced source global still reserves its spelling");
+    assert!(body.contains(scalar_name) && body.contains(array_name), "{body}");
+    assert!(scalar.declaration.contains(scalar_name), "{scalar:?}");
+    assert!(bytes.declaration.contains(array_name) && bytes.declaration.ends_with("[32]"), "{bytes:?}");
+    let selected: std::collections::BTreeSet<_> = sources.iter()
+        .filter(|(_, _, name, _)| name == "b.1" || name == "b+1")
+        .map(|(_, id, name, _)| print.global_presentation_name(*id, name).to_owned())
+        .collect();
+    assert_eq!(selected.len(), 3, "same-storage aliases and namespace peers keep separate identities");
+    let scalar_name = scalar_name.to_owned();
+    let array_name = array_name.to_owned();
+    for (id, source_id, name, datatype) in &sources {
+        let symbol = program.arch().symboltab.symbol(*id);
+        assert_eq!((symbol.get_id(), symbol.get_name()), (*source_id, name.as_str()));
+        assert!(Rc::ptr_eq(symbol.dtype.as_ref().unwrap(), datatype));
+    }
+    assert_eq!(program.arch().symboltab.get_full_name(namespace), "other");
+
+    let prelude = print_c_recompile_prelude(program.arch());
+    let types = print_c_types(program.arch_mut());
+    let header = build_header("globals", &prelude, &types, &results);
+    let header_path = common::scratch_file("global-presentation-values", "h");
+    let source_path = common::scratch_file("global-presentation-values", "c");
+    let executable = common::scratch_file("global-presentation-values", "exe");
+    std::fs::write(&header_path, &header).unwrap();
+    std::fs::write(&source_path, format!(
+        "#include \"{}\"\n{}\nint {scalar_name}=7;\nchar {array_name}[32]={{0,0,5}};\n\
+         int main(void){{if({function}(3)!=15)return 1;\
+         {scalar_name}=37;{array_name}[2]=13;return {function}(9)!=59;}}\n",
+        header_path.display(), render_c(&results),
+    )).unwrap();
+    for optimization in ["-O0", "-O2"] {
+        let compiled = Command::new("cc").args(["-std=c11", optimization])
+            .arg(&source_path).arg("-o").arg(&executable).output().expect("C compiler prerequisite");
+        assert!(compiled.status.success(), "{optimization}:\n{}\n{header}\n{body}",
+            String::from_utf8_lossy(&compiled.stderr));
+        let observed = Command::new(&executable).output().expect("execute generated global-value consumer");
+        assert!(observed.status.success(), "{optimization}: {observed:?}");
+    }
+    for path in [&header_path, &source_path, &executable] {
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn supplied_default_callable_model_remains_explicit_for_mixed_join_storage() {
+    use std::rc::Rc;
+    use kuna_base::marshal::{PackedDecode, PackedEncode};
+    use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeField};
+    use kuna_decomp::fspec::{FuncCallSpecs, FuncProto, ProtoModel, PrototypeDecoding,
+        PrototypeEncoding, PrototypePieces};
+    use kuna_decomp::funcdata::Funcdata;
+    use kuna_num::opcodes::OpCode;
+
+    let fixture = RawFixture::new("supplied-default-callable", &[0xc3]);
+    let program = source_state_program(&fixture, &[0x1000]);
+    let types = program.arch().types_impl();
+    let shell = types.kuna_declare_record("MixedNode", false).unwrap();
+    let floating = types.get_base(8, type_metatype::TYPE_FLOAT).unwrap();
+    let code = types.get_type_code().unwrap();
+    let pointer = types.get_type_pointer(8, code, 1).unwrap();
+    let node = types.set_fields_struct_raw(&shell, vec![
+        TypeField::new(0, 0, "d", floating), TypeField::new(1, 8, "next", pointer),
+    ], vec![], 16, 8, 0).unwrap();
+    let model = program.arch().default_fp().unwrap().clone();
+    let logical = FuncProto::from_logical(&PrototypePieces {
+        outtype: Some(node.clone()), intypes: vec![node.clone()], innames: vec!["node".into()],
+        first_var_arg_slot: -1,
+        ..PrototypePieces::default()
+    }, model.clone(), types).unwrap();
+    let inferred_default = Rc::new(types.acquire_working_proto(&logical).unwrap());
+    let mut bytes = Vec::new();
+    logical.encode_with_context(&mut PackedEncode::new(&mut bytes),
+        PrototypeEncoding::LogicalCallable).unwrap();
+    let mut decoder = PackedDecode::new(program.arch().manage());
+    decoder.ingest_stream(&bytes).unwrap();
+    let supplied = types.decode_proto(&mut decoder, PrototypeDecoding::LogicalCallable).unwrap();
+    let supplied = Rc::new(types.acquire_working_proto(&supplied).unwrap());
+    assert_eq!(supplied.get_model_name(), model.get_name());
+    assert!(supplied.is_input_locked() && supplied.is_output_locked());
+    assert_eq!(supplied.num_params(), 1);
+    assert_eq!((supplied.get_param(0).unwrap().get_size(), supplied.get_output().get_size()), (16, 16));
+    assert!(supplied.get_param(0).unwrap().get_address().is_join());
+    assert!(supplied.get_output().get_address().is_join());
+
+    let call_context = |default: Rc<ProtoModel>| {
+        let mut context = Rc::try_unwrap(program.arch().build_arch_handle())
+            .unwrap_or_else(|_| panic!("fresh call context must be uniquely owned"));
+        // Hosted architectures have specifications but no standalone image ABI evidence.
+        context.float_arg_registers = None;
+        context.defaultfp = Some(default);
+        let address = program.find_entry_at(0x1000).unwrap().addr;
+        let mut data = Funcdata::new("subject", "subject", Rc::new(context),
+            address.clone(), 0x1000_0000, 1).unwrap();
+        let call = data.new_op(1, address);
+        data.op_set_opcode(call, kuna_decomp::typeop::type_op_for(OpCode::CPUI_CALLIND));
+        let target = data.new_constant(8, 0x2000);
+        data.op_set_input(call, target, 0).unwrap();
+        data.new_unique_out(16, call).unwrap();
+        (data, FuncCallSpecs::new(call, Address::new_invalid()))
+    };
+    let (data, call) = call_context(model.clone());
+    assert!(kuna_decomp::kuna_typedcallabi::admit(&data, &call, inferred_default).is_none(),
+        "internal default selection is not supplied convention authority");
+    let admitted = kuna_decomp::kuna_typedcallabi::admit(&data, &call, supplied.clone()).unwrap();
+    assert!(Rc::ptr_eq(&admitted, &supplied));
+    let mut variadic = FuncProto::new();
+    variadic.copy(&supplied);
+    variadic.set_dotdotdot(true);
+    assert!(kuna_decomp::kuna_typedcallabi::admit(&data, &call, Rc::new(variadic)).is_none(),
+        "supplied convention must not bypass variadic JOIN/float eligibility");
+
+    let changed_model = Rc::new(ProtoModel::copy_named("current_default", &model));
+    let mut changed = FuncProto::new();
+    changed.copy(&supplied);
+    changed.set_model(Some(changed_model.clone()));
+    let (data, call) = call_context(changed_model);
+    assert!(kuna_decomp::kuna_typedcallabi::admit(&data, &call, Rc::new(changed)).is_none(),
+        "historical declared name cannot authorize a different effective model");
+}
+
+#[test]
+fn live_source_parameter_replacement_retires_analyzed_symbol_links_before_printing() {
+    use kuna_console::ifacedecomp::{register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
+    use kuna_console::ifaceterm::ConsoleCommands;
+    let fixture = RawFixture::new("live-source-parameter-links", &[0x89, 0xf8, 0x01, 0xf0, 0xc3]);
+    for edit in [
+        "map param subject::0 [register,0x8,2] uint2 fresh",
+        "parse line extern uint4 subject(uint1 fresh,uint1 other);",
+        "parse line extern uint4 subject(void);",
+    ] {
+        let program = source_state_program(&fixture, &[0x1000]);
+        let script: Vec<String> = [
+            "map function [ram,0x1000] subject", "load function subject",
+            "parse line extern uint4 subject(uint1 value,uint1 other);", "decompile",
+            "rename value prior", edit, "print C",
+        ].into_iter().map(str::to_owned).collect();
+        let commands = script.clone();
+        let mut status = ConsoleCommands::into_status(script);
+        register_decomp_commands(&mut status);
+        status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+            .downcast_mut::<IfaceDecompData>().unwrap().conf = Some(program);
+        for command in commands {
+            status.run_command().unwrap_or_else(|error| panic!("{command}: {error}"));
+        }
+        assert!(!status.optr.contains("prior"),
+            "analyzed body kept a superseded source identifier after {edit}: {}", status.optr);
+        let data = status.get_data_mut(DECOMPILE_MODULE).unwrap().as_any_mut()
+            .downcast_mut::<IfaceDecompData>().unwrap();
+        let fd = data.fd.as_ref().unwrap();
+        let scope = fd.get_scope_local().unwrap();
+        assert!(scope.query_by_name("prior").is_empty(), "superseded source symbol survives: {edit}");
+        assert!(fd.kuna_directive_symbols().is_empty(), "superseded parameter directive survives: {edit}");
+        assert!(data.pending_local_checks.is_empty(), "superseded parameter check survives: {edit}");
+        assert_eq!(fd.get_func_proto().num_params(), if edit.contains("(void)") { 0 } else { 2 });
+    }
 }
 
 #[test]
@@ -184,7 +410,7 @@ fn physical_source_console_edits_replay_without_resurrecting_old_slots() {
                         .any(|id| original_input(fd, id, offset, 4))
             }), "original four-byte machine input provenance at {offset:#x} must survive source replay");
         }
-        let c = kuna_decomp::decompile_drive::print_c(data.conf.as_mut().unwrap().arch_mut(), fd);
+        let c = kuna_decomp::decompile_drive::print_c(data.conf.as_mut().unwrap().arch_mut(), fd).unwrap();
         for &(name, _, _) in &expected {
             assert!(c.contains(name), "source-authored name missing from readable C:\n{c}");
         }
@@ -207,7 +433,7 @@ fn physical_source_assertion_batch_replays_the_authored_parameter_roster() {
         }},
     ]);
     assertions::apply_program_scoped(&mut program);
-    let results = decompile_targets(&mut program, vec![entry], false, false, false);
+    let results = decompile_targets(&mut program, vec![entry], false, false, false).unwrap();
     let result = &results[0];
     assert!(result.error.is_none(), "{:?}", result.error);
     let formals: Vec<_> = result.variables.iter().filter(|variable| variable.is_param)
@@ -242,14 +468,14 @@ fn link_register_bodies_preserve_declared_zero_arity_and_plain_return_export() {
     ]);
     assertions::apply_program_scoped(&mut program);
     assert!(program.assertion_outcomes().iter().all(|outcome| outcome.status == "applied"));
-    let ordinary = decompile_targets(&mut program, vec![escape, plain.clone()], false, false, false);
+    let ordinary = decompile_targets(&mut program, vec![escape, plain.clone()], false, false, false).unwrap();
     for result in &ordinary {
         assert!(result.error.is_none(), "{:?}", result.error);
         assert!(result.variables.iter().all(|variable| !variable.is_param),
             "control or observable entry X30 is not an invented source formal");
         assert!(result.code.as_deref().unwrap().contains("return"), "ordinary return body remains readable");
     }
-    let plain_export = kuna_console::project::decompile_export_targets(&mut program, vec![plain]);
+    let plain_export = kuna_console::project::decompile_export_targets(&mut program, vec![plain]).unwrap();
     assert!(plain_export[0].error.is_none(), "plain RET export must remain supported");
     assert!(plain_export[0].code.as_deref().unwrap().contains("return"), "plain void return must remain readable");
 }
@@ -302,7 +528,7 @@ fn raw_thumb_maps_base_zero_and_nonzero() {
         assert_eq!(entry.addr.get_offset(), base);
         assert!(program.entry_bytes_mapped(&entry.addr));
 
-        let results = decompile_targets(&mut program, vec![entry], true, false, false);
+        let results = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].error.is_none(), "{:?}", results[0].error);
         let code = results[0].code.as_deref().unwrap();

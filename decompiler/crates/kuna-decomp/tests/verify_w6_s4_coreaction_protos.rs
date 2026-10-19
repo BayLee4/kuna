@@ -115,7 +115,7 @@ fn proto_action_apply_change_signal_contract() {
         let name = act.get_name().to_string();
         let before = act.base().count;
         assert_eq!(before, 0, "{name}: fresh action must start with count 0");
-        let res: int4 = act.apply(&mut data, &mut ctx);
+        let res: int4 = act.apply(&mut data, &mut ctx).unwrap();
         assert_eq!(res, 0, "{name}: apply must return 0 (change signalling is via count)");
         if name == "prototypetypes" {
             // The realized init_active_output bumps count exactly once (one
@@ -154,7 +154,7 @@ fn repeated_apply_stays_inert() {
     let mut ctx = ActionContext::new();
     let mut act = ActionExtraPopSetup::boxed("protorecovery", Some(2));
     for _ in 0..5 {
-        let res: int4 = act.apply(&mut data, &mut ctx);
+        let res: int4 = act.apply(&mut data, &mut ctx).unwrap();
         assert_eq!(res, 0);
         assert_eq!(act.base().count, 0);
     }
@@ -265,11 +265,11 @@ fn extrapop_null_and_nonnull_both_inert_for_now() {
     let mut ctx = ActionContext::new();
 
     let mut null_space = ActionExtraPopSetup::boxed("protorecovery", None);
-    assert_eq!(null_space.apply(&mut data, &mut ctx), 0);
+    assert_eq!(null_space.apply(&mut data, &mut ctx).unwrap(), 0);
     assert_eq!(null_space.base().count, 0);
 
     let mut some_space = ActionExtraPopSetup::boxed("protorecovery", Some(2));
-    assert_eq!(some_space.apply(&mut data, &mut ctx), 0);
+    assert_eq!(some_space.apply(&mut data, &mut ctx).unwrap(), 0);
     assert_eq!(
         some_space.base().count,
         0,

@@ -1,0 +1,25 @@
+<decompilertest>
+<binaryimage arch="x86:LE:32:default:gcc">
+<!-- A selected root calls a mapped helper returning seven, then adds four.
+     Explicit source prototypes remain identical across the policy toggle. -->
+<bytechunk space="ram" offset="0x100000" readonly="true">e81b00000083c004c3</bytechunk>
+<bytechunk space="ram" offset="0x100020" readonly="true">b807000000c3</bytechunk>
+<symbol space="ram" offset="0x100000" name="export_root"/>
+<symbol space="ram" offset="0x100020" name="mapped_helper"/>
+</binaryimage>
+<script>
+<com>parse line extern int4 export_root(void);</com>
+<com>parse line extern int4 mapped_helper(void);</com>
+<com>option exportinline off</com>
+<com>load function export_root</com><com>decompile</com><com>print C</com>
+<com>option exportinline on</com>
+<com>decompile</com><com>print C</com>
+<com>option exportinline off</com>
+<com>decompile</com><com>print C</com>
+<com>quit</com>
+</script>
+<stringmatch name="EXPORTINLINE #1 ordinary acquisitions retain the call before and after preparation" min="2" max="2">mapped_helper\(\)</stringmatch>
+<stringmatch name="EXPORTINLINE #2 prepared root retains the physical helper result" min="1" max="1">return (11|0xb);</stringmatch>
+<stringmatch name="EXPORTINLINE #3 all acquisitions retain the selected root declaration" min="3" max="3">int4 export_root\(void\)</stringmatch>
+<stringmatch name="EXPORTINLINE #4 only the prepared body reports its generated inline annotation" min="1" max="1">// inlined: mapped_helper</stringmatch>
+</decompilertest>

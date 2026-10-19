@@ -114,8 +114,8 @@ fn action_is_inert_when_gate_is_off() {
     // The ArchContext fixture leaves `strip_security_check` at its ctor value
     // (false), and the scheduled instance registers `enabled == false`.
     let mut act = ActionRemoveSecurityCheck::new(false, "returnsplit");
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
     // Gate on, but no blocks: still nothing to do.
     let mut act = ActionRemoveSecurityCheck::new(true, "returnsplit");
-    assert_eq!(act.apply(&mut fd, &mut ctx), 0);
+    assert_eq!(act.apply(&mut fd, &mut ctx).unwrap(), 0);
 }

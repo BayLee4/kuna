@@ -433,7 +433,7 @@ impl ConditionalExecution {
         op: OpId,
         fd: &mut Funcdata,
     ) -> KunaResult<VarnodeId> {
-        let vn = fd.new_varnode(s, m, None);
+        let vn = fd.new_varnode(s, m, None)?;
         fd.op_set_output(op, vn)?; // STUB(opSetOutput)
         Ok(vn)
     }
@@ -706,8 +706,8 @@ impl ConditionalExecution {
     /// `ConditionalExecution::execute`, `condexe.cc:456-475`).
     ///
     /// We assume the last call to [`verify`](ConditionalExecution::verify)
-    /// returned \b true.  STUB(opSetOutput / W6): the data-flow rewrite
-    /// (`doReplacement`) surfaces the documented stub `Err`s.
+    /// returned \b true. Data-flow replacement and teardown errors propagate
+    /// before any subsequent control-flow rewrite.
     pub fn execute(&mut self, fd: &mut Funcdata) -> KunaResult<()> {
         let iblock = self.iblock.expect("execute: no iblock");
         // Remove ops in reverse order
@@ -723,7 +723,7 @@ impl ConditionalExecution {
                 self.do_replacement(op, fd)?; // Remove all read refs of op
             }
             // Then destroy op
-            fd.op_destroy(op);
+            fd.op_destroy(op)?;
             if !notdone {
                 break;
             }
@@ -774,16 +774,10 @@ impl Action for ActionConditionalExe {
     /// The control loop (the round/`changethisround` fixpoint over the basic
     /// blocks) is reproduced exactly; `count += numhits` lands on
     /// [`ActionBase::count`].
-    ///
-    /// STUB(opSetOutput / W6): a successful trial whose `condexe.execute()` then
-    /// surfaces the documented stub `Err` cannot abort an `apply` that returns a
-    /// bare `int4`; such an execute degrades to "no change made this trial" (the
-    /// hit is not counted and the round does not loop on it).  This is the only
-    /// faithful adaptation possible until `opSetOutput` lands; recorded as a loss.
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         if data.has_unreachable_blocks() {
             // Conditional execution elimination logic may not work with unreachable blocks
-            return 0;
+            return Ok(0);
         }
         let mut numhits: int4 = 0;
         let mut condexe = ConditionalExecution::new(data);
@@ -799,13 +793,9 @@ impl Action for ActionConditionalExe {
             while i < data.bblocks_get_size() {
                 let bb = data.bblocks_get_block(i);
                 if condexe.trial(bb, data) {
-                    // condexe.execute() now succeeds (the W6 resolve_typeop stub is
-                    // closed); a residual Err still degrades to "no change this
-                    // trial" rather than aborting the bare-int4 apply.
-                    if condexe.execute(data).is_ok() {
-                        numhits += 1; // Adjust dataflow succeeded
-                        changethisround = true;
-                    }
+                    condexe.execute(data)?;
+                    numhits += 1; // Adjust dataflow succeeded
+                    changethisround = true;
                 }
                 i += 1;
             }
@@ -814,7 +804,7 @@ impl Action for ActionConditionalExe {
             }
         }
         self.base.count += numhits;
-        0
+        Ok(0)
     }
 }
 
@@ -1066,12 +1056,8 @@ impl RuleOrPredicate {
 }
 
 impl Rule for RuleOrPredicate {
-    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
-        // Note: the C++ returns int4; the stub `Err` paths cannot return through
-        // an `int4`, so a stub error degrades to "no change" (0) here and is
-        // reported by the helper's `Err`.  The applyOp structure is otherwise
-        // faithful.  See STUB notes.
-        self.apply_op_inner(op, data).unwrap_or(0)
+    fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
+        self.apply_op_inner(op, data)
     }
 
     fn get_op_list(&self) -> Vec<OpCode> {

@@ -113,6 +113,23 @@ impl<R: Read, W: Write> GhidraRemoteFetch<R, W> {
 }
 
 impl<R: Read, W: Write> RemoteProviderFetch for GhidraRemoteFetch<R, W> {
+    fn fetch_cpool_ref(&self, refs: &[u64], decoder: &mut dyn Decoder) -> KunaResult<bool> {
+        self.client.borrow_mut().get_cpool_ref(refs, decoder).map_err(wire_to_kuna)
+    }
+
+    fn fetch_string_data(
+        &self,
+        addr: &Address,
+        max_bytes: i32,
+        datatype: &kuna_decomp::dtype::Datatype,
+    ) -> KunaResult<(Vec<u8>, bool)> {
+        let mut bytes = Vec::new();
+        let truncated = self.client.borrow_mut().get_string_data(
+            &mut bytes, addr, datatype.get_name(), datatype.get_unsized_id()?, max_bytes,
+        ).map_err(wire_to_kuna)?;
+        Ok((bytes, truncated))
+    }
+
     fn fetch_mapped_symbols(
         &self,
         addr: &Address,
@@ -190,17 +207,13 @@ impl<R: Read, W: Write> RemoteTypeFetch for GhidraRemoteFetch<R, W> {
 /// case — an unmapped address).  A pipe/IO failure means the host connection
 /// died mid-query; upstream `exit(1)`s from inside `readToAnyBurst`
 /// (`ghidra_arch.cc:95-96`), but the trait method can only return a
-/// `KunaError`, so it is mapped to a `LowlevelError` here.
-///
-/// TODO(phase-2): the process loop needs a way for a provider to signal
-/// "host pipe dead → terminate" so a mid-decompile pipe death still exits
-/// the process with status 1 (the `SharedClient` should carry a fatal flag
-/// the loop checks after each command).
+/// `KunaError`, so terminal transport retains its own engine category until
+/// it reaches the connection owner.
 pub(crate) fn wire_to_kuna(err: WireError) -> KunaError {
     match err {
         WireError::Kuna(e) => e,
-        WireError::PipeClosed => KunaError::lowlevel("ghidra host pipe closed during query"),
-        WireError::Io(e) => KunaError::lowlevel(format!("i/o error during query: {e}")),
+        WireError::PipeClosed => KunaError::transport("ghidra host pipe closed during query"),
+        WireError::Io(e) => KunaError::transport(format!("i/o error during query: {e}")),
     }
 }
 
@@ -327,5 +340,61 @@ mod tests {
             matches!(err, KunaError::DataUnavail { .. }),
             "expected DataUnavail, got {err:?}"
         );
+    }
+
+    #[test]
+    fn load_fill_payload_eof_is_terminal_transport() {
+        let tr = test_translate();
+        let ram = Rc::clone(tr.manager.get_space_by_name("ram").unwrap());
+        let mut reply = Vec::new();
+        burst(&mut reply, 8);
+        burst(&mut reply, 12);
+        reply.extend_from_slice(b"AB"); // one byte of a requested four-byte payload
+        let mut loader = GhidraLoadImage::new(shared(reply));
+        let mut bytes = [0xa5; 4];
+        let err = loader.load_fill(&mut bytes, &Address::new(ram, 0x1000)).unwrap_err();
+        assert!(matches!(err, KunaError::Transport { .. }));
+        assert_eq!(bytes, [0xa5; 4], "incomplete payload must not be admitted");
+        assert!(matches!(WireError::from(err), WireError::PipeClosed));
+    }
+
+    #[test]
+    fn received_exception_allows_next_query_on_same_loader() {
+        let tr = test_translate();
+        let ram = Rc::clone(tr.manager.get_space_by_name("ram").unwrap());
+        let mut reply = Vec::new();
+        burst(&mut reply, 10);
+        burst(&mut reply, 14);
+        reply.extend_from_slice(b"java.lang.IllegalStateException");
+        burst(&mut reply, 15);
+        burst(&mut reply, 14);
+        reply.extend_from_slice(b"temporarily unavailable");
+        burst(&mut reply, 15);
+        burst(&mut reply, 11);
+        reply.extend_from_slice(&get_bytes_response(&[1, 2, 3, 4]));
+        let mut loader = GhidraLoadImage::new(shared(reply));
+        let addr = Address::new(ram, 0x1000);
+        let mut bytes = [0; 4];
+        let err = loader.load_fill(&mut bytes, &addr).unwrap_err();
+        assert!(matches!(err, KunaError::Java { .. }));
+        loader.load_fill(&mut bytes, &addr).unwrap();
+        assert_eq!(bytes, [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn actual_query_read_io_is_terminal_not_a_java_exception() {
+        struct FailedRead;
+        impl Read for FailedRead {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "host reset"))
+            }
+        }
+        let tr = test_translate();
+        let ram = Rc::clone(tr.manager.get_space_by_name("ram").unwrap());
+        let client = Rc::new(RefCell::new(GhidraClient::new(FailedRead, Vec::new())));
+        let mut loader = GhidraLoadImage::new(client);
+        let err = loader.load_fill(&mut [0; 1], &Address::new(ram, 0x1000)).unwrap_err();
+        assert!(matches!(err, KunaError::Transport { .. }));
+        assert!(err.explain().contains("host reset"));
     }
 }

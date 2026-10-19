@@ -9,7 +9,7 @@ import traceback
 
 def run(output, report):
     import pyghidra
-    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra
+    from kuna_vs_stock import KUNA_GHIDRA, get_exepath_field, start_ghidra, test_cores
     from prototype_facts import execute_c
 
     start_ghidra()
@@ -89,8 +89,8 @@ def run(output, report):
                             assert actual == offset, (case, actual)
                         finally:
                             emulator.dispose()
-                        for core, executable in (("stock", None), ("kuna", KUNA_GHIDRA)):
-                            field.set(None, executable)
+                        for core in test_cores():
+                            field.set(None, KUNA_GHIDRA if core == "kuna" else None)
                             interface = DecompInterface()
                             row = {"case": case, "core": core, "bank": bank, "offset": offset,
                                    "wire": wire, "machine_return": actual}

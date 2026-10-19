@@ -1,0 +1,350 @@
+--- a/ghidra/app/decompiler/DecompileResults.java
++++ b/ghidra/app/decompiler/DecompileResults.java
+@@ -16,7 +16,14 @@
+ package ghidra.app.decompiler;
+ 
+ import static ghidra.program.model.pcode.ElementId.*;
+-
++import static ghidra.program.model.pcode.AttributeId.*;
++
++import java.util.*;
++import java.util.function.BooleanSupplier;
++
++import ghidra.program.model.address.Address;
++import ghidra.program.model.address.AddressSpace;
++import ghidra.program.model.data.DataType;
+ import ghidra.program.model.lang.CompilerSpec;
+ import ghidra.program.model.lang.Language;
+ import ghidra.program.model.listing.Function;
+@@ -52,6 +59,69 @@
+  *
+  */
+ public class DecompileResults {
++	private static final ElementId ELEM_KUNA_EXPORT = new ElementId("kuna_export", 4005);
++	private static final ElementId ELEM_KUNA_EXPORT_DECL =
++		new ElementId("kuna_export_decl", 4006);
++	private static final AttributeId ATTRIB_KUNA_PRIVATE = new AttributeId("kuna_private", 4007);
++	private static final AttributeId ATTRIB_KUNA_PUBLIC = new AttributeId("kuna_public", 4008);
++
++	/** One declaration's identity in the actual typed markup, not a reconstructed signature. */
++	public static final class ExportDeclaration {
++		private final int index;
++		private final String name;
++		private final String role;
++
++		private ExportDeclaration(int index, String name, String role) {
++			this.index = index;
++			this.name = name;
++			this.role = role;
++		}
++
++		public int getIndex() { return index; }
++		public String getName() { return name; }
++		public String getRole() { return role; }
++	}
++
++	/** Immutable publication metadata bound to this result's existing typed markup. */
++	public static final class ExportBinding {
++		private final String sourceName;
++		private final String implementationName;
++		private final boolean privateImplementation;
++		private final int publicPrototypeIndex;
++		private final Address entry;
++		private final List<ExportDeclaration> declarations;
++		private final ClangFuncProto publicPrototype;
++		private final Collection<String> declarationNames;
++
++		private ExportBinding(String sourceName, String implementationName,
++				boolean privateImplementation, int publicPrototypeIndex, Address entry,
++				List<ExportDeclaration> declarations, ClangFuncProto publicPrototype) {
++			this.sourceName = sourceName;
++			this.implementationName = implementationName;
++			this.privateImplementation = privateImplementation;
++			this.publicPrototypeIndex = publicPrototypeIndex;
++			this.entry = entry;
++			this.declarations = List.copyOf(declarations);
++			this.publicPrototype = publicPrototype;
++			Set<String> names = new LinkedHashSet<>();
++			names.add(sourceName);
++			names.add(implementationName);
++			for (ExportDeclaration declaration : declarations) {
++				names.add(declaration.name);
++			}
++			declarationNames = List.copyOf(names);
++		}
++
++		public String getSourceName() { return sourceName; }
++		public String getImplementationName() { return implementationName; }
++		public boolean isPrivateImplementation() { return privateImplementation; }
++		public int getPublicPrototypeIndex() { return publicPrototypeIndex; }
++		public Address getEntry() { return entry; }
++		public List<ExportDeclaration> getDeclarations() { return declarations; }
++		public ClangFuncProto getPublicPrototype() { return publicPrototype; }
++		public Collection<String> getDeclarationNames() { return declarationNames; }
++	}
++
+ 	private Function function; // Function to which results pertain
+ 	private Language language;
+ 	private CompilerSpec compilerSpec;
+@@ -61,21 +131,193 @@
+ 	private ClangTokenGroup docroot; // C code parsed from XML
+ 	private String errMsg; // Error message from decompiler
+ 	private DecompileProcess.DisposeState processState;
++	private ExportBinding exportBinding;
+ 
+ 	public DecompileResults(Function f, Language language, CompilerSpec compilerSpec,
+ 			PcodeDataTypeManager d, String e, Decoder decoder,
+ 			DecompileProcess.DisposeState processState) {
++		this(f, language, compilerSpec, d, e, decoder, processState, null);
++	}
++
++	DecompileResults(Function f, Language language, CompilerSpec compilerSpec,
++			PcodeDataTypeManager d, String e, Decoder decoder,
++			DecompileProcess.DisposeState processState, BooleanSupplier exportAuthority) {
++		this(f, language, compilerSpec, d, e, decoder, processState, exportAuthority,
++			d == null ? 0 : d.getProgram().getModificationNumber());
++	}
++
++	DecompileResults(Function f, Language language, CompilerSpec compilerSpec,
++			PcodeDataTypeManager d, String e, Decoder decoder,
++			DecompileProcess.DisposeState processState, BooleanSupplier exportAuthority,
++			long sourceRevision) {
+ 		function = f;
+ 		this.language = language;
+ 		this.compilerSpec = compilerSpec;
+-		dtmanage = d;
++		dtmanage = d == null ? null : exportAuthority == null ? d.createResultView(sourceRevision) :
++			d.createExportResultView(exportAuthority, sourceRevision);
+ 		errMsg = e;
+ 		hfunc = null;
+ 		hparamid = null;
+ 		docroot = null;
+ 		this.processState = processState;
+ 		//dumpResults(raw);
+-		decodeStream(decoder);
++		try {
++			decodeStream(decoder);
++		}
++		finally {
++			if (dtmanage != null) {
++				dtmanage.finishResultDecode();
++			}
++		}
++	}
++
++	public PcodeDataTypeManager getDataTypeManager() {
++		return dtmanage;
++	}
++
++	public Collection<DataType> getResultDataTypes() {
++		return dtmanage == null ? Collections.emptyList() : dtmanage.getResultDataTypes();
++	}
++
++	public boolean isEnhancedResult() {
++		return dtmanage != null && dtmanage.isEnhancedResult();
++	}
++
++	public boolean isExportResult() {
++		return dtmanage != null && dtmanage.isExportResult();
++	}
++
++	public boolean hasCurrentExportAuthority() {
++		return decompileCompleted() &&
++			(dtmanage == null || dtmanage.hasCurrentExportAuthority());
++	}
++
++	public void requireCurrentExportAuthority() {
++		if (!decompileCompleted()) {
++			throw new IllegalStateException("Incomplete decompiler result cannot be exported");
++		}
++		if (dtmanage != null) {
++			dtmanage.requireCurrentExportAuthority();
++		}
++	}
++
++	public boolean hasCurrentSourceAuthority() {
++		return dtmanage == null || dtmanage.hasCurrentSourceAuthority();
++	}
++
++	public void requireCurrentSourceAuthority() {
++		if (dtmanage != null) {
++			dtmanage.requireCurrentSourceAuthority();
++		}
++	}
++
++	public ExportBinding getExportBinding() {
++		return exportBinding;
++	}
++
++	private ExportBinding decodeExportBinding(Decoder decoder) throws DecoderException {
++		int root = decoder.openElement(ELEM_KUNA_EXPORT);
++		String sourceName = decoder.readString(ATTRIB_NAME);
++		String implementationName = decoder.readString(ATTRIB_CONTENT);
++		boolean privateImplementation = decoder.readBool(ATTRIB_KUNA_PRIVATE);
++		int publicIndex = Math.toIntExact(decoder.readSignedInteger(ATTRIB_KUNA_PUBLIC));
++		if (sourceName.isEmpty() || implementationName.isEmpty() || publicIndex < -1) {
++			throw new DecoderException("Invalid export publication identity");
++		}
++		int addressElement = decoder.openElement(ELEM_ADDR);
++		AddressSpace space = decoder.readSpace(ATTRIB_SPACE);
++		long offset = decoder.readUnsignedInteger(ATTRIB_OFFSET);
++		if (space == null) {
++			throw new DecoderException("Missing export entry address space");
++		}
++		Address entry = space.getAddress(offset);
++		decoder.closeElement(addressElement);
++		if (!entry.equals(function.getEntryPoint())) {
++			throw new DecoderException("Export publication entry does not match the function");
++		}
++		List<ExportDeclaration> declarations = new ArrayList<>();
++		Set<Integer> indices = new HashSet<>();
++		while (decoder.peekElement() != 0) {
++			int child = decoder.openElement(ELEM_KUNA_EXPORT_DECL);
++			int index = Math.toIntExact(decoder.readUnsignedInteger(ATTRIB_INDEX));
++			String name = decoder.readString(ATTRIB_NAME);
++			String role = decoder.readString(ATTRIB_CONTENT);
++			if (index < 0 || name.isEmpty() || !indices.add(index) ||
++				!(role.equals("public") || role.equals("implementation") ||
++					role.equals("dependency") || role.equals("helper"))) {
++				throw new DecoderException("Invalid or duplicate export declaration");
++			}
++			declarations.add(new ExportDeclaration(index, name, role));
++			decoder.closeElement(child);
++		}
++		decoder.closeElement(root);
++		return new ExportBinding(sourceName, implementationName, privateImplementation,
++			publicIndex, entry, declarations, null);
++	}
++
++	private ExportBinding bindExportMarkup(ExportBinding binding) throws DecoderException {
++		if (hfunc == null || docroot == null) {
++			throw new DecoderException("Export publication requires complete High and C markup");
++		}
++		List<ClangFuncProto> prototypes = new ArrayList<>();
++		collectExportPrototypes(docroot, prototypes);
++		if (binding.publicPrototypeIndex >= prototypes.size()) {
++			throw new DecoderException("Export public prototype index is out of range");
++		}
++		boolean foundPublic = false;
++		boolean foundImplementation = false;
++		for (ExportDeclaration declaration : binding.declarations) {
++			if (declaration.index >= prototypes.size()) {
++				throw new DecoderException("Export declaration index is out of range");
++			}
++			if (!declaration.name.equals(findExportFunctionName(prototypes.get(declaration.index)))) {
++				throw new DecoderException("Export declaration does not match typed markup");
++			}
++			if (declaration.role.equals("public")) {
++				if (foundPublic || declaration.index != binding.publicPrototypeIndex ||
++					!declaration.name.equals(binding.sourceName)) {
++					throw new DecoderException("Export public declaration does not match publication");
++				}
++				foundPublic = true;
++			}
++			if (declaration.role.equals("implementation")) {
++				if (foundImplementation || !declaration.name.equals(binding.implementationName)) {
++					throw new DecoderException("Export implementation declaration does not match publication");
++				}
++				foundImplementation = true;
++			}
++		}
++		if (foundPublic != (binding.publicPrototypeIndex >= 0) ||
++			binding.privateImplementation && !foundImplementation) {
++			throw new DecoderException("Missing export publication declaration");
++		}
++		ClangFuncProto publicPrototype = binding.publicPrototypeIndex < 0 ? null :
++			prototypes.get(binding.publicPrototypeIndex);
++		return new ExportBinding(binding.sourceName, binding.implementationName,
++			binding.privateImplementation, binding.publicPrototypeIndex, binding.entry,
++			binding.declarations, publicPrototype);
++	}
++
++	private static void collectExportPrototypes(ClangNode node, List<ClangFuncProto> prototypes) {
++		if (node instanceof ClangFuncProto prototype) {
++			prototypes.add(prototype);
++		}
++		for (int i = 0; i < node.numChildren(); i++) {
++			collectExportPrototypes(node.Child(i), prototypes);
++		}
++	}
++
++	private static String findExportFunctionName(ClangNode node) {
++		if (node instanceof ClangFuncNameToken token) {
++			return token.getText();
++		}
++		for (int i = 0; i < node.numChildren(); i++) {
++			String name = findExportFunctionName(node.Child(i));
++			if (name != null) {
++				return name;
++			}
++		}
++		return null;
+ 	}
+ 
+ //	private void dumpResults(String raw) {
+@@ -220,7 +462,12 @@
+ 			hfunc = null;
+ 			hparamid = null;
+ 			docroot = null;
++			exportBinding = null;
++			ExportBinding pendingBinding = null;
+ 			int docel = decoder.openElement(ELEM_DOC);
++			if (decoder.peekElement() == PcodeDataTypeManager.ELEM_KUNA_RESULT.id()) {
++				dtmanage.decodeResultPrelude(decoder);
++			}
+ 			for (;;) {
+ 				int el = decoder.peekElement();
+ 				if (el == 0) {
+@@ -232,9 +479,12 @@
+ 						hfunc.decode(decoder);
+ 					}
+ 					else {		// TODO: This is an ugly kludge to get around duplicate XML tag names
++						if (isExportResult() && docroot != null) {
++							throw new DecoderException("Duplicate export C markup");
++						}
+ 						docroot = ClangMarkup.buildClangTree(decoder, hfunc);
+ 						if (docroot == null) {
+-							errMsg = "Unable to decode C markup";
++							throw new DecoderException("Unable to decode C markup");
+ 						}
+ 					}
+ 				}
+@@ -242,23 +492,36 @@
+ 					hparamid = new HighParamID(function, language, compilerSpec, dtmanage);
+ 					hparamid.decode(decoder);
+ 				}
++				else if (el == ELEM_KUNA_EXPORT.id()) {
++					if (!isExportResult() || !isEnhancedResult() || hfunc == null ||
++						docroot != null || pendingBinding != null) {
++						throw new DecoderException("Unexpected export publication metadata");
++					}
++					pendingBinding = decodeExportBinding(decoder);
++				}
+ 				else {
+-					errMsg = "Unknown decompiler tag";
+-					return;
++					throw new DecoderException("Unknown decompiler tag");
+ 				}
+ 			}
+ 			decoder.closeElement(docel);
++			if (pendingBinding != null) {
++				exportBinding = bindExportMarkup(pendingBinding);
++			}
+ 		}
+ 		catch (DecoderException e) {		// Error while walking the DOM
+ 			errMsg = e.getMessage();
+ 			hfunc = null;
+ 			hparamid = null;
++			docroot = null;
++			exportBinding = null;
+ 			return;
+ 		}
+ 		catch (Exception e) {				// Exception with the underlying stream
+ 			errMsg = e.getMessage();
+ 			hfunc = null;
+ 			hparamid = null;
++			docroot = null;
++			exportBinding = null;
+ 			return;
+ 		}
+ 	}

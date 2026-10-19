@@ -651,7 +651,8 @@ impl BitFieldPullTransform {
 
     /// Transform recovered expressions into ZPULL or SPULL operations (C++
     /// `BitFieldPullTransform::apply`, bitfield.cc:1649-1669).
-    pub fn apply(&mut self, data: &mut Funcdata) {
+    /// Propagates output-detachment and recursive-teardown acquisition failures to the rule.
+    pub fn apply(&mut self, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
         let partial_type = self.build_partial_type(data);
         let mut state = TransformState {
             partial_type,
@@ -665,7 +666,7 @@ impl BitFieldPullTransform {
                 self.apply_compare_record(data);
             } else {
                 let rec = self.pull_list.remove(0);
-                self.apply_record(data, rec, &mut state);
+                self.apply_record(data, rec, &mut state)?;
             }
         }
         if let Some(load) = self.load_op {
@@ -673,6 +674,7 @@ impl BitFieldPullTransform {
                 self.fold_ptrsub(data, load);
             }
         }
+        Ok(())
     }
 
     /// Build the (partial) data-type associated with the root bitfield container
@@ -697,13 +699,13 @@ impl BitFieldPullTransform {
 
     /// Perform transform corresponding to the given PullRecord (C++
     /// `BitFieldPullTransform::applyRecord`, bitfield.cc:1435-1499).
-    fn apply_record(&mut self, data: &mut Funcdata, mut rec: PullRecord, state: &mut TransformState) {
+    fn apply_record(&mut self, data: &mut Funcdata, mut rec: PullRecord, state: &mut TransformState) -> kuna_base::error::KunaResult<()> {
         let mod_op: OpId;
         if rec.read_op.is_none() {
             // null readOp -> readVn contains a complete pull.
             let read_vn = rec.read_vn.unwrap();
             mod_op = data.vbank().get(read_vn).unwrap().get_def().unwrap();
-            data.op_unset_output(mod_op);
+            data.op_unset_output(mod_op)?;
         } else {
             let read_op = rec.read_op.unwrap();
             let read_vn = rec.read_vn.unwrap();
@@ -792,10 +794,11 @@ impl BitFieldPullTransform {
                 Some(v) => data.vbank().get(v).map(|x| x.has_no_descend()).unwrap_or(true),
             };
             if dead {
-                data.op_destroy_recursive(mod_op, &mut state.dead_scratch);
+                data.op_destroy_recursive(mod_op, &mut state.dead_scratch)?;
             }
         }
         state.count += 1;
+        Ok(())
     }
 
     /// Perform transform on an INT_EQUAL or INT_NOTEQUAL group (C++

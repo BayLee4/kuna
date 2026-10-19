@@ -74,7 +74,7 @@ fn program(budget: Option<Duration>) -> (ConsoleProgram, PathBuf) {
 fn decompile(budget: Option<Duration>) -> (Option<String>, Option<String>) {
     let (mut program, path) = program(budget);
     let entry = program.find_entry_at(0x401000).expect("entry point");
-    let mut result = decompile_targets(&mut program, vec![entry], true, false, false);
+    let mut result = decompile_targets(&mut program, vec![entry], true, false, false).unwrap();
     std::fs::remove_file(path).unwrap();
     let r = result.remove(0);
     (r.code, r.error)

@@ -1422,7 +1422,7 @@ mod tests {
         }
         #[allow(clippy::mutable_key_type)] // register map keys' Ord is index/offset/size
         fn get_all_registers(&self, _reglist: &mut BTreeMap<VarnodeData, String>) {}
-        fn get_user_op_names(&self, _res: &mut Vec<String>) {}
+        fn get_user_op_names(&self, _res: &mut Vec<String>) -> KunaResult<()> { Ok(()) }
         fn instruction_length(&self, baseaddr: &Address) -> KunaResult<i32> {
             match self.prog.get(&baseaddr.get_offset()) {
                 Some(i) => Ok(i.len),
@@ -1474,11 +1474,11 @@ mod tests {
         fn get_register(&self, _nm: &str) -> KunaResult<VarnodeStorage> {
             Err(KunaError::sleigh("no registers"))
         }
-        fn get_register_name(&self, _b: &Rc<AddrSpace>, _o: u64, _s: i32) -> String {
-            String::new()
+        fn get_register_name(&self, _b: &Rc<AddrSpace>, _o: u64, _s: i32) -> KunaResult<String> {
+            Ok(String::new())
         }
-        fn get_exact_register_name(&self, _b: &Rc<AddrSpace>, _o: u64, _s: i32) -> String {
-            String::new()
+        fn get_exact_register_name(&self, _b: &Rc<AddrSpace>, _o: u64, _s: i32) -> KunaResult<String> {
+            Ok(String::new())
         }
     }
 

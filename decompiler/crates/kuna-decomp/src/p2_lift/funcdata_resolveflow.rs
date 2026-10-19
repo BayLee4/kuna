@@ -166,7 +166,7 @@ impl Funcdata {
             if let Some(vn) = o.get_in(1) {
                 let is_lock = self.vbank().get(vn).map(|v| v.is_type_lock()).unwrap_or(false);
                 if is_lock {
-                    let read = self.vn_type_read_facing(vn, op);
+                    let read = self.vn_type_read_facing(vn, op)?;
                     if read.get_metatype() == type_metatype::TYPE_PTR
                         && read.get_ptr_to().map(|p| Rc::ptr_eq(&p, parent)).unwrap_or(false)
                     {

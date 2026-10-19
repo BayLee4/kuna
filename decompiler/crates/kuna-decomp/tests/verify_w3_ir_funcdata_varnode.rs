@@ -87,7 +87,7 @@ fn no_replace() -> impl FnMut(&mut VarnodeBank, VarnodeId, VarnodeId) -> KunaRes
 /// xref split-borrow `setInputVarnode` needs — see funcdata_varnode.rs module doc).
 fn make_input(fd: &mut Funcdata, off: u64, size: int4) -> VarnodeId {
     let r = ram(fd);
-    let vn = fd.new_varnode(size, &Address::new(r, off), None);
+    let vn = fd.new_varnode(size, &Address::new(r, off), None).unwrap();
     fd.vbank_mut().set_input(vn, &mut no_replace()).unwrap()
 }
 
@@ -98,7 +98,7 @@ fn make_written(fd: &mut Funcdata, off: u64, size: int4) -> (VarnodeId, OpId) {
     let pc = Address::new(Rc::clone(&r), off);
     let defop = fd.obank_mut().create_at(1, pc);
     fd.obank_mut().change_opcode(defop, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
-    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size)));
+    let vn = fd.new_varnode(size, &Address::new(r, off), Some(unk(size))).unwrap();
     let seq = fd.obank().get(defop).unwrap().get_seq_num().clone();
     let info = DefOpInfo { id: defop, seqnum: seq };
     let vn = fd.vbank_mut().set_def(vn, info, &mut no_replace()).unwrap();
@@ -139,7 +139,7 @@ fn find_input_overlap_picks_immediately_preceding_input() {
     let mid = make_input(&mut fd, 0x200, 4);
     let _hi = make_input(&mut fd, 0x300, 4);
 
-    let cand = fd.new_varnode(4, &Address::new(r, 0x200), None);
+    let cand = fd.new_varnode(4, &Address::new(r, 0x200), None).unwrap();
     // C++: --iter lands on the input at 0x200 (same addr+size) -> identical ->
     // return invn (funcdata_varnode.cc:358-359).
     assert_eq!(
@@ -158,7 +158,7 @@ fn find_input_overlap_no_inputs_but_written_present_returns_none() {
     let mut fd = build_fd();
     let r = ram(&fd);
     let (_w, _d) = make_written(&mut fd, 0x40, 4); // a written varnode, no inputs
-    let cand = fd.new_varnode(4, &Address::new(r, 0x40), None);
+    let cand = fd.new_varnode(4, &Address::new(r, 0x40), None).unwrap();
     assert_eq!(
         fd.find_input_overlap(cand).unwrap(),
         None,
@@ -175,7 +175,7 @@ fn find_input_overlap_probe_at_first_input_start_is_none() {
     let r = ram(&fd);
     let _inp = make_input(&mut fd, 0x200, 4);
     // candidate [0x100,0x104) ; probe = 0x104 <= 0x200 (first input start).
-    let cand = fd.new_varnode(4, &Address::new(r, 0x100), None);
+    let cand = fd.new_varnode(4, &Address::new(r, 0x100), None).unwrap();
     assert_eq!(
         fd.find_input_overlap(cand).unwrap(),
         None,
@@ -191,7 +191,7 @@ fn find_input_overlap_overlapping_not_identical_errors() {
     let mut fd = build_fd();
     let r = ram(&fd);
     let _inp = make_input(&mut fd, 0x100, 4);
-    let cand = fd.new_varnode(2, &Address::new(r, 0x101), None);
+    let cand = fd.new_varnode(2, &Address::new(r, 0x101), None).unwrap();
     assert!(
         fd.find_input_overlap(cand).is_err(),
         "overlapping-but-not-identical candidate must error"
@@ -210,7 +210,7 @@ fn find_input_overlap_multiple_inputs_same_addr_picks_largest() {
     let big = make_input(&mut fd, 0x100, 4);
     // Candidate matching the size-4 input. probe = 0x100 + 4 = 0x104. --iter
     // steps back over {(0x100,2),(0x100,4)} to (0x100,4) == big.
-    let cand = fd.new_varnode(4, &Address::new(r, 0x100), None);
+    let cand = fd.new_varnode(4, &Address::new(r, 0x100), None).unwrap();
     assert_eq!(
         fd.find_input_overlap(cand).unwrap(),
         Some(big),

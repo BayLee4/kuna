@@ -5,6 +5,7 @@ use crate::database::SymbolId;
 use crate::dtype::type_metatype;
 use crate::funcdata::Funcdata;
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_num::opcodes::OpCode;
 
 #[derive(Clone, Copy)]
@@ -30,71 +31,68 @@ pub(crate) struct Assignment {
     pub ranges: Vec<Range>,
 }
 
-pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
-    macro_rules! reject {
-        ($($arg:tt)*) => {{
-            return None;
-        }};
-    }
+pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> KunaResult<Option<Assignment>> {
     if !fd.get_arch().stack_views {
-        reject!("stackviews off");
+        return Ok(None);
     }
     let Some(operation) = fd.obank().get(op) else {
-        reject!("stale op");
+        return Ok(None);
     };
     if operation.is_marker() {
-        reject!("marker");
+        return Ok(None);
     }
     let Some(output) = operation.get_out() else {
-        reject!("no output");
+        return Ok(None);
     };
     let Some(value) = fd.vbank().get(output) else {
-        reject!("missing output varnode");
+        return Ok(None);
     };
     let Some(stack) = fd.get_arch().manage().get_stack_space() else {
-        reject!("no stack space");
+        return Ok(None);
     };
     if value.get_space().get_index() != stack.get_index() {
-        reject!("output is not stack space");
+        return Ok(None);
     }
     let size = value.get_size();
     if !(1..=8).contains(&size) {
-        reject!("output size {size}");
+        return Ok(None);
     }
     let Some(scope) = fd.get_scope_local() else {
-        reject!("no local scope");
+        return Ok(None);
     };
     let Some(info) =
         scope.query_container_for_link_width(value.get_addr(), size, &Address::new_invalid())
     else {
-        reject!(
-            "no stack container for offset {} size {size}",
-            value.get_offset()
-        );
+        return Ok(None);
     };
     if info.is_name_undefined {
-        reject!("unnamed stack container");
+        return Ok(None);
     }
     let stackview_container = info
         .sym_type
         .as_ref()
         .is_some_and(|ty| ty.get_name().starts_with("stack_views_"));
-    let output_type = fd.vn_type_read_facing(output, op).get_metatype();
+    let output_type = fd.vn_type_read_facing(output, op)?.get_metatype();
     let source_type = operation
         .get_in(0)
-        .map(|source| fd.vn_type_read_facing(source, op).get_metatype());
+        .map(|source| fd.vn_type_read_facing(source, op))
+        .transpose()?;
     let pointer_copy = operation.code() == OpCode::CPUI_COPY
         && stackview_container
         && (is_pointer_type(output_type)
-            || is_pointer_type(fd.vn_type_def_facing(output).get_metatype())
-            || operation.get_in(0).is_some_and(|source| {
-                source_type.is_some_and(is_pointer_type) || def_facing_pointer(fd, source)
-            }));
+            || is_pointer_type(fd.vn_type_def_facing(output)?.get_metatype())
+            || match operation.get_in(0) {
+                Some(source) => {
+                    source_type.as_ref().is_some_and(|ty| is_pointer_type(ty.get_metatype()))
+                        || def_facing_pointer(fd, source)?
+                }
+                None => false,
+            });
     if pointer_copy {
-        reject!("pointer-valued stackview COPY stays typed");
+        return Ok(None);
     }
-    let Some(mut bytes) = expression(fd, output, true, 32, op, info.symbol, None) else {
-        reject!("unsupported source expression, output size {size}");
+    let Some(mut bytes) = expression(fd, output, true, 32, op, info.symbol, None)? else {
+        return Ok(None);
     };
     if stack.is_big_endian() {
         bytes.reverse();
@@ -121,38 +119,37 @@ pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
         .enumerate()
         .map(|(index, byte)| preserved(index, *byte))
         .collect();
-    let physical_merged_source = bytes.iter().any(|byte| {
+    let mut physical_merged_source = false;
+    for byte in &bytes {
         let Byte::Value {
             source, read_op, ..
         } = byte
         else {
-            return false;
+            continue;
         };
-        shares_backing_high(fd, *source, info.symbol)
+        if shares_backing_high(fd, *source, info.symbol)
             && !same_backing(fd, *source, info.symbol)
             && (safe_load_op(fd, *source, op).is_some()
                 || safe_global_source(fd, *source, op, *read_op).is_some())
             && fd.vbank().get(*source).is_some()
-            && !is_pointer_type(fd.vn_type_read_facing(*source, op).get_metatype())
-            && !def_facing_pointer(fd, *source)
-    });
+            && !is_pointer_type(fd.vn_type_read_facing(*source, op)?.get_metatype())
+            && !def_facing_pointer(fd, *source)?
+        {
+            physical_merged_source = true;
+            break;
+        }
+    }
     let stackview_scalar_copy = operation.code() == OpCode::CPUI_COPY
         && stackview_container
         && !pointer_copy
         && (operation.not_printed() || value.is_implied() || physical_merged_source);
     if matches!(size, 1 | 2 | 4 | 8) && !keep.iter().any(|keep| *keep) {
         if !matches!(
-            fd.vn_type_def_facing(output).get_metatype(),
+            fd.vn_type_def_facing(output)?.get_metatype(),
             type_metatype::TYPE_ARRAY | type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION
         ) && !stackview_scalar_copy
         {
-            reject!(
-                "no preserved bytes and scalar output type {:?}; op={:?}; internal={}; container={}",
-                fd.vn_type_def_facing(output).get_metatype(),
-                operation.code(),
-                operation.not_printed(),
-                info.sym_type.as_ref().map_or("<none>", |ty| ty.get_name())
-            );
+            return Ok(None);
         }
     }
     let mut ranges: Vec<Range> = Vec::new();
@@ -168,7 +165,7 @@ pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
         } = byte
         {
             let Some(source_value) = fd.vbank().get(source) else {
-                reject!("missing source varnode");
+                return Ok(None);
             };
             let shares_stackview_high = shares_backing_high(fd, source, info.symbol);
             let safe_load = safe_load_op(fd, source, op).is_some();
@@ -179,23 +176,12 @@ pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
                 && !safe_load
                 && !safe_global
             {
-                reject!(
-                    "source cannot be safely re-read after stackview merge (implied {}, shared high {}, size {}, readonly {}, volatile {}, def {:?})",
-                    source_value.is_implied(),
-                    shares_stackview_high,
-                    source_value.get_size(),
-                    source_value.is_read_only(),
-                    source_value.is_volatile(),
-                    source_value
-                        .get_def()
-                        .and_then(|def| fd.obank().get(def))
-                        .map(|op| op.code())
-                );
+                return Ok(None);
             }
             if !matches!(source_value.get_size(), 1 | 2 | 4 | 8) {
-                reject!("source size {} unsupported", source_value.get_size());
+                return Ok(None);
             }
-            let read_type = fd.vn_type_read_facing(source, op).get_metatype();
+            let read_type = fd.vn_type_read_facing(source, op)?.get_metatype();
             if !matches!(
                 read_type,
                 type_metatype::TYPE_BOOL
@@ -203,17 +189,17 @@ pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
                     | type_metatype::TYPE_UINT
                     | type_metatype::TYPE_UNKNOWN
             ) {
-                reject!("source read type {read_type:?} rejected");
+                return Ok(None);
             }
-            if def_facing_pointer(fd, source) {
-                reject!("pointer source cannot be flattened into raw bytes");
+            if def_facing_pointer(fd, source)? {
+                return Ok(None);
             }
             if !safe_load
                 && !safe_global
                 && !same_backing(fd, source, info.symbol)
                 && !named(fd, source)
             {
-                reject!("source has no declared name");
+                return Ok(None);
             }
         }
         let index = index as i32;
@@ -230,15 +216,15 @@ pub(crate) fn assignment(fd: &Funcdata, op: OpId) -> Option<Assignment> {
         }
     }
     if ranges.is_empty() {
-        reject!("no output ranges after preserved bytes");
+        return Ok(None);
     }
-    Some(Assignment {
+    Ok(Some(Assignment {
         output,
         name: info.display_name,
         offset: info.sym_off,
         pointer_size: stack.get_addr_size() as i32,
         ranges,
-    })
+    }))
 }
 
 fn same_backing(fd: &Funcdata, value: VarnodeId, symbol: SymbolId) -> bool {
@@ -380,23 +366,23 @@ fn expression(
     use_op: OpId,
     backing_symbol: SymbolId,
     read_op: Option<OpId>,
-) -> Option<Vec<Byte>> {
-    let depth = depth.checked_sub(1)?;
-    let value = fd.vbank().get(id)?;
+) -> KunaResult<Option<Vec<Byte>>> {
+    let Some(depth) = depth.checked_sub(1) else { return Ok(None) };
+    let Some(value) = fd.vbank().get(id) else { return Ok(None) };
     let size = value.get_size();
     if !(1..=8).contains(&size) {
-        return None;
+        return Ok(None);
     }
     if value.is_constant() {
-        let read_type = fd.vn_type_read_facing(id, use_op).get_metatype();
-        if is_pointer_type(read_type) || def_facing_pointer(fd, id) {
-            return None;
+        let read_type = fd.vn_type_read_facing(id, use_op)?.get_metatype();
+        if is_pointer_type(read_type) || def_facing_pointer(fd, id)? {
+            return Ok(None);
         }
-        return Some(
+        return Ok(Some(
             (0..size)
                 .map(|byte| Byte::Constant((value.get_offset() >> (byte * 8)) as u8))
                 .collect(),
-        );
+        ));
     }
     let merged_source =
         shares_backing_high(fd, id, backing_symbol) && !same_backing(fd, id, backing_symbol);
@@ -419,7 +405,7 @@ fn expression(
     if top || value.is_implied() || merged_source || has_projectable_def {
         let Some(def) = value.get_def() else {
             if merged_source && is_default_data_value(fd, id) {
-                return Some(
+                return Ok(Some(
                     (0..size)
                         .map(|byte| Byte::Value {
                             source: id,
@@ -427,19 +413,20 @@ fn expression(
                             read_op: read_op.or(Some(use_op)),
                         })
                         .collect(),
-                );
+                ));
             }
-            return None;
+            return Ok(None);
         };
-        let op = fd.obank().get(def)?;
-        let input = op.get_in(0)?;
+        let Some(op) = fd.obank().get(def) else { return Ok(None) };
+        let Some(input) = op.get_in(0) else { return Ok(None) };
         let literal = |slot| {
             let value = fd.vbank().get(op.get_in(slot)?)?;
             value.is_constant().then_some(value.get_offset())
         };
         match op.code() {
             OpCode::CPUI_COPY | OpCode::CPUI_CAST => {
-                if fd.vbank().get(input)?.get_size() == size {
+                let Some(input_value) = fd.vbank().get(input) else { return Ok(None) };
+                if input_value.get_size() == size {
                     let next_read = if is_default_data_value(fd, input) {
                         Some(def)
                     } else {
@@ -449,7 +436,7 @@ fn expression(
                 }
             }
             OpCode::CPUI_PIECE => {
-                let low_input = op.get_in(1)?;
+                let Some(low_input) = op.get_in(1) else { return Ok(None) };
                 let low_read = if is_default_data_value(fd, low_input) {
                     Some(def)
                 } else {
@@ -460,7 +447,7 @@ fn expression(
                 } else {
                     read_op
                 };
-                let mut low = expression(
+                let Some(mut low) = expression(
                     fd,
                     low_input,
                     false,
@@ -468,8 +455,8 @@ fn expression(
                     use_op,
                     backing_symbol,
                     low_read,
-                )?;
-                low.extend(expression(
+                )? else { return Ok(None) };
+                let Some(high) = expression(
                     fd,
                     input,
                     false,
@@ -477,20 +464,24 @@ fn expression(
                     use_op,
                     backing_symbol,
                     high_read,
-                )?);
-                return (low.len() == size as usize).then_some(low);
+                )? else { return Ok(None) };
+                low.extend(high);
+                return Ok((low.len() == size as usize).then_some(low));
             }
             OpCode::CPUI_SUBPIECE => {
-                let offset: usize = literal(1)?.try_into().ok()?;
+                let Some(offset) = literal(1).and_then(|offset| usize::try_from(offset).ok()) else {
+                    return Ok(None);
+                };
                 let next_read = if is_default_data_value(fd, input) {
                     Some(def)
                 } else {
                     read_op
                 };
-                let bytes = expression(fd, input, false, depth, use_op, backing_symbol, next_read)?;
-                return bytes
-                    .get(offset..offset.checked_add(size as usize)?)
-                    .map(|bytes| bytes.to_vec());
+                let Some(bytes) = expression(fd, input, false, depth, use_op, backing_symbol, next_read)? else {
+                    return Ok(None);
+                };
+                let Some(end) = offset.checked_add(size as usize) else { return Ok(None) };
+                return Ok(bytes.get(offset..end).map(|bytes| bytes.to_vec()));
             }
             OpCode::CPUI_INT_ZEXT => {
                 let next_read = if is_default_data_value(fd, input) {
@@ -498,30 +489,34 @@ fn expression(
                 } else {
                     read_op
                 };
-                let mut bytes =
-                    expression(fd, input, false, depth, use_op, backing_symbol, next_read)?;
+                let Some(mut bytes) =
+                    expression(fd, input, false, depth, use_op, backing_symbol, next_read)? else {
+                        return Ok(None);
+                    };
                 if bytes.len() > size as usize {
-                    return None;
+                    return Ok(None);
                 }
                 bytes.resize(size as usize, Byte::Constant(0));
-                return Some(bytes);
+                return Ok(Some(bytes));
             }
             OpCode::CPUI_INT_LEFT | OpCode::CPUI_INT_RIGHT => {
-                let shift = literal(1)?;
+                let Some(shift) = literal(1) else { return Ok(None) };
                 if shift % 8 != 0 {
-                    return None;
+                    return Ok(None);
                 }
                 let next_read = if is_default_data_value(fd, input) {
                     Some(def)
                 } else {
                     read_op
                 };
-                let bytes = expression(fd, input, false, depth, use_op, backing_symbol, next_read)?;
+                let Some(bytes) = expression(fd, input, false, depth, use_op, backing_symbol, next_read)? else {
+                    return Ok(None);
+                };
                 if bytes.len() != size as usize {
-                    return None;
+                    return Ok(None);
                 }
-                let shift: usize = (shift / 8).try_into().ok()?;
-                return Some(
+                let Ok(shift) = usize::try_from(shift / 8) else { return Ok(None) };
+                return Ok(Some(
                     (0..size as usize)
                         .map(|byte| {
                             let source = if op.code() == OpCode::CPUI_INT_LEFT {
@@ -534,10 +529,10 @@ fn expression(
                                 .unwrap_or(Byte::Constant(0))
                         })
                         .collect(),
-                );
+                ));
             }
             OpCode::CPUI_LOAD if safe_load_op(fd, id, use_op).is_some() => {
-                return Some(
+                return Ok(Some(
                     (0..size)
                         .map(|byte| Byte::Value {
                             source: id,
@@ -545,13 +540,13 @@ fn expression(
                             read_op: None,
                         })
                         .collect(),
-                );
+                ));
             }
             _ => (),
         }
-        return None;
+        return Ok(None);
     }
-    Some(
+    Ok(Some(
         (0..size)
             .map(|byte| Byte::Value {
                 source: id,
@@ -563,7 +558,7 @@ fn expression(
                 },
             })
             .collect(),
-    )
+    ))
 }
 
 /// A byte source printed by name must be a declared variable, not bare storage.
@@ -576,14 +571,13 @@ fn named(fd: &Funcdata, value: VarnodeId) -> bool {
 }
 
 /// Only a written Varnode has a def-facing type; an input or constant has its own.
-fn def_facing_pointer(fd: &Funcdata, value: VarnodeId) -> bool {
-    fd.vbank().get(value).is_some_and(|vn| {
-        is_pointer_type(if vn.is_written() {
-            fd.vn_type_def_facing(value).get_metatype()
-        } else {
-            vn.get_type().get_metatype()
-        })
-    })
+fn def_facing_pointer(fd: &Funcdata, value: VarnodeId) -> KunaResult<bool> {
+    let Some(vn) = fd.vbank().get(value) else { return Ok(false) };
+    Ok(is_pointer_type(if vn.is_written() {
+        fd.vn_type_def_facing(value)?.get_metatype()
+    } else {
+        vn.get_type().get_metatype()
+    }))
 }
 
 fn is_pointer_type(meta: type_metatype) -> bool {
@@ -671,7 +665,9 @@ mod tests {
             fd.op_set_opcode(op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
             op
         };
-        let global = fd.new_varnode(1, &Address::new(Rc::clone(&ram), 0x2000), None);
+        let global = fd
+            .new_varnode(1, &Address::new(Rc::clone(&ram), 0x2000), None)
+            .unwrap();
         let read = make_copy(&mut fd, 0x1001);
         fd.op_set_input(read, global, 0).unwrap();
         fd.new_varnode_out(1, &Address::new(Rc::clone(&register), 0x40), read)
@@ -744,7 +740,7 @@ mod tests {
                 .expect("register space"),
         );
         let block = fd.obank().get(use_op).unwrap().get_parent().unwrap();
-        let global = fd.new_varnode(4, &Address::new(ram, 0x2100), None);
+        let global = fd.new_varnode(4, &Address::new(ram, 0x2100), None).unwrap();
 
         let copy = fd.new_op(1, Address::new(Rc::clone(&register), 0x60));
         fd.op_set_opcode(copy, crate::typeop::type_op_for(OpCode::CPUI_COPY));
@@ -780,6 +776,7 @@ mod tests {
             SymbolId::default(),
             None,
         )
+        .expect("source type resolution")
         .expect("projectable source");
         assert_eq!(bytes.len(), 4);
         assert!(matches!(
@@ -812,7 +809,9 @@ mod tests {
             .unwrap()
             .copy_symbol_fields(pointer_type, 0);
 
-        assert!(expression(&fd, pointer, true, 16, use_op, SymbolId::default(), None,).is_none());
+        assert!(expression(&fd, pointer, true, 16, use_op, SymbolId::default(), None,)
+            .expect("pointer type resolution")
+            .is_none());
     }
 
     fn needing_resolution(size: i32, meta: type_metatype) -> Rc<Datatype> {
@@ -828,15 +827,17 @@ mod tests {
             .get_mut(global)
             .unwrap()
             .copy_symbol_fields(needing_resolution(1, type_metatype::TYPE_UNION), 0);
-        assert!(!def_facing_pointer(&fd, global));
+        assert!(!def_facing_pointer(&fd, global).expect("unwritten union classification"));
 
         let pointer = fd.new_constant(8, 0x402008);
         fd.vbank_mut()
             .get_mut(pointer)
             .unwrap()
             .copy_symbol_fields(needing_resolution(8, type_metatype::TYPE_PTR), 0);
-        assert!(def_facing_pointer(&fd, pointer));
-        assert!(expression(&fd, pointer, true, 16, use_op, SymbolId::default(), None).is_none());
+        assert!(def_facing_pointer(&fd, pointer).expect("unwritten pointer classification"));
+        assert!(expression(&fd, pointer, true, 16, use_op, SymbolId::default(), None)
+            .expect("pointer type resolution")
+            .is_none());
     }
 
     #[test]

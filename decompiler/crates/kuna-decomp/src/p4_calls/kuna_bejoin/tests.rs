@@ -47,7 +47,7 @@ fn pair(fd: &Funcdata) -> Pair {
 /// The function's input in the register at `off`.
 fn input(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let a = at(fd, off);
-    let vn = fd.new_varnode(4, &a, None);
+    let vn = fd.new_varnode(4, &a, None).unwrap();
     fd.set_input_varnode(vn).expect("input")
 }
 
@@ -278,7 +278,7 @@ fn a_register_pair_heritage_split_is_followed_to_the_entry_value() {
     let mut fd = build_fd();
     let a = input(&mut fd, 0x20);
     let at_pair = at(&fd, HI);
-    let pair_in = fd.new_varnode(8, &at_pair, None);
+    let pair_in = fd.new_varnode(8, &at_pair, None).unwrap();
     let pair_in = fd.set_input_varnode(pair_in).expect("input");
     let zero = k(&mut fd, 0);
     let lo = def(&mut fd, OpCode::CPUI_SUBPIECE, &[pair_in, zero], LO, 4);

@@ -25,10 +25,11 @@
 use std::rc::Rc;
 
 use kuna_base::address::signbit_negative;
+use kuna_base::error::KunaResult;
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
 
-use crate::cast::{CastStrategy, CastStrategyC};
+use crate::cast::CastStrategy;
 use crate::context::{OpId, VarnodeId};
 use crate::coreaction_casts::FuncdataCastContext;
 use crate::dtype::{type_metatype, Datatype, TypeFactory};
@@ -41,45 +42,49 @@ pub(crate) type CInt = (bool, int4);
 
 /// The unsigned type input `slot` of `op` must be cast to because the
 /// expression there is a signed `int` or `long` in C, or `None`.
-pub(crate) fn cast(data: &mut Funcdata, strat: &CastStrategyC, op: OpId, slot: int4) -> Option<Rc<Datatype>> {
-    let o = data.obank().get(op)?;
+pub(crate) fn cast(data: &mut Funcdata, strat: &dyn CastStrategy, op: OpId, slot: int4) -> KunaResult<Option<Rc<Datatype>>> {
+    if !data.get_arch().int_promotion || data.get_arch().out_lang == crate::kuna_lang::OutLang::Java {
+        return Ok(None);
+    }
+    let Some(o) = data.obank().get(op) else { return Ok(None) };
     let binary = match o.code() {
         OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_RIGHT if slot == 0 => false,
         OpCode::CPUI_INT_LESS | OpCode::CPUI_INT_LESSEQUAL | OpCode::CPUI_INT_DIV | OpCode::CPUI_INT_REM => true,
-        _ => return None,
+        _ => return Ok(None),
     };
-    let vn = o.get_in(slot)?;
+    let Some(vn) = o.get_in(slot) else { return Ok(None) };
     let other = if binary { o.get_in(1 - slot) } else { None };
-    let v = data.vbank().get(vn)?;
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     if v.is_constant() || v.is_explicit() || !v.is_written() {
-        return None;
+        return Ok(None);
     }
     let size = v.get_size();
     if size < strat.promote_size() || size > 8 || !signbit_negative(v.get_nz_mask(), size) {
-        return None;
+        return Ok(None);
     }
-    let ir = data.vn_type_read_facing(vn, op);
+    let ir = data.vn_type_read_facing(vn, op)?;
     if !matches!(ir.get_metatype(), type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN) {
-        return None;
+        return Ok(None);
     }
-    if c_int(data, strat, vn, op)? != (false, size) {
-        return None;
+    if c_int(data, strat, vn, op)? != Some((false, size)) {
+        return Ok(None);
     }
     if let Some(other) = other {
-        if c_int(data, strat, other, op).is_some_and(|(unsigned, width)| unsigned && width >= size) {
-            return None;
+        if c_int(data, strat, other, op)?.is_some_and(|(unsigned, width)| unsigned && width >= size) {
+            return Ok(None);
         }
     }
-    if let Some(c) = suffixable_literal(data, vn) {
+    if let Some(c) = suffixable_literal(data, vn)? {
         if let Some(cv) = data.vbank_mut().get_mut(c) {
             cv.set_unsigned_print();
             if size > 4 {
                 cv.set_long_print();
             }
-            return None;
+            return Ok(None);
         }
     }
-    data.get_arch().types_rc()?.get_base(size, type_metatype::TYPE_UINT).ok()
+    let Some(types) = data.get_arch().types_rc() else { return Ok(None) };
+    Ok(Some(types.get_base(size, type_metatype::TYPE_UINT)?))
 }
 
 /// A constant operand of the operation that computes the implied `vn` whose
@@ -87,9 +92,9 @@ pub(crate) fn cast(data: &mut Funcdata, strat: &CastStrategyC, op: OpId, slot: i
 /// arithmetic whose result bits do not depend on the sign it computes with
 /// (a division, a remainder or a shift would change meaning), printed as a
 /// plain non-negative integer.
-fn suffixable_literal(data: &Funcdata, vn: VarnodeId) -> Option<VarnodeId> {
-    let def = data.vbank().get(vn)?.get_def()?;
-    let d = data.obank().get(def)?;
+fn suffixable_literal(data: &Funcdata, vn: VarnodeId) -> KunaResult<Option<VarnodeId>> {
+    let Some(def) = data.vbank().get(vn).and_then(|v| v.get_def()) else { return Ok(None) };
+    let Some(d) = data.obank().get(def) else { return Ok(None) };
     if !matches!(
         d.code(),
         OpCode::CPUI_INT_ADD
@@ -101,71 +106,81 @@ fn suffixable_literal(data: &Funcdata, vn: VarnodeId) -> Option<VarnodeId> {
             | OpCode::CPUI_INT_NEGATE
             | OpCode::CPUI_INT_2COMP
     ) {
-        return None;
+        return Ok(None);
     }
-    (0..d.num_input()).filter_map(|i| d.get_in(i)).find(|&c| {
-        data.vbank().get(c).is_some_and(|cv| cv.is_constant() && !cv.is_annotation()) && {
-            let t = data.vn_type_read_facing(c, def);
-            matches!(t.get_metatype(), type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
+    for c in (0..d.num_input()).filter_map(|i| d.get_in(i)) {
+        if data.vbank().get(c).is_some_and(|cv| cv.is_constant() && !cv.is_annotation()) {
+            let t = data.vn_type_read_facing(c, def)?;
+            if matches!(t.get_metatype(), type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
                 && !t.is_char_print()
                 && !t.is_enum_type()
                 && data.vn_high_display_format(c) == 0
+            {
+                return Ok(Some(c));
+            }
         }
-    })
+    }
+    Ok(None)
 }
 
 /// The promoted C type of `vn` as printed where `reader` reads it,
 /// `(unsigned, bytes)`, or `None` when the text does not settle it.
-pub(crate) fn c_int(data: &mut Funcdata, strat: &CastStrategyC, vn: VarnodeId, reader: OpId) -> Option<CInt> {
+pub(crate) fn c_int(data: &mut Funcdata, strat: &dyn CastStrategy, vn: VarnodeId, reader: OpId) -> KunaResult<Option<CInt>> {
     c_int_at(data, strat, vn, reader, DEPTH)
 }
 
-fn c_int_at(data: &mut Funcdata, strat: &CastStrategyC, vn: VarnodeId, reader: OpId, depth: u32) -> Option<CInt> {
-    let v = data.vbank().get(vn)?;
+fn c_int_at(data: &mut Funcdata, strat: &dyn CastStrategy, vn: VarnodeId, reader: OpId, depth: u32) -> KunaResult<Option<CInt>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
     if v.is_annotation() || depth == 0 {
-        return None;
+        return Ok(None);
     }
     if v.is_constant() {
         return literal(data, vn, reader);
     }
     if v.is_explicit() || !v.is_written() {
-        return declared(&data.vn_type_read_facing(vn, reader));
+        return Ok(declared(data.vn_type_read_facing(vn, reader)?.as_ref()));
     }
-    let def = v.get_def()?;
-    let d = data.obank().get(def)?;
+    let Some(def) = v.get_def() else { return Ok(None) };
+    let Some(d) = data.obank().get(def) else { return Ok(None) };
     let code = d.code();
     let ins: Vec<VarnodeId> = (0..d.num_input()).filter_map(|i| d.get_in(i)).collect();
     let info = crate::typeop::type_op_info(code);
     match code {
-        OpCode::CPUI_COPY => c_int_at(data, strat, *ins.first()?, def, depth - 1),
+        OpCode::CPUI_COPY => match ins.first() {
+            Some(&input) => c_int_at(data, strat, input, def, depth - 1),
+            None => Ok(None),
+        },
         OpCode::CPUI_INT_ZEXT | OpCode::CPUI_INT_SEXT => {
-            let outtype = data.vn_type_def_facing(vn);
-            let intype = data.vn_type_read_facing(*ins.first()?, def);
+            let Some(&input) = ins.first() else { return Ok(None) };
+            let outtype = data.vn_type_def_facing(vn)?;
+            let intype = data.vn_type_read_facing(input, def)?;
             let cast = if code == OpCode::CPUI_INT_ZEXT {
                 strat.is_zext_cast(&outtype, &intype)
             } else {
                 strat.is_sext_cast(&outtype, &intype)
             };
             if !cast {
-                return None;
+                return Ok(None);
             }
             let hidden = {
                 let ctx = FuncdataCastContext::new(data);
                 let (d, r) = (ctx.op_ref(def), ctx.op_ref(reader));
-                strat.is_extension_cast_implied(&ctx, d, Some(r))
+                strat.is_extension_cast_implied(&ctx, d, Some(r))?
             };
             if hidden {
                 c_int_at(data, strat, ins[0], def, depth - 1)
             } else {
-                declared(&outtype)
+                Ok(declared(&outtype))
             }
         }
-        _ if d.is_bool_output() => Some((false, 4)),
+        _ if d.is_bool_output() => Ok(Some((false, 4))),
         _ if info.inherits_sign() => {
             let n = if info.inherits_sign_first_param_only() { 1 } else { ins.len() };
             let mut acc: Option<CInt> = None;
             for &i in &ins[..n.min(ins.len())] {
-                let (unsigned, width) = c_int_at(data, strat, i, def, depth - 1)?;
+                let Some((unsigned, width)) = c_int_at(data, strat, i, def, depth - 1)? else {
+                    return Ok(None);
+                };
                 acc = Some(match acc {
                     None => (unsigned, width),
                     Some((au, aw)) if aw == width => (au || unsigned, width),
@@ -173,9 +188,9 @@ fn c_int_at(data: &mut Funcdata, strat: &CastStrategyC, vn: VarnodeId, reader: O
                     Some(_) => (unsigned, width),
                 });
             }
-            acc
+            Ok(acc)
         }
-        _ => declared(&data.vn_type_def_facing(vn)),
+        _ => Ok(declared(data.vn_type_def_facing(vn)?.as_ref())),
     }
 }
 
@@ -201,28 +216,28 @@ fn declared(t: &Datatype) -> Option<CInt> {
 /// it: a `U` or `L` suffix says so, a character is an `int`, and a
 /// hexadecimal magnitude takes the first of `int`, `unsigned int`, `long`,
 /// `unsigned long` that holds it (a leading minus keeps that type).
-fn literal(data: &Funcdata, vn: VarnodeId, reader: OpId) -> Option<CInt> {
-    let v = data.vbank().get(vn)?;
-    let t = data.vn_type_read_facing(vn, reader);
+fn literal(data: &Funcdata, vn: VarnodeId, reader: OpId) -> KunaResult<Option<CInt>> {
+    let Some(v) = data.vbank().get(vn) else { return Ok(None) };
+    let t = data.vn_type_read_facing(vn, reader)?;
     if t.is_enum_type() {
-        return None;
+        return Ok(None);
     }
     let (size, off) = (v.get_size(), v.get_offset());
     let magnitude = match t.get_metatype() {
-        type_metatype::TYPE_BOOL => return Some((false, 4)),
-        _ if t.is_char_print() => return Some((false, 4)),
+        type_metatype::TYPE_BOOL => return Ok(Some((false, 4))),
+        _ if t.is_char_print() => return Ok(Some((false, 4))),
         type_metatype::TYPE_INT if signbit_negative(off, size) => kuna_base::address::uintb_negate(off, size),
         type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN => off,
-        _ => return None,
+        _ => return Ok(None),
     };
     let long = v.is_long_print() || magnitude > 0xffff_ffff;
     if v.is_unsigned_print() {
-        return Some((true, if long { 8 } else { 4 }));
+        return Ok(Some((true, if long { 8 } else { 4 })));
     }
-    Some(match (long, magnitude) {
+    Ok(Some(match (long, magnitude) {
         (false, x) if x <= 0x7fff_ffff => (false, 4),
         (false, _) => (true, 4),
         (true, x) if x <= 0x7fff_ffff_ffff_ffff => (false, 8),
         (true, _) => (true, 8),
-    })
+    }))
 }

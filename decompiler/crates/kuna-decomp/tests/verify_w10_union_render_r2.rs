@@ -107,7 +107,7 @@ fn wire_input(
 ) -> VarnodeId {
     let r = ram(fd);
     let m = Address::new(r, off);
-    let vn = fd.new_varnode(size, &m, Some(ty));
+    let vn = fd.new_varnode(size, &m, Some(ty)).unwrap();
     fd.op_set_input(op, vn, slot).unwrap();
     vn
 }
@@ -115,13 +115,13 @@ fn wire_input(
 fn const_vn(fd: &mut Funcdata, val: uintb, size: int4) -> VarnodeId {
     let cspace = Rc::clone(fd.get_arch().manage().get_constant_space().unwrap());
     let m = Address::new(cspace, val);
-    fd.new_varnode(size, &m, None)
+    fd.new_varnode(size, &m, None).unwrap()
 }
 
 fn set_output(fd: &mut Funcdata, op: OpId, off: u64, size: int4, ty: Rc<Datatype>) {
     let r = ram(fd);
     let m = Address::new(r, off);
-    let out = fd.new_varnode(size, &m, Some(ty));
+    let out = fd.new_varnode(size, &m, Some(ty)).unwrap();
     fd.op_set_output(op, out).unwrap();
 }
 

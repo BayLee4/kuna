@@ -1,0 +1,10 @@
+--- a/ghidra/app/plugin/core/decompile/actions/EditPrototypeOverrideAction.java
++++ b/ghidra/app/plugin/core/decompile/actions/EditPrototypeOverrideAction.java
+@@ -91,6 +91,7 @@
+ 
+ 		int transaction = program.startTransaction("Override Signature");
+ 		try {
++			HighFunctionDBUtil.requireSourceAuthority(context.getHighFunction(), updatedFuncDef);
+ 			Address addr = sym.getAddress();
+ 			sym.delete(); // delete old marker symbol
+ 			HighFunctionDBUtil.writeOverride(func, addr, updatedFuncDef);

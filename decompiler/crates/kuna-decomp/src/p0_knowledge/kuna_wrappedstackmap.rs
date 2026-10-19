@@ -46,11 +46,10 @@ pub(crate) fn is_wrapped_join(join: &kuna_base::space::JoinRecord) -> bool {
 }
 
 pub(crate) fn is_wrapped_address(addr: &Address) -> bool {
-    addr.is_join()
-        && addr
-            .get_space()
-            .and_then(|space| space.find_join(addr.get_offset()).ok())
-            .is_some_and(|join| is_wrapped_join(&join))
+    addr.get_space()
+        .filter(|space| space.get_type() == kuna_base::space::spacetype::IPTR_JOIN)
+        .and_then(|space| space.find_join(addr.get_offset()).ok())
+        .is_some_and(|join| is_wrapped_join(&join))
 }
 
 pub(crate) fn is_wrapped_in_space(addr: &Address, index: usize) -> bool {

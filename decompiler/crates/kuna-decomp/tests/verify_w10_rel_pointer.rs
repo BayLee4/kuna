@@ -129,6 +129,7 @@ fn w10rel_get_ptr_into_struct_union_and_scalar_arms() {
     let mk_relptr = |ptrto: Rc<Datatype>, offset: i32| -> Datatype {
         let mut pr = Datatype::new_with_align(8, -1, TYPE_PTRREL);
         pr.kind = DatatypeKind::PointerRel {
+            spaceid: None,
             ptrto,
             wordsize: 1,
             stripped: None,

@@ -52,7 +52,9 @@ use kuna_sleigh::sleigh::Sleigh;
 use kuna_sleigh::translate::Translate;
 
 mod config_ir_regressions {
-    use super::{Address, ArchContext, FlowEnvironment, FlowInfo, Funcdata, OpCode, Rc, Translate, TypeOp, build_manager, make_op, pcodeop_flags, ram_space, set_coderef_in, type_metatype, typeop_for};
+    use kuna_base::error::KunaResult;
+
+use super::{Address, ArchContext, FlowEnvironment, FlowInfo, Funcdata, OpCode, Rc, Translate, TypeOp, build_manager, make_op, pcodeop_flags, ram_space, set_coderef_in, type_metatype, typeop_for};
     fn config_flow_fd() -> Funcdata {
         let mut context = ArchContext::new(build_manager());
         let factory = kuna_decomp::dtype::TypeFactoryImpl::new();
@@ -77,11 +79,11 @@ mod config_ir_regressions {
             fn resolve_typeop(&self, opcode: OpCode) -> TypeOp {
                 typeop_for(opcode)
             }
-            fn query_call(&self, _: &Address) -> Option<String> {
-                Some("global_noreturn".into())
+            fn query_call(&self, _: &Address) -> KunaResult<Option<String>> {
+                Ok(Some("global_noreturn".into()))
             }
-            fn query_call_no_return(&self, _: &Address) -> bool {
-                true
+            fn query_call_no_return(&self, _: &Address) -> KunaResult<bool> {
+                Ok(true)
             }
         }
 
@@ -159,16 +161,32 @@ mod config_ir_regressions {
             }
         }
 
-        // A site without an override retains ordinary global noreturn behavior.
-        let mut fd = config_flow_fd();
-        let call = make_op(&mut fd, OpCode::CPUI_CALL, 0x1000, 1);
-        set_coderef_in(&mut fd, call, 0x2000);
-        let env = NoReturnCallee;
-        let mut flow = FlowInfo::new(fd, &env);
-        let mut startbasic = true;
-        let mut fallthrough = true;
-        flow.xref_for_test(call, &mut startbasic, &mut fallthrough).unwrap();
-        assert!(!fallthrough);
+        // Without a site prototype, known callees retain ordinary global
+        // noreturn behavior; an unresolved indirect target has no callee facts.
+        for route in 0..3 {
+            let mut fd = config_flow_fd();
+            if route == 2 {
+                let ram = ram_space(&fd);
+                fd.get_override_mut().insert_indirect_override(
+                    Address::new(Rc::clone(&ram), 0x1000),
+                    Address::new(ram, 0x2000),
+                );
+            }
+            let call = make_op(
+                &mut fd,
+                if route == 0 { OpCode::CPUI_CALL } else { OpCode::CPUI_CALLIND },
+                0x1000, 1,
+            );
+            set_coderef_in(&mut fd, call, 0x2000);
+            let env = NoReturnCallee;
+            let mut flow = FlowInfo::new(fd, &env);
+            let mut startbasic = true;
+            let mut fallthrough = true;
+            flow.xref_for_test(call, &mut startbasic, &mut fallthrough).unwrap();
+            assert_eq!(fallthrough, route == 1, "unoverridden route {route}");
+            let fc = flow.data.get_call_specs(flow.data.get_call_specs_index(call).unwrap());
+            assert_eq!(fc.proto().is_no_return(), route != 1, "unoverridden route {route}");
+        }
     }
 }
 
@@ -271,7 +289,7 @@ fn set_const_in(fd: &mut Funcdata, op: OpId, slot: int4, val: uintb, size: int4)
 /// Set input slot 0 of `op` to a code reference at ram offset `dest`.
 fn set_coderef_in(fd: &mut Funcdata, op: OpId, dest: u64) {
     let ram = ram_space(fd);
-    let vn = fd.new_varnode(8, &Address::new(ram, dest), Some(unk(8)));
+    let vn = fd.new_varnode(8, &Address::new(ram, dest), Some(unk(8))).unwrap();
     fd.vbank_mut().add_descend(vn, op).unwrap();
     fd.obank_mut().get_mut(op).unwrap().set_input(Some(vn), 0);
 }

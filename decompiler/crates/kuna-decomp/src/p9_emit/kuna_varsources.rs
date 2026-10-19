@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use kuna_base::address::Address;
+use kuna_base::error::KunaResult;
 use kuna_base::space::{spacetype, AddrSpace};
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
@@ -63,27 +64,28 @@ pub fn representative_comment(
     arch: &Architecture,
     high: HighVariableId,
     varnode: &crate::varnode::Varnode,
-) -> Option<StorageComment> {
+) -> KunaResult<Option<StorageComment>> {
     let address = varnode.get_addr();
-    let space = address.get_space()?;
+    let Some(space) = address.get_space() else { return Ok(None) };
     let register =
         arch.translate()
-            .get_register_name(space, address.get_offset(), varnode.get_size());
+            .get_register_name(space, address.get_offset(), varnode.get_size())?;
     if !register.is_empty() {
-        return Some((
+        return Ok(Some((
             register.to_ascii_lowercase(),
             space.clone(),
             address.get_offset(),
-        ));
+        )));
     }
-    let stack = fd.get_arch().manage().get_stack_space()?;
+    let Some(stack) = fd.get_arch().manage().get_stack_space() else { return Ok(None) };
     if stack.get_index() != space.get_index() {
-        return None;
+        return Ok(None);
     }
-    let offset = fd.high_bank().get(high)?.kuna_symbol_offset().max(0);
+    let Some(high) = fd.high_bank().get(high) else { return Ok(None) };
+    let offset = high.kuna_symbol_offset().max(0);
     let base = address - offset as i64;
-    storage_comment(fd, arch, &base, varnode.get_size())
-        .map(|(text, space, _)| (text, space, address.get_offset()))
+    Ok(storage_comment(fd, arch, &base, varnode.get_size())?
+        .map(|(text, space, _)| (text, space, address.get_offset())))
 }
 
 pub fn storage_comment(
@@ -91,12 +93,12 @@ pub fn storage_comment(
     arch: &Architecture,
     address: &Address,
     size: int4,
-) -> Option<StorageComment> {
-    let space = address.get_space()?;
+) -> KunaResult<Option<StorageComment>> {
+    let Some(space) = address.get_space() else { return Ok(None) };
     let offset = address.get_offset();
-    let register = arch.translate().get_register_name(space, offset, size);
+    let register = arch.translate().get_register_name(space, offset, size)?;
     if !register.is_empty() {
-        return Some((register.to_ascii_lowercase(), space.clone(), offset));
+        return Ok(Some((register.to_ascii_lowercase(), space.clone(), offset)));
     }
     if fd
         .get_arch()
@@ -111,47 +113,44 @@ pub fn storage_comment(
         } else {
             format!("stack + 0x{:x}", signed as u64)
         };
-        return Some((text, space.clone(), offset));
+        return Ok(Some((text, space.clone(), offset)));
     }
     if space.get_type() == spacetype::IPTR_JOIN {
-        let record = arch.manage().find_join(offset).ok()?;
-        let pieces: Option<Vec<_>> = (0..record.num_pieces())
-            .map(|i| {
-                let piece = record.get_piece(i);
-                storage_comment(fd, arch, &piece.get_addr(), piece.size as int4)
-                    .map(|(text, _, _)| text)
-            })
-            .collect();
-        return pieces
-            .filter(|pieces| !pieces.is_empty())
-            .map(|pieces| (pieces.join(":"), space.clone(), offset));
+        let record = arch.manage().find_join(offset)?;
+        let mut pieces = Vec::with_capacity(record.num_pieces() as usize);
+        for i in 0..record.num_pieces() {
+            let piece = record.get_piece(i);
+            let Some((text, _, _)) = storage_comment(fd, arch, &piece.get_addr(), piece.size as int4)? else {
+                return Ok(None);
+            };
+            pieces.push(text);
+        }
+        return Ok((!pieces.is_empty()).then(|| (pieces.join(":"), space.clone(), offset)));
     }
     if space.get_type() == spacetype::IPTR_PROCESSOR {
-        return Some((
+        return Ok(Some((
             format!("{} 0x{offset:x}", space.get_name()),
             space.clone(),
             offset,
-        ));
+        )));
     }
-    None
+    Ok(None)
 }
 
 pub fn high_comment(
     fd: &Funcdata,
     arch: &Architecture,
     high: HighVariableId,
-) -> Option<StorageComment> {
+) -> KunaResult<Option<StorageComment>> {
     if !arch.name_style_angr {
-        return None;
+        return Ok(None);
     }
-    let (homes, fallback) = high_homes(fd, arch, high)?;
+    let Some((homes, fallback)) = high_homes(fd, arch, high)? else { return Ok(None) };
     if homes.is_empty() {
-        let (space, offset) = fallback?;
-        return Some(("tmp".to_string(), space, offset));
+        return Ok(fallback.map(|(space, offset)| ("tmp".to_string(), space, offset)));
     }
     let text = homes.keys().cloned().collect::<Vec<_>>().join(" | ");
-    let (_, (space, offset)) = homes.into_iter().next()?;
-    Some((text, space, offset))
+    Ok(homes.into_iter().next().map(|(_, (space, offset))| (text, space, offset)))
 }
 
 /// The storage homes [`high_comment`] lists for `high`, keyed by their text, and
@@ -160,14 +159,14 @@ pub fn high_homes(
     fd: &Funcdata,
     arch: &Architecture,
     high: HighVariableId,
-) -> Option<(BTreeMap<String, (Rc<AddrSpace>, u64)>, Option<(Rc<AddrSpace>, u64)>)> {
+) -> KunaResult<Option<(BTreeMap<String, (Rc<AddrSpace>, u64)>, Option<(Rc<AddrSpace>, u64)>)>> {
     let own = high;
-    let high = fd.high_bank().get(high)?;
+    let Some(high) = fd.high_bank().get(high) else { return Ok(None) };
     let mut homes = BTreeMap::new();
     let mut fallback = None;
     if let Some((scope, symbol)) = fd.get_scope_local().zip(high.kuna_ref_symbol()) {
         for (address, size) in scope.symbol_storage(symbol) {
-            if let Some((text, space, offset)) = storage_comment(fd, arch, &address, size) {
+            if let Some((text, space, offset)) = storage_comment(fd, arch, &address, size)? {
                 homes.entry(text).or_insert((space, offset));
             }
         }
@@ -201,16 +200,16 @@ pub fn high_homes(
         {
             address = &address - symbol_offset as i64;
         }
-        if !fd.kuna_is_call_transport(id) {
+        if !fd.kuna_is_call_transport(id)? {
             if let Some((text, space, offset)) =
-                storage_comment(fd, arch, &address, varnode.get_size())
+                storage_comment(fd, arch, &address, varnode.get_size())?
             {
                 homes.entry(text).or_insert((space, offset));
             }
         }
         for source in fd.kuna_storage_sources(id) {
             if let Some((text, space, offset)) =
-                storage_comment(fd, arch, &source.address, source.size)
+                storage_comment(fd, arch, &source.address, source.size)?
             {
                 homes.entry(text).or_insert((space, offset));
             }
@@ -230,5 +229,5 @@ pub fn high_homes(
         }
     }
     remove_join_pieces(&mut homes);
-    Some((homes, fallback))
+    Ok(Some((homes, fallback)))
 }

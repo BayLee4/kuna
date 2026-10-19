@@ -89,7 +89,7 @@ fn store_conversion_preserves_every_overlapping_byte_in_both_endiannesses() {
             data.op_set_input(store, written, 2).unwrap();
             data.op_insert(store, block, None);
             let effect =
-                data.new_indirect_op(store, &Address::new(ram, effect_off), effect_size, 0);
+                data.new_indirect_op(store, &Address::new(ram, effect_off), effect_size, 0).unwrap();
             let old_value = 0x8877665544332211 & calc_mask(effect_size);
             let old = data.new_constant(effect_size, old_value);
             data.op_set_input(effect, old, 0).unwrap();
@@ -99,7 +99,7 @@ fn store_conversion_preserves_every_overlapping_byte_in_both_endiannesses() {
             let result = data.new_unique_out(effect_size, reader).unwrap();
             data.op_set_input(reader, out, 0).unwrap();
             data.op_insert(reader, block, None);
-            assert_eq!(RuleStoreVarnode::new().apply_op(store, &mut data), 1);
+            assert_eq!(RuleStoreVarnode::new().apply_op(store, &mut data).unwrap(), 1);
             let mut expected = old_value;
             for byte in 0..effect_size {
                 let address = effect_off + byte as u64;
@@ -156,11 +156,11 @@ fn neighboring_indirects_for_another_operation_remain_unchanged() {
     data.new_varnode_out(4, &Address::new(ram.clone(), 0x100), copy)
         .unwrap();
     data.op_insert(copy, block, None);
-    let unrelated = data.new_indirect_op(other, &Address::new(ram, 0x100), 4, 0);
+    let unrelated = data.new_indirect_op(other, &Address::new(ram, 0x100), 4, 0).unwrap();
     data.op_uninsert(unrelated);
     data.op_insert_before(unrelated, copy);
     let old = data.obank().get(unrelated).unwrap().get_in(0);
-    collapse(&mut data, copy);
+    collapse(&mut data, copy).unwrap();
     assert_eq!(
         data.obank().get(unrelated).unwrap().code(),
         OpCode::CPUI_INDIRECT

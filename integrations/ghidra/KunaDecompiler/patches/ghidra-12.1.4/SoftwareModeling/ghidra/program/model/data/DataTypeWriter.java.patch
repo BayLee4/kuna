@@ -1,0 +1,530 @@
+--- a/ghidra/program/model/data/DataTypeWriter.java
++++ b/ghidra/program/model/data/DataTypeWriter.java
+@@ -18,9 +18,15 @@
+ import java.io.IOException;
+ import java.io.Writer;
+ import java.util.*;
++import java.util.function.Function;
+ 
+ import org.apache.commons.lang3.StringUtils;
+ 
++import ghidra.program.model.lang.CompilerSpec;
++import ghidra.program.model.lang.PrototypeModel;
++import ghidra.program.model.pcode.PartialUnion;
++import ghidra.program.model.pcode.PcodeDataTypeManager.ResultPartialDataType;
++import ghidra.program.model.pcode.PcodeDataTypeManager.ResultQualifiedDataType;
+ import ghidra.util.Msg;
+ import ghidra.util.exception.CancelledException;
+ import ghidra.util.task.TaskMonitor;
+@@ -52,6 +58,9 @@
+ 	private DataOrganization dataOrganization;
+ 	private AnnotationHandler annotator;
+ 	private boolean cppStyleComments = false;
++	private Function<DataType, String> typeNames;
++	private CompilerSpec callingConventionSpec;
++	private boolean printCallingConvention;
+ 
+ 	/**
+ 	 * Constructs a new instance of this class using the given writer. The default annotation
+@@ -99,7 +108,23 @@
+ 	 */
+ 	public DataTypeWriter(DataTypeManager dtm, Writer writer, AnnotationHandler annotator,
+ 			boolean cppStyleComments) throws IOException {
++		this(dtm, writer, annotator, cppStyleComments, null);
++	}
++
++	/**
++	 * Writes with invocation-local presentation names. A null name preserves the datatype's
++	 * display name. The mapped path uses the original type identities and does not clone or
++	 * resolve the graph into a manager.
++	 */
++	public DataTypeWriter(DataTypeManager dtm, Writer writer, boolean cppStyleComments,
++			Function<DataType, String> typeNames) throws IOException {
++		this(dtm, writer, new DefaultAnnotationHandler(), cppStyleComments, typeNames);
++	}
++
++	public DataTypeWriter(DataTypeManager dtm, Writer writer, AnnotationHandler annotator,
++			boolean cppStyleComments, Function<DataType, String> typeNames) throws IOException {
+ 		this.dtm = dtm;
++		setTypeNames(typeNames);
+ 		if (dtm != null) {
+ 			dataOrganization = dtm.getDataOrganization();
+ 		}
+@@ -111,9 +136,57 @@
+ 		this.cppStyleComments = cppStyleComments;
+ 		if (dtm != null) {
+ 			writeBuiltInDeclarations(dtm);
++		}
++	}
++
++	/**
++	 * Configures callable declarations for this writer's actual export invocation.
++	 * Unconfigured writers retain their ordinary unannotated convention policy.
++	 */
++	public void setCallingConventionContext(CompilerSpec compilerSpec, boolean printConvention) {
++		callingConventionSpec = compilerSpec;
++		printCallingConvention = printConvention;
++	}
++
++	/**
++	 * Installs presentation names for subsequent declarations, including definitions appended
++	 * after a program's ordinary declarations. Previously resolved source types stay resolved.
++	 */
++	public void setTypeNames(Function<DataType, String> typeNames) {
++		if (this.typeNames == typeNames) {
++			return;
++		}
++		this.typeNames = typeNames;
++		if (typeNames != null) {
++			resolved = identitySet(resolved);
++			deferredCompositeDeclarations = identitySet(deferredCompositeDeclarations);
++			deferredTypes = identitySet(deferredTypes);
+ 		}
+ 	}
+ 
++	private static <T> Set<T> identitySet(Set<T> values) {
++		Set<T> identities = Collections.newSetFromMap(new IdentityHashMap<>());
++		identities.addAll(values);
++		return identities;
++	}
++
++	private String typeName(DataType dataType) {
++		String name = typeNames == null ? null : typeNames.apply(dataType);
++		return name != null ? name : dataType.getDisplayName();
++	}
++
++	/**
++	 * Formats a typed declaration without writing definitions or changing the datatype graph.
++	 */
++	public String getDeclaration(String name, DataType dataType, int instanceLength,
++			TaskMonitor monitor) throws IOException, CancelledException {
++		if (dataType instanceof FunctionDefinition function) {
++			// This API declares a function, not a variable of its named function type.
++			return getFunctionPointerString(function, name, function, false, monitor);
++		}
++		return getTypeDeclaration(name, dataType, instanceLength, false, monitor);
++	}
++
+ 	private String comment(String text) {
+ 		if (text == null) {
+ 			return "";
+@@ -189,6 +262,14 @@
+ 
+ 	public void write(List<DataType> dataTypes, TaskMonitor monitor,
+ 			boolean throwExceptionOnInvalidType) throws IOException, CancelledException {
++		write((Collection<DataType>) dataTypes, monitor, throwExceptionOnInvalidType);
++	}
++
++	/**
++	 * Writes a retained result's type closure without copying it to another graph or list.
++	 */
++	public void write(Collection<DataType> dataTypes, TaskMonitor monitor,
++			boolean throwExceptionOnInvalidType) throws IOException, CancelledException {
+ 		monitor.initialize(dataTypes.size());
+ 		int cnt = 0;
+ 		for (DataType dataType : dataTypes) {
+@@ -225,9 +306,32 @@
+ 		if (dt == null) {
+ 			return;
+ 		}
+-		if (dt instanceof FunctionDefinition) {
++		if (dt instanceof ResultQualifiedDataType qualified) {
++			write(qualified.getDataType(), monitor);
+ 			return;
+ 		}
++		if (dt instanceof ResultPartialDataType partial) {
++			write(partial.getParentDataType(), monitor);
++			write(partial.getStrippedDataType(), monitor);
++			return;
++		}
++		if (typeNames != null && dt instanceof PartialUnion partial) {
++			write(partial.getParent(), monitor);
++			write(partial.getStrippedDataType(), monitor);
++			return;
++		}
++		if (typeNames == null && dt instanceof FunctionDefinition) {
++			return;
++		}
++		if (dt instanceof FunctionDefinition function && typeNames.apply(dt) == null) {
++			if (resolved.add(dt)) {
++				write(function.getReturnType(), monitor);
++				for (ParameterDefinition parameter : function.getArguments()) {
++					write(parameter.getDataType(), monitor);
++				}
++			}
++			return;
++		}
+ 		if (dt instanceof FactoryDataType) {
+ 			IllegalArgumentException iae =
+ 				new IllegalArgumentException("Factory data types may not be written");
+@@ -241,7 +345,9 @@
+ 			return;
+ 		}
+ 
+-		dt = dt.clone(dtm); // force resize/repack for target data organization
++		if (typeNames == null) {
++			dt = dt.clone(dtm); // force resize/repack for target data organization
++		}
+ 
+ 		if (resolved.contains(dt)) {
+ 			return;
+@@ -249,7 +355,8 @@
+ 
+ 		resolved.add(dt);
+ 
+-		DataType resolvedType = resolvedTypeMap.get(dt.getName());
++		String outputName = typeNames == null ? dt.getName() : typeName(dt);
++		DataType resolvedType = resolvedTypeMap.get(outputName);
+ 		if (resolvedType != null) {
+ 			if (resolvedType.isEquivalent(dt)) {
+ 				return; // skip equivalent type with same name as a resolved type
+@@ -271,7 +378,7 @@
+ 			return;
+ 		}
+ 
+-		resolvedTypeMap.put(dt.getName(), dt);
++		resolvedTypeMap.put(outputName, dt);
+ 
+ 		++writerDepth;
+ 
+@@ -299,6 +406,15 @@
+ 		else if (dt instanceof TypeDef) {
+ 			writeTypeDef((TypeDef) dt, monitor);
+ 		}
++		else if (dt instanceof FunctionDefinition function) {
++			// Keep the function type nominal without turning it into a pointer alias.
++			// Dependency writes retain the existing deferred composite-body ordering.
++			writer.write("typedef " +
++				getFunctionPointerString(function, typeName(function), function, true, monitor) +
++				";");
++			writer.write(EOL);
++			writer.write(EOL);
++		}
+ 		else if (dt instanceof BuiltInDataType) {
+ 			writeBuiltIn((BuiltInDataType) dt, monitor);
+ 		}
+@@ -348,8 +464,8 @@
+ 	private boolean containsComposite(Composite container, Composite contained) {
+ 		for (DataTypeComponent component : container.getDefinedComponents()) {
+ 			DataType dt = getBaseArrayTypedefType(component.getDataType());
+-			if (dt instanceof Composite && dt.getName().equals(contained.getName()) &&
+-				dt.isEquivalent(contained)) {
++			if (dt instanceof Composite && (typeNames != null ? dt == contained :
++				dt.getName().equals(contained.getName()) && dt.isEquivalent(contained))) {
+ 				return true;
+ 			}
+ 		}
+@@ -404,7 +520,9 @@
+ 		if (dynamicType.canSpecifyLength()) {
+ 			DataType replacementBaseType = dynamicType.getReplacementBaseType();
+ 			if (replacementBaseType != null) {
+-				replacementBaseType = replacementBaseType.clone(dtm);
++				if (typeNames == null) {
++					replacementBaseType = replacementBaseType.clone(dtm);
++				}
+ 				int elementLen = replacementBaseType.getLength();
+ 				if (elementLen <= 0) {
+ 					Msg.error(this,
+@@ -414,7 +532,7 @@
+ 				}
+ 				else {
+ 					int elementCnt = (length + elementLen - 1) / elementLen;
+-					return replacementBaseType.getDisplayName() + " " + fieldName + "[" +
++					return typeName(replacementBaseType) + " " + fieldName + "[" +
+ 						elementCnt + "]";
+ 				}
+ 			}
+@@ -428,8 +546,9 @@
+ 		String compositeType = composite instanceof Structure ? "struct" : "union";
+ 
+ 		// output original name as a typedef
+-		writer.write("typedef " + compositeType + " " + composite.getDisplayName() + " " +
+-			composite.getDisplayName() + ", *P" + composite.getDisplayName() + ";");
++		String name = typeName(composite);
++		writer.write("typedef " + compositeType + " " + name + " " +
++			name + ", *P" + name + ";");
+ 		writer.write(EOL);
+ 		writer.write(EOL);
+ 
+@@ -452,7 +571,7 @@
+ 		String compositeType = composite instanceof Structure ? "struct" : "union";
+ 
+ 		StringBuilder sb = new StringBuilder();
+-		sb.append(compositeType + " " + composite.getDisplayName() + " {");
++		sb.append(compositeType + " " + typeName(composite) + " {");
+ 
+ 		String descrip = composite.getDescription();
+ 		if (descrip != null && descrip.length() > 0) {
+@@ -460,19 +579,78 @@
+ 		}
+ 		sb.append(EOL);
+ 
+-		for (DataTypeComponent component : composite.getComponents()) {
+-			monitor.checkCancelled();
+-			writeComponent(component, composite, sb, monitor);
++		DataTypeComponent[] components = composite.getComponents();
++		boolean placedBitFields = false;
++		if (composite instanceof Structure) {
++			for (DataTypeComponent component : components) {
++				if (component.isBitFieldComponent()) {
++					placedBitFields = true;
++					break;
++				}
++			}
+ 		}
++		if (placedBitFields) {
++			// As in the native C layout writer, FIRST is relative to the least
++			// significant end of the component storage, not the declaration order.
++			Arrays.sort(components, Comparator.comparingLong(this::componentBitStart));
++			long cursor = 0;
++			for (DataTypeComponent component : components) {
++				monitor.checkCancelled();
++				long start = componentBitStart(component);
++				cursor = appendBitPadding(sb, cursor, start);
++				if (component.isZeroBitFieldComponent()) {
++					continue;
++				}
++				writeComponent(component, composite, sb, monitor);
++				long width = component.isBitFieldComponent()
++						? ((BitFieldDataType) component.getDataType()).getBitSize()
++						: (long) component.getLength() * 8;
++				cursor = Math.max(cursor, start + width);
++			}
++			appendBitPadding(sb, cursor, (long) composite.getLength() * 8);
++		}
++		else {
++			for (DataTypeComponent component : components) {
++				monitor.checkCancelled();
++				writeComponent(component, composite, sb, monitor);
++			}
++		}
+ 
+ 		sb.append(annotator.getSuffix(composite, null));
+-		sb.append("};");
++		if (placedBitFields) {
++			sb.append("} __attribute__((packed, aligned(");
++			sb.append(Math.max(1, composite.getAlignment()));
++			sb.append(")));");
++		}
++		else {
++			sb.append("};");
++		}
+ 
+ 		writer.write(sb.toString());
+ 		writer.write(EOL);
+ 		writer.write(EOL);
+ 	}
+ 
++	private long componentBitStart(DataTypeComponent component) {
++		long start = (long) component.getOffset() * 8;
++		if (component.getDataType() instanceof BitFieldDataType bitfield) {
++			int first = dataOrganization.isBigEndian()
++					? component.getLength() * 8 - bitfield.getBitOffset() - bitfield.getBitSize()
++					: bitfield.getBitOffset();
++			start += first;
++		}
++		return start;
++	}
++
++	private static long appendBitPadding(StringBuilder text, long cursor, long end) {
++		while (cursor < end) {
++			long width = Math.min(end - cursor, 8 - cursor % 8);
++			text.append("    unsigned char : ").append(width).append(";").append(EOL);
++			cursor += width;
++		}
++		return cursor;
++	}
++
+ 	private void writeComponent(DataTypeComponent component, Composite composite, StringBuilder sb,
+ 			TaskMonitor monitor) throws IOException, CancelledException {
+ 		sb.append("    ");
+@@ -507,6 +685,7 @@
+ 
+ 		StringBuilder sb = new StringBuilder();
+ 		String componentString = null;
++		String qualifiers = "";
+ 		if (dataType instanceof Dynamic) {
+ 			componentString = getDynamicComponentString((Dynamic) dataType, name, instanceLength);
+ 			if (componentString != null) {
+@@ -527,14 +706,42 @@
+ 			}
+ 
+ 			while (true) {
+-				if (dataType instanceof Array array) {
++				if (dataType instanceof ResultPartialDataType partial) {
++					dataType = partial.getStrippedDataType();
++				}
++				else if (typeNames != null && dataType instanceof PartialUnion partial) {
++					dataType = partial.getStrippedDataType();
++				}
++				else if (dataType instanceof ResultQualifiedDataType qualified) {
++					int mask = qualified.getQualifiers();
++					dataType = qualified.getDataType();
++					while (dataType instanceof ResultQualifiedDataType inner) {
++						mask |= inner.getQualifiers();
++						dataType = inner.getDataType();
++					}
++					String layer = getQualifiers(mask);
++					if (dataType instanceof Pointer pointer) {
++						name = "*" + layer + name;
++						dataType = pointer.getDataType();
++						if (dataType == null) {
++							dataType = VoidDataType.dataType;
++						}
++						if (dataType instanceof Array) {
++							name = "(" + name + ")";
++						}
++					}
++					else {
++						qualifiers += layer;
++					}
++				}
++				else if (dataType instanceof Array array) {
+ 					name += "[" + array.getNumElements() + "]";
+ 					dataType = array.getDataType();
+ 				}
+ 				else if (dataType instanceof Pointer pointer) {
+ 					DataType elem = pointer.getDataType();
+ 					if (elem == null) {
+-						break;
++						elem = VoidDataType.dataType;
+ 					}
+ 					name = "*" + name;
+ 					dataType = elem;
+@@ -548,21 +755,37 @@
+ 			}
+ 
+ 			DataType baseDataType = getBaseDataType(dataType);
+-			if (baseDataType instanceof FunctionDefinition) {
++			if (baseDataType instanceof FunctionDefinition &&
++				(typeNames == null || typeNames.apply(baseDataType) == null)) {
+ 				componentString = getFunctionPointerString((FunctionDefinition) baseDataType, name,
+ 					dataType, writeEnabled, monitor);
+ 			}
+ 			else {
+-				componentString = getDataTypePrefix(dataType) + dataType.getDisplayName();
++				componentString = getDataTypePrefix(dataType) + typeName(dataType);
+ 				if (name.length() != 0) {
+ 					componentString += " " + name;
+ 				}
+ 			}
++			sb.append(qualifiers);
+ 			sb.append(componentString);
+ 		}
+ 		return sb.toString();
+ 	}
+ 
++	private static String getQualifiers(int mask) {
++		StringBuilder text = new StringBuilder();
++		if ((mask & ResultQualifiedDataType.CONST) != 0) {
++			text.append("const ");
++		}
++		if ((mask & ResultQualifiedDataType.RESTRICT) != 0) {
++			text.append("restrict ");
++		}
++		if ((mask & ResultQualifiedDataType.VOLATILE) != 0) {
++			text.append("volatile ");
++		}
++		return text.toString();
++	}
++
+ 	private String getDataTypePrefix(DataType dataType) {
+ 		dataType = getBaseDataType(dataType);
+ 		if (dataType instanceof Structure) {
+@@ -579,8 +802,17 @@
+ 
++	/** Returns the macro identifier emitted for a source single-entry define_ enum, if any. */
++	public static String getEnumMacroName(Enum enumm) {
++		String name = enumm.getDisplayName();
++		return name.startsWith("define_") && name.length() > 7 && enumm.getCount() == 1
++				? name.substring(7) : null;
++	}
++
+ 	private void writeEnum(Enum enumm, TaskMonitor monitor) throws IOException {
+ 
+-		String enumName = enumm.getDisplayName();
+-		if (enumName.startsWith("define_") && enumName.length() > 7 && enumm.getCount() == 1) {
++		String enumName = typeName(enumm);
++		String macroName = typeNames == null || typeNames.apply(enumm) == null
++				? getEnumMacroName(enumm) : null;
++		if (macroName != null) {
+ 			long val = enumm.getValues()[0];
+-			writer.append("#define " + enumName.substring(7) + " " + Long.toString(val));
++			writer.append("#define " + macroName + " " + Long.toString(val));
+ 			writer.write(EOL);
+@@ -626,9 +858,9 @@
+ 	 */
+ 	private void writeTypeDef(TypeDef typeDef, TaskMonitor monitor)
+ 			throws IOException, CancelledException {
+-		String typedefName = typeDef.getDisplayName();
++		String typedefName = typeName(typeDef);
+ 		DataType dataType = typeDef.getDataType();
+-		String dataTypeName = dataType.getDisplayName();
++		String dataTypeName = typeName(dataType);
+ 		if (isIntegral(typedefName, dataTypeName)) {
+ 			return;
+ 		}
+@@ -637,7 +869,7 @@
+ 		try {
+ 			if (baseType instanceof Composite || baseType instanceof Enum) {
+ 				// auto-typedef generated with composite and enum
+-				if (typedefName.equals(baseType.getName())) {
++				if (typedefName.equals(typeNames == null ? baseType.getName() : typeName(baseType))) {
+ 					resolvedTypeMap.remove(typedefName);
+ 					return;
+ 				}
+@@ -648,7 +880,8 @@
+ 				if (dt instanceof TypeDef) {
+ 					dt = ((TypeDef) dt).getBaseDataType();
+ 				}
+-				if (dt instanceof Composite && dt.getName().equals(typedefName.substring(1))) {
++				if (dt instanceof Composite &&
++					(typeNames == null ? dt.getName() : typeName(dt)).equals(typedefName.substring(1))) {
+ 					// auto-pointer-typedef generated with composite
+ 					resolvedTypeMap.remove(typedefName);
+ 					return;
+@@ -761,7 +994,16 @@
+ 
+ 	private DataType getBaseDataType(DataType dt) {
+ 		while (dt != null) {
+-			if (dt instanceof Array) {
++			if (dt instanceof ResultPartialDataType partial) {
++				dt = partial.getStrippedDataType();
++			}
++			else if (typeNames != null && dt instanceof PartialUnion partial) {
++				dt = partial.getStrippedDataType();
++			}
++			else if (dt instanceof ResultQualifiedDataType qualified) {
++				dt = qualified.getDataType();
++			}
++			else if (dt instanceof Array) {
+ 				Array array = (Array) dt;
+ 				dt = array.getDataType();
+ 			}
+@@ -819,6 +1061,15 @@
+ 		}
+ 
+ 		sb.append("(");
++		if (callingConventionSpec != null && printCallingConvention) {
++			PrototypeModel model =
++				callingConventionSpec.getCallingConvention(fd.getCallingConventionName());
++			PrototypeModel defaultModel = callingConventionSpec.getDefaultCallingConvention();
++			if (model != null && (defaultModel == null ||
++				!Objects.equals(model.getName(), defaultModel.getName()))) {
++				sb.append(model.getName()).append(' ');
++			}
++		}
+ 		String arrayDecorations = "";
+ 		if (functionPointerArrayType instanceof Array) {
+ 			Array a = (Array) functionPointerArrayType;
+@@ -849,6 +1100,10 @@
+ 		sb.append(")");
+ 		sb.append(getParameterListString(fd, false, writeEnabled, monitor));
+ 
++		if (typeNames != null) {
++			return getTypeDeclaration(sb.toString(), returnType, returnType.getLength(), false,
++				monitor);
++		}
+ 		DataType baseReturnType = getBaseDataType(returnType);
+ 		if (baseReturnType instanceof FunctionDefinition) {
+ 			// nest with function return type

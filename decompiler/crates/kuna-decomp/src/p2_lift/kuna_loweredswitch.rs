@@ -1305,9 +1305,9 @@ impl Action for ActionLowerSwitchDetect {
     /// C++ `return 0` and leave `count` untouched.
     ///
     /// [`detect`]: ActionLowerSwitchDetect::detect
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let _ = self.detect(data);
-        0 // no op change; let the fullloop quiesce and the restart fire
+        Ok(0) // no op change; let the fullloop quiesce and the restart fire
     }
 }
 
@@ -1500,10 +1500,10 @@ impl Action for ActionLowerSwitchInstall {
     /// `BRANCHIND` + `JumpTable`.  The change count flows into `count` (the C++
     /// `return changed` makes the mainloop re-iterate); here the install declines
     /// at the W7/W4 surgery boundary, so `count` is untouched.
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> ApplyResult {
+    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
         let changed = self.install(data);
         self.base.count += changed;
-        0
+        Ok(0)
     }
 }
 

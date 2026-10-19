@@ -8,6 +8,42 @@
 use super::*;
 
 #[test]
+fn java_uses_the_existing_output_language_plane() {
+    assert_eq!(OutLang::from_print_name("java-language"), Some(OutLang::Java));
+    assert_eq!(OutLang::from_print_name("java"), Some(OutLang::Java));
+    let java = OutLang::Java.profile();
+    assert_eq!(java.name, "java-language");
+    assert_eq!(java.file_ext, "java");
+    assert_eq!(java.null_literal, "null");
+    assert_eq!((java.map_token)(&tokens::SCOPE).print1, ".");
+    assert_eq!((java.map_token)(&tokens::SHIFT_RIGHT).print1, ">>>");
+    assert_eq!((java.map_token)(&tokens::SHIFT_SRIGHT).print1, ">>");
+    assert_eq!((java.map_token)(&tokens::BOOLEAN_XOR).print1, "^");
+    assert!(!java.caps.arrow_member);
+    assert!(!java.caps.implicit_bool_conditions);
+    assert!(java.caps.integer_promotion);
+    assert_eq!(OutLang::C.profile().null_literal, "NULL");
+    assert_eq!((OutLang::C.profile().map_token)(&tokens::SHIFT_RIGHT).print1, ">>");
+}
+
+#[test]
+fn java_spelling_distinguishes_arrays_and_object_placeholders() {
+    use std::rc::Rc;
+    use crate::dtype::{type_metatype::*, TypeFactory, TypeFactoryImpl};
+    use crate::kuna_langtypes::SpellCtx;
+    let factory = TypeFactoryImpl::new();
+    factory.set_default_alignment_map();
+    factory.set_max_basetype_size(8);
+    let int = factory.get_base(4, TYPE_INT).unwrap();
+    let array = factory.get_type_pointer(4, Rc::clone(&int), 1).unwrap();
+    let cx = SpellCtx { lang: OutLang::Java, ..SpellCtx::OFF };
+    assert_eq!(OutLang::Java.speller().declarator(&cx, &int).0, "int");
+    assert_eq!(OutLang::Java.speller().declarator(&cx, &array).0, "int[]");
+    let float = factory.get_base(8, TYPE_FLOAT).unwrap();
+    assert_eq!(OutLang::Java.speller().declarator(&cx, &float).0, "double");
+}
+
+#[test]
 fn profile_matches_legacy_constants() {
     let p = OutLang::C.profile();
 

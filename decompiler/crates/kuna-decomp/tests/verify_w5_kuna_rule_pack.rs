@@ -124,7 +124,7 @@ fn wire(fd: &mut Funcdata, vn: VarnodeId, op: OpId, slot: int4) {
 fn mk_byte(fd: &mut Funcdata, off: u64) -> VarnodeId {
     let r = ram(fd);
     let defop = mk_op_dead(fd, off, 1, OpCode::CPUI_COPY);
-    let vn = fd.new_varnode(1, &Address::new(r, off), Some(unk(1)));
+    let vn = fd.new_varnode(1, &Address::new(r, off), Some(unk(1))).unwrap();
     set_def(fd, vn, defop)
 }
 
@@ -188,7 +188,7 @@ fn w5_arraystride_swapped_sibling_edges_decline() {
 
     let mut rule = RuleArrayStride::new(true);
     assert_eq!(
-        rule.apply_op(acc_phi, &mut fd),
+        rule.apply_op(acc_phi, &mut fd).unwrap(),
         0,
         "misaligned sibling edges must NOT fold (kuna_arraystride.cc:118)"
     );
@@ -215,7 +215,7 @@ fn w5_arraystride_commuted_back_edge_add_folds() {
 
     let mut rule = RuleArrayStride::new(true);
     assert_eq!(
-        rule.apply_op(acc_phi, &mut fd),
+        rule.apply_op(acc_phi, &mut fd).unwrap(),
         1,
         "commuted add order INT_ADD(step,self) must still fold (kuna_arraystride.cc:71)"
     );
@@ -284,7 +284,7 @@ fn w5_addcarrychain_commuted_int_carry_operands_fold() {
     let op = build_piece_with_carry(&mut fd, bl, a, b, hipart, carryvn);
     let mut rule = RuleAddCarryChain::new(true);
     assert_eq!(
-        rule.apply_op(op, &mut fd),
+        rule.apply_op(op, &mut fd).unwrap(),
         1,
         "commuted INT_CARRY(b,a) must still fuse (kuna_addcarrychain.cc:56)"
     );
@@ -343,7 +343,7 @@ fn w5_addcarrychain_carryelim_const_baselo_dedups_and_completes() {
     fd.op_insert(op, bl, None);
 
     let mut rule = RuleAddCarryChain::new(true);
-    assert_eq!(rule.apply_op(op, &mut fd), 1, "const-folded carry now fuses (dedup guard)");
+    assert_eq!(rule.apply_op(op, &mut fd).unwrap(), 1, "const-folded carry now fuses (dedup guard)");
     // op fused to INT_ADD; its index operand is the ZEXT of the constant `a`.
     assert_eq!(fd.obank().get(op).unwrap().code(), OpCode::CPUI_INT_ADD);
     let zext_out = fd.obank().get(op).unwrap().get_in(1).unwrap();
@@ -378,7 +378,7 @@ fn w5_addcarrychain_carryelim_wrong_negc_declines() {
     let op = build_piece_with_carry(&mut fd, bl, a, b_const, hipart, carryvn);
     let mut rule = RuleAddCarryChain::new(true);
     assert_eq!(
-        rule.apply_op(op, &mut fd),
+        rule.apply_op(op, &mut fd).unwrap(),
         0,
         "wrong (-c) constant must NOT fuse (kuna_addcarrychain.cc:72)"
     );
@@ -401,7 +401,7 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
     let r = ram(&fd);
     // V (a written value)
     let vdef = mk_op_dead(&mut fd, 0x40, 1, OpCode::CPUI_COPY);
-    let v = fd.new_varnode(sz, &Address::new(Rc::clone(&r), 0x40), Some(unk(sz)));
+    let v = fd.new_varnode(sz, &Address::new(Rc::clone(&r), 0x40), Some(unk(sz))).unwrap();
     let v = set_def(&mut fd, v, vdef);
 
     // helper: build R = INT_ADD(V, #5).  Each add owns a fresh K constant (a
@@ -456,7 +456,7 @@ fn w5_ovlesssimplify_mone_not_minus_one_declines() {
 
     let mut rule = RuleOvLessSimplify::new(true);
     assert_eq!(
-        rule.apply_op(op, &mut fd),
+        rule.apply_op(op, &mut fd).unwrap(),
         0,
         "SLESS-hi limb whose first operand is not -1 must NOT collapse (kuna_ovlesssimplify.cc:79)"
     );
@@ -492,7 +492,7 @@ fn w5_booleanmask_byte_aligned_shift_declines() {
 
     let mut rule = RuleBoolSignShift::new(true);
     assert_eq!(
-        rule.apply_op(op, &mut fd),
+        rule.apply_op(op, &mut fd).unwrap(),
         0,
         "byte-aligned shift must defer to RuleLeftRight (kuna_booleanmask.cc:36)"
     );

@@ -291,11 +291,31 @@ fn a_narrow_argument_or_return_round_trips_through_the_printed_c() {
     }
 }
 
-/// `narrowext_rv64.cpp`'s functions in C, and the names its printed C uses.
+/// A full modeled extension remains an entry SSA producer under every mode;
+/// it must not be replaced by a source cast in a physical wrapper.
+#[test]
+fn an_apple_entry_keeps_the_models_extension_producer() {
+    let image = IMAGES.iter().find(|image| image.name == "apple").unwrap();
+    for mode in ["abi", "compiler", "off"] {
+        let text = decompile(image, mode);
+        for name in ["psc", "pus"] {
+            assert!(
+                !function(&text, name).contains(&format!("kuna_impl_{name}")),
+                "{mode}: a fully modeled entry read must retain its extension producer:\n{text}"
+            );
+        }
+        // A range guarantee is not a license to normalize a raw Boolean byte.
+        assert!(
+            function(&text, "pb").contains("kuna_impl_pb"),
+            "{mode}: the Boolean input must retain its raw-byte implementation:\n{text}"
+        );
+    }
+}
+
+/// Independent scalar C references for `narrowext_rv64.cpp`'s functions.
+/// The printed functions' source enum declarations come from the actual header.
 const SIGNED_SOURCE: &str = r#"
 #include <stdbool.h>
-typedef signed char neg1;
-enum { NEGA = -100, NEGB = 100 };
 long s_c16(int k) { return (unsigned short)(k * 300 + 5) + 1L; }
 long s_ce2(int k) { return (unsigned short)(k * 1000) + 1L; }
 long s_cn(int k) { return (signed char)(k - 100) / 3L; }
@@ -333,9 +353,27 @@ fn a_char16_t_or_short_enum_extends_by_the_sign_of_its_source_type() {
         let path = common::fixture(fixture);
         let (text, err, rc) = common::run_kuna(&["decompile-all", &path]);
         assert_eq!(rc, 0, "{fixture}: {err}");
+        // Bare decompile-all bodies retain source names but intentionally omit
+        // their definitions. Consume the existing whole-project header once,
+        // not reconstructed enums or repeated per-function preambles.
+        let project = common::scratch_file(fixture, "project");
+        let (export, err, rc) = common::run_kuna(&[
+            "decompile-project", &path, "-o", project.to_str().unwrap(),
+        ]);
+        assert_eq!(rc, 0, "{fixture}: {err}\n{export}");
+        let header = std::fs::read_to_string(project.join(format!("{fixture}.h"))).unwrap();
         let mut printed = String::new();
         let mut checks = String::new();
         if checked.contains(&"c16") {
+            assert!(header.contains("typedef enum __attribute__((packed)) {\n"), "{header}");
+            assert!(header.contains("} E2;"), "{header}");
+            assert!(!header.contains("typedef enum __attribute__((packed)) E2 {"), "{header}");
+            printed.push_str(
+                "_Static_assert(sizeof(E2) == 2 && (E2)-1 > 0, \"source E2 storage\");\n\
+                 _Static_assert(EA == 0 && EB == 40000 && EC == 50000, \"source E2 members\");\n\
+                 _Static_assert(sizeof(neg1) == 1 && (neg1)-1 < 0, \"source neg1 storage\");\n\
+                 _Static_assert(NEGA == -100 && NEGB == 100, \"source neg1 members\");\n",
+            );
             for callee in SIGNED_CALLEES {
                 printed.push_str(function(&text, callee));
             }
@@ -345,7 +383,7 @@ fn a_char16_t_or_short_enum_extends_by_the_sign_of_its_source_type() {
             checks.push_str(&format!("    CHECK({n}({arg}), s_{n}({arg}));\n"));
         }
         let program = format!(
-            "#include <stdio.h>\n{SIGNED_SOURCE}\n{printed}\n\
+            "#include <stdio.h>\n{header}\n{SIGNED_SOURCE}\n{printed}\n\
              static const int V[] = {{0, 1, -1, 99, 100, 101, 127, 128, 0x7fff, 0x8000, 0xd7ff, 0xd800,\n\
              0xdbff, 0xdc00, 0xffff, 0x10000, 40000, 50000, -100, 200}};\n\
              #define CHECK(got, want) do {{ long long g = (got), w = (want); if (g != w) {{ \\\n\
@@ -511,6 +549,9 @@ fn charsign_round_trip(stem: &str, text: &str, checked: &[&str], compilers: &[&s
     let mut checks = String::new();
     for (n, ty) in CHARSIGN_FORMATS.iter().filter(|c| checked.contains(&c.0)) {
         printed.push_str(function(text, n));
+        printed.push_str(&format!(
+            "_Static_assert(_Generic(&{n}, int (*)(char *, const char *, {ty}): 1, default: 0), \"{n} source signature\");\n"
+        ));
         checks.push_str(&format!(
             "    {n}(x, \"%d\", ({ty})v); s_{n}(y, \"%d\", ({ty})v);\n    \
              if (strcmp(x, y)) {{ printf(\"{n} v=%#x: %s, want %s\\n\", v, x, y); bad++; }}\n"
@@ -518,6 +559,10 @@ fn charsign_round_trip(stem: &str, text: &str, checked: &[&str], compilers: &[&s
     }
     for (n, ty) in CHARSIGN_VALUES.iter().filter(|c| checked.contains(&c.0)) {
         printed.push_str(function(text, n));
+        let result = if matches!(*n, "wid" | "wids" | "wus" | "wss") { "long" } else { "int" };
+        printed.push_str(&format!(
+            "_Static_assert(_Generic(&{n}, {result} (*)({ty}): 1, default: 0), \"{n} source signature\");\n"
+        ));
         checks.push_str(&format!("    CHECK({n}(({ty})v), s_{n}(({ty})v));\n"));
     }
     let program = format!(
@@ -537,8 +582,10 @@ fn charsign_round_trip(stem: &str, text: &str, checked: &[&str], compilers: &[&s
 /// `char c` printed 202 as -54 when compiled. A one-element `unsigned char`
 /// array read whole extends as its element (`(int)b[0]`, not `ZEXT14(b[0])`).
 /// clang -O2 also reads a narrow parameter as the 32-bit value its caller
-/// extended it to, which only `narrowext compiler` states on x86-64: by default
-/// (and with it off) that prints `CONCAT31(v1,c)` with an unassigned `v1`.
+/// extended it to. Physical publication can now express that carrier in a
+/// private implementation while the public wrapper retains the source sign
+/// and performs the widening conversion. Check its actual values with the
+/// compiler extension both enabled and disabled, not an unassigned `CONCAT`.
 /// clang's `getc1` keeps its buffer in the slot of an alignment push, which
 /// kuna reads wrongly on main too, so only gcc's is checked.
 #[test]
@@ -573,17 +620,23 @@ fn a_dwarf_char_parameter_keeps_its_declared_sign() {
     charsign_round_trip("charsign-clang-compiler", &compiler, &all, &compilers)
         .unwrap_or_else(|e| panic!("clang -O2 under compiler: {e}\n{compiler}"));
     let off = run("charsign_x86_64_clang_O2", &["--option", "narrowext", "off"]);
+    charsign_round_trip("charsign-clang-off", &off, &all, &compilers)
+        .unwrap_or_else(|e| panic!("clang -O2 under off: {e}\n{off}"));
     for n in widened {
-        assert!(function(&off, n).contains("CONCAT"), "{n} under off:\n{off}");
+        let ty = CHARSIGN_VALUES.iter().find(|(name, _)| *name == n).unwrap().1;
+        let result = if n == "wb" { "int" } else { "long" };
+        let parameter = if n == "wb" { "bool b".to_string() } else { format!("{ty} c") };
+        assert!(function(&off, n).contains(&format!("{result} {n}({parameter})")),
+            "{n} lost its public source sign/width/return under off:\n{off}");
     }
 
     let arm = run("charsign_aarch64_O2.o", &[]);
     for want in [
-        "int fmt(char *b,char *f,unsigned char c)",
-        "int fmts(char *b,char *f,signed char c)",
-        "int fmt8(char *b,char *f,unsigned char c)",
-        "int fmtc(char *b,char *f,char c)",
-        "unsigned long ulen(char *s)",
+        "int fmt(char *b,const char *f,unsigned char c)",
+        "int fmts(char *b,const char *f,signed char c)",
+        "int fmt8(char *b,const char *f,u8 c)",
+        "int fmtc(char *b,const char *f,char c)",
+        "unsigned long ulen(const char *s)",
     ] {
         assert!(arm.contains(want), "AArch64 has no `{want}`:\n{arm}");
     }

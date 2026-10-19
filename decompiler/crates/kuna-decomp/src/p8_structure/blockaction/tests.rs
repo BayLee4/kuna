@@ -89,6 +89,47 @@ fn assert_fully_collapsed(g: &BlockGraph, root: BlockId) {
     }
 }
 
+#[test]
+fn graph_only_switch_preserves_case_topology_and_function_switch_requires_table() {
+    let (mut graph, input, blocks) = build_graph(4);
+    for target in 1..4 {
+        graph.add_edge(blocks[0], blocks[target]);
+    }
+    graph.set_default_switch(blocks[0], 2);
+    let edges = (0..3).map(|slot| {
+        ((blocks[0], blocks[slot + 1]), (slot as int4, slot == 2))
+    }).collect::<std::collections::BTreeMap<_, _>>();
+    let output = graph.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    graph.build_copy(output, input);
+    label_loops_and_doms(&mut graph, output);
+    let mut collapse = CollapseStructure::new(&mut graph, output)
+        .with_switch_case_edges(edges);
+    collapse.graph_only = true;
+    collapse.collapse_all().unwrap();
+    let switch = graph.block(output).get_block(0);
+    assert_eq!(graph.block(switch).get_type(), BlockType::Switch);
+    assert_eq!(graph.block(switch).switch_jt_index(), None);
+    let mut cases = graph.block(switch).switch_caseblocks().to_vec();
+    cases.sort_by_key(|case| case.outindex);
+    assert_eq!(cases.len(), 3);
+    for (slot, case) in cases.iter().enumerate() {
+        assert_eq!(case.basicblock, Some(blocks[slot + 1]));
+        assert_eq!(case.outindex, slot as int4);
+        assert_eq!(case.isdefault, slot == 2);
+        assert_eq!(case.gototype, 0);
+        assert_eq!(case.chain, -1);
+    }
+
+    let (mut function, input, blocks) = build_graph(4);
+    for target in 1..4 {
+        function.add_edge(blocks[0], blocks[target]);
+    }
+    let output = function.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    function.build_copy(output, input);
+    label_loops_and_doms(&mut function, output);
+    assert!(CollapseStructure::new(&mut function, output).collapse_all().is_err());
+}
+
 // ---------------------------------------------------------------------------
 // FloatingEdge
 // ---------------------------------------------------------------------------
@@ -333,18 +374,6 @@ fn loopbody_compare_head_is_signed_three_way() {
     assert_eq!(LoopBody::compare_head(1, 3), -1);
     assert_eq!(LoopBody::compare_head(3, 3), 0);
     assert_eq!(LoopBody::compare_head(5, 3), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Action / switch stub visibility
-// ---------------------------------------------------------------------------
-
-#[test]
-fn new_block_switch_stub_is_err() {
-    // The switch factory (getExitLeaf + grabCaseBasic) is a documented stub; the
-    // engine surfaces it as an Err rather than silently mis-porting.
-    assert!(new_block_switch_stub(true).is_err());
-    assert!(new_block_switch_stub(false).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -1200,7 +1229,7 @@ fn normalization_keeps_eligible_branch_ir_and_edge_order_unchanged() {
         assert!(!candidates.is_empty());
         let before = normalization_snapshot(&data, entry, ops);
         let mut action = ActionNormalizeBranches::boxed("normalizebranches");
-        assert_eq!(action.apply(&mut data, &mut ActionContext::default()), 0);
+        assert_eq!(action.apply(&mut data, &mut ActionContext::default()).unwrap(), 0);
         assert_eq!(action.base().count, 0);
         assert_eq!(normalization_snapshot(&data, entry, ops), before);
     }
@@ -1218,7 +1247,7 @@ fn normalization_keeps_registration_and_group_filtering() {
         "normalizebranches"
     );
     let mut data = cj_fd();
-    assert_eq!(action.apply(&mut data, &mut ActionContext::default()), 0);
+    assert_eq!(action.apply(&mut data, &mut ActionContext::default()).unwrap(), 0);
     assert_eq!(data.bblocks_get_size(), 0);
 }
 
@@ -1228,5 +1257,5 @@ fn normalization_requires_an_initialized_graph() {
     let mut data = cj_fd();
     data.bblocks_mut().root = None;
     ActionNormalizeBranches::boxed("normalizebranches")
-        .apply(&mut data, &mut ActionContext::default());
+        .apply(&mut data, &mut ActionContext::default()).unwrap();
 }

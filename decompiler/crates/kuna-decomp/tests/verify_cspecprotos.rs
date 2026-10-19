@@ -60,8 +60,9 @@ fn bootstrap(arch_id: &str) -> Result<XmlArchitecture, String> {
     let root = repo_root();
     let registry = build_registry();
     let mut store = DocumentStorage::new();
+    let code_space = if arch_id.starts_with("HCS-12X:") { "RAM" } else { "ram" };
     let img_xml = format!(
-        r#"<binaryimage arch="{arch_id}"><bytechunk space="ram" offset="0x1000">c3</bytechunk></binaryimage>"#
+        r#"<binaryimage arch="{arch_id}"><bytechunk space="{code_space}" offset="0x1000">c3</bytechunk></binaryimage>"#
     );
     let binaryimage: Rc<Element> = store
         .parse_document(img_xml.as_bytes())
@@ -98,6 +99,131 @@ fn bootstrap(arch_id: &str) -> Result<XmlArchitecture, String> {
 
 fn arch_of(x: &XmlArchitecture) -> &Architecture {
     x.sleigh().base().expect("Architecture base")
+}
+
+#[derive(Default)]
+struct ModelPayloadOps {
+    ops: Vec<(kuna_num::opcodes::OpCode, Option<kuna_num::pcoderaw::VarnodeData>, Vec<kuna_num::pcoderaw::VarnodeData>)>,
+}
+
+impl kuna_sleigh::translate::PcodeEmit for ModelPayloadOps {
+    fn dump(
+        &mut self,
+        _addr: &Address,
+        opcode: kuna_num::opcodes::OpCode,
+        output: Option<&kuna_num::pcoderaw::VarnodeData>,
+        inputs: &[kuna_num::pcoderaw::VarnodeData],
+    ) {
+        self.ops.push((opcode, output.cloned(), inputs.to_vec()));
+    }
+}
+
+fn emit_model_payload(arch: &Architecture, id: i32) -> ModelPayloadOps {
+    use kuna_decomp::inject_sleigh::SleighInjectEngine;
+    use kuna_decomp::pcodeinject::InjectContext;
+    let manager = arch.manage();
+    let code = Rc::clone(manager.get_default_code_space().unwrap());
+    let engine = SleighInjectEngine::new(
+        Rc::clone(manager.get_constant_space().unwrap()),
+        Rc::clone(manager.get_unique_space().unwrap()),
+        Rc::clone(&code),
+    );
+    let mut context = InjectContext {
+        baseaddr: Some(Address::new(Rc::clone(&code), 0x1000)),
+        nextaddr: Some(Address::new(code, 0x1004)),
+        ..Default::default()
+    };
+    let library = arch.pcodeinjectlib.borrow();
+    let payload = library.get_payload(id);
+    assert_eq!(payload.core().get_type(), kuna_decomp::pcodeinject::CALLMECHANISM_TYPE);
+    assert!(!payload.core().is_dynamic());
+    let template = library.get_tpl(id).expect("production initialization compiles model bodies");
+    let mut emitted = ModelPayloadOps::default();
+    engine.emit_payload(payload, template, &mut context, &mut emitted).unwrap();
+    emitted
+}
+
+#[test]
+fn selected_ppc_compiler_models_compile_authentic_return_stores() {
+    use kuna_num::opcodes::OpCode;
+    for (arch_id, width, displacement, saved_register) in [
+        ("PowerPC:LE:64:default:default", 8, 40, b"r2Save".as_slice()),
+        ("PowerPC:BE:64:default:default", 8, 40, b"r2Save".as_slice()),
+        ("PowerPC:BE:32:default:macosx", 4, 20, b"r2".as_slice()),
+    ] {
+        let xml_arch = bootstrap(arch_id).unwrap_or_else(|error| panic!("{arch_id}: {error}"));
+        let arch = arch_of(&xml_arch);
+        let model = arch.default_fp().unwrap();
+        assert_eq!(model.get_name(), "__stdcall");
+        assert_eq!(model.get_inject_upon_entry(), -1);
+        let id = model.get_inject_upon_return();
+        assert!(id >= 0, "{arch_id}: actual selected default model carries its return mechanism");
+        let alias = arch.get_model("__thiscall").unwrap();
+        assert_eq!(alias.get_inject_upon_return(), id, "aliases keep the original payload identity");
+        let library = arch.pcodeinjectlib.borrow();
+        assert_eq!(library.base.get_payload_id(
+            kuna_decomp::pcodeinject::CALLMECHANISM_TYPE,
+            b"__stdcall@@inject_uponreturn",
+        ), id);
+        drop(library);
+        let emitted = emit_model_payload(arch, id);
+        assert_eq!(emitted.ops.iter().map(|op| op.0).collect::<Vec<_>>(),
+            [OpCode::CPUI_INT_ADD, OpCode::CPUI_STORE], "{arch_id}: complete memory-writing body");
+        let (_, pointer, add_inputs) = &emitted.ops[0];
+        assert_eq!(add_inputs[0], arch.get_register_varnode(b"r1").unwrap());
+        assert_eq!((add_inputs[1].size, add_inputs[1].offset), (width, displacement));
+        let (_, output, store_inputs) = &emitted.ops[1];
+        assert!(output.is_none());
+        assert_eq!(store_inputs[1], *pointer.as_ref().unwrap());
+        assert_eq!(store_inputs[1].size, width);
+        assert_eq!(store_inputs[2], arch.get_register_varnode(saved_register).unwrap());
+        assert_eq!(store_inputs[2].size, width, "STORE value determines memory width, not its space selector");
+    }
+}
+
+#[test]
+fn named_hcs12x_model_compiles_its_authentic_entry_copy() {
+    use kuna_num::opcodes::OpCode;
+    let xml_arch = bootstrap("HCS-12X:BE:24:default:default").unwrap();
+    let arch = arch_of(&xml_arch);
+    assert_eq!(arch.default_fp().unwrap().get_inject_upon_entry(), -1,
+        "the default is not the xgate model");
+    let model = arch.get_model("__asm_xgate").expect("authentic named model is registered");
+    let id = model.get_inject_upon_entry();
+    assert!(id >= 0);
+    assert_eq!(model.get_inject_upon_return(), -1);
+    let emitted = emit_model_payload(arch, id);
+    assert_eq!(emitted.ops.len(), 1);
+    let (opcode, output, inputs) = &emitted.ops[0];
+    assert_eq!(*opcode, OpCode::CPUI_COPY);
+    assert_eq!(*output, Some(arch.get_register_varnode(b"R7").unwrap()));
+    assert_eq!(*inputs, vec![arch.get_register_varnode(b"SP").unwrap()]);
+    assert_eq!(inputs[0].size, 2);
+}
+
+#[test]
+fn selected_dalvik_model_retains_dynamic_entry_without_a_local_template() {
+    let mut xml_arch = bootstrap("Dalvik:LE:32:DEX_KitKat:default").unwrap();
+    let arch = arch_of(&xml_arch);
+    let id = arch.default_fp().unwrap().get_inject_upon_entry();
+    assert!(id >= 0);
+    assert_eq!(arch.default_fp().unwrap().get_inject_upon_return(), -1);
+    let library = arch.pcodeinjectlib.borrow();
+    let payload = library.get_payload(id);
+    assert_eq!(payload.core().get_type(), kuna_decomp::pcodeinject::CALLMECHANISM_TYPE);
+    assert_eq!(payload.core().get_name(), b"__stdcall@@inject_uponentry");
+    assert!(payload.core().is_dynamic());
+    assert!(library.get_tpl(id).is_none(), "host-generated entry is not replaced by a static body");
+    let count = library.injection.len();
+    drop(library);
+    // A repeated production model decode must preserve the original live ids,
+    // including the callother payload registered before the model.
+    let cspec = std::fs::read(repo_root().join("specs/Ghidra/Processors/Dalvik/data/languages/Dalvik_Base.cspec")).unwrap();
+    let arch = xml_arch.sleigh_mut().base_mut().unwrap();
+    arch.set_cspec_xml(cspec);
+    arch.build_default_proto().unwrap();
+    assert_eq!(arch.default_fp().unwrap().get_inject_upon_entry(), id);
+    assert_eq!(arch.pcodeinjectlib.borrow().injection.len(), count);
 }
 
 const RECURSIVE_NODE_HOST_ID: u64 = 0x71000001;
@@ -281,11 +407,11 @@ fn assert_recursive_call_storage(
     fd.op_set_opcode(call, kuna_decomp::typeop::type_op_for(OpCode::CPUI_CALLIND));
     let target_type = factory.get_type_pointer(8, Rc::clone(callable), 1).unwrap();
     let target = fd.new_unique(8, Some(target_type));
-    let argument = fd.new_varnode(16, &input_storage, Some(Rc::clone(declared)));
+    let argument = fd.new_varnode(16, &input_storage, Some(Rc::clone(declared))).unwrap();
     let argument = fd.set_input_varnode(argument).unwrap();
     fd.op_set_input(call, target, 0).unwrap();
     fd.op_set_input(call, argument, 1).unwrap();
-    let result = fd.new_varnode(16, &output_storage, Some(Rc::clone(declared)));
+    let result = fd.new_varnode(16, &output_storage, Some(Rc::clone(declared))).unwrap();
     fd.op_set_output(call, result).unwrap();
     fd.op_insert_end(call, block);
     let mut fc = FuncCallSpecs::new(call, Address::new_invalid());
@@ -294,7 +420,7 @@ fn assert_recursive_call_storage(
     fc.get_active_input().register_trial(&input_storage, 16);
     fd.push_call_specs(fc);
     fd.start_type_recovery();
-    ActionDeindirect::boxed("typerecovery").apply(&mut fd, &mut ActionContext::new());
+    ActionDeindirect::boxed("typerecovery").apply(&mut fd, &mut ActionContext::new()).unwrap();
     assert!(!fd.has_restart_pending(), "the completed held declaration must be usable at the call");
     let operation = fd.obank().get(call).unwrap();
     assert_eq!(operation.num_input(), 2);
@@ -366,8 +492,13 @@ fn recursive_host_callable_decodes_and_assigns_real_target_abis_in_both_query_or
 
 #[test]
 fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage() {
+    use kuna_decomp::action::ActionContext;
+    use kuna_decomp::coreaction_protos::{
+        ActionDefaultParams, ActionFuncLink, ActionFuncLinkOutOnly, ActionPrototypeTypes,
+    };
     use kuna_decomp::dtype::{type_metatype, TypeFactory, TypeField};
-    use kuna_decomp::fspec::PrototypePieces;
+    use kuna_decomp::fspec::{FuncCallSpecs, FuncProto, PrototypePieces};
+    use kuna_num::opcodes::OpCode;
     let architecture = bootstrap("x86:LE:64:default:gcc").unwrap();
     let arch = arch_of(&architecture);
     let factory = arch.types_impl();
@@ -380,6 +511,37 @@ fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage(
     };
     assert!(factory.get_type_code_proto(&pieces(Rc::clone(&alias))).is_err(),
         "an unresolved by-value layout cannot publish assigned storage");
+    let memory = Rc::clone(arch.manage().get_default_code_space().unwrap());
+    let site = Address::new(Rc::clone(&memory), 0x1000);
+    let entry = Address::new(memory, 0x2000);
+    let mut fd = arch.new_funcdata("pending_call", site.clone(), 0).unwrap();
+    ActionPrototypeTypes::boxed("base").apply(&mut fd, &mut ActionContext::new()).unwrap();
+    let root = fd.bblocks_ref().root.unwrap();
+    let block = fd.bblocks_mut().new_block_basic(root);
+    let call = fd.new_op(1, site);
+    fd.op_set_opcode(call, kuna_decomp::typeop::type_op_for(OpCode::CPUI_CALL));
+    let target = fd.new_constant(8, 0x2000);
+    fd.op_set_input(call, target, 0).unwrap();
+    let previous_output = fd.new_unique_out(16, call).unwrap();
+    fd.op_insert_end(call, block);
+    let mut spec = FuncCallSpecs::new(call, entry);
+    *spec.proto_mut() = FuncProto::from_logical(
+        &pieces(Rc::clone(&alias)), Rc::clone(arch.default_fp().unwrap()), factory,
+    ).unwrap();
+    fd.push_call_specs(spec);
+    assert!(ActionDefaultParams::boxed("base")
+        .apply(&mut fd, &mut ActionContext::new()).is_err());
+    assert!(ActionFuncLink::boxed("base")
+        .apply(&mut fd, &mut ActionContext::new()).is_err());
+    assert!(ActionFuncLinkOutOnly::boxed("base")
+        .apply(&mut fd, &mut ActionContext::new()).is_err());
+    let operation = fd.obank().get(call).unwrap();
+    assert_eq!((operation.num_input(), operation.get_in(0), operation.get_out()),
+        (1, Some(target), Some(previous_output)));
+    assert_eq!(fd.vbank().get(previous_output).unwrap().get_def(), Some(call));
+    assert!(!fd.get_call_specs(0).is_input_active());
+    assert!(fd.get_call_specs(0).proto().get_param(0).unwrap().get_address().is_invalid());
+    assert_eq!(fd.get_call_specs(0).proto().get_param(0).unwrap().get_name(), "node");
     let callback_pointer = factory.get_type_pointer(8, factory.get_type_code().unwrap(), 1).unwrap();
     factory.set_fields_struct_raw(&node, vec![
         TypeField::new(101, 0, "d", factory.get_base(8, type_metatype::TYPE_FLOAT).unwrap()),
@@ -392,6 +554,39 @@ fn recursive_alias_callable_waits_for_layout_before_assigning_aggregate_storage(
     assert_eq!(proto.num_params(), 1);
     assert_recursive_join(arch, &proto.get_param(0).unwrap().get_address(), ["RDI", "XMM0"]);
     assert_recursive_join(arch, &proto.get_output().get_address(), ["RAX", "XMM0"]);
+    ActionDefaultParams::boxed("base").apply(&mut fd, &mut ActionContext::new()).unwrap();
+    let ready = fd.get_call_specs(0).proto();
+    assert_eq!(ready.get_param(0).unwrap().get_name(), "node");
+    assert_recursive_join(arch, &ready.get_param(0).unwrap().get_address(), ["RDI", "XMM0"]);
+    assert_recursive_join(arch, &ready.get_output().get_address(), ["RAX", "XMM0"]);
+    ActionFuncLink::boxed("base").apply(&mut fd, &mut ActionContext::new()).unwrap();
+    let operation = fd.obank().get(call).unwrap();
+    // FuncLink has staged the one real JOIN argument and its separate
+    // call-frame placeholder. The latter is consumed by normal stack
+    // resolution later; this isolated setup has not run that lifecycle.
+    assert_eq!(operation.num_input(), 3);
+    assert_eq!(operation.get_in(0), Some(target));
+    assert_eq!(fd.vbank().get(operation.get_in(1).unwrap()).unwrap().get_size(), 16);
+    assert_eq!(fd.vbank().get(operation.get_out().unwrap()).unwrap().get_size(), 16);
+    let spec = fd.get_call_specs(0);
+    assert_eq!(spec.proto().num_params(), 1);
+    assert_eq!(spec.get_stack_placeholder_slot(), 2);
+    let placeholder = operation.get_in(spec.get_stack_placeholder_slot()).unwrap();
+    let value = fd.vbank().get(placeholder).unwrap();
+    assert!(value.is_spacebase_placeholder());
+    assert_eq!(value.get_size(), 1);
+    let load = fd.obank().get(value.get_def().unwrap()).unwrap();
+    assert_eq!(load.code(), OpCode::CPUI_LOAD);
+    assert_eq!(load.get_out(), Some(placeholder));
+    assert_eq!(load.num_input(), 2);
+    assert_eq!(spec.active_input().get_num_trials(), 1);
+    let trial = spec.active_input().get_trial(0);
+    let parameter = spec.proto().get_param(0).unwrap();
+    assert_eq!(trial.get_address(), &parameter.get_address());
+    assert_eq!(trial.get_size(), 16);
+    assert_eq!(trial.get_slot(), 1);
+    assert!(trial.is_active());
+    assert_eq!(spec.final_input_storage(), &[(parameter.get_address(), 16)]);
 }
 
 
@@ -610,7 +805,7 @@ fn x86_64_win_registers_thiscall_and_the_model_aliases() {
     let alias = arch.get_model("__cdecl").unwrap();
     let parent = arch.get_model("__fastcall").unwrap();
     assert_eq!(alias.get_name(), "__cdecl");
-    assert!(alias.is_compatible(parent), "a <modelalias> must stay compatible with its parent");
+    assert!(alias.is_compatible(&parent), "a <modelalias> must stay compatible with its parent");
 }
 
 /// The ELF specs register their own named models, and the 32-bit gcc spec has a
@@ -659,7 +854,7 @@ fn the_default_model_is_untouched_by_the_named_models() {
     let x = bootstrap("x86:LE:32:default:windows").expect("bootstrap x86win");
     let arch = arch_of(&x);
     let defaultfp = arch.default_fp().unwrap();
-    assert!(Rc::ptr_eq(defaultfp, arch.get_model("__stdcall").unwrap()));
+    assert!(Rc::ptr_eq(defaultfp, &arch.get_model("__stdcall").unwrap()));
     // The x86win <default_proto> is `extrapop="unknown"` with an ESP/EBP/...
     // <unaffected> block; those are what proto recovery reads.
     assert_eq!(defaultfp.get_extra_pop(), kuna_decomp::fspec::EXTRAPOP_UNKNOWN);

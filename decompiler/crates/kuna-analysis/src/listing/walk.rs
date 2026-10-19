@@ -264,7 +264,7 @@ pub(super) fn in_exec(exec_ranges: &[(u64, u64)], vma: u64) -> bool {
 /// serial [`walk`] drives it through a sink that pushes onto its own worklists.
 /// Returns `false` when the path stopped here (already decoded, outside every
 /// executable range, undecodable, or zero-length) and nothing was recorded.
-pub(super) fn step<I, F, R, C, S>(
+pub(super) fn step_without_tables<I, F, R, C, S>(
     ctx: &StepCtx<'_>,
     vma: u64,
     insns: &mut I,
@@ -364,26 +364,50 @@ where
         out.insn(fall);
         refs.file(vma, fall, RefKind::Code);
     }
-    // (kuna) `thumbswitch`: the case bodies of a Thumb `tbb`/`tbh` are this
-    // function's own successors. See [`super::kuna_thumbswitch`].
-    if let Some(tables) = ctx.tables.filter(|_| c.flow.is_computed && c.flow.is_jump && c.flows.is_empty()) {
-        let decoded = |at: u64| insns.decoded(at);
-        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma).0 {
-            out.insn(target);
-            refs.file(vma, target, RefKind::Code);
-        }
-    }
-    let skip = vma.wrapping_add(u64::from(decoded.len));
-    if let Some(tables) = ctx.a32_tables
-        .filter(|_| c.flow.is_computed && c.flow.is_jump && c.flows.iter().all(|&t| t == skip))
-    {
-        let decoded = |at: u64| insns.decoded(at);
-        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma) {
-            out.insn(target);
-            refs.file(vma, target, RefKind::Code);
-        }
-    }
     true
+}
+
+/// File one instruction and acquire any Thumb or A32 table successors. Decode lanes
+/// use `step_without_tables`: they have no table reader or host queries.
+pub(super) fn step<I, F, R, C, S>(
+    ctx: &StepCtx<'_>,
+    vma: u64,
+    insns: &mut I,
+    funcs: &mut F,
+    refs: &mut R,
+    callbacks: &mut C,
+    out: &mut S,
+) -> kuna_base::error::KunaResult<bool>
+where
+    I: InsnSink + ?Sized,
+    F: FuncSink + ?Sized,
+    R: RefSink + ?Sized,
+    C: CallbackSink + ?Sized,
+    S: Successors + ?Sized,
+{
+    let mut store = LastRecord { store: insns, last: None };
+    if !step_without_tables(ctx, vma, &mut store, funcs, refs, callbacks, out) {
+        return Ok(false);
+    }
+    let computed_jump = store.last.is_some_and(|last| {
+        last.flow.is_computed && last.flow.is_jump && last.target.is_none()
+    });
+    let a32_jump = store.last.is_some_and(|last| last.computed_fallthrough);
+    if let Some(tables) = ctx.tables.filter(|_| computed_jump) {
+        let decoded = |at: u64| insns.decoded(at);
+        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma)?.0 {
+            out.insn(target);
+            refs.file(vma, target, RefKind::Code);
+        }
+    }
+    if let Some(tables) = ctx.a32_tables.filter(|_| a32_jump) {
+        let decoded = |at: u64| insns.decoded(at);
+        for target in tables.targets(ctx.translate, ctx.code_space, ctx.exec_ranges, &decoded, vma)? {
+            out.insn(target);
+            refs.file(vma, target, RefKind::Code);
+        }
+    }
+    Ok(true)
 }
 
 /// The serial walk's two worklists behind a [`Successors`] sink.
@@ -454,7 +478,7 @@ pub(super) fn walk(
     tables: Option<&super::kuna_thumbswitch::HalfwordTables<'_>>,
     a32_tables: Option<&super::kuna_a32switch::A32Tables<'_>>,
     memo: Option<&super::kuna_decodememo::DecodeMemo>,
-) -> WalkState {
+) -> kuna_base::error::KunaResult<WalkState> {
     // Paint the decode-mode context (ARM TMode / MIPS ISA_MODE) into the engine's
     // ContextDatabase BEFORE we decode a single instruction — the timing the
     // alternate ISAs require (the same ordering `commit_analysis_output` uses).
@@ -472,11 +496,11 @@ pub(super) fn walk(
         translate, code_space, exec_ranges, local_entries, policy, detail, tables, a32_tables, memo,
     };
 
-    let mut st = walk_plain(&ctx, arch, seeds, seed_funcs, painter, plan, frames, arm_walk, resumed);
+    let mut st = walk_plain(&ctx, arch, seeds, seed_funcs, painter, plan, frames, arm_walk, resumed)?;
     if let Some(mode) = flow_mode {
         st.mode_runs.extend(super::kuna_flowmode::disagreeing_runs(&ctx, arch, mode));
     }
-    st
+    Ok(st)
 }
 
 /// The serial or parallel walk, as [`walk`] runs it.
@@ -491,7 +515,7 @@ fn walk_plain(
     frames: Option<&mut super::kuna_framemode::FrameModes>,
     arm_walk: Option<&super::kuna_armwalkmode::ArmWalkMode>,
     resumed: Option<WalkState>,
-) -> WalkState {
+) -> kuna_base::error::KunaResult<WalkState> {
     let StepCtx { translate, code_space, exec_ranges, local_entries, policy, detail, .. } = *ctx;
     if plan.lanes() > 1 && frames.is_none() && arm_walk.is_none() && resumed.is_none() {
         let inputs = super::kuna_pdecode::ParallelInputs {
@@ -508,15 +532,15 @@ fn walk_plain(
         };
         if let Some(parallel) = super::kuna_pdecode::try_parallel(plan, &inputs) {
             let Some(abort) = super::kuna_pdecode::selfcheck() else {
-                return parallel;
+                return Ok(parallel);
             };
-            let serial = walk_serial(ctx, seeds, seed_funcs, detail, arch, None, None, None);
+            let serial = walk_serial(ctx, seeds, seed_funcs, detail, arch, None, None, None)?;
             let differences = super::kuna_pdecode::compare(&parallel, &serial);
             assert!(
                 differences == 0 || !abort,
                 "KUNA_DECODE_SELFCHECK=abort: {differences} differences against the serial walk"
             );
-            return serial;
+            return Ok(serial);
         }
     }
 
@@ -536,7 +560,7 @@ fn walk_serial(
     mut frames: Option<&mut super::kuna_framemode::FrameModes>,
     arm_walk: Option<&super::kuna_armwalkmode::ArmWalkMode>,
     resumed: Option<WalkState>,
-) -> WalkState {
+) -> kuna_base::error::KunaResult<WalkState> {
     let mut walk_context = super::kuna_walkcontext::WalkContext::new(
         frames.is_some(), ctx.translate, arch, ctx.code_space, ctx.exec_ranges,
     );
@@ -576,7 +600,7 @@ fn walk_serial(
 
     if let Some(mode) = arm_walk.filter(|_| walk_context.is_none()) {
         let mut state = WalkSinks { insns: &mut insns, funcs: &mut funcs, refs: &mut refs, callbacks: &mut callbacks };
-        walk_carried(ctx, arch, mode, &mut func_worklist, &mut visited_funcs, &mut state);
+        walk_carried(ctx, arch, mode, &mut func_worklist, &mut visited_funcs, &mut state)?;
     }
 
     while let Some(entry) = func_worklist.pop() {
@@ -587,7 +611,7 @@ fn walk_serial(
         if walk_context.is_none() {
             let mut work = Worklists { insns: vec![entry], funcs: &mut func_worklist };
             while let Some(vma) = work.insns.pop() {
-                step(ctx, vma, &mut insns, &mut funcs, &mut refs, &mut callbacks, &mut work);
+                step(ctx, vma, &mut insns, &mut funcs, &mut refs, &mut callbacks, &mut work)?;
             }
             continue;
         }
@@ -600,7 +624,7 @@ fn walk_serial(
             if insns.contains_key(&vma) { continue; }
             let selection = super::kuna_walkcontext::InstructionMode::select(arch, ctx.translate, ctx.code_space, vma, mode);
             let mut work = Worklists { insns: std::mem::take(&mut successors), funcs: &mut func_worklist };
-            if step(ctx, vma, &mut insns, &mut funcs, &mut refs, &mut callbacks, &mut work) {
+            if step(ctx, vma, &mut insns, &mut funcs, &mut refs, &mut callbacks, &mut work)? {
                 let insn = insns.get(&vma).unwrap();
                 let commits = if walk_context.is_some() { ctx.last_context_commits() }
                     else { Vec::new() };
@@ -624,13 +648,13 @@ fn walk_serial(
         }
     }
 
-    WalkState {
+    Ok(WalkState {
         insns,
         refs: refs.into_edges(),
         funcs,
         stack_callback_refs: callbacks.refs,
         mode_runs,
-    }
+    })
 }
 
 /// The serial walk's stores, as [`walk_carried`] fills them.
@@ -651,15 +675,15 @@ fn walk_carried(
     func_worklist: &mut Vec<u64>,
     visited_funcs: &mut BTreeSet<u64>,
     sinks: &mut WalkSinks<'_>,
-) {
+) -> kuna_base::error::KunaResult<()> {
     let mut modes = mode.begin();
     let mut resumed = Vec::new();
     loop {
-        walk_items(ctx, &mut modes, std::mem::take(&mut resumed), func_worklist, sinks);
+        walk_items(ctx, &mut modes, std::mem::take(&mut resumed), func_worklist, sinks)?;
         while let Some(entry) = func_worklist.pop() {
             if visited_funcs.insert(entry) {
                 let start = vec![(entry, modes.entry(entry))];
-                walk_items(ctx, &mut modes, start, func_worklist, sinks);
+                walk_items(ctx, &mut modes, start, func_worklist, sinks)?;
             }
         }
         resumed = modes.resume(arch, ctx.code_space, sinks.insns);
@@ -668,6 +692,7 @@ fn walk_carried(
         }
     }
     modes.finish(arch, ctx.code_space);
+    Ok(())
 }
 
 /// Walk from `start`, each item in the mode it carries (`None` reads the
@@ -678,7 +703,7 @@ fn walk_items(
     start: Vec<(u64, Option<u32>)>,
     func_worklist: &mut Vec<u64>,
     sinks: &mut WalkSinks<'_>,
-) {
+) -> kuna_base::error::KunaResult<()> {
     let mut pending = start;
     let mut successors = Vec::new();
     let mut reads = modes.read_override(ctx.translate);
@@ -686,7 +711,7 @@ fn walk_items(
         reads.set(mode);
         let mut work = Worklists { insns: std::mem::take(&mut successors), funcs: func_worklist };
         let mut store = LastRecord { store: sinks.insns, last: None };
-        step(ctx, vma, &mut store, sinks.funcs, sinks.refs, sinks.callbacks, &mut work);
+        step(ctx, vma, &mut store, sinks.funcs, sinks.refs, sinks.callbacks, &mut work)?;
         match (store.last, mode) {
             (Some(last), Some(mode)) => {
                 let commits = if last.target.is_some() {
@@ -714,6 +739,7 @@ fn walk_items(
         }
         successors = work.insns;
     }
+    Ok(())
 }
 
 /// What [`walk_items`] reads back about the instruction [`step`] just filed.
@@ -722,15 +748,16 @@ struct Filed {
     len: u32,
     flow: super::model::FlowType,
     target: Option<u64>,
+    computed_fallthrough: bool,
 }
 
 /// An [`InsnSink`] that keeps [`Filed`] for the last record it files.
-struct LastRecord<'a> {
-    store: &'a mut InstructionStore,
+struct LastRecord<'a, I: InsnSink + ?Sized> {
+    store: &'a mut I,
     last: Option<Filed>,
 }
 
-impl InsnSink for LastRecord<'_> {
+impl<I: InsnSink + ?Sized> InsnSink for LastRecord<'_, I> {
     fn decoded(&self, vma: u64) -> bool {
         self.store.decoded(vma)
     }
@@ -740,7 +767,14 @@ impl InsnSink for LastRecord<'_> {
     }
 
     fn record(&mut self, insn: InsnLite) {
-        self.last = Some(Filed { len: insn.len, flow: insn.flow, target: insn.flows.first().copied() });
+        self.last = Some(Filed {
+            len: insn.len,
+            flow: insn.flow,
+            target: insn.flows.first().copied(),
+            computed_fallthrough: insn.flow.is_computed && insn.flow.is_jump
+                && insn.flows.iter()
+                    .all(|&target| target == insn.addr.wrapping_add(u64::from(insn.len))),
+        });
         self.store.record(insn);
     }
 }

@@ -229,7 +229,7 @@ mod tests {
             Address::new(Rc::clone(&ram), 0x2000),
         ));
         let indirect =
-            data.new_indirect_op(call, &Address::new(Rc::clone(&stack), u64::MAX - 3), 4, 0);
+            data.new_indirect_op(call, &Address::new(Rc::clone(&stack), u64::MAX - 3), 4, 0).unwrap();
         let vn = data.obank().get(indirect).unwrap().get_out().unwrap();
         data.vbank_mut()
             .get_mut(vn)
@@ -359,7 +359,7 @@ mod tests {
             &Address::new(Rc::clone(&f.stack), u64::MAX - 3),
             4,
             0,
-        );
+        ).unwrap();
         f.data.op_uninsert(write);
         f.data.op_insert_after(write, f.call);
         assert_eq!(guarded_block(&f.data, f.vn, &[f.read]), None);
@@ -370,7 +370,7 @@ mod tests {
         let mut f = fixture();
         let indirect =
             f.data
-                .new_indirect_op(f.call, &Address::new(Rc::clone(&f.ram), 0x3000), 4, 0);
+                .new_indirect_op(f.call, &Address::new(Rc::clone(&f.ram), 0x3000), 4, 0).unwrap();
         let value = f.data.obank().get(indirect).unwrap().get_out().unwrap();
         f.data.op_set_input(f.read, value, 0).unwrap();
         assert_eq!(guarded_block(&f.data, value, &[f.read]), None);
