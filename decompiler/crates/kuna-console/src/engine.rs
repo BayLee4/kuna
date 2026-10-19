@@ -580,7 +580,7 @@ pub struct ConsoleProgram {
     /// is decided by [`entry_name_rank`]'s length tie-break, and an analysis
     /// pass that names the same address something shorter silently wins
     /// (`elfmain` naming a libc-start `main` at an address the caller declared
-    /// `stage1`). The discovered names stay as aliases; only the report changes.
+    /// `stage1`). The discovered names stay as aliases.
     declared_names: BTreeMap<u64, String>,
     /// (kuna `--assert`) The caller-supplied assertions this program was loaded
     /// with, in the order they were given -- the one override plane an agent
@@ -895,6 +895,26 @@ impl ConsoleProgram {
             }
         }
         entries
+    }
+
+    /// Keep call presentation aligned with the completed source inventory.
+    fn synchronize_function_display_names(&mut self) {
+        let entries = self.function_entries_canonical();
+        let db = &mut self.arch_mut().symboltab;
+        for mut entry in entries {
+            let Some((symbol, scope)) = db.find_function_across_scopes(&entry.addr) else {
+                continue;
+            };
+            let (namespace, base) = entry.name.rsplit_once("::").unwrap_or(("", &entry.name));
+            if namespace != db.get_full_name(scope)
+                || base == db.symbol(symbol).get_display_name()
+            {
+                continue;
+            }
+            let base_start = entry.name.len() - base.len();
+            entry.name.drain(..base_start);
+            db.symbol_mut(symbol).display_name = entry.name;
+        }
     }
 
     /// Append the loader's alias names at `vma` that neither `name` nor `aliases`
@@ -2776,6 +2796,7 @@ impl ConsoleProgram {
         suppress_pdb_interior_entries(self.arch(), &code_space, &mut merged);
         merged.context_paints.extend(input_context_paints);
         commit_analysis_output(self, &code_space, merged)?;
+        self.synchronize_function_display_names();
         self.arch_mut().invalidate_body_caches();
         self.arch_mut().print_mut().set_export_binding(None);
         self.stash_float_scan();

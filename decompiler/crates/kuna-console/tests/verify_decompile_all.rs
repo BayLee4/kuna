@@ -177,6 +177,45 @@ fn canonical_enumeration_reports_each_entry_address_once() {
     }
 }
 
+#[test]
+fn dwarf_aliases_preserve_loader_identity_and_call_name_authority() {
+    use std::rc::Rc;
+
+    let root = repo_root();
+    let specs = vec![root.join("specs").to_str().unwrap().to_string()];
+    let fixture = root.join("decompiler/crates/kuna-analysis/tests/fixtures/macho_dwarf.o");
+    let mut prog = bootstrap_from_object(fixture.to_str().unwrap(), "", &specs).unwrap();
+    let loader_symbols: Vec<_> = prog.function_entries_canonical().into_iter().map(|entry| {
+        let (id, scope) = prog.arch().symboltab.find_function_across_scopes(&entry.addr).unwrap();
+        let raw = prog.arch().symboltab.symbol(id).name.clone();
+        (entry.addr, id, scope, raw)
+    }).collect();
+    prog.commit_pending_analysis().unwrap();
+    for (addr, id, scope, raw) in loader_symbols {
+        let entry = prog.find_entry_at(addr.get_offset()).unwrap();
+        let db = &prog.arch().symboltab;
+        assert_eq!(db.find_function_across_scopes(&addr), Some((id, scope)));
+        assert_eq!(db.symbol(id).name, raw);
+        assert_eq!(db.find_function(scope, &addr), Some(id));
+        assert_eq!(db.function_display_name_across_scopes(&addr).as_deref(), Some(entry.name.as_str()));
+        assert_eq!(prog.find_entry_by_name(&raw).unwrap().addr, addr);
+    }
+
+    let first = prog.find_entry_by_name("first_byte").unwrap();
+    let source = Rc::clone(prog.arch().symboltab.function_source_proto_across_scopes(&first.addr).unwrap());
+    let mapped = prog.dwarf_locals_for(first.addr.get_offset());
+    let fd = decompile_func_full_with_override_dyn(
+        prog.arch_mut(), &first.name, first.addr.clone(), 0, &mapped, &[], &[], None, &[], &[], &[],
+    ).unwrap();
+    let code = print_c(prog.arch_mut(), &fd).unwrap();
+    assert!(code.contains("first_byte("), "{code}");
+    assert!(!code.contains("_l0("), "{code}");
+    prog.declare_function(first.addr.clone(), Some("AnalystByte"), 0).unwrap();
+    assert_eq!(prog.find_entry_by_name("first_byte").unwrap().name, "AnalystByte");
+    assert_eq!(prog.arch().symboltab.function_display_name_across_scopes(&first.addr).as_deref(), Some("AnalystByte"));
+    assert!(Rc::ptr_eq(&source, prog.arch().symboltab.function_source_proto_across_scopes(&first.addr).unwrap()));
+}
+
 /// Assert the cross-cutting `VarInfo` invariants the type_match metric relies on:
 /// non-empty type strings, dense ordered parameter `arg_index`es, and no
 /// `arg_index` on stack locals.

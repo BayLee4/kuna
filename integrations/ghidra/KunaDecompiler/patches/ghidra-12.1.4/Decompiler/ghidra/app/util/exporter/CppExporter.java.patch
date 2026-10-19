@@ -168,7 +168,7 @@
  
  			if (headerWriter != null) {
  				headerWriter.close();
-@@ -158,40 +243,136 @@
+@@ -158,40 +243,135 @@
  
  	}
  
@@ -286,7 +286,6 @@
 +					external.signature(), -1, monitor) + " __asm__(\"" + escaped + "\");";
 +				if (processedGlobals.add(declaration)) {
 +					if (typeWriter != null) {
-+						typeWriter.setTypeNames(typeNames);
 +						typeWriter.write(List.of(external.signature()), monitor, true);
 +					}
 +					writer.println(declaration);
@@ -318,7 +317,7 @@
  	}
  
  	private boolean excludeFunction(Function currentFunction) {
-@@ -213,11 +394,37 @@
+@@ -213,11 +393,37 @@
  	}
  
  	private void writeResults(List<CPPResult> results, Set<String> processedGlobals,
@@ -359,7 +358,7 @@
  
  		StringBuilder globalDecls = new StringBuilder();
  		StringBuilder headers = new StringBuilder();
-@@ -228,21 +435,50 @@
+@@ -228,21 +434,50 @@
  			if (result == null) {
  				continue;
  			}
@@ -414,7 +413,7 @@
  			if (bodyCode != null) {
  				bodies.append(bodyCode);
  				bodies.append(EOL);
-@@ -291,13 +527,17 @@
+@@ -291,13 +526,17 @@
  		}
  	}
  
@@ -437,7 +436,7 @@
  			dataTypeWriter.write(dtm, monitor);
  
  			headerWriter.println("");
-@@ -309,8 +549,9 @@
+@@ -309,8 +548,9 @@
  		}
  		else if (cFileWriter != null) {
  			DataTypeManager dtm = program.getDataTypeManager();
@@ -449,7 +448,7 @@
  			dataTypeWriter.write(dtm, monitor);
  		}
  
-@@ -319,6 +560,7 @@
+@@ -319,6 +559,7 @@
  			cFileWriter.println("");
  		}
  
@@ -457,7 +456,7 @@
  	}
  
  	private void writeEquates(Program program, File header, PrintWriter headerWriter,
-@@ -405,67 +647,71 @@
+@@ -405,67 +646,71 @@
  		}
  	}
  
@@ -551,7 +550,7 @@
  		writer.write(EOL);
  
  		return writer.toString();
-@@ -475,8 +721,8 @@
+@@ -475,8 +720,8 @@
  // Inner Classes
  //==================================================================================================
  
@@ -562,7 +561,7 @@
  		@Override
  		public int compareTo(CPPResult other) {
  			return address.compareTo(other.address);
-@@ -486,32 +732,63 @@
+@@ -486,32 +731,63 @@
  	private class DecompilerFactory extends CountingBasicFactory<DecompInterface> {
  
  		private Program program;
@@ -635,7 +634,7 @@
  		}
  
  		@Override
-@@ -531,43 +808,41 @@
+@@ -531,43 +807,41 @@
  		}
  
  		private CPPResult doWork(Function function, DecompInterface decompiler,

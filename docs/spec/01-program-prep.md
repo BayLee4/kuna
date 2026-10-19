@@ -101,7 +101,13 @@ qualification also sets the existing storage property over that exact extent;
 qualification of a pointer's pointee does not make the pointer slot volatile.
 Complete per-entry source prototypes are installed after the pieces projections,
 retaining source arity, convention and effects independently of working ABI
-assignment. A successful analysis-output commit invalidates body-derived caches.
+assignment. After the complete successful commit, the selected function symbol's
+display name follows the final canonical entry name when its existing namespace
+can represent that spelling. Definitions and calls then agree for loader/debug
+aliases, including Mach-O decoration, without renaming the raw symbol, moving its
+scope, replacing its source prototype or discarding any alias. Authored names keep
+their existing precedence. Changed displays refresh generation-keyed symbol
+snapshots; the commit also invalidates body-derived caches.
 
 Two timing consequences shape the tier. First, anything that must influence the
 **loader itself** runs before any `option` line exists, so load-time gates are
