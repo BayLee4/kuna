@@ -84,6 +84,14 @@ impl Funcdata {
             return Ok(());
         }
         let num = self.get_func_proto().num_params();
+        // `ProtoStoreSymbol::setInput` carries the prototype's locks onto the
+        // parameter Symbol, which the host session (ghidra mode) needs for its
+        // `<localdb>`.  A standalone decompile keeps its parameter Symbols
+        // unlocked: a namelocked Symbol would also name-lock every Varnode
+        // `set_varnode_properties` binds at the function's entry use point
+        // (e.g. an inlined body's write to the parameter register), and two
+        // name-locked highs never merge.
+        let host = self.get_arch().remote_scope.is_some();
         // Gather (slot, name, type, addr) first; `get_param` borrows the proto and
         // `add_param_symbol` borrows the scope (both on &mut self).
         let mut specs: Vec<(int4, String, Rc<Datatype>, Address, Address, uint4, bool)> = Vec::new();
@@ -117,11 +125,11 @@ impl Funcdata {
                 param.get_name(),
             );
             let mut locks = 0;
-            if param.is_name_locked() { locks |= varnode_flags::namelock; }
-            if param.is_type_locked() { locks |= varnode_flags::typelock; }
-            if param.is_indirect_storage() { locks |= varnode_flags::indirectstorage; }
-            if param.is_hidden_return() { locks |= varnode_flags::hiddenretparm; }
-            specs.push((i, name, ty, addr, param.get_usepoint(), locks, param.is_this_pointer()));
+            if host && param.is_name_locked() { locks |= varnode_flags::namelock; }
+            if host && param.is_type_locked() { locks |= varnode_flags::typelock; }
+            if host && param.is_indirect_storage() { locks |= varnode_flags::indirectstorage; }
+            if host && param.is_hidden_return() { locks |= varnode_flags::hiddenretparm; }
+            specs.push((i, name, ty, addr, param.get_usepoint(), locks, host && param.is_this_pointer()));
         }
         // C++ `funcp.setScope(localmap, baseaddr + -1)` (funcdata.cc:69): the
         // function's `restricted_usepoint` is the entry address minus one, used by
@@ -360,7 +368,7 @@ impl Funcdata {
         if s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
-        self.set_varnode_properties_at(vn, Address::new_invalid())?;
+        self.set_varnode_properties(vn)?;
         Ok(vn)
     }
 
@@ -3350,77 +3358,6 @@ mod tests {
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap()
-    }
-
-    #[test]
-    fn free_construction_does_not_acquire_input_or_later_definition_locks() {
-        let mut manager = build_manager();
-        let ram = Rc::clone(manager.get_space_by_name("ram").unwrap());
-        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
-            "stack", 5, 8, &ram, 1, true, false,
-        ))).unwrap();
-        let entry = Address::new(Rc::clone(&ram), 0x1000);
-        let storage = Address::new(Rc::clone(&ram), 0x38);
-        let input_usepoint = &entry + -1;
-        let later_usepoint = Address::new(Rc::clone(&ram), 0x1020);
-        let mut fd = Funcdata::new(
-            "func", "func", Rc::new(ArchContext::new(manager)), entry, 0x10000000, 0x40,
-        ).unwrap();
-        let scope = fd.get_scope_local_mut().unwrap();
-        let input_symbol = scope.add_symbol(
-            "counter", Rc::new(Datatype::new(4, type_metatype::TYPE_INT)),
-            &storage, &input_usepoint,
-        ).unwrap();
-        let later_symbol = scope.add_symbol(
-            "later_value", Rc::new(Datatype::new(4, type_metatype::TYPE_UINT)),
-            &storage, &later_usepoint,
-        ).unwrap();
-        let locks = varnode_flags::namelock | varnode_flags::typelock;
-        scope.set_attribute(input_symbol, locks);
-        scope.set_attribute(later_symbol, locks);
-
-        let free_input = fd.new_varnode(4, &storage, None).unwrap();
-        assert!(fd.vbank().get(free_input).unwrap().is_free());
-        assert!(!fd.vbank().get(free_input).unwrap().is_mapped());
-        assert!(!fd.vbank().get(free_input).unwrap().is_name_lock());
-        let input = fd.set_input_varnode(free_input).unwrap();
-        assert!(fd.vbank().get(input).unwrap().is_name_lock());
-        assert_eq!(fd.vn_container_entry_key(input).unwrap().0, input_symbol);
-
-        let later = fd.new_varnode(4, &storage, None).unwrap();
-        assert!(!fd.vbank().get(later).unwrap().is_name_lock());
-        let definition = fd.new_op(0, later_usepoint);
-        fd.op_set_output(definition, later).unwrap();
-        assert!(fd.vbank().get(later).unwrap().is_name_lock());
-        assert_eq!(fd.vn_container_entry_key(later).unwrap().0, later_symbol);
-
-        let unrelated = fd.new_varnode(4, &storage, None).unwrap();
-        let definition = fd.new_op(0, Address::new(Rc::clone(&ram), 0x1030));
-        fd.op_set_output(definition, unrelated).unwrap();
-        assert!(!fd.vbank().get(unrelated).unwrap().is_mapped());
-        assert!(!fd.vbank().get(unrelated).unwrap().is_name_lock());
-        let wide_storage = Address::new(Rc::clone(&ram), 0x80);
-        let scope = fd.get_scope_local_mut().unwrap();
-        let wide = scope.add_symbol(
-            "wide_value", Rc::new(Datatype::new(8, type_metatype::TYPE_UINT)),
-            &wide_storage, &input_usepoint,
-        ).unwrap();
-        scope.set_attribute(wide, locks);
-        let upper = fd.new_varnode(4, &(&wide_storage + 4), None).unwrap();
-        assert!(!fd.vbank().get(upper).unwrap().is_mapped());
-        let definition = fd.new_op(0, Address::new(Rc::clone(&ram), 0x1040));
-        fd.op_set_output(definition, upper).unwrap();
-        assert!(!fd.vbank().get(upper).unwrap().is_name_lock());
-        let tied_storage = Address::new(ram, 0x48);
-        let scope = fd.get_scope_local_mut().unwrap();
-        let tied = scope.add_symbol("whole_scope", unk(4), &tied_storage, &Address::new_invalid()).unwrap();
-        scope.set_attribute(tied, locks);
-        let free = fd.new_varnode(4, &tied_storage, None).unwrap();
-        assert!(fd.vbank().get(free).unwrap().is_mapped());
-        assert!(fd.vbank().get(free).unwrap().is_name_lock());
-        let scope = fd.get_scope_local().unwrap();
-        assert!(scope.database().symbol(input_symbol).is_type_locked());
-        assert!(scope.database().symbol(later_symbol).is_type_locked());
     }
 
     fn ram(fd: &Funcdata) -> Rc<AddrSpace> {

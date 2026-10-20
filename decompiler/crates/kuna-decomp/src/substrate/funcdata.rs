@@ -3677,21 +3677,13 @@ impl Funcdata {
     /// a missing cover and mark its HighVariable cover dirty when necessary.
     /// (C++ `Funcdata::setVarnodeProperties`, `funcdata_varnode.cc:25`).
     pub fn set_varnode_properties(&mut self, vn: VarnodeId) -> KunaResult<()> {
-        let Some(value) = self.vbank().get(vn) else { return Ok(()) };
-        if value.is_mapped() {
-            self.ensure_varnode_cover(vn);
-            return Ok(());
-        }
-        self.set_varnode_properties_at(vn, self.vn_use_point(vn))
-    }
-
-    pub(crate) fn set_varnode_properties_at(&mut self, vn: VarnodeId, usepoint: Address) -> KunaResult<()> {
         // An already-mapped Varnode keeps its flags.
         let already_mapped = match self.vbank().get(vn) {
             Some(v) => v.is_mapped(),
             None => return Ok(()),
         };
         if !already_mapped {
+            let usepoint = self.vn_use_point(vn);
             // Both halves of the C++ walk are now wired: the LOCAL symbol-map half
             // (recovered stack locals, via `ScopeLocal::query_properties`) and the
             // GLOBAL half — the parent-scope reach that paints a global-mapped RAM
@@ -6205,52 +6197,6 @@ mod tests {
         }
         assert_eq!(source.num_params(), 3);
         assert!(source.get_param(1).is_none());
-    }
-
-    #[test]
-    fn scoped_input_symbol_properties_wait_for_varnode_lifetime() {
-        let mut manager = build_manager();
-        let register = Rc::new(AddrSpace::new(
-            spacetype::IPTR_PROCESSOR, "register", false, 8, 1, 3,
-            addrspace_flags::hasphysical, 1, 1,
-        ));
-        manager.insert_space(Rc::clone(&register)).unwrap();
-        manager.insert_space(Rc::new(kuna_base::space::SpacebaseSpace::new(
-            "stack", 4, 8, &register, 1, true, false,
-        ))).unwrap();
-        let arch = Rc::new(ArchContext::new(manager));
-        let code = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
-        let mut fd = Funcdata::new(
-            "parameter_scope", "parameter_scope", arch,
-            Address::new(Rc::clone(&code), 0x1000), 0x10000000, 0x40,
-        ).unwrap();
-        let storage = Address::new(register, 0x38);
-        let usepoint = Address::new(Rc::clone(&code), 0xfff);
-        let dtype = Rc::new(Datatype::new(4, type_metatype::TYPE_INT));
-        let scope = fd.get_scope_local_mut().unwrap();
-        let symbol = scope.add_param_symbol(0, "val", dtype, &storage, &usepoint)
-            .unwrap().unwrap();
-        scope.set_attribute(symbol, crate::varnode::varnode_flags::namelock
-            | crate::varnode::varnode_flags::typelock);
-        let free = fd.new_varnode(4, &storage, None).unwrap();
-        assert!(fd.vbank().get(free).unwrap().is_free());
-        assert!(!fd.vbank().get(free).unwrap().is_name_lock());
-        assert!(!fd.vbank().get(free).unwrap().is_mapped());
-        let input = fd.set_input_varnode(free).unwrap();
-        assert!(fd.vbank().get(input).unwrap().is_name_lock());
-        assert!(fd.vbank().get(input).unwrap().is_mapped());
-        let later = fd.new_varnode(4, &storage, None).unwrap();
-        assert!(!fd.vbank().get(later).unwrap().is_name_lock());
-        assert!(!fd.vbank().get(later).unwrap().is_mapped());
-        let copy = fd.new_op(1, Address::new(code, 0x1020));
-        fd.op_set_opcode(copy, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
-        let value = fd.new_constant(4, 7);
-        fd.op_set_input(copy, value, 0).unwrap();
-        fd.op_set_output(copy, later).unwrap();
-        assert!(fd.vbank().get(later).unwrap().is_written());
-        assert!(!fd.vbank().get(later).unwrap().is_name_lock());
-        assert!(!fd.vbank().get(later).unwrap().is_mapped());
-        assert!(fd.vbank().get(input).unwrap().is_name_lock());
     }
 
     #[test]

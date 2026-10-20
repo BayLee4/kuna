@@ -60,5 +60,5 @@
 <stringmatch name="FPU TRUNC VIEWS #2: evaluate the provider into integer locals" min="2" max="2">v[0-9]+ = \(int4\)sample\(source\);</stringmatch>
 <stringmatch name="FPU TRUNC VIEWS #3: keep genuine floating multiplication" min="6" max="6">= \*value \* \*value;</stringmatch>
 <stringmatch name="FPU TRUNC VIEWS #4: retain the floating storage write" min="5" max="5">unsigned int from; float to;.*\.from = v[0-9]+ \}\)\.to;</stringmatch>
-<stringmatch name="FPU TRUNC VIEWS #5: off or a clobber reads actual floating storage" min="4" max="4">float from; unsigned int to;.*\.from = v[0-9]+\[0\] \}\)\.to\)?;</stringmatch>
+<stringmatch name="FPU TRUNC VIEWS #5: off or a clobber reads actual floating storage" min="4" max="4">float from; unsigned int to;.*\.from = v[0-9]+\[0\] \}\)\.to;</stringmatch>
 </decompilertest>
