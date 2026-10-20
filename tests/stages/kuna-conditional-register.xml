@@ -20,5 +20,5 @@
 <stringmatch name="CONDITIONAL REGISTER #2: the validity call remains" min="1" max="1">valid\(entity\)</stringmatch>
 <stringmatch name="CONDITIONAL REGISTER #3: the guarded pointer definition remains" min="1" max="1">= \(char \*\)entity\[1\];</stringmatch>
 <stringmatch name="CONDITIONAL REGISTER #4: the pending-byte load remains" min="1" max="1">= \*v[0-9]+;</stringmatch>
-<stringmatch name="CONDITIONAL REGISTER #5: the guarded word return remains" min="1" max="1">return \*\((?:uint4|unsigned int) \*\)&amp;v[0-9]+\[4\];</stringmatch>
+<stringmatch name="CONDITIONAL REGISTER #5: the guarded word return remains" min="1" max="1">return \*\(uint4 \*\)&amp;v[0-9]+\[4\];</stringmatch>
 </decompilertest>

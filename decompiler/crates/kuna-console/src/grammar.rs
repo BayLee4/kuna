@@ -1762,8 +1762,7 @@ impl<'a> CParse<'a> {
     /// A run of exactly one keyword is looked up by name first, so `void`,
     /// `char` and any host-supplied type spelled with a keyword resolve to the
     /// same interned type they always have; only combinations, and the keywords
-    /// the type factory does not name, resolve against the target's widths.
-    /// Explicit integer combinations also retain their canonical C rank.
+    /// the type factory does not name, take the width-driven path.
     fn scalar_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
         let mut kws: Vec<ScalarKw> = Vec::new();
         while let PToken::ScalarSpecifier(kw) = self.peek()? {
@@ -1870,20 +1869,16 @@ impl<'a> CParse<'a> {
         if kws.len() != sign_only + sh + lng + int_ {
             return Ok(None);
         }
-        let (size, signed_name, unsigned_name) = if sh > 0 {
-            (self.factory.get_size_of_short(), "short", "unsigned short")
+        let size = if sh > 0 {
+            self.factory.get_size_of_short()
         } else if lng == 2 {
-            (self.factory.get_size_of_long_long(), "long long", "unsigned long long")
+            self.factory.get_size_of_long_long()
         } else if lng == 1 {
-            (self.factory.get_size_of_long(), "long", "unsigned long")
+            self.factory.get_size_of_long()
         } else {
-            (self.factory.get_size_of_int(), "int", "unsigned int")
+            self.factory.get_size_of_int()
         };
-        if size <= 0 {
-            return Ok(None);
-        }
-        let (meta, name) = if uns > 0 { (TYPE_UINT, unsigned_name) } else { (TYPE_INT, signed_name) };
-        self.factory.get_base_named(size, meta, name).map(Some)
+        self.sized_scalar(size, Some(if uns > 0 { TYPE_UINT } else { TYPE_INT }))
     }
 
     /// (kuna) The core type of `size` bytes with the given meta-type, or the

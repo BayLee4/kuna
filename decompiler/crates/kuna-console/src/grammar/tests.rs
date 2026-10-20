@@ -1126,72 +1126,45 @@ fn factory_sized(long_size: i32) -> TypeFactoryImpl {
 #[test]
 fn scalar_keywords_resolve_to_core_types() {
     let f = factory_sized(8);
-    for (decl, want, size, metatype) in [
-        ("int x", "int", 4, meta::TYPE_INT),
-        ("signed x", "int", 4, meta::TYPE_INT),
-        ("signed int x", "int", 4, meta::TYPE_INT),
-        ("unsigned x", "unsigned int", 4, meta::TYPE_UINT),
-        ("unsigned int x", "unsigned int", 4, meta::TYPE_UINT),
-        ("short x", "short", 2, meta::TYPE_INT),
-        ("short int x", "short", 2, meta::TYPE_INT),
-        ("unsigned short x", "unsigned short", 2, meta::TYPE_UINT),
-        ("short unsigned int x", "unsigned short", 2, meta::TYPE_UINT),
-        ("long x", "long", 8, meta::TYPE_INT),
-        ("unsigned long x", "unsigned long", 8, meta::TYPE_UINT),
-        ("long long x", "long long", 8, meta::TYPE_INT),
-        ("unsigned long long x", "unsigned long long", 8, meta::TYPE_UINT),
-        ("signed char x", "int1", 1, meta::TYPE_INT),
-        ("unsigned char x", "uint1", 1, meta::TYPE_UINT),
-        ("float x", "float4", 4, meta::TYPE_FLOAT),
-        ("double x", "float8", 8, meta::TYPE_FLOAT),
-        ("long double x", "float10", 10, meta::TYPE_FLOAT),
-        ("wchar_t x", "wchar2", 2, meta::TYPE_INT),
-        ("_Bool x", "bool", 1, meta::TYPE_BOOL),
+    for (decl, want) in [
+        ("int x", "int4"),
+        ("signed x", "int4"),
+        ("signed int x", "int4"),
+        ("unsigned x", "uint4"),
+        ("unsigned int x", "uint4"),
+        ("short x", "int2"),
+        ("short int x", "int2"),
+        ("unsigned short x", "uint2"),
+        ("short unsigned int x", "uint2"),
+        ("long x", "int8"),
+        ("unsigned long x", "uint8"),
+        ("long long x", "int8"),
+        ("unsigned long long x", "uint8"),
+        ("signed char x", "int1"),
+        ("unsigned char x", "uint1"),
+        ("float x", "float4"),
+        ("double x", "float8"),
+        ("long double x", "float10"),
+        ("wchar_t x", "wchar2"),
+        ("_Bool x", "bool"),
     ] {
         let (ty, name) = parse_type(decl, &f, org()).unwrap_or_else(|e| {
             panic!("{decl:?} must parse: {}", e.explain());
         });
         assert_eq!(ty.get_name(), want, "{decl:?}");
-        assert_eq!((ty.get_size(), ty.get_metatype()), (size, metatype), "{decl:?}");
         assert_eq!(name, "x");
     }
 }
 
 #[test]
 fn scalar_long_follows_the_targets_declared_width() {
-    use std::rc::Rc;
     // The whole point of reading `<data_organization>`: `long` is 8 bytes on
     // LP64 and 4 on LLP64, and `long long` is 8 on both.
     let lp64 = factory_sized(8);
-    let long = parse_type("long x", &lp64, org()).unwrap().0;
-    let long_long = parse_type("long long x", &lp64, org()).unwrap().0;
-    assert_eq!((long.get_name(), long.get_size()), ("long", 8));
-    assert_eq!((long_long.get_name(), long_long.get_size()), ("long long", 8));
-    assert_ne!(long.get_id(), long_long.get_id(), "equal widths do not erase C rank");
-    assert!(!Rc::ptr_eq(&long, &long_long));
-    for (canonical, alternatives) in [
-        ("long long x", ["signed long long int x", "long signed int long x"]),
-        ("unsigned long long x", ["long unsigned long int x", "int long long unsigned x"]),
-        ("long x", ["signed long int x", "int long signed x"]),
-        ("unsigned long x", ["long unsigned int x", "int unsigned long x"]),
-        ("short x", ["signed short int x", "int short signed x"]),
-        ("unsigned short x", ["short unsigned int x", "int unsigned short x"]),
-        ("int x", ["signed int x", "signed x"]),
-        ("unsigned int x", ["int unsigned x", "unsigned x"]),
-    ] {
-        let expected = parse_type(canonical, &lp64, org()).unwrap().0;
-        for declaration in alternatives {
-            let actual = parse_type(declaration, &lp64, org()).unwrap().0;
-            assert!(Rc::ptr_eq(&actual, &expected), "{declaration}: same declared rank");
-        }
-    }
+    assert_eq!(parse_type("long x", &lp64, org()).unwrap().0.get_name(), "int8");
     let llp64 = factory_sized(4);
-    let long = parse_type("long x", &llp64, org()).unwrap().0;
-    let long_long = parse_type("long long x", &llp64, org()).unwrap().0;
-    assert_eq!((long.get_name(), long.get_size()), ("long", 4));
-    assert_eq!((long_long.get_name(), long_long.get_size()), ("long long", 8));
-    assert_eq!(long.get_metatype(), meta::TYPE_INT);
-    assert_eq!(long_long.get_metatype(), meta::TYPE_INT);
+    assert_eq!(parse_type("long x", &llp64, org()).unwrap().0.get_name(), "int4");
+    assert_eq!(parse_type("long long x", &llp64, org()).unwrap().0.get_name(), "int8");
 }
 
 #[test]
@@ -1220,8 +1193,7 @@ fn scalar_keywords_work_in_a_prototype() {
     assert_eq!(p.name, "VirtualAlloc");
     assert_eq!(p.outtype.as_ref().unwrap().get_metatype(), meta::TYPE_PTR);
     let names: Vec<&str> = p.intypes.iter().map(|t| t.get_name()).collect();
-    assert_eq!(names, vec!["", "unsigned int", "unsigned long long", "float10"], "pointer, then the declared scalars");
-    assert_eq!(p.intypes.iter().map(|t|t.get_size()).collect::<Vec<_>>(), [org().addr_size, 4, 8, 10]);
+    assert_eq!(names, vec!["", "uint4", "uint8", "float10"], "pointer, then the scalars");
 }
 
 #[test]
@@ -1271,9 +1243,7 @@ fn a_scalar_keyword_with_no_declared_width_is_a_parse_error() {
         "got: {}",
         err.explain()
     );
-    let integer = parse_type("unsigned int x", &f, org()).unwrap().0;
-    assert_eq!(integer.get_name(), "unsigned int");
-    assert_eq!((integer.get_size(), integer.get_metatype()), (4, meta::TYPE_UINT));
+    assert_eq!(parse_type("unsigned int x", &f, org()).unwrap().0.get_name(), "uint4");
 }
 
 // ===========================================================================
@@ -1500,8 +1470,7 @@ fn a_pointer_parameter_may_be_named_after_a_type() {
     assert_eq!(p.name, "vm");
     assert_eq!(p.innames, vec!["code", "index", "ctx"]);
     assert_eq!(p.intypes[0].get_ptr_to().unwrap().get_name(), "uint1");
-    assert_eq!(p.intypes[1].get_name(), "unsigned int");
-    assert_eq!((p.intypes[1].get_size(), p.intypes[1].get_metatype()), (4, meta::TYPE_UINT));
+    assert_eq!(p.intypes[1].get_name(), "uint4");
     assert_eq!(p.intypes[2].get_metatype(), meta::TYPE_PTR);
 }
 

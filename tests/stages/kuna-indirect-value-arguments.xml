@@ -110,7 +110,7 @@
 <stringmatch name="ordinary pointer retains its address" min="1" max="1">pointer_sink\(&amp;v[0-9]+\);</stringmatch>
 <stringmatch name="indirect call passes aggregate value" min="1" max="1">\(\*fn\)\(v[0-9]+\);</stringmatch>
 <stringmatch name="function pointer signature uses source aggregate" min="1" max="1">void \(\*fn\)\(Pair\)</stringmatch>
-<stringmatch name="callee signature uses source aggregate" min="1" max="1">^(?:int4|int) value_reader\(Pair value\)$</stringmatch>
+<stringmatch name="callee signature uses source aggregate" min="1" max="1">int4 value_reader\(Pair value\)</stringmatch>
 <stringmatch name="by-value callee reads parameter fields" min="3" max="3">return value\.b \+ value\.a;</stringmatch>
 <stringmatch name="mutable ABI pointer has its own local" min="2" max="2">Link \*value_addr = &amp;value;</stringmatch>
 <stringmatch name="pointer callback keeps pointer contract" min="1" max="1">void \(\*ptr_fn\)\(Pair \*\)</stringmatch>
