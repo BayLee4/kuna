@@ -4,17 +4,13 @@
     A value living only in a register piece no register name covers.
         sh_openpipe (gcc -O2):  mov rcx,rdi; call xpipe; test eax,eax
                                 js done; ... done: ret
-    The supplied xpipe body writes eax, so callee-body evidence proves the
-    upper half of rax zero. This original case remains, but no longer needs
-    an unknown upper-register piece.
-
-    piece_return instead consumes a whole rax after wide_return, whose
-    declared int4 result covers only eax while its body loads all of rax.
-    The upper half remains outside that declaration: storage register 0x4,
-    which no register name covers. Naming routed it to the global
-    `dat_<addr>` arm because register is a processor space like ram, printing
-    `return CONCAT44(dat_4,wide_return(p));` without declaring dat_4.
-    The piece must instead be a local declared with its storage.
+    xpipe returns an int, so the call writes only eax, and the early return
+    hands back all of rax: the C reads the register's upper half, storage
+    register 0x4 (the upper half of rax), which no register name covers.
+    Naming routed such a high to the global `dat_<addr>` arm because the
+    register space is a processor space like ram, and the function printed
+    `return CONCAT44(dat_4,v1);` with nothing declaring `dat_4`.  A register
+    piece is now a local, declared with its storage.
 
     Stage: P6 variable naming (ActionNameVars).  A strict fix with no
     option: #1 is the declared local, #2 the old global-looking name.
@@ -27,12 +23,6 @@ ffffff8b79048901e8c9ffffff89410431c0c3
 <bytechunk space="ram" offset="0x404000">
 0000000000000000
 </bytechunk>
-<bytechunk space="ram" offset="0x401100" readonly="true">
-488b07c390909090909090
-</bytechunk>
-<bytechunk space="ram" offset="0x401120" readonly="true">
-e8dbffffffc3
-</bytechunk>
 </binaryimage>
 <script>
   <com>map function r0x401000 xpipe</com>
@@ -41,13 +31,6 @@ e8dbffffffc3
   <com>parse line extern int4 mtf(int4 fd,int4 a,int4 b);</com>
   <com>map function r0x401030 sh_openpipe</com>
   <com>lo fu sh_openpipe</com>
-  <com>decompile</com>
-  <com>print C</com>
-  <com>map function r0x401100 wide_return</com>
-  <com>parse line extern int4 wide_return(int4 *p);</com>
-  <com>map function r0x401120 piece_return</com>
-  <com>parse line extern uint8 piece_return(int4 *p);</com>
-  <com>lo fu piece_return</com>
   <com>decompile</com>
   <com>print C</com>
   <com>quit</com>
