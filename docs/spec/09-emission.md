@@ -1330,7 +1330,7 @@ hidden results and other shapes keep their existing dispatch.
 
 ### First promoted-integer variadic entry value
 
-`option varargentry` (default on) gives one existing unrepresented entry local
+`option varargentry` (default off; the aggressive preset turns it on) gives one existing unrepresented entry local
 the recovered interpretation of the first default-promoted `int` after the fixed
 parameters. The P9 owner
 `decompiler/crates/kuna-decomp/src/p9_emit/kuna_varargentry.rs` requires a complete
@@ -1376,8 +1376,8 @@ arity, variadic flag, physical input, High category or source-edit authority.
 It does not guess skipped or heterogeneous tail sequences, reconstruct a
 register-save area, or authorize escaping callback/export cases. In particular,
 a far-stack read which does not match the model's first integer-tail storage
-retains its original domain and rendering. `option varargentry off` retains the
-raw uninitialized-entry-local presentation for these otherwise eligible values.
+retains its original domain and rendering. With the option off, the
+raw uninitialized-entry-local presentation is retained for these otherwise eligible values.
 The original finite variadic own-entry consumer remains the executable oracle;
 the MSABI stage companion separately checks model-selected storage, the option
 flip, conditional placement and additional-input exclusions.

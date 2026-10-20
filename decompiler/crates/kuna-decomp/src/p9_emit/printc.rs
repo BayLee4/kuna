@@ -509,7 +509,7 @@ impl PrintCOptions {
     /// `emitInplaceOp`; `option inplaceops off` restores).
     pub fn new() -> PrintCOptions {
         PrintCOptions {
-            convention: false, // (kuna) console default; Ghidra's wire default is on (reset_wire_option_defaults)
+            convention: true,
             hide_exts: true,
             inplace_ops: true, // (kuna) DIV-36; upstream flag default off + never consumed
             nocasts: false,
@@ -2037,8 +2037,7 @@ impl PrintC {
     pub fn reset_wire_option_defaults(&mut self) {
         self.set_export_binding(None);
         self.options = PrintCOptions::new();
-        self.options.convention = true;
-        self.rt_ctx.convention = true;
+        self.rt_ctx.convention = self.options.convention;
         // DecompileOptions encodes only differences from Ghidra's defaults
         // (DecompileOptions.java:898-923). The console's rendering defaults
         // deliberately differ, but cannot be used to interpret this sparse wire.
