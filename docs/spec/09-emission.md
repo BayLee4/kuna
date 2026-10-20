@@ -92,14 +92,8 @@ brace elision, DIV-39 inline warning slugs) in `docs/history.md`.
 An address-only local is declared from its mapped object's type
 (`kuna_addressdecl.rs`), rather than the pointer-width constant used to reference
 it. Thus a four-byte scalar reached through a saved `int *` remains an `int`,
-even on a 64-bit target. A genuinely narrower nonconstant storage piece contained
-within a mapped scalar or pointer instead declares that complete object's type,
-including its qualifiers and typedef identity. Access widths and offsets remain
-unchanged: two four-byte stores at offsets zero and four of an eight-byte scalar
-need one eight-byte object. Composite and array declaration paths stay unchanged.
-Standalone pieces and accesses that outgrow a narrower frame-map Symbol keep
-their wider representative; this does not infer a new object or reinterpret a
-value. When another
+even on a 64-bit target. Real storage representatives still determine their
+own declarations, including wider and overlapping accesses. When another
 directly accessed Symbol lies wholly inside the address width from the object's
 start, the frame map has likely split one wider object, so the declaration keeps
 the address width rather than shrink to the piece. A buffer whose other part

@@ -88,5 +88,5 @@ e6268000e826a00481c7e00881e80000
 <stringmatch name="first cursor snapshot is explicit" min="1" max="1">v1 = cursor;</stringmatch>
 <stringmatch name="second cursor snapshot is explicit" min="1" max="1">v2 = cursor;</stringmatch>
 <stringmatch name="first index uses first snapshot" min="1" max="1">\*output = first\[v1\];</stringmatch>
-<stringmatch name="second index uses second snapshot" min="1" max="1">v[0-9]+ = second\[v2\];</stringmatch>
+<stringmatch name="second index uses second snapshot" min="1" max="1">v2 = second\[v2\];</stringmatch>
 </decompilertest>

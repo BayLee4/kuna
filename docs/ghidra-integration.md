@@ -261,13 +261,6 @@ declaration view, but a partial access never promotes volatility to its parent.
 Whole-object qualifier evidence takes precedence when the same source object
 also has partial accesses, independently of occurrence order.
 Qualified type views do not compete with their source base for a nominal name.
-The separate volatile local-type hooks retain the accessed value's exact source
-piece: registered read outputs and write operand 2 query at their actual width
-and operation use point only when `special_prop` is present. They preserve the
-source entry's byte displacement and symbol offset without adding the separate
-Symbol typelock filter used by ordinary varnode property synchronization.
-Missing optional type geometry retains ordinary inference; actual query and
-type errors propagate.
 These declarations do not depend on
 `globalref`: that option controls synthesized names for otherwise unnamed
 addresses, not whether an existing named global needs an `extern`. Callable
@@ -1259,10 +1252,11 @@ connection without a completed response.
 
 Successful replacement flow clears only that function's generated
 `warning`/`warningheader` comments before publishing its new diagnostics.
-Reflow also discards its buffered generated comments with the old IR.
+Reflow keeps the warnings its abandoned pass buffered and publishes them with
+the replacement flow's.
 Authored header/instruction comments, other functions' diagnostics and held
-encoded results are preserved; an inline annotation cannot outlive the body
-that produced it after a policy transition.
+encoded results are preserved; a stored inline annotation cannot outlive the
+body that produced it after a policy transition.
 
 Dead host EOF and stream I/O failures carry the distinct engine
 `KunaError::Transport` category through provider, flow, transformation and

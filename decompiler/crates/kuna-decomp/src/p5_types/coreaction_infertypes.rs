@@ -74,15 +74,6 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> KunaResult<Rc<Data
             .and_then(|v| data.vbank().get(v))
             .map(|v| v.get_offset())
             .unwrap_or(0);
-        if o.does_special_propagation()
-            && o.get_out().is_some()
-            && arch.userops.get_op(in0_off as u32)
-                .is_some_and(|userop| userop.get_type() == crate::userop::userop_type::volatile_read)
-        {
-            if let Some(ty) = volatile_source_type(data, o, out_size)? {
-                return Ok(ty);
-            }
-        }
         if in0_off == crate::userop::BUILTIN_STRINGDATA as u64 {
             if let Some(out) = o.get_out().and_then(|v| data.vbank().get(v)) {
                 return Ok(Rc::clone(out.get_type()));
@@ -116,29 +107,6 @@ pub(crate) fn output_type_local(data: &Funcdata, op: OpId) -> KunaResult<Rc<Data
     })
 }
 
-/// VolatileReadOp::getOutputLocal / VolatileWriteOp::getInputLocal use the
-/// operation's special-propagation authority, not SymbolEntry::updateType's
-/// additional Symbol typelock filter.
-fn volatile_source_type(
-    data: &Funcdata,
-    op: &crate::op::PcodeOp,
-    size: int4,
-) -> KunaResult<Option<Rc<Datatype>>> {
-    let Some(annotation) = op.get_in(1).and_then(|value| data.vbank().get(value))
-        .filter(|value| value.is_annotation()) else { return Ok(None) };
-    let arch = data.get_arch();
-    let Some(container) = arch.query_container_global(annotation.get_addr(), size, op.get_addr())?
-        else { return Ok(None) };
-    let Some(source) = container.symbol_type else { return Ok(None) };
-    let offset = (annotation.get_addr().get_offset()
-        .wrapping_sub(container.entry_addr.get_offset()) as int4)
-        .wrapping_add(container.symbol_offset);
-    match arch.types() {
-        Some(types) => types.get_exact_piece(source, offset, size),
-        None => Ok(None),
-    }
-}
-
 pub(crate) fn input_type_local(data: &Funcdata, op: OpId, slot: int4) -> KunaResult<Rc<Datatype>> {
     input_type_local_with(data, op, slot, true)
 }
@@ -160,17 +128,6 @@ fn input_type_local_with(data: &Funcdata, op: OpId, slot: int4, recovered: bool)
         .and_then(|v| data.vbank().get(v))
         .map(|v| v.get_size())
         .unwrap_or(1);
-
-    if opcode == OpCode::CPUI_CALLOTHER && slot == 2 && o.does_special_propagation()
-        && o.get_in(slot).is_some()
-        && o.get_in(0).and_then(|v| data.vbank().get(v))
-            .and_then(|index| arch.userops.get_op(index.get_offset() as u32))
-            .is_some_and(|userop| userop.get_type() == crate::userop::userop_type::volatile_write)
-    {
-        if let Some(ty) = volatile_source_type(data, o, in_size)? {
-            return Ok(ty);
-        }
-    }
 
     // C++ `TypeOpCall::getInputLocal` (typeop.cc:689) / `TypeOpCallind` (typeop.cc:763):
     // for a slot>0 whose in(0) is an fspec (CALL) / code-pointer (CALLIND) reference

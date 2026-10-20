@@ -4084,7 +4084,6 @@ impl Funcdata {
         self.kuna_regnarrow_failed.clear();
         self.kuna_fpu_trunc_views.clear();
         self.kuna_x87_empty_returns.clear();
-        self.pending_comments.clear();
         // Clear the analysis-derived flags (the exact mask from funcdata.cc:88).
         self.flags &= !(funcdata_flags::highlevel_on
             | funcdata_flags::blocks_generated

@@ -1108,9 +1108,10 @@ fn drain_pipeline_comments(arch: &mut Architecture, fd: &mut Funcdata) {
 /// preserving the per-function `Override`, then re-runs the flow follow in place.
 #[allow(clippy::mutable_key_type)]
 fn refollow_flow(arch: &mut Architecture, fd: &mut Funcdata) -> KunaResult<()> {
-    // Drops ops/vbank/blocks/qlst/heritage and buffered generated warnings but
-    // keeps `localoverride`. Stored warnings are replaced only after the new
-    // flow succeeds, at follow_flow_on_fd's publication boundary.
+    // Drops ops/vbank/blocks/qlst/heritage but keeps `localoverride` and the
+    // warnings the abandoned pass buffered. Stored warnings are replaced only
+    // after the new flow succeeds, at follow_flow_on_fd's publication boundary,
+    // where the kept buffer is published with the new flow's.
     fd.clear();
     // Move the cleared shell out so `follow_flow_on_fd` can re-flow it (it takes
     // `fd` by value, mirroring the fresh-build path), then put the re-flowed IR
