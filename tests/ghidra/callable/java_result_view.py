@@ -667,6 +667,51 @@ def export_scope_consumers(output):
         fixture_machine.close()
 
 
+def commit_consumers():
+    """Public commits of ordinary results match stock, also after sibling commits."""
+    from ghidra.app.decompiler import DecompInterface
+    from ghidra.program.flatapi import FlatProgramAPI
+    from ghidra.program.model.pcode import HighFunctionDBUtil
+    from ghidra.program.model.symbol import SourceType
+    code = {"load_first": (0x1000, "0fb607c3"), "load_second": (0x1010, "0fb64701c3"),
+            "sum_fields": (0x1020, "488b0f31c031d24885c97e0c48034708" "48ffc24839ca75f4" "48034710c3")}
+    image = bytearray(0x40)
+    for pc, raw in code.values():
+        image[pc - 0x1000:pc - 0x1000 + len(raw) // 2] = bytes.fromhex(raw)
+    machine = Machine(bytes(image), [(name, pc, None, None) for name, (pc, _) in code.items()])
+    program = machine.program
+    interface = DecompInterface()
+    try:
+        tx = program.startTransaction("Ordinary pointer functions")
+        try:
+            functions = [FlatProgramAPI(program, machine.monitor).createFunction(
+                machine.address(pc), name) for name, (pc, _) in code.items()]
+        finally:
+            program.endTransaction(tx, True)
+        assert interface.openProgram(program), str(interface.getLastMessage())
+        # The stock batch pattern: every result exists before the first commit advances the Program.
+        results = [interface.decompileFunction(function, 60, machine.monitor) for function in functions]
+        assert all(result.decompileCompleted() and result.isEnhancedResult() for result in results)
+        expected = []
+        for result in results:
+            high = result.getHighFunction()
+            manager = high.getDataTypeManager()
+            pointer = high.getFunctionPrototype().getParam(0).getDataType()
+            assert manager.isResultLocal(pointer) and not manager.isResultLocal(pointer.getDataType())
+            expected.append(str(pointer.getName()))
+        for function, result in zip(functions, results):
+            tx = program.startTransaction("Commit " + str(function.getName()))
+            try:
+                HighFunctionDBUtil.commitParamsToDatabase(result.getHighFunction(), True,
+                    HighFunctionDBUtil.ReturnCommitOption.COMMIT, SourceType.USER_DEFINED)
+            finally:
+                program.endTransaction(tx, True)
+        assert [str(function.getParameter(0).getDataType().getName()) for function in functions] == expected
+    finally:
+        interface.dispose()
+        machine.close()
+
+
 def main():
     start_ghidra()
     from java.io import ByteArrayOutputStream
@@ -1048,6 +1093,7 @@ def main():
         with selected_core(KUNA_GHIDRA):
             acquisition = acquisition_authority_consumer(output)
             scoped = export_scope_consumers(output)
+            commit_consumers()
         (output / 'result_view.json').write_text(json.dumps({'passed': True, 'local_types': len(reservations),
             'markup_only_temporary_retained': True, 'explicit_empty_acknowledgment': True,
             'ordinary_authority_unchanged': True, 'stale_enhanced_edit_refused': True,

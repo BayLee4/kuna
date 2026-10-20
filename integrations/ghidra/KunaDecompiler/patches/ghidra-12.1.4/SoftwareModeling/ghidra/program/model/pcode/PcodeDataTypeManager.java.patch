@@ -11,7 +11,7 @@
  
  import ghidra.app.plugin.processors.sleigh.SleighLanguage;
  import ghidra.docking.settings.FormatSettingsDefinition;
-@@ -42,6 +42,577 @@
+@@ -42,6 +42,586 @@
   *
   */
  public class PcodeDataTypeManager {
@@ -164,7 +164,7 @@
 +	}
 +
 +	public boolean hasCurrentExportAuthority() {
-+		return hasCurrentResultBasis() &&
++		return hasCurrentResultBasis(true) &&
 +			(exportAuthority == null || exportAuthority.getAsBoolean());
 +	}
 +
@@ -175,12 +175,17 @@
 +	}
 +
 +	public boolean hasCurrentSourceAuthority() {
-+		return !isExportResult() && hasCurrentResultBasis();
++		return hasCurrentSourceAuthority(true);
 +	}
 +
-+	private boolean hasCurrentResultBasis() {
++	/** A commit or retype installs caller-supplied state, so sibling commits need not expire it. */
++	public boolean hasCurrentSourceAuthority(boolean sameRevision) {
++		return !isExportResult() && hasCurrentResultBasis(sameRevision);
++	}
++
++	private boolean hasCurrentResultBasis(boolean sameRevision) {
 +		return (!enhancedResult && !isExportResult()) ||
-+			(sourceRevision == program.getModificationNumber() &&
++			((!sameRevision || sourceRevision == program.getModificationNumber()) &&
 +				(registrationAuthority == null || registrationAuthority.getAsBoolean()));
 +	}
 +
@@ -190,7 +195,11 @@
 +	}
 +
 +	public void requireCurrentSourceAuthority() {
-+		if (!hasCurrentSourceAuthority()) {
++		requireCurrentSourceAuthority(true);
++	}
++
++	public void requireCurrentSourceAuthority(boolean sameRevision) {
++		if (!hasCurrentSourceAuthority(sameRevision)) {
 +			if (isExportResult()) {
 +				throw new IllegalStateException("Export decompiler results cannot edit the source Program");
 +			}
@@ -589,7 +598,7 @@
  
  	// Mask for routing bits at head of a data-type's temporary id
  	private static final long TEMP_ID_MASK = 0xC000000000000000L;
-@@ -201,6 +772,19 @@
+@@ -201,6 +781,19 @@
  		else if ((id & TEMP_ID_MASK) == NONDB_ID_HEADER && mapIDToNonDBDataType != null) {
  			dt = mapIDToNonDBDataType.get(id);
  		}
@@ -609,7 +618,7 @@
  		return dt;
  	}
  
-@@ -218,6 +802,7 @@
+@@ -218,6 +811,7 @@
  		}
  		String name = "";
  		long id = 0;
@@ -617,7 +626,7 @@
  		for (;;) {
  			int attribId = decoder.getNextAttributeId();
  			if (attribId == 0) {
-@@ -229,6 +814,14 @@
+@@ -229,6 +823,14 @@
  			else if (attribId == ATTRIB_ID.id()) {
  				id = decoder.readUnsignedInteger();
  			}
@@ -632,7 +641,7 @@
  		}
  		if (el == ELEM_TYPEREF.id()) {
  			decoder.closeElement(el);
-@@ -938,6 +1531,12 @@
+@@ -938,6 +1540,12 @@
  	 * @throws IOException for errors in the underlying stream
  	 */
  	public void encodeTypeRef(Encoder encoder, DataType type, int size) throws IOException {
@@ -645,7 +654,7 @@
  		if (type != null && type.getDataTypeManager() != progDataTypes) {
  			type = type.clone(progDataTypes);
  		}
-@@ -999,6 +1598,26 @@
+@@ -999,6 +1607,26 @@
  	 * @return the temporary id
  	 */
  	private long assignTemporaryId(DataType type) {
@@ -672,7 +681,7 @@
  		Long tempId;
  		if (mapNonDBDataTypeToID == null || mapIDToNonDBDataType == null) {
  			mapNonDBDataTypeToID = new HashMap<>();
-@@ -1022,6 +1641,9 @@
+@@ -1022,6 +1650,9 @@
  	 * reset the counter.
  	 */
  	public void clearTemporaryIds() {
@@ -682,7 +691,7 @@
  		mapNonDBDataTypeToID = null;
  		mapIDToNonDBDataType = null;
  		tempIDCounter = 0;
-@@ -1035,6 +1657,20 @@
+@@ -1035,6 +1666,20 @@
  	 * @throws IOException for errors in the underlying stream
  	 */
  	private void encodeNameIdAttributes(Encoder encoder, DataType type) throws IOException {
@@ -703,7 +712,7 @@
  		long id;
  		if (type instanceof BuiltIn) {
  			String nm = ((BuiltIn) type).getDecompilerDisplayName(displayLanguage);
-@@ -1117,7 +1753,19 @@
+@@ -1117,7 +1762,19 @@
  		if (type != null && type.getDataTypeManager() != progDataTypes) {
  			type = type.clone(progDataTypes);
  		}
@@ -724,7 +733,7 @@
  			encodeVoid(encoder);
  		}
  		else if (type instanceof TypeDef) {
-@@ -1273,6 +1921,7 @@
+@@ -1273,6 +1930,7 @@
  	 */
  	public void encodeCoreTypes(Encoder encoder) throws IOException {
  		encoder.openElement(ELEM_CORETYPES);
