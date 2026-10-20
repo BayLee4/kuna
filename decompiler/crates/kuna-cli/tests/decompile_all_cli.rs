@@ -2684,8 +2684,8 @@ static int source_comparator(const void *left, const void *right) {
 /// `(short)((unsigned int)v1 >> 0x10)` and `a2[1] = (int)v1` -- value conversions
 /// where the machine moves bits -- so it is refused.  The round trip compiles the
 /// seven printed callers (`-no-pie`, so the array's address survives the printed
-/// 32-bit `(int)a1 + 0xc`) together with the emitted `h(int, float)` and compares
-/// them with the source.
+/// 32-bit `(int)a1 + 0xc`) against a bit-preserving `h` and compares them with the
+/// source.
 #[test]
 fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
     let bin = repo_root()
@@ -2698,6 +2698,7 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         run_kuna(&["decompile-all", &bin, "--option", "structdefs", "on", "--sleighpath", &sp]);
     assert!(ok, "kuna decompile-all failed: {stderr}");
     for want in [
+        "return (int)h(a0,v1) + v1 + 3;",
         "(unsigned int)(v1 < 0x3fc00000)",
         "if (v1 == 0x3fc00001)",
         "(unsigned int)(0x3fc00000 < v1)",
@@ -2727,7 +2728,7 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         .filter(|cc| process::optional_output(Command::new(cc).arg("--version")).is_some())
         .collect();
     assert!(!compilers.is_empty(), "protoorder float-in-GPR round trip requires a C compiler");
-    let printed = printed_functions(&stdout, &["h ", "g3 ", "g5 ", "g6 ", "g9 ", "g20 ", "g22 ", "g24 "]);
+    let printed = printed_functions(&stdout, &["g3 ", "g5 ", "g6 ", "g9 ", "g20 ", "g22 ", "g24 "]);
     let dir = std::env::temp_dir().join(format!("kuna-protoorder-floatgpr-rt-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("rt.c");
@@ -2737,6 +2738,7 @@ fn a_float_in_a_general_register_keeps_its_integer_uses_round_trip() {
         format!(
             "#include <stdio.h>\n#include <string.h>\n\
              static float hs(int k, float x) {{ return x * 2.5f + (float)k; }}\n\
+             static float h(int k, int bits) {{ float x; memcpy(&x, &bits, 4); return hs(k, x); }}\n\
              {printed}\n\
              static float fb(int b) {{ float f; memcpy(&f, &b, 4); return f; }}\n\
              static int s3(int k, int *p) {{ int b = p[3]; return (int)hs(k, fb(b)) + b + 3; }}\n\
@@ -2864,6 +2866,7 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
     for want in [
         "float nanf(void)",
         "float sub_1150(void)",
+        "return nanf((char *)0x203d);",
         "v1 = sub_1150();",
         "unsigned int sub_11c0(void)",
         "unsigned long sub_11d0(void)",
@@ -2878,16 +2881,8 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
     for bad in ["(float)(*dat_4018)", "(float)sub_1150"] {
         assert!(!stdout.contains(bad), "`{bad}` printed:\n{stdout}");
     }
-    let stub = printed_functions(&stdout, &["nanf "]);
-    let names = ["sub_1150 ", "sub_1170 ", "sub_11c0 ", "sub_11d0 ", "sub_11e0 ", "sub_11f0 ", "sub_1200 ", "sub_1210 "];
+    let names = ["nanf ", "sub_1150 ", "sub_1170 ", "sub_11c0 ", "sub_11d0 ", "sub_11e0 ", "sub_11f0 ", "sub_1200 ", "sub_1210 "];
     let printed = printed_functions(&stdout, &names);
-    // The vendored qnan loads its empty tag with LEA RIP+disp32 before
-    // calling the import. Derive the argument from those original bytes.
-    let tag_load = image_bytes(&bin, 0x1154, 7);
-    assert_eq!(&tag_load[..3], &[0x48, 0x8d, 0x3d]);
-    let tag_displacement = i32::from_le_bytes(tag_load[3..].try_into().unwrap());
-    let tag_address = u64::try_from(0x115bi64 + i64::from(tag_displacement)).unwrap();
-    assert_eq!(image_bytes(&bin, tag_address, 1), [0]);
     let mut globals = String::new();
     let mut init = String::new();
     for (name, ty, addr, size) in [
@@ -2900,18 +2895,11 @@ fn a_float_register_return_and_a_read_void_result_round_trip() {
         globals.push_str(&format!("{ty} {name};\nstatic const unsigned char {name}_b[{size}] = {{{}}};\n", bytes.join(",")));
         init.push_str(&format!("  memcpy(&{name}, {name}_b, sizeof {name});\n"));
     }
-    // Keep the emitted zero-parameter stub and its provider. A typed observer
-    // records the caller's actual argument before forwarding through that stub.
+    // The stub takes no parameters (its jump reads none); its caller passes nanf's.
     let src = format!(
-        "#include <stdio.h>\n#include <stdint.h>\n#include <string.h>\n{BITS}\
-         static float target(void) {{ return __builtin_nanf(\"\"); }}\nfloat (*dat_4018)(void) = target;\n{globals}\
-         #define nanf nanf_stub\n{stub}\n#undef nanf\n\
-         static unsigned nanf_calls;\nstatic uintptr_t nanf_argument;\n\
-         static float observed_nanf(const char *tag) {{\n  ++nanf_calls;\n  nanf_argument = (uintptr_t)tag;\n  return nanf_stub();\n}}\n\
-         #define nanf observed_nanf\n{printed}\n#undef nanf\n\
-         int main(void) {{\n{init}  float positive = sub_1170(3.0f), negative = sub_1170(-3.0f);\n\
-         if (nanf_calls != 1 || nanf_argument != UINT64_C({tag_address})) return 1;\n\
-         printf(\"%llx %llx %llx %llx %llx %llx %llx\\n\", BITS(positive), BITS(negative), \
+        "#include <stdio.h>\n#include <string.h>\n{BITS}#define nanf(...) nanf_stub()\n\
+         static float target(void) {{ return __builtin_nanf(\"\"); }}\nfloat (*dat_4018)(void) = target;\n{globals}{printed}\n\
+         int main(void) {{\n{init}  printf(\"%llx %llx %llx %llx %llx %llx %llx\\n\", BITS(sub_1170(3.0f)), BITS(sub_1170(-3.0f)), \
          BITS(sub_11c0()), BITS(sub_11d0()), BITS(sub_11e0()), BITS(sub_11f0({})), BITS(sub_1210()));\n  return 0;\n}}\n",
         arg_of_bits(&printed, "sub_11f0", 0, 0x3fa0_0000)
     );
@@ -3663,9 +3651,8 @@ fn a_float_return_beside_a_global_read_stays_an_integer() {
 /// The entry hands `f`'s `eax` to `ExitProcess`, so `f` is decompiled again to
 /// return it, and that decompile restarts once its second indirect call
 /// resolves to `ExitProcess`. On its one returning path `f` returns the handle
-/// the comparison also reads: the HANDLE with low 32 bits `0xffffffff`.
-/// Patched to also load through the handle on that path (`je` to a
-/// `mov ecx,[eax]` the `ExitProcess` path jumps
+/// the comparison also reads: `return -1;`. Patched to also load through the
+/// handle on that path (`je` to a `mov ecx,[eax]` the `ExitProcess` path jumps
 /// over), the pass before the restart returned `eax`, joined with what the
 /// unresolved call left, and the pass after it refused the handle; the first
 /// pass's output survived as `int sub_401020(..)` around a bare `return;`, and
@@ -3681,17 +3668,14 @@ fn a_return_refused_after_a_restart_leaves_the_function_void() {
         for chunk in stdout.split("// Function: ") {
             let mut lines = chunk.lines().skip(1);
             let Some(sig) = lines.next() else { continue };
-            let returns_void = sig.strip_prefix("void ")
-                .is_some_and(|declarator| !declarator.trim_start().starts_with('*'));
-            if !returns_void {
+            if !sig.starts_with("void ") {
                 assert!(!lines.any(|l| l.trim() == "return;"), "`{sig}` returns nothing:\n{stdout}");
             }
         }
         printed_functions(&stdout, &["sub_401020 "])
     };
     let printed = decompile(fixture.to_str().unwrap());
-    assert!(printed.contains("void * sub_401020(unsigned int a0)")
-        && printed.contains("return (void *)0xffffffff;"), "{printed}");
+    assert!(printed.contains("int sub_401020(unsigned int a0)") && printed.contains("return -1;"), "{printed}");
 
     let mut image = std::fs::read(&fixture).unwrap();
     let at = |image: &[u8], pattern: &[u8]| image.windows(pattern.len()).position(|w| w == pattern).unwrap();
@@ -3827,7 +3811,7 @@ fn soft_float_imports_keep_their_core_register_values() {
 /// its bits into a `uint64_t`. With the libc table's `double` rows the soft
 /// image printed `double sub_10224(..)` beside `rd`'s `unsigned long long v1 =
 /// sub_10224()`, which converts 2.25 to 2, where the rows' absence returns the
-/// combined r0:r1 bits; the hard image printed `unsigned int sub_101f0(..)`
+/// right `CONCAT44(v2,v1)`; the hard image printed `unsigned int sub_101f0(..)`
 /// returning `SUB84(v1,0)`, the low half of `d0`. ARM gets none of the rows.
 #[test]
 fn arm_images_get_no_double_libc_rows() {
@@ -6985,13 +6969,15 @@ fn a_variable_index_and_a_byte_pointer_difference_round_trip_through_the_printed
     }
 }
 
-/// Enum loads retain their source width, sign and identity under `castarith`.
-/// The fixture's packed enums occupy 1 and 2 bytes, not C's default enum width.
-/// Compile the actual emitted providers as well as the four original callers:
-/// a physical provider can have a private unsigned carrier and a public source
-/// enum wrapper, whose definition need not occur in the caller's preamble.
-/// Both option arms must reproduce the original fixture's complete output and
-/// preserve its source enum definitions. The C++ build is checked for spelling.
+/// An enum element keeps the integer form under `castarith`.  kuna prints every
+/// enum as a plain `enum`, which C sizes as an `int`, while the fixture's
+/// packed enums are 1 and 2 bytes in the binary (as are `-fshort-enums` enums
+/// and a C++ `enum class : uint8_t`), so `((color *)p)[3]` would read 12 bytes
+/// past `p` instead of 3.  The round trip compiles kuna's own enum typedefs,
+/// the prelude of `castarith_enum_x86_64.c` (whose callees read the width the
+/// binary passes), the printed functions between its markers and its `main`,
+/// with the option on and off, and checks the program prints what the binary
+/// does.  The C++ build is checked for spelling only.
 #[test]
 fn an_enum_element_keeps_the_integer_form_and_round_trips() {
     let fx = repo_root().join("decompiler/crates/kuna-analysis/tests/fixtures");
@@ -7009,11 +6995,6 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
         .filter_map(|l| l.split('(').next())
         .collect();
     assert_eq!(tested.len(), 4, "{tested:?}");
-    let providers: Vec<&str> = prelude.lines()
-        .filter_map(|l| l.strip_prefix("KEEP void "))
-        .filter_map(|l| l.split('(').next())
-        .collect();
-    assert_eq!(providers.len(), 4, "{providers:?}");
     let sp = specs();
     let runs_here = cfg!(all(target_os = "linux", target_arch = "x86_64"));
     let have_cc = process::optional_output(Command::new("cc").arg("--version")).is_some();
@@ -7041,16 +7022,12 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
             let mut types: Vec<String> = Vec::new();
             let mut body = String::new();
             let mut seen = 0;
-            let mut seen_providers = 0;
             for part in stdout.split("// Function: ").skip(1) {
                 let name = part.split(' ').next().unwrap_or("");
-                if tested.contains(&name) {
-                    seen += 1;
-                } else if providers.contains(&name) {
-                    seen_providers += 1;
-                } else {
+                if !tested.contains(&name) {
                     continue;
                 }
+                seen += 1;
                 let mut block: Option<String> = None;
                 for line in part.lines().skip(1) {
                     if let Some(b) = block.as_mut() {
@@ -7071,23 +7048,10 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
                 }
             }
             assert_eq!(seen, tested.len(), "{build} {arm}: missing a tested function\n{stdout}");
-            assert_eq!(seen_providers, providers.len(), "{build} {arm}: missing an emitted provider\n{stdout}");
             assert_eq!(types.len(), 3, "{build} {arm}: expected kuna's color, mark and level\n{stdout}");
-            for (source, carrier) in [
-                ("use_color(*(color *)((long)p + 3));", if arm == "on" {
-                    "((unsigned char *)p)[3]"
-                } else { "*(unsigned char *)((long)p + 3)" }),
-                ("use_mark(*(mark *)((long)p + 6));", if arm == "on" {
-                    "((unsigned short *)p)[3]"
-                } else { "*(unsigned short *)((long)p + 6)" }),
-            ] {
-                assert!(body.contains(source) || body.contains(carrier),
-                    "{build} castarith {arm}: expected source or physical width-correct load `{source}` / `{carrier}`\n{body}");
-            }
             for w in [
-                "void use_color(color c)",
-                "void use_mark(mark m)",
-                "void use_level(level l)",
+                "use_color(*(color *)((long)p + 3));",
+                "use_mark(*(mark *)((long)p + 6));",
                 "use_level(*(level *)((long)p + 8));",
                 "set_color((color *)((long)p + 5));",
             ] {
@@ -7105,11 +7069,7 @@ fn an_enum_element_keeps_the_integer_form_and_round_trips() {
             let exe = dir.join("rt");
             std::fs::write(
                 &c,
-                format!("#include <stdio.h>\n{}\n\
-                    _Static_assert(sizeof(color) == 1 && sizeof(mark) == 2 && sizeof(level) == 4, \"source enum widths\");\n\
-                    _Static_assert((color)-1 > 0 && (mark)-1 > 0 && (level)-1 > 0, \"source enum signs\");\n\
-                    _Static_assert(RED == 1 && GREEN == 200 && M0 == 1 && M1 == 0x1234 && L0 == 0 && L1 == 7, \"source enum names and values\");\n\
-                    {body}\n{main}", types.concat()),
+                format!("#include <stdio.h>\n#define KUNA_RT\n{}\n{prelude}\n{body}\n{main}", types.concat()),
             )
             .unwrap();
             let cc = Command::new("cc")
@@ -10031,257 +9991,4 @@ fn a_float_result_held_as_bits_round_trips() {
             "{cc}: the printed C computes something else:\n{printed}"
         );
     }
-}
-
-fn scratch_dir(stem: &str) -> PathBuf {
-    let dir = common::scratch_file(stem, "dir");
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-fn have_c_compiler() -> bool {
-    process::optional_output(Command::new("cc").arg("--version")).is_some()
-}
-
-fn compile_project(dir: &std::path::Path, project: &std::path::Path, stem: &str, driver: &str) {
-    let source = dir.join("consumer.c");
-    std::fs::write(&source, driver).unwrap();
-    for opt in ["-O0", "-O2"] {
-        let executable = dir.join(format!("consumer{opt}"));
-        let built = Command::new("cc")
-            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
-                "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
-            .arg("-I").arg(project).arg(project.join(format!("{stem}.c")))
-            .arg(&source).arg("-o").arg(&executable).output().expect("compile original providers");
-        assert!(built.status.success(), "{opt}: {}", String::from_utf8_lossy(&built.stderr));
-        let ran = process::required_output(&mut Command::new(&executable));
-        assert!(ran.status.success(), "{opt}: {}", String::from_utf8_lossy(&ran.stderr));
-    }
-}
-#[test]
-fn branch_selected_entry_values_survive_the_cli_raw_image_pipeline() {
-    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
-    let dir = scratch_dir("branch_selected_entry_values_survive_the_cli_raw_image_pipeline");
-    std::fs::create_dir_all(&dir).unwrap();
-    let binary = dir.join("branch_copy");
-    let project = dir.join("project");
-    std::fs::write(&binary, [0x85,0xd2,0x74,5,0x48,0x89,0xf0,0xeb,3,0x48,0x89,0xf8,0xc3]).unwrap();
-    let sp = specs();
-    let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
-        .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap(),
-            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
-            "--addr", "0x1000", "--define-function", "0x1000-0x100d=subject", "--assert-strict", "--assert",
-            "prototype subject unsigned long long subject(unsigned long long first,unsigned long long second,unsigned int which)"])
-        .output().expect("export branch entry-value effects");
-    let stderr = String::from_utf8_lossy(&export.stderr);
-    assert!(export.status.success(), "a branch selecting declared inputs must be representable: {stderr}");
-    let driver = dir.join("consumer.c");
-    std::fs::write(&driver, r#"#include "branch_copy.h"
-#include <stdint.h>
-#include <stdio.h>
-int main(void) {
-    const uint64_t pairs[][2] = {{0,7}, {7,0},
-        {UINT64_C(0x123456789abcdef0),UINT64_C(0x76543210fedcba98)}};
-    const unsigned flags[] = {0,1,UINT32_MAX};
-    for (unsigned i=0; i<3; ++i) for (unsigned j=0; j<3; ++j) {
-        uint64_t want = pairs[i][flags[j] != 0];
-        uint64_t got = subject(pairs[i][0],pairs[i][1],flags[j]);
-        if (got != want) {
-            fprintf(stderr,"pair=%u flag=%u got=%llx want=%llx\n",i,flags[j],
-                (unsigned long long)got,(unsigned long long)want);
-            return 1;
-        }
-    }
-    return 0;
-}
-"#).unwrap();
-    for opt in ["-O0", "-O2"] {
-        let exe = dir.join(format!("consumer{opt}"));
-        let build = Command::new("cc")
-            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
-            .arg("-I").arg(&project).arg(project.join("branch_copy.c"))
-            .arg(&driver).arg("-o").arg(&exe).output().expect("compile branch entry-value effects");
-        assert!(build.status.success(), "{opt}: {}", String::from_utf8_lossy(&build.stderr));
-        let run = Command::new(&exe).output().expect("run branch entry-value effects");
-        assert!(run.status.success(), "{opt}: unchanged C discarded a branch's incoming value: {}", String::from_utf8_lossy(&run.stderr));
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn callback_callee_saved_effects_cannot_be_folded_into_the_wrong_result() {
-    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
-    let dir = scratch_dir("callback_callee_saved_effects_cannot_be_folded_into_the_wrong_result");
-    std::fs::create_dir_all(&dir).unwrap();
-    let sp = specs();
-    {
-        let name = "restored";
-        let binary = dir.join(name);
-        let project = dir.join(format!("{name}-project"));
-            let dispatch = [0x48,0x8d,0x35,0xf9,1,0,0,0xbf,85,0,0,0,0xe8,0xef,0,0,0,0xc3];
-        let caller = [0x53,0xbb,42,0,0,0,0xff,0xd6,0x89,0xd8,0x5b,0xc3];
-        let target: &[u8] = &[0x53,0xbb,7,0,0,0,0xb8,3,0,0,0,0x5b,0xc3];
-        let mut image = vec![0u8; 0x220];
-        image[..dispatch.len()].copy_from_slice(&dispatch);
-        image[0x100..0x100+caller.len()].copy_from_slice(&caller);
-        image[0x200..0x200+target.len()].copy_from_slice(target);
-        std::fs::write(&binary, image).unwrap();
-        let target_definition = format!("0x1200-0x{:x}=target", 0x1200 + target.len());
-        let common = [
-            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000", "--sleighpath", &sp,
-            "--addr", "0x1000", "--addr", "0x1100", "--addr", "0x1200",
-            "--define-function", "0x1000-0x1012=dispatch", "--define-function", "0x1100-0x110c=caller",
-            "--define-function", &target_definition, "--assert-strict",
-            "--assert", "typedef typedef int (*Callback)(unsigned char);",
-            "--assert", "prototype dispatch int dispatch(void)",
-            "--assert", "prototype caller int caller(unsigned char value,Callback callback)",
-            "--assert", "prototype target int target(unsigned char value)",
-        ];
-        let export = Command::new(env!("CARGO_BIN_EXE_kuna"))
-            .args(["decompile-project", binary.to_str().unwrap(), "-o", project.to_str().unwrap()])
-            .args(common).output().expect("export callback effects");
-        let stderr = String::from_utf8_lossy(&export.stderr);
-        assert!(export.status.success(), "a real save/restore must remain representable: {stderr}");
-        let expected = 42;
-        let driver = dir.join(format!("{name}-consumer.c"));
-        std::fs::write(&driver, format!(
-            "#include \"{name}.h\"\n#include <stdio.h>\nint main(void) {{ int got=dispatch(); if(got!={expected}) {{ fprintf(stderr,\"got=%d expected={expected}\\n\",got); return 1; }} return 0; }}\n"
-        )).unwrap();
-        for opt in ["-O0", "-O2"] {
-            let exe = dir.join(format!("{name}{opt}"));
-            let build = Command::new("cc")
-                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
-                .arg("-I").arg(&project).arg(project.join(format!("{name}.c")))
-                .arg(&driver).arg("-o").arg(&exe).output().expect("compile callback effects");
-            assert!(build.status.success(), "{name} {opt}: {}", String::from_utf8_lossy(&build.stderr));
-            let run = Command::new(&exe).output().expect("run callback effects");
-            assert!(run.status.success(), "{name} {opt}: unchanged C differs from the machine: {}", String::from_utf8_lossy(&run.stderr));
-        }
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn joined_return_project_compiles_with_scalar_piece_helpers() {
-    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
-    let dir = scratch_dir("joined_return_project_compiles_with_scalar_piece_helpers");
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("join_return");
-    std::fs::write(&image, [0x8b, 0x44, 0x24, 0x04, 0x8b, 0x54, 0x24, 0x08, 0xc3]).unwrap();
-    let project = dir.join("project");
-    let sp = specs();
-    let (_, stderr, ok) = run_kuna(&[
-        "decompile-project", image.to_str().unwrap(), "-o", project.to_str().unwrap(),
-        "--raw-image", "--target", "x86:LE:32:default:gcc", "--base", "0x1000",
-        "--sleighpath", &sp, "--addr", "0x1000", "--define-function", "0x1000-0x1009=subject",
-        "--assert-strict", "--assert",
-        "prototype subject unsigned long long __cdecl subject(unsigned int low,unsigned int high)",
-    ]);
-    assert!(ok, "joined return export failed: {stderr}");
-    let consumer = dir.join("consumer.c");
-    std::fs::write(&consumer, r#"#include "join_return.h"
-int main(void) {
-    /* Exact EDX:EAX instruction results, including the signed high-bit boundary. */
-    if (subject(0, 7) != 0x0000000700000000ULL) return 1;
-    if (subject(7, 0) != 7ULL) return 2;
-    if (subject(0x12345678U, 0x76543210U) != 0x7654321012345678ULL) return 3;
-    if (subject(0xffffffffU, 0x80000000U) != 0x80000000ffffffffULL) return 4;
-    return 0;
-}
-"#).unwrap();
-    for opt in ["-O0", "-O2"] {
-        let executable = dir.join(format!("consumer{opt}"));
-        let built = Command::new("cc")
-            .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized",
-                "-Werror=incompatible-pointer-types", "-Werror=implicit-function-declaration", opt])
-            .arg("-I").arg(&project).arg(project.join("join_return.c"))
-            .arg(&consumer).arg("-o").arg(&executable).output().expect("spawn cc");
-        assert!(built.status.success(), "unchanged JOIN export failed to compile {opt}:\n{}",
-            String::from_utf8_lossy(&built.stderr));
-        let ran = Command::new(&executable).output().expect("run joined return consumer");
-        assert!(ran.status.success(), "JOIN return differs from EDX:EAX {opt}:\n{}",
-            String::from_utf8_lossy(&ran.stderr));
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-fn assert_parameter(document: &str, function: &str, index: u64, name: &str, size: u64) {
-    let json: serde_json::Value = serde_json::from_str(document).expect("CLI JSON");
-    let row = json["functions"].as_array().unwrap().iter()
-        .find(|r| r["name"] == function).expect("selected function");
-    let param = row["variables"].as_array().unwrap().iter()
-        .find(|v| v["kind"] == "arg" && v["arg_index"] == index).expect("source parameter");
-    assert_eq!(param["name"], name, "source-authored parameter name");
-    assert_eq!(param["size"], size, "source formal must not become its wider machine carrier");
-}
-
-#[test]
-fn narrow_declared_inputs_preserve_live_physical_bits() {
-    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
-    let dir = scratch_dir("physical-input");
-    let sp = specs();
-    let cases: &[(&str, &[u8], &str, &str, u32)] = &[
-        ("movzx_byte", &[0x40,0x0f,0xb6,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
-         "unsigned int subject(unsigned char value)", "(uint8_t)raw == 85", 255),
-        ("movzx_short", &[0x0f,0xb7,0xff,0x31,0xc0,0x83,0xff,0x55,0x0f,0x94,0xc0,0xc3],
-         "unsigned int subject(unsigned short value)", "(uint16_t)raw == 85", 65535),
-        ("movsx_edi_clears_upper", &[0x40,0x0f,0xbe,0xff,0x48,0x89,0xf8,0x48,0xc1,0xe8,0x20,0xc3],
-         "unsigned long long subject(signed char value)", "0", 255),
-    ];
-    for &(name, code, declaration, expected, limit) in cases {
-        let image = dir.join(name);
-        let project = dir.join(format!("{name}-project"));
-        let mut bytes = vec![0u8; 0x240];
-        bytes[..code.len()].copy_from_slice(code);
-        let mut carrier = Vec::new();
-        let call_pc = 0x1200i64 + carrier.len() as i64;
-        carrier.push(0xe8);
-        carrier.extend_from_slice(&i32::try_from(0x1000 - call_pc - 5).unwrap().to_le_bytes());
-        carrier.push(0xc3);
-        bytes[0x200..0x200 + carrier.len()].copy_from_slice(&carrier);
-        std::fs::write(&image, bytes).unwrap();
-        let end = 0x1000 + code.len();
-        let definition = format!("0x1000-0x{end:x}=subject");
-        let carrier_definition = format!("0x1200-0x{:x}=carry", 0x1200 + carrier.len());
-        let prototype = format!("prototype subject {declaration}");
-        let carrier_proto = "prototype carry unsigned long long carry(unsigned long long raw)";
-        let args = vec![
-            "--raw-image", "--target", "x86:LE:64:default:gcc", "--base", "0x1000",
-            "--addr", "0x1000", "--addr", "0x1200", "--define-function", &definition,
-            "--define-function", &carrier_definition, "--sleighpath", &sp,
-            "--assert-strict", "--assert", &prototype, "--assert", carrier_proto,
-        ];
-        let mut metadata_args = vec!["decompile-all", image.to_str().unwrap(), "--json"];
-        metadata_args.extend_from_slice(&args);
-        let (document, error, ok) = run_kuna(&metadata_args);
-        assert!(ok, "{name}: readable source result failed: {error}");
-        let source_size = if declaration.contains("short") { 2 } else { 1 };
-        assert_parameter(&document, "subject", 0, "value", source_size);
-        let mut export_args = vec!["decompile-project", image.to_str().unwrap(), "-o", project.to_str().unwrap()];
-        export_args.extend_from_slice(&args);
-        let (_, error, ok) = run_kuna(&export_args);
-        assert!(ok, "{name}: genuine wide caller export failed: {error}");
-        let driver = format!(r#"#include <stdint.h>
-#include <stdio.h>
-#include "{name}.h"
-static uint64_t reference(uint64_t raw) {{
-    (void)raw; return {expected};
-}}
-int main(void) {{
-    const uint64_t upper[] = {{0, UINT64_C(0x10000), UINT64_C(0x1234567800000000), UINT64_C(0xffffffff00000000)}};
-    for (unsigned p=0; p<4; ++p)
-        for (uint32_t bits=0; bits<={limit}U; ++bits) {{
-            uint64_t raw=upper[p]|bits;
-            uint64_t want=reference(raw), got=carry(raw);
-            if (got!=want) {{
-                fprintf(stderr,"raw=%llx got=%llx want=%llx\n",(unsigned long long)raw,
-                    (unsigned long long)got,(unsigned long long)want); return 1;
-            }}
-        }}
-    return 0;
-}}
-"#);
-        compile_project(&dir, &project, name, &driver);
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
 }

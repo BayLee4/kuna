@@ -1237,24 +1237,6 @@ acquires this evidence for narrow source returns, including declarations whose
 storage is still unassigned, independently of the Rust and preservation options.
 Existing may-write summaries keep their separate completeness semantics.
 
-For a locked ordinary direct call, source arity is not a negative body-read
-proof. Before heritage can discard register setup, `ActionFuncLink` also stages
-exact incoming reads proved by the existing bounded `CalleeEntryDead` producer
-and justified by an actual general-purpose register entry of the call's ABI.
-An exact containing range refines the existing operand and trial in place:
-source `DIL:1` and consumed `EDI:4` are one physical occurrence, not two raw
-arguments. Smaller reads of the same actual ABI container are coalesced with
-endian-aware containment. Aligned multi-slot entries retain their existing
-container boundaries, rather than treating the entire entry as one carrier.
-Disjoint consumed containers alone append another occurrence.
-Straddling or multiply overlapping source storage retains its existing
-occurrences; failure of optional body refinement is not an acquisition error
-or a decompilation-refusal policy. No union or missing bytes are invented.
-The real CALL operands, trials and finalized physical storage survive independently of
-the unchanged source formal list, datatype/name locks and source symbols.
-An unexplained register, incomplete read, or unsupported storage geometry adds
-nothing; this does not demand every register or invent missing formals.
-
 Ordinary direct-call C presentation may omit trailing physical dependencies only
 when both the locked callsite and the independently named target declaration
 justify the same nonvariadic source boundary. The acquired target prototype must

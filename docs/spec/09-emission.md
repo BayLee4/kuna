@@ -539,13 +539,6 @@ where the binary's byte compare does not. An integer operand beside a `bool`
 of its size is the compared type instead (`integer_beside_bool`), and the
 comparison prints `*a0 == (a1 != 0)`. This is a correctness fix with no option.
 
-When a direct call has an unlocked unknown input requirement, an exact recovered
-parameter match can require a four-byte nonconstant LOAD's bits as `float`.
-The match includes parameter index, final storage address and width. Signed,
-unsigned and UNKNOWN storage all qualify; the conversion belongs to that call
-edge, leaving shared integer uses unchanged. Constants, other widths, indirect
-calls and authored input or site authority remain on their existing paths.
-
 **Integer equality on float bits (kuna).** An `INT_EQUAL` or `INT_NOTEQUAL`
 compares bits, but when the more ordered operand type is a 4- or 8-byte float
 the upstream rule coerces both sides to the float, and the comparison printed
