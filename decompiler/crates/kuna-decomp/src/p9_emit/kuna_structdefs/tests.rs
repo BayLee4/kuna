@@ -183,14 +183,13 @@ fn invocation_names_reach_nested_declarations_without_renaming_field_identifiers
         &[Rc::clone(&first), Rc::clone(&second), Rc::clone(&owner)],
         &RealTypeCtx::OFF,
         Some(&names),
-        None,
     );
     assert!(rendered.contains("struct Record {\n    int4 first;\n};"), "{rendered}");
     assert!(rendered.contains("struct Record__kuna_2 {\n    int4 second;\n};"), "{rendered}");
     assert!(rendered.contains("Record__kuna_2 *Record;"), "{rendered}");
     assert!(!rendered.contains("duplicate type name skipped"), "{rendered}");
     assert_eq!(
-        definition_text_with_names(&owner, &RealTypeCtx::OFF, Some(&names), None),
+        definition_text_with_names(&owner, &RealTypeCtx::OFF, Some(&names)),
         "struct Owner {\n    Record__kuna_2 *Record;\n};\n",
     );
     assert_eq!(second.get_name(), "Record");

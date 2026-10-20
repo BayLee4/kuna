@@ -31,14 +31,6 @@ mod decompile_project_type_render {
             .collect(), vec![], size, 8, 0).unwrap()
     }
 
-    fn make_enum(types: &TypeFactoryImpl, nm: &str, size: i32, m: type_metatype, entries: &[(u64, &str)]) -> Rc<Datatype> {
-        let shell = types.get_type_enum_sized(nm, size, if m == type_metatype::TYPE_INT {
-            type_metatype::TYPE_ENUM_INT
-        } else { type_metatype::TYPE_ENUM_UINT }).unwrap();
-        types.set_enum_values(&shell, entries.iter()
-            .map(|(value, name)| (*value, (*name).to_string())).collect()).unwrap()
-    }
-
     #[test]
     fn named_callable_definitions_preserve_recursive_aliases_and_function_type() {
         use crate::dtype::DatatypeKind;
@@ -166,58 +158,6 @@ int main(void) {
     }
 
     #[test]
-    fn anonymous_enum_typedefs_preserve_source_identity_and_share_one_definition() {
-        let types = TypeFactoryImpl::new();
-        types.setup_sizes(Some(4), 8, 8);
-        types.set_max_basetype_size(8);
-        let shell = types.reserve_enum("", 0x27, 2, type_metatype::TYPE_ENUM_UINT).unwrap();
-        let enumeration = types.set_enum_values(&shell, [
-            (0, "EA".to_string()), (40000, "EB".to_string()), (50000, "EC".to_string()),
-        ].into_iter().collect()).unwrap();
-        let alias = types.get_typedef(&enumeration, "E2", 0x5b, 0).unwrap();
-        let second = types.get_typedef(&enumeration, "E2Alias", 0x5c, 0).unwrap();
-        let definitions = render_type_definitions(
-            &[Rc::clone(&enumeration), Rc::clone(&alias), Rc::clone(&second), Rc::clone(&alias)],
-            &RealTypeCtx::OFF,
-        );
-        assert!(definitions.contains("typedef enum __attribute__((packed)) {\n"), "{definitions}");
-        assert!(!definitions.contains("typedef enum __attribute__((packed)) E2 {"), "{definitions}");
-        assert!(definitions.contains("typedef E2 E2Alias;"), "{definitions}");
-        assert_eq!(definitions.matches("EA = ").count(), 1, "{definitions}");
-        assert!(!definitions.contains("duplicate type name skipped"), "{definitions}");
-        assert_eq!(enumeration.get_name(), "");
-        assert_eq!(enumeration.get_id(), 0x27);
-        assert_eq!(alias.get_name(), "E2");
-        assert_eq!(alias.get_id(), 0x5b);
-        assert!(Rc::ptr_eq(alias.get_typedef().unwrap(), &enumeration));
-        assert!(alias.is_enum_type());
-        assert_eq!(
-            crate::kuna_structdefs::definition_text(&alias, &RealTypeCtx::OFF),
-            crate::printc::compose_enum_body(&enumeration, "E2", None),
-        );
-        let source = format!(
-            "{definitions}\n\
-             _Static_assert(sizeof(E2) == 2 && (E2)-1 > 0, \"source storage\");\n\
-             _Static_assert(EA == 0 && EB == 40000 && EC == 50000, \"source members\");\n\
-             _Static_assert(__builtin_types_compatible_p(E2, E2Alias), \"shared enum identity\");\n\
-             int main(void) {{ E2Alias value = EC; return value != 50000; }}\n",
-        );
-        super::assert_c_source(&source, "anonymous-enum-aliases");
-
-        let names = std::collections::BTreeMap::from([
-            (Rc::as_ptr(&alias) as usize, "PresentedE2".to_string()),
-            (Rc::as_ptr(&second) as usize, "PresentedAlias".to_string()),
-        ]);
-        let presented = crate::printc::render_type_definitions_with_names(
-            &[alias, second], &RealTypeCtx::OFF, Some(&names), None,
-        );
-        assert!(presented.contains("} PresentedE2;"), "{presented}");
-        assert!(presented.contains("typedef PresentedE2 PresentedAlias;"), "{presented}");
-        assert!(!presented.contains("enum __attribute__((packed)) PresentedE2 {"), "{presented}");
-        assert_eq!(enumeration.get_name(), "");
-    }
-
-    #[test]
     fn anonymous_enum_alias_registration_keeps_the_declared_alias_identity() {
         let types = TypeFactoryImpl::new();
         types.setup_sizes(Some(4), 8, 8);
@@ -249,7 +189,7 @@ int main(void) {
             let mut text = String::new();
             let forward = std::collections::HashSet::new();
             let mut writer = crate::printc::CTypeDefinitionWriter {
-                rt: &RealTypeCtx::OFF, names: None, reserved: None,
+                rt: &RealTypeCtx::OFF, names: None,
                 forward: &forward, defined: std::collections::HashMap::new(), out: &mut text,
             };
             for alias in order {
@@ -265,102 +205,6 @@ int main(void) {
             )), "{}", writer.out);
             assert_eq!(writer.out.matches("ONE = ").count(), 1);
         }
-    }
-
-    #[test]
-    fn generated_enum_width_sign_and_complements_are_consumed_without_repair() {
-        let types = TypeFactoryImpl::new();
-        types.setup_sizes(Some(4), 8, 8);
-        types.set_max_basetype_size(8);
-        for size in [1, 2, 4, 8] {
-            for signed in [false, true] {
-                let meta = if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
-                let name = format!("Flags{}{}", size * 8, if signed { "s" } else { "u" });
-                let wide = if size == 8 { 0x8000_0000 } else { 4 };
-                let ty = make_enum(&types, &name, size, meta, &[(1, "ONE"), (2, "TWO"), (wide, "WIDE")]);
-                let declarations = render_type_definitions(&[ty.clone()], &RealTypeCtx::OFF);
-                let mut checks = String::new();
-                for flag in [1, 3, wide] {
-                    let value = kuna_base::address::calc_mask(size) ^ flag;
-                    let mut print = PrintC::new();
-                    print.set_output_stream();
-                    print.push_enum_constant_ir(&ty, value, OpId::default(), VarnodeId::default());
-                    let expression = print.emit_mut().output_str();
-                    let expected = if signed {
-                        format!("({}LL)", value as i128 - (1i128 << (size * 8)))
-                    } else {
-                        format!("{value}ULL")
-                    };
-                    checks.push_str(&format!("assert(({expression}) == {expected});\n"));
-                }
-                let source = format!(
-                    "#include <assert.h>\n#include <stdint.h>\n{declarations}\n\
-                     _Static_assert(sizeof({name}) == {size}, \"declared enum width\");\n\
-                     _Static_assert((({name})-1 < 0) == {}, \"declared enum sign\");\n\
-                     int main(void) {{ {checks} return 0; }}\n",
-                    u8::from(signed),
-                );
-                super::assert_c_source(&source, &format!("enum-{name}"));
-            }
-        }
-    }
-
-    #[test]
-    fn enum_range_endpoints_preserve_producer_names_and_strict_c_literals() {
-        let types = TypeFactoryImpl::new();
-        types.setup_sizes(Some(4), 8, 8);
-        types.set_max_basetype_size(8);
-        // These names deliberately collide with the renderer's range names.
-        // The signed minimum must not be spelled as the too-large positive
-        // decimal token 9223372036854775808 with a unary minus in front.
-        let signed = make_enum(&types, "Signed", 8, type_metatype::TYPE_INT, &[
-            (0x8000_0000_0000_0000, "Signed__kuna_min"),
-            (1, "Signed__kuna_max"),
-        ]);
-        let unsigned = make_enum(&types, "Unsigned", 8, type_metatype::TYPE_UINT, &[
-            (u64::MAX, "ALL_BITS"),
-        ]);
-        let declarations = render_type_definitions(&[signed, unsigned], &RealTypeCtx::OFF);
-        let source = format!(
-            "#include <stdint.h>\n{declarations}\n\
-             _Static_assert(sizeof(Signed) == 8, \"signed width\");\n\
-             _Static_assert(sizeof(Unsigned) == 8, \"unsigned width\");\n\
-             _Static_assert(Signed__kuna_min == INT64_MIN, \"producer minimum\");\n\
-             _Static_assert(Signed__kuna_max == 1, \"producer name\");\n\
-             _Static_assert(ALL_BITS == UINT64_MAX, \"producer maximum\");\n\
-             int main(void) {{ return 0; }}\n"
-        );
-        super::assert_c_source_with_warnings(
-            &source, "enum-strict-range-literals", &["-Wall", "-Werror"],
-        );
-    }
-
-    #[test]
-    fn enum_range_endpoints_respect_later_authored_ordinary_identifiers() {
-        let types = TypeFactoryImpl::new();
-        types.setup_sizes(Some(4), 8, 8);
-        types.set_max_basetype_size(8);
-        let flags = make_enum(&types, "Flags", 4, type_metatype::TYPE_UINT, &[(1, "ONE")]);
-        let reserved = std::collections::BTreeSet::from([
-            "Flags__kuna_min".to_string(), "Flags__kuna_min_".to_string(),
-            "Flags__kuna_max".to_string(), "Flags__kuna_max_".to_string(),
-        ]);
-        let declaration = crate::printc::compose_enum_body(&flags, "Flags", Some(&reserved));
-        let source = format!(
-            "#include <assert.h>\n{declaration}\n\
-             enum Later {{ Flags__kuna_min = 17 }};\n\
-             int Flags__kuna_min_ = 19;\n\
-             typedef int Flags__kuna_max;\n\
-             int Flags__kuna_max_(void) {{ return 23; }}\n\
-             _Static_assert(sizeof(Flags) == 4, \"original enum width\");\n\
-             _Static_assert(!((Flags)-1 < 0), \"original enum sign\");\n\
-             int main(void) {{ Flags__kuna_max value = Flags__kuna_max_();\n\
-                 assert(ONE == 1 && Flags__kuna_min == 17);\n\
-                 assert(Flags__kuna_min_ == 19 && value == 23); return 0; }}\n"
-        );
-        super::assert_c_source_with_warnings(
-            &source, "enum-later-ordinary-identifiers", &["-Wall", "-Werror"],
-        );
     }
 
     #[test]

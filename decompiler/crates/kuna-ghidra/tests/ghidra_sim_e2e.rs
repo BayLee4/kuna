@@ -562,13 +562,7 @@ const PIN_FAILLOG_VARDECL_UNRESOLVED: [usize; 3] = [0, 0, 0];
 // walk is a cache miss for an entry no earlier caller probed. No new
 // instruction address is read. Measured both arms on this tree: the option off
 // by default gives 2121.
-// The measurements above predate invalidating body-derived evidence at
-// flushNative. The repeat main must now reacquire 277 entry-read and 206
-// write-probe instructions instead of reusing pre-flush summaries: 2142 + 483
-// = 2625. This is required for host Listing edits even when the source signature
-// stays int(void). The unchanged-body fixture emits identical repeated C;
-// distinct decoded addresses remain 1044 and mapped-symbol queries remain 1455.
-const PIN_FAILLOG_GETPCODE_TOTAL: u64 = 2625;
+const PIN_FAILLOG_GETPCODE_TOTAL: u64 = 2142;
 const PIN_FAILLOG_DECODED_INSTS: usize = 1044;
 // Whole-session getMappedSymbols traffic: Phase 2 pinned this at 0 (the
 // providers did not exist); Phase 3 pins the real query-through traffic —

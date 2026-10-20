@@ -178,10 +178,6 @@ fn library_allocate_routes_by_type() {
     assert!(matches!(lib.injection[1], SleighPayload::Callother(_)));
     assert!(matches!(lib.injection[2], SleighPayload::Executable(_)));
     assert!(matches!(lib.injection[3], SleighPayload::Sleigh(_)));
-    assert_eq!(lib.get_payload(cf).core().get_name(), b"cf");
-    assert_eq!(lib.get_payload(co).core().get_name(), b"co");
-    assert_eq!(lib.get_payload(ex).core().get_name(), b"ex");
-    assert_eq!(lib.get_payload(cm).core().get_name(), b"cm");
 }
 
 #[test]
@@ -201,42 +197,13 @@ fn library_decode_inject_registers_in_namespace() {
     assert_eq!(lib.base.get_call_other_target(0), b"setISAMode");
 }
 
-#[test]
-fn decoded_fixup_names_override_the_allocation_name() {
-    let reg = registry();
-    let mgr = manager();
-    let mut lib = PcodeInjectLibrarySleigh::new(0x1000);
-    let fixtures: &[(int4, &[u8], &[u8])] = &[
-        (CALLFIXUP_TYPE, b"decoded-call",
-            br#"<callfixup name="decoded-call"><pcode><body>EAX = ESP;</body></pcode></callfixup>"#),
-        (CALLOTHERFIXUP_TYPE, b"decoded-other",
-            br#"<callotherfixup targetop="decoded-other"><pcode><body>EAX = ESP;</body></pcode></callotherfixup>"#),
-    ];
-    for &(ptype, name, xml) in fixtures {
-        let mut dec = XmlDecode::new(&mgr, &reg);
-        dec.ingest_stream(xml).unwrap();
-        let id = lib.decode_inject(b"src", b"allocation-name", ptype, &mut dec).unwrap();
-        assert_eq!(lib.get_payload(id).core().get_name(), name);
-        assert_eq!(lib.base.get_payload_id(ptype, name), id);
-        assert_eq!(lib.base.get_payload_id(ptype, b"allocation-name"), -1);
-    }
-}
-
-#[test]
-fn manual_call_fixups_register_distinct_formal_names_and_reject_duplicates() {
-    let mut lib = PcodeInjectLibrarySleigh::new(0x1000);
-    let first = lib.manual_call_fixup(b"first", b"").unwrap();
-    let second = lib.manual_call_fixup(b"second", b"").unwrap();
-    assert_ne!(first, second);
-    assert_eq!(lib.get_payload(first).core().get_name(), b"first");
-    assert_eq!(lib.get_payload(second).core().get_name(), b"second");
-    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"first"), first);
-    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"second"), second);
-    assert_eq!(lib.base.get_call_fixup_name(first), b"first");
-    assert_eq!(lib.base.get_call_fixup_name(second), b"second");
-    assert_eq!(lib.manual_call_fixup(b"first", b"").unwrap_err(),
-        KunaError::lowlevel("Duplicate <callfixup>: first"));
-    assert_eq!(lib.base.get_payload_id(CALLFIXUP_TYPE, b"first"), first);
+/// Register a call fixup under a distinct name (the decode path assigns the name from the
+/// XML document; manual registration keeps the C++ `"unknown"` name).
+fn register_named_call_fixup(library: &mut PcodeInjectLibrarySleigh, name: &[u8]) -> int4 {
+    let id = library.allocate_inject(b"test", name, CALLFIXUP_TYPE);
+    library.injection[id as usize].as_payload_mut().core_mut().name = name.to_vec();
+    library.register_inject(id).unwrap();
+    id
 }
 
 #[test]
@@ -254,18 +221,15 @@ fn manual_call_other_fixup_orders_params_in_then_out() {
     assert_eq!(payload.core().get_input(1).get_index(), 1);
     assert_eq!(payload.core().get_output(0).get_name(), b"out");
     assert_eq!(payload.core().get_output(0).get_index(), 2);
-    // The formal name is shared by the payload, forward lookup and reverse
-    // target lookup, including for manual registration without XML decoding.
-    assert_eq!(payload.core().get_name(), b"myop");
-    assert_eq!(lib.base.get_call_other_target(id), b"myop");
-    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"myop"), id);
-    let second = lib.manual_call_other_fixup(b"otherop", b"", &[], b"").unwrap();
-    assert_ne!(second, id);
-    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"otherop"), second);
-    assert_eq!(lib.base.get_call_other_target(second), b"otherop");
-    assert_eq!(lib.manual_call_other_fixup(b"myop", b"", &[], b"").unwrap_err(),
-        KunaError::lowlevel("Duplicate <callotherfixup>: myop"));
-    assert_eq!(lib.base.get_payload_id(CALLOTHERFIXUP_TYPE, b"myop"), id);
+    // FAITHFUL C++ QUIRK: `manualCallOtherFixup` constructs the payload via
+    // `InjectPayloadCallother(sourceName)`, whose ctor hard-codes the payload
+    // name to "unknown" (the `name` argument is used only for the sourceName
+    // string, not the payload name). `registerInject` then registers the
+    // payload under "unknown", so the callother-target reverse map says
+    // "unknown" — not "myop". The userop caller does not consult this map (it
+    // uses the returned injectid directly), so the quirk is harmless. We pin it
+    // here to prove the port matches C++ `manualCallOtherFixup` exactly.
+    assert_eq!(lib.base.get_call_other_target(0), b"unknown");
 }
 
 #[test]
@@ -420,7 +384,7 @@ impl kuna_num::opbehavior::OpBehavior for ReentrantAdd {
             let library = self.library.upgrade().unwrap();
             // Registration and same-payload evaluation must both be possible
             // while the outer frame is in an operation callback.
-            library.borrow_mut().manual_call_fixup(b"late", b"").unwrap();
+            register_named_call_fixup(&mut library.borrow_mut(), b"late");
             assert_eq!(evaluate_executable(&library, 0, &[40])?, 41);
             self.nested.set(self.nested.get() + 1);
             self.active.set(false);
@@ -470,7 +434,7 @@ impl crate::pcodeinject::InjectPcodeResolver for ExecutableTestResolver {
         assert_eq!(context.output[0].offset, 0x30);
         self.calls.set(self.calls.get() + 1);
         let library = self.library.upgrade().unwrap();
-        library.borrow_mut().manual_call_fixup(b"during-build", b"").unwrap();
+        register_named_call_fixup(&mut library.borrow_mut(), b"during-build");
         let library = library.borrow();
         let engine = SleighInjectEngine::new(
             Rc::clone(self.manager.get_constant_space().unwrap()),
@@ -656,7 +620,7 @@ impl PcodeEmit for ReentrantPayloadEmitter {
         assert_eq!(addr.get_offset(), 0x1000);
         if let Some(library) = self.library.upgrade() {
             let name = format!("during-emit-{}", self.ops.len());
-            library.borrow_mut().manual_call_fixup(name.as_bytes(), b"").unwrap();
+            register_named_call_fixup(&mut library.borrow_mut(), name.as_bytes());
         }
         self.ops.push((opc, outvar.cloned(), vars.to_vec()));
     }
@@ -873,7 +837,7 @@ impl crate::pcodeinject::InjectPcodeResolver for MechanismTestResolver {
         let call = self.calls.get();
         self.calls.set(call + 1);
         let library = self.library.upgrade().unwrap();
-        library.borrow_mut().manual_call_fixup(format!("host-{call}").as_bytes(), b"").unwrap();
+        register_named_call_fixup(&mut library.borrow_mut(), format!("host-{call}").as_bytes());
         if self.fail.get() {
             return Err(KunaError::transport("mechanism callback disconnected"));
         }

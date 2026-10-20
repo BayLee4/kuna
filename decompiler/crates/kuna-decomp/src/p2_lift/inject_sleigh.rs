@@ -458,19 +458,13 @@ impl PcodeInjectLibrarySleigh {
     /// \brief Allocate a new InjectPayload object (C++ `allocateInject`).
     ///
     /// The factory: maps the payload type to the concrete SLEIGH payload and
-    /// returns its id (= the index it is pushed to). Manual registration uses
-    /// the supplied name; XML decoding replaces it with `name` or `targetop`.
+    /// returns its id (= the index it is pushed to).
     pub fn allocate_inject(&mut self, source_name: &[u8], name: &[u8], ptype: int4) -> int4 {
         let injectid = self.injection.len() as int4;
         let payload = if ptype == CALLFIXUP_TYPE {
-            SleighPayload::Callfixup(InjectPayloadCallfixup {
-                payload: InjectPayloadSleigh::new(source_name, name, CALLFIXUP_TYPE),
-                target_symbol_names: Vec::new(),
-            })
+            SleighPayload::Callfixup(InjectPayloadCallfixup::new(source_name))
         } else if ptype == CALLOTHERFIXUP_TYPE {
-            SleighPayload::Callother(InjectPayloadCallother {
-                payload: InjectPayloadSleigh::new(source_name, name, CALLOTHERFIXUP_TYPE),
-            })
+            SleighPayload::Callother(InjectPayloadCallother::new(source_name))
         } else if ptype == EXECUTABLEPCODE_TYPE {
             SleighPayload::Executable(ExecutablePcodeSleigh::new(source_name, name))
         } else {

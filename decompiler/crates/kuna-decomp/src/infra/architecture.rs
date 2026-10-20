@@ -3813,7 +3813,6 @@ impl Architecture {
     /// RemoteScope, cleared with it).
     pub fn flush_remote_caches(&mut self) {
         self.print.set_export_binding(None);
-        self.invalidate_body_caches();
         if let Some(remote) = &self.remote_scope {
             remote.clear();
         }

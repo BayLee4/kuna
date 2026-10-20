@@ -1035,21 +1035,17 @@ Cast insertion
 transfers the original read before attaching its replacement CAST input, keeping
 free values single-reader without dropping operands when already-analyzed IR is
 Generated C
-enum definitions retain recovered width/sign, and narrow unsigned complements
-are truncated after C integer promotion. Synthetic enum range endpoints use the
-invocation's reserved ordinary identifiers, including later enum members,
-typedefs, functions and globals, rather than checking only their own enum.
-The CLI collects these from its complete source inventory before rendering.
+narrow unsigned enum complements are truncated after C integer promotion.
 An authored typedef exposing an anonymous DWARF enum retains the enum's own
 identity, unnamed source spelling, members, width and sign separately from the
-typedef's identity. Native headers define that enum inline under its genuine
-typedef without inventing a tag; other aliases of the same enum reuse the first
-emitted genuine alias while retaining their own declaration identities.
+typedef's identity. Native headers define that enum under its genuine typedef name; other aliases
+of the same enum reuse the first emitted genuine alias while retaining their own
+declaration identities.
 Bare `decompile-all` output still omits type definitions by default. Consumers
 combining selected bodies can use the actual `decompile-project` header once
 instead of reconstructing missing source enums or repeating per-body definitions.
 Ordinary Ghidra output leaves the native `structdefs` preamble disabled;
-`CppExporter` uses Java's `DataTypeWriter`, not these synthetic endpoints.
+`CppExporter` uses Java's `DataTypeWriter`.
 An authored `FunctionDefinition` name identifies its callable datatype, not a
 C pointer typedef. Named Code keeps its source spelling and managed type-token
 binding; anonymous Code retains its structural declarator. CLI headers and the
@@ -1144,8 +1140,7 @@ CLI lenient decoding is unchanged.
 `ActionDatabase` alone owns the selected root. Reduced roots use the same
 source/local preparation, deadline and reflow driver as decompile; temporary
 jump-table and signature normalization roots restore the previous selection on
-success and failure. `flushNative` also detaches the five body-derived caches
-(write, dead-entry, forward-transfer, memory, and wide-return evidence).
+success and failure.
 Model/default changes publish through the existing type and remote-scope
 resolvers without modifying held immutable source prototypes.
 Architecture and TypeFactory share one named-model registry, so a
@@ -1349,11 +1344,6 @@ so the pinned line-diff band measures markup fidelity rather than this known gap
   provider/emitter change that earns the move — Phase 3/4 land by flipping them
   downward. Run: `make test-ghidra` (release; also part of the CI `gates` job on
   every PR, which matters because the workspace suite is skipped on internal PRs).
-  The faillog guards bound the normalized line-diff ratio and preserve global
-  store ordering without pinning exact line counts. Its 2625-instruction-query
-  fingerprint includes 277 entry-read and 206 write-probe queries reacquired
-  after `flushNative`, rather than retaining stale body summaries across host
-  edits. The distinct-address and mapped-symbol fingerprints remain 1044/1455.
 - **Phase 3+: DecompileDebug captures as fixtures.** Ghidra's "Debug Function
   Decompilation" action (`DecompInterface.enableDebug`, `DebugDecompilerAction.java:38-73`)
   records every callback answer into an `<xml_savefile>` — exactly the document kuna's

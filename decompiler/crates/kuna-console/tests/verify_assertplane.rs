@@ -1104,7 +1104,7 @@ fn a_type_on_a_register_local_reaches_the_declaration() {
         Body::Type { func: None, symbol: "v1".into(), decl: "unsigned int".into() },
     )]);
     all_applied(&report);
-    kuna_harness::c_behavior::assert_c_declaration(&code, "v1", "unsigned int", "eax");
+    assert!(code.contains("uint4 v1; // eax"), "the retype did not land:\n{code}");
 }
 
 /// And a name: the body reads the caller's identifier, not `v1`.

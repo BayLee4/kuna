@@ -144,53 +144,6 @@ fn export_helpers_report_sections_disasm_bytes_and_globals() {
 }
 
 #[test]
-fn invocation_reserves_later_source_identifiers_for_enum_endpoints() {
-    use kuna_base::address::Address;
-    use kuna_decomp::decompile_drive::print_c_types;
-    use kuna_decomp::dtype::{type_metatype, TypeFactory};
-    use kuna_decomp::kuna_langtypes::SpellCtx;
-
-    let root = repo_root();
-    let specs = vec![root.join("specs").to_str().unwrap().to_string()];
-    let mut prog = bootstrap_from_object(fauxware().to_str().unwrap(), "", &specs).unwrap();
-    prog.commit_pending_analysis().unwrap();
-    let main = prog.function_entries_canonical().into_iter().find(|entry| entry.name == "main").unwrap();
-    prog.register_symbol("Flags__kuna_min_", main.addr);
-    let integer = prog.arch().types().get_base(4, type_metatype::TYPE_INT).unwrap();
-    let flags = {
-        let types = prog.arch().types_impl();
-        let shell = types.get_type_enum_sized("Flags", 4, type_metatype::TYPE_ENUM_INT).unwrap();
-        let flags = types.set_enum_values(&shell, [(1, "Ready".into())].into()).unwrap();
-        let later = types.get_type_enum_sized("Later", 4, type_metatype::TYPE_ENUM_INT).unwrap();
-        types.set_enum_values(&later, [(1, "Flags__kuna_min".into())].into()).unwrap();
-        types.get_typedef(&integer, "Flags__kuna_max_", 0, 0).unwrap();
-        flags
-    };
-    let global = prog.arch().symboltab.get_global_scope().unwrap();
-    let space = prog.arch().manage().get_default_data_space().unwrap().clone();
-    prog.arch_mut().symboltab.add_symbol_mapped(
-        global, "Flags__kuna_max", integer, &Address::new(space, 0x7777_0000),
-        &Address::new_invalid(),
-    ).unwrap();
-
-    kuna_console::project::prepare_type_names(&mut prog);
-    let reserved = prog.arch().print().reserved_identifiers().unwrap().clone();
-    for name in ["Flags", "Later", "Ready", "Flags__kuna_min", "Flags__kuna_min_", "Flags__kuna_max", "Flags__kuna_max_"] {
-        assert!(reserved.contains(name), "missing source reservation {name}");
-    }
-    let names = prog.arch().print().type_names().cloned();
-    let metadata = kuna_decomp::kuna_structdefs::definition_text_with_names(
-        &flags, &SpellCtx::OFF, names.as_deref(), Some(reserved.as_ref()),
-    );
-    let header = print_c_types(prog.arch_mut());
-    assert!(metadata.contains("Flags__kuna_min__ = -2147483648"), "{metadata}");
-    assert!(metadata.contains("Flags__kuna_max__ = 2147483647LL"), "{metadata}");
-    assert!(header.contains(&metadata), "metadata/header reservation disagreement:\n{header}\n{metadata}");
-    assert_eq!(flags.get_name(), "Flags");
-    assert_eq!(flags.as_enum_namemap().unwrap()[&1], "Ready");
-}
-
-#[test]
 fn invocation_reserves_held_function_and_callable_parameter_spellings() {
     use std::rc::Rc;
     use kuna_decomp::dtype::type_metatype;

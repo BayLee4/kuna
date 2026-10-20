@@ -260,7 +260,7 @@ pub fn dedup_by_identity(types: &[Rc<Datatype>]) -> Vec<Rc<Datatype>> {
 /// without parsing C out of the body.  Returns `""` for a type the preamble does
 /// not define.
 pub fn definition_text(ct: &Rc<Datatype>, rt: &SpellCtx) -> String {
-    definition_text_with_names(ct, rt, None, None)
+    definition_text_with_names(ct, rt, None)
 }
 
 /// Render a retained nominal through the invocation's identity-bound spelling.
@@ -268,7 +268,6 @@ pub fn definition_text_with_names(
     ct: &Rc<Datatype>,
     rt: &SpellCtx,
     names: Option<&std::collections::BTreeMap<usize, String>>,
-    reserved: Option<&std::collections::BTreeSet<String>>,
 ) -> String {
     let raw = ct.get_name();
     let name = names
@@ -277,7 +276,7 @@ pub fn definition_text_with_names(
         .unwrap_or_else(|| sanitize_type_name(raw));
     if let Some(base) = ct.get_typedef() {
         if base.get_name().is_empty() && base.is_enum_type() {
-            return compose_enum_body(base, &name, reserved);
+            return compose_enum_body(base, &name);
         }
         if names.is_some() {
             return format!("typedef {};\n", crate::printc::declaration_text_with_names(base, &name, rt, names));
@@ -297,7 +296,7 @@ pub fn definition_text_with_names(
                 }
             }
         }
-        _ if ct.is_enum_type() => compose_enum_body(ct, &name, reserved),
+        _ if ct.is_enum_type() => compose_enum_body(ct, &name),
         DatatypeKind::Code { proto: Some(proto) } if proto.has_store() =>
             crate::printc::compose_callable_definition(ct, &name, rt, names),
         _ => String::new(),

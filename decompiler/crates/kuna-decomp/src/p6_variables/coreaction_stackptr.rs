@@ -188,7 +188,9 @@ impl StackSolver {
     /// C++ `StackSolver::build` (`coreaction.cc:162`): collect spacebase
     /// references as variables and derive the equations from their defs.
     fn build(&mut self, data: &Funcdata, id: &Rc<AddrSpace>, spcbase: int4) -> KunaResult<bool> {
-        let point = id.get_spacebase(spcbase)?;
+        // C++ `analyzeExtraPop` catches the LowlevelError `getSpacebase` throws for a
+        // space with no base register and leaves the solve unchanged.
+        let Ok(point) = id.get_spacebase(spcbase) else { return Ok(false) };
         let Some(point_space) = point.space.clone() else { return Ok(false) };
         let spacebase = Address::new(point_space, point.offset);
         let point_size = point.size as int4;

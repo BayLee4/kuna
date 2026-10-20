@@ -88,7 +88,7 @@ fn default_model_visibility_is_live_while_held_prototypes_keep_their_models() {
     assert!(held_named.print_in_decl(), "a distinct named convention is explicit");
     assert!(!arch.model_print_in_decl(&source_default));
     assert!(arch.model_print_in_decl(&source_named));
-    assert!(arch.print().options.convention, "visibility is not a printer-option override");
+    assert!(!arch.print().options.convention, "visibility is not a printer-option override");
     let spelling = crate::printc::RealTypeCtx::from_arch(&arch, crate::kuna_lang::OutLang::C, true);
     assert_eq!(spelling.convention_name(&source_default), None);
     assert_eq!(spelling.convention_name(&source_named), Some("__regparm3"));

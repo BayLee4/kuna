@@ -2898,9 +2898,9 @@ impl PrintC {
         let deporder =
             crate::kuna_structsynth::ledger::in_name_order(arch.types_impl().dependent_order());
         let rt = RealTypeCtx::from_arch(arch, self.out_lang, self.options.convention);
-        match (self.type_names.as_deref(), self.reserved_identifiers.as_deref()) {
-            (None, None) => render_type_definitions(&deporder, &rt),
-            (names, reserved) => render_type_definitions_with_names(&deporder, &rt, names, reserved),
+        match self.type_names.as_deref() {
+            None => render_type_definitions(&deporder, &rt),
+            names => render_type_definitions_with_names(&deporder, &rt, names),
         }
     }
 
@@ -3263,9 +3263,9 @@ impl PrintC {
             return;
         }
         let types = crate::kuna_calltargettype::with_declared_fields(types, fd);
-        let text = match (self.type_names.as_deref(), self.reserved_identifiers.as_deref()) {
-            (None, None) => render_type_definitions(&types, &self.rt_ctx),
-            (names, reserved) => render_type_definitions_with_names(&types, &self.rt_ctx, names, reserved),
+        let text = match self.type_names.as_deref() {
+            None => render_type_definitions(&types, &self.rt_ctx),
+            names => render_type_definitions_with_names(&types, &self.rt_ctx, names),
         };
         for line in text.trim_end_matches('\n').split('\n') {
             self.emit.tag_line();
@@ -13192,16 +13192,13 @@ pub(crate) fn compose_type_body_with_names(
     out
 }
 
-/// Render ONE enum definition, preserving its recovered width and sign.
-/// C otherwise chooses both from the currently named values. A packed enum
-/// with explicit range endpoints retains the storage even when all recovered
-/// names are small positive flags. Producer names/values remain unchanged.
-/// An empty namemap uses a scalar typedef (an empty `enum {}` is invalid C).
-pub(crate) fn compose_enum_body(
-    ct: &std::rc::Rc<crate::dtype::Datatype>,
-    name: &str,
-    reserved: Option<&std::collections::BTreeSet<String>>,
-) -> String {
+/// (kuna) Render ONE enum definition — `typedef enum <name> { A = <v>, … }
+/// <name>;` — from the `TypeEnum` namemap.  A `TYPE_INT`-facing enum (the
+/// decode-time `TYPE_ENUM_INT` form) prints signed decimal values
+/// (sign-extended by the enum's byte size); the `TYPE_UINT` form prints hex.
+/// An empty namemap falls back to a plain integer typedef (an empty `enum {}`
+/// is not valid C).
+pub(crate) fn compose_enum_body(ct: &std::rc::Rc<crate::dtype::Datatype>, name: &str) -> String {
     use crate::dtype::type_metatype;
     let Some(nmap) = ct.as_enum_namemap() else {
         return String::new();
@@ -13214,52 +13211,17 @@ pub(crate) fn compose_enum_body(
         );
     }
     let signed = ct.get_metatype() == type_metatype::TYPE_INT;
-    let mut out = String::from("typedef enum __attribute__((packed))");
-    if !ct.get_name().is_empty() {
-        out.push(' ');
-        out.push_str(name);
-    }
-    out.push_str(" {\n");
-    for (val, ename) in nmap {
+    let mut out = format!("typedef enum {name} {{\n");
+    let n = nmap.len();
+    for (i, (val, ename)) in nmap.iter().enumerate() {
         let ename = sanitize_type_name(ename);
         let vtxt = if signed && size > 0 && size <= 8 {
-            let value = kuna_base::address::sign_extend(*val as i64, size * 8 - 1);
-            if value == i64::MIN {
-                "(-9223372036854775807LL - 1)".to_string()
-            } else {
-                format!("{value}")
-            }
+            format!("{}", kuna_base::address::sign_extend(*val as i64, size * 8 - 1))
         } else {
-            format!("0x{val:x}ULL")
+            format!("0x{val:x}")
         };
-        out.push_str(&format!("    {ename} = {vtxt},\n"));
-    }
-    if (1..=8).contains(&size) {
-        let max = calc_mask(size);
-        let (minimum, maximum) = if signed {
-            let max = max >> 1;
-            let min = if size == 8 {
-                "(-9223372036854775807LL - 1)".to_string()
-            } else {
-                format!("-{}", max + 1)
-            };
-            (min, format!("{max}LL"))
-        } else {
-            ("0".to_string(), format!("0x{max:x}ULL"))
-        };
-        for (suffix, value) in [("min", minimum), ("max", maximum)] {
-            let mut sentinel = format!("{name}__kuna_{suffix}");
-            // Enum constants share C's ordinary identifier namespace with
-            // other enums, typedefs, functions and globals. The invocation
-            // authority reserves all authored spellings before generating
-            // any endpoint, not merely this enum's members.
-            while reserved.is_some_and(|names| names.contains(&sentinel))
-                || nmap.values().any(|entry| sanitize_type_name(entry) == sentinel)
-            {
-                sentinel.push('_');
-            }
-            out.push_str(&format!("    {sentinel} = {value},\n"));
-        }
+        let comma = if i + 1 < n { "," } else { "" };
+        out.push_str(&format!("    {ename} = {vtxt}{comma}\n"));
     }
     out.push_str(&format!("}} {name};\n"));
     out
@@ -13300,7 +13262,7 @@ pub(crate) fn render_type_definitions(
     deporder: &[std::rc::Rc<crate::dtype::Datatype>],
     rt: &RealTypeCtx,
 ) -> String {
-    render_type_definitions_with_names(deporder, rt, None, None)
+    render_type_definitions_with_names(deporder, rt, None)
 }
 
 /// Definitions need complete composite bodies for array elements and by-value
@@ -13309,7 +13271,6 @@ pub(crate) fn render_type_definitions(
 struct CTypeDefinitionWriter<'a> {
     rt: &'a RealTypeCtx,
     names: Option<&'a std::collections::BTreeMap<usize, String>>,
-    reserved: Option<&'a std::collections::BTreeSet<String>>,
     forward: &'a std::collections::HashSet<String>,
     // Declared identity always remains authoritative for a spelling. An
     // inline anonymous enum also records its base identity for later aliases.
@@ -13429,7 +13390,7 @@ impl CTypeDefinitionWriter<'_> {
             self.out.push_str(&format!("/* renamed from \"{}\" */\n", comment_safe(ct.get_name())));
         }
         self.out.push_str(&crate::kuna_structdefs::definition_text_with_names(
-            ct, self.rt, self.names, self.reserved));
+            ct, self.rt, self.names));
         self.out.push('\n');
     }
 }
@@ -13438,28 +13399,11 @@ pub(crate) fn render_type_definitions_with_names(
     deporder: &[std::rc::Rc<crate::dtype::Datatype>],
     rt: &RealTypeCtx,
     names: Option<&std::collections::BTreeMap<usize, String>>,
-    reserved: Option<&std::collections::BTreeSet<String>>,
 ) -> String {
     use crate::dtype::{Datatype, DatatypeKind};
     use std::collections::HashSet;
     use std::rc::Rc;
 
-    let local_reserved = reserved.is_none().then(|| {
-        let mut identifiers = std::collections::BTreeSet::new();
-        for ct in deporder {
-            if !ct.get_name().is_empty() {
-                identifiers.insert(sanitize_type_name(ct.get_name()).into_owned());
-            }
-            if let Some(members) = ct.as_enum_namemap() {
-                identifiers.extend(members.values().map(|name| sanitize_type_name(name).into_owned()));
-            }
-        }
-        if let Some(names) = names {
-            identifiers.extend(names.values().cloned());
-        }
-        identifiers
-    });
-    let reserved = reserved.or(local_reserved.as_ref());
     let output_name = |ct: &Rc<Datatype>| {
         names.and_then(|names| names.get(&(Rc::as_ptr(ct) as usize)))
             .cloned()
@@ -13511,7 +13455,7 @@ pub(crate) fn render_type_definitions_with_names(
 
     // -- Pass 2: declarations before the bodies that require them. ------------
     let mut writer = CTypeDefinitionWriter {
-        rt, names, reserved, forward: &fwd,
+        rt, names, forward: &fwd,
         defined: std::collections::HashMap::new(), out: &mut out,
     };
     for ct in deporder {

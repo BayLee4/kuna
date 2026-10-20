@@ -528,11 +528,7 @@ recovered switch table.
   language, so in ghidra mode — no `.sla` — the payloads are registered but
   never compiled, and each injection instead asks the host to lift the snippet
   for that one call site (chapter 00). The metadata half is unchanged either
-  way; only the ops change source. Manual callfixup and callother registration
-  preserves the supplied payload name for forward lookup, reverse lookup and
-  duplicate detection. XML decoding replaces that allocation name with the
-  document's `name` or `targetop`. Unlike stock SLEIGH's source-only constructors,
-  this keeps distinct manual registrations from colliding under `"unknown"`.
+  way; only the ops change source.
 - **User ops.** `decompiler/crates/kuna-decomp/src/p2_lift/userop.rs
   (UserOpManage)` manages the CALLOTHER black-box ops (unspecialized, datatype,
   volatile, segment, jump-assist, injected). A CALLOTHER whose user op is

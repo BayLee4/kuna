@@ -2110,9 +2110,7 @@ pub fn extract_type_definitions(arch: &Architecture, fd: &Funcdata) -> Vec<TypeI
         .map(|ct| TypeInfo {
             name: names.and_then(|names| names.get(&(std::rc::Rc::as_ptr(ct) as usize)))
                 .cloned().unwrap_or_else(|| ct.get_name().to_string()),
-            definition: crate::kuna_structdefs::definition_text_with_names(
-                ct, &rt, names, arch.print().reserved_identifiers().map(|names| names.as_ref()),
-            ),
+            definition: crate::kuna_structdefs::definition_text_with_names(ct, &rt, names),
             size: ct.get_size() as i64,
         })
         .collect()

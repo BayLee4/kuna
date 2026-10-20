@@ -472,8 +472,8 @@ Four front-ends drive one engine assembly:
   `long long` or `unsigned long`, whose rank-bearing syntax is preserved.
   The same invocation authority reserves all loaded enum members, source
   function names/aliases, held function and callable-type parameter names,
-  and global names, including sanitized and selected presentation spellings,
-  before synthetic enum range endpoints are named. Workers reserve the
+  and global names, including sanitized and selected presentation spellings.
+  Workers reserve the
   parent's complete transported canonical and alias spellings independently
   of additive symbol replay: an already-resolved address cannot discard its
   parent spellings. Full-load workers use the same inventory for reservations

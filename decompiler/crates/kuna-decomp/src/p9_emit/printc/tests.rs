@@ -932,14 +932,12 @@ mod decompile_project_type_render {
             type_metatype::TYPE_INT,
             &[(0, "OK"), (0xffff_ffff, "FAIL")],
         );
-        let body = compose_enum_body(&se, "serrs", None);
+        let body = compose_enum_body(&se, "serrs");
         assert_eq!(
             body,
-            "typedef enum __attribute__((packed)) serrs {\n\
+            "typedef enum serrs {\n\
              \x20   OK = 0,\n\
-             \x20   FAIL = -1,\n\
-             \x20   serrs__kuna_min = -2147483648,\n\
-             \x20   serrs__kuna_max = 2147483647LL,\n\
+             \x20   FAIL = -1\n\
              } serrs;\n"
         );
         // Unsigned 4-byte enum: hex values.
@@ -949,14 +947,12 @@ mod decompile_project_type_render {
             type_metatype::TYPE_UINT,
             &[(0x1, "LO"), (0x80, "HI")],
         );
-        let body = compose_enum_body(&ue, "uflags", None);
+        let body = compose_enum_body(&ue, "uflags");
         assert_eq!(
             body,
-            "typedef enum __attribute__((packed)) uflags {\n\
-             \x20   LO = 0x1ULL,\n\
-             \x20   HI = 0x80ULL,\n\
-             \x20   uflags__kuna_min = 0,\n\
-             \x20   uflags__kuna_max = 0xffffffffULL,\n\
+            "typedef enum uflags {\n\
+             \x20   LO = 0x1,\n\
+             \x20   HI = 0x80\n\
              } uflags;\n"
         );
     }
@@ -1148,7 +1144,7 @@ mod decompile_project_type_render {
             out.contains("/* duplicate type name skipped: tagged */"),
             "enum colliding with a struct tag must be skipped as a duplicate:\n{out}"
         );
-        assert!(!out.contains("typedef enum __attribute__((packed)) tagged"), "colliding enum must not define:\n{out}");
+        assert!(!out.contains("typedef enum tagged"), "colliding enum must not define:\n{out}");
     }
 }
 
