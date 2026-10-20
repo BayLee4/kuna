@@ -346,7 +346,12 @@ fn global_presentation_names(
             return None;
         }
         let spelling = identifier_spelling(name);
-        Some((*symbol, fresh_presentation_name(&spelling, reserved)))
+        let unique = if reserved.insert(spelling.clone()) {
+            spelling
+        } else {
+            fresh_presentation_name(&spelling, reserved)
+        };
+        Some((*symbol, unique))
     }).collect()
 }
 
