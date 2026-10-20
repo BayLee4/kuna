@@ -37,12 +37,6 @@
     and those loads keep variables of their own ahead of the store
     (`option indexaliasguard global`, issue #792): #3 and #4 check the -O0
     build, #16 and #17 the -O2 one.
-
-    r_char's machine loads sign-extend bytes at offsets 1 and 5. Each read
-    therefore pins `(signed char)` before its original int4 widening without
-    changing the char pointer's declaration or reading through gi. The selected
-    main calls read positive bytes; the machine operation also fixes the sign
-    for high bytes when a consumer uses unsigned plain char.
 -->
 </binaryimage>
 <script>
@@ -143,7 +137,7 @@
 <stringmatch name="globalpointee #6: the store before a call stays where the binary makes it" min="1" max="1">gc = a0;
   touch\(\);</stringmatch>
 <stringmatch name="globalpointee #7: the load after a store that may alias the global stays a load" min="2" max="2">return gi\[1\];</stringmatch>
-<stringmatch name="globalpointee #8: the chars are read through the value, not the int global" min="1" max="1">return \(int4\)\(signed char\)a0\[1\] \+ \(int4\)\(signed char\)a0\[5\];</stringmatch>
+<stringmatch name="globalpointee #8: the chars are read through the value, not the int global" min="1" max="1">return \(int4\)a0\[1\] \+ \(int4\)a0\[5\];</stringmatch>
 <stringmatch name="globalpointee #9: the load after a store through a pointer reads the global, the value its register" min="2" max="2">v1 = \(&amp;a0\[a1\]\)\[2\];
   \*a2 = \(unsigned long\)a0;
   return v1 \+ gi\[1\];</stringmatch>

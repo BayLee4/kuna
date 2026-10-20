@@ -78,11 +78,6 @@
 
     Pass 1 (`option elemptr off`) reproduces the casts and pass 2 (`on`) is the
     fix. The two controls are identical in both passes.
-
-    The table's byte remains char, but its machine sign-extension pins that
-    byte with `(signed char)` even for a consumer built with unsigned plain
-    char. `castternary on` still removes the outer int4 widening: the
-    conditional promotes the signed byte itself, including the 0x80 sentinel.
 -->
 <bytechunk space="ram" offset="0x100000" readonly="true">
 c3
@@ -201,7 +196,7 @@ c3
 <stringmatch name="elemptr #9: a pointer read at two widths is not an array in either pass" min="2" max="2">int8 w_mixed\(void \*a0,int4 a1\)</stringmatch>
 <stringmatch name="elemptr #10: with the option on a returned word nothing shows the sign of is an unsigned element" min="1" max="1">uint2 w_wu\(uint4 a0\)</stringmatch>
 <stringmatch name="elemptr #11: the returned word is never declared signed in either pass" min="0" max="0">\bint2 w_wu\(|^short w_wu\(</stringmatch>
-<stringmatch name="elemptr #12: with the option on a lookup in the global table is a char the conditional widens itself" min="4" max="4">\? \(signed char\)dat_300053e0\[\(uint1\)a0\[v7\]\] : 0;</stringmatch>
+<stringmatch name="elemptr #12: with the option on a lookup in the global table is a char the conditional widens itself" min="4" max="4">\? dat_300053e0\[\(uint1\)a0\[v7\]\] : 0;</stringmatch>
 <stringmatch name="elemptr #13: a buffer's length compared against a pointer difference stays a number in both passes" min="2" max="2">void w_put\(char \*a0,uint8 a1,char \*a2\)</stringmatch>
 <stringmatch name="elemptr #14: with the option on the table a counter is stored into is unsigned and the counter stays int" min="1" max="1">void w_ctr\(uint4 \*a0,int4 \*a1,int4 a2\)</stringmatch>
 <stringmatch name="elemptr #15: the stored counter is compared and used as an index with no cast" min="1" max="1">a0\[v1\] = v1;</stringmatch>

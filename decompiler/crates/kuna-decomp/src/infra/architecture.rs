@@ -1441,6 +1441,9 @@ pub struct Architecture {
     /// (kuna `indirectargs`) Render a parameter the ABI passes through a hidden
     /// pointer at its declared value type in C, instead of as that pointer.
     pub indirect_args: bool,
+    /// An export surface prepared this architecture: with `indirect_args`, a
+    /// proven hidden aggregate result prints as the source result.
+    pub hidden_results: bool,
     /// Recover one consumed first variadic signed-int value in C.
     pub vararg_entry: bool,
     /// (kuna `framelayout`) Report the union of every stack-frame slot any
@@ -3032,6 +3035,7 @@ impl Architecture {
             realtypes: false,
             ctypes: false, // (kuna) option ctypes; reset_defaults sets the shipped default
             indirect_args: false, // (kuna) option indirectargs; reset_defaults sets the shipped default
+            hidden_results: false,
             vararg_entry: false,
             framelayout: false, // (kuna) option framelayout; reset_defaults sets the shipped default
             byte_honest: false, // (kuna) option bytehonest; reset_defaults sets the shipped default

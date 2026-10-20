@@ -677,7 +677,9 @@ fn run_jobs_worker(args: &Args) -> Result<(), String> {
     }
     // Even a worker retired before its first chunk may publish a type block.
     // Reserve the parent's complete source inventory before any such render.
-    kuna_console::project::prepare_type_names(&mut prog);
+    if args.jobs_types {
+        kuna_console::project::prepare_type_names(&mut prog);
+    }
     let export_spec = dir.join(jobs::EXPORT_SPEC_FILE);
     if export_spec.is_file() {
         let spec = jobs::read_export_spec(&export_spec)?;
@@ -1296,14 +1298,6 @@ fn decompile_all(args: &Args, filters: &Filters) -> Result<AllRun, String> {
         targets
     };
     let interior = crate::interior::selections(&prog, args, &targets);
-    if prog.arch().print().get_name() == "c-language" {
-        arm_fn_budgets(&mut prog, args);
-        kuna_console::project::prepare_type_names(&mut prog);
-        if !args.json {
-            kuna_console::project::prepare_export_callables(&mut prog, &targets)
-                .map_err(|e| e.to_string())?;
-        }
-    }
     let whole = targets.len() == discovered && args.addrs.is_empty() && args.names.is_none();
     let (callee_first, explicit) = callee_first_decision(&prog, args, targets.len(), whole);
     // `--jobs N`: hand the targets to the worker pool and release the parent's

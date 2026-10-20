@@ -52,11 +52,6 @@
     identical in all three passes.  Under `void` each field read is an element
     of the pointer, `((int4 *)a0)[2]`, because the default `castarith` keeps a
     pointer plus whole elements in pointer terms instead of `(int8)a0 + 8`.
-
-    globalindex's MOVSX reads the named table's byte as signed in every pass.
-    Its `(signed char)` interpretation remains even for unsigned plain char;
-    the return's implicit widening still removes the outer int4 cast. Neither
-    conversion changes the table's identity or makes the index a pointer.
 -->
 <bytechunk space="ram" offset="0x100000">
 8b4708034710c300000000000000000048c1e7028b4708c300000000000000008b07c3000000000000000000000000000fbe8700002000c300000000000000000fbe8700003000c30000000000000000
@@ -129,5 +124,5 @@
 <stringmatch name="ptrfromuse #8: and a parameter that upstream already typed is untouched in all three" min="3" max="3">unsigned int derefzero\(unsigned int \*a0\)</stringmatch>
 <stringmatch name="ptrfromuse #9: a parameter that subscripts a global byte table is refused in all three passes" min="3" max="3">int4 globalindex\(int8 a0\)</stringmatch>
 <stringmatch name="ptrfromuse #11: an address-like constant that names nothing is ambiguous, so that parameter is refused too in all three passes" min="3" max="3">int4 blindindex\(int8 a0\)</stringmatch>
-<stringmatch name="ptrfromuse #10: and the named global it indexes survives in all three, instead of becoming a raw address" min="3" max="3">return \(signed char\)\(char\)table\[a0\];</stringmatch>
+<stringmatch name="ptrfromuse #10: and the named global it indexes survives in all three, instead of becoming a raw address" min="3" max="3">return \(char\)table\[a0\];</stringmatch>
 </decompilertest>

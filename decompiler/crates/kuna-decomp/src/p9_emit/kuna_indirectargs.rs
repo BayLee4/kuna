@@ -51,7 +51,7 @@ pub(crate) fn hidden_result(proto: &FuncProto) -> Option<HiddenResult> {
     Some(HiddenResult { value_type, pointer_type, slot })
 }
 
-pub(crate) fn callable_logical(proto: &FuncProto, enabled: bool) -> Option<&crate::fspec::PrototypePieces> {
+pub(crate) fn callable_logical(proto: &FuncProto, enabled: bool, results: bool) -> Option<&crate::fspec::PrototypePieces> {
     let logical = proto.logical_pieces()?;
     // The off policy exposes allocated ABI inputs, not pending logical slots.
     let physical_indirect = !enabled && proto.has_store()
@@ -65,7 +65,7 @@ pub(crate) fn callable_logical(proto: &FuncProto, enabled: bool) -> Option<&crat
     if physical_indirect { return None; }
     let hidden = proto.has_store() && (0..proto.num_params())
         .any(|slot| proto.get_param(slot).is_some_and(|p| p.is_hidden_return()));
-    if hidden && (!enabled || hidden_result(proto).is_none()) { return None; }
+    if hidden && (!results || hidden_result(proto).is_none()) { return None; }
     Some(logical)
 }
 

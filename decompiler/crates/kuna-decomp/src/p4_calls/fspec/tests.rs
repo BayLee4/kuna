@@ -1797,6 +1797,17 @@ fn func_proto_return_bytes_consumed_takes_smallest() {
     assert_eq!(fp.get_return_bytes_consumed(), 4);
 }
 
+#[test]
+fn func_proto_stub_methods_error() {
+    let mut fp = FuncProto::new();
+    assert!(fp.set_scope().is_err());
+    assert!(fp.update_input_types().is_err());
+    assert!(fp.update_output_types().is_err());
+    let mgr = AddrSpaceManager::new();
+    let mut model = ProtoModel::new(&mgr);
+    assert!(model.decode().is_err());
+}
+
 // =========================================================================
 // fspec-3: FuncCallSpecs
 // =========================================================================

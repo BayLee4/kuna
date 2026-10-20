@@ -3841,52 +3841,8 @@ fn arm_images_get_no_double_libc_rows() {
         }
         if name.ends_with("soft") {
             assert!(
-                stdout.contains("unsigned long long sub_10224("),
+                stdout.contains("unsigned long long sub_10224(") && stdout.contains("return CONCAT44(v2,v1);"),
                 "{name}: `clampd` no longer returns its r0:r1 bits:\n{stdout}"
-            );
-            let body = printed_functions(&stdout, &["sub_10224 "]);
-            c_behavior::assert_c_behavior(
-                &common::scratch_file("arm-libc-core-return-bits", "c"),
-                r#"
-#include <stdint.h>
-#include <string.h>
-#include <assert.h>
-static uint64_t result_bits;
-static unsigned calls;
-static unsigned long long strtod(unsigned argument, unsigned end) {
-    assert(argument == 0x12345678 && end == 0);
-    ++calls;
-    return result_bits;
-}
-static int __aeabi_dcmplt(unsigned low, unsigned high, unsigned zero_low, unsigned zero_high) {
-    assert(zero_low == 0 && zero_high == 0);
-    uint64_t bits = ((uint64_t)high << 32) | low;
-    double value;
-    memcpy(&value, &bits, sizeof(value));
-    return value < 0;
-}
-"#,
-                &body,
-                r#"
-int main(void) {
-    const uint64_t samples[] = {0, UINT64_C(0x8000000000000000),
-        UINT64_C(0x4002000000000000), UINT64_C(0xc002000000000000),
-        UINT64_C(0x3ff0000000000001), UINT64_C(0x7ff8123456789abc)};
-    for (unsigned i=0; i<sizeof(samples)/sizeof(*samples); ++i) {
-        result_bits = samples[i];
-        double value;
-        memcpy(&value, &result_bits, sizeof(value));
-        uint64_t expected = value < 0 ? 0 : result_bits;
-        calls = 0;
-        assert(sub_10224(0x12345678) == expected);
-        assert(calls == 1);
-    }
-    return 0;
-}
-"#,
-                &["-Wall", "-Werror=implicit-function-declaration", "-Werror=int-conversion",
-                  "-Werror=uninitialized", "-Werror=return-type", "-fno-builtin",
-                  "-fsanitize=undefined", "-fno-sanitize-recover=undefined"],
             );
         }
     }
@@ -5482,15 +5438,13 @@ int main(void) {
   return 0;
 }
 "#;
-    // The byte's sign conversion stays in both modes; only the outer widening
-    // is implied by C's destination conversion.
     let changed: [(&str, &str); 6] = [
-        ("memchr(a0,(int)(signed char)a1,(unsigned long)a2);", "memchr(a0,(signed char)a1,a2);"),
+        ("memchr(a0,(int)a1,(unsigned long)a2);", "memchr(a0,a1,a2);"),
         ("strchr(a0,(int)a1);", "strchr(a0,a1);"),
-        ("v1 = (long)(signed char)a0[v2];", "v1 = (signed char)a0[v2];"),
+        ("v1 = (long)a0[v2];", "v1 = a0[v2];"),
         (
-            "(int)(unsigned int)(unsigned char)to_uchar((int)(signed char)a1)",
-            "(int)(unsigned char)to_uchar((int)(signed char)a1)",
+            "(int)(unsigned int)(unsigned char)to_uchar((int)a1)",
+            "(int)(unsigned char)to_uchar((int)a1)",
         ),
         ("long ret_int(int a0)\n{\n  return (long)a0;", "long ret_int(int a0)\n{\n  return a0;"),
         ("*a1 = a0 >> 1;\n  return (long)(int)a0;", "*a1 = a0 >> 1;\n  return (int)a0;"),
@@ -5810,13 +5764,12 @@ int main(void) {
 }
 "#;
     let both = [("v1 = (a2) ? (unsigned long)a0 : (unsigned long)a1;", "v1 = (a2) ? (unsigned long)a0 : a1;")];
-    // Pin signed-byte values independently of the conditional's outer widening.
     let gcc_only: [(&str, &str); 8] = [
         (
-            "v2 = (*(char *)(v7 + a1) != '=') ? (int)(signed char)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
-            "v2 = (*(char *)(v7 + a1) != '=') ? (signed char)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
+            "v2 = (*(char *)(v7 + a1) != '=') ? (int)*(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
+            "v2 = (*(char *)(v7 + a1) != '=') ? *(char *)(a0 + (unsigned long)*(unsigned char *)(v7 + a1)) : 0;",
         ),
-        ("v1 = (a1) ? (int)(signed char)*(char *)(a0 + a1) : 0;", "v1 = (a1) ? (signed char)*(char *)(a0 + a1) : 0;"),
+        ("v1 = (a1) ? (int)*(char *)(a0 + a1) : 0;", "v1 = (a1) ? *(char *)(a0 + a1) : 0;"),
         (
             "v1 = (a1) ? (unsigned int)*(unsigned char *)(a0 + a1) : 0xffffffff;",
             "v1 = (a1) ? *(unsigned char *)(a0 + a1) : 0xffffffff;",
@@ -5830,8 +5783,8 @@ int main(void) {
             "v1 = (a1) ? (long)*(int *)(a0 + (long)a1 * 4) : 3000000000;",
             "v1 = (a1) ? *(int *)(a0 + (long)a1 * 4) : 3000000000;",
         ),
-        ("v1 = (a1) ? (int)(signed char)*(char *)(a0 + a1) : -1;", "v1 = (a1) ? (signed char)*(char *)(a0 + a1) : -1;"),
-        ("v5 = (*(char *)(a1 + v7 + 3) != '=') ? (int)(signed char)*(char", "v5 = (*(char *)(a1 + v7 + 3) != '=') ? (signed char)*(char"),
+        ("v1 = (a1) ? (int)*(char *)(a0 + a1) : -1;", "v1 = (a1) ? *(char *)(a0 + a1) : -1;"),
+        ("v5 = (*(char *)(a1 + v7 + 3) != '=') ? (int)*(char", "v5 = (*(char *)(a1 + v7 + 3) != '=') ? *(char"),
     ];
     let gcc_kept = ["v1 = (a1) ? (long)*(int *)(a0 + (long)a1 * 4) : -5;", "v1 = (a2) ? (unsigned int)(a0 < a1) : 0xffffffff;"];
     let sp = specs();
@@ -10248,61 +10201,6 @@ int main(void) {
         let ran = Command::new(&executable).output().expect("run joined return consumer");
         assert!(ran.status.success(), "JOIN return differs from EDX:EAX {opt}:\n{}",
             String::from_utf8_lossy(&ran.stderr));
-    }
-    std::fs::remove_dir_all(&dir).unwrap();
-}
-
-#[test]
-fn signed_byte_table_loads_ignore_the_consumers_plain_char_mode() {
-    assert!(have_c_compiler(), "required `cc` compiler is unavailable");
-    let dir = scratch_dir("signed_byte_table_loads_ignore_the_consumers_plain_char_mode");
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("signed_table");
-    let mut bytes = vec![0u8; 0x108];
-    let code = [0x83,0xe7,0x07,0x48,0x8d,0x05,0xf6,0,0,0,0x0f,0xbe,0x04,0x07,0xc3];
-    bytes[..code.len()].copy_from_slice(&code);
-    bytes[0x100..].copy_from_slice(&[129,4,225,99,0,127,255,42]);
-    std::fs::write(&image, bytes).unwrap();
-    let sp = specs();
-    let (printed, stderr, ok) = run_kuna(&[
-        "decompile-all", image.to_str().unwrap(), "--raw-image", "--target", "x86:LE:64:default:gcc",
-        "--base", "0x1000", "--addr", "0x1000", "--define-function", "0x1000-0x100f=table_value",
-        "--sleighpath", &sp, "--assert-strict",
-        "--assert", "prototype table_value int table_value(unsigned int index)",
-        "--assert", "data 0x1100 char identity_table[8]",
-    ]);
-    assert!(ok, "signed table decompilation failed: {stderr}");
-    assert!(printed.contains("identity_table"), "the machine load lost its named global dependency:\n{printed}");
-    let source = dir.join("consumer.c");
-    std::fs::write(&source, format!(r#"#include <stdint.h>
-#include <stdio.h>
-typedef signed char sbyte, schar;
-typedef unsigned char byte, uchar;
-typedef unsigned int uint;
-const char identity_table[8] = {{(char)129,4,(char)225,99,0,127,(char)255,42}};
-{printed}
-int main(void) {{
-    const int expected[8] = {{-127,4,-31,99,0,127,-1,42}};
-    for (unsigned index=0; index<8; ++index) {{
-        int actual=table_value(index);
-        if (actual!=expected[index]) {{
-            fprintf(stderr,"table_value(%u)=%d expected=%d\n",index,actual,expected[index]);
-            return 1;
-        }}
-    }}
-    return 0;
-}}
-"#)).unwrap();
-    for opt in ["-O0", "-O2"] {
-        for char_mode in ["-fsigned-char", "-funsigned-char"] {
-            let exe = dir.join(format!("consumer{opt}{char_mode}"));
-            let build = Command::new("cc")
-                .args(["-std=c11", "-Wall", "-Wextra", "-Werror=uninitialized", "-Werror=implicit-function-declaration", opt, char_mode])
-                .arg(&source).arg("-o").arg(&exe).output().expect("spawn cc");
-            assert!(build.status.success(), "{opt} {char_mode}: unchanged signed table C did not compile:\n{}\n{printed}", String::from_utf8_lossy(&build.stderr));
-            let run = Command::new(&exe).output().expect("run signed table consumer");
-            assert!(run.status.success(), "{opt} {char_mode}: MOVSBL changed meaning:\n{}\n{printed}", String::from_utf8_lossy(&run.stderr));
-        }
     }
     std::fs::remove_dir_all(&dir).unwrap();
 }

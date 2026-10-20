@@ -1,14 +1,6 @@
 --- a/ghidra/app/util/exporter/CppExporter.java
 +++ b/ghidra/app/util/exporter/CppExporter.java
-@@ -17,6 +17,7 @@
- 
- import java.io.*;
- import java.util.*;
-+import java.util.function.Consumer;
- 
- import org.apache.commons.lang3.StringUtils;
- 
-@@ -27,6 +28,7 @@
+@@ -27,6 +27,7 @@
  import ghidra.app.decompiler.DecompileOptions.CommentStyleEnum;
  import ghidra.app.decompiler.component.DecompilerUtils;
  import ghidra.app.decompiler.parallel.ChunkingParallelDecompiler;
@@ -16,7 +8,7 @@
  import ghidra.app.decompiler.parallel.ParallelDecompiler;
  import ghidra.app.util.*;
  import ghidra.framework.model.DomainObject;
-@@ -35,6 +37,7 @@
+@@ -35,6 +36,7 @@
  import ghidra.program.model.data.*;
  import ghidra.program.model.listing.*;
  import ghidra.program.model.symbol.Equate;
@@ -24,7 +16,7 @@
  import ghidra.util.HelpLocation;
  import ghidra.util.Msg;
  import ghidra.util.exception.CancelledException;
-@@ -65,6 +68,7 @@
+@@ -65,6 +67,7 @@
  
  	private DecompileOptions options;
  	private boolean userSuppliedOptions = false;
@@ -32,7 +24,7 @@
  
  	public CppExporter() {
  		super("C/C++", "c", new HelpLocation("ExporterPlugin", "c_cpp"));
-@@ -87,6 +91,43 @@
+@@ -87,6 +90,43 @@
  		}
  	}
  
@@ -76,7 +68,7 @@
  	@Override
  	public boolean export(File file, DomainObject domainObj, AddressSetView addrSet,
  			TaskMonitor monitor) throws IOException, ExporterException {
-@@ -118,24 +159,64 @@
+@@ -118,24 +158,70 @@
  			cFileWriter = new PrintWriter(file);
  		}
  
@@ -94,8 +86,14 @@
 +			ExportDataTypeNames typeNames = new ExportDataTypeNames(program,
 +				emitDataTypeDefinitions && (headerWriter != null || cFileWriter != null));
 +			String fakeCDefinitions = emitDataTypeDefinitions && headerWriter != null
-+					? getFakeCTypeDefinitions(program.getDataTypeManager().getDataOrganization(),
-+						typeNames::reserveIdentifier) : null;
++					? getFakeCTypeDefinitions(program.getDataTypeManager().getDataOrganization()) : null;
++			if (fakeCDefinitions != null) {
++				for (String line : fakeCDefinitions.split(EOL)) {
++					if (line.startsWith("#define ")) {
++						typeNames.reserveIdentifier(line.split("\\s+")[1]);
++					}
++				}
++			}
 +			List<Function> actualFunctions = new ArrayList<>();
 +			FunctionIterator iterator = program.getListing().getFunctions(addrSet, true);
 +			while (iterator.hasNext()) {
@@ -132,10 +130,9 @@
  			if (emitDataTypeDefinitions) {
  				writeEquates(program, header, headerWriter, cFileWriter, chunkingMonitor);
 -				writeProgramDataTypes(program, header, headerWriter, cFileWriter, chunkingMonitor);
--			}
 +				typeWriter = writeProgramDataTypes(program, header, headerWriter, cFileWriter,
 +					chunkingMonitor, typeNames, fakeCDefinitions, printConventions);
-+			}
+ 			}
 +			DataTypeWriter declarations =
 +				new DataTypeWriter(null, Writer.nullWriter(), isUseCppStyleComments, typeNames);
 +			declarations.setCallingConventionContext(program.getCompilerSpec(), printConventions);
@@ -143,17 +140,16 @@
  
 -			decompileAndExport(addrSet, program, headerWriter, cFileWriter, parallelDecompiler,
 -				chunkingMonitor);
--
--			return true;
 +			decompileAndExport(actualFunctions, program, headerWriter, cFileWriter, parallelDecompiler,
 +				chunkingMonitor, typeNames, typeWriter, declarations);
-+
+ 
+-			return true;
 +			return (headerWriter == null || !headerWriter.checkError()) &&
 +				(cFileWriter == null || !cFileWriter.checkError());
  		}
  		catch (CancelledException e) {
  			return false;
-@@ -145,8 +226,12 @@
+@@ -145,8 +231,12 @@
  			return false;
  		}
  		finally {
@@ -168,7 +164,7 @@
  
  			if (headerWriter != null) {
  				headerWriter.close();
-@@ -158,40 +243,135 @@
+@@ -158,42 +248,137 @@
  
  	}
  
@@ -263,8 +259,8 @@
 +				retained.set(i, null);
 +			}
 +		}
-+	}
-+
+ 	}
+ 
 +	private void writeExternalDeclarations(ExportDataTypeNames typeNames,
 +			DataTypeWriter typeWriter, DataTypeWriter declarations, PrintWriter writer,
 +			Set<String> processedGlobals, TaskMonitor monitor) throws IOException, CancelledException {
@@ -314,10 +310,12 @@
 +				typeNames.reserveSources(result.result(), monitor);
 +			}
 +		}
- 	}
- 
++	}
++
  	private boolean excludeFunction(Function currentFunction) {
-@@ -213,11 +393,37 @@
+ 
+ 		if (functionTagSet.isEmpty()) {
+@@ -213,11 +398,37 @@
  	}
  
  	private void writeResults(List<CPPResult> results, Set<String> processedGlobals,
@@ -358,7 +356,7 @@
  
  		StringBuilder globalDecls = new StringBuilder();
  		StringBuilder headers = new StringBuilder();
-@@ -228,21 +434,50 @@
+@@ -228,21 +439,50 @@
  			if (result == null) {
  				continue;
  			}
@@ -413,7 +411,7 @@
  			if (bodyCode != null) {
  				bodies.append(bodyCode);
  				bodies.append(EOL);
-@@ -291,13 +526,17 @@
+@@ -291,13 +531,17 @@
  		}
  	}
  
@@ -436,7 +434,7 @@
  			dataTypeWriter.write(dtm, monitor);
  
  			headerWriter.println("");
-@@ -309,8 +548,9 @@
+@@ -309,8 +553,9 @@
  		}
  		else if (cFileWriter != null) {
  			DataTypeManager dtm = program.getDataTypeManager();
@@ -448,7 +446,7 @@
  			dataTypeWriter.write(dtm, monitor);
  		}
  
-@@ -319,6 +559,7 @@
+@@ -319,6 +564,7 @@
  			cFileWriter.println("");
  		}
  
@@ -456,101 +454,7 @@
  	}
  
  	private void writeEquates(Program program, File header, PrintWriter headerWriter,
-@@ -405,67 +646,71 @@
- 		}
- 	}
- 
--	private static String getBuiltInDeclaration(String typeName, String ctypeName) {
-+	private static String getBuiltInDeclaration(String typeName, String ctypeName,
-+			Consumer<String> identifiers) {
-+		identifiers.accept(typeName);
- 		return "#define " + typeName + "   " + ctypeName + EOL;
- 	}
- 
- 	private static String getBuiltInDeclaration(String typeName, int typeLen, boolean signed,
--			DataOrganization dataOrganization) {
-+			DataOrganization dataOrganization, Consumer<String> identifiers) {
- 		return getBuiltInDeclaration(typeName,
--			dataOrganization.getIntegerCTypeApproximation(typeLen, signed));
-+			dataOrganization.getIntegerCTypeApproximation(typeLen, signed), identifiers);
- 	}
- 
- 	/**
- 	 * Generate suitable C-style definition statements (#define) for any fake data-type names
- 	 * which may be produced by the decompiler (e.g., unkint, unkuint, etc.).
- 	 * @param dataOrganization is the data organization to result the size of core types.
-+	 * @param identifiers receives each actual generated macro name before presentation naming
- 	 * @return multi-line string containing C-style declarations of fake decompiler types.
- 	 */
--	private static String getFakeCTypeDefinitions(DataOrganization dataOrganization) {
-+	private static String getFakeCTypeDefinitions(DataOrganization dataOrganization,
-+			Consumer<String> identifiers) {
- 
- 		StringWriter writer = new StringWriter();
- 
- 		// unkbyte - decompiler fabricated unknown types - need only cover sizes larger than the max Undefined size
- 		for (int n = 9; n <= 16; n++) {
--			writer.write(getBuiltInDeclaration("unkbyte" + n, n, false, dataOrganization));
-+			writer.write(getBuiltInDeclaration("unkbyte" + n, n, false, dataOrganization, identifiers));
- 		}
- 		writer.write(EOL);
- 
- 		// unkuint - decompiler fabricated unsigned integer types
- 		// need only cover sizes larger than the max integer size (i.e., AbstractIntegerDataType)
- 		for (int n = 9; n <= 16; n++) {
--			writer.write(getBuiltInDeclaration("unkuint" + n, n, false, dataOrganization));
-+			writer.write(getBuiltInDeclaration("unkuint" + n, n, false, dataOrganization, identifiers));
- 		}
- 		writer.write(EOL);
- 
- 		// unkint - decompiler fabricated signed integer types
- 		// need only cover sizes larger than the max integer size (i.e., AbstractIntegerDataType)
- 		for (int n = 9; n <= 16; n++) {
--			writer.write(getBuiltInDeclaration("unkint" + n, n, true, dataOrganization));
-+			writer.write(getBuiltInDeclaration("unkint" + n, n, true, dataOrganization, identifiers));
- 		}
- 		writer.write(EOL);
- 
- 		// unkfloat - decompiler fabricated floating point types
--		writer.write(getBuiltInDeclaration("unkfloat1", "float"));
--		writer.write(getBuiltInDeclaration("unkfloat2", "float"));
--		writer.write(getBuiltInDeclaration("unkfloat3", "float"));
-+		writer.write(getBuiltInDeclaration("unkfloat1", "float", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat2", "float", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat3", "float", identifiers));
- 		//writer.write(getBuiltInDeclaration("unkfloat4", "float")); // covered by fixed-size built-in float
--		writer.write(getBuiltInDeclaration("unkfloat5", "double"));
--		writer.write(getBuiltInDeclaration("unkfloat6", "double"));
--		writer.write(getBuiltInDeclaration("unkfloat7", "double"));
-+		writer.write(getBuiltInDeclaration("unkfloat5", "double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat6", "double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat7", "double", identifiers));
- 		//writer.write(getBuiltInDeclaration("unkfloat8", "double")); // covered by fixed-size built-in double
--		writer.write(getBuiltInDeclaration("unkfloat9", "long double"));
-+		writer.write(getBuiltInDeclaration("unkfloat9", "long double", identifiers));
- 		//writer.write(getBuiltInDeclaration("unkfloat10", "long double")); // covered by fixed-size built-in longdouble
--		writer.write(getBuiltInDeclaration("unkfloat11", "long double"));
--		writer.write(getBuiltInDeclaration("unkfloat12", "long double"));
--		writer.write(getBuiltInDeclaration("unkfloat13", "long double"));
--		writer.write(getBuiltInDeclaration("unkfloat14", "long double"));
--		writer.write(getBuiltInDeclaration("unkfloat15", "long double"));
--		writer.write(getBuiltInDeclaration("unkfloat16", "long double"));
-+		writer.write(getBuiltInDeclaration("unkfloat11", "long double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat12", "long double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat13", "long double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat14", "long double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat15", "long double", identifiers));
-+		writer.write(getBuiltInDeclaration("unkfloat16", "long double", identifiers));
- 		writer.write(EOL);
- 
--		writer.write(getBuiltInDeclaration("BADSPACEBASE", "void"));
--		writer.write(getBuiltInDeclaration("code", "void"));
-+		writer.write(getBuiltInDeclaration("BADSPACEBASE", "void", identifiers));
-+		writer.write(getBuiltInDeclaration("code", "void", identifiers));
- 		writer.write(EOL);
- 
- 		return writer.toString();
-@@ -475,8 +720,8 @@
+@@ -475,8 +721,8 @@
  // Inner Classes
  //==================================================================================================
  
@@ -561,16 +465,15 @@
  		@Override
  		public int compareTo(CPPResult other) {
  			return address.compareTo(other.address);
-@@ -486,32 +731,63 @@
+@@ -486,32 +732,63 @@
  	private class DecompilerFactory extends CountingBasicFactory<DecompInterface> {
  
  		private Program program;
--
--		DecompilerFactory(Program program) {
 +		private DecompileConfigurer invocationConfigurer;
 +		private boolean requireOpen;
 +		private final DecompInterface.ExportScope exportScope;
-+
+ 
+-		DecompilerFactory(Program program) {
 +		DecompilerFactory(Program program, DecompileConfigurer configurer, boolean requireOpen,
 +				DecompInterface.ExportScope exportScope) {
  			this.program = program;
@@ -623,10 +526,9 @@
  	private class ParallelDecompilerCallback implements QCallback<Function, CPPResult> {
  
  		private CachingPool<DecompInterface> pool;
--
--		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool) {
 +		private final DecompInterface.ExportScope exportScope;
-+
+ 
+-		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool) {
 +		ParallelDecompilerCallback(CachingPool<DecompInterface> decompilerPool,
 +				DecompInterface.ExportScope exportScope) {
  			this.pool = decompilerPool;
@@ -634,7 +536,7 @@
  		}
  
  		@Override
-@@ -531,43 +807,41 @@
+@@ -531,43 +808,41 @@
  		}
  
  		private CPPResult doWork(Function function, DecompInterface decompiler,

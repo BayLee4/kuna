@@ -24,6 +24,7 @@ use std::rc::Rc;
         use crate::fspec::{FuncCallSpecs, PrototypePieces, ParamEntry, ProtoModel};
 
         let mut arch = bare_arch();
+        arch.hidden_results = true;
         arch.realtypes = false;
         arch.ctypes = false;
         arch.cast_implied = false;

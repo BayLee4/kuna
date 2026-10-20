@@ -971,6 +971,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 arch.print_mut().set_reserved_identifiers(Rc::new(reserved));
                 let binding = kuna_decomp::kuna_exportcall::prepare_addresses(arch, &roots)?;
                 arch.print_mut().set_export_binding(Some(Rc::new(binding)));
+                arch.hidden_results = true;
                 let mut acknowledgment = Vec::new();
                 ResultTypeTable::encode_prelude_packed(
                     &ResultTypeTable::shared(), &mut acknowledgment,

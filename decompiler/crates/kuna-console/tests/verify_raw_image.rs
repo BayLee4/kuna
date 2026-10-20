@@ -62,7 +62,7 @@ fn source_state_program(fixture: &RawFixture, entries: &[u64]) -> kuna_console::
 #[test]
 fn global_presentation_keeps_alias_identity_and_body_header_values() {
     use std::rc::Rc;
-    use kuna_console::project::{build_header, render_c};
+    use kuna_console::project::{build_header, prepare_type_names, render_c};
     use kuna_decomp::decompile_drive::{print_c_recompile_prelude, print_c_types};
     use kuna_decomp::dtype::{type_metatype, TypeFactory};
 
@@ -111,6 +111,7 @@ fn global_presentation_keeps_alias_identity_and_body_header_values() {
         sources.push((id, symbol.get_id(), name.to_owned(), datatype));
     }
 
+    prepare_type_names(&mut program);
     let results = decompile_targets(&mut program, vec![entry], false, true, false).unwrap();
     let result = &results[0];
     assert!(result.error.is_none(), "{:?}", result.error);

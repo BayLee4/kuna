@@ -1005,6 +1005,7 @@ impl Rule for RulePtrsubCharConstant {
         }
         let Some(chartype) = outtype.get_ptr_to() else { return Ok(0) };
         if !chartype.is_char_print() { return Ok(0); }
+        if crate::kuna_elemptr::reaches_element_pointer(data, out) { return Ok(0); }
         let usepoint = op_addr(data, op);
         let val = offset(data, vn1);
         let Some(addr) = spacebase.spacebase_get_address(

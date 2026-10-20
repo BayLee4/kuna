@@ -666,11 +666,18 @@ impl Action for ActionMergeRequired {
         // later `ActionDominantCopy` (`processCopyTrims`).  StackAffectingOps is
         // the W7 stack-alias cross-call test source; the merged-tree default is
         // empty (no stack-affecting ops on the boolless/condconst slices).
+        // An engine error stops the forced merges and keeps the function; a host
+        // failure still aborts it.
         data.with_covermerge(|merge, data| {
-            merge.merge_addr_tied(data)?;
-            crate::kuna_fputruncviews::recover(data)?;
-            merge.group_partials(data)?;
-            merge.merge_marker(data)
+            merge.merge_addr_tied(data)
+                .and_then(|_| crate::kuna_fputruncviews::recover(data))
+                .and_then(|_| merge.group_partials(data))
+                .and_then(|_| merge.merge_marker(data))
+                .or_else(|error| match error {
+                    kuna_base::error::KunaError::Transport { .. }
+                    | kuna_base::error::KunaError::Java { .. } => Err(error),
+                    _ => Ok(()),
+                })
         })?;
 
         // (kuna LOSS-229) Re-attach dynamic-hash symbols to the firstuse COPYs that

@@ -454,7 +454,7 @@ a typed forward declaration for its actual selected private definition. This
 declaration closure preserves the authored call operands/prototype and does not
 certify compatibility with that definition or expose an unavailable public
 source wrapper.
-Ordinary `decompile-all --json` does not acquire this private binding: its code,
+Ordinary `decompile-all` does not acquire this private binding: its code,
 variables and provenance all describe its actual ordinary Funcdata. Project
 publication can explicitly report retained source parameters alongside its
 private working body; generic variable extraction never substitutes a printer-
@@ -1022,12 +1022,13 @@ Printing correct C is not enough. The `decompileAt` response is a packed `<doc>`
   Decompiler Parameter ID and calling-convention analyzers
   (`DecompilerParameterIdCmd.java:325-345`).
 
-Source emission also retains machine value and layout contracts independently
-of the receiving compiler's defaults. C `INT_SEXT` from a text byte explicitly
-converts through `signed char`, without changing the source `char` declaration.
-That sign pin is independent of the outer widening: `castimplied`,
-`castternary`, ordinary promotion hiding and widening policies still decide
-whether C performs the outer conversion without an explicit cast.
+Source emission also retains machine value contracts independently of the
+receiving compiler's defaults. With an attached Ghidra host, C `INT_SEXT` from a
+text byte explicitly converts through `signed char`, without changing the source
+`char` declaration; the standalone CLI keeps the upstream spelling. That sign pin
+is independent of the outer widening: `castimplied`, `castternary`, ordinary
+promotion hiding and widening policies still decide whether C performs the outer
+conversion without an explicit cast.
 Phi commoning keeps distinct address-tied storage locations separate even when
 their incoming values match. In particular, a global-state phi is not replaced
 by a local pointer phi: its later aliasing-store marker must retain the global's
@@ -1044,7 +1045,7 @@ operands convert explicitly at that boundary even when inferred types agree:
 an implied call retains its callee's declared source return type. Cast insertion
 transfers the original read before attaching its replacement CAST input, keeping
 free values single-reader without dropping operands when already-analyzed IR is
-rendered in another language. Generated C
+Generated C
 enum definitions retain recovered width/sign, and narrow unsigned complements
 are truncated after C integer promotion. Synthetic enum range endpoints use the
 invocation's reserved ordinary identifiers, including later enum members,

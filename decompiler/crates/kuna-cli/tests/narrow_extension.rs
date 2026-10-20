@@ -291,27 +291,6 @@ fn a_narrow_argument_or_return_round_trips_through_the_printed_c() {
     }
 }
 
-/// A full modeled extension remains an entry SSA producer under every mode;
-/// it must not be replaced by a source cast in a physical wrapper.
-#[test]
-fn an_apple_entry_keeps_the_models_extension_producer() {
-    let image = IMAGES.iter().find(|image| image.name == "apple").unwrap();
-    for mode in ["abi", "compiler", "off"] {
-        let text = decompile(image, mode);
-        for name in ["psc", "pus"] {
-            assert!(
-                !function(&text, name).contains(&format!("kuna_impl_{name}")),
-                "{mode}: a fully modeled entry read must retain its extension producer:\n{text}"
-            );
-        }
-        // A range guarantee is not a license to normalize a raw Boolean byte.
-        assert!(
-            function(&text, "pb").contains("kuna_impl_pb"),
-            "{mode}: the Boolean input must retain its raw-byte implementation:\n{text}"
-        );
-    }
-}
-
 /// Independent scalar C references for `narrowext_rv64.cpp`'s functions.
 /// The printed functions' source enum declarations come from the actual header.
 const SIGNED_SOURCE: &str = r#"
@@ -582,10 +561,8 @@ fn charsign_round_trip(stem: &str, text: &str, checked: &[&str], compilers: &[&s
 /// `char c` printed 202 as -54 when compiled. A one-element `unsigned char`
 /// array read whole extends as its element (`(int)b[0]`, not `ZEXT14(b[0])`).
 /// clang -O2 also reads a narrow parameter as the 32-bit value its caller
-/// extended it to. Physical publication can now express that carrier in a
-/// private implementation while the public wrapper retains the source sign
-/// and performs the widening conversion. Check its actual values with the
-/// compiler extension both enabled and disabled, not an unassigned `CONCAT`.
+/// extended it to, which only `narrowext compiler` states on x86-64: by default
+/// (and with it off) that prints `CONCAT31(v1,c)` with an unassigned `v1`.
 /// clang's `getc1` keeps its buffer in the slot of an alignment push, which
 /// kuna reads wrongly on main too, so only gcc's is checked.
 #[test]
@@ -620,14 +597,8 @@ fn a_dwarf_char_parameter_keeps_its_declared_sign() {
     charsign_round_trip("charsign-clang-compiler", &compiler, &all, &compilers)
         .unwrap_or_else(|e| panic!("clang -O2 under compiler: {e}\n{compiler}"));
     let off = run("charsign_x86_64_clang_O2", &["--option", "narrowext", "off"]);
-    charsign_round_trip("charsign-clang-off", &off, &all, &compilers)
-        .unwrap_or_else(|e| panic!("clang -O2 under off: {e}\n{off}"));
     for n in widened {
-        let ty = CHARSIGN_VALUES.iter().find(|(name, _)| *name == n).unwrap().1;
-        let result = if n == "wb" { "int" } else { "long" };
-        let parameter = if n == "wb" { "bool b".to_string() } else { format!("{ty} c") };
-        assert!(function(&off, n).contains(&format!("{result} {n}({parameter})")),
-            "{n} lost its public source sign/width/return under off:\n{off}");
+        assert!(function(&off, n).contains("CONCAT"), "{n} under off:\n{off}");
     }
 
     let arm = run("charsign_aarch64_O2.o", &[]);

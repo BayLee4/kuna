@@ -99,6 +99,7 @@ pub fn prepare_export_callables(prog: &mut ConsoleProgram, targets: &[FunctionEn
     prog.arch_mut().print_mut().set_export_binding(None);
     let binding = kuna_decomp::kuna_exportcall::prepare(prog.arch_mut(), &selected)?;
     prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
+    prog.arch_mut().hidden_results = true;
     // Only private physical implementations can lose a post-decompile formal
     // edit at publication. Resolve those bounded batches before any worker or
     // renderer can acquire the invocation binding.
@@ -170,6 +171,7 @@ pub fn install_export_callables(
     }
     let binding = kuna_decomp::kuna_exportcall::ExportBinding::from_spec_with_entries(prog.arch_mut(),spec,&entries)?;
     prog.arch_mut().print_mut().set_export_binding(Some(std::rc::Rc::new(binding)));
+    prog.arch_mut().hidden_results = true;
     Ok(())
 }
 
@@ -873,7 +875,9 @@ pub fn decompile_pulled(
     next: &mut dyn FnMut() -> Option<FunctionEntry>,
     sink: &mut dyn FnMut(FuncResult),
 ) -> KunaResult<()> {
-    prepare_type_names(prog);
+    if opts.header_carries_types {
+        prepare_type_names(prog);
+    }
     let float_scan_batch = prog.arch().kuna_float_scan_batch;
     prog.arch_mut().kuna_float_scan_batch = !opts.single_target;
     // (kuna `structdefs`) A project export's bodies do NOT carry the

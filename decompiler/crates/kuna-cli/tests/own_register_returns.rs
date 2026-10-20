@@ -353,12 +353,14 @@ fn a_shift_that_returns_its_argument_unchanged_returns_both_words() {
         body.contains("unsigned long long ashr(unsigned int a0,int a1,unsigned int a2)"),
         "{stem}\n{printed}"
     );
+    assert!(body.contains("return CONCAT44(a1,a0);"), "{stem}\n{printed}");
     let src = common::scratch_file(stem, "c");
     let exe = common::scratch_file(stem, "exe");
     std::fs::write(
         &src,
         format!(
             r#"
+#define CONCAT44(h, l) ((unsigned long long)(unsigned int)(h) << 32 | (unsigned int)(l))
 {printed}
 {ASHR_SOURCE}
 int main(void) {{

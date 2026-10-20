@@ -3322,7 +3322,7 @@ impl PrintC {
         // base (metatype UNKNOWN), rendered as `undefined<N>` — the documented
         // residual vs. the oracle's inferred `uint1`.
         let rt = &self.rt_ctx;
-        let source_result = (self.out_lang == crate::kuna_lang::OutLang::C && rt.indirect_args)
+        let source_result = (self.out_lang == crate::kuna_lang::OutLang::C && rt.hidden_results)
             .then(|| crate::kuna_indirectargs::hidden_result(fd.get_func_proto())).flatten();
         let return_type = source_result.as_ref().map(|result| &result.value_type)
             .or_else(|| fd.get_func_proto().has_store().then(|| fd.get_func_proto().get_output_type()).flatten());
@@ -3494,7 +3494,7 @@ impl PrintC {
             return;
         }
         let sz = proto.num_params();
-        let hidden = (self.out_lang == crate::kuna_lang::OutLang::C && self.rt_ctx.indirect_args)
+        let hidden = (self.out_lang == crate::kuna_lang::OutLang::C && self.rt_ctx.hidden_results)
             .then(|| crate::kuna_indirectargs::hidden_result(proto)).flatten();
         let visible = sz - i32::from(hidden.is_some());
         if visible == 0 {
@@ -7855,7 +7855,8 @@ impl PrintC {
         // Converting straight to the wider result (or hiding the extension)
         // zero-extends negative bytes under -funsigned-char. Pin the operand's
         // sign at its original width without changing its source declaration.
-        if self.out_lang == crate::kuna_lang::OutLang::C
+        if arch.remote_scope.is_some()
+            && self.out_lang == crate::kuna_lang::OutLang::C
             && !self.options.nocasts
             && intype.is_char_print()
             && intype.get_size() == 1
@@ -8421,7 +8422,7 @@ impl PrintC {
                 || crate::funcdata_varnode::op_iop_decode(iop.get_offset()) != call
             { return None; }
             let site = fd.get_call_specs(fd.get_call_specs_index(call)?);
-            if crate::kuna_indirectargs::hidden_result(site.proto()).is_some()
+            if (self.rt_ctx.hidden_results && crate::kuna_indirectargs::hidden_result(site.proto()).is_some())
                 || site.get_paramshift() != 0
             { return None; }
             let target = call_op.get_in(0)?;
@@ -8522,7 +8523,7 @@ impl PrintC {
                 return self.op_export_call_ir(fd,arch,op,&call);
             }
         }
-        if self.out_lang == crate::kuna_lang::OutLang::C && self.rt_ctx.indirect_args {
+        if self.out_lang == crate::kuna_lang::OutLang::C && self.rt_ctx.hidden_results {
             if let Some(result) = fd.get_call_specs_index(op)
                 .and_then(|index| crate::kuna_indirectargs::hidden_result(fd.get_call_specs(index).proto()))
             {
@@ -8775,7 +8776,7 @@ impl PrintC {
     }
 
     fn emit_hidden_result_locals(&mut self, fd: &Funcdata) -> KunaResult<()> {
-        if self.out_lang != crate::kuna_lang::OutLang::C || !self.rt_ctx.indirect_args { return Ok(()); }
+        if self.out_lang != crate::kuna_lang::OutLang::C || !self.rt_ctx.hidden_results { return Ok(()); }
         let own = crate::kuna_indirectargs::hidden_result(fd.get_func_proto());
         let calls: Vec<_> = (0..fd.num_calls()).filter_map(|index| {
             let call = fd.get_call_specs(index);
@@ -8951,7 +8952,7 @@ impl PrintC {
             }
             let Some(operation) = fd.obank().get(op) else { return false };
             proto.is_override() && fd.get_override().is_authored_proto_override(operation.get_addr())
-                || self.rt_ctx.indirect_args && skip.is_some_and(|slot|
+                || self.rt_ctx.hidden_results && skip.is_some_and(|slot|
                     crate::kuna_indirectargs::hidden_result(proto).is_some_and(|result| slot == result.slot + 1))
         });
         let per_call = proto.is_none()
@@ -12238,19 +12239,12 @@ impl PrintC {
             }
         };
         if !rep.match_name.is_empty() {
-            let partial = match &ct.kind {
-                crate::dtype::DatatypeKind::PartialEnum { stripped, .. } => Some(stripped),
-                _ => None,
-            };
-            // C promotes narrow unsigned enum operands to int before `~`.
-            // A partial enum also denotes a bit slice, not the parent's signed
-            // right-shift result. Narrow the completed expression, not the
-            // complement operand: correctly declared 64-bit enums need no cast.
+            // C promotes narrow unsigned enum operands to int before `~`. Narrow the
+            // completed expression, not the complement operand.
             if self.out_lang == crate::kuna_lang::OutLang::C
-                && (partial.is_some()
-                    || (rep.complement
-                        && ct.get_metatype() == type_metatype::TYPE_UINT
-                        && ct.get_size() < self.rt_ctx.model.int_size))
+                && rep.complement
+                && ct.get_metatype() == type_metatype::TYPE_UINT
+                && ct.get_size() < self.rt_ctx.model.int_size
             {
                 if let Some(name) = self.rt_ctx.model.integer_spelling(ct.get_size(), false) {
                     self.push_op(&tokens::TYPECAST, Some(op_key(op)));
@@ -12260,12 +12254,6 @@ impl PrintC {
                         crate::printlanguage::SyntaxHighlight::type_color,
                     ));
                 }
-            }
-            // Rust keeps the parent's i64 type through a shift. The partial's
-            // stripped scalar is the direct expression's actual width.
-            let rust_partial = partial.filter(|_| self.out_lang == crate::kuna_lang::OutLang::Rust);
-            if let Some(stripped) = rust_partial {
-                self.push_cast_open(stripped, op);
             }
             // printc.cc:1742-1743 — `if (rep.shiftAmount != 0) pushOp(&shift_right,op);`
             if rep.shift_amount != 0 {
@@ -12299,9 +12287,6 @@ impl PrintC {
             // no format (printc.cc:1750-1751).
             if rep.shift_amount != 0 {
                 self.push_constant_ir_fmt(rep.shift_amount as uintb, 4, op, display_format::NONE);
-            }
-            if let Some(stripped) = rust_partial {
-                self.push_cast_close(stripped);
             }
         } else {
             // printc.cc:1753-1754 — no named representation: the raw integer with
@@ -13825,6 +13810,7 @@ impl RealTypeCtx {
             ctypes: arch.ctypes,
             model: crate::kuna_ctypes::CDataModel::from_types(&*arch.types()),
             indirect_args: arch.indirect_args,
+            hidden_results: arch.indirect_args && arch.hidden_results,
             convention,
             model_visibility: Some(arch.model_visibility()),
             inline_host_callables: false,

@@ -206,7 +206,7 @@ impl CSpeller {
     /// Borrow a call site's declaration without allocating a Code type or
     /// acquiring physical ABI storage. All type leaves keep their source owners.
     pub(crate) fn callable_pointer(&self, cx: &SpellCtx, proto: &crate::fspec::FuncProto) -> Option<TypedDeclarator> {
-        let logical = crate::kuna_indirectargs::callable_logical(proto,cx.indirect_args);
+        let logical = crate::kuna_indirectargs::callable_logical(proto,cx.indirect_args,cx.hidden_results);
         let output = logical.and_then(|pieces| pieces.outtype.as_ref()
             .or_else(|| pieces.output_storage.as_ref().and_then(|piece| piece.type_.as_ref())))
             .or_else(|| proto.has_store().then(|| proto.get_output_type()).flatten())?;
@@ -278,7 +278,7 @@ impl CSpeller {
                 type_metatype::TYPE_CODE => cur
                     .get_code_prototype()
                     .and_then(|proto| (if define_callable || inline_callable { proto.logical_pieces() }
-                        else { crate::kuna_indirectargs::callable_logical(proto, cx.indirect_args) })
+                        else { crate::kuna_indirectargs::callable_logical(proto, cx.indirect_args, cx.hidden_results) })
                         .and_then(|pieces| pieces.outtype.as_ref()
                             .or_else(|| pieces.output_storage.as_ref().and_then(|piece| piece.type_.as_ref())))
                         .or_else(|| proto.has_store().then(|| proto.get_output_type()).flatten()).cloned()),
@@ -381,7 +381,7 @@ impl CSpeller {
         let mut param_types = Vec::new();
         let mut param_offset = 1; // opening parenthesis
         let logical = if define_callable { proto.logical_pieces() }
-            else { crate::kuna_indirectargs::callable_logical(proto, cx.indirect_args) };
+            else { crate::kuna_indirectargs::callable_logical(proto, cx.indirect_args, cx.hidden_results) };
         let count = logical.map_or_else(|| proto.num_params() as usize, |pieces| {
             match usize::try_from(pieces.first_var_arg_slot) {
                 Ok(first) if first > 0 && first <= pieces.intypes.len() => first,

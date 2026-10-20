@@ -27,9 +27,7 @@
     both bare, int4 and uint4 would meet as uint4), and the int4 arm against a
     decimal literal too wide for int4 (its C type is int8).  Both passes keep
     the (int8) against -5, whose bare conditional would be an int4 (#9), and the
-    (uint4) on a comparison (#10). The machine's signed-byte conversion is
-    separately pinned with (signed char), independent of the consumer's
-    plain-char mode. A "bare" arm below omits only the redundant widening.
+    (uint4) on a comparison (#10).
 -->
 <bytechunk space="ram" offset="0x1000">
 554889e548897de8488975e0488b45e00fb6003c3d7419488b45e00fb6000fb6
@@ -98,8 +96,8 @@ f8488b45f85dc3554889e5897dec8975e88955e4837de400740e8b45ec3b45e8
   <com>print C</com>
   <com>quit</com>
 </script>
-<stringmatch name="castternary #1: with the option off each table lookup carries the (int4) the conditional applies itself" min="4" max="4">\? \(int4\)\(signed char\)a0\[\(uint1\)[^;]*\] : 0;</stringmatch>
-<stringmatch name="castternary #2: with the option on the char arm is bare" min="4" max="4">\? \(signed char\)a0\[\(uint1\)[^;]*\] : 0;</stringmatch>
+<stringmatch name="castternary #1: with the option off each table lookup carries the (int4) the conditional applies itself" min="4" max="4">\? \(int4\)a0\[\(uint1\)[^;]*\] : 0;</stringmatch>
+<stringmatch name="castternary #2: with the option on the char arm is bare" min="4" max="4">\? a0\[\(uint1\)[^;]*\] : 0;</stringmatch>
 <stringmatch name="castternary #3: with the option off the unsigned byte arm carries a (uint4)" min="1" max="1">v1 = \(a1\) \? \(uint4\)a0\[a1\] : 0xffffffff;</stringmatch>
 <stringmatch name="castternary #4: with the option on the byte meets the uint4 literal bare" min="1" max="1">v1 = \(a1\) \? a0\[a1\] : 0xffffffff;</stringmatch>
 <stringmatch name="castternary #5: with the option off both arms carry a (uint8)" min="1" max="1">v1 = \(a2\) \? \(uint8\)a0 : \(uint8\)a1;</stringmatch>

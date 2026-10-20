@@ -84,6 +84,9 @@ pub struct SpellCtx {
     pub(crate) model: crate::kuna_ctypes::CDataModel,
     /// (kuna `indirectargs`) Spell an indirectly passed parameter at its value type.
     pub(crate) indirect_args: bool,
+    /// `indirect_args` for a prepared export, which also publishes a proven hidden
+    /// aggregate result as the source result.
+    pub(crate) hidden_results: bool,
     /// The active printer's convention option, independent of model visibility.
     pub(crate) convention: bool,
     /// The architecture's existing live registry, not a model snapshot.
@@ -102,6 +105,7 @@ impl SpellCtx {
         ctypes: false,
         model: crate::kuna_ctypes::CDataModel::LP64,
         indirect_args: false,
+        hidden_results: false,
         convention: false,
         model_visibility: None,
         inline_host_callables: false,
