@@ -493,8 +493,7 @@ Four front-ends drive one engine assembly:
   owner: qualified or punctuation-bearing names acquire valid output spellings
   without renaming their source Symbols or High variables. The original
   width-sensitive global-name acquisition retains its actual nonzero source
-  Symbol id with the High's name/type/offset; deliberate root-to-piece copies
-  carry the same binding. Body tokens, whole-object header declarators and High
+  Symbol id with the High's name/type/offset. Body tokens, whole-object header declarators and High
   wire references read that receipt instead of selecting another width-one
   alias. Global metadata keeps the original name, id, type and address space.
   Workers rebind the chosen source inventory to their own database-local ids.

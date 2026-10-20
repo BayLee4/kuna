@@ -181,167 +181,6 @@ int main(void){{
     }
 
     #[test]
-    fn emitted_rust_nested_arithmetic_evaluates_calls_once() {
-        let mut fd = build_fd();
-        fd.set_high_level();
-        let ty = named("u32", 4, type_metatype::TYPE_UINT);
-        let first = execution_call(&mut fd, "next_value", ty.clone(), 0x1000);
-        let second = execution_call(&mut fd, "next_value", ty.clone(), 0x1004);
-        let mul = mk_op(&mut fd, 2, 0x1008, OpCode::CPUI_INT_MULT);
-        fd.op_set_input(mul, first, 0).unwrap();
-        fd.op_set_input(mul, second, 1).unwrap();
-        let product = fd.new_unique(4, Some(ty.clone()));
-        fd.op_set_output(mul, product).unwrap();
-        fd.vbank_mut().get_mut(product).unwrap().set_implied();
-        let add = mk_op(&mut fd, 2, 0x100c, OpCode::CPUI_INT_ADD);
-        let literal = fd.new_constant(4, 0xffffffff);
-        fd.op_set_input(add, product, 0).unwrap();
-        fd.op_set_input(add, literal, 1).unwrap();
-        let result = fd.new_unique(4, Some(ty));
-        fd.op_set_output(add, result).unwrap();
-        let arch = bare_arch();
-        let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None).unwrap();
-        let emitted = print.emit_mut().output_str().to_string();
-        let source = format!(r#"
-use std::sync::atomic::{{AtomicU32, Ordering}};
-static CALLS: AtomicU32 = AtomicU32::new(0);
-fn next_value() -> u32 {{ CALLS.fetch_add(1, Ordering::SeqCst) + 1 }}
-fn consumer() -> u32 {{ {emitted} }}
-fn main() {{
-    assert_eq!(consumer(), 1);
-    assert_eq!(CALLS.load(Ordering::SeqCst), 2);
-}}
-"#);
-        assert_rust_source(&source, "single-evaluation");
-    }
-
-    #[test]
-    fn emitted_rust_u128_variable_addition_wraps() {
-        let mut fd = build_fd();
-        fd.set_high_level();
-        let ty = named("u128", 16, type_metatype::TYPE_UINT);
-        let a = execution_input(&mut fd, "a", ty.clone());
-        let b = execution_input(&mut fd, "b", ty.clone());
-        let add = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_INT_ADD);
-        fd.op_set_input(add, a, 0).unwrap();
-        fd.op_set_input(add, b, 1).unwrap();
-        let result = fd.new_unique(16, Some(ty));
-        fd.op_set_output(add, result).unwrap();
-        let arch = bare_arch();
-        let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, add, None).unwrap();
-        let emitted = print.emit_mut().output_str().to_string();
-        let source = format!(r#"
-fn consumer(a: u128, b: u128) -> u128 {{ {emitted} }}
-fn main() {{
-    assert_eq!(consumer(u128::MAX, 2), 1);
-    assert_eq!(consumer(1u128 << 127, 1u128 << 127), 0);
-}}
-"#);
-        assert_rust_source(&source, "u128-variable");
-    }
-
-    /// Neither an untyped literal receiver nor an outer expected type may
-    /// choose the machine operation's width. In particular, the u64 constant
-    /// must not first be interpreted as a default i32 on the way into a cast.
-    #[test]
-    fn emitted_rust_constant_arithmetic_uses_the_operation_width() {
-        let arch = bare_arch();
-        let mut source = String::from("fn main() {\n");
-        for size in [1, 2, 4, 8] {
-            let bits = size * 8;
-            let mask = kuna_base::address::calc_mask(size);
-            let tyname = format!("u{bits}");
-            for (opcode, left, right, expected) in [
-                (OpCode::CPUI_INT_ADD, mask, 2, 1),
-                (OpCode::CPUI_INT_SUB, 0, 1, mask),
-                (OpCode::CPUI_INT_MULT, mask, 2, mask - 1),
-            ] {
-                let mut fd = build_fd();
-                fd.set_high_level();
-                let op = mk_op(&mut fd, 2, 0x1000, opcode);
-                let a = fd.new_constant(size, left);
-                let b = fd.new_constant(size, right);
-                fd.op_set_input(op, a, 0).unwrap();
-                fd.op_set_input(op, b, 1).unwrap();
-                let out = fd.new_unique(size, Some(named(&tyname, size, type_metatype::TYPE_UINT)));
-                fd.op_set_output(op, out).unwrap();
-                let mut print = execution_printer(&arch, true);
-                print.op_push_ir(&fd, &arch, op, None).unwrap();
-                let expression = print.emit_mut().output_str();
-                source.push_str(&format!("assert_eq!({expression}, {expected}{tyname});\n"));
-            }
-        }
-        source.push_str("}\n");
-        assert_rust_source(&source, "constant-operation-width");
-    }
-
-    #[test]
-    fn emitted_rust_narrow_addition_wraps_before_widening() {
-        let mut fd = build_fd();
-        fd.set_high_level();
-        let narrow = named("u8", 1, type_metatype::TYPE_UINT);
-        let wide = named("u32", 4, type_metatype::TYPE_UINT);
-        let a = execution_input(&mut fd, "a", narrow.clone());
-        let b = execution_input(&mut fd, "b", narrow.clone());
-        let add = mk_op(&mut fd, 2, 0x1000, OpCode::CPUI_INT_ADD);
-        fd.op_set_input(add, a, 0).unwrap();
-        fd.op_set_input(add, b, 1).unwrap();
-        let sum = fd.new_unique(1, Some(narrow));
-        fd.op_set_output(add, sum).unwrap();
-        fd.vbank_mut().get_mut(sum).unwrap().set_implied();
-        // Genuine p-code width transition, not an invalid merge of differently
-        // sized High members manufactured to exercise declaration recovery.
-        let extend = mk_op(&mut fd, 1, 0x1004, OpCode::CPUI_INT_ZEXT);
-        fd.op_set_input(extend, sum, 0).unwrap();
-        let result = fd.new_unique(4, Some(wide));
-        fd.op_set_output(extend, result).unwrap();
-        let arch = bare_arch();
-        let mut print = execution_printer(&arch, true);
-        print.op_push_ir(&fd, &arch, extend, None).unwrap();
-        let emitted = print.emit_mut().output_str().to_string();
-        let source = format!(r#"
-fn consumer(a: u8, b: u8) -> u32 {{ {emitted} }}
-fn main() {{
-    assert_eq!(consumer(255, 2), 1);
-    assert_eq!(consumer(128, 128), 0);
-    assert_eq!(consumer(200, 7), 207);
-}}
-"#);
-        assert_rust_source(&source, "narrow-before-widening");
-    }
-
-    #[test]
-    fn emitted_rust_mixed_signed_words_preserve_the_operation_bits() {
-        let arch = bare_arch();
-        let mut source = String::from("fn main() {\nlet a = -1i64;\nlet b = 2u64;\n");
-        for (opcode, expected) in [
-            (OpCode::CPUI_INT_ADD, 1i64),
-            (OpCode::CPUI_INT_SUB, -3),
-            (OpCode::CPUI_INT_MULT, -2),
-        ] {
-            let mut fd = build_fd();
-            fd.set_high_level();
-            let signed = named("i64", 8, type_metatype::TYPE_INT);
-            let unsigned = named("u64", 8, type_metatype::TYPE_UINT);
-            let a = execution_input(&mut fd, "a", signed.clone());
-            let b = execution_input(&mut fd, "b", unsigned);
-            let op = mk_op(&mut fd, 2, 0x1000, opcode);
-            fd.op_set_input(op, a, 0).unwrap();
-            fd.op_set_input(op, b, 1).unwrap();
-            let result = fd.new_unique(8, Some(signed));
-            fd.op_set_output(op, result).unwrap();
-            let mut print = execution_printer(&arch, true);
-            print.op_push_ir(&fd, &arch, op, None).unwrap();
-            let expression = print.emit_mut().output_str();
-            source.push_str(&format!("assert_eq!({expression}, {expected}i64);\n"));
-        }
-        source.push_str("}\n");
-        assert_rust_source(&source, "mixed-signed-words");
-    }
-
-    #[test]
     fn emitted_rust_pointer_stride_and_index_evaluation_are_preserved() {
         use crate::dtype::TypeFactory;
         if !cfg!(target_pointer_width = "64") {
@@ -528,101 +367,82 @@ fn main() {{ unsafe {{
 
     #[test]
     fn emitted_integer_arithmetic_executes_at_its_pcode_width() {
-        for rust in [true, false] {
-            let mut source = if rust { String::new() } else {
-                "#include <stdint.h>\n#include <assert.h>\n".to_string()
-            };
-            let mut checks = String::new();
-            for size in [1, 2, 4, 8] {
-                for signed in [false, true] {
-                    let bits = size * 8;
-                    let mask = (1u128 << bits) - 1;
-                    let tyname = if rust {
-                        format!("{}{bits}", if signed { "i" } else { "u" })
-                    } else {
-                        format!("{}int{bits}_t", if signed { "" } else { "u" })
-                    };
-                    for (opname, opcode) in [
-                        ("add", OpCode::CPUI_INT_ADD),
-                        ("sub", OpCode::CPUI_INT_SUB),
-                        ("mul", OpCode::CPUI_INT_MULT),
-                    ] {
-                        for compound in [false, true] {
-                            let name = format!("f_{bits}_{signed}_{opname}_{compound}");
-                            let mut fd = build_fd();
-                            fd.set_high_level();
-                            let meta = if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
-                            let ty = named(&tyname, size, meta);
-                            let a = execution_input(&mut fd, "a", ty.clone());
-                            let b = execution_input(&mut fd, "b", ty.clone());
-                            let op = mk_op(&mut fd, 2, 0x1000, opcode);
-                            fd.op_set_input(op, a, 0).unwrap();
-                            fd.op_set_input(op, b, 1).unwrap();
-                            let out = fd.new_unique(size, Some(ty));
-                            fd.op_set_output(op, out).unwrap();
-                            name_call_local(&mut fd, out, "result");
-                            if compound {
-                                let high = fd.vbank().get(a).unwrap().get_high().unwrap();
-                                let other = fd.vbank().get(out).unwrap().get_high().unwrap();
-                                let mut writes = Vec::new();
-                                fd.with_high_split(|bank, ctx| {
-                                    bank.merge_internal(high, other, false, ctx, &mut |vn, high, group| {
-                                        writes.push((vn, high, group));
-                                    })
-                                }).unwrap();
-                                for (vn, high, group) in writes {
-                                    fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
-                                }
-                                fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("a");
+        let mut source = "#include <stdint.h>\n#include <assert.h>\n".to_string();
+        let mut checks = String::new();
+        for size in [1, 2, 4, 8] {
+            for signed in [false, true] {
+                let bits = size * 8;
+                let mask = (1u128 << bits) - 1;
+                let tyname = format!("{}int{bits}_t", if signed { "" } else { "u" });
+                for (opname, opcode) in [
+                    ("add", OpCode::CPUI_INT_ADD),
+                    ("sub", OpCode::CPUI_INT_SUB),
+                    ("mul", OpCode::CPUI_INT_MULT),
+                ] {
+                    for compound in [false, true] {
+                        let name = format!("f_{bits}_{signed}_{opname}_{compound}");
+                        let mut fd = build_fd();
+                        fd.set_high_level();
+                        let meta = if signed { type_metatype::TYPE_INT } else { type_metatype::TYPE_UINT };
+                        let ty = named(&tyname, size, meta);
+                        let a = execution_input(&mut fd, "a", ty.clone());
+                        let b = execution_input(&mut fd, "b", ty.clone());
+                        let op = mk_op(&mut fd, 2, 0x1000, opcode);
+                        fd.op_set_input(op, a, 0).unwrap();
+                        fd.op_set_input(op, b, 1).unwrap();
+                        let out = fd.new_unique(size, Some(ty));
+                        fd.op_set_output(op, out).unwrap();
+                        name_call_local(&mut fd, out, "result");
+                        if compound {
+                            let high = fd.vbank().get(a).unwrap().get_high().unwrap();
+                            let other = fd.vbank().get(out).unwrap().get_high().unwrap();
+                            let mut writes = Vec::new();
+                            fd.with_high_split(|bank, ctx| {
+                                bank.merge_internal(high, other, false, ctx, &mut |vn, high, group| {
+                                    writes.push((vn, high, group));
+                                })
+                            }).unwrap();
+                            for (vn, high, group) in writes {
+                                fd.vbank_mut().get_mut(vn).unwrap().set_high(high, group);
                             }
-                            let mut arch = bare_arch();
-                            arch.ctypes = false;
-                            arch.realtypes = false;
-                            let mut print = execution_printer(&arch, rust);
-                            if compound { print.emit_statement(&fd, &arch, op).unwrap(); }
-                            else { print.op_push_ir(&fd, &arch, op, None).unwrap(); }
-                            let emitted = print.emit_mut().output_str().to_string();
-                            let body = if compound { format!("{emitted}\nreturn a;") }
-                                else { format!("return {emitted};") };
-                            if rust {
-                                source.push_str(&format!("fn {name}(mut a: {tyname}, b: {tyname}) -> {tyname} {{ {body} }}\n"));
-                            } else {
-                                source.push_str(&format!("{tyname} {name}({tyname} a, {tyname} b) {{ {body} }}\n"));
-                            }
-                            // C signed overflow is not defined under ordinary
-                            // flags. Its control arm uses only defined inputs;
-                            // Rust must preserve p-code bits across overflow.
-                            let cases: Vec<(u128, u128)> = if !rust && signed {
-                                vec![(7, 3), (12, 2)]
-                            } else if !rust && size < 4 && opname == "mul" {
-                                // u16 promotes to int, but 65535*2 still fits
-                                // int: the return must truncate to 65534.
-                                if size == 2 { vec![(65535, 2)] }
-                                else { vec![(127, 3), (17, 9)] }
-                            } else {
-                                vec![(mask, 2), (0, 1), (mask >> 1, 3), ((mask >> 1) + 1, mask)]
+                            fd.high_bank_mut().get_mut(high).unwrap().set_kuna_name("a");
+                        }
+                        let mut arch = bare_arch();
+                        arch.ctypes = false;
+                        arch.realtypes = false;
+                        let mut print = execution_printer(&arch, false);
+                        if compound { print.emit_statement(&fd, &arch, op).unwrap(); }
+                        else { print.op_push_ir(&fd, &arch, op, None).unwrap(); }
+                        let emitted = print.emit_mut().output_str().to_string();
+                        let body = if compound { format!("{emitted}\nreturn a;") }
+                            else { format!("return {emitted};") };
+                        source.push_str(&format!("{tyname} {name}({tyname} a, {tyname} b) {{ {body} }}\n"));
+                        // C signed overflow is not defined under ordinary
+                        // flags. Its control arm uses only defined inputs.
+                        let cases: Vec<(u128, u128)> = if signed {
+                            vec![(7, 3), (12, 2)]
+                        } else if size < 4 && opname == "mul" {
+                            // u16 promotes to int, but 65535*2 still fits
+                            // int: the return must truncate to 65534.
+                            if size == 2 { vec![(65535, 2)] }
+                            else { vec![(127, 3), (17, 9)] }
+                        } else {
+                            vec![(mask, 2), (0, 1), (mask >> 1, 3), ((mask >> 1) + 1, mask)]
+                        };
+                        for (a, b) in cases {
+                            let expected = match opname {
+                                "add" => (a + b) & mask,
+                                "sub" => (a + mask + 1 - b) & mask,
+                                _ => (a * b) & mask,
                             };
-                            for (a, b) in cases {
-                                let expected = match opname {
-                                    "add" => (a + b) & mask,
-                                    "sub" => (a + mask + 1 - b) & mask,
-                                    _ => (a * b) & mask,
-                                };
-                                if rust {
-                                    checks.push_str(&format!("assert_eq!(({name}({a}u64 as {tyname}, {b}u64 as {tyname}) as u64) & {mask}u64, {expected}u64);\n"));
-                                } else {
-                                    checks.push_str(&format!("assert((((uint64_t){name}(({tyname})UINT64_C({a}), ({tyname})UINT64_C({b}))) & UINT64_C({mask})) == UINT64_C({expected}));\n"));
-                                }
-                            }
+                            checks.push_str(&format!("assert((((uint64_t){name}(({tyname})UINT64_C({a}), ({tyname})UINT64_C({b}))) & UINT64_C({mask})) == UINT64_C({expected}));\n"));
                         }
                     }
                 }
             }
-            source.push_str(&if rust { format!("fn main() {{ {checks} }}") }
-                else { format!("int main(void) {{ {checks} return 0; }}") });
-            if rust { assert_rust_source(&source, "integers"); }
-            else { assert_c_source(&source, "integers"); }
         }
+        source.push_str(&format!("int main(void) {{ {checks} return 0; }}"));
+        assert_c_source(&source, "integers");
     }
 
     #[test]

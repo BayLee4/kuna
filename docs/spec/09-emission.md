@@ -1768,14 +1768,7 @@ into 16 bytes, as `memset` when the source is a constant whose bytes are all
 equal and as `memcpy` when it is another such piece or a variable, with the
 exact byte count (`memset(&v2,0,0x10);`, `memcpy((char *)&v1 + 0x10,(char
 *)&d + 0x10,0x38);`); a whole array variable that takes a copy out of such
-bytes is copied the same way, since an array cannot be assigned. Bounded native
-aggregate snapshots also recognize the type factory's anonymous unknown-byte
-arrays and partial datatypes stripped to those arrays. Their C byte storage still
-requires every High definition and use to satisfy the existing exact-copy plan;
-named, qualified or host-source arrays, typed elements, volatile accesses and
-out-of-range slices are not admitted by this recognition. The pre-existing
-scalar-UNKNOWN path is unchanged. Native types, JOIN identities and byte extents
-stay unchanged. A read of 3,
+bytes is copied the same way, since an array cannot be assigned. A read of 3,
 5, 6 or 7 bytes out of a scalar prints as the `SUB<in><out>(v,k)` intrinsic
 the surrounding output already uses for a truncation, `k` counted from the
 value's low end (the memory offset on a little-endian space, the bytes after

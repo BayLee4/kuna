@@ -169,8 +169,7 @@ The native CLI collector likewise chooses source-global output names before
 rendering, using the existing invocation identifier reservation and suffix owner.
 Its original global-name acquisition retains the actual nonzero source Symbol
 id alongside the High's name/type/offset, including width-sensitive aliases and
-SPACEBASE references. Rebinding a name clears that receipt; a deliberate
-root-to-piece binding copy restores the same receipt after copying the name.
+SPACEBASE references. Rebinding a name clears that receipt.
 Bodies, typed global declarations and global High wire references use the held
 identity, while source names, Symbols and types remain unchanged. Only a missing
 receipt uses the existing source-declaration query path; it does not reconstruct
@@ -1039,10 +1038,7 @@ pending logical declarations are not treated as allocated storage.
 C declaration assertions accept a typedef with the same name as its struct,
 union or enum tag; the existing tag is retained rather than creating a
 conflicting factory typedef identity.
-Rust integer addition, subtraction and multiplication use width-qualified
-wrapping operations, including when every operand is a literal. Same-width word
-operands convert explicitly at that boundary even when inferred types agree:
-an implied call retains its callee's declared source return type. Cast insertion
+Cast insertion
 transfers the original read before attaching its replacement CAST input, keeping
 free values single-reader without dropping operands when already-analyzed IR is
 Generated C

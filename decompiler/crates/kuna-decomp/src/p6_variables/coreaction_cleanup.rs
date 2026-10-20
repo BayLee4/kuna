@@ -2144,7 +2144,7 @@ fn bind_proto_partial_piece(
     } else {
         None
     };
-    let (root_name, root_sym_off, root_type, root_global_symbol_id, root_global) = match container {
+    let (root_name, root_sym_off, root_type) = match container {
         Some(info) => {
             // Member of a mapped composite.  Resolve the name on demand: reuse the
             // root's existing name; else rename the undefined Symbol to `vN` once
@@ -2158,9 +2158,7 @@ fn bind_proto_partial_piece(
                         .unwrap_or_else(|| default_v_name(data, base))
                 }),
             };
-            // This is a fresh local container binding, not a copy of a source-global
-            // binding the root may previously have carried.
-            (name, info.sym_off, info.sym_type, None, false)
+            (name, info.sym_off, info.sym_type)
         }
         None => {
             // No mapped container — the whole-value (register-return) path.  Keep the
@@ -2185,22 +2183,9 @@ fn bind_proto_partial_piece(
                 },
             };
             taken.insert(name.clone());
-            let binding = data.high_bank().get(root_high);
-            let cur_off = binding.map(|h| h.get_symbol_offset()).unwrap_or(-1);
-            let global_symbol_id = binding.and_then(|h| h.kuna_global_symbol_id());
-            let global = binding.is_some_and(|h| {
-                h.kuna_global() || (0..h.num_instances()).any(|i|
-                    data.vbank().get(h.get_instance(i)).is_some_and(|v| v.is_persist()))
-            });
-            // A retained global receipt names the whole source object, even if
-            // this CONCAT represents only a portion. Copy its held type with
-            // the name/offset/identity, not the representative's access type.
-            let ty = if global_symbol_id.is_some() {
-                binding.and_then(|h| h.kuna_symbol_type()).cloned()
-            } else {
-                data.vbank().get(root_rep).map(|v| v.get_type().clone())
-            };
-            (name, cur_off, ty, global_symbol_id, global)
+            let cur_off = data.high_bank().get(root_high).map(|h| h.get_symbol_offset()).unwrap_or(-1);
+            let rep_ty = data.vbank().get(root_rep).map(|v| v.get_type().clone());
+            (name, cur_off, rep_ty)
         }
     };
     // Bind the resolved Symbol (name + the root's in-symbol byte offset + the whole
@@ -2211,9 +2196,6 @@ fn bind_proto_partial_piece(
         h.set_symbol_offset(root_sym_off);
         if let Some(t) = root_type.clone() {
             h.set_symbol_type(t);
-        }
-        if let Some(id) = root_global_symbol_id {
-            h.set_kuna_global_symbol_id(id);
         }
     }
     // rootHigh->establishGroupSymbolOffset();  — write the group's symbol offset so
@@ -2235,12 +2217,8 @@ fn bind_proto_partial_piece(
     if let Some(h) = data.high_bank_mut().get_mut(piece_high) {
         h.set_kuna_name(root_name);
         h.set_symbol_offset(sym_off);
-        h.set_kuna_global(root_global);
         if let Some(t) = root_type {
             h.set_symbol_type(t);
-        }
-        if let Some(id) = root_global_symbol_id {
-            h.set_kuna_global_symbol_id(id);
         }
     }
     true
@@ -3409,7 +3387,7 @@ use crate::varnode::varnode_flags;
     }
 
     #[test]
-    fn source_global_receipts_follow_width_spacebase_and_piece_bindings() {
+    fn source_global_receipts_follow_width_and_spacebase_bindings() {
         use crate::context::{GlobalEntry, GlobalQuery, TypeOp};
         use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
         use kuna_base::address::RangeList;
@@ -3423,12 +3401,10 @@ use crate::varnode::varnode_flags;
         types.set_max_basetype_size(8);
         let narrow_type = types.get_base(4, type_metatype::TYPE_INT).unwrap();
         let wide_type = types.get_base(8, type_metatype::TYPE_INT).unwrap();
-        let whole_type = types.get_type_array(2, wide_type.clone()).unwrap();
         context.types = Some(types);
         context.global_query = Some(Rc::new(GlobalQuery::new(
             [(4, "narrow", narrow_type.clone(), 0x501),
-             (8, "wide", wide_type.clone(), 0x502),
-             (16, "container", whole_type.clone(), 0x503)]
+             (8, "wide", wide_type.clone(), 0x502)]
                 .into_iter().map(|(size, name, ty, id)| GlobalEntry {
                     space_index: ram.get_index(), first: 0x2000, last: 0x2000 + size as u64 - 1,
                     size, all_flags: varnode_flags::persist | varnode_flags::addrtied,
@@ -3479,91 +3455,6 @@ use crate::varnode::varnode_flags;
         assert_eq!(binding.kuna_symbol_offset(), 4);
         assert_eq!(binding.kuna_global_symbol_id(), Some(0x502));
         assert!(binding.kuna_global());
-
-        let piece = fd.new_varnode(4, &Address::new(ram, 0x2004), Some(narrow_type)).unwrap();
-        fd.vbank_mut().get_mut(piece).unwrap().set_proto_partial();
-        let low = fd.new_constant(4, 0);
-        let concat = fd.new_op(2, entry);
-        fd.op_set_opcode(concat, TypeOp::new(OpCode::CPUI_PIECE, 0, "PIECE"));
-        fd.op_set_all_input(concat, &[piece, low]).unwrap();
-        let whole = fd.new_varnode(8, &global, Some(wide_type.clone())).unwrap();
-        fd.op_set_output(concat, whole).unwrap();
-        fd.op_insert_end(concat, block);
-        let whole_high = fd.vbank().get(whole).unwrap().get_high().unwrap();
-        let piece_high = fd.vbank().get(piece).unwrap().get_high().unwrap();
-        // Acquire the root from the same source query, then exercise the deliberate
-        // root-to-piece binding rather than reconstructing identity at the piece.
-        let (name, off, ty, id) = fd.get_arch()
-            .name_for_global_varnode(&global, 16, &Address::new_invalid()).unwrap().unwrap();
-        let binding = fd.high_bank_mut().get_mut(whole_high).unwrap();
-        binding.set_kuna_name(name);
-        binding.set_symbol_offset(off);
-        binding.set_symbol_type(ty.unwrap());
-        binding.set_kuna_global_symbol_id(id);
-        fd.high_bank_mut().group_with(piece_high, 4, whole_high, 4, 8).unwrap();
-        assert!(bind_proto_partial_piece(&mut fd, piece, piece_high, &mut 1,
-            &Default::default(), &mut Default::default(), &mut Default::default()));
-        for high in [whole_high, piece_high] {
-            let binding = fd.high_bank().get(high).unwrap();
-            assert_eq!(binding.kuna_name(), Some("container"));
-            assert_eq!(binding.kuna_global_symbol_id(), Some(0x503));
-            assert!(Rc::ptr_eq(binding.kuna_symbol_type().unwrap(), &whole_type));
-            assert_eq!(binding.kuna_symbol_type().unwrap().get_size(), 16);
-        }
-        assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_symbol_offset(), 4);
-    }
-
-    #[test]
-    fn partial_binding_retains_storage_role_without_promoting_receipt_provenance() {
-        use crate::context::TypeOp;
-        use crate::dtype::{type_metatype, TypeFactory, TypeFactoryImpl};
-        use kuna_num::opcodes::OpCode;
-
-        for persistent in [false, true] {
-            let mut context = ArchContext::new(build_manager());
-            let types = Rc::new(TypeFactoryImpl::new());
-            types.setup_sizes(Some(4), 8, 8);
-            types.set_max_basetype_size(8);
-            let word = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
-            let whole_type = types.get_type_array(2, word.clone()).unwrap();
-            context.types = Some(types);
-            let ram = context.manage().get_space_by_name("ram").unwrap().clone();
-            let entry = Address::new(ram.clone(), 0x1000);
-            let mut fd = Funcdata::new("func", "func", Rc::new(context),
-                entry.clone(), 0x10000000, 0x40).unwrap();
-            fd.set_high_level();
-            let root = fd.bblocks_root_pub();
-            let block = fd.bblocks_mut().new_block_basic(root);
-            let piece = fd.new_varnode(4, &Address::new(ram.clone(), 0x2004),
-                Some(word)).unwrap();
-            fd.vbank_mut().get_mut(piece).unwrap().set_proto_partial();
-            let low = fd.new_constant(4, 0);
-            let concat = fd.new_op(2, entry);
-            fd.op_set_opcode(concat, TypeOp::new(OpCode::CPUI_PIECE, 0, "PIECE"));
-            fd.op_set_all_input(concat, &[piece, low]).unwrap();
-            let whole = fd.new_varnode(8, &Address::new(ram, 0x2000),
-                Some(whole_type.clone())).unwrap();
-            if persistent {
-                fd.vbank_mut().get_mut(whole).unwrap().set_flags_pub(varnode_flags::persist);
-            }
-            fd.op_set_output(concat, whole).unwrap();
-            fd.op_insert_end(concat, block);
-            let whole_high = fd.vbank().get(whole).unwrap().get_high().unwrap();
-            let piece_high = fd.vbank().get(piece).unwrap().get_high().unwrap();
-            let binding = fd.high_bank_mut().get_mut(whole_high).unwrap();
-            binding.set_kuna_name("bound");
-            binding.set_symbol_offset(0);
-            binding.set_symbol_type(whole_type.clone());
-            binding.set_kuna_global_symbol_id(0x503);
-            fd.high_bank_mut().group_with(piece_high, 4, whole_high, 4, 8).unwrap();
-            assert!(bind_proto_partial_piece(&mut fd, piece, piece_high, &mut 1,
-                &Default::default(), &mut Default::default(), &mut Default::default()));
-            assert!(!fd.vbank().get(piece).unwrap().is_persist());
-            assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_global(), persistent);
-            assert_eq!(fd.high_bank().get(piece_high).unwrap().kuna_global_symbol_id(), Some(0x503));
-            assert!(Rc::ptr_eq(fd.high_bank().get(piece_high).unwrap().kuna_symbol_type().unwrap(), &whole_type));
-            assert!(fd.high_bank().is_same_group(whole_high, piece_high));
-        }
     }
 
     #[test]

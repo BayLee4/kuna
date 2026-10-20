@@ -47,13 +47,6 @@
 //! between `&&` and `||`. Rust has one `^` for both logical and bitwise xor, so
 //! the Rust token is `^` at the bitwise tier.
 //!
-//! Integer ADD/SUB/MULT are machine-width operations, not Rust's checked
-//! arithmetic. Their opcode dispatch uses the wrapping method tokens below,
-//! independently of optimization or overflow-check settings. They are not
-//! global token remaps: subtraction's C token also serves floating subtraction.
-//! Same-width signed/unsigned words are explicitly converted to the operation's
-//! integer type; Rust does not supply C's implicit arithmetic conversions.
-//!
 //! Raw PTRADD addresses use byte-pointer `wrapping_offset` with a product
 //! truncated at the p-code address width, not C indexing or Rust references.
 //! Array decay remains a raw pointer cast, so merely forming a one-past address
@@ -220,8 +213,8 @@ pub mod rust_tokens {
         left_to_right_only: false,
     };
 
-    /// A machine-width binary operation, qualified by its output type:
-    /// `u8::wrapping_add(a, b)`. The explicit type also gives constant operands
+    /// A machine-width binary operation, qualified by its type:
+    /// `u8::wrapping_mul(a, b)`. The explicit type also gives constant operands
     /// their width without relying on the surrounding expression to infer it.
     /// Postsurround retains grouping and single evaluation of both arguments.
     const fn wrapping_method(print1: &'static str) -> OpToken {
@@ -240,8 +233,6 @@ pub mod rust_tokens {
         }
     }
 
-    pub static WRAPPING_ADD: OpToken = wrapping_method("::wrapping_add(");
-    pub static WRAPPING_SUB: OpToken = wrapping_method("::wrapping_sub(");
     pub static WRAPPING_MUL: OpToken = wrapping_method("::wrapping_mul(");
 }
 

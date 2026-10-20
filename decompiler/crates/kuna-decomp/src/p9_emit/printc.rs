@@ -4421,15 +4421,6 @@ impl PrintC {
             }
             None => (type_name, None),
         };
-        // A physical slice crossing fields (and possibly padding) is not a
-        // scalar undefined<N>, nor a new member of the source datatype.
-        // Only actual bounded aggregate snapshots get this byte-storage view.
-        if self.out_lang == crate::kuna_lang::OutLang::C {
-            if let Some(size) = self.wide_snapshot_size(fd, arch, high) {
-                return Ok(("unsigned char".into(), String::new(),
-                    Some(("unsigned char".into(), size)), comment, None));
-            }
-        }
         if self.options.partial_access && self.out_lang == crate::kuna_lang::OutLang::C
             && arch.types().get_size_of_pointer() == 8
             && crate::kuna_widelocal::scalar_bits(fd, high)
@@ -6361,13 +6352,6 @@ impl PrintC {
             ),
             None => (opc, in0, in1, num_input, op),
         };
-        // Rust's +=/-=/*= remain checked arithmetic. Let the ordinary assignment
-        // path render `out = T::wrapping_*(out, rhs)` at the operation's own width.
-        if self.out_lang == crate::kuna_lang::OutLang::Rust
-            && matches!(opc, OpCode::CPUI_INT_ADD | OpCode::CPUI_INT_SUB | OpCode::CPUI_INT_MULT)
-        {
-            return Ok(false);
-        }
         let tok: &'static OpToken = match opc {
             OpCode::CPUI_INT_MULT => &tokens::MULTEQUAL,
             OpCode::CPUI_INT_DIV | OpCode::CPUI_INT_SDIV => &tokens::DIVEQUAL,
@@ -6792,46 +6776,6 @@ impl PrintC {
     /// the operator then resolves both operand Varnodes.  The negate-token flip
     /// (the `negatetoken` mod) is honoured.
     fn op_binary_ir(&mut self, fd: &Funcdata, arch: &Architecture, tok: &'static OpToken, op: OpId) -> KunaResult<()> {
-        if self.out_lang == crate::kuna_lang::OutLang::Rust {
-            let wrapping = match fd.obank().get(op).map(|o| o.code()) {
-                Some(OpCode::CPUI_INT_ADD) => Some(&crate::kuna_langrust::rust_tokens::WRAPPING_ADD),
-                Some(OpCode::CPUI_INT_SUB) => Some(&crate::kuna_langrust::rust_tokens::WRAPPING_SUB),
-                Some(OpCode::CPUI_INT_MULT) => Some(&crate::kuna_langrust::rust_tokens::WRAPPING_MUL),
-                _ => None,
-            };
-            if let Some(wrapping) = wrapping {
-                let out = fd.obank().get(op).and_then(|o| o.get_out());
-                let ty = out.map(|vn| fd.vn_type_def_facing(vn)).transpose()?;
-                if let Some(ty) = ty.filter(|ty| matches!(ty.get_metatype(),
-                    type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN))
-                {
-                    self.push_op(wrapping, Some(op_key(op)));
-                    self.push_cast_type(&ty);
-                    self.push_op(&tokens::COMMA, Some(op_key(op)));
-                    for slot in 0..2 {
-                        if let Some(vn) = fd.obank().get(op).and_then(|o| o.get_in(slot)) {
-                            // C-analyzed arithmetic can carry differently signed
-                            // words (including address casts). Rust has no usual
-                            // arithmetic conversions: preserve same-width bits
-                            // explicitly at this operation's typed boundary.
-                            // Even equal inferred types need this conversion:
-                            // an implied CALL still renders its callee's declared
-                            // return type, not the type propagated onto its use.
-                            let input_type = fd.vn_type_read_facing(vn, op)?;
-                            let convert = fd.vbank().get(vn).is_some_and(|value|
-                                value.get_size() == ty.get_size())
-                                && matches!(input_type.get_metatype(),
-                                    type_metatype::TYPE_INT | type_metatype::TYPE_UINT
-                                        | type_metatype::TYPE_UNKNOWN | type_metatype::TYPE_PTR);
-                            if convert { self.push_cast_open(&ty, op); }
-                            self.push_vn_ir(fd, arch, vn, op)?;
-                            if convert { self.push_cast_close(&ty); }
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-        }
         if self.out_lang == crate::kuna_lang::OutLang::C
             && !self.context.is_set(modifiers::NEGATETOKEN)
         {
@@ -10557,194 +10501,22 @@ impl PrintC {
         Some((name, self.partial_walk(fd, arch, st, symoff as int8, asize, vn, op, slot, allow_cast)))
     }
 
-    /// Resolve an actual aggregate extraction: a mapped partial COPY, SUBPIECE,
-    /// or COPY of an implied SUBPIECE. Offsets use memory, not low-end order.
-    /// Both the native input and its named storage must contain the full range.
-    fn wide_aggregate_source(&self, fd: &Funcdata, op: OpId) -> Option<(VarnodeId, int8)> {
-        use crate::dtype::type_metatype::{TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION};
-        let mut extraction = op;
-        let operation = fd.obank().get(op)?;
-        let size = fd.vbank().get(operation.get_out()?)?.get_size();
-        if operation.code() == OpCode::CPUI_COPY {
-            let input_id = operation.get_in(0)?;
-            let input = fd.vbank().get(input_id)?;
-            if input.get_size() != size || input.is_constant() || input.is_volatile() {
-                return None;
-            }
-            if !input.is_implied() {
-                let (_, offset, ty) = self.emitted_high_symbol(fd, input.get_high()?)?;
-                let ty = ty?;
-                let offset = i64::from(offset.max(0));
-                return (matches!(ty.get_metatype(), TYPE_STRUCT | TYPE_UNION | TYPE_ARRAY)
-                    && (offset > 0 || size < ty.get_size())
-                    && offset.checked_add(i64::from(size))? <= i64::from(ty.get_size()))
-                    .then_some((input_id, offset));
-            }
-            extraction = input.get_def()?;
-        }
-        let operation = fd.obank().get(extraction)?;
-        if operation.code() != OpCode::CPUI_SUBPIECE
-            || !fd.vbank().get(operation.get_in(1)?)?.is_constant()
-        {
-            return None;
-        }
-        let input = operation.get_in(0)?;
-        let value = fd.vbank().get(input)?;
-        if value.is_constant() || value.is_implied() || value.is_volatile() {
-            return None;
-        }
-        let offset = subpiece_byte_offset_for_composite(fd, extraction);
-        if offset < 0 || size <= 0 || offset.checked_add(i64::from(size))? > i64::from(value.get_size()) {
-            return None;
-        }
-        let (_, symbol_offset, symbol_type) = self.emitted_high_symbol(fd, value.get_high()?)?;
-        let symbol_type = symbol_type?;
-        if !matches!(symbol_type.get_metatype(), TYPE_STRUCT | TYPE_UNION | TYPE_ARRAY) {
-            return None;
-        }
-        let offset = offset.checked_add(i64::from(symbol_offset.max(0)))?;
-        (offset.checked_add(i64::from(size))? <= i64::from(symbol_type.get_size()))
-            .then_some((input, offset))
-    }
-
-    /// The exact bounded range left unnamed by a partial-symbol walk.
-    fn wide_piece_offset(walk: &PartialWalk, size: int4) -> Option<int8> {
-        match walk.stack.last() {
-            Some(&PartialEntry::Unnamed(offset, width))
-                if width == size && offset >= 0 && walk.finalcast.is_none()
-                    && walk.unnamed_in.as_ref().is_some_and(|ty|
-                        offset.checked_add(i64::from(size)).is_some_and(|end| end <= i64::from(ty.get_size()))) =>
-                Some(offset),
-            _ => None,
-        }
-    }
-
-    /// The source plan actually consumed by byte-copy emission. Native range
-    /// containment alone does not prove that a named member is an unnamed byte
-    /// piece: admission must agree with the printer's exact partial walk.
-    fn wide_aggregate_piece(
-        &self,
-        fd: &Funcdata,
-        arch: &Architecture,
-        op: OpId,
-    ) -> Option<(VarnodeId, String, PartialWalk, int8)> {
-        let (source, offset) = self.wide_aggregate_source(fd, op)?;
-        let size = fd.vbank().get(fd.obank().get(op)?.get_out()?)?.get_size();
-        let (name, _, symbol_type) = self.emitted_high_symbol(fd, fd.vbank().get(source)?.get_high()?)?;
-        let walk = self.partial_walk(fd, arch, symbol_type?, offset, size, source, op, 0, false);
-        let offset = Self::wide_piece_offset(&walk, size)?;
-        Some((source, name, walk, offset))
-    }
-
-    /// C byte storage requires every definition and use of the High to be
-    /// representable. Existing nonprinting identities remain nonprinting;
-    /// neither a phi opcode nor sharing a High suppresses a rendered assignment.
-    /// This changes neither the High type nor the native Varnode/JOIN identity.
-    fn wide_snapshot_size(&self, fd: &Funcdata, arch: &Architecture, high: crate::context::HighVariableId) -> Option<int4> {
-        use crate::dtype::type_metatype::{TYPE_ARRAY, TYPE_PARTIALSTRUCT, TYPE_STRUCT, TYPE_UNION, TYPE_UNKNOWN};
-        let binding = fd.high_bank().get(high)?;
-        let representative = fd.vbank().get(decl_rep_varnode(fd, high)?)?;
-        let size = representative.get_size();
-        // Oversized get_base(TYPE_UNKNOWN) is an anonymous UNKNOWN1 array;
-        // native aggregate partials strip to that same canonical byte storage.
-        let anonymous = |ty: &crate::dtype::Datatype|
-            ty.get_name().is_empty() && ty.get_typedef().is_none()
-                && ty.c_qualifiers() == 0 && ty.qualified_base().is_none()
-                && !ty.is_host_type();
-        let raw_storage = |ty: &crate::dtype::Datatype|
-            ty.get_metatype() == TYPE_UNKNOWN
-                || (ty.get_metatype() == TYPE_ARRAY && anonymous(ty)
-                    && ty.get_array_base().is_some_and(|base|
-                        base.get_size() == 1 && base.get_metatype() == TYPE_UNKNOWN
-                            && base.c_qualifiers() == 0 && base.qualified_base().is_none()
-                            && base.get_typedef().is_none()));
-        let unknown = |ty: &crate::dtype::Datatype|
-            ty.get_size() == size && (raw_storage(ty)
-                || (ty.get_metatype() == TYPE_PARTIALSTRUCT && ty.get_stripped().is_some_and(|stripped|
-                    stripped.get_size() == size && (stripped.get_metatype() == TYPE_UNKNOWN
-                        || (anonymous(ty) && raw_storage(&stripped))))));
-        if size <= 8 || !unknown(representative.get_type())
-            || binding.kuna_symbol_type().is_some_and(|ty| !unknown(ty))
-        {
-            return None;
-        }
-        let same_high = |id: VarnodeId| fd.vbank().get(id).is_some_and(|value|
-            value.get_high() == Some(high) && value.get_size() == size
-                && !value.is_implied() && !value.is_volatile());
-        let transparent = |operation: &crate::op::PcodeOp| {
-            operation.not_printed()
-                && matches!(operation.code(), OpCode::CPUI_COPY | OpCode::CPUI_MULTIEQUAL)
-                && operation.num_input() > 0
-                && operation.get_out().is_some_and(same_high)
-                && (0..operation.num_input()).all(|slot|
-                    operation.get_in(slot).is_some_and(same_high))
-        };
-        let mut extracted = false;
-        for index in 0..binding.num_instances() {
-            let value = fd.vbank().get(binding.get_instance(index))?;
-            if value.is_input() || value.is_persist() || value.is_volatile() || value.is_implied()
-                || value.get_size() != size || !unknown(value.get_type())
-            {
-                return None;
-            }
-            let definition = value.get_def()?;
-            let operation = fd.obank().get(definition)?;
-            if !operation.not_printed()
-                && !crate::p9_emit::kuna_stackmarkers::nonprinting(fd, definition)
-                && self.wide_aggregate_piece(fd, arch, definition).is_some()
-            {
-                extracted = true;
-            } else if !transparent(operation) {
-                return None;
-            }
-            for use_id in value.descend_iter() {
-                let operation = fd.obank().get(use_id)?;
-                if transparent(operation) {
-                    continue;
-                }
-                if operation.code() != OpCode::CPUI_COPY || operation.num_input() != 1
-                    || operation.not_printed()
-                    || crate::p9_emit::kuna_stackmarkers::nonprinting(fd, use_id)
-                {
-                    return None;
-                }
-                let output = operation.get_out()?;
-                let target = fd.vbank().get(output)?;
-                if target.get_size() != size || target.is_volatile() || target.is_implied() {
-                    return None;
-                }
-                let (_, symbol_offset, symbol_type) =
-                    self.emitted_high_symbol(fd, target.get_high()?)?;
-                let symbol_type = symbol_type?;
-                if !matches!(symbol_type.get_metatype(), TYPE_STRUCT | TYPE_UNION | TYPE_ARRAY)
-                    || i64::from(symbol_offset.max(0)).checked_add(i64::from(size))? > i64::from(symbol_type.get_size())
-                {
-                    return None;
-                }
-                let (_, walk) = self.piece_walk(fd, arch, output, use_id, -1, false)?;
-                Self::wide_piece_offset(&walk, size)?;
-            }
-        }
-        extracted.then_some(size)
-    }
-
-    /// A plain store or copy of a width C has no scalar
+    /// (kuna `partialaccess`) A plain store or copy of a width C has no scalar
     /// for, into bytes no member names, as `memset`/`memcpy` of exactly those
     /// bytes. The source is a constant whose bytes are all equal, the same kind
     /// of piece, or a variable; a whole array variable takes a copy out of such a
-    /// piece the same way. Bounded aggregate slices and their large local
-    /// snapshots are physical storage transfers even without `partialaccess`;
-    /// other legacy forms remain opt-in.
+    /// piece the same way. Anything else (an intrinsic, an expression) declines
+    /// and the statement keeps its assignment.
     fn emit_wide_copy(&mut self, fd: &Funcdata, arch: &Architecture, op: OpId) -> KunaResult<bool> {
         use crate::dtype::type_metatype;
         use crate::kuna_partialaccess::is_scalar_width;
-        if self.out_lang != crate::kuna_lang::OutLang::C {
+        if !self.options.partial_access || self.out_lang != crate::kuna_lang::OutLang::C {
             return Ok(false);
         }
         let Some((out, input)) = fd
             .obank()
             .get(op)
-            .filter(|o| matches!(o.code(), OpCode::CPUI_COPY | OpCode::CPUI_SUBPIECE))
+            .filter(|o| o.code() == OpCode::CPUI_COPY)
             .and_then(|o| Some((o.get_out()?, o.get_in(0)?)))
         else {
             return Ok(false);
@@ -10754,32 +10526,15 @@ impl PrintC {
         if size <= 0 || is_scalar_width(size) || ov.get_type().get_metatype() == type_metatype::TYPE_FLOAT {
             return Ok(false);
         }
-        let wide = |walk: &PartialWalk| Self::wide_piece_offset(walk, size);
-        let target = self.piece_walk(fd, arch, out, op, -1, false).and_then(|(n, w)| wide(&w).map(|o| (n, w, o)));
-        let (extraction, piece_source) = if let Some((source, name, walk, offset)) = self.wide_aggregate_piece(fd, arch, op) {
-            (Some(source), Some((name, walk, offset)))
-        } else if fd.obank().get(op).is_some_and(|o| o.code() == OpCode::CPUI_COPY) {
-            (None, self.piece_walk(fd, arch, input, op, 0, true)
-                .and_then(|(name, walk)| wide(&walk).map(|offset| (name, walk, offset))))
-        } else {
-            return Ok(false);
+        let wide = |w: &PartialWalk| -> Option<int8> {
+            match w.stack.last() {
+                Some(&PartialEntry::Unnamed(off, s)) if s == size && w.finalcast.is_none() => Some(off),
+                _ => None,
+            }
         };
-        let snapshot = |value: &crate::varnode::Varnode|
-            value.get_high().is_some_and(|high| self.wide_snapshot_size(fd, arch, high) == Some(size));
-        let output_snapshot = snapshot(ov);
-        let physical = output_snapshot || snapshot(iv)
-            || (size > 8 && target.as_ref().is_some_and(|(_, walk, _)|
-                walk.unnamed_in.as_ref().is_some_and(|ty| matches!(ty.get_metatype(),
-                    type_metatype::TYPE_STRUCT | type_metatype::TYPE_UNION | type_metatype::TYPE_ARRAY)))
-                && piece_source.is_some());
-        if physical && (ov.is_volatile() || iv.is_volatile()
-            || extraction.is_some_and(|source| fd.vbank().get(source).is_some_and(|value| value.is_volatile())))
-        {
-            return Ok(false);
-        }
-        if !physical && !self.options.partial_access {
-            return Ok(false);
-        }
+        let target = self.piece_walk(fd, arch, out, op, -1, false).and_then(|(n, w)| wide(&w).map(|o| (n, w, o)));
+        let piece_source =
+            self.piece_walk(fd, arch, input, op, 0, true).and_then(|(n, w)| wide(&w).map(|o| (n, w, o)));
         let fill = iv.is_constant().then(|| {
             let value = iv.get_offset();
             let low = (value & 0xff) as u8;
@@ -10788,8 +10543,8 @@ impl PrintC {
             equal.then_some(low)
         });
         let variable = |v: &crate::varnode::Varnode| !v.is_constant() && !v.is_implied() && v.get_high().is_some();
-        let whole_array = variable(ov) && (output_snapshot
-            || matches!(ov.get_type().get_metatype(), type_metatype::TYPE_ARRAY | type_metatype::TYPE_UNKNOWN));
+        let whole_array = variable(ov)
+            && matches!(ov.get_type().get_metatype(), type_metatype::TYPE_ARRAY | type_metatype::TYPE_UNKNOWN);
         if target.is_none() && !(whole_array && piece_source.is_some()) {
             return Ok(false);
         }
@@ -10802,12 +10557,7 @@ impl PrintC {
         let key = Some(op_key(op));
         let filled = fill.flatten();
         self.push_op(&tokens::FUNCTION_CALL, key);
-        let callee = match (physical, filled.is_some()) {
-            (true, true) => "__builtin_memset",
-            (true, false) => "__builtin_memcpy",
-            (false, true) => "memset",
-            (false, false) => "memcpy",
-        };
+        let callee = if filled.is_some() { "memset" } else { "memcpy" };
         self.push_atom(&Atom::syntax(callee, TagType::FuncToken, crate::printlanguage::SyntaxHighlight::funcname_color));
         self.push_op(&tokens::COMMA, key);
         self.push_op(&tokens::COMMA, key);
@@ -10820,8 +10570,7 @@ impl PrintC {
         }
         match (filled, piece_source) {
             (Some(byte), _) => self.push_constant_ir_fmt_sign(byte as uintb, 0, op, display_format::NONE, false),
-            (None, Some((name, walk, off))) => self.push_piece_address(
-                arch, &name, &walk, off, extraction.unwrap_or(input), op),
+            (None, Some((name, walk, off))) => self.push_piece_address(arch, &name, &walk, off, input, op),
             (None, None) => {
                 self.push_op(&tokens::ADDRESSOF, key);
                 self.push_vn_ir(fd, arch, input, op)?;
@@ -11271,6 +11020,7 @@ impl PrintC {
                 return Ok(());
             }
             let named = self.emitted_high_symbol(fd, high);
+
             if let Some((name, sym_off, sym_type)) = named {
                 if self.is_value_indirect_input(fd, vn) {
                     if !self.context.is_set(modifiers::PRINT_LOAD_VALUE | modifiers::PRINT_STORE_VALUE) {
