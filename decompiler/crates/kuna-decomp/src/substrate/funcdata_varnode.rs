@@ -360,7 +360,7 @@ impl Funcdata {
         if s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
-        self.set_varnode_properties_at(vn, Address::new_invalid())?;
+        self.set_varnode_properties(vn)?;
         Ok(vn)
     }
 

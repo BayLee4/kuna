@@ -147,7 +147,6 @@ use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::{spacetype, VarnodeStorage};
 use kuna_base::types::int4;
 use kuna_num::opcodes::OpCode;
-use smallvec::SmallVec;
 
 use crate::context::{OpId, VarnodeId};
 use crate::funcdata::Funcdata;
@@ -401,46 +400,9 @@ pub struct CalleeReturnWrites {
     /// Did the walk read through a `setISAMode` user op?  See
     /// [`Self::proves_untouched_for`].
     through_mode_switch: bool,
-    return_zeros: SmallVec<[ReturnZero; 2]>,
-}
-
-#[derive(Clone, Debug)]
-struct ReturnZero {
-    address: Address,
-    size: int4,
-    zero_from: int4,
-}
-
-impl ReturnZero {
-    fn zero_start(&self) -> u64 {
-        self.address.get_offset()
-            + if self.address.is_big_endian() { 0 } else { self.zero_from as u64 }
-    }
-
-    fn zero_end(&self) -> u64 {
-        self.zero_start() + (self.size - self.zero_from) as u64
-    }
 }
 
 impl CalleeReturnWrites {
-    /// A wider physical result whose bytes outside the source result are proven zero.
-    pub(crate) fn zero_extended_result(&self, addr: &Address, size: int4) -> Option<(Address, int4)> {
-        let space = addr.get_space()?;
-        if size <= 0 || self.store_spaces.contains(&space.get_index()) {
-            return None;
-        }
-        self.return_zeros.iter().find_map(|witness| {
-            let written_space = witness.address.get_space()?;
-            if !Rc::ptr_eq(space, written_space) || size < witness.zero_from || size >= witness.size {
-                return None;
-            }
-            let low_offset = witness.address.get_offset()
-                + if space.is_big_endian() { (witness.size - size) as u64 } else { 0 };
-            (addr.get_offset() == low_offset)
-                .then(|| (witness.address.clone(), witness.size))
-        })
-    }
-
     /// Does this summary *prove* the callee never writes any byte of
     /// `[addr, addr+size)`?
     ///
@@ -527,7 +489,6 @@ impl CalleeReturnWrites {
             call_facts: Vec::new(),
             return_targets: Vec::new(),
             through_mode_switch: false,
-            return_zeros: SmallVec::new(),
         }
     }
 
@@ -563,7 +524,6 @@ impl CalleeReturnWrites {
             call_facts: Vec::new(),
             return_targets: Vec::new(),
             through_mode_switch: false,
-            return_zeros: SmallVec::new(),
         }
     }
 }
@@ -629,9 +589,6 @@ struct ProbeEmit {
     temp_consts: Vec<(u64, int4, u64)>,
     /// The `intloc` temp a matched `swi(0x29)` wrote, as `(offset, size)`.
     fastfail_intloc: Option<(u64, int4)>,
-    return_zeros: SmallVec<[ReturnZero; 2]>,
-    nonlinear: bool,
-    normal_return: bool,
 }
 
 impl ProbeEmit {
@@ -701,29 +658,8 @@ impl kuna_sleigh::translate::PcodeEmit for ProbeEmit {
             if let Some(sp) = &o.space {
                 if sp.get_type() == kuna_base::space::spacetype::IPTR_PROCESSOR {
                     self.writes.push((sp.get_index(), o.offset, o.size as int4));
-                    self.return_zeros.retain(|witness| {
-                        let same_space = witness.address.get_space().is_some_and(|s| Rc::ptr_eq(s, sp));
-                        !same_space
-                            || o.offset >= witness.zero_end()
-                            || o.offset.saturating_add(o.size as u64) <= witness.zero_start()
-                    });
-                    if opc == OpCode::CPUI_INT_ZEXT && vars.len() == 1
-                        && vars[0].size > 0 && vars[0].size < o.size && o.size <= 8
-                        && o.offset.checked_add(o.size as u64).is_some()
-                    {
-                        self.return_zeros.push(ReturnZero {
-                            address: Address::new(Rc::clone(sp), o.offset),
-                            size: o.size as int4,
-                            zero_from: vars[0].size as int4,
-                        });
-                    }
                 }
             }
-        }
-        if matches!(opc, OpCode::CPUI_BRANCH | OpCode::CPUI_CBRANCH | OpCode::CPUI_BRANCHIND
-            | OpCode::CPUI_CALL | OpCode::CPUI_CALLIND | OpCode::CPUI_CALLOTHER)
-        {
-            self.nonlinear = true;
         }
         match opc {
             // The vector of an `INT imm8` reaches the `swi` user-op through an
@@ -783,7 +719,6 @@ impl kuna_sleigh::translate::PcodeEmit for ProbeEmit {
             OpCode::CPUI_BRANCHIND => self.unresolved = true,
             OpCode::CPUI_RETURN => {
                 self.ends_flow = true;
-                self.normal_return = true;
                 if let Some(v) = vars.first() {
                     if let Some(sp) = v.space.as_ref().filter(|sp| sp.get_type() == spacetype::IPTR_PROCESSOR) {
                         let target = (sp.get_index(), v.offset, v.size as int4);
@@ -852,7 +787,6 @@ pub fn probe_callee_return_writes<T: kuna_sleigh::translate::Translate + ?Sized>
         call_facts: Vec::new(),
         return_targets: Vec::new(),
         through_mode_switch: false,
-        return_zeros: SmallVec::new(),
     };
     let Some(entry_space) = entry.get_space() else {
         res.complete = false;
@@ -865,8 +799,6 @@ pub fn probe_callee_return_writes<T: kuna_sleigh::translate::Translate + ?Sized>
     let mut seen: std::collections::HashSet<(int4, u64)> = std::collections::HashSet::new();
     let mut todo: Vec<Address> = vec![entry.clone()];
     let mut budget = MAX_PROBE_INSTRUCTIONS;
-    let mut linear = true;
-    let mut normal_return = false;
     while let Some(at) = todo.pop() {
         let Some(sp) = at.get_space() else {
             res.complete = false;
@@ -883,7 +815,6 @@ pub fn probe_callee_return_writes<T: kuna_sleigh::translate::Translate + ?Sized>
         let mut emit = ProbeEmit {
             fastfail_swi: userops.fastfail_swi,
             mode_switch: userops.mode_switch,
-            return_zeros: std::mem::take(&mut res.return_zeros),
             ..ProbeEmit::default()
         };
         let len = match tr.one_instruction(&mut emit, &at) {
@@ -895,9 +826,6 @@ pub fn probe_callee_return_writes<T: kuna_sleigh::translate::Translate + ?Sized>
             }
         };
         res.call_facts.extend(emit.resolve_calls(&no_return)?);
-        linear &= !emit.nonlinear;
-        normal_return |= emit.normal_return;
-        res.return_zeros = emit.return_zeros;
         res.instructions += 1;
         res.writes.append(&mut emit.writes);
         res.through_mode_switch |= emit.mode_switched;
@@ -919,9 +847,6 @@ pub fn probe_callee_return_writes<T: kuna_sleigh::translate::Translate + ?Sized>
         if !emit.ends_flow {
             todo.push(&at + len as i64);
         }
-    }
-    if !res.complete || !linear || !normal_return {
-        res.return_zeros.clear();
     }
     Ok(res)
 }
@@ -1011,7 +936,7 @@ pub fn classify_call_output_pair(
 /// against carries the load image but no translator, so the probe cannot be
 /// taken lazily at the seam itself. Results are cached on the `Architecture`, so
 /// each distinct callee body is decoded once per run rather than once per
-/// caller. Needed by pair recovery or a source-locked narrow integer result.
+/// caller. A no-op unless the rule is live for this image.
 pub fn seed_callee_return_writes(
     arch: &mut crate::architecture::Architecture,
     data: &mut Funcdata,
@@ -1024,34 +949,10 @@ pub fn seed_callee_return_writes(
     };
     // `option callretpair` reaches the same call-output arm and needs the same
     // callee evidence to veto a pair with, so it seeds the probe too.
-    let narrow_output = (0..data.num_calls()).any(|i| {
-        needs_return_zero_probe(data.get_call_specs(i))
-    });
-    if !on && !crate::p4_calls::kuna_callretpair::live_arch(arch) && !narrow_output {
+    if !on && !crate::p4_calls::kuna_callretpair::live_arch(arch) {
         return Ok(());
     }
     seed_callee_write_probe(arch, data)
-}
-
-pub(crate) fn needs_return_zero_probe(call: &crate::fspec::FuncCallSpecs) -> bool {
-    let proto = call.proto();
-    if call.get_entry_address().is_invalid() || !proto.has_model() || !proto.has_store()
-        || !proto.is_output_locked() || proto.has_output_errors() || proto.has_custom_storage()
-        || proto.is_inline() || proto.get_inject_id() >= 0
-        || proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0
-    {
-        return false;
-    }
-    let output = proto.get_output();
-    let Some(ty) = output.get_type() else { return false };
-    matches!(ty.get_metatype(), crate::dtype::type_metatype::TYPE_INT
-        | crate::dtype::type_metatype::TYPE_UINT | crate::dtype::type_metatype::TYPE_BOOL)
-        && output.get_size() > 0
-        && output.get_size() < 8
-        && (output.get_address().is_invalid()
-            || output.get_address().get_space().is_some_and(|space| {
-                space.get_type() == spacetype::IPTR_PROCESSOR
-            }))
 }
 
 /// Take (or reuse) the callee-body write probe for every direct call in `data`,

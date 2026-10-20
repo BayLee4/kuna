@@ -1089,19 +1089,6 @@ impl ActionFuncLink {
                         OpCode::CPUI_INT_ZEXT
                     };
                 }
-                if res == OpCode::CPUI_COPY
-                    && crate::kuna_rustabi::needs_return_zero_probe(data.get_call_specs(idx))
-                {
-                    let entry = data.get_call_specs(idx).get_entry_address();
-                    if let Some((physical, size)) = data.kuna_callee_ret_writes(entry)
-                        .and_then(|writes| writes.zero_extended_result(&addr, sz))
-                    {
-                        vdata.space = physical.get_space().cloned();
-                        vdata.offset = physical.get_offset();
-                        vdata.size = size as u32;
-                        res = OpCode::CPUI_INT_ZEXT;
-                    }
-                }
                 if res != OpCode::CPUI_COPY {
                     // The (small-size) output is extended to a full register;
                     // create the extension op immediately after the call.

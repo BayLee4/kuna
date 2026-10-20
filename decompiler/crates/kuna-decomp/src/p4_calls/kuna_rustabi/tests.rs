@@ -383,12 +383,12 @@ fn build_call_with_pair(fd: &mut Funcdata, hi_read: bool) -> (OpId, VarnodeId, V
 
 /// A summary that proves the callee wrote nothing at all.
 fn proves_nothing_written() -> CalleeReturnWrites {
-    CalleeReturnWrites { writes: Vec::new(), store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false, return_zeros: SmallVec::new() }
+    CalleeReturnWrites { writes: Vec::new(), store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false }
 }
 
 /// A summary the probe could not complete: it proves nothing.
 fn proves_nothing() -> CalleeReturnWrites {
-    CalleeReturnWrites { writes: Vec::new(), store_spaces: Vec::new(), complete: false, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false, return_zeros: SmallVec::new() }
+    CalleeReturnWrites { writes: Vec::new(), store_spaces: Vec::new(), complete: false, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false }
 }
 
 fn callee_entry(fd: &Funcdata) -> Address {
@@ -499,7 +499,7 @@ fn a_callee_that_writes_the_payload_still_pairs() {
     let (call, lo, hi) = build_call_with_pair(&mut fd, true);
     let entry = callee_entry(&fd);
     let ram_index = space(&fd, "ram").get_index();
-    let written = CalleeReturnWrites { writes: vec![(ram_index, 0x40, 8)], store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false, return_zeros: SmallVec::new() };
+    let written = CalleeReturnWrites { writes: vec![(ram_index, 0x40, 8)], store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false };
     assert!(!written.proves_untouched(&Address::new(space(&fd, "ram"), 0x40), 8));
     fd.kuna_set_callee_ret_writes(&entry, Rc::new(written));
     assert_eq!(
@@ -514,7 +514,7 @@ fn a_callee_that_writes_the_payload_still_pairs() {
 fn a_partial_write_of_the_payload_register_counts() {
     let mut fd = build_call_fd(RustAbiMode::Always);
     let ram = space(&fd, "ram");
-    let w = CalleeReturnWrites { writes: vec![(ram.get_index(), 0x40, 4)], store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false, return_zeros: SmallVec::new() };
+    let w = CalleeReturnWrites { writes: vec![(ram.get_index(), 0x40, 4)], store_spaces: Vec::new(), complete: true, instructions: 2, call_facts: Vec::new(), return_targets: Vec::new(), through_mode_switch: false };
     assert!(
         !w.proves_untouched(&Address::new(Rc::clone(&ram), 0x40), 8),
         "`lea 0x7(%rdi),%edx` writes four bytes of an eight-byte half",
@@ -630,7 +630,6 @@ fn a_store_into_the_space_defeats_the_proof() {
         instructions: 2,
         return_targets: Vec::new(),
         through_mode_switch: false,
-        return_zeros: SmallVec::new(),
     };
     assert!(!w.proves_untouched(&Address::new(Rc::clone(&ram), 0x40), 8));
     let _ = &mut fd;
@@ -663,47 +662,6 @@ fn write_probe_only_stops_at_unconditional_known_terminal_calls() {
     failed.calls.push(Address::new(space(&fd, "ram"), 0x2000));
     let error = kuna_base::error::KunaError::Transport { explain: "closed host".into() };
     assert_eq!(failed.resolve_calls(&|_| Err(error.clone())), Err(error));
-}
-
-#[test]
-fn return_zero_bytes_survive_only_nonoverlapping_writes() {
-    use kuna_num::pcoderaw::VarnodeData;
-    use kuna_sleigh::translate::PcodeEmit;
-    for big_endian in [false, true] {
-        let register = || Rc::new(AddrSpace::new(
-            spacetype::IPTR_PROCESSOR, "register", big_endian, 8, 1, 2,
-            addrspace_flags::hasphysical, 1, 1,
-        ));
-        let space = register();
-        let wide = VarnodeData { space: Some(Rc::clone(&space)), offset: 0x20, size: 8 };
-        let low_offset = 0x20 + if big_endian { 4 } else { 0 };
-        let narrow = VarnodeData { space: Some(Rc::clone(&space)), offset: low_offset, size: 4 };
-        let byte = VarnodeData {
-            space: Some(Rc::clone(&space)),
-            offset: 0x20 + if big_endian { 7 } else { 0 }, size: 1,
-        };
-        let at = Address::new(Rc::clone(&space), 0x1000);
-        let low = Address::new(Rc::clone(&space), low_offset);
-        let summary = |emit: &ProbeEmit| CalleeReturnWrites {
-            complete: true, return_zeros: emit.return_zeros.clone(), ..Default::default()
-        };
-        let mut emit = ProbeEmit::default();
-        emit.dump(&at, OpCode::CPUI_INT_ZEXT, Some(&wide), &[narrow.clone()]);
-        emit.dump(&at, OpCode::CPUI_COPY, Some(&byte), &[byte.clone()]);
-        assert_eq!(summary(&emit).zero_extended_result(&low, 4), Some((wide.get_addr(), 8)));
-        assert!(summary(&emit).zero_extended_result(&byte.get_addr(), 1).is_none());
-        assert!(summary(&emit).zero_extended_result(
-            &Address::new(register(), low_offset), 4,
-        ).is_none(), "equal space indices do not establish space identity");
-        let upper_byte = VarnodeData {
-            space: Some(Rc::clone(&space)), offset: 0x20 + if big_endian { 0 } else { 4 }, size: 1,
-        };
-        emit.dump(&at, OpCode::CPUI_COPY, Some(&upper_byte), &[byte.clone()]);
-        assert!(summary(&emit).zero_extended_result(&low, 4).is_none());
-        emit.dump(&at, OpCode::CPUI_INT_ZEXT, Some(&wide), &[narrow]);
-        emit.dump(&at, OpCode::CPUI_COPY, Some(&wide), &[wide.clone()]);
-        assert!(summary(&emit).zero_extended_result(&low, 4).is_none());
-    }
 }
 
 /// ARM's `bx lr` and MIPS's `jr ra` run `setISAMode` on their way to the

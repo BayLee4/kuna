@@ -3677,21 +3677,13 @@ impl Funcdata {
     /// a missing cover and mark its HighVariable cover dirty when necessary.
     /// (C++ `Funcdata::setVarnodeProperties`, `funcdata_varnode.cc:25`).
     pub fn set_varnode_properties(&mut self, vn: VarnodeId) -> KunaResult<()> {
-        let Some(value) = self.vbank().get(vn) else { return Ok(()) };
-        if value.is_mapped() {
-            self.ensure_varnode_cover(vn);
-            return Ok(());
-        }
-        self.set_varnode_properties_at(vn, self.vn_use_point(vn))
-    }
-
-    pub(crate) fn set_varnode_properties_at(&mut self, vn: VarnodeId, usepoint: Address) -> KunaResult<()> {
         // An already-mapped Varnode keeps its flags.
         let already_mapped = match self.vbank().get(vn) {
             Some(v) => v.is_mapped(),
             None => return Ok(()),
         };
         if !already_mapped {
+            let usepoint = self.vn_use_point(vn);
             // Both halves of the C++ walk are now wired: the LOCAL symbol-map half
             // (recovered stack locals, via `ScopeLocal::query_properties`) and the
             // GLOBAL half — the parent-scope reach that paints a global-mapped RAM
