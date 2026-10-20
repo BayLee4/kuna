@@ -4360,60 +4360,6 @@ pub fn bootstrap_from_object_with_isa(
 /// overlap check no-ops a duplicate). Bound to the real-ELF path; the XML
 /// `<binaryimage>` path never produces an `AnalysisOutput`, so this never runs
 /// there. See `docs/missing-analyses.md` for the per-fact-kind API rationale.
-fn publish_typed_data(
-    prog: &mut ConsoleProgram,
-    fact: &kuna_analysis::pass::TypedDataFact,
-    num_spaces: i32,
-) -> KunaResult<()> {
-    let size = fact.type_.get_size();
-    if size <= 0 || fact.addr.checked_add(size as u64 - 1).is_none() {
-        return Ok(());
-    }
-    let Some(space) = fact.space.clone()
-        .or_else(|| prog.arch().manage().get_default_data_space().cloned())
-    else {
-        return Ok(());
-    };
-    let addr = Address::new(space, fact.addr);
-    let arch = prog.arch_mut();
-    if let Some(global) = arch.symboltab.get_global_scope() {
-        if arch.symboltab.find_overlap(global, &addr, size).is_some() {
-            return Ok(());
-        }
-    }
-    let (scope, base) =
-        arch.symboltab.find_create_scope_from_symbol_name(&fact.name, "::", None, num_spaces)?;
-    if arch.symboltab.find_overlap(scope, &addr, size).is_some() {
-        return Ok(());
-    }
-    let (sid, _) = arch.symboltab.add_symbol_mapped(
-        scope, &base, Rc::clone(&fact.type_), &addr, &Address::new_invalid(),
-    )?;
-    arch.symboltab.set_attribute(
-        sid,
-        kuna_decomp::varnode::varnode_flags::typelock
-            | kuna_decomp::varnode::varnode_flags::namelock,
-    );
-    let mut object_type = Rc::clone(&fact.type_);
-    let volatile = loop {
-        if kuna_decomp::kuna_typequal::is_volatile(&object_type) {
-            break true;
-        }
-        match object_type.get_array_base() {
-            Some(element) => object_type = element,
-            None => break false,
-        }
-    };
-    if volatile {
-        let end = fact.addr.checked_add(size as u64)
-            .map(|end| Address::new(addr.get_space().unwrap().clone(), end))
-            .unwrap_or_else(Address::new_invalid);
-        arch.symboltab.set_attribute(sid, kuna_decomp::varnode::varnode_flags::volatil);
-        arch.symboltab.set_property_range(kuna_decomp::varnode::varnode_flags::volatil, &addr, &end);
-    }
-    Ok(())
-}
-
 fn commit_analysis_output(
     prog: &mut ConsoleProgram,
     code_space: &Rc<AddrSpace>,
@@ -4505,12 +4451,58 @@ fn commit_analysis_output(
         }
     }
 
-    // Debug declarations claim their full typed extent before heuristic strings
-    // and untyped names. Existing analyst mappings always retain precedence.
-    for fact in out.typed_data.iter().filter(|fact| fact.dwarf) {
-        publish_typed_data(prog, fact, num_spaces)?;
+    // 1a. Named data globals with a known byte size (`out.data_objects`, the DWARF
+    //     top-level variables). Mapped into the global scope with an
+    //     `undefined<size>` type so a memory access of the object's storage
+    //     (`mov [max_width], eax`) queries `queryContainer(addr, size)` and finds a
+    //     covering SymbolEntry — the ActionNameVars global-scope query then binds the
+    //     name, rendering `max_width` instead of `dat_<addr>`. A plain `SymFact{Data}`
+    //     is installed with a size-1 code type, which only covers a 1-byte access, so
+    //     multi-byte globals (`int`/`char*`) were left unnamed. Matches IDA Pro /
+    //     Ghidra, which name data globals from the symbol table. `namelock` keeps the
+    //     name; the `undefined<size>` type is NOT typelocked, so type propagation still
+    //     infers the object's real type from its uses. A synthetic-`namelock` symbol
+    //     is skipped where the address already carries a function or a covering data
+    //     Symbol (a string `s_<addr>` or a hand-`map addr`ed global must not be
+    //     shadowed) — the same guard the string-literal placement uses.
+    //     The extent is clamped into the type factory's `int4` domain exactly as
+    //     arm 4a does. This arm cannot actually overflow — `d.size` is produced
+    //     from a `Datatype::get_size()`, itself an `int4`, and filtered to `>= 1`
+    //     (`analyzers/dwarf/mod.rs`), so it already lives in `1..=int4::MAX` —
+    //     but the two arms must not differ in shape, or the safe one reads as an
+    //     endorsement of the unsafe one.
+    for d in &out.data_objects {
+        let addr = Address::new(Rc::clone(code_space), d.addr);
+        let occupied = {
+            let arch = prog.arch();
+            match arch.symboltab.get_global_scope() {
+                Some(global) => {
+                    arch.symboltab.find_function(global, &addr).is_some()
+                        || arch
+                            .symboltab
+                            .find_container(global, &addr, 1, &Address::new_invalid())
+                            .is_some()
+                }
+                None => false,
+            }
+        };
+        if occupied {
+            continue;
+        }
+        let ct = prog
+            .arch()
+            .types()
+            .get_base(
+                d.size.clamp(1, int4::MAX as u32) as int4,
+                kuna_decomp::dtype::type_metatype::TYPE_UNKNOWN,
+            )?;
+        let arch = prog.arch_mut();
+        let (scope, base) =
+            arch.symboltab.find_create_scope_from_symbol_name(&d.name, "::", None, num_spaces)?;
+        let (sid, _) =
+            arch.symboltab.add_symbol_mapped(scope, &base, ct, &addr, &Address::new_invalid())?;
+        arch.symboltab.set_attribute(sid, kuna_decomp::varnode::varnode_flags::namelock);
     }
-
 
     // 1b. Extra read-only address ranges a pass discovered (`out.readonly`) — e.g.
     //     the MSVC RTTI vftable slot arrays (`rtti` R3). OR `Varnode::readonly`
@@ -4857,10 +4849,44 @@ fn commit_analysis_output(
     //     and `libctypes` only decides what the named object IS. There is no half
     //     of this to keep: the type rides on the symbol, and with no symbol there
     //     is nothing to lock a type onto.
-    for fact in out.typed_data.iter().filter(|fact| !fact.dwarf) {
-        if prog.arch().analysis_datasyms {
-            publish_typed_data(prog, fact, num_spaces)?;
+    let stream_syms = if prog.arch().analysis_datasyms { out.typed_data.as_slice() } else { &[] };
+    for fact in stream_syms {
+        let addr = Address::new(Rc::clone(code_space), fact.addr);
+        let occupied = {
+            let arch = prog.arch();
+            match arch.symboltab.get_global_scope() {
+                Some(global) => {
+                    arch.symboltab.find_function(global, &addr).is_some()
+                        || arch
+                            .symboltab
+                            .find_container(global, &addr, 1, &Address::new_invalid())
+                            .is_some()
+                }
+                None => false,
+            }
+        };
+        if occupied {
+            continue;
         }
+        let arch = prog.arch_mut();
+        let (scope, base) = arch.symboltab.find_create_scope_from_symbol_name(
+            &fact.name,
+            "::",
+            None,
+            num_spaces,
+        )?;
+        let (sid, _) = arch.symboltab.add_symbol_mapped(
+            scope,
+            &base,
+            Rc::clone(&fact.type_),
+            &addr,
+            &Address::new_invalid(),
+        )?;
+        arch.symboltab.set_attribute(
+            sid,
+            kuna_decomp::varnode::varnode_flags::typelock
+                | kuna_decomp::varnode::varnode_flags::namelock,
+        );
     }
 
     // 4a. Loader data symbols: the defined `STT_OBJECT` entries of `.symtab` /

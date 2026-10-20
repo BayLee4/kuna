@@ -398,7 +398,6 @@ pub(super) fn intern_variant_aggregate(
     }
 
     let want = if niche { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
-    let alias = super::aggregate_alias(die, alias, walk, cpp);
     let name = resolve_name(
         types,
         &qualified_name(die, dies, alias, fallback, Some(size)),
@@ -406,19 +405,19 @@ pub(super) fn intern_variant_aggregate(
         fallback,
         want,
     )?;
-    let (shell, complete) = open_shell(types, &name, die.identity, niche)?;
+    let (shell, complete) = open_shell(types, &name, niche)?;
     if complete {
         return Some(shell);
     }
-    if !walk.begin_aggregate(die.identity) {
+    if !walk.begin_aggregate(&name) {
         // An enclosing frame is already populating this enum (a recursive
         // payload, `enum List { Cons(u32, *const List), Nil }`); the shell it
         // interned is what the inner pointer must name.
         return Some(shell);
     }
     let built =
-        build_facets(types, dies, &raw, &name, die.identity, size, payload_offset, tag_size, walk, word_size, cpp);
-    walk.end_aggregate(die.identity);
+        build_facets(types, dies, &raw, &name, size, payload_offset, tag_size, walk, word_size, cpp);
+    walk.end_aggregate(&name);
 
     // From here on the name is ALREADY interned, so a refusal must not return
     // `None`: that would leave a zero-size incomplete type under the enum's own
@@ -494,7 +493,7 @@ fn install_layout(
         name,
         type_metatype::TYPE_UNION,
     )?;
-    let (ushell, ucomplete) = open_shell(types, &uname, super::nominal_id((die.identity, "payload")), true)?;
+    let (ushell, ucomplete) = open_shell(types, &uname, true)?;
     let union = if ucomplete {
         ushell
     } else {
@@ -595,46 +594,52 @@ fn field_name_survives(i: usize, off: int4, width: int4, name: &str, built: &[Bu
     })
 }
 
-/// Whether an existing generated spelling describes this facet's field layout.
-/// This chooses presentation names only, never nominal identity or completion.
-fn same_facet_layout(ty: &Datatype, fields: &[TypeField]) -> bool {
-    ty.num_depend() == fields.len() as int4
-        && fields.iter().enumerate().all(|(i, field)| {
-            ty.get_field(i as int4).is_some_and(|existing| {
-                existing.offset == field.offset
-                    && existing.name == field.name
-                    && existing.field_type.get_size() == field.field_type.get_size()
-            })
-        })
+/// Whether an already-complete interned struct has exactly `fields`
+/// (offset, name, width), i.e. is the same facet rather than a name collision.
+fn same_layout(t: &Rc<Datatype>, fields: &[TypeField]) -> bool {
+    if t.num_depend() != fields.len() as int4 {
+        return false;
+    }
+    fields.iter().enumerate().all(|(i, f)| match t.get_field(i as int4) {
+        Some(g) => {
+            g.offset == f.offset
+                && g.name == f.name
+                && g.field_type.get_size() == f.field_type.get_size()
+        }
+        None => false,
+    })
 }
 
-/// A facet is identified by the owning producer enum and variant ordinal.
-/// Its generated offset spelling still steps over incompatible layouts, with
-/// the existing bounded refusal when no candidate presentation name is usable.
+/// Intern the payload struct for one facet under `base`, stepping over a
+/// same-named complete type whose layout is a DIFFERENT one.
+///
+/// The step-over matters because a suppressed facet's name is derived from its
+/// offset, so two variants of the same enum can want the same one
+/// (`Tree::field_0x8` for both `Leaf` and `Node`). Where the layouts match, the
+/// single interned struct is shared, which is correct — the two facets describe
+/// the same bytes. Where they differ they must not be merged: the ABI classifier
+/// common-refines the union's members, so collapsing two shapes into one would
+/// change how the enum is passed.
 fn open_facet(
     types: &dyn TypeFactory,
     base: &str,
     fallback: &str,
-    identity: u64,
     fields: Vec<TypeField>,
     size: int4,
     align: int4,
 ) -> Option<(Rc<Datatype>, String)> {
     for attempt in 0..8 {
-        let candidate = if attempt == 0 { base.to_string() } else { format!("{base}_{attempt}") };
-        let fname = resolve_name(types, &candidate, Some(size), fallback, type_metatype::TYPE_STRUCT)?;
-        if let Some(existing) = types.find_by_name(&fname).ok()? {
-            if !existing.is_incomplete() && !same_facet_layout(&existing, &fields) {
-                continue;
+        let cand = if attempt == 0 { base.to_string() } else { format!("{base}_{attempt}") };
+        let fname =
+            resolve_name(types, &cand, Some(size), fallback, type_metatype::TYPE_STRUCT)?;
+        let (fshell, fcomplete) = open_shell(types, &fname, false)?;
+        if fcomplete {
+            if same_layout(&fshell, &fields) {
+                return Some((fshell, fname));
             }
+            continue;
         }
-        // Equal layout can authorize the same generated spelling, but cannot
-        // authorize reusing another producer variant's datatype identity.
-        let (shell, complete) = open_shell(types, &fname, identity, false)?;
-        if complete {
-            return Some((shell, fname));
-        }
-        let done = types.set_fields_struct_raw(&shell, fields, Vec::new(), size, align, 0).ok()?;
+        let done = types.set_fields_struct_raw(&fshell, fields, Vec::new(), size, align, 0).ok()?;
         return Some((done, fname));
     }
     None
@@ -660,7 +665,6 @@ fn build_facets(
     dies: &BTreeMap<usize, DieSnap>,
     raw: &RawVariantPart,
     name: &str,
-    identity: u64,
     size: int4,
     payload_offset: int4,
     tag_size: int4,
@@ -742,7 +746,6 @@ fn build_facets(
                 types,
                 &format!("{name}::{label}"),
                 name,
-                super::nominal_id((identity, "variant", i)),
                 renamed,
                 payload_size,
                 falign,
@@ -795,12 +798,22 @@ fn is_discriminant_shaped(t: &Rc<Datatype>) -> bool {
 fn open_shell(
     types: &dyn TypeFactory,
     name: &str,
-    identity: u64,
     is_union: bool,
 ) -> Option<(Rc<Datatype>, bool)> {
-    let shell = types.reserve_record(name, identity, is_union).ok()?;
-    let complete = !shell.is_incomplete();
-    Some((shell, complete))
+    let want = if is_union { type_metatype::TYPE_UNION } else { type_metatype::TYPE_STRUCT };
+    match types.find_by_name(name) {
+        Ok(Some(t)) if t.get_metatype() == want => {
+            let complete = !t.is_incomplete();
+            Some((t, complete))
+        }
+        Ok(Some(_)) => None,
+        Ok(None) => {
+            let built =
+                if is_union { types.get_type_union(name) } else { types.get_type_struct(name) };
+            built.ok().filter(|t| t.get_metatype() == want).map(|t| (t, false))
+        }
+        Err(_) => None,
+    }
 }
 
 /// The alignment for a synthesized facet or overlay: the producer's

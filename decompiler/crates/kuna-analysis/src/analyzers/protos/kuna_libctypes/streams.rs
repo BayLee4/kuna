@@ -194,7 +194,7 @@ pub(super) fn stream_data_symbols(
             continue;
         }
         claimed.push(offset);
-        out.push(TypedDataFact { addr: offset, space: None, dwarf: false, name: sym_name, type_: ct });
+        out.push(TypedDataFact { addr: offset, name: sym_name, type_: ct });
     }
     out
 }

@@ -2592,13 +2592,6 @@ impl ArchContext {
         let Some(space) = entry.get_space() else { return Ok(None) };
         let space_index = space.get_index();
         let start = entry.get_offset();
-        if let Some(source) = gq.source_protos.get(&(space_index, start)) {
-            let effective = gq.entries_for_space(space_index).iter()
-                .find(|entry| entry.first == start && entry.is_function)
-                .map(|entry| self.with_callee_symbol_facts(source, entry))
-                .unwrap_or_else(|| Rc::clone(source));
-            return Ok(Some(effective));
-        }
         for e in gq.entries_for_space(space_index) {
             if e.first != start {
                 continue;
@@ -2608,6 +2601,14 @@ impl ArchContext {
                     return Ok(Some(self.with_callee_symbol_facts(proto, e)));
                 }
             }
+        }
+
+        if let Some(source) = gq.source_protos.get(&(space_index, start)) {
+            let effective = gq.entries_for_space(space_index).iter()
+                .find(|entry| entry.first == start && entry.is_function)
+                .map(|entry| self.with_callee_symbol_facts(source, entry))
+                .unwrap_or_else(|| Rc::clone(source));
+            return Ok(Some(effective));
         }
         Ok(None)
     }
@@ -2664,9 +2665,6 @@ impl ArchContext {
                 continue;
             }
             let entry_addr = Address::new(std::rc::Rc::clone(space), e.first);
-            if let Some(source) = gq.source_protos.get(&(space_index, start)) {
-                return Ok(Some((e.symbol_name.clone(), entry_addr, self.with_callee_symbol_facts(source, e))));
-            }
             // Prefer a recovered code prototype when the type carries one (a
             // declared callee, e.g. `parse line extern void f(...)`); otherwise
             // hand back the default void proto the C++ funcsym's `getFuncProto`

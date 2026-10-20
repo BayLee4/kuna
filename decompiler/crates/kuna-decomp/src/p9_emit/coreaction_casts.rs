@@ -410,14 +410,6 @@ fn get_input_cast_op(
                 None => input_type_local(data, op, slot)?,
             };
             let curtype = data.vn_high_type_read_facing(invn, op)?;
-            let reqtype = if reqtype.get_metatype() == type_metatype::TYPE_UNKNOWN
-                && matches!(curtype.get_metatype(),
-                    type_metatype::TYPE_INT | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
-            {
-                call_argument_representation(data, op, slot).unwrap_or(reqtype)
-            } else {
-                reqtype
-            };
             let care_ptr_uint = declared_storage || reqtype.get_metatype() != type_metatype::TYPE_UNKNOWN
                 || crate::p9_emit::kuna_unknowncasts::declared_argument(data, op, slot);
             let cast = strat
@@ -427,33 +419,6 @@ fn get_input_cast_op(
             crate::kuna_truncarg::narrowed_arg_cast(data, strat, op, slot)
         }
     }
-}
-
-/// A physically matched callee float read constrains this use, not the shared integer value.
-fn call_argument_representation(data: &Funcdata, op: OpId, slot: int4) -> Option<Rc<Datatype>> {
-    let call = data.obank().get(op)?;
-    if call.code() != OpCode::CPUI_CALL || slot <= 0 {
-        return None;
-    }
-    let value = data.vbank().get(call.get_in(slot)?)?;
-    if value.is_constant() || value.get_size() != 4
-        || data.obank().get(value.get_def()?)?.code() != OpCode::CPUI_LOAD
-    {
-        return None;
-    }
-    let fc = data.get_call_specs(data.get_call_specs_index(op)?);
-    if fc.proto().is_input_locked() || fc.proto().is_override() {
-        return None;
-    }
-    let index = (slot - 1) as usize;
-    let (address, size) = fc.final_input_storage().get(index)?;
-    if *size != value.get_size() {
-        return None;
-    }
-    let recovered = data.kuna_protoorder_types(fc.get_entry_address())?;
-    recovered.param_type_at(index, address, *size)
-        .filter(|ty| ty.get_metatype() == type_metatype::TYPE_FLOAT && ty.get_size() == *size)
-        .cloned()
 }
 
 /// TypeOpLoad::getInputCast (typeop.cc:441-471).

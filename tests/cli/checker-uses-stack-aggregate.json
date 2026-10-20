@@ -28,11 +28,11 @@
       "eq": 0
     },
     "stdout_matches": [
-      "u64 v12; // (?:[^|\\r\\n]+ \\| )*stack - 0x10(?: \\| [^|\\r\\n]+)*",
-      "\\*\\(u32 \\*\\)&v12 = a;",
-      "\\(\\(u32 \\*\\)&v12\\)\\[1\\] = b;",
+      "unsigned int v12; // (?:[^|\\r\\n]+ \\| )*stack - 0x10(?: \\| [^|\\r\\n]+)*",
+      "\\*\\(unsigned int \\*\\)&v12 = a;",
+      "\\(\\(unsigned int \\*\\)&v12\\)\\[1\\] = b;",
       "sink\\(&v12\\);"
     ]
   },
-  "notes": "DWARF maps one authored u64 local v12: its two u32 pieces and address reference share that name. Retain the eight-byte whole-object declaration, stores at offsets zero and four, and sink(&v12). The constant-only address reference is not a whole storage high and cannot suppress the piece accesses."
+  "notes": "Reduced from RE-friction need checker-uses-stack-aggregate. DWARF maps one 8-byte local named `v12` whose two 4-byte pieces and address reference share that name. The constant-only `&v12` reference is not a whole storage high and cannot justify suppressing both piece declarations."
 }

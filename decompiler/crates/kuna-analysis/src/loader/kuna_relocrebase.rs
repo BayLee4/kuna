@@ -418,13 +418,8 @@ pub fn retain_in_image(out: &mut AnalysisOutput, view: &RebasedView) {
     let keep_range = |&(lo, hi): &(u64, u64)| view.contains(lo) && (hi <= lo || view.contains(hi - 1));
 
     out.symbols.retain(|s| keep(s.addr));
+    out.data_objects.retain(|d| keep(d.addr));
     out.source_prototypes.retain(|(addr, _)| keep(*addr));
-
-    out.typed_data.retain(|d| {
-        d.type_.get_size() > 0
-            && d.addr.checked_add(d.type_.get_size() as u64 - 1)
-                .is_some_and(|end| keep(d.addr) && keep(end))
-    });
     out.entries.retain(|&a| keep(a));
     out.fde_bodies.retain(keep_range);
     out.pdb_bodies.retain(keep_range);
