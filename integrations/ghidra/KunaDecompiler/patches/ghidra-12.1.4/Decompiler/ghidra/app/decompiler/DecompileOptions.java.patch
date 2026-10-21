@@ -47,3 +47,43 @@
  				"doubleprecis", simplifyDoublePrecision ? "on" : "off");
  		}
  		if (splitStructures != SPLITSTRUCTURES_OPTIONDEFAULT ||
+@@ -895,12 +915,9 @@
+ 		if (analyzeForLoops != ANALYZEFORLOOPS_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_ANALYZEFORLOOPS, analyzeForLoops ? "on" : "off", "", "");
+ 		}
+-		if (nullToken != NULLTOKEN_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_NULLPRINTING, nullToken ? "on" : "off", "", "");
+-		}
+-		if (inplaceTokens != INPLACEOP_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_INPLACEOPS, inplaceTokens ? "on" : "off", "", "");
+-		}
++		// Kuna: always sent; the native defaults differ from Java's.
++		appendOption(encoder, ELEM_NULLPRINTING, nullToken ? "on" : "off", "", "");
++		appendOption(encoder, ELEM_INPLACEOPS, inplaceTokens ? "on" : "off", "", "");
+ 		if (aliasBlock != ALIASBLOCK_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_ALIASBLOCK, aliasBlock.getOptionString(), "", "");
+ 		}
+@@ -914,10 +931,8 @@
+ 		if (noCastPrint != NOCAST_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_NOCASTPRINTING, noCastPrint ? "on" : "off", "", "");
+ 		}
+-		if (braceFunction != BRACEFUNCTION_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_BRACEFORMAT, "function", braceFunction.getOptionString(),
+-				"");
+-		}
++		appendOption(encoder, ELEM_BRACEFORMAT, "function", braceFunction.getOptionString(),
++			"");
+ 		if (braceIfElse != BRACEIFELSE_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_BRACEFORMAT, "ifelse", braceIfElse.getOptionString(), "");
+ 		}
+@@ -927,9 +942,7 @@
+ 		if (braceSwitch != BRACESWITCH_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_BRACEFORMAT, "switch", braceSwitch.getOptionString(), "");
+ 		}
+-		if (maxwidth != MAXWIDTH_OPTIONDEFAULT) {
+-			appendOption(encoder, ELEM_MAXLINEWIDTH, Integer.toString(maxwidth), "", "");
+-		}
++		appendOption(encoder, ELEM_MAXLINEWIDTH, Integer.toString(maxwidth), "", "");
+ 		if (indentwidth != INDENTWIDTH_OPTIONDEFAULT) {
+ 			appendOption(encoder, ELEM_INDENTINCREMENT, Integer.toString(indentwidth), "", "");
+ 		}

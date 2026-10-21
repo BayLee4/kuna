@@ -7533,10 +7533,6 @@ impl ArchOptionContext for Architecture {
         );
     }
 
-    fn reset_native_print_language_defaults(&mut self) {
-        self.print.options.null = self.print.out_lang() == crate::kuna_lang::OutLang::Java;
-    }
-
     // --- action database ---------------------------------------------------
     fn set_action_warning(&mut self, val: bool, name: &str) -> bool {
         // C++ `glb->allacts.getCurrent()->setWarning(val,p1)`.

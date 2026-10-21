@@ -2038,12 +2038,6 @@ impl PrintC {
         self.set_export_binding(None);
         self.options = PrintCOptions::new();
         self.rt_ctx.convention = self.options.convention;
-        // DecompileOptions encodes only differences from Ghidra's defaults
-        // (DecompileOptions.java:898-923). The console's rendering defaults
-        // deliberately differ, but cannot be used to interpret this sparse wire.
-        self.options.null = false;
-        self.options.inplace_ops = false;
-        self.options.brace_func = BraceStyle::SkipLine;
         self.max_line_size = 100;
         // The constant is inside the upstream emitter's valid range.
         self.emit.set_max_line_size(100).expect("default maximum line size");
@@ -10947,7 +10941,7 @@ impl PrintC {
                 // bare decimal `0`.  Previously this arm fell straight through to the
                 // signed/unsigned integer path below, dropping both the leading
                 // typecast and the force_hex, so the pointer constant printed as `0`.
-                if self.options.null && off == 0 {
+                if (self.options.null || self.out_lang == crate::kuna_lang::OutLang::Java) && off == 0 {
                     // option_NULL set (OFF by kuna default): emit the NULL token.
                     self.push_atom(&Atom::with_op_vn(
                         self.lang().null_literal.to_string(),

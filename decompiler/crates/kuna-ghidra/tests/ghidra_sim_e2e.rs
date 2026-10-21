@@ -625,9 +625,6 @@ fn ghidra_sim_faillog_pins() {
         .arch_mut()
         .set_kuna_option("libcnames", "off")
         .unwrap_or_else(|e| panic!("libcnames off: {}", e.explain()));
-    // Same print options as the session: its defaults are Ghidra's (the sparse
-    // wire cannot carry kuna's console defaults), so the CLI arm uses them too.
-    oracle.prog.arch_mut().print_mut().reset_wire_option_defaults();
     let mut ratios = Vec::new();
     for (i, parsed) in docs.iter().enumerate() {
         let cli_c = decompile_cli(&mut oracle.prog, &parsed.name.clone(), &addrs[i]);

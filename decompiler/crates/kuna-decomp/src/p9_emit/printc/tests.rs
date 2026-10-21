@@ -1394,18 +1394,18 @@ fn option_defaults_match_reset_defaults_printc() {
 }
 
 #[test]
-fn sparse_native_defaults_are_distinct_from_console_defaults() {
+fn wire_reset_restores_the_engine_defaults() {
     let mut print = PrintC::new();
     assert!(print.options.null && print.options.inplace_ops);
     assert_eq!(print.options.brace_func, BraceStyle::NextLine);
     print.reset_wire_option_defaults();
     for _ in 0..2 {
-        assert!(!print.options.null && !print.options.inplace_ops);
+        assert!(print.options.null && print.options.inplace_ops);
         assert!(print.options.convention);
-        assert_eq!(print.options.brace_func, BraceStyle::SkipLine);
+        assert_eq!(print.options.brace_func, BraceStyle::NextLine);
         assert_eq!(print.max_line_size, 100);
-        print.set_null_printing(true);
-        print.set_inplace_ops(true);
+        print.set_null_printing(false);
+        print.set_inplace_ops(false);
         print.set_convention_printing(false);
         print.set_brace_format(crate::options::BraceCategory::Function, BraceStyle::SameLine);
         print.set_max_line_size(20).unwrap();

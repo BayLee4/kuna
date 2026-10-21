@@ -947,12 +947,13 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   registerProgram baseline (`Architecture::reset_wire_defaults` + the DIV-77
   ghidra-mode preset layer) and then applies the deltas — a previously-sent
   non-default option reverts when the user sets it back to default.
-  Native sparse C printing defaults are Ghidra's `NULL`-off,
-  inplace-operators-off and function-brace `skip`; the standalone CLI retains
-  its own defaults. After the native producer selects its language, Java's
-  baseline enables `null` before subsequent explicit rendering deltas apply.
-  Repeated options and Java→C→Java replay restore that selected-language
-  baseline; general console language selection keeps its existing option policy.
+  Java's `DecompileOptions.encode` omits an option equal to Java's default, and
+  the engine's defaults (`NULL` on, in-place operators on, function brace on the
+  next line) differ from Java's for four options. The extension patch therefore
+  sends `nullprinting`, `inplaceops`, the function `braceformat` and
+  `maxlinewidth` on every `setOptions`; the session keeps the engine's own
+  defaults. Java output always prints `null` for a null pointer: the literal is
+  part of the language, and `nullprinting` selects only C's `NULL`.
   Calling-convention printing is enabled by Java's sparse default, but the
   architecture's default model is implicit (`printInDecl=false`). Changing the
   default republishes the former model as explicit and the new default as

@@ -581,10 +581,6 @@ pub trait ArchOptionContext {
     /// `glb->setPrintLanguage(p1)` (options.cc:865).  // STUB(W8)
     fn set_print_language(&mut self, language: &str);
 
-    /// Establish the selected language's sparse native baseline before its
-    /// following rendering options, without changing console language selection.
-    fn reset_native_print_language_defaults(&mut self) {}
-
     // --- action database (STUB W5: action / coreaction) --------------------
 
     /// `glb->allacts.getCurrent()->setWarning(val,p1)`; `false` => bad
@@ -2019,9 +2015,6 @@ impl OptionDatabase {
                 continue;
             }
             self.decode_one(decoder, glb)?;
-            if id == ELEM_SETLANGUAGE {
-                glb.reset_native_print_language_defaults();
-            }
         }
         decoder.close_element(elem_id)?;
         Ok(warnings)
