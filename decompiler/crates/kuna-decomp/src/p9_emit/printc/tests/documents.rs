@@ -212,11 +212,7 @@ mod comment_consumers {
                 assert!(source.calls.get() > calls);
                 let mut clean = configured(markup);
                 let expected = render(root, &mut clean, &fd, &arch).unwrap();
-                match (&retried, &expected) {
-                    (Document::Markup(left), Document::Markup(right)) =>
-                        kuna_harness::packed_document::assert_eq_modulo_syntax_pair_ids(left, right),
-                    _ => assert_eq!(retried, expected),
-                }
+                assert_eq!(retried, expected);
                 assert_eq!(print.doc_function_full(&fd, &arch).unwrap(),
                     clean.doc_function_full(&fd, &arch).unwrap());
                 assert_eq!(print.doc_function_tokens(&fd, &arch).unwrap(),
