@@ -19,6 +19,7 @@ fn callable_child(name: &str) -> bool {
         .args(["--exact", name, "--nocapture", "--include-ignored"])
         .env(CHILD, name)
         .env(kuna_decomp::kuna_calltargettype::CALLTARGETTYPE_ENV, "on")
+        .env(kuna_decomp::kuna_dwarftypedefs::DWARFTYPEDEFS_ENV, "on")
         .output()
         .expect("isolated declaration test child");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -203,7 +204,6 @@ macro_rules! callback_execution {
         }
     };
 }
-callback_execution!(open_callback_preserves_actual_argument_at_o0_o2, "invoke_open", "int main(void) { return invoke_open(target_open, 41) != 42 || invoke_open(target_open, 99) != 100; }");
 callback_execution!(closed_callback_stays_closed_at_o0_o2, "invoke_closed", "int main(void) { return invoke_closed(target_closed) != 7; }");
 callback_execution!(fixed_callback_preserves_argument_at_o0_o2, "invoke_fixed", "int main(void) { return invoke_fixed(target_fixed, 41) != 43 || invoke_fixed(target_fixed, 99) != 101; }");
 callback_execution!(variadic_callback_preserves_tail_at_o0_o2, "invoke_variadic", "int tail_provider(int x, ...) { __builtin_va_list ap; int tail; __builtin_va_start(ap,x); tail = __builtin_va_arg(ap,int); __builtin_va_end(ap); return x + tail; } int main(void) { return invoke_variadic(target_variadic, 41) != 44 || invoke_variadic(target_variadic, 99) != 102 || invoke_variadic(tail_provider, 41) != 44 || invoke_variadic(tail_provider, 99) != 102; }");

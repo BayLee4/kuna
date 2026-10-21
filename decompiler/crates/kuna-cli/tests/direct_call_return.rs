@@ -8,8 +8,8 @@ const DRIVER: &str = r#"
 #include <stdint.h>
 #include <assert.h>
 #include <string.h>
-void * __attribute__((ms_abi)) checked_return(void *, unsigned long long);
-void * __attribute__((ms_abi)) simple_checked_return(void *, unsigned long long);
+void * __attribute__((ms_abi)) checked_return(void *, uint64_t);
+void * __attribute__((ms_abi)) simple_checked_return(void *, uint64_t);
 int main(int argc, char **argv) {
     if (argc > 1) return checked_return(0, UINT64_MAX) != 0;
     int value = 42;
@@ -151,7 +151,7 @@ fn terminal_failure_call_preserves_the_pre_call_result() {
         );
         assert_eq!(code.matches("return value;").count(), 2, "{code}");
         let emitted = asm.with_extension("emitted.c");
-        std::fs::write(&emitted, format!("#include <stdint.h>\n#define MSABI __attribute__((ms_abi))\ntypedef uint64_t uint8;\nvoid __attribute__((ms_abi)) check_cookie(uint8);\nvoid __attribute__((ms_abi)) simple_check(uint8);\n{DRIVER}\n{code}")).unwrap();
+        std::fs::write(&emitted, format!("#include <stdint.h>\ntypedef uint64_t uint8;\nvoid __attribute__((ms_abi)) check_cookie(uint8);\nvoid __attribute__((ms_abi)) simple_check(uint8);\n{DRIVER}\n{code}")).unwrap();
         let helpers = asm.with_extension("helpers.S");
         let start = ASM.find(".globl simple_check\n").unwrap();
         std::fs::write(&helpers, format!(".text\n{}", &ASM[start..])).unwrap();

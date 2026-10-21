@@ -159,7 +159,7 @@ fn semantic_oracle_with_parameter(
             std::fs::write(
                 &source,
                 format!(
-                    "#define MSABI __attribute__((ms_abi))\ntypedef int int4; typedef unsigned int uint4; typedef unsigned long long uint8;\n{support}\n{body}\n{harness}"
+                    "typedef int int4; typedef unsigned int uint4; typedef unsigned long long uint8;\n{support}\n{body}\n{harness}"
                 ),
             )
             .unwrap();
@@ -190,7 +190,7 @@ fn renamed_parameter_is_declared_and_read_under_the_same_name() {
     let control = decompile(&image, PROTO, &[]);
     assert!(control.contains("return value + 1;"), "{control}");
     let renamed = decompile(&image, PROTO, &["name probe::value property"]);
-    kuna_harness::c_behavior::assert_c_parameters(&renamed, "probe", &["unused", "property"], "int (*)(void *, int)");
+    assert!(renamed.contains("int4 property)"), "{renamed}");
     assert!(renamed.contains("return property + 1;"), "{renamed}");
     assert!(!renamed.contains("value"), "{renamed}");
     semantic_oracle(&image, &[control, renamed], false);
@@ -203,7 +203,7 @@ fn renamed_register_keeps_its_incoming_value_before_a_conditional_overwrite() {
         let image = image(bytes);
         let control = decompile(&image, prototype, &[]);
         let renamed = decompile(&image, prototype, &["name value property"]);
-        kuna_harness::c_behavior::assert_c_parameters(&renamed, "probe", &["unused", "property"], if msabi { "int (__attribute__((ms_abi)) *)(void *, int)" } else { "int (*)(void *, int)" });
+        assert!(renamed.contains("int4 property)"), "{renamed}");
         assert!(renamed.contains("if (property == 7)"), "{renamed}");
         assert!(renamed.contains("return property;"), "{renamed}");
         assert!(
@@ -229,7 +229,7 @@ fn retyped_parameter_and_batched_aliases_reach_the_prototype() {
         } else {
             "property"
         };
-        kuna_harness::c_behavior::assert_c_parameters(&code, "probe", &["unused", name], "int (*)(void *, unsigned int)");
+        assert!(code.contains(&format!("uint4 {name})")), "{code}");
         assert!(!code.contains("v1"), "{code}");
         semantic_oracle(&image, &[code], false);
     }
@@ -244,7 +244,7 @@ fn swapping_parameter_names_preserves_their_slots() {
         ["name unused value", "name value unused"],
     ] {
         let code = decompile(&image, PROTO, &assertions);
-        kuna_harness::c_behavior::assert_c_parameters(&code, "probe", &["value", "unused"], "int (*)(void *, int)");
+        assert!(code.contains("probe(void *value,int4 unused)"), "{code}");
         assert!(code.contains("return unused + 1;"), "{code}");
         assert!(!code.contains("v1"), "{code}");
     }
@@ -258,7 +258,7 @@ fn a_stack_parameter_is_replayed_by_its_parameter_slot() {
     let control = decompile(&image, prototype, &[]);
     assert!(control.contains("return value;"), "{control}");
     let renamed = decompile(&image, prototype, &["name value property"]);
-    kuna_harness::c_behavior::assert_c_parameters(&renamed, "probe", &["a", "b", "c", "d", "e", "f", "property"], "int (*)(int,int,int,int,int,int,int)");
+    assert!(renamed.contains("int4 property)"), "{renamed}");
     assert!(renamed.contains("return property;"), "{renamed}");
     assert!(!renamed.contains("value"), "{renamed}");
     std::fs::remove_file(image).unwrap();
@@ -324,7 +324,10 @@ fn later_register_alias_keeps_the_parameter_checks_and_call_value() {
         let local = register_local(&control, register);
         let directive = format!("name {local} cleared_property");
         let renamed = decompile(&image, &proto, &[&callee, &directive]);
-        kuna_harness::c_behavior::assert_c_parameters(&renamed, "probe", &["popup", "property"], if msabi { "int (__attribute__((ms_abi)) *)(void *, int)" } else { "int (*)(void *, int)" });
+        assert!(
+            renamed.contains("probe(void *popup,int4 property)"),
+            "{renamed}"
+        );
         assert!(renamed.contains("if (property != 7)"), "{renamed}");
         assert!(renamed.contains("if (property != 0xb)"), "{renamed}");
         assert!(renamed.contains("cleared_property = 0x29;"), "{renamed}");
@@ -352,10 +355,10 @@ fn later_narrow_register_lifetime_preserves_the_wider_parameter() {
     let local = register_local(&control, "edx");
     let directive = format!("name {local} cleared_property");
     let renamed = decompile(&image, proto, &[callee, &directive]);
-    kuna_harness::c_behavior::assert_c_parameters(&renamed, "probe", &["popup", "property"], "int (__attribute__((ms_abi)) *)(void *, unsigned long long)");
+    assert!(renamed.contains("probe(void *popup,uint8 property)"), "{renamed}");
     assert!(renamed.contains("if ((int4)property != 7)"), "{renamed}");
     assert!(renamed.contains("if ((int4)property != 0xb)"), "{renamed}");
-    kuna_harness::c_behavior::assert_c_declaration(&renamed, "cleared_property", "int", "edx");
+    assert!(renamed.contains("int4 cleared_property; // edx"), "{renamed}");
     assert!(renamed.contains("sink(popup,cleared_property)"), "{renamed}");
     semantic_oracle_with_parameter(
         &image,

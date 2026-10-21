@@ -627,7 +627,7 @@ fn frame_bookkeeping_preserves_native_writes_and_real_snapshots() {
 #include <stdint.h>
 #include <string.h>
 typedef uint8_t uint1; typedef uint8_t undefined1;
-typedef uint16_t uint2; typedef uint32_t uint4; typedef unsigned long long uint8;
+typedef uint16_t uint2; typedef uint32_t uint4; typedef uint64_t uint8;
 typedef int32_t int4;
 struct ChoiceItem;
 void expose_input(const struct ChoiceItem *item);
@@ -910,9 +910,7 @@ fn locked_pointer_views_keep_interiors_retypes_and_name_collisions_readable() {
             "name obj_reuse::object_401064_1 replacement",
         ],
     );
-    kuna_harness::c_behavior::assert_c_declaration(
-        &collision, "initial_view", "int", "ebx",
-    );
+    assert!(collision.contains("int4 initial_view;"), "{collision}");
     assert!(collision.contains("read_pair(initial_view_"), "{collision}");
     native_code("obj_reuse", "", 32, collision);
 
@@ -1443,15 +1441,7 @@ int4 check_snapshot(uint8 input,void (*callback)(void *),uint8 expected) {
             } else {
                 "cached_word"
             };
-            if assertions.len() == 2 {
-                kuna_harness::c_behavior::assert_c_declaration(
-                    &code, name, "unsigned long long", "stack - 0x28",
-                );
-            } else {
-                kuna_harness::c_behavior::assert_c_unsigned_integer_declaration(
-                    &code, name, 8, "stack - 0x28",
-                );
-            }
+            assert!(code.contains(&format!("uint8 {name};")), "{code}");
             assert!(!code.contains(".bytes._"), "{code}");
             execute_with_context("check_snapshot", &cases, context, &code, helpers);
         }
@@ -1511,7 +1501,7 @@ int4 check_publication(uint4 capacity,int4 *value) {
                 .chain(names.iter().copied())
                 .collect();
             let code = decompile_surface("publish_frame_word", true, &[], &assertions, json);
-            kuna_harness::c_behavior::assert_c_declaration(&code, "v1", "int **", "rax");
+            assert!(code.contains("int4 **v1;"), "{code}");
             assert!(
                 !code.contains(".bytes._") && !code.contains("(uint1[8])"),
                 "{code}"

@@ -150,6 +150,7 @@ fn project_callback_header_preserves_open_closed_fixed_and_variadic_types() {
     let exported = Command::new(env!("CARGO_BIN_EXE_kuna"))
         .args(["decompile-project", input.path.to_str().unwrap(), "-o", project.to_str().unwrap(),
             "--sleighpath", &specs(), "--mode", "aggressive", "--option", "protoorder", "off",
+            "--option", "dwarftypedefs", "on",
             "--functions", "invoke_open,invoke_closed,invoke_fixed,invoke_variadic"])
         .env(kuna_decomp::kuna_calltargettype::CALLTARGETTYPE_ENV, "on")
         .output().unwrap();

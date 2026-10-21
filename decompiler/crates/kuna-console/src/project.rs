@@ -1231,7 +1231,11 @@ fn decompile_pulled_inner(
                     };
                     let pointerargs = prog.arch_mut().print_mut().take_pointer_arguments(&untrimmed);
                     let code = untrimmed.trim_matches('\n').to_string();
-                    let globals = kuna_decomp::decompile_drive::extract_global_objects(prog.arch(), &fd)?;
+                    let mut globals = kuna_decomp::decompile_drive::extract_global_objects(prog.arch(), &fd)?;
+                    // A source Symbol the body never spells (a string literal's
+                    // backing object) is not a global "the code names".
+                    globals.retain(|g| g.source_symbol.is_none()
+                        || contains_identifier(&code, &declarator_name(&g.declaration)));
                     let type_bindings = result_type_bindings(prog, &fd);
                     let field_calls = kuna_decomp::kuna_calltargettype::field_declarations(prog.arch(), &fd);
                     let mut variables = if no_vars {
