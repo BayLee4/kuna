@@ -4364,29 +4364,34 @@ impl PrintC {
             datatype = Some(object);
         }
 
-        // C++ `emitVarDecl` declares the whole *Symbol*'s type (printc.cc:1719
-        // `sym->getType()`), not the partial member Varnode's type.  When the
-        // high is a non-array partial cover of a composite Symbol (a struct/
-        // union member, `kuna_symbol_offset() >= 0`), the local storage
-        // representative carries only the truncated member type (e.g. the
-        // 1-byte `flagfield` read => `undefined1`); declare the composite Symbol
-        // type (`enumstruct`) so the member access `v1.flagfield` has a base of
-        // the right type.  (The array case is handled by `array_count` below, so
-        // it is excluded here.)
+        // C++ `emitVarDecl` declares the whole Symbol's type, not a member's
+        // storage width. A bounded storage piece of a mapped scalar also needs
+        // that whole object: two four-byte stores through one eight-byte Symbol
+        // must not share a four-byte C declaration. Keep address-only references
+        // with `kuna_addressdecl`, standalone pieces with their own declarations,
+        // and an outgrown frame-map Symbol with its wider storage representative.
+        // Arrays retain their existing element/declarator handling below.
         if let Some(st) = fd.high_bank().get(high).and_then(|h| {
-            if h.kuna_symbol_offset() >= 0 {
-                h.kuna_symbol_type()
-            } else {
+            let offset = h.kuna_symbol_offset();
+            if offset < 0 { return None; }
+            let st = h.kuna_symbol_type()?;
+            use crate::dtype::type_metatype::*;
+            if matches!(st.get_metatype(), TYPE_STRUCT | TYPE_UNION) {
+                return Some(st);
+            }
+            if st.get_metatype() == TYPE_ARRAY || self.local_name_standalones.contains(&high) {
                 None
+            } else {
+                let width = (0..h.num_instances()).filter_map(|i|
+                    fd.vbank().get(h.get_instance(i)).filter(|v| !v.is_constant())
+                        .map(|v| v.get_size())).max()?;
+                let end = offset.checked_add(width)?;
+                (width > 0 && width < st.get_size() && end <= st.get_size()
+                    && st.get_metatype() != TYPE_UNKNOWN).then_some(st)
             }
         }) {
-            let mt = st.get_metatype();
-            if mt == crate::dtype::type_metatype::TYPE_STRUCT
-                || mt == crate::dtype::type_metatype::TYPE_UNION
-            {
-                type_name = type_name_for_decl(st, rt);
-                datatype = Some(std::rc::Rc::clone(st));
-            }
+            type_name = type_name_for_decl(st, rt);
+            datatype = Some(std::rc::Rc::clone(st));
         }
         // Array member: if the mapped Symbol is an array, declare the base
         // type and an `[count]` adornment after the name (C++ `emitVarDecl`'s

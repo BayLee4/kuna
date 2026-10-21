@@ -791,7 +791,7 @@ fn descend(
             Some(entry) => entry,
             None if prologues && !prologues_done => {
                 prologues_done = true;
-                let mut listing = partition_listing(&partition, &st.funcs, &exec);
+                let mut listing = partition_listing(&partition, &st.funcs, &exec, &st);
                 if gapwalk {
                     render_fingerprints(
                         &mut listing, &st.funcs, arch, translate, &code_space,
@@ -849,7 +849,7 @@ fn descend(
                         let original = frame_partition.as_ref().unwrap();
                         let candidates = frame_candidates.iter().copied()
                             .filter(|root| st.funcs.contains(root)).collect();
-                        let mut corpus = partition_listing(&partition, &st.funcs, &exec);
+                        let mut corpus = partition_listing(&partition, &st.funcs, &exec, &st);
                         render_fingerprints(
                             &mut corpus, &st.funcs, arch, translate, &code_space,
                             &partition, fingerprint_contexts.as_ref(),
@@ -947,6 +947,7 @@ fn descend(
                         &partition,
                         &st.funcs,
                         &exec,
+                        &st,
                         fingerprint_contexts.as_ref(),
                         frame_partition.as_ref(),
                         arch.analysis_aifbracket
@@ -1308,6 +1309,7 @@ fn gap_entries(
     partition: &[(u64, u32)],
     funcs: &BTreeSet<u64>,
     exec: &[(u64, u64)],
+    state: &State,
     contexts: Option<&super::kuna_fingerprintcontext::FingerprintContexts>,
     frame: Option<&super::Listing>,
     bracket: Option<&crate::aif::kuna_aifbracket::BracketEvidence>,
@@ -1315,7 +1317,7 @@ fn gap_entries(
     if funcs.len() < AIF_MIN_FUNCTIONS || partition.is_empty() {
         return Vec::new();
     }
-    let mut listing = partition_listing(partition, funcs, exec);
+    let mut listing = partition_listing(partition, funcs, exec, state);
     let _probe = crate::aif::arm_gap_probe_scope(translate);
     render_fingerprints(&mut listing, funcs, arch, translate, code_space, partition, contexts);
     let poolslide = (arch.analysis_aifpoolslide && crate::loadimage_object::is_arm32_language(&arch.archid))
@@ -1394,6 +1396,7 @@ fn partition_listing(
     partition: &[(u64, u32)],
     funcs: &BTreeSet<u64>,
     exec: &[(u64, u64)],
+    state: &State,
 ) -> super::Listing {
     let mut insns = super::kuna_insnstore::InstructionStore::default();
     for &(addr, len) in partition {
@@ -1411,7 +1414,7 @@ fn partition_listing(
             },
         );
     }
-    super::Listing::from_partition_store(
+    let mut listing = super::Listing::from_partition_store(
         insns,
         funcs
             .iter()
@@ -1429,7 +1432,23 @@ fn partition_listing(
             })
             .collect(),
         exec.to_vec(),
-    )
+    );
+    listing.refs = super::kuna_compactrefs::ReferenceIndex::new(
+        state.by_source.values().flatten().map(|reference| super::Reference {
+            from: reference.from,
+            to: reference.to,
+            kind: match reference.kind {
+                XrefKind::Call => super::RefKind::Call,
+                XrefKind::Jump => super::RefKind::Code,
+                XrefKind::Read => super::RefKind::Read,
+                XrefKind::Write => super::RefKind::Write,
+                XrefKind::Data => super::RefKind::Data,
+            },
+            op_index: None,
+        }).collect(),
+    );
+    listing.has_refs = true;
+    listing
 }
 
 /// A forwarding veneer: the fixed pointer slot it jumps through, and the VMA one
