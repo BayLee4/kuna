@@ -531,6 +531,7 @@ fn entry_fact_acquisition_preserves_terminal_failure_without_caching() {
 #[test]
 fn recoverable_entry_decode_remains_conservatively_unknown() {
     let (mut arch, entry, calls) = crate::engine_translate::test_support::failure_arch(false);
+    arch.remote_scope = Some(crate::remote_provider::empty_host_scope(&arch.translate().manager_rc()));
     let facts = entry_facts(&mut arch, &entry).unwrap().unwrap();
     assert!(!facts.is_complete());
     assert_eq!(calls.get(), 1);

@@ -26,7 +26,7 @@ use crate::context::{ArchContext, BlockId};
 mod config_ir_regressions {
     use super::{Address, ArchContext, Funcdata, OpCode, Rc, build_manager, mk_op, type_metatype};
     #[test]
-    fn constant_input_duplication_preserves_float_bits_type_and_locks() {
+    fn constant_input_duplication_preserves_locked_float_type_and_recomputes_inferred_type() {
         use crate::varnode::varnode_flags;
 
         for bits in [2.5_f64.to_bits(), (-0.0_f64).to_bits()] {
@@ -62,6 +62,12 @@ mod config_ir_regressions {
                     let value = fd.vbank().get(id).unwrap();
                     assert!(value.is_constant());
                     assert_eq!(value.get_offset(), bits);
+                    if id == duplicate && locks == 0 {
+                        // An inferred (unlocked) type is recomputed, not copied.
+                        assert_eq!(value.get_type().get_metatype(), type_metatype::TYPE_UNKNOWN);
+                        assert_eq!(value.get_type().get_size(), 8);
+                        continue;
+                    }
                     assert_eq!(value.get_type().get_metatype(), type_metatype::TYPE_FLOAT);
                     assert_eq!(value.get_type().get_size(), 8);
                     assert_eq!(value.is_type_lock(), locks != 0);

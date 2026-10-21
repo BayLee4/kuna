@@ -1047,7 +1047,7 @@ pub(crate) fn probe_cached(
         let memory_layout = arch.manage().get_default_data_space()
             .map(|space| (space.get_index(), space.is_big_endian()));
         let probed =
-            probe_entry_with(arch.translate(), entry, reg_idx, follow, &traps, &arch.format_stack_args, stack_pointer, memory_layout)?;
+            probe_entry_with(arch.translate(), entry, reg_idx, follow, &traps, &arch.format_stack_args, stack_pointer, memory_layout, arch.remote_scope.is_some())?;
         arch.kuna_callee_dead_cache.insert(key, Rc::new(probed));
     }
     Ok(arch.kuna_callee_dead_cache.get(&key).cloned())
@@ -1548,7 +1548,7 @@ pub fn probe_entry<T: kuna_sleigh::translate::Translate + ?Sized>(
     reg_idx: int4,
     follow: bool,
 ) -> KunaResult<CalleeEntryDead> {
-    probe_entry_with(tr, entry, reg_idx, follow, &[], &std::collections::BTreeMap::new(), None, None)
+    probe_entry_with(tr, entry, reg_idx, follow, &[], &std::collections::BTreeMap::new(), None, None, false)
 }
 
 /// [`probe_entry`], recording where a path reaches one of the system-call user
@@ -1569,6 +1569,7 @@ pub fn probe_entry_with<T: kuna_sleigh::translate::Translate + ?Sized>(
     stack_args: &std::collections::BTreeMap<u64, usize>,
     stack_pointer: Option<(u64, u32)>,
     memory_layout: Option<(int4, bool)>,
+    strict_undecodable: bool,
 ) -> KunaResult<CalleeEntryDead> {
     let mut res = CalleeEntryDead {
         reg_idx, complete: true, stack_effect_invalid: stack_pointer.is_none(),
@@ -1591,10 +1592,10 @@ pub fn probe_entry_with<T: kuna_sleigh::translate::Translate + ?Sized>(
     };
     let start = vec![Frame { at: entry.clone(), written: ByteSet::new(), pushed }];
     let mut skips = Vec::new();
-    walk(tr, &mut res, start, if follow { Skips::Aside(&mut skips) } else { Skips::Dropped }, traps, stack_args)?;
+    walk(tr, &mut res, start, if follow { Skips::Aside(&mut skips) } else { Skips::Dropped }, traps, stack_args, strict_undecodable)?;
     if res.complete && !skips.is_empty() {
         let mut late = CalleeEntryDead { reg_idx, complete: true, ..CalleeEntryDead::default() };
-        walk(tr, &mut late, skips, Skips::Walked, traps, stack_args)?;
+        walk(tr, &mut late, skips, Skips::Walked, traps, stack_args, strict_undecodable)?;
         res.skipped = Some(Box::new(late));
     }
     if !res.complete {
@@ -1635,6 +1636,7 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
     mut skips: Skips<'_>,
     traps: &[uint4],
     stack_args: &std::collections::BTreeMap<u64, usize>,
+    strict_undecodable: bool,
 ) -> KunaResult<()> {
     let mut visited: HashMap<(int4, u64), (ByteSet, Option<(u64, u32)>, Option<i64>)> = HashMap::new();
     let mut budget = MAX_PROBE_INSTRUCTIONS;
@@ -1668,13 +1670,21 @@ fn walk<T: kuna_sleigh::translate::Translate + ?Sized>(
         let len = match tr.one_instruction(&mut emit, &frame.at) {
             Ok(n) if n > 0 => n,
             Err(error @ kuna_base::error::KunaError::Transport { .. }) => return Err(error),
-            // A failed decode does not cover the rest of this path. In
-            // particular, an empty entry is unknown, not complete no-read
-            // evidence for consumers that trim a recovered parameter list.
-            _ => {
+            // A host session treats a failed decode as covering nothing: an
+            // empty entry is unknown, not complete no-read evidence for
+            // consumers that trim a recovered parameter list.
+            _ if strict_undecodable => {
                 res.undecodable = true;
                 res.complete = false;
                 break;
+            }
+            // Undecodable: the path ends where the walk cannot see.
+            _ => {
+                res.undecodable = true;
+                frame.pushed.flush(res);
+                res.opaque_cuts.push(frame.written.clone());
+                res.cuts.push(frame.written);
+                continue;
             }
         };
         let skip = if follow { Some(&mut found) } else { None };

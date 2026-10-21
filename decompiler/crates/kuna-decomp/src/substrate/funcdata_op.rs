@@ -483,8 +483,12 @@ impl Funcdata {
                 let (size, off, dtype, flags) =
                     (v.get_size(), v.get_offset(), Rc::clone(v.get_type()), v.get_flags());
                 let cvn = self.new_constant(size, off);
-                self.vbank_mut().get_mut(cvn).expect("fresh constant")
-                    .copy_symbol_fields(dtype, flags);
+                // Only a locked constant (a forced type or name) carries its
+                // type onto the duplicate; an inferred type is recomputed.
+                if flags & (crate::varnode::varnode_flags::typelock | crate::varnode::varnode_flags::namelock) != 0 {
+                    self.vbank_mut().get_mut(cvn).expect("fresh constant")
+                        .copy_symbol_fields(dtype, flags);
+                }
                 // Preserve any bound (dynamic) SymbolEntry
                 // onto the duplicated constant (C++ `funcdata_op.cc:111`).  Without
                 // this an equate parked on a shared constant is lost the first time

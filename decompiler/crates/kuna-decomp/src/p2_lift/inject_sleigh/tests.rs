@@ -658,6 +658,7 @@ fn live_model_payload_preserves_call_store_load_order_and_operand_geometry() {
     let ram = Rc::clone(manager.get_default_code_space().unwrap());
     let address = Address::new(Rc::clone(&ram), 0x1000);
     let mut context = ArchContext::new_shared(manager);
+    context.remote_scope = Some(crate::remote_provider::empty_host_scope(&context.manage));
     context.injection_library = Some(library);
     let mut model = ProtoModel::new(context.manage());
     model.build_param_list("standard").unwrap();

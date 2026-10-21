@@ -1495,3 +1495,22 @@ impl RemoteScope {
 
 #[cfg(test)]
 mod tests;
+
+/// A host scope that answers every query with an empty result: tests use it to
+/// make an analysis behave as a host session without a wire.
+#[cfg(test)]
+pub(crate) fn empty_host_scope(manager: &Rc<AddrSpaceManager>) -> Rc<RemoteScope> {
+    struct Empty;
+    impl RemoteProviderFetch for Empty {
+        fn fetch_mapped_symbols(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+        fn fetch_namespace_path(&self, _: u64, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+        fn fetch_external_ref(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+        fn fetch_tracked_registers(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+        fn fetch_comments(&self, _: &Address, _: u32, _: &mut dyn Decoder) -> KunaResult<bool> { Ok(false) }
+    }
+    Rc::new(RemoteScope::new(
+        Rc::new(Empty), Rc::clone(manager), Rc::new(TypeFactoryImpl::new()),
+        Rc::new(RefCell::new(std::collections::BTreeMap::new())), None,
+        GlobalQuery::new(Vec::new(), RangeList::default(), PartMap::default()),
+    ))
+}

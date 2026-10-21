@@ -767,6 +767,7 @@ fn acquisition_propagates_transport_before_caching_but_retains_recoverable_unkno
         assert_eq!(queries.get(), expected);
     }
     let (mut arch, entry, queries) = failure_arch(false);
+    arch.remote_scope = Some(crate::remote_provider::empty_host_scope(&arch.translate().manager_rc()));
     let summary = probe_cached(&mut arch, &entry, 2).unwrap().unwrap();
     let register = Address::new(
         Rc::clone(arch.manage().get_space_by_name("register").unwrap()), 0x18);
