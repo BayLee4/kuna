@@ -819,11 +819,11 @@ pub fn redo_replaces(first: &FuncResult, again: &FuncResult) -> bool {
 
 /// Does this result spell any of `names` as a type name?
 ///
-/// Retained typed bindings remain available after a streamed body is appended
-/// and released. Text matching supports older synthetic records without them.
+/// Retained typed bindings answer only once a streamed body has been appended and
+/// released; while the body is present its text is the surface a rename reaches.
 pub fn names_any_type(r: &FuncResult, names: &[String]) -> bool {
     let mut hit = |hay: &str| names.iter().any(|n| contains_identifier(hay, n));
-    r.type_bindings.iter().any(|binding| names.contains(&binding.presentation))
+    (r.code.is_none() && r.type_bindings.iter().any(|binding| names.contains(&binding.presentation)))
         || r.code.as_deref().is_some_and(&mut hit)
         || r.proto.as_deref().is_some_and(&mut hit)
         || r.variables.iter().any(|v| hit(&v.type_name))

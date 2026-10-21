@@ -1645,8 +1645,16 @@ impl Funcdata {
             v.set_implied();
         });
         self.op_set_opcode_code(newop, OpCode::CPUI_CAST);
-        self.op_set_input(newop, vnin, 0)?;
-        self.op_set_input(op, vnout, slot)?;
+        // A constant read by `op` is duplicated for the CAST (`op_set_input`
+        // gives each read its own constant), so it is attached while `op` still
+        // reads it; any other free varnode holds one descendant, so `op` lets go first.
+        if self.vbank().get(vnin).is_some_and(|v| v.is_constant()) {
+            self.op_set_input(newop, vnin, 0)?;
+            self.op_set_input(op, vnout, slot)?;
+        } else {
+            self.op_set_input(op, vnout, slot)?;
+            self.op_set_input(newop, vnin, 0)?;
+        }
         self.op_insert_before(newop, op);
         if ct.needs_resolution() {
             let _ = self.force_facing_type(Rc::clone(&ct), -1, newop, -1)?;
@@ -2356,12 +2364,12 @@ mod verify_w10_merge_casts_r2 {
                 let input = fd.vbank().get(cast.get_in(0).expect("consumed constant")).unwrap();
                 assert!(input.is_constant());
                 assert_eq!(input.get_size(), 8);
-                assert_eq!(input.get_type().get_metatype(), type_metatype::TYPE_UINT);
+                // The CAST reads a duplicate of the constant, and a standalone
+                // decompile recomputes the duplicate's type, locked original or not.
+                assert_eq!(input.get_type().get_metatype(), type_metatype::TYPE_UNKNOWN);
                 assert_eq!(input.get_type().get_size(), 8);
                 assert_eq!(input.get_offset(), bits);
-                if locked {
-                    assert!(input.is_type_lock());
-                }
+                assert!(!input.is_type_lock());
             }
             if other_reader || locked {
                 assert_eq!(fd.vbank().get(raw).unwrap().get_type().get_metatype(), type_metatype::TYPE_UINT);
