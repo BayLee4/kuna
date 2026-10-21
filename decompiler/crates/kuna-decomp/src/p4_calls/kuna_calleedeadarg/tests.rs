@@ -368,6 +368,8 @@ fn saved_cell_reload_does_not_let_padding_evidence_authorize_store_only_argument
 
 #[test]
 fn local_projection_retains_exact_physical_demand_without_source_width_coercion() {
+    use crate::dtype::{type_class, type_metatype, Datatype};
+    use crate::fspec::{FuncCallSpecs, FuncProto, ParamEntry, ParameterPieces, ProtoModel};
     for big in [false, true] {
         let space = |kind, name, index| Rc::new(kuna_base::space::AddrSpace::new(
             kind, name, big, 8, 1, index, 0, 1, 1,
@@ -475,6 +477,57 @@ fn local_projection_retains_exact_physical_demand_without_source_width_coercion(
                 "raw range/width policies do not inherit the physical demand projection");
             assert!(!summary.proves_dead(&raw_address, source_width as int4),
                 "the original read still vetoes dead-entry proof despite a later complete overwrite");
+            if !matches!(shape, "lea" | "scaled_lea" | "whole") {
+                continue;
+            }
+            // Exercise the actual early physical-binding consumer, with the
+            // same one-byte source formal for both the four- and eight-byte body.
+            let mut manager = kuna_base::space::AddrSpaceManager::new();
+            for space in [&constant, &ram, &unique, &reg] {
+                manager.insert_space(Rc::clone(space)).unwrap();
+            }
+            manager.set_default_code_space(1).unwrap();
+            manager.set_default_data_space(1).unwrap();
+            let arch = Rc::new(crate::context::ArchContext::new(manager));
+            let mut data = crate::funcdata::Funcdata::new("caller", "caller", arch,
+                Address::new(Rc::clone(&ram), 0x1000), 0x1000_0000, 0x40).unwrap();
+            let target = data.new_constant(8, 0x2000);
+            let call_op = data.new_op(1, data.get_address().clone());
+            data.op_set_opcode_code(call_op, OpCode::CPUI_CALL);
+            data.op_set_input(call_op, target, 0).unwrap();
+            let mut model = ProtoModel::new(data.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            model.input_mut().push_entry(ParamEntry::seed(0,
+                type_class::TYPECLASS_GENERAL, Rc::clone(&reg), 0x10, 8, 1, 0, 0,
+                true, false, &[], data.get_arch().manage()).unwrap());
+            model.input_mut().finish_decode();
+            model.output_mut().finish_decode();
+            let source_address = Address::new(Rc::clone(&reg), if big { 0x17 } else { 0x10 });
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(model), Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            proto.set_param(0, "flags", &ParameterPieces {
+                addr: source_address.clone(),
+                type_: Some(Rc::new(Datatype::new(1, type_metatype::TYPE_BOOL))), flags: 0,
+            });
+            proto.set_input_lock(true);
+            proto.set_output_lock(true);
+            let entry = Address::new(Rc::clone(&ram), 0x2000);
+            let mut call = FuncCallSpecs::new(call_op, entry.clone());
+            call.proto_mut().copy(&proto);
+            data.push_call_specs(call);
+            data.kuna_set_callee_entry_dead(&entry, Rc::new(summary));
+            crate::coreaction_protos::ActionFuncLink::boxed("g")
+                .apply(&mut data, &mut crate::action::ActionContext::new()).unwrap();
+            let call = data.get_call_specs(0);
+            assert_eq!(data.obank().get(call_op).unwrap().num_input(), 2);
+            assert_eq!(call.active_input().get_num_trials(), 1, "one carrier, not a duplicated source slice");
+            assert_eq!(call.final_input_storage(), &[(Address::new(Rc::clone(&reg), offset), width as int4)]);
+            let param = call.proto().get_param(0).unwrap();
+            assert_eq!(call.proto().num_params(), 1);
+            assert_eq!(param.get_name(), "flags");
+            assert_eq!(param.get_size(), 1);
+            assert_eq!(param.get_address(), source_address);
+            assert_eq!(param.get_type().unwrap().get_metatype(), type_metatype::TYPE_BOOL);
         }
     }
 }

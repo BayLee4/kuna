@@ -844,6 +844,7 @@ impl ActionFuncLink {
             }
         }
         if inputlocked && !varargs {
+            Self::link_physical_inputs(idx, data)?;
             let storage = {
                 let active = data.get_call_specs(idx).active_input();
                 (0..active.get_num_trials()).map(|i| {
@@ -878,6 +879,151 @@ impl ActionFuncLink {
             let result = fc.create_placeholder(data, &sb);
             data.restore_call_specs_at(idx, fc);
             result?;
+        }
+        Ok(())
+    }
+
+    /// A locked declaration is a source formal list, not proof that the body
+    /// cannot consume another ABI register. Retain only exact incoming reads
+    /// proved by the existing body probe, as physical CALL operands/trials.
+    /// No parameter or source symbol is added to the prototype.
+    fn link_physical_inputs(idx: int4, data: &mut Funcdata) -> kuna_base::error::KunaResult<()> {
+        use crate::dtype::type_class;
+        use kuna_base::address::Address;
+        use kuna_base::space::spacetype;
+        let physical: Vec<_> = {
+            let call = data.get_call_specs(idx);
+            let proto = call.proto();
+            if !proto.has_model() || proto.has_custom_storage()
+                || proto.is_inline() || proto.get_inject_id() >= 0
+                || proto.get_inject_upon_entry() >= 0 || proto.get_inject_upon_return() >= 0
+                || data.obank().get(call.get_op()).is_none_or(|op| op.code() != OpCode::CPUI_CALL)
+            {
+                return Ok(());
+            }
+            // A site's logical formal list is not negative body-read evidence.
+            // Its actual model/storage/injection geometry still controls which
+            // physical occurrences may be retained below.
+            // Source hidden/indirect/JOIN roles already own their physical
+            // assembly. Do not infer additional ordinary operands through it.
+            if (0..proto.num_params()).any(|i| proto.get_param(i).is_some_and(|param| {
+                param.is_hidden_return() || param.is_indirect_storage() || param.is_this_pointer()
+                    || param.get_address().get_space()
+                        .is_some_and(|space| space.get_type() == spacetype::IPTR_JOIN)
+            })) {
+                return Ok(());
+            }
+            let Some(reads) = data.kuna_callee_entry_dead(call.get_entry_address()) else {
+                return Ok(());
+            };
+            let entries = proto.model().input().get_entry();
+            let mut ranges: Vec<(Address, int4, Address, int4)> = Vec::new();
+            for (space_index, offset, size) in reads.consumed_input_ranges() {
+                let Some(entry) = entries.iter().find(|entry| {
+                    entry.get_type() == type_class::TYPECLASS_GENERAL
+                        && entry.get_space().get_name() == "register"
+                        && entry.get_space().get_index() == space_index
+                        && size >= entry.get_min_size() && size <= entry.get_size()
+                        && entry.justified_contain(
+                            &Address::new(Rc::clone(entry.get_space()), offset), size,
+                        ) == 0
+                }) else { continue };
+                let Some(end) = offset.checked_add(size as u64) else { continue };
+                let alignment = entry.get_align();
+                if alignment > 0 && entry.get_min_size() > alignment {
+                    continue; // A multi-slot logical assembly needs its existing source owner.
+                }
+                let mut at = offset;
+                while at < end {
+                    let width = if alignment > 0 {
+                        let into_slot = (at - entry.get_base()) % alignment as u64;
+                        (end - at).min(alignment as u64 - into_slot) as int4
+                    } else { size };
+                    let address = Address::new(Rc::clone(entry.get_space()), at);
+                    at += width as u64;
+                    let mut container = kuna_num::pcoderaw::VarnodeData::default();
+                    if width < entry.get_min_size() || entry.justified_contain(&address, width) != 0
+                        || !entry.get_container(&address, width, &mut container)
+                    {
+                        continue;
+                    }
+                    let Some(container_space) = container.space else { continue };
+                    let container_address = Address::new(container_space, container.offset);
+                    if let Some((_, _, existing, old_width)) = ranges.iter_mut().find(|(at, width, _, _)| {
+                        *at == container_address && *width == container.size as int4
+                    }) {
+                        if existing.justified_contain(*old_width, &address, width, false) >= 0 {
+                            continue;
+                        }
+                        if address.justified_contain(width, existing, *old_width, false) < 0 {
+                            continue; // Optional evidence does not invalidate source geometry.
+                        }
+                        *existing = address;
+                        *old_width = width;
+                    } else {
+                        ranges.push((container_address, container.size as int4, address, width));
+                    }
+                }
+            }
+            let mut physical = Vec::new();
+            'candidates: for (_, _, address, size) in ranges {
+                let active = call.active_input();
+                let mut overlap = None;
+                for i in 0..active.get_num_trials() {
+                    let trial = active.get_trial(i);
+                    let at = trial.get_address();
+                    if at.get_space().map(|space| space.get_index())
+                        != address.get_space().map(|space| space.get_index())
+                        || at.get_offset() >= address.get_offset().saturating_add(size as u64)
+                        || address.get_offset() >= at.get_offset().saturating_add(trial.get_size().max(0) as u64)
+                    {
+                        continue;
+                    }
+                    if overlap.is_some() {
+                        continue 'candidates;
+                    }
+                    overlap = Some(i);
+                }
+                if let Some(i) = overlap {
+                    let trial = active.get_trial(i);
+                    if trial.get_address().justified_contain(trial.get_size(), &address, size, false) >= 0 {
+                        continue; // An already wider physical occurrence covers the read.
+                    }
+                    if address.justified_contain(size, trial.get_address(), trial.get_size(), false) < 0
+                        || trial.get_slot() <= 0 || trial.get_slot() == call.get_stack_placeholder_slot()
+                        || data.obank().get(call.get_op()).and_then(|op| op.get_in(trial.get_slot())).is_none()
+                    {
+                        continue;
+                    }
+                    physical.push((address, size, Some((i, trial.get_slot()))));
+                    continue;
+                }
+                physical.push((address, size, None));
+            }
+            physical
+        };
+        let op = data.get_call_specs(idx).get_op();
+        for (address, size, reuse) in physical {
+            let value = data.new_varnode(size, &address, None)?;
+            if let Some((index, slot)) = reuse {
+                let old = data.obank().get(op).and_then(|operation| operation.get_in(slot))
+                    .expect("physical call input: missing staged source operand");
+                data.op_set_input(op, value, slot)?;
+                data.get_call_specs_mut(idx).get_active_input()
+                    .get_trial_mut(index).set_address(address, size);
+                if data.vbank().get(old).is_some_and(|vn| vn.is_free() && vn.has_no_descend()) {
+                    data.delete_varnode(old)?;
+                }
+                continue;
+            }
+            let slot = data.obank().get(op).expect("physical call input: stale op").num_input();
+            data.op_insert_input(op, value, slot)?;
+            let active = data.get_call_specs_mut(idx).get_active_input();
+            let index = active.get_num_trials();
+            active.register_trial(&address, size);
+            let trial = active.get_trial_mut(index);
+            trial.mark_active();
+            trial.set_slot(slot);
         }
         Ok(())
     }
@@ -2540,6 +2686,165 @@ mod tests {
         let copied = fd.new_unique_out(8, copy).unwrap();
         let copied_call = callind(&mut fd, copied);
         assert!(exact_indirect_target_slot(&fd, copied_call).is_none());
+    }
+
+    #[test]
+    fn locked_source_arity_does_not_erase_proven_physical_abi_reads() {
+        use crate::fspec::{FuncCallSpecs, FuncProto, ParamEntry, ParameterPieces, ProtoModel};
+        use crate::dtype::type_class;
+        use crate::p3_dataflow::kuna_calleehomes::tests::Fx;
+        use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
+        for authority in ["body", "aligned", "aligned_wide", "site", "site_model", "site_injection",
+            "site_effect", "injection", "incomplete", "indirect"] {
+            let mut fx = Fx::new();
+            let target = fx.constant(8, 0x2000);
+            let op = fx.emit(
+                if authority == "indirect" { OpCode::CPUI_CALLIND } else { OpCode::CPUI_CALL },
+                &[target], None,
+            ).0;
+            let mut model = ProtoModel::new(fx.fd.get_arch().manage());
+            model.build_param_list("standard").unwrap();
+            let aligned = authority.starts_with("aligned");
+            for (group, offset) in if aligned || authority == "site_model" {
+                vec![(0, 0x10)]
+            } else { vec![(0, 0x10), (1, 0x18)] } {
+                let entry = ParamEntry::seed(group, type_class::TYPECLASS_GENERAL,
+                    Rc::clone(&fx.reg), offset, if aligned { 16 } else { 8 }, 1,
+                    if aligned { 8 } else { 0 }, 0, true, false, &[],
+                    fx.fd.get_arch().manage()).unwrap();
+                model.input_mut().push_entry(entry);
+            }
+            model.input_mut().finish_decode();
+            model.output_mut().finish_decode();
+            let mut proto = FuncProto::new();
+            proto.set_internal(Rc::new(model), Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+            proto.set_param(0, "first", &ParameterPieces {
+                addr: Address::new(Rc::clone(&fx.reg), 0x10),
+                type_: Some(Rc::new(Datatype::new(4, type_metatype::TYPE_INT))),
+                flags: 0,
+            });
+            proto.set_input_lock(true);
+            proto.set_override(authority.starts_with("site"));
+            if authority == "injection" || authority == "site_injection" { proto.set_inject_id(1); }
+            if authority == "site_effect" {
+                proto.push_effect_override(crate::fspec::EffectRecord::from_varnode(
+                    kuna_num::pcoderaw::VarnodeData { space: Some(Rc::clone(&fx.reg)), offset: 0x18, size: 4 },
+                    crate::fspec::effect_type::UNAFFECTED,
+                ));
+            }
+            let entry = Address::new(Rc::clone(&fx.reg), 0x2000);
+            let mut call = FuncCallSpecs::new(op, entry.clone());
+            call.proto_mut().copy(&proto);
+            fx.fd.push_call_specs(call);
+            fx.fd.kuna_set_callee_entry_dead(&entry, Rc::new(CalleeEntryDead::from_parts(
+                fx.reg.get_index(),
+                if authority == "aligned_wide" { vec![(fx.reg.get_index(), 0x10, 16)] }
+                else { vec![(fx.reg.get_index(), 0x10, 4), (fx.reg.get_index(), 0x18, 4),
+                    (fx.reg.get_index(), 0x28, 8)] },
+                vec![vec![]], authority != "incomplete",
+            )));
+            ActionFuncLink::func_link_input(0, &mut fx.fd).unwrap();
+            let call = fx.fd.get_call_specs(0);
+            assert_eq!(call.proto().num_params(), 1, "{authority}: source arity");
+            assert!(call.proto().is_input_locked());
+            assert_eq!(call.proto().get_param(0).unwrap().get_name(), "first");
+            let inputs = fx.fd.obank().get(op).unwrap().num_input();
+            let retains_physical = authority == "body" || aligned || authority == "site" || authority == "site_effect";
+            assert_eq!(inputs, if retains_physical { 3 } else { 2 }, "{authority}");
+            assert_eq!(call.proto().is_override(), authority.starts_with("site"));
+            if authority == "site_effect" {
+                assert_eq!(call.proto().has_effect(&Address::new(Rc::clone(&fx.reg), 0x18), 4),
+                    crate::fspec::effect_type::UNAFFECTED);
+            }
+            if retains_physical {
+                let width = if authority == "aligned_wide" { 8 } else { 4 };
+                assert_eq!(call.final_input_storage().len(), 2);
+                assert_eq!(call.final_input_storage()[1], (Address::new(Rc::clone(&fx.reg), 0x18), width));
+                let physical = fx.fd.obank().get(op).unwrap().get_in(2).unwrap();
+                assert_eq!(fx.fd.vbank().get(physical).unwrap().get_size(), width);
+                assert_eq!(fx.fd.vbank().get(physical).unwrap().get_offset(), 0x18);
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_slice_reuses_one_physical_carrier_with_endian_aware_geometry() {
+        use crate::dtype::type_class;
+        use crate::fspec::{FuncCallSpecs, FuncProto, ParamEntry, ParameterPieces, ProtoModel};
+        use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
+        for big in [false, true] {
+            for shape in ["lower", "upper", "straddle"] {
+                let mut manager = build_manager();
+                let register = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR,
+                    "register", big, 8, 1, 3, addrspace_flags::hasphysical, 1, 1));
+                manager.insert_space(Rc::clone(&register)).unwrap();
+                let arch = Rc::new(ArchContext::new(manager));
+                let code = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
+                let mut data = Funcdata::new("caller", "caller", arch,
+                    Address::new(Rc::clone(&code), 0x1000), 0x1000_0000, 0x40).unwrap();
+                let target = data.new_constant(8, 0x2000);
+                let op = callind(&mut data, target);
+                data.op_set_opcode_code(op, OpCode::CPUI_CALL);
+                let mut model = ProtoModel::new(data.get_arch().manage());
+                model.build_param_list("standard").unwrap();
+                model.input_mut().push_entry(ParamEntry::seed(0,
+                    type_class::TYPECLASS_GENERAL, Rc::clone(&register), 0x10,
+                    8, 1, 0, 0, true, false, &[], data.get_arch().manage()).unwrap());
+                model.input_mut().finish_decode();
+                model.output_mut().finish_decode();
+                let carrier = if big { 0x14 } else { 0x10 };
+                let source = if shape == "straddle" { carrier + 2 }
+                    else if shape == "upper" { carrier + 1 } else if big { 0x17 } else { 0x10 };
+                let source_address = Address::new(Rc::clone(&register), source);
+                let source_type = Rc::new(Datatype::new(
+                    if shape == "straddle" { 4 } else { 1 },
+                    if shape == "straddle" { type_metatype::TYPE_UINT } else { type_metatype::TYPE_BOOL },
+                ));
+                let mut proto = FuncProto::new();
+                proto.set_internal(Rc::new(model), Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
+                proto.set_param(0, "flags", &ParameterPieces {
+                    addr: source_address.clone(), type_: Some(Rc::clone(&source_type)), flags: 0,
+                });
+                proto.set_input_lock(true);
+                let entry = Address::new(code, 0x2000);
+                let mut call = FuncCallSpecs::new(op, entry.clone());
+                call.proto_mut().copy(&proto);
+                data.push_call_specs(call);
+                // Both low-byte and word reads occupy this one ABI occurrence,
+                // even when their big-endian start addresses differ.
+                data.kuna_set_callee_entry_dead(&entry, Rc::new(CalleeEntryDead::from_parts(
+                    register.get_index(), vec![(register.get_index(), if big { 0x17 } else { 0x10 }, 1),
+                        (register.get_index(), carrier, 4)], vec![vec![]], true,
+                )));
+                let result = ActionFuncLink::func_link_input(0, &mut data);
+                if shape == "straddle" {
+                    result.unwrap(); // Unsupported optional evidence is not an analysis failure.
+                    let call = data.get_call_specs(0);
+                    assert_eq!(call.proto().get_param(0).unwrap().get_address(), source_address);
+                    assert_eq!(call.active_input().get_trial(0).get_address(), &source_address);
+                    assert_eq!(call.active_input().get_trial(0).get_size(), 4);
+                    assert_eq!(data.obank().get(op).unwrap().num_input(), 2);
+                    continue;
+                }
+                result.unwrap();
+                let call = data.get_call_specs(0);
+                assert_eq!(data.obank().get(op).unwrap().num_input(), 2, "no extra source projection");
+                assert_eq!(call.proto().num_params(), 1);
+                let param = call.proto().get_param(0).unwrap();
+                assert_eq!(param.get_address(), source_address);
+                assert!(Rc::ptr_eq(param.get_type().unwrap(), &source_type));
+                assert_eq!(param.get_name(), "flags");
+                assert!(param.is_type_locked());
+                let trial = call.active_input().get_trial(0);
+                assert_eq!(trial.get_slot(), 1);
+                assert!(trial.is_active());
+                assert_eq!(trial.get_size(), 4);
+                assert_eq!(trial.get_address().get_offset(), carrier);
+                assert_eq!(call.final_input_storage(), &[(Address::new(Rc::clone(&register), carrier), 4)]);
+                let physical = data.obank().get(op).unwrap().get_in(1).unwrap();
+                assert_eq!(data.vbank().get(physical).unwrap().get_size(), 4);
+            }
+        }
     }
 
     #[test]

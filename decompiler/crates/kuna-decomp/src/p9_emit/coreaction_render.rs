@@ -1353,6 +1353,11 @@ impl Action for ActionDeindirect {
                 };
 
             if let Some((name, entry, proto)) = resolved {
+                let proto = glb.types_rc()
+                    .map(|types| types.apply_source_prototype(&proto))
+                    .transpose()?
+                    .map(std::rc::Rc::new)
+                    .unwrap_or(proto);
                 // fc->deindirect(data, newfd): splice the call spec out so it can be
                 // mutated alongside `&mut data` (the op rewrite + override + proto
                 // merge), then re-insert it at the same index to keep `qlst` ordering.
