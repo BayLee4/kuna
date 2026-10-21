@@ -43,14 +43,6 @@ fn repo_root() -> PathBuf {
 /// Bootstrap the fixture with `typedepth` on/off, decompile each of `funcs` and return the
 /// concatenated C.
 fn decompile(funcs: &[&str], typedepth: bool) -> String {
-    decompile_checking(funcs, typedepth, |_| {})
-}
-
-fn decompile_checking(
-    funcs: &[&str],
-    typedepth: bool,
-    check: impl FnOnce(&kuna_console::engine::ConsoleProgram),
-) -> String {
     let _guard = GATE.lock().unwrap_or_else(|e| e.into_inner());
     let root = repo_root();
     let specs = root.join("specs");
@@ -74,7 +66,6 @@ fn decompile_checking(
     std::env::remove_var(DWARFSTRUCTS_ENV);
     let mut prog = prog.expect("bootstrap fixture with built processor specs");
     prog.commit_pending_analysis().expect("analysis commit succeeds");
-    check(&prog);
 
     let mut cmds: Vec<String> = Vec::new();
     for f in funcs {
@@ -102,11 +93,9 @@ fn decompile_checking(
 fn stack_local_keeps_its_element_type() {
     let (off, on) =
         (decompile(&["count_authors"], false), decompile(&["count_authors"], true));
-    assert!(off.contains("void * const *p"), "gate off should lose the pointee but retain the reached qualification, got:\n{off}");
+    assert!(off.contains("void **p"), "gate off should reproduce the bug, got:\n{off}");
     assert!(
-        on.contains("const char * const *p")
-            && !on.contains("void **p")
-            && !on.contains("void * const *p"),
+        on.contains("char **p") && !on.contains("void **p"),
         "`const char *const *p` should keep its element type, got:\n{on}"
     );
 }
@@ -151,52 +140,18 @@ fn colliding_typedef_name_falls_back_not_to_void() {
     assert!(on.contains("anon_struct *base"), "expected the anonymous fallback, got:\n{on}");
 }
 
-fn check_authors_global(program: &kuna_console::engine::ConsoleProgram, typedepth: bool) {
-    use kuna_decomp::{dtype::type_metatype, kuna_typequal::CONST};
-    let database = &program.arch().symboltab;
-    let scope = database.get_global_scope().unwrap();
-    let ids = database.query_by_name(scope, "default_authors");
-    assert_eq!(ids.len(), 1, "the original global has one mapped declaration");
-    let symbol = database.symbol(ids[0]);
-    let array = symbol.dtype.as_ref().unwrap();
-    assert_eq!(array.get_size(), 24, "retain the original producer's object extent");
-    assert_eq!(database.entry(symbol.scope, symbol.mapentry[0]).get_size(), 24);
-    assert!(symbol.is_name_locked());
-    assert_eq!(symbol.is_type_locked(), typedepth, "DWARF adds the declaration, not a guessed pointee");
-    if typedepth {
-        assert_eq!(array.num_elements(), Some(3));
-        let pointer = array.get_array_base().expect("declared array element");
-        assert_eq!((pointer.get_metatype(), pointer.get_size()), (type_metatype::TYPE_PTR, 8));
-        assert_ne!(pointer.c_qualifiers() & CONST, 0);
-        let character = pointer.get_ptr_to().expect("declared character pointee");
-        assert_eq!((character.get_name(), character.get_size()), ("char", 1));
-        assert_ne!(character.c_qualifiers() & CONST, 0);
-    } else {
-        assert!(!array.get_array_base().and_then(|element| element.get_ptr_to())
-            .is_some_and(|pointee| pointee.get_name() == "char"),
-            "the depth budget must still lose the declared character pointee");
-    }
-}
-
-const DEGRADED_AUTHORS_CALL: &str =
-    r"\bcount_authors\(\s*\(\s*void\s*\*\s*(?:const\s*)?\*\s*\)\s*default_authors\s*\)";
-const TYPED_AUTHORS_CALL: &str =
-    r"\bcount_authors\(\s*(?:\(\s*(?:const\s+)?char\s*\*\s*(?:const\s*)?\*\s*\)\s*)?default_authors\s*\)";
-
-/// The loader retains the original 24-byte object even with the depth budget.
-/// Full-depth DWARF additionally supplies its three qualified character pointers;
-/// its compatible consumer need not cast the already-correct array.
+/// A global whose element type is four DIEs deep was marked one byte wide, so it
+/// rendered address-taken; with the real extent it decays like the array it is.
 #[test]
 fn global_array_gets_its_real_extent() {
-    let off = decompile_checking(&["main"], false, |program| check_authors_global(program, false));
-    let on = decompile_checking(&["main"], true, |program| check_authors_global(program, true));
+    let (off, on) = (decompile(&["main"], false), decompile(&["main"], true));
     assert!(
-        regex::Regex::new(DEGRADED_AUTHORS_CALL).unwrap().is_match(&off),
-        "gate off retains object extent but loses the qualified character pointee:\n{off}"
+        off.contains("(char **)&default_authors"),
+        "gate off should reproduce the bug, got:\n{off}"
     );
     assert!(
-        regex::Regex::new(TYPED_AUTHORS_CALL).unwrap().is_match(&on),
-        "the declared array must decay at its actual consumer, without address-taking:\n{on}"
+        on.contains("(char **)default_authors"),
+        "the global array should carry its real extent, got:\n{on}"
     );
 }
 

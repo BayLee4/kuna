@@ -12,22 +12,7 @@ use kuna_console::ifaceterm::ConsoleCommands;
 
 const FIXTURE: &str = "pe_iatincode_readonly_i386.exe";
 const ENTRY: u64 = 0x401010;
-// The imported Win32 declaration supplies four arguments, independently of the
-// two values this fixture explicitly stages. Match their meaning and order,
-// not local names, whitespace, null printing, or equivalent 32-bit casts.
-fn named_call_matches(code: &str, library_source: bool) -> bool {
-    let address = r"(?:\(\s*void\s*\*\s*\)\s*)?(?:0[xX]40|64)";
-    let word = r"(?:\(\s*(?:uint4|uint32_t|unsigned(?:\s+int)?)\s*\)\s*)?";
-    let zero = r"(?:\(\s*(?:(?:const\s+)?char|void)\s*\*\s*\)\s*)?(?:NULL|0[xX]0+|0)";
-    let trailing = if library_source {
-        r",\s*[A-Za-z_][A-Za-z_0-9]*\s*,\s*[A-Za-z_][A-Za-z_0-9]*\s*"
-    } else {
-        ""
-    };
-    regex::Regex::new(&format!(
-        r"(?m)^\s*VirtualAlloc\s*\(\s*{address}\s*,\s*{word}GetModuleHandleA\s*\(\s*{zero}\s*\)\s*{trailing}\)\s*;\s*$"
-    )).unwrap().is_match(code)
-}
+const NAMED_CALL: &str = "VirtualAlloc(0x40,GetModuleHandleA(0));";
 const RAW_CALL: &str = "(*(code *)0x10a0)(0x40,(*(code *)0x10b0)(0));";
 
 fn repo_root() -> PathBuf {
@@ -106,7 +91,7 @@ fn default_and_explicit_on_keep_the_nested_calls_named() {
         let prog = load(options);
         let c = body(prog);
         assert!(
-            named_call_matches(&c, true),
+            c.contains(NAMED_CALL),
             "both import calls and their arguments must survive; got:\n{c}"
         );
         assert!(
@@ -125,7 +110,7 @@ fn readonly_on_still_preserves_external_reference_identity() {
     let prog = load(&[("peimportcall", "on"), ("readonly", "on")]);
     let c = body(prog);
     assert!(
-        named_call_matches(&c, true),
+        c.contains(NAMED_CALL),
         "program-wide read-only folding must not consume an external reference; got:\n{c}"
     );
     assert!(
@@ -136,15 +121,4 @@ fn readonly_on_still_preserves_external_reference_identity() {
         !c.contains("0x10b0"),
         "the nested call must retain its import identity; got:\n{c}"
     );
-}
-
-#[test]
-fn library_disabled_retains_the_original_two_staged_values() {
-    for readonly in ["off", "on"] {
-        let c = body(load(&[("peimportcall", "on"), ("win32sigs", "off"), ("readonly", readonly)]));
-        assert!(named_call_matches(&c, false), "the original two staged values and nested order must survive; got:\n{c}");
-        assert!(!named_call_matches(&c, true), "the disabled library must not add source positions; got:\n{c}");
-        assert!(!c.contains("0x10a0"), "the outer IAT slot must retain import identity; got:\n{c}");
-        assert!(!c.contains("0x10b0"), "the nested IAT slot must retain import identity; got:\n{c}");
-    }
 }

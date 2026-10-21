@@ -562,12 +562,17 @@ mod tests {
         ///
         /// `exportinline` belongs to an explicitly prepared export invocation;
         /// ordinary mode selection must not inline its selected roots.
+        ///
+        /// `varargentry` and `dwarftypedefs` are turned on by the Ghidra session
+        /// (`varargentry`) and the Ghidra product gate (`dwarftypedefs`), the
+        /// callers that consume what they change; the preset, which is the default
+        /// output of every other invocation, must not carry them.
         const EXCLUDED_ON_PURPOSE: &[&str] =
             &["v850indirectbranch", "dwarf_lines", "ifuncfpret",
               "aifcorroborate", "linuxsyscall", "nulterminator", "msvcstrappend",
               "structdefs", "indirectonly", "protoorder", "stackalias", "stackviews", "bejoin",
               "mixedtailret", "varargsharedfloat", "callarrayextent",
-              "armconstshift", "exportinline"];
+              "armconstshift", "exportinline", "varargentry", "dwarftypedefs"];
 
         /// Default-off options that predate this test and are **not** in the preset,
         /// i.e. are currently unreachable on the default path. Each is a genuine open

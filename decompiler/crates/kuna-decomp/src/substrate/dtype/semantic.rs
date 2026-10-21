@@ -395,7 +395,14 @@ impl TypeFactoryImpl {
 
     pub(crate) fn ready_value_type(&self, ty: &Rc<Datatype>) -> KunaResult<Rc<Datatype>> {
         let resolved = Datatype::completed_record(ty);
-        if resolved.is_incomplete() && !matches!(&resolved.kind, DatatypeKind::Pointer { .. } | DatatypeKind::PointerRel { .. }) { return Err(KunaError::lowlevel(format!("Pending callable datatype: {}", resolved.get_name()))); }
+        // Only a declaration still awaiting its completion is pending. The
+        // analysis passes' own opaque aggregates (DWARF with `dwarfstructs` off)
+        // have no completion to wait for and keep their zero-size assignment.
+        if resolved.is_incomplete() && resolved.record_completion.is_some()
+            && !matches!(&resolved.kind, DatatypeKind::Pointer { .. } | DatatypeKind::PointerRel { .. })
+        {
+            return Err(KunaError::lowlevel(format!("Pending callable datatype: {}", resolved.get_name())));
+        }
         if let DatatypeKind::Array { arrayof, arraysize } = &resolved.kind {
             let element = self.ready_value_type(arrayof)?;
             if !Rc::ptr_eq(&element, arrayof) { return self.get_type_array(*arraysize, element); }

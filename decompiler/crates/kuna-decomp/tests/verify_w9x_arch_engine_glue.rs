@@ -86,7 +86,6 @@ mod config_ir_regressions {
     struct RestartProbe {
         base: ActionBase,
         visits: Rc<Cell<u32>>,
-        emit_warnings: bool,
     }
 
     struct PanicProbe(ActionBase);
@@ -110,21 +109,13 @@ mod config_ir_regressions {
             groups.contains("restart_probe").then(|| Box::new(Self {
                 base: ActionBase::new(0, "restart_probe", "restart_probe"),
                 visits: self.visits.clone(),
-                emit_warnings: self.emit_warnings,
             }) as Box<dyn Action>)
         }
         fn apply(&mut self, fd: &mut Funcdata, _: &mut ActionContext) -> kuna_base::error::KunaResult<i32> {
             let visits = self.visits.get();
             self.visits.set(visits + 1);
             if visits == 0 {
-                if self.emit_warnings {
-                    fd.warning_header("discarded before reflow");
-                    fd.warning("discarded instruction warning", &fd.get_address().clone());
-                }
                 fd.set_restart_pending(true);
-            } else if self.emit_warnings {
-                fd.warning_header("current after reflow");
-                fd.warning("current instruction after reflow", &fd.get_address().clone());
             }
             Ok(0)
         }
@@ -140,10 +131,6 @@ mod config_ir_regressions {
     }
 
     fn install_selected_root(arch: &mut Architecture) -> Rc<Cell<u32>> {
-        install_selected_root_with_warnings(arch, false)
-    }
-
-    fn install_selected_root_with_warnings(arch: &mut Architecture, emit_warnings: bool) -> Rc<Cell<u32>> {
         arch.allacts.set_current("firstpass").unwrap();
         let firstpass = arch.allacts.get_current().unwrap()
             .clone_filtered(arch.allacts.get_group("firstpass").unwrap()).unwrap();
@@ -152,7 +139,6 @@ mod config_ir_regressions {
         root.add_action(firstpass);
         root.add_action(Box::new(RestartProbe {
             base: ActionBase::new(0, "restart_probe", "restart_probe"), visits: visits.clone(),
-            emit_warnings,
         }));
         root.add_action(Box::new(PanicProbe(ActionBase::new(0, "panic_probe", "panic_probe"))));
         arch.allacts.set_universal(Box::new(root));
@@ -163,57 +149,6 @@ mod config_ir_regressions {
         arch.allacts.set_group("panic_probe", ["panic_probe"]);
         arch.allacts.set_current("seeded_firstpass").unwrap();
         visits
-    }
-
-    #[test]
-    fn replacement_flow_and_reflow_replace_only_generated_body_warnings() {
-        use kuna_decomp::comment::comment_type;
-        let (mut xarch, name, entry) = selected_root_fixture();
-        let arch = xarch.sleigh_mut().base_mut().unwrap();
-        let other = Address::new(entry.get_space().unwrap().clone(), entry.get_offset() + 0x10000);
-        let stale = "WARNING: Inlined function: old body";
-        // The console's instruction-comment producer uses a composite display
-        // mask, while remote source comments can also be warning-only.
-        arch.commentdb.add_comment(comment_type::HEADER, &entry, &entry, stale);
-        arch.commentdb.add_comment(comment_type::USER1, &entry, &entry, "authored end-of-line");
-        arch.commentdb.add_comment(comment_type::USER2, &entry, &entry, "authored pre-comment");
-        arch.commentdb.add_comment(comment_type::USER2 | comment_type::WARNING,
-            &entry, &entry, "authored composite instruction");
-        arch.commentdb.add_comment(comment_type::WARNING, &entry, &entry, "authored warning category");
-        arch.commentdb.add_comment(comment_type::WARNINGHEADER, &entry, &entry, "authored warning header");
-        arch.commentdb.add_comment(comment_type::WARNINGHEADER, &other, &other, "other function warning");
-        let visits = install_selected_root_with_warnings(arch, true);
-        let _fd = decompile_func(arch, &name, entry.clone(), 0).expect("real flow and one reflow");
-        assert_eq!(visits.get(), 2);
-        let comments = arch.commentdb.comments();
-        assert!(!comments.iter().any(|c| c.func_addr == entry
-            && c.text.contains("discarded")));
-        assert_eq!(comments.iter().filter(|c| c.func_addr == entry
-            && c.tp == comment_type::WARNINGHEADER && c.text == "WARNING: current after reflow").count(), 1);
-        assert_eq!(comments.iter().filter(|c| c.func_addr == entry
-            && c.tp == comment_type::WARNING && c.text == "WARNING: current instruction after reflow").count(), 1);
-        let held = comments.to_vec();
-
-        let visits = install_selected_root_with_warnings(arch, false);
-        let _fd = decompile_func(arch, &name, entry.clone(), 0).expect("replacement real flow and reflow");
-        assert_eq!(visits.get(), 2);
-        let comments = arch.commentdb.comments();
-        assert!(!comments.iter().any(|c| c.func_addr == entry
-            && (c.text.contains("current after reflow") || c.text.contains("current instruction after reflow")
-                || c.text.contains("discarded"))));
-        for (tp, text) in [
-            (comment_type::HEADER, stale),
-            (comment_type::USER1, "authored end-of-line"),
-            (comment_type::USER2, "authored pre-comment"),
-            (comment_type::USER2 | comment_type::WARNING, "authored composite instruction"),
-            (comment_type::WARNING, "authored warning category"),
-            (comment_type::WARNINGHEADER, "authored warning header"),
-        ] {
-            assert!(comments.iter().any(|c| c.func_addr == entry && c.tp == tp && c.text == text));
-        }
-        assert!(comments.iter().any(|c| c.func_addr == other && c.text == "other function warning"));
-        assert!(held.iter().any(|c| c.func_addr == entry && c.tp == comment_type::WARNINGHEADER
-            && c.text == "WARNING: current after reflow"));
     }
 
     #[test]

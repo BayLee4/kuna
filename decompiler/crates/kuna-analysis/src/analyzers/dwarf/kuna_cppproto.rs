@@ -220,7 +220,7 @@ pub(super) fn build_pieces(
     types: &dyn TypeFactory,
     word_size: uint4,
 ) -> Option<PrototypePieces> {
-    let mut walk = TypeWalk::new();
+    let mut walk = TypeWalk::declaring();
     let outtype = build_datatype(res.type_ref, dies, types, word_size, &mut walk, true);
 
     let mut intypes = Vec::with_capacity(res.params.len());
@@ -315,12 +315,19 @@ pub(super) fn collect_fbreg_locals(
     out: &mut Vec<crate::pass::LocalFact>,
 ) {
     let mut walk = TypeWalk::new();
+    let mut declared = TypeWalk::declaring();
     for &coff in &sub.children {
         let Some(child) = dies.get(&coff) else { continue };
         if !matches!(child.tag, gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter) {
             continue;
         }
         let Some(fbreg) = child.fbreg_location else { continue };
+        // A parameter is a declaration the prototype also states; a local is not.
+        let walk = if child.tag == gimli::DW_TAG_formal_parameter && declared.keeps_source_names() {
+            &mut declared
+        } else {
+            &mut walk
+        };
         let origin = child.origin_ref.and_then(|o| dies.get(&o));
         let name = if child.name.is_empty() {
             origin.map(|o| o.name.clone()).unwrap_or_default()
@@ -333,7 +340,7 @@ pub(super) fn collect_fbreg_locals(
         let type_ref = child.type_ref.or_else(|| origin.and_then(|o| o.type_ref));
         // A zero-width type (the named-opaque aggregate) would map a zero-extent
         // stack symbol that covers no access; skip rather than shadow the slot.
-        let Some(ty) = build_datatype(type_ref, dies, types, word_size, &mut walk, true)
+        let Some(ty) = build_datatype(type_ref, dies, types, word_size, walk, true)
             .filter(|t| t.get_size() > 0)
         else {
             continue;

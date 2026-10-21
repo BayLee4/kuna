@@ -1117,6 +1117,12 @@ fn c_language(language: gimli::DwLang) -> bool {
         | gimli::DW_LANG_C11 | gimli::DW_LANG_C17)
 }
 
+fn cplusplus_language(language: gimli::DwLang) -> bool {
+    matches!(language, gimli::DW_LANG_C_plus_plus | gimli::DW_LANG_C_plus_plus_03
+        | gimli::DW_LANG_C_plus_plus_11 | gimli::DW_LANG_C_plus_plus_14
+        | gimli::DW_LANG_C_plus_plus_17 | gimli::DW_LANG_C_plus_plus_20)
+}
+
 fn source_convention(die: &DieSnap) -> Option<&'static str> {
     Some(match die.calling_convention.map(|cc| cc.0) {
         // DW_CC_normal has no independently authored ABI name.
@@ -1344,7 +1350,14 @@ impl AnalysisPass for DwarfPass {
                                     if let Ok(proto) = types.logical_proto(
                                         &pieces, model, true, false,
                                     ) {
-                                        out.source_prototypes.push((low_pc, proto));
+                                        // A C++ definition is bound by entry address, which
+                                        // only the `cppproto` arm below does: with it off the
+                                        // recovery stays the by-name walk.
+                                        if snap.language.is_some_and(cplusplus_language) {
+                                            out.cpp_dwarf.source_prototypes.push((low_pc, proto));
+                                        } else {
+                                            out.source_prototypes.push((low_pc, proto));
+                                        }
                                     }
                                 }
                                 out.prototypes.push(pieces);

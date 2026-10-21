@@ -9969,7 +9969,7 @@ mod tests {
         use crate::fspec::{FuncProto, ParameterPieces, PrototypePieces, parameter_pieces_flags};
         use kuna_base::error::KunaError;
         let (f, model, register) = declaration_application_fixture();
-        let pending = f.get_type_struct("PendingEntry").unwrap();
+        let pending = f.kuna_declare_record("PendingEntry", false).unwrap();
         let mut pieces = PrototypePieces {
             outtype: Some(f.get_type_void().unwrap()),
             intypes: vec![Rc::clone(&pending)],

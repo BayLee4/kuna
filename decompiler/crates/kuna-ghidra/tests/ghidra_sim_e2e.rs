@@ -500,7 +500,20 @@ const PIN_FAILLOG_RESOLVABLE: [usize; 3] = [0, 0, 0];
 // tables, which a wire session never consults (Ghidra's archives name a
 // callee's parameters itself).
 const PIN_FAILLOG_DIFF_FLOOR: [f64; 3] = [0.02, 0.04, 0.06];
-const PIN_FAILLOG_DIFF_CEILING: [f64; 3] = [0.09, 0.12, 0.15];
+// The session prints with Ghidra's own defaults (100 columns, no NULL, no
+// in-place operators) where the CLI arm does not. Measured with the CLI's
+// defaults in the session: 0.043 / 0.091 / 0.099. Wrapping alone moves sub_2620
+// to 0.084-0.091 (0.050 -> 0.091 with the other two as they are); `(char *)0x0`
+// and `v = v + 1` against `NULL` and `v += 1` move sub_3320 / sub_3ad0 to
+// 0.152 / 0.143. The ceilings sit just above those measurements.
+const PIN_FAILLOG_DIFF_CEILING: [f64; 3] = [0.095, 0.16, 0.15];
+// Normalized non-empty line count of the flattened markup C, per target: the
+// structural size of what the GUI renders.  A `<break>`-token regression would
+// collapse this to ~1 while leaving every ratio-floor assertion green -- this
+// pin is what catches it.  The Ghidra markup path wraps at Java's default 100
+// columns, so the long `if` conditions of sub_2620 span more lines here than
+// in the CLI's unwrapped C.
+const PIN_FAILLOG_C_LINES: [usize; 3] = [291, 34, 92];
 // Tokens Java's `getC()` cleaner REWRITES (`IllegalCharCppTransformer`).
 // Phase 3 measured 57/10/24 (whole rendered declarators like
 // `"unsigned long *"` as single `<type>` tokens, received by scripts/exports
@@ -590,6 +603,7 @@ fn ghidra_sim_faillog_pins() {
     let mut ph_resolvables = Vec::new();
     let mut mangled_counts = Vec::new();
     let mut vardecl_unresolved_counts = Vec::new();
+    let mut c_line_counts = Vec::new();
     for parsed in &run.docs {
         let c = &parsed.c_text;
         let (reg_count, reg_names) = register_leaks(c, &run.oracle.register_names);
@@ -600,6 +614,7 @@ fn ghidra_sim_faillog_pins() {
         ph_resolvables.push(resolvable_placeholders(&run.oracle, c));
         mangled_counts.push(parsed.mangled_tokens);
         vardecl_unresolved_counts.push(ghidra_sim::vardecl_unresolved(parsed));
+        c_line_counts.push(normalized_lines(c).len());
     }
 
     // The differential-C gap vs the in-process CLI path.
@@ -642,9 +657,9 @@ fn ghidra_sim_faillog_pins() {
     for (i, t) in FAILLOG_TARGETS.iter().enumerate() {
         summary.push_str(&format!(
             "{t}: registers={} {:?} unique={} placeholders={} resolvable={} mangled={} \
-             vardecl_unresolved={} diff_ratio={:.3}\n",
+             vardecl_unresolved={} c_lines={} diff_ratio={:.3}\n",
             reg_counts[i], reg_names_seen[i], uniq_counts[i], ph_totals[i], ph_resolvables[i],
-            mangled_counts[i], vardecl_unresolved_counts[i], ratios[i]
+            mangled_counts[i], vardecl_unresolved_counts[i], c_line_counts[i], ratios[i]
         ));
     }
     summary.push_str(&format!(
@@ -696,6 +711,11 @@ fn ghidra_sim_faillog_pins() {
             "{t}: ghidra-vs-CLI diff ratio {:.3} rose above the pinned ceiling {} — \
              the GUI path got WORSE (a markup/flatten regression?).",
             ratios[i], PIN_FAILLOG_DIFF_CEILING[i]
+        );
+        assert_eq!(
+            c_line_counts[i], PIN_FAILLOG_C_LINES[i],
+            "{t}: flattened-C line count moved — the rendered structure changed \
+             (a <break>/token regression collapses this while ratios stay in band)"
         );
     }
 

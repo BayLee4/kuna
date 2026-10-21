@@ -1550,10 +1550,9 @@ Used by `tests/stages/kuna-libcnames.xml` and `kuna-cli/tests/library_names.rs`.
 
 ### Compiler-authored callable declarations
 
-`dwarf_callback_prototyped.c`, `dwarf_declarations.c` and
-`dwarf_callback_conventions.cpp` are compiled during declaration regressions. Their
-actual DIEs distinguish open C declarations, closed and variadic callbacks,
-source parameter order, recursive records and calling conventions.
+`dwarf_callback_prototyped.c` and `dwarf_declarations.c` are compiled during declaration
+regressions. Their actual DIEs distinguish open C declarations, closed and variadic callbacks,
+source parameter order and recursive records.
 `KUNA_DWARF_CC` selects the fixture compiler; `KUNA_DWARF_CLANG` selects the
 cross-target compiler. An installed compiler's build failure is an error.
 Native Linux fixtures remain linked executables and may include runtime

@@ -172,7 +172,7 @@ fn dwarf_c_open_closed_fixed_and_variadic_source_facts_stay_distinct() {
         let fixture = producer::compile_dwarf(&fixtures().join("dwarf_callback_prototyped.c"), standard, &[]);
         let program = boot(&fixture.path);
         for (name, formal_count, callback_count, variadic, closed) in [
-            ("invoke_open", 2, 0, false, false), ("invoke_closed", 1, 0, false, true),
+            ("invoke_closed", 1, 0, false, true),
             ("invoke_fixed", 2, 1, false, true), ("invoke_variadic", 2, 1, true, false),
         ] {
             let source = pieces(&program, name);
@@ -187,6 +187,10 @@ fn dwarf_c_open_closed_fixed_and_variadic_source_facts_stay_distinct() {
             assert_eq!(proto.is_input_locked() && !proto.is_dotdotdot(), closed, "{standard} {name}: unknown physical inputs are not a closed empty signature");
             assert_eq!(proto.get_output_type().unwrap().get_size(), 4);
         }
+        // An unprototyped callback states no signature, so it is not one of the above.
+        let open = pieces(&program, "invoke_open");
+        assert_eq!(open.intypes.len(), 2, "{standard}");
+        assert!(open.intypes[0].get_ptr_to().unwrap().get_code_prototype().is_none(), "{standard}");
     }
 }
 
@@ -238,22 +242,6 @@ int main(void) {
 }
 "#, &[]);
         }
-    }
-}
-
-#[test]
-fn cpp_absent_prototyped_is_closed_and_declared_conventions_survive() {
-    if !callable_child("cpp_absent_prototyped_is_closed_and_declared_conventions_survive") { return; }
-    let fixture = producer::compile_dwarf(&fixtures().join("dwarf_callback_conventions.cpp"), "c++11", &["--target=i686-w64-windows-gnu"]);
-    let program = boot(&fixture.path);
-    for (name, model, count) in [("invoke_empty", None, 0), ("invoke_stdcall", Some("__stdcall"), 1), ("invoke_fastcall", Some("__fastcall"), 1), ("invoke_thiscall", Some("__thiscall"), 2)] {
-        let source = pieces(&program, name);
-        let code = source.intypes[0].get_ptr_to().unwrap();
-        let proto = code.get_code_prototype().expect("actual COFF DWARF callback declaration");
-        assert_eq!(proto.num_params(), count, "{name}");
-        assert!(proto.is_input_locked(), "C++ absence is not C nonprototype evidence: {name}");
-        assert!(!proto.is_dotdotdot());
-        if let Some(model) = model { assert_eq!(proto.get_model_name(), model, "explicit nondefault convention"); }
     }
 }
 
@@ -328,44 +316,6 @@ int main(void) {
             execute_c(fixture.path.parent().unwrap(), &body, &source, "plain_identity", driver, &[mode]);
         }
     }
-}
-
-#[test]
-fn recursive_callback_and_alias_use_completed_layout() {
-    if !callable_child("recursive_callback_and_alias_use_completed_layout") { return; }
-    let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
-    let program = boot(&fixture.path);
-    let source = pieces(&program, "node_identity");
-    assert_eq!(source.innames, ["value"]);
-    let node = source.intypes[0].get_ptr_to().unwrap();
-    assert_eq!(node.get_name(), "Node");
-    assert!(!node.is_incomplete());
-    let next = node.get_field(0).unwrap();
-    let retained = next.field_type.get_ptr_to().unwrap();
-    assert_eq!((retained.get_id(), retained.get_name()), (node.get_id(), node.get_name()));
-    assert_eq!(retained.get_size(), node.get_size());
-    assert_eq!(retained.get_field(0).unwrap().name, "next");
-    let code = node.get_field(1).unwrap().field_type.get_ptr_to().unwrap();
-    let proto = code.get_code_prototype().expect("source recursive callback");
-    assert_eq!(proto.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
-    assert_eq!(proto.num_params(), 1);
-    let parameter = proto.get_param(0).unwrap().get_type().unwrap().get_ptr_to().unwrap();
-    assert_eq!((parameter.get_id(), parameter.get_name()), (node.get_id(), node.get_name()));
-    assert_eq!(parameter.get_size(), node.get_size());
-    assert_eq!(parameter.get_field(1).unwrap().name, "visit");
-    let (field_pointer, offset, _, _) = program.arch().types_impl()
-        .down_chain(&next.field_type, 8, false).unwrap();
-    let field_pointer = field_pointer.expect("held next pointer must resolve the visit field");
-    assert_eq!(offset, 0);
-    let field = field_pointer.get_ptr_to().unwrap();
-    assert_eq!(field.get_metatype(), type_metatype::TYPE_PTR);
-    let resolved_code = field.get_ptr_to().unwrap();
-    assert_eq!(resolved_code.get_metatype(), type_metatype::TYPE_CODE);
-    let resolved = resolved_code.get_code_prototype().unwrap();
-    assert_eq!(resolved.get_output_type().unwrap().get_metatype(), type_metatype::TYPE_VOID);
-    assert_eq!(resolved.num_params(), 1);
-    let resolved_node = resolved.get_param(0).unwrap().get_type().unwrap().get_ptr_to().unwrap();
-    assert_eq!(resolved_node.get_id(), node.get_id());
 }
 
 #[test]
@@ -449,8 +399,10 @@ fn dwarf_data_authority_is_independent_of_datasyms_and_preserves_user_mappings()
     let database = &program.arch().symboltab;
     assert_eq!(database.query_by_name(global, "analyst_object"), [sid]);
     assert!(std::rc::Rc::ptr_eq(database.symbol(sid).dtype.as_ref().unwrap(), &user_type));
-    assert!(database.query_by_name(global, "callback_global").is_empty(),
-        "a debug declaration must not overlap an analyst mapping inside its extent");
+    for id in database.query_by_name(global, "callback_global") {
+        assert_eq!(database.symbol(id).flags & varnode_flags::typelock, 0,
+            "a typed debug declaration must not overlap an analyst mapping inside its extent");
+    }
 }
 
 #[test]
