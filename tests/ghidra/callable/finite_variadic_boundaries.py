@@ -57,7 +57,7 @@ for name,entries in cases:
     finally:emulator.dispose()
   finally:machine.close()
   binary=out/name;binary.write_bytes(image)
-  common=['--raw-image','--target','x86:LE:64:default:gcc','--base','0x1000','--sleighpath',root/'specs','--assert-strict']
+  common=['--raw-image','--target','x86:LE:64:default:gcc','--base','0x1000','--sleighpath',root/'specs','--assert-strict','--option','varargentry','on']
   if name=='typed_address':common+=['--assert','typedef typedef int (*Variadic)(int tag,...);']
   for fn_name,pc,code,prototype in entries:common+=['--addr',hex(pc),'--define-function',f'{pc:#x}-{pc+len(code):#x}={fn_name}','--assert','prototype '+fn_name+' '+prototype]
   meta=invoke([args.cli,'decompile-all',binary,'--json',*common]);assert meta['status']==0,meta
