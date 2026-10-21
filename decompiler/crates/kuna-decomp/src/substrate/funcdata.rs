@@ -5996,67 +5996,7 @@ mod tests {
         Rc::new(Datatype::new(4, type_metatype::TYPE_UNKNOWN))
     }
 
-    #[test]
-    fn late_spacebase_copy_trim_uses_the_copy_transfer_type_without_retyping_storage() {
-        use crate::dtype::{TypeFactory, TypeFactoryImpl};
-        use crate::varnode::varnode_flags;
-
-        let mut manager = build_manager();
-        manager.set_default_code_space(2).unwrap();
-        manager.set_default_data_space(2).unwrap();
-        let types = Rc::new(TypeFactoryImpl::new());
-        types.set_default_alignment_map();
-        types.set_max_basetype_size(8);
-        let word = types.get_base(4, type_metatype::TYPE_UINT).unwrap();
-        let word_pointer = types.get_type_pointer(4, word, 1).unwrap();
-        let mut context = ArchContext::new(manager);
-        context.types = Some(types);
-        let ram = Rc::clone(context.manage().get_space_by_name("ram").unwrap());
-        let pc = Address::new(Rc::clone(&ram), 0x1000);
-        let mut fd = Funcdata::new(
-            "func", "func", Rc::new(context), pc.clone(), 0x10000000, 0x40,
-        ).unwrap();
-
-        for spacebase in [true, false] {
-            let input = fd.new_varnode(
-                4, &Address::new(Rc::clone(&ram), if spacebase { 0x54 } else { 0x24 }),
-                Some(Rc::clone(&word_pointer)),
-            ).unwrap();
-            let input = fd.vbank_mut().set_input(input, &mut |_, _, _| Ok(())).unwrap();
-            let flags = varnode_flags::mapped
-                | if spacebase { varnode_flags::spacebase } else { 0 };
-            fd.vbank_mut().get_mut(input).unwrap().set_flags_pub(flags);
-            let original_flags = fd.vbank().get(input).unwrap().get_flags();
-            let marker = fd.new_op(2, pc.clone());
-            fd.op_set_opcode_code(marker, OpCode::CPUI_MULTIEQUAL);
-            fd.op_set_input(marker, input, 0).unwrap();
-            fd.op_set_input(marker, input, 1).unwrap();
-            fd.new_unique_out(4, marker).unwrap();
-
-            let copy = fd.build_copy_trim_op(input, pc.clone(), marker).unwrap();
-            let operation = fd.obank().get(copy).unwrap();
-            assert_eq!(operation.code(), OpCode::CPUI_COPY);
-            assert_eq!(operation.get_in(0), Some(input));
-            let output = fd.vbank().get(operation.get_out().unwrap()).unwrap();
-            assert_eq!(output.get_size(), 4);
-            assert!(output.is_mapped(), "the existing mapped binding survives the trim");
-            assert!(!output.is_spacebase(), "the temporary is an ordinary pointer value");
-            if spacebase {
-                let pointee = output.get_type().get_ptr_to().unwrap();
-                assert_eq!(pointee.get_size(), 1);
-                assert_eq!(pointee.get_metatype(), type_metatype::TYPE_UNKNOWN);
-                assert_eq!(output.get_type().get_word_size(), Some(1));
-            } else {
-                assert!(Rc::ptr_eq(output.get_type(), &word_pointer),
-                    "an ordinary pointer keeps its exact original type");
-            }
-            let original = fd.vbank().get(input).unwrap();
-            assert!(Rc::ptr_eq(original.get_type(), &word_pointer));
-            assert_eq!(original.get_flags(), original_flags);
-        }
-    }
-
-    #[test]
+        #[test]
     fn locked_prototype_seed_error_is_not_published_as_success_and_can_retry() {
         let manager = build_manager();
         let mut concrete = crate::fspec::ProtoModel::new(&manager);

@@ -991,9 +991,8 @@ pub trait Rule {
     }
 
     /// Clone this Rule filtered by `grouplist` (C++ virtual `clone(grouplist)`).
-    /// The owning RuleEntry first filters by its registered basegroup. Rules
-    /// retaining their own group may also filter here; stateless rules can
-    /// clone unconditionally because their membership lives in RuleState.
+    /// The implementor decides membership, conventionally
+    /// `grouplist.contains(my_group)`.
     fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>>;
 
     /// Reset any function-specific state (C++ virtual `reset`).  The default is
@@ -1088,12 +1087,6 @@ struct RuleEntry {
 
 impl RuleEntry {
     fn clone_filtered(&self, grouplist: &ActionGroupList) -> Option<RuleEntry> {
-        // C++ rules test getGroup() in clone(). In this port RuleState owns
-        // that group, including for stateless bitfield rules, so enforce it
-        // before asking the concrete rule to clone its transformation state.
-        if !grouplist.contains(&self.state.basegroup) {
-            return None;
-        }
         self.rule
             .clone_rule(grouplist)
             .map(|rule| RuleEntry { state: self.state.clone(), rule, applied_at_reset: 0 })

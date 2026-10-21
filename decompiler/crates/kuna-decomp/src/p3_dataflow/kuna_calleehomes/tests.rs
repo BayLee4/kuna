@@ -38,11 +38,6 @@ impl Fx {
         Self::with_return_address(Some((0, 8)))
     }
 
-    /// A fixture analysed as a host session would.
-    pub(crate) fn host() -> Self {
-        Self::with_layout_host(Some((0, 8)), false, false, true)
-    }
-
     pub(crate) fn with_stack_views() -> Self {
         Self::with_return_address_and_views(Some((0, 8)), true)
     }
@@ -111,7 +106,7 @@ impl Fx {
         let mut arch = ArchContext::new_shared(Rc::clone(&manager));
         arch.stack_views = stack_views;
         if host {
-            arch.remote_scope = Some(crate::remote_provider::inert_host_scope(&manager));
+            arch.remote_scope = Some(crate::remote_provider::empty_host_scope(&manager));
         }
         arch.callee_preserves = true;
         if host {

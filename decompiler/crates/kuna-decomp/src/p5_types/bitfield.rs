@@ -785,10 +785,9 @@ impl Rule for RuleBitFieldStore {
         vec![OpCode::CPUI_STORE]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        // Group membership lives in the engine-owned RuleState; see ruleaction_3
-        // module docs.  The clone is unconditional here.
-        Some(Box::new(RuleBitFieldStore))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RuleBitFieldStore) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
@@ -841,8 +840,9 @@ impl Rule for RuleBitFieldOut {
         oplist
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldOut))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RuleBitFieldOut) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
@@ -878,8 +878,9 @@ impl Rule for RuleBitFieldLoad {
         vec![OpCode::CPUI_LOAD]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldLoad))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RuleBitFieldLoad) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
@@ -945,8 +946,9 @@ impl Rule for RuleBitFieldIn {
         ]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleBitFieldIn))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RuleBitFieldIn) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
@@ -982,8 +984,9 @@ impl Rule for RulePullAbsorb {
         vec![OpCode::CPUI_ZPULL, OpCode::CPUI_SPULL]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RulePullAbsorb))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RulePullAbsorb) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
@@ -1004,8 +1007,9 @@ impl Rule for RuleInsertAbsorb {
         vec![OpCode::CPUI_INSERT]
     }
 
-    fn clone_rule(&self, _grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
-        Some(Box::new(RuleInsertAbsorb))
+    fn clone_rule(&self, grouplist: &ActionGroupList) -> Option<Box<dyn Rule>> {
+        // Bitfield rules are registered in the `bitfields` group only.
+        grouplist.contains("bitfields").then(|| Box::new(RuleInsertAbsorb) as Box<dyn Rule>)
     }
 
     fn apply_op(&mut self, op: crate::context::OpId, data: &mut Funcdata) -> kuna_base::error::KunaResult<int4> {
