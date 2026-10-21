@@ -948,8 +948,10 @@ relocated the lazy model to the seams the kuna pipeline actually reads
   locks or layout. Explicit non-default model display still obeys
   the convention-printing toggle.
   Native host documents use the existing `EmitPrettyPrint` queue for linewidth,
-  optional parameter/expression breaks and comment continuation. Width survives
-  fresh document sinks and resets to 100 with fresh options. Standalone C and
+  optional parameter/expression breaks and comment continuation. The engine's
+  default width is unwrapped (10000); Java sends its own `maxlinewidth` (100 by
+  default) on every `setOptions`. Width survives fresh document sinks and resets
+  to the engine default with the next list. Standalone C and
   its raw token/provenance maps keep their original unwrapped emission path.
   Bitfield access follows this same action policy: Java sends
   `currentaction(bitfields,off)` only for the non-default disabled state.

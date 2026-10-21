@@ -1904,8 +1904,8 @@ content no longer fits either indents to the group's saved column or, when
 breaking would recover fewer than 10 characters, stays on the line;
 overflow permanently raises inner indents to guarantee at least half a line of
 working space (`prettyprint.rs (EmitPrettyPrint::overflow)`), and inside a
-comment every forced break re-emits the comment fill prefix. Defaults: 100
-columns (`option maxlinewidth`), indent step 2 (`option indentincrement`),
+comment every forced break re-emits the comment fill prefix. Defaults: unwrapped
+(10000 columns, `option maxlinewidth`; the Ghidra host sends 100), indent step 2 (`option indentincrement`),
 comment indent 20; brace placement per construct via the four `braceformat`
 fields of `printc.rs (PrintCOptions)`: if/loop/switch braces sit on the same
 line as their construct, and a function's brace sits directly under its
