@@ -1645,10 +1645,8 @@ impl Funcdata {
             v.set_implied();
         });
         self.op_set_opcode_code(newop, OpCode::CPUI_CAST);
-        // Move the existing read before attaching the CAST's input. A free
-        // varnode may have only one descendant, even during this edge transfer.
-        self.op_set_input(op, vnout, slot)?;
         self.op_set_input(newop, vnin, 0)?;
+        self.op_set_input(op, vnout, slot)?;
         self.op_insert_before(newop, op);
         if ct.needs_resolution() {
             let _ = self.force_facing_type(Rc::clone(&ct), -1, newop, -1)?;

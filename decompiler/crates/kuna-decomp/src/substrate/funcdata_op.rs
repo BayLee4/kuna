@@ -483,9 +483,12 @@ impl Funcdata {
                 let (size, off, dtype, flags) =
                     (v.get_size(), v.get_offset(), Rc::clone(v.get_type()), v.get_flags());
                 let cvn = self.new_constant(size, off);
-                // Only a locked constant (a forced type or name) carries its
-                // type onto the duplicate; an inferred type is recomputed.
-                if flags & (crate::varnode::varnode_flags::typelock | crate::varnode::varnode_flags::namelock) != 0 {
+                // Only a host session's locked constant (a forced type or name)
+                // carries its type onto the duplicate; a standalone decompile
+                // and every inferred type recompute it.
+                if self.get_arch().remote_scope.is_some()
+                    && flags & (crate::varnode::varnode_flags::typelock | crate::varnode::varnode_flags::namelock) != 0
+                {
                     self.vbank_mut().get_mut(cvn).expect("fresh constant")
                         .copy_symbol_fields(dtype, flags);
                 }
