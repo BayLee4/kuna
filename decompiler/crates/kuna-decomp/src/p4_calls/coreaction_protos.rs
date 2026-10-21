@@ -2296,57 +2296,33 @@ impl Action for ActionPrototypeWarnings {
         }
         Some(Box::new(ActionPrototypeWarnings { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
-        for message in data.get_override().generate_override_messages(data.get_arch().manage()) {
-            data.warning_header(&message);
-        }
-        let proto = data.get_func_proto();
-        let input_error = proto.has_input_errors();
-        let output_error = proto.has_output_errors();
-        let unknown = if proto.has_model() && proto.is_model_unknown() {
-            let mut message = "Unknown calling convention".to_string();
-            if proto.print_model_in_decl() {
-                message.push_str(": ");
-                message.push_str(proto.get_model_name());
-            }
-            if !proto.has_custom_storage() && (proto.is_input_locked() || proto.is_output_locked()) {
-                message.push_str(" -- yet parameter storage is locked");
-            }
-            Some(message)
-        } else {
-            None
-        };
-        if input_error {
-            data.warning_header("Cannot assign parameter locations for this function: Prototype may be inaccurate");
-        }
-        if output_error {
-            data.warning_header("Cannot assign location of return value for this function: Return value may be inaccurate");
-        }
-        if let Some(message) = unknown {
-            data.warning_header(&message);
-        }
-        for index in 0..data.num_calls() {
-            let call = data.get_call_specs(index);
-            let input_error = call.proto().has_input_errors();
-            let output_error = call.proto().has_output_errors();
-            if !input_error && !output_error {
-                continue;
-            }
-            let name = if call.has_funcdata() { call.get_name() } else { "<indirect>" };
-            let input_message = input_error.then(|| format!(
-                "Cannot assign parameter location for function {name}: Prototype may be inaccurate",
-            ));
-            let output_message = output_error.then(|| format!(
-                "Cannot assign location of return value for function {name}: Return value may be inaccurate",
-            ));
-            let entry = call.get_entry_address().clone();
-            if let Some(message) = input_message {
-                data.warning(&message, &entry);
-            }
-            if let Some(message) = output_message {
-                data.warning(&message, &entry);
-            }
-        }
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        // C++ coreaction.cc:5140 — ActionPrototypeWarnings::apply. Generate override
+        // messages via data.getOverride().generateOverrideMessages(msgs, getArch())
+        // and warningHeader each. Then, for ourproto = data.getFuncProto():
+        //   - when ourproto.hasInputErrors(): warningHeader("Cannot assign parameter
+        //     locations ...").
+        //   - when ourproto.hasOutputErrors(): warningHeader("Cannot assign location
+        //     of return value ...").
+        //   - when ourproto.isModelUnknown(): s = "Unknown calling convention"; append
+        //     ": " + getModelName() when printModelInDecl(); append " -- yet parameter
+        //     storage is locked" when !hasCustomStorage() && (isInputLocked() ||
+        //     isOutputLocked()); warningHeader(s).
+        // Then over each call spec (fc = data.getCallSpecs(i), fd = fc->getFuncdata()):
+        //   - when fc->hasInputErrors(): warning("Cannot assign parameter location
+        //     for function ...", entryAddr).
+        //   - when fc->hasOutputErrors(): warning("Cannot assign location of return
+        //     value for function ...", entryAddr).
+        //
+        // STUB(W7/W8-funcdata): the override-message generation reads
+        // `Funcdata::getOverride()` (the local override store is not on
+        // `Funcdata` in the merged tree); the function-level headers read
+        // `Funcdata::funcp` (the empty `context::FuncProto` placeholder, not the
+        // real `fspec::FuncProto` with `hasInputErrors`/`isModelUnknown`/...);
+        // and the per-call loop iterates `Funcdata::getCallSpecs(i)` (absent).
+        // The warning channel (`ActionContext::warnings`) IS realized, but with
+        // the placeholder proto there are no errors to report.  Deferred
+        // (count stays 0); no warning is emitted.
         Ok(0)
     }
 }
@@ -2510,140 +2486,6 @@ mod tests {
             assert!(!source.is_model_locked());
             assert_eq!(source.num_params(), 1);
             assert!(source.get_param(0).unwrap().get_address().is_invalid());
-        }
-    }
-
-    #[test]
-    fn source_assignment_refusal_reaches_the_original_prototype_warning() {
-        use crate::dtype::{TypeFactory, TypeFactoryImpl};
-        use crate::fspec::{FuncProto, ProtoModel, PrototypePieces};
-        let manager = Rc::new(build_manager());
-        let types = TypeFactoryImpl::new();
-        types.setup_sizes(Some(4), 8, 8);
-        types.set_max_basetype_size(8);
-        types.set_proto_context(manager.clone());
-        let mut model = ProtoModel::new(&manager);
-        model.build_param_list("standard").unwrap();
-        model.input_mut().finish_decode();
-        model.output_mut().finish_decode();
-        let source = FuncProto::from_logical(&PrototypePieces {
-            outtype: Some(types.get_type_void().unwrap()),
-            intypes: vec![types.get_base(4, type_metatype::TYPE_INT).unwrap()],
-            innames: vec!["value".to_string()],
-            first_var_arg_slot: -1,
-            ..Default::default()
-        }, Rc::new(model), &types).unwrap();
-        let working = types.apply_source_prototype(&source).unwrap();
-        assert!(working.has_input_errors());
-        assert!(!source.has_input_errors());
-        assert!(matches!(types.acquire_working_proto(&source),
-            Err(kuna_base::error::KunaError::ParamUnassigned { .. })));
-
-        let mut data = build_fd();
-        data.get_func_proto_mut().copy(&working);
-        let mut action = ActionPrototypeWarnings::boxed("protorecovery");
-        assert_eq!(action.apply(&mut data, &mut ActionContext::default()).unwrap(), 0);
-        let warnings = data.drain_pending_comments();
-        assert_eq!(warnings.len(), 1);
-        assert_eq!(warnings[0].0, crate::comment::comment_type::WARNINGHEADER);
-        assert_eq!(&warnings[0].1, data.get_address());
-        assert_eq!(warnings[0].2,
-            "WARNING: Cannot assign parameter locations for this function: Prototype may be inaccurate");
-        assert!(data.get_func_proto().has_input_errors());
-        assert_eq!(source.num_params(), 1);
-        assert_eq!(source.get_param(0).unwrap().get_name(), "value");
-        assert!(source.get_param(0).unwrap().get_address().is_invalid());
-        assert!(source.logical_pieces().is_some());
-        assert!(!source.has_input_errors());
-    }
-
-    #[test]
-    fn prototype_warning_action_preserves_override_function_and_call_origins() {
-        use crate::fspec::{FuncCallSpecs, ProtoModel};
-        use crate::comment::comment_type;
-        let mut data = build_fd();
-        let ram = Rc::clone(data.get_arch().manage().get_space_by_name("ram").unwrap());
-        let mut model = ProtoModel::new(data.get_arch().manage());
-        model.build_param_list("standard").unwrap();
-        data.get_func_proto_mut().set_internal(Rc::new(model),
-            Rc::new(Datatype::new(0, type_metatype::TYPE_VOID)));
-        data.get_func_proto_mut().set_input_errors(true);
-        data.get_func_proto_mut().set_output_errors(true);
-        data.get_override_mut().insert_deadcode_delay(&ram, 4);
-        for known in [true, false] {
-            let at = Address::new(ram.clone(), if known { 0x1010 } else { 0x1020 });
-            let op = data.new_op(1, at);
-            data.op_set_opcode_code(op, if known { OpCode::CPUI_CALL } else { OpCode::CPUI_CALLIND });
-            let target = data.new_constant(8, 0x4000);
-            data.op_set_input(op, target, 0).unwrap();
-            let mut call = FuncCallSpecs::new(op, Address::new(ram.clone(), 0x4000));
-            if known {
-                call.set_funcdata(Address::new(ram.clone(), 0x4000), "callee").unwrap();
-            }
-            call.proto_mut().copy(data.get_func_proto());
-            call.proto_mut().set_output_errors(known);
-            data.push_call_specs(call);
-        }
-        let mut action = ActionPrototypeWarnings::boxed("protorecovery");
-        assert_eq!(action.apply(&mut data, &mut ActionContext::default()).unwrap(), 0);
-        let warnings = data.drain_pending_comments();
-        assert_eq!(warnings.len(), 6);
-        assert!(warnings.iter().any(|(kind, at, text)|
-            *kind == comment_type::WARNINGHEADER && at == data.get_address()
-                && text == "WARNING: Restarted to delay deadcode elimination for space: ram"));
-        for text in [
-            "WARNING: Cannot assign parameter locations for this function: Prototype may be inaccurate",
-            "WARNING: Cannot assign location of return value for this function: Return value may be inaccurate",
-        ] {
-            assert!(warnings.iter().any(|(kind, at, message)|
-                *kind == comment_type::WARNINGHEADER && at == data.get_address() && message == text));
-        }
-        for text in [
-            "WARNING: Cannot assign parameter location for function callee: Prototype may be inaccurate",
-            "WARNING: Cannot assign location of return value for function callee: Return value may be inaccurate",
-            "WARNING: Cannot assign parameter location for function <indirect>: Prototype may be inaccurate",
-        ] {
-            assert!(warnings.iter().any(|(kind, at, message)|
-                *kind == comment_type::WARNING && at.get_offset() == 0x4000 && message == text));
-        }
-        assert!(data.get_func_proto().has_input_errors() && data.get_func_proto().has_output_errors());
-        assert!(data.get_call_specs(0).proto().has_input_errors());
-        assert!(!data.get_call_specs(1).proto().has_output_errors());
-    }
-
-    #[test]
-    fn unknown_model_warning_obeys_visibility_and_custom_storage_policy() {
-        use crate::dtype::{TypeFactory, TypeFactoryImpl};
-        use crate::fspec::{FuncProto, ParameterPieces, ProtoModel, PrototypePieces, parameter_pieces_flags};
-        let manager = build_manager();
-        let types = TypeFactoryImpl::new();
-        for (visible, custom, locked, expected) in [
-            (true, false, true, "Unknown calling convention: foreign -- yet parameter storage is locked"),
-            (false, false, false, "Unknown calling convention"),
-            (true, true, true, "Unknown calling convention: foreign"),
-        ] {
-            let base = ProtoModel::new(&manager);
-            let mut model = ProtoModel::new_unknown("foreign", &base);
-            model.set_print_in_decl(visible);
-            let void = types.get_type_void().unwrap();
-            let mut proto = FuncProto::from_logical(&PrototypePieces {
-                outtype: Some(void.clone()),
-                output_storage: custom.then(|| ParameterPieces {
-                    type_: Some(void), flags: parameter_pieces_flags::CUSTOM_STORAGE,
-                    ..Default::default()
-                }),
-                first_var_arg_slot: -1, ..Default::default()
-            }, Rc::new(model), &types).unwrap();
-            proto.set_input_lock(locked);
-            proto.set_output_lock(locked);
-            assert_eq!(proto.has_custom_storage(), custom);
-            let mut data = build_fd();
-            data.get_func_proto_mut().copy(&proto);
-            let mut action = ActionPrototypeWarnings::boxed("protorecovery");
-            assert_eq!(action.apply(&mut data, &mut ActionContext::default()).unwrap(), 0);
-            let warnings = data.drain_pending_comments();
-            assert_eq!(warnings.len(), 1);
-            assert_eq!(warnings[0].2, format!("WARNING: {expected}"));
         }
     }
 

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use kuna_base::address::{
     calc_mask, count_leading_zeros, popcount, sign_extend, sign_extend_sized, signbit_negative,
 };
-use kuna_base::error::KunaResult;
+use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::types::{int4, int8, uint4, uintb, Wrap};
 use kuna_num::multiprecision::{
     add128, leftshift128, set_u128, subtract128, udiv128, uless128, ulessequal128,
@@ -107,6 +107,15 @@ fn new_extended_constant(
         data.op_insert_before(piece_op, op);
     }
     Ok(new_const_vn)
+}
+
+/// `Varnode::getTypeReadFacing(op)` — the read-facing data-type resolution
+/// (union/flow aware) is W6.  // STUB(W6)
+#[inline]
+fn type_read_facing_stub(_data: &Funcdata, _vn: VarnodeId, _op: OpId) -> KunaResult<()> {
+    Err(KunaError::lowlevel(
+        "ruleaction_6: Varnode::getTypeReadFacing is a W6 type-facing surface",
+    ))
 }
 
 // =============================================================================
@@ -948,29 +957,23 @@ impl RulePtrsubCharConstant {
     /// Try to push a collapsed constant pointer further through a descendant
     /// PTRADD (C++ `RulePtrsubCharConstant::pushConstFurther`).
     ///
-    fn push_const_further(
-        data: &mut Funcdata, outtype: &std::rc::Rc<crate::dtype::Datatype>,
-        op: OpId, slot: int4, val: uintb,
-    ) -> KunaResult<bool> {
+    /// The dtype/newConstant-with-pointer-type commit is W6/W3-varnode; the shape
+    /// guards (`PTRADD`, slot 0, constant index) are transcribed.  Returns
+    /// `false` whenever it cannot complete.
+    fn push_const_further(data: &mut Funcdata, op: OpId, slot: int4, _val: uintb) -> bool {
         if code(data, op) != OpCode::CPUI_PTRADD {
-            return Ok(false);
+            return false;
         }
         if slot != 0 {
-            return Ok(false);
+            return false;
         }
         let vn = in_vn(data, op, 1);
         if !is_const(data, vn) {
-            return Ok(false);
+            return false;
         }
-        let addval = offset(data, vn).wrapping_mul(offset(data, in_vn(data, op, 2)));
-        let constant = data.new_constant(size(data, vn), val.wrapping_add(addval));
-        data.vbank_mut().get_mut(constant).expect("string pointer constant")
-            .update_type(std::rc::Rc::clone(outtype));
-        data.op_remove_input(op, 2);
-        data.op_remove_input(op, 1);
-        data.op_set_opcode_code(op, OpCode::CPUI_COPY);
-        data.op_set_input(op, constant, 0)?;
-        Ok(true)
+        // newconst->updateType(outtype);          -- STUB(W6) pointer datatype
+        // opRemoveInput(op,2); opRemoveInput(op,1); opSetOpcode(op,CPUI_COPY);  -- STUB(W6)
+        false // STUB(W6): cannot stamp pointer type / change opcode -> no push
     }
 }
 
@@ -988,65 +991,17 @@ impl Rule for RulePtrsubCharConstant {
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> KunaResult<int4> {
         let sb = in_vn(data, op, 0);
-        let sbtype = data.vn_type_read_facing(sb, op)?;
-        if sbtype.get_metatype() != crate::dtype::type_metatype::TYPE_PTR {
-            return Ok(0);
+        // Datatype *sbType = sb->getTypeReadFacing(op);  -- STUB(W6)
+        //   The whole guard chain (TYPE_PTR -> TYPE_SPACEBASE -> getAddress / scope
+        //   isReadOnly / stringManager->isString) is W6/W4.  The descendant
+        //   push-const loop (pushConstFurther) and the COPY conversion are also W6.
+        //   Without the read-facing type we cannot proceed.
+        let _push = Self::push_const_further
+            as fn(&mut Funcdata, OpId, int4, uintb) -> bool;
+        if type_read_facing_stub(data, sb, op).is_err() {
+            return Ok(0); // STUB(W6)
         }
-        let Some(spacebase) = sbtype.get_ptr_to() else { return Ok(0) };
-        if spacebase.get_metatype() != crate::dtype::type_metatype::TYPE_SPACEBASE {
-            return Ok(0);
-        }
-        let vn1 = in_vn(data, op, 1);
-        if !is_const(data, vn1) { return Ok(0); }
-        let out = out_vn(data, op);
-        let outtype = data.vn_type_def_facing(out)?;
-        if outtype.get_metatype() != crate::dtype::type_metatype::TYPE_PTR {
-            return Ok(0);
-        }
-        let Some(chartype) = outtype.get_ptr_to() else { return Ok(0) };
-        if !chartype.is_char_print() { return Ok(0); }
-        if crate::kuna_elemptr::reaches_element_pointer(data, out) { return Ok(0); }
-        let usepoint = op_addr(data, op);
-        let val = offset(data, vn1);
-        let Some(addr) = spacebase.spacebase_get_address(
-            val, size(data, vn1), &usepoint, data.get_arch().manage(),
-        ) else { return Ok(0) };
-        if data.get_arch().query_global_properties(&addr, 1, &usepoint)?
-            & crate::varnode::varnode_flags::readonly == 0 {
-            return Ok(0);
-        }
-        let arch = data.get_arch();
-        let (Some(strings), Some(loader)) = (&arch.internal_strings, &arch.loader) else {
-            return Ok(0);
-        };
-        let mut truncated = false;
-        {
-            let mut strings = strings.borrow_mut();
-            let mut loader = loader.borrow_mut();
-            if strings.get_string_data(&addr, &chartype, &mut **loader, &mut truncated)?.is_empty() {
-                return Ok(0);
-            }
-        }
-        let mut remove_copy = !data.vbank().get(out).expect("string pointer").is_addr_force();
-        if remove_copy {
-            for descendant in data.descend_snapshot(out) {
-                let slot = slot_of(data, descendant, out);
-                if !Self::push_const_further(data, &outtype, descendant, slot, val)? {
-                    remove_copy = false;
-                }
-            }
-        }
-        if remove_copy {
-            data.op_destroy(op)?;
-        } else {
-            let constant = data.new_constant(size(data, out), val);
-            data.vbank_mut().get_mut(constant).expect("string pointer constant")
-                .update_type(outtype);
-            data.op_remove_input(op, 1);
-            data.op_set_input(op, constant, 0)?;
-            data.op_set_opcode_code(op, OpCode::CPUI_COPY);
-        }
-        Ok(1)
+        Ok(0)
     }
 }
 

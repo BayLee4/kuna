@@ -6710,7 +6710,7 @@ impl JumpTable {
                 }
             }
             if isthunk {
-                return Err(KunaError::lowlevel("Likely thunk"));
+                return Err(KunaError::jumptable_thunk("Likely thunk"));
             }
         }
         let mut model = self.jmodel.take().unwrap();
