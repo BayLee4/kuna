@@ -57,10 +57,24 @@ impl Fx {
         Self::with_layout(return_address, stack_views, false)
     }
 
+    /// A host session (`remote_scope` set), for behavior only a host enables.
+    pub(crate) fn host() -> Self {
+        Self::with_layout_host(Some((0, 8)), false, false, true)
+    }
+
     fn with_layout(
         return_address: Option<(u64, u32)>,
         stack_views: bool,
         join: bool,
+    ) -> Self {
+        Self::with_layout_host(return_address, stack_views, join, false)
+    }
+
+    fn with_layout_host(
+        return_address: Option<(u64, u32)>,
+        stack_views: bool,
+        join: bool,
+        host: bool,
     ) -> Self {
         let original = build_fd();
         let mut manager = Rc::clone(&original.get_arch().manage);
@@ -91,6 +105,9 @@ impl Fx {
         let stack = Rc::clone(manager.get_stack_space().unwrap());
         let mut arch = ArchContext::new_shared(Rc::clone(&manager));
         arch.stack_views = stack_views;
+        if host {
+            arch.remote_scope = Some(crate::remote_provider::inert_host_scope(&manager));
+        }
         arch.callee_preserves = true;
         arch.default_return_addr =
             return_address.map(|(offset, size)| kuna_num::pcoderaw::VarnodeData {

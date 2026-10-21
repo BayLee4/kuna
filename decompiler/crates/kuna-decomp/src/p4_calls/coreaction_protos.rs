@@ -504,10 +504,11 @@ impl Action for ActionDefaultParams {
                 }
             }
             // FuncCallSpecs::insertPcode: inject immediately after the real call.
-            // Snapshot the id/op before mutating the owning Funcdata.
+            // Snapshot the id/op before mutating the owning Funcdata. Host
+            // sessions only: a standalone decompile injects no upon-return p-code.
             let call = data.get_call_specs(i);
             let inject_id = call.proto().get_inject_upon_return();
-            if inject_id >= 0 {
+            if inject_id >= 0 && data.get_arch().remote_scope.is_some() {
                 let call_op = call.get_op();
                 let operation = data.obank().get(call_op)
                     .ok_or_else(|| KunaError::lowlevel("Upon-return injection has a stale call"))?;
@@ -844,7 +845,11 @@ impl ActionFuncLink {
             }
         }
         if inputlocked && !varargs {
-            Self::link_physical_inputs(idx, data)?;
+            // Host sessions only: a standalone decompile keeps the declared
+            // formal list as the call's argument list.
+            if data.get_arch().remote_scope.is_some() {
+                Self::link_physical_inputs(idx, data)?;
+            }
             let storage = {
                 let active = data.get_call_specs(idx).active_input();
                 (0..active.get_num_trials()).map(|i| {
@@ -2538,7 +2543,7 @@ mod tests {
         use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
         for authority in ["body", "aligned", "aligned_wide", "site", "site_model", "site_injection",
             "site_effect", "injection", "incomplete", "indirect"] {
-            let mut fx = Fx::new();
+            let mut fx = Fx::host();
             let target = fx.constant(8, 0x2000);
             let op = fx.emit(
                 if authority == "indirect" { OpCode::CPUI_CALLIND } else { OpCode::CPUI_CALL },
@@ -2620,7 +2625,10 @@ mod tests {
                 let register = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR,
                     "register", big, 8, 1, 3, addrspace_flags::hasphysical, 1, 1));
                 manager.insert_space(Rc::clone(&register)).unwrap();
-                let arch = Rc::new(ArchContext::new(manager));
+                let manager = Rc::new(manager);
+                let mut arch = ArchContext::new_shared(Rc::clone(&manager));
+                arch.remote_scope = Some(crate::remote_provider::inert_host_scope(&manager));
+                let arch = Rc::new(arch);
                 let code = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
                 let mut data = Funcdata::new("caller", "caller", arch,
                     Address::new(Rc::clone(&code), 0x1000), 0x1000_0000, 0x40).unwrap();

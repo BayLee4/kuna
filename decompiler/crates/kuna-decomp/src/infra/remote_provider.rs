@@ -1493,5 +1493,27 @@ impl RemoteScope {
     }
 }
 
+/// A host-session scope that holds no host data, for tests of behavior that
+/// only a host session (`ArchContext::remote_scope`) enables.
+#[cfg(test)]
+pub(crate) fn inert_host_scope(manager: &Rc<AddrSpaceManager>) -> Rc<RemoteScope> {
+    struct NoHost;
+    impl RemoteProviderFetch for NoHost {
+        fn fetch_mapped_symbols(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+        fn fetch_namespace_path(&self, _: u64, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+        fn fetch_external_ref(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+        fn fetch_tracked_registers(&self, _: &Address, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+        fn fetch_comments(&self, _: &Address, _: u32, _: &mut dyn Decoder) -> KunaResult<bool> { unreachable!() }
+    }
+    Rc::new(RemoteScope::new(
+        Rc::new(NoHost),
+        Rc::clone(manager),
+        Rc::new(TypeFactoryImpl::new()),
+        Rc::new(RefCell::new(std::collections::BTreeMap::new())),
+        None,
+        GlobalQuery::default(),
+    ))
+}
+
 #[cfg(test)]
 mod tests;

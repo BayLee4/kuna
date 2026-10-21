@@ -228,7 +228,6 @@ struct DieSnap {
     gnu_producer: bool,
     signature_ref: Option<u64>,
     calling_convention: Option<gimli::DwCc>,
-    no_return: bool,
     /// The DIE tag (`DW_TAG_*`).
     tag: gimli::DwTag,
     /// `DW_AT_name`, resolved through `.debug_str`/`.debug_line_str` (may be empty).
@@ -314,7 +313,6 @@ impl DieSnap {
             gnu_producer: false,
             signature_ref: None,
             calling_convention: None,
-            no_return: false,
             tag,
             name: String::new(),
             low_pc: None,
@@ -438,8 +436,6 @@ fn snapshot_unit(
         {
             snap.calling_convention = Some(cc);
         }
-        snap.no_return =
-            matches!(entry.attr_value(gimli::DW_AT_noreturn), Some(gimli::AttributeValue::Flag(true)));
         if let Some(v) = entry.attr_value(gimli::DW_AT_byte_size) {
             snap.byte_size = v.udata_value();
         }
@@ -1273,12 +1269,6 @@ impl AnalysisPass for DwarfPass {
                         if snap.declaration {
                             continue;
                         }
-                        if snap.no_return {
-                            out.noreturn.push(crate::pass::NoReturnFact {
-                                addr: low_pc,
-                                name: snap.name.clone(),
-                            });
-                        }
                         if !snap.name.is_empty() {
                             out.symbols.push(SymFact {
                                 addr: low_pc,
@@ -1295,7 +1285,7 @@ impl AnalysisPass for DwarfPass {
                                 // Callable-type openness is handled separately.
                                 if let Some(model) = source_convention(snap) {
                                     if let Ok(proto) = types.logical_proto(
-                                        &pieces, model, true, snap.no_return,
+                                        &pieces, model, true, false,
                                     ) {
                                         out.source_prototypes.push((low_pc, proto));
                                     }
@@ -1340,7 +1330,7 @@ impl AnalysisPass for DwarfPass {
                             if let Some(model) = source_convention(declaration) {
                                 if let Ok(proto) = types.logical_proto(
                                     &pieces, model, true,
-                                    snap.no_return || declaration.no_return,
+                                    false,
                                 ) {
                                     out.cpp_dwarf.source_prototypes.push((low_pc, proto));
                                 }
