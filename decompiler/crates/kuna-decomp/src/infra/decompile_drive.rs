@@ -904,12 +904,11 @@ fn follow_flow_on_fd(arch: &mut Architecture, fd: Funcdata) -> KunaResult<Funcda
     data.set_flag_raw(funcdata_flags::processing_started);
     // Publish buffered flow comments only after replacement construction succeeds.
     let func_addr = data.get_address().clone();
-    // Architecture::clearAnalysis clears generated warnings, not authored
-    // comments. A fresh/reflowed body must not inherit the previous body's
-    // diagnostics (including inline/injection and mapping warnings).
-    arch.commentdb.clear_generated(&func_addr);
+    if arch.mapped_flow_boundary_image {
+        crate::kuna_mappedflowboundary::clear_stale_warnings(&mut arch.commentdb, &func_addr);
+    }
     for (tp, ad, txt) in data.drain_pending_comments() {
-        arch.commentdb.add_generated_comment_no_duplicate(tp, &func_addr, &ad, &txt);
+        arch.commentdb.add_comment_no_duplicate(tp, &func_addr, &ad, &txt);
     }
     Ok(data)
 }
@@ -1098,7 +1097,7 @@ fn run_pipeline(
 fn drain_pipeline_comments(arch: &mut Architecture, fd: &mut Funcdata) {
     let func_addr = fd.get_address().clone();
     for (tp, ad, txt) in fd.drain_pending_comments() {
-        arch.commentdb.add_generated_comment_no_duplicate(tp, &func_addr, &ad, &txt);
+        arch.commentdb.add_comment_no_duplicate(tp, &func_addr, &ad, &txt);
     }
 }
 

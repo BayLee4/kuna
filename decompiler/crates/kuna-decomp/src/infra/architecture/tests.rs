@@ -505,16 +505,6 @@ fn comment_database_dedups_matching_text() {
     assert!(db.add_comment_no_duplicate(comment_type::warning, &fad, &ad, "WARNING: y"));
     assert_eq!(db.comments().len(), 2);
 
-    db.clear();
-    assert!(db.add_generated_comment_no_duplicate(comment_type::warning, &fad, &ad, "same text"));
-    assert!(!db.add_comment_no_duplicate(crate::comment::comment_type::USER2, &fad, &ad, "same text"));
-    db.clear_generated(&fad);
-    assert_eq!(db.comments().len(), 1, "authored duplicate takes ownership without reinserting");
-    assert!(!db.add_generated_comment_no_duplicate(comment_type::warning, &fad, &ad, "same text"));
-    assert!(db.add_generated_comment_no_duplicate(comment_type::warningheader, &fad, &ad, "generated only"));
-    db.clear_generated(&fad);
-    assert_eq!(db.comments().len(), 1, "generated duplicates cannot take ownership from source");
-    assert_eq!(db.comments()[0].text, "same text");
 }
 
 #[test]
