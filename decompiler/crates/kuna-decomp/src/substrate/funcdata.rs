@@ -4869,20 +4869,11 @@ impl Funcdata {
     ) -> KunaResult<OpId> {
         let copy_op = self.new_op(1, addr);
         self.op_set_opcode(copy_op, crate::typeop::type_op_for(OpCode::CPUI_COPY));
-        // This COPY is inserted after type propagation. Apply its existing
-        // SPACEBASE transfer rule here: the frame object's pointee describes
-        // storage at this address, not every value of a merged walking pointer.
         let (ct, size) = {
             let v = self.vbank.get(in_vn).expect("build_copy_trim_op: stale in_vn");
-            let size = v.get_size();
-            let ct = if v.is_spacebase() {
-                crate::coreaction_infertypes::spacebase_pointer(self, size)
-            } else {
-                Some(Rc::clone(v.get_type()))
-            };
-            (ct, size)
+            (Rc::clone(v.get_type()), v.get_size())
         };
-        let out_vn = self.new_unique(size, ct);
+        let out_vn = self.new_unique(size, Some(ct));
         self.op_set_output(copy_op, out_vn)?;
         self.op_set_input(copy_op, in_vn, 0)?;
         // (kuna LOSS-229) Preserve the dynamic-symbol / `mapped` binding across a
