@@ -507,99 +507,6 @@ impl ActionMultiCse {
     pub fn boxed(g: impl Into<String>) -> Box<dyn Action> {
         Box::new(ActionMultiCse { base: ActionBase::new(0, "multicse", g) })
     }
-
-    /// Normalize exactly one COPY, as in coreaction.cc:778-852. This compares
-    /// values only: it never moves a definition to another incoming edge.
-    fn copied_input(data: &Funcdata, vn: VarnodeId) -> Option<VarnodeId> {
-        let value = data.vbank().get(vn).expect("multicse: stale input");
-        let Some(def) = value.get_def() else { return Some(vn) };
-        let op = data.obank().get(def).expect("multicse: stale definition");
-        if op.code() != OpCode::CPUI_COPY {
-            return Some(vn);
-        }
-        if op.num_input() != 1 {
-            return None;
-        }
-        let input = op.get_in(0)?;
-        (data.vbank().get(input).expect("multicse: stale copy input").get_size()
-            == value.get_size()).then_some(input)
-    }
-
-    fn preferred_output(data: &Funcdata, out1: VarnodeId, out2: VarnodeId) -> bool {
-        let v1 = data.vbank().get(out1).expect("multicse: stale output");
-        let v2 = data.vbank().get(out2).expect("multicse: stale output");
-        let used_by_return = |vn: &crate::varnode::Varnode| {
-            vn.descend_iter().any(|op| {
-                data.obank().get(op).expect("multicse: stale reader").code() == OpCode::CPUI_RETURN
-            })
-        };
-        if used_by_return(v1) {
-            return false;
-        }
-        if used_by_return(v2) {
-            return true;
-        }
-        !v1.is_addr_tied()
-            && (v2.is_addr_tied()
-                || (v1.get_space().get_type() == kuna_base::space::spacetype::IPTR_INTERNAL
-                    && v2.get_space().get_type() != kuna_base::space::spacetype::IPTR_INTERNAL))
-    }
-
-    fn find_match(
-        data: &Funcdata,
-        block: crate::context::BlockId,
-        target: OpId,
-        shared: VarnodeId,
-    ) -> Option<OpId> {
-        let target_op = data.obank().get(target).expect("multicse: stale target");
-        let target_output = data.vbank().get(target_op.get_out()?).expect("multicse: stale output");
-        let size = target_output.get_size();
-        let mut cursor = data.bb_op_head(block);
-        while let Some(candidate) = cursor {
-            if candidate == target {
-                break;
-            }
-            let op = data.obank().get(candidate).expect("multicse: stale candidate");
-            cursor = op.basic_neighbours().1;
-            if op.code() != OpCode::CPUI_MULTIEQUAL || op.num_input() != target_op.num_input() {
-                continue;
-            }
-            let Some(out) = op.get_out() else { continue };
-            let output = data.vbank().get(out).expect("multicse: stale output");
-            // Equal incoming values do not make two address-tied locations
-            // interchangeable. Their markers must keep each location's state,
-            // just as copy propagation and required High merges do.
-            // SPACEBASE markers also have a distinct pointee-propagation role.
-            if output.get_size() != size
-                || output.is_spacebase() != target_output.is_spacebase()
-                || (output.is_addr_tied()
-                    && target_output.is_addr_tied()
-                    && output.get_addr() != target_output.get_addr())
-                || !(0..op.num_input()).any(|i| {
-                    op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) == Some(shared)
-                })
-            {
-                continue;
-            }
-            // Both PHIs are in the same block: slot i denotes the same incoming
-            // edge for both. Do not sort operands or compare PHIs as expressions.
-            let equivalent = (0..op.num_input()).all(|i| {
-                let Some(in1) = op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) else {
-                    return false;
-                };
-                let Some(in2) = target_op.get_in(i).and_then(|vn| Self::copied_input(data, vn)) else {
-                    return false;
-                };
-                data.vbank().get(in1).expect("multicse: stale input").get_size() == size
-                    && data.vbank().get(in2).expect("multicse: stale input").get_size() == size
-                    && crate::expression::functional_equality(in1, in2, data.vbank(), data.obank())
-            });
-            if equivalent {
-                return Some(candidate);
-            }
-        }
-        None
-    }
 }
 
 impl Action for ActionMultiCse {
@@ -615,58 +522,21 @@ impl Action for ActionMultiCse {
         }
         Some(Box::new(ActionMultiCse { base: self.base.clone() }))
     }
-    fn apply(&mut self, data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
-        // C++ coreaction.cc:823-897. Reuse the seen-input set across restarts;
-        // unlike temporary Varnode marks it cannot leak into another action.
-        let mut seen = HashSet::new();
-        for i in 0..data.bblocks_get_size() {
-            let block = data.bblocks_get_block(i);
-            loop {
-                seen.clear();
-                let mut cursor = data.bb_op_head(block);
-                let mut pair = None;
-                while let Some(target) = cursor {
-                    let op = data.obank().get(target).expect("multicse: stale op");
-                    cursor = op.basic_neighbours().1;
-                    if op.code() == OpCode::CPUI_COPY {
-                        continue;
-                    }
-                    if op.code() != OpCode::CPUI_MULTIEQUAL {
-                        break;
-                    }
-                    for slot in 0..op.num_input() {
-                        let Some(vn) = op.get_in(slot).and_then(|vn| Self::copied_input(data, vn)) else {
-                            continue;
-                        };
-                        if seen.contains(&vn) {
-                            if let Some(previous) = Self::find_match(data, block, target, vn) {
-                                pair = Some((previous, target));
-                                break;
-                            }
-                        }
-                    }
-                    if pair.is_some() {
-                        break;
-                    }
-                    for slot in 0..op.num_input() {
-                        if let Some(vn) = op.get_in(slot).and_then(|vn| Self::copied_input(data, vn)) {
-                            seen.insert(vn);
-                        }
-                    }
-                }
-                let Some((previous, target)) = pair else { break };
-                let out1 = data.obank().get(previous).expect("multicse: stale match").get_out().expect("multicse: no output");
-                let out2 = data.obank().get(target).expect("multicse: stale target").get_out().expect("multicse: no output");
-                if Self::preferred_output(data, out1, out2) {
-                    data.total_replace(out1, out2)?;
-                    data.op_destroy(previous)?;
-                } else {
-                    data.total_replace(out2, out1)?;
-                    data.op_destroy(target)?;
-                }
-                self.base.count += 1;
-            }
-        }
+    fn apply(&mut self, _data: &mut Funcdata, _ctx: &mut ActionContext) -> kuna_base::error::KunaResult<ApplyResult> {
+        // C++ coreaction.cc:894 — ActionMultiCse::apply
+        //   bblocks = data.getBasicBlocks(); sz = bblocks.getSize();
+        //   for (i = 0; i < sz; ++i):
+        //       bl = bblocks.getBlock(i);
+        //       while (processBlock(data, bl)) {}   // repeat until no change
+        //   return 0;
+        //
+        // `processBlock` (coreaction.cc:846-892) scans a block for equivalent
+        // MULTIEQUAL ops (via `findMatch`/`preferredOutput`) and folds the
+        // redundant one, bumping `count` through the Funcdata edit surface.
+        //
+        // STUB(W8-funcdata): the block graph (`getBasicBlocks`) and the
+        // MULTIEQUAL fold (`opSetOutput`/`totalReplace`/`opDestroy`) are not in the
+        // merged tree.  Body transcribed; no change applied (count stays 0).
         Ok(0)
     }
 }

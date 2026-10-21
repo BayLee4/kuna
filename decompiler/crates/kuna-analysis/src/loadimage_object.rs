@@ -559,7 +559,6 @@ pub struct ObjectLoadImage {
 /// (`__bss_start`, `_edata`, `_end`) are exactly the zero-size entries that would
 /// otherwise plant a spurious name on the first byte of an unrelated object.
 fn collect_data_sym<'a>(
-    unsized_extents: &std::collections::BTreeMap<u64, u64>,
     sym: &impl object::ObjectSymbol<'a>,
     out: &mut Vec<DataSym>,
     seen: &mut HashSet<u64>,
@@ -568,11 +567,7 @@ fn collect_data_sym<'a>(
     if sym.is_undefined() {
         return;
     }
-    let size = if sym.size() == 0 {
-        unsized_extents.get(&sym.address()).copied().unwrap_or(0)
-    } else {
-        sym.size()
-    };
+    let size = sym.size();
     if size == 0 {
         return;
     }
@@ -590,61 +585,6 @@ fn collect_data_sym<'a>(
     if seen.insert(addr) {
         out.push(DataSym { addr, name, size });
     }
-}
-
-/// Mach-O nlist omits sizes. Build section-bounded label intervals once, rather
-/// than rescanning all symbols for each object. DWARF declarations retain their
-/// independent, stronger authored extents at publication.
-fn macho_data_extents(
-    file: &object::File<'_>,
-    mode: NameChars,
-) -> (std::collections::BTreeMap<u64, u64>, Vec<DataSym>) {
-    use std::collections::{BTreeMap, BTreeSet};
-    if file.format() != object::BinaryFormat::MachO {
-        return (BTreeMap::new(), Vec::new());
-    }
-    let mut sections = BTreeMap::new();
-    for section in file.sections() {
-        if let Some(end) = section.address().checked_add(section.size()) {
-            sections.insert(section.index().0, (section.address(), end, section.kind(), BTreeSet::new()));
-        }
-    }
-    for symbol in file.symbols() {
-        if symbol.is_undefined() { continue; }
-        let Some(index) = symbol.section_index() else { continue };
-        if let Some((start, end, _, labels)) = sections.get_mut(&index.0) {
-            if symbol.address() >= *start && symbol.address() < *end {
-                labels.insert(symbol.address());
-            }
-        }
-    }
-    let starts: BTreeMap<_, _> = sections.iter().map(|(&index, &(start, _, _, _))| (start, index)).collect();
-    let mut exported_data = Vec::new();
-    for export in file.exports().unwrap_or_default() {
-        let Some((_, index)) = starts.range(..=export.address()).next_back() else { continue };
-        let (_, end, kind, labels) = sections.get_mut(index).unwrap();
-        if export.address() >= *end { continue; }
-        labels.insert(export.address());
-        if matches!(kind, object::SectionKind::Data | object::SectionKind::ReadOnlyData
-            | object::SectionKind::ReadOnlyString | object::SectionKind::UninitializedData)
-            && !export.name().is_empty()
-        {
-            exported_data.push((export.address(), sanitize_symbol_name_bytes(export.name(), mode).into_owned()));
-        }
-    }
-    let mut extents = BTreeMap::new();
-    for (_, (_, end, _, labels)) in sections {
-        let mut next = end;
-        for address in labels.into_iter().rev() {
-            extents.insert(address, next - address);
-            next = address;
-        }
-    }
-    let exported_data = exported_data.into_iter().filter_map(|(addr, name)| {
-        let size = *extents.get(&addr)?;
-        (size > 0).then_some(DataSym { addr, name, size })
-    }).collect();
-    (extents, exported_data)
 }
 
 /// (kuna `dynrelocs`) Store `value` into the `width`-byte slot at `vma`, in the
@@ -921,7 +861,6 @@ impl ObjectLoadImage {
         // the same walks and deduped on its own address set.  See [`DataSym`].
         let mut datasyms: Vec<DataSym> = Vec::new();
         let mut seen_data: HashSet<u64> = HashSet::new();
-        let (unsized_extents, exported_data) = macho_data_extents(&file, namechars);
 
         // 1. `.symtab` defined functions.  Skip *undefined* (import-placeholder)
         //    entries — e.g. the ELF UND `puts@@GLIBC_2.2.5` (`st_value == 0`),
@@ -938,7 +877,7 @@ impl ObjectLoadImage {
         //    COFF object's defined-at-0 function (design §3.6 object-vs-image).
         for sym in file.symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&unsized_extents, &sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -983,7 +922,7 @@ impl ObjectLoadImage {
         //    functions in `.dynsym`.
         for sym in file.dynamic_symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&unsized_extents, &sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -1006,11 +945,6 @@ impl ObjectLoadImage {
                 funcsyms.push(FuncSym { addr, name });
             } else if is_elf {
                 aliases.push(FuncSym { addr, name });
-            }
-        }
-        for symbol in exported_data {
-            if seen_data.insert(symbol.addr) {
-                datasyms.push(symbol);
             }
         }
 

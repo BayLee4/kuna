@@ -97,8 +97,8 @@ fn wide_literal_is_unmarked_with_the_width_off() {
         "off must mark up nothing at 2-byte width, got:\n{out}"
     );
     assert!(
-        out.contains("LoadLibraryW(&dat_140002100)"),
-        "off keeps the independent global-address projection without a wide literal, got:\n{out}"
+        out.contains("LoadLibraryW(0x140002100)"),
+        "off must leave the wide literal's address untyped, got:\n{out}"
     );
     // The control: the ASCII width is untouched by the gate.
     assert!(
@@ -109,14 +109,14 @@ fn wide_literal_is_unmarked_with_the_width_off() {
 
 /// The recorded defect, on the pass set a default `kuna decompile` runs: with
 /// `operand_refs` on and the 2-byte width off, the wide literal rendered as its
-/// own first character, `LoadLibraryW("n")`; the scalar markup now leaves its
-/// address to global-reference rendering. With the width on it renders whole, and `widestrings` wins the
+/// own first character, `LoadLibraryW("n")`; the scalar markup now leaves it
+/// untyped. With the width on it renders whole, and `widestrings` wins the
 /// shared commit stream.
 #[test]
 fn the_width_outranks_the_scalar_markup_that_read_one_character() {
     let off = decompile_entry_with(false, true);
     assert!(
-        off.contains("LoadLibraryW(&dat_140002100)"),
+        off.contains("LoadLibraryW(0x140002100)"),
         "operand_refs must not read the wide literal as a one-character string \
          with the width off, got:\n{off}"
     );

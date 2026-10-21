@@ -132,19 +132,6 @@ recursive renamer and heritage action with their original error class, rather
 than becoming invariant panics. Constant-address STORE conversion uses the
 same fallible varnode factory and rule result boundary.
 
-**Redundant PHIs.** `ActionMultiCse` compares the leading MULTIEQUALs in each
-basic block, allowing intervening COPYs, and repeats after every elimination.
-As in upstream `coreaction.cc:742-897`, each incoming value may be normalized
-through exactly one COPY before comparing matching predecessor slots with the
-existing functional-equivalence predicate. This is not commutative expression
-matching: swapping predecessor operands changes the value. COPY normalization
-does not move instructions or redirect edges; heritage's SSA invariant already
-requires each operand to be available on its own incoming edge. Width-changing
-COPYs and unequal PHI widths are not identity substitutions. The survivor
-preference is RETURN use, then address-tied storage, then non-unique storage;
-`total_replace` rewires all consumers before `op_destroy` removes the redundant
-definition, and the action's change count drives the enclosing fixed point.
-
 **Op properties on a heritage-created op.** The three op-codes heritage installs
 (the phi, the read-size SUBPIECE, the write-size PIECE) take their property flags
 from the same op-code table every other producer of p-code resolves through

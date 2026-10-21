@@ -414,7 +414,7 @@ name only the printer fixed would be one the tool could no longer be asked for.
 The **data** half of those same two symbol tables is read alongside the function
 half (`loadimage_object.rs (data_symbols)`): every defined, named `STT_OBJECT`
 entry with a non-zero `st_size`, deduplicated by address, `.symtab` before
-`.dynsym`. ELF zero-size entries are dropped because the linker's section-boundary
+`.dynsym`. Zero-size entries are dropped because the linker's section-boundary
 markers (`__bss_start`, `_edata`, `_end`) are exactly the sizeless ones, and a
 sizeless symbol would plant a name on the first byte of whatever object follows
 it. Each surviving entry becomes a named `undefined<size>` global — the same
@@ -429,14 +429,7 @@ default ON, DIV-26/DIV-76): the stream is collected at `load file` but committed
 at `read symbols`, after the option lines are applied, so the gate is the plain
 `Architecture` flag the commit consults — no env bridge is needed on either CLI
 path. Off drops the stream at the commit and restores the raw `dat_<addr>`
-rendering exactly. Mach-O's nlist has no size field: its defined data labels retain
-the interval to the next definition in the same section, bounded by the section's
-end. That loader interval is not a replacement for a DWARF-authored object type.
-Neutral Mach-O exports enter the function stream only when their address belongs
-to a code section; data exports do not become functions. Typed import pointer slots
-and code stubs retain their separately supplied roles. A defined function at
-address zero remains a function: undefined status, not a zero-address heuristic,
-identifies unresolved symbols.
+rendering exactly.
 
 A **declared extent is never trusted to be representable.** `st_size` is a 64-bit
 field of the image that no header check validates, while the type factory sizes

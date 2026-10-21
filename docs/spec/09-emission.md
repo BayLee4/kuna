@@ -53,14 +53,6 @@ With `partialaccess` enabled, pointer views of volatile annotations retain a
 volatile pointee, including sixteen-byte views, so changing the spelling does
 not change the access width or permit the C compiler to merge the accesses.
 
-The shared action collection's `coreaction_render.rs
-(ActionMultiCse::find_match)` keeps SPACEBASE and ordinary-pointer phi outputs
-separate even when their incoming values match. A SPACEBASE marker deliberately
-propagates an unknown-byte pointer; replacing an ordinary-pointer phi with it
-would erase independent pointee inference from its incoming paths. Compatible
-roles retain the existing value comparison and survivor preference; source
-flags, storage flags and datatype locks remain unchanged.
-
 This phase renders the finished decompilation: it inserts the explicit
 cast/field-access operations a C compiler would need to *see* the recovered
 types (§9.1), then walks the structured block tree of chapter 08 and the SSA

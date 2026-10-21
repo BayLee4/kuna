@@ -290,18 +290,11 @@ fn finish_with_exports(
     neutral: &object::File,
     mut out: MachOIndirectSymbols,
 ) -> MachOIndirectSymbols {
-    use object::read::{Object, ObjectSection};
+    use object::read::Object;
     if let Ok(exports) = neutral.exports() {
         for e in exports {
             let name = e.name();
-            let code = neutral.sections().any(|section| {
-                (section.kind() == object::SectionKind::Text
-                    || matches!(section.flags(), object::SectionFlags::MachO { flags }
-                        if flags & object::macho::S_ATTR_PURE_INSTRUCTIONS != 0))
-                    && e.address() >= section.address()
-                    && e.address() - section.address() < section.size()
-            });
-            if !name.is_empty() && code {
+            if !name.is_empty() {
                 out.imports.push(ImportSym {
                     addr: e.address(),
                     name: strip_leading_underscore(name),

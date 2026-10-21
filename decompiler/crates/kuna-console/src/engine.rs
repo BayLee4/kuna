@@ -4920,7 +4920,7 @@ fn commit_analysis_output(
                     arch.symboltab.find_function(global, &addr).is_some()
                         || arch
                             .symboltab
-                            .find_overlap(global, &addr, (*size).clamp(1, int4::MAX as u64) as int4)
+                            .find_container(global, &addr, 1, &Address::new_invalid())
                             .is_some()
                 }
                 None => false,
