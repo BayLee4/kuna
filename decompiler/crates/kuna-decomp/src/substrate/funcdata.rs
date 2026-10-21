@@ -3015,14 +3015,6 @@ impl Funcdata {
     }
     /// (kuna `calltargettype`) The type the indirect call `op` states, if recorded.
     pub fn kuna_call_target_type(&self, op: OpId) -> Option<std::rc::Rc<crate::dtype::Datatype>> {
-        if self.get_arch().call_target_publication == crate::kuna_calltargettype::CallTargetPublication::PerCallOnly {
-            return None;
-        }
-        self.kuna_call_target_print_type(op)
-    }
-    /// The original-phase receipt for structural C spelling. Per-call-only
-    /// receipts are deliberately invisible to type requirements and CAST IR.
-    pub(crate) fn kuna_call_target_print_type(&self, op: OpId) -> Option<std::rc::Rc<crate::dtype::Datatype>> {
         self.kuna_call_target_types.get(&op).cloned()
     }
     /// Toggle whether normalization transforms will be performed

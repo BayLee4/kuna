@@ -1465,19 +1465,6 @@ type is the base's rather than its own, which takes `void *`. A call any of
 whose types has no C spelling (a partial or union-resolving type, an array, a
 `TYPE_SPACEBASE`, a scalar of a width C has no type for) is skipped.
 
-The receiver's derived `CallTargetPublication` selects the publication, not
-the proof. `Full` is the CLI default and the enhanced Ghidra policy; the existing
-High, implied-load, public parameter/global and synthesized-field behavior below
-remains unchanged. An ordinary Ghidra receiver uses `PerCallOnly`: the same
-original-phase action acquires the existing per-op callable receipt and returns
-before any High or field publication. Authored/source signatures, locked or
-variadic calls, custom/hidden roles, injection and incomplete prototypes retain
-their existing owners. The ordinary receipt is unavailable through the type
-requirement/CAST getter; only structural C rendering borrows it. It never enters
-the inference lattice, raw call prototype, public High, or native type codec.
-Acquisition is not moved after `ActionSetCasts`: that action can interpose CASTs
-between a call and the INDIRECT clobbers used by the admission below.
-
 The type must also be one a C compiler would pass the same way. Laid out under
 the default model, each parameter of the built prototype has to fall inside the
 storage the call recorded for that argument (`FuncCallSpecs::final_input_storage`)

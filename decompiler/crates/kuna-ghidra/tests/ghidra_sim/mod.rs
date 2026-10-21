@@ -225,7 +225,7 @@ pub const QUERY_COMMAND_IDS: std::ops::RangeInclusive<u32> = 239..=257;
 /// stub left the engine without char/bool/void core types and broke init);
 /// mirroring the default keeps the ghidra-mode factory identical to the
 /// oracle's, which is what makes `<typeref>` name+id resolution agree.
-pub const DEFAULT_CORETYPES_XML: &[u8] = b"<coretypes>\
+pub const DEFAULT_CORETYPES_XML: &[u8] = b"<coretypes kuna_result_version=\"1\">\
 <type name=\"void\" size=\"1\" metatype=\"void\"/>\
 <type name=\"bool\" size=\"1\" metatype=\"bool\"/>\
 <type name=\"uint1\" size=\"1\" metatype=\"uint\"/>\
@@ -674,6 +674,8 @@ pub struct ParsedDoc {
     pub markup_varrefs: BTreeSet<u64>,
     /// Whether the second (markup) `<function>` was present.
     pub has_markup: bool,
+    /// Whether the extension's `<kuna_result>` prelude led the `<doc>`.
+    pub has_prelude: bool,
     /// The C text flattened from the markup token stream (content strings +
     /// `<break indent>` line breaks), with Java's `getC()` token cleaning
     /// applied ([`illegal_char_cpp_transform`]) — what a script/export user
@@ -734,7 +736,18 @@ pub fn parse_decompile_doc(doc: &[u8], manager: &AddrSpaceManager) -> ParsedDoc 
         if c == 0 {
             break;
         }
-        if c == ELEM_PARAMMEASURES_ID {
+        if c == kuna_decomp::resulttypes::ELEM_KUNA_RESULT.get_id() && !parsed.has_prelude {
+            // The extension's Java requires this first child, with the version
+            // it offered at registration.
+            assert!(!parsed.has_function && !parsed.has_markup, "result prelude is not the first <doc> child");
+            let rid = dec.open_element().expect("open <kuna_result>");
+            let version = dec
+                .read_unsigned_integer_id(&kuna_decomp::resulttypes::ATTRIB_KUNA_RESULT_VERSION)
+                .expect("<kuna_result> version");
+            assert_eq!(version, u64::from(kuna_decomp::resulttypes::RESULT_VERSION));
+            dec.close_element_skipping(rid).expect("close <kuna_result>");
+            parsed.has_prelude = true;
+        } else if c == ELEM_PARAMMEASURES_ID {
             let pid = dec.open_element().expect("open <parammeasures>");
             parse_parammeasures(&mut dec, &mut parsed);
             dec.close_element(pid).expect("close <parammeasures>");

@@ -85,10 +85,10 @@ Ghidra copies. Derive the effective settings and extension locations from Ghidra
 the extension preserves the ordinary untouched-Java control. See
 [`tests/ghidra/README.md`](../tests/ghidra/README.md) for setup.
 
-An enhanced manager offers `kuna_result_version="1"` on registration's `coretypes`.
-Only a supporting native session sends a first-child `kuna_result` DOC prelude
-with that same version, including when its definition set is empty. No prelude
-means ordinary decoding, **not** assumed enhanced support. Version 1 uses element
+The extension's Java offers `kuna_result_version="1"` on registration's `coretypes`;
+`registerProgram` without it is refused. Every session sends a first-child
+`kuna_result` DOC prelude with that same version, including when its definition set
+is empty. Version 1 uses element
 IDs 4000 (`kuna_result`), 4003 (`kuna_type`), 4002 (`kuna_definition`), version attribute
 4003, and explicit `kuna_local` handle attribute 4004. Reservations precede
 definitions; result-local reference handles are distinct from host datatype IDs.
@@ -96,19 +96,11 @@ Packed element and attribute IDs have separate namespaces and a 12-bit limit.
 This unreleased coherent version-1 boundary also includes exporter-private
 selected-root preparation and the export-only working-result role. It does not
 claim compatibility with an earlier partial version-1 implementation.
-Callable inference uses that same session negotiation to derive one native
-publication policy. CLI architectures default to `Full`; an enhanced session
-retains normal anonymous callable High/result types, while an ordinary session
-uses `PerCallOnly`. Both use the existing aggressive `calltargettype` preset;
-the catalog default and named ON/OFF controls are unchanged. An ordinary C
-request may spell an ABI-admitted per-call signature without retyping its High,
-public input, source prototype, record field, or CAST IR. The structural cast
-binds actual source/core datatype leaves only; an anonymous native Code, minted
-record, or other receiver-unresolvable leaf is not published to stock Java.
-A plain `void` keyword needs no invented datatype identity. This is not an
-external callback declaration: unknown-width inference cannot recover a missing
-nominal integer rank, and C providers must match the selected target's data
-organization and actual signature.
+The session applies the existing aggressive `calltargettype` preset; the catalog
+default and named ON/OFF controls are unchanged. This is not an external callback
+declaration: unknown-width inference cannot recover a missing nominal integer
+rank, and C providers must match the selected target's data organization and
+actual signature.
 
 An authored managed `FunctionDefinition` is separate from native callable
 inference. In ordinary C markup, its bare name expands to its source function
@@ -119,13 +111,6 @@ publication is unchanged. This presentation choice is invocation-local and
 preserves source objects, IDs, High types and physical storage.
 Visible scalar type tokens bind their scalar owners; the parameter declaration's
 HighSymbol retains the complete callback pointer for source edits.
-
-The policy is derived only from `Session.result_version` during registration
-and after `reset_wire_defaults`, before normal Java option deltas. Each
-`ArchContext` receives that projection at construction. Ordinary no-C,
-no-casts, non-C-language, and non-decompile requests skip receipt acquisition;
-the request scope restores the stored feature option on success or failure.
-No additional user option, capability version, or result cache is introduced.
 
 Only actually referenced syntax-tree, measurement, token and transitive datatype
 dependencies are described, including recursive records and callable types.

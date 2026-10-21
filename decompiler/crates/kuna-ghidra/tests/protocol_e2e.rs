@@ -82,7 +82,7 @@ const PSPEC: &[u8] = b"<processor_spec><programcounter register=\"PC\"/></proces
 const CSPEC: &[u8] = b"<compiler_spec><default_proto/></compiler_spec>";
 // Phase 3 decodes the wire corespec for real (build_core_types): mirror the
 // standalone default core-type set so engine init still finds char/bool/void.
-const CORETYPES: &[u8] = b"<coretypes>\
+const CORETYPES: &[u8] = b"<coretypes kuna_result_version=\"1\">\
 <type name=\"void\" size=\"1\" metatype=\"void\"/>\
 <type name=\"bool\" size=\"1\" metatype=\"bool\"/>\
 <type name=\"uint1\" size=\"1\" metatype=\"uint\"/>\

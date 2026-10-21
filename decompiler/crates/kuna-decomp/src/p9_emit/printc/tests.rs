@@ -1403,7 +1403,7 @@ fn wire_reset_restores_the_engine_defaults() {
         assert!(print.options.null && print.options.inplace_ops);
         assert!(print.options.convention);
         assert_eq!(print.options.brace_func, BraceStyle::NextLine);
-        assert_eq!(print.max_line_size, 100);
+        assert_eq!(print.max_line_size, 10000);
         print.set_null_printing(false);
         print.set_inplace_ops(false);
         print.set_convention_printing(false);

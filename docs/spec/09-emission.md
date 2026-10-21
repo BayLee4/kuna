@@ -671,20 +671,6 @@ Inferred calls still depend on `calltargettype` and its physical ABI admission;
 rendering neither repairs the option-off bare-call controls nor fabricates an
 integer function type for values held in floating-point registers.
 
-For a `PerCallOnly` ordinary receiver, the same structural target-declarator
-owner may instead borrow the existing original-phase `calltargettype` receipt.
-This is not permission to infer again from the post-cast call. The authored and
-actual hidden-result source paths retain precedence; inferred spelling requires
-`calltargettype`, `ctypes`, C output and casts enabled. It evaluates the existing
-target once and leaves its High, ordered physical operands, source prototype
-and CAST IR unchanged. The borrowed declarator binds only real host/source/core
-leaf IDs that the stock `ClangTypeToken` decoder can resolve; a plain `void`
-keyword is syntax, while any other native-only leaf declines the conversion.
-There is no anonymous-Code token, inferred record declaration, or stock result
-prelude. `Full` receivers retain the existing inferred-type and CAST publication
-path, including its record-identity behavior. Option-OFF and ABI/clobber refusals
-remain bare calls rather than being silently cast to pass a C consumer.
-
 One value-changing case is still open. A 32-bit argument trimmed out of a
 64-bit register keeps its `int` type, so `sink64(a0 * 3)` with `int a0`
 reaches a callee defined as `void sink64(unsigned long a0)` sign-extended,

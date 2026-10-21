@@ -57,11 +57,6 @@ impl Fx {
         Self::with_layout(return_address, stack_views, false)
     }
 
-    /// A host session (`remote_scope` set), for behavior only a host enables.
-    pub(crate) fn host() -> Self {
-        Self::with_layout_host(Some((0, 8)), false, false, true)
-    }
-
     fn with_layout(
         return_address: Option<(u64, u32)>,
         stack_views: bool,

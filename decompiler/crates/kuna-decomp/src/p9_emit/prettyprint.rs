@@ -1838,17 +1838,24 @@ impl Default for TokenSplit {
     }
 }
 
-/// Static counter for uniquely assigning begin/end pair ids
-/// (C++ `TokenSplit::countbase`).
-///
-/// C++ uses a process-wide `static int4 countbase`.  The port keeps the same
-/// monotonic behavior with a thread-local cell (the emitter is single-threaded
-/// per `PrintLanguage`); the absolute id values are never compared across
-/// emitters, only matched begin/end within one stream.
+// Static counter for uniquely assigning begin/end pair ids
+// (C++ `TokenSplit::countbase`).
+//
+// C++ uses a process-wide `static int4 countbase`.  The port keeps the same
+// monotonic behavior with a thread-local cell (the emitter is single-threaded
+// per `PrintLanguage`); the absolute id values are never compared across
+// emitters, only matched begin/end within one stream.
+thread_local! {
+    static COUNTBASE: std::cell::Cell<int4> = const { std::cell::Cell::new(0) };
+}
+
+/// Restart the count for a new host document, so repeated renders of one
+/// function are byte-identical. Documents render one at a time per thread.
+pub fn restart_countbase() {
+    COUNTBASE.with(|c| c.set(0));
+}
+
 fn next_countbase() -> int4 {
-    thread_local! {
-        static COUNTBASE: std::cell::Cell<int4> = const { std::cell::Cell::new(0) };
-    }
     COUNTBASE.with(|c| {
         let v = c.get();
         c.set(v + 1);

@@ -94,8 +94,6 @@ struct Session {
     send_c_code: bool,
     /// setAction "parammeasures"/"noparammeasures" (default false).
     send_param_measures: bool,
-    /// Explicit enhanced result-definition protocol, zero for stock peers.
-    result_version: u32,
 }
 
 impl Session {
@@ -109,7 +107,6 @@ impl Session {
             send_syntax_tree: true,
             send_c_code: true,
             send_param_measures: false,
-            result_version: 0,
         }
     }
 
@@ -504,7 +501,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
             CommandKind::RegisterProgram => {
                 let [pspec, cspec, tspec, corespec] =
                     cmd.specs.take().expect("registerProgram params");
-                let result_version = negotiated_result_version(&corespec)?;
+                require_result_version(&corespec)?;
                 let mut open: Option<usize> = None;
                 for (i, s) in self.archlist.iter().enumerate() {
                     if s.is_none() {
@@ -523,7 +520,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 };
                 cmd.slot = Some(slot);
                 cmd.archid = slot as i32;
-                self.archlist[slot].as_mut().expect("bound session").result_version = result_version;
                 // Build the live engine over the four wire specs.  This issues
                 // the init-time queries (the getUserOpName probe loop, C++
                 // `userops.initialize`) on the shared client — nested inside the
@@ -534,7 +530,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 // registration failure (DecompInterface.java:291-294; the C++
                 // `RegisterProgram::rawAction` assigns `ghidra` before `init` for
                 // exactly this reason, ghidra_process.cc:176-201).
-                match self.build_architecture(cmd.archid, &pspec, &cspec, &tspec, &corespec, result_version) {
+                match self.build_architecture(cmd.archid, &pspec, &cspec, &tspec, &corespec) {
                     Ok(arch) => {
                         self.archlist[slot]
                             .as_mut()
@@ -731,13 +727,12 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 }
 
                 // Snapshot the render flags before taking `&mut Architecture`.
-                let (send_syntax_tree, send_c_code, send_param_measures, result_version) = {
+                let (send_syntax_tree, send_c_code, send_param_measures) = {
                     let session = self.archlist[slot].as_ref().expect("bound session");
                     (
                         session.send_syntax_tree,
                         session.send_c_code,
                         session.send_param_measures,
-                        session.result_version,
                     )
                 };
 
@@ -759,14 +754,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                     if signature {
                         arch.allacts.set_current("normalize").map_err(WireError::from)?;
                     }
-                    let requested_callable = arch.call_target_type;
-                    if arch.call_target_publication == kuna_decomp::kuna_calltargettype::CallTargetPublication::PerCallOnly
-                        && (!send_c_code || arch.print().options.nocasts
-                            || arch.print().out_lang() != kuna_decomp::kuna_lang::OutLang::C
-                            || arch.allacts.get_current_name() != "decompile")
-                    {
-                        arch.call_target_type = false;
-                    }
                     let driven = kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
                         arch,
                         &name,
@@ -782,10 +769,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         // for an unlocked signature — kuna recovers those).
                         &[],
                     );
-                    // Restore the user's option before either Result path or
-                    // any fallible root restoration. The Funcdata context
-                    // already owns the request's projection.
-                    arch.call_target_type = requested_callable;
                     if signature {
                         arch.allacts.set_current(&saved_root).map_err(WireError::from)?;
                     }
@@ -815,7 +798,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                                 send_c_code,
                                 send_param_measures,
                                 &current_action,
-                                result_version,
                             )
                             }
                         }
@@ -904,7 +886,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                         // defaults, then the DIV-77 ghidra-mode preset layer),
                         // then let the deltas land on it.
                         arch.reset_wire_defaults();
-                        apply_ghidra_mode_defaults(arch, session.result_version);
+                        apply_ghidra_mode_defaults(arch);
                         let bytes = cmd.optionslist.take()
                             .ok_or_else(|| KunaError::decoder("missing <optionslist>"))?;
                         let manager = arch.translate().manager_rc();
@@ -933,9 +915,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                 // decisions. The physical-publication owner alone holds roots
                 // and computed bindings; command routing has no second cache.
                 arch.print_mut().set_export_binding(None);
-                if session.result_version != RESULT_VERSION {
-                    return Err(KunaError::recov("selected-root preparation requires the negotiated result protocol").into());
-                }
                 let bytes = cmd.optionslist.take()
                     .ok_or_else(|| KunaError::decoder("missing selected-root address stream"))?;
                 // Command-specific collection: canonical <addr/> and <string>
@@ -1034,7 +1013,6 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
         cspec: &[u8],
         tspec: &[u8],
         corespec: &[u8],
-        result_version: u32,
     ) -> KunaResult<Architecture> {
         let registry = build_registry();
         let translate = GhidraTranslate::new(tspec, &registry, Rc::clone(&self.client))?;
@@ -1067,7 +1045,7 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
         // fid, aif, ...) run over a real file in kuna-analysis and have no seam
         // here: their PRODUCTS are what the Phase-3 providers pull over the
         // wire instead.
-        apply_ghidra_mode_defaults(&mut arch, result_version);
+        apply_ghidra_mode_defaults(&mut arch);
         // Phase 3: install the lazy wire-backed providers (ScopeGhidra /
         // TypeFactoryGhidra) — after init (cspec <global> ranges + pspec
         // property paints are in, the lockDefaultProperties point), before the
@@ -1163,19 +1141,10 @@ pub fn kuna_banner_text() -> String {
 /// every setOptions after `reset_wire_defaults` — the reset-then-apply
 /// contract): Ghidra-convention fallback naming plus the CLI `aggressive`
 /// ENGINE-TIER preset.  See the build_architecture doc comment for why.
-/// Enhanced receivers retain anonymous callable types. Ordinary receivers use
-/// the same original-phase admission but publish only a structural C spelling;
-/// their High types and source prototypes stay unchanged. Session negotiation
-/// is the sole authority, replayed after every reset before Java option deltas.
-fn apply_ghidra_mode_defaults(arch: &mut Architecture, result_version: u32) {
+fn apply_ghidra_mode_defaults(arch: &mut Architecture) {
     arch.name_style_ghidra = true;
     arch.retain_physical_call_inputs = true;
     arch.vararg_entry = true;
-    arch.call_target_publication = if result_version == RESULT_VERSION {
-        kuna_decomp::kuna_calltargettype::CallTargetPublication::Full
-    } else {
-        kuna_decomp::kuna_calltargettype::CallTargetPublication::PerCallOnly
-    };
     if let Some(overrides) = kuna_decomp::modes::mode_overrides("aggressive") {
         for (name, value) in overrides {
             if kuna_decomp::options::KUNA_OPTION_NAMES.contains(name) {
@@ -1224,14 +1193,16 @@ fn parse_arch_id(payload: &[u8]) -> i32 {
     val.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
-fn negotiated_result_version(corespec: &[u8]) -> KunaResult<u32> {
+/// The session requires the Kuna extension's Java: its `coretypes` offers the
+/// result protocol version this native speaks.
+fn require_result_version(corespec: &[u8]) -> KunaResult<()> {
     let mut store = kuna_base::xml::DocumentStorage::new();
     let doc = store.parse_document(corespec)?;
     let root = doc.get_root();
-    Ok(match root.get_attribute_value("kuna_result_version") {
-        Ok(value) if kuna_base::marshal::cxx_parse_unsigned(value) == u64::from(RESULT_VERSION) => RESULT_VERSION,
-        _ => 0,
-    })
+    match root.get_attribute_value("kuna_result_version") {
+        Ok(value) if kuna_base::marshal::cxx_parse_unsigned(value) == u64::from(RESULT_VERSION) => Ok(()),
+        _ => Err(KunaError::recov("registerProgram: coretypes does not offer the Kuna result protocol; the Kuna extension's Java classes are required")),
+    }
 }
 
 /// C++ integer extraction with the base selected by the prefix. Invalid or
@@ -1297,39 +1268,26 @@ fn build_decompile_at_doc(
     send_c_code: bool,
     send_param_measures: bool,
     current_action: &str,
-    result_version: u32,
 ) -> KunaResult<Vec<u8>> {
     use kuna_decomp::resulttypes::ResultTypeEncoder;
-    let result_types = (result_version == RESULT_VERSION).then(ResultTypeTable::shared);
+    let types = ResultTypeTable::shared();
     let mut buf: Vec<u8> = Vec::new();
     // The symbol-link pass, ahead of everything that reads its results (the
     // markup's `<vardecl symref>` and the `<localdb>`/`<highlist>` encode).
     if send_syntax_tree {
         fd.kuna_link_high_symbols();
     }
-    if result_types.is_none() {
-        let mut enc = PackedEncode::new(&mut buf);
-        enc.open_element(&ELEM_DOC);
-    }
     if send_param_measures && current_action == "paramid" {
         // The parammeasures-only doc (DecompilerParameterIdCmd /
         // ConventionAnalysisDecompileConfigurer).
         let analysis = kuna_decomp::paramid::ParamIDAnalysis::new(fd, true)?;
         let mut enc = PackedEncode::new(&mut buf);
-        if let Some(types) = &result_types {
-            analysis.encode(&mut ResultTypeEncoder::new(&mut enc, types), true)?;
-        } else {
-            analysis.encode(&mut enc, true)?;
-        }
+        analysis.encode(&mut ResultTypeEncoder::new(&mut enc, &types), true)?;
     } else {
         if send_param_measures {
             let analysis = kuna_decomp::paramid::ParamIDAnalysis::new(fd, false)?;
             let mut enc = PackedEncode::new(&mut buf);
-            if let Some(types) = &result_types {
-                analysis.encode(&mut ResultTypeEncoder::new(&mut enc, types), true)?;
-            } else {
-                analysis.encode(&mut enc, true)?;
-            }
+            analysis.encode(&mut ResultTypeEncoder::new(&mut enc, &types), true)?;
         }
         // The dual <function>: the Clang token-markup document, rendered first
         // (see above), spliced after the syntax tree.  `doc_function_markup`
@@ -1339,11 +1297,7 @@ fn build_decompile_at_doc(
             let mut printer = arch.take_print();
             // Markup and ordinary C/Java presentation use the same selected
             // language. Clang token identities do not require C spelling.
-            let m = if let Some(types) = &result_types {
-                printer.doc_function_markup_result(fd, arch, Rc::clone(types))
-            } else {
-                printer.doc_function_markup(fd, arch)
-            };
+            let m = printer.doc_function_markup_result(fd, arch, Rc::clone(&types));
             arch.put_print(printer);
             Some(m?)
         } else {
@@ -1351,33 +1305,21 @@ fn build_decompile_at_doc(
         };
         {
             let mut enc = PackedEncode::new(&mut buf);
-            if let Some(types) = &result_types {
-                fd.encode(&mut ResultTypeEncoder::new(&mut enc, types), 0, send_syntax_tree)?;
-            } else {
-                fd.encode(&mut enc, 0, send_syntax_tree)?;
-            }
+            fd.encode(&mut ResultTypeEncoder::new(&mut enc, &types), 0, send_syntax_tree)?;
         }
         if let Some(m) = markup {
-            if result_types.is_some() {
-                if let Some(publication) = arch.print().export_publication() {
-                    publication.encode(&mut PackedEncode::new(&mut buf))?;
-                }
+            if let Some(publication) = arch.print().export_publication() {
+                publication.encode(&mut PackedEncode::new(&mut buf))?;
             }
             buf.extend_from_slice(&m);
         }
     }
-    if let Some(types) = result_types {
-        let mut doc = Vec::new();
-        PackedEncode::new(&mut doc).open_element(&ELEM_DOC);
-        ResultTypeTable::encode_prelude_packed(&types, &mut doc)?;
-        doc.extend_from_slice(&buf);
-        PackedEncode::new(&mut doc).close_element(&ELEM_DOC);
-        Ok(doc)
-    } else {
-        let mut enc = PackedEncode::new(&mut buf);
-        enc.close_element(&ELEM_DOC);
-        Ok(buf)
-    }
+    let mut doc = Vec::new();
+    PackedEncode::new(&mut doc).open_element(&ELEM_DOC);
+    ResultTypeTable::encode_prelude_packed(&types, &mut doc)?;
+    doc.extend_from_slice(&buf);
+    PackedEncode::new(&mut doc).close_element(&ELEM_DOC);
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -1395,11 +1337,11 @@ mod tests {
     }
 
     #[test]
-    fn result_extension_requires_explicit_supported_offer() {
-        assert_eq!(negotiated_result_version(b"<coretypes/>").unwrap(), 0);
-        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"1\"/>").unwrap(), 1);
-        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"0x1\"/>").unwrap(), 1);
-        assert_eq!(negotiated_result_version(b"<coretypes kuna_result_version=\"2\"/>").unwrap(), 0);
+    fn registration_requires_the_supported_result_offer() {
+        assert!(require_result_version(b"<coretypes/>").is_err());
+        assert!(require_result_version(b"<coretypes kuna_result_version=\"1\"/>").is_ok());
+        assert!(require_result_version(b"<coretypes kuna_result_version=\"0x1\"/>").is_ok());
+        assert!(require_result_version(b"<coretypes kuna_result_version=\"2\"/>").is_err());
     }
 
     #[test]

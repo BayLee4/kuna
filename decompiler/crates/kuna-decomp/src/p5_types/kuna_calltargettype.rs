@@ -79,18 +79,6 @@ use crate::dtype::{type_metatype, Datatype, TypeFactory};
 use crate::fspec::{FuncProto, ParameterPieces, ProtoParameter, PrototypePieces};
 use crate::funcdata::Funcdata;
 
-/// Where a receiver can represent an inferred callable type. This is an engine
-/// projection of the negotiated result capability, not another user option.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum CallTargetPublication {
-    /// CLI and enhanced receivers retain the full native inferred type.
-    #[default]
-    Full,
-    /// Ordinary receivers retain their public types; C borrows a per-call
-    /// spelling from the receipt acquired at the normal ABI/clobber phase.
-    PerCallOnly,
-}
-
 /// A call through a field of a synthesized record: the record, the field's
 /// offset, and the type the call states, or `None` when the function's calls
 /// through the field disagree (see [`declare_field`]).
@@ -391,34 +379,14 @@ pub fn retype_call_targets(data: &mut Funcdata) -> kuna_base::error::KunaResult<
     let tlst: &dyn TypeFactory = &*tlst;
     let mut groups: BTreeMap<HighVariableId, Group> = BTreeMap::new();
     let mut casts: Vec<(OpId, Rc<Datatype>)> = Vec::new();
-    let per_call = data.get_arch().call_target_publication == CallTargetPublication::PerCallOnly;
-    for index in 0..data.num_calls() {
-        let op = {
-            let fc = data.get_call_specs(index);
-            if fc.is_input_locked() || fc.is_dotdotdot() {
-                continue;
-            }
-            if per_call {
-                let proto = fc.proto();
-                // Authored/source contracts keep their existing printer path.
-                // A default-model inference cannot replace custom roles,
-                // injection, or an incomplete working prototype.
-                if !proto.has_store() || !proto.has_model()
-                    || proto.logical_pieces().is_some()
-                    || proto.is_override() || proto.has_custom_storage()
-                    || proto.is_inline() || proto.has_this_pointer()
-                    || proto.has_input_errors() || proto.has_output_errors()
-                    || proto.get_inject_upon_return() >= 0 || fc.get_paramshift() != 0
-                    || proto.get_output().is_hidden_return()
-                    || proto.get_output().is_indirect_storage()
-                    || (0..proto.num_params()).any(|slot| proto.get_param(slot).is_some_and(|param|
-                        param.is_hidden_return() || param.is_indirect_storage()))
-                {
-                    continue;
-                }
-            }
-            fc.get_op()
-        };
+    let ops: Vec<OpId> = (0..data.num_calls())
+        .filter(|&i| {
+            let fc = data.get_call_specs(i);
+            !fc.is_input_locked() && !fc.is_dotdotdot()
+        })
+        .map(|i| data.get_call_specs(i).get_op())
+        .collect();
+    for op in ops {
         let Some(target) = data
             .obank()
             .get(op)
@@ -434,24 +402,12 @@ pub fn retype_call_targets(data: &mut Funcdata) -> kuna_base::error::KunaResult<
         if function_pointer(&current) {
             continue;
         }
-        if per_call && (!matches!(current.get_metatype(),
-            type_metatype::TYPE_PTR | type_metatype::TYPE_INT
-                | type_metatype::TYPE_UINT | type_metatype::TYPE_UNKNOWN)
-            || !data.vbank().get(target).is_some_and(|value| spellable(&current, value.get_size())))
-        {
-            continue;
-        }
         let Some(ty) = call_type(data, tlst, op)? else { continue };
-        if per_call {
-            data.kuna_set_call_target_type(op, ty);
-        } else if uncallable_pointer(&current) {
+        if uncallable_pointer(&current) {
             groups.entry(high).or_default().push((op, ty));
         } else {
             casts.push((op, ty));
         }
-    }
-    if per_call {
-        return Ok(());
     }
     for (op, ty) in casts {
         data.kuna_set_call_target_type(op, ty);

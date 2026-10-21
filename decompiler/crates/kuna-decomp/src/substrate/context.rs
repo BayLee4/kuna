@@ -861,8 +861,6 @@ pub struct ArchContext {
     /// Read by
     /// [`ActionCallTargetType`](crate::kuna_calltargettype::ActionCallTargetType).
     pub call_target_type: bool,
-    /// Receiver projection copied from Architecture at this context's birth.
-    pub call_target_publication: crate::kuna_calltargettype::CallTargetPublication,
     /// (kuna `calltargettype`) C output: a parameter or global takes the call's
     /// type too, and a target whose uses disagree is cast at each call. The
     /// Rust speller spells every pointer to code `*const ()`, so neither changes
@@ -1838,7 +1836,6 @@ impl ArchContext {
             rodata_string: false,        // (kuna) rodatastring
             ptrdepthcap: false,          // (kuna) option ptrdepthcap
             call_target_type: false,     // (kuna) option calltargettype
-            call_target_publication: crate::kuna_calltargettype::CallTargetPublication::Full,
             call_target_c: false,        // (kuna) option calltargettype, C output
             float_globals: None,         // (kuna) option floatglobals
             float_globals_pending: false,

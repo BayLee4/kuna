@@ -1,5 +1,4 @@
-use super::*;
-use super::support::{assert_c_source, assert_c_source_with_warnings, assert_rust_source, bare_arch, execution_printer};
+use super::support::assert_c_source;
 use crate::dtype::{type_metatype, Datatype, TypeFactory, TypeFactoryImpl, TypeField};
 use std::rc::Rc;
 

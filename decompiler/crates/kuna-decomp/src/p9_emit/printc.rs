@@ -1286,6 +1286,10 @@ pub fn op_emit_kind(opcode: kuna_num::opcodes::OpCode) -> OpEmitKind {
 // PrintEmit — the emit back-end selector (static, no-vtable delegation)
 // ===========================================================================
 
+/// The widest margin the emitter accepts: the engine default wraps nowhere, as
+/// the console does. Java sends its own `maxlinewidth` on every `setOptions`.
+const DEFAULT_MAX_LINE_SIZE: int4 = 10000;
+
 /// The low-level [`Emit`] back-end `PrintC` drives, selected between the
 /// byte-exact plain-text sink ([`EmitNoMarkup`], the `print C` datatest path)
 /// and packed clang token markup. Native host documents wrap [`EmitMarkup`]
@@ -1330,6 +1334,7 @@ macro_rules! pe_forward {
 
 impl PrintEmit {
     fn markup(max_line_size: int4) -> Self {
+        crate::prettyprint::restart_countbase();
         let mut emit = crate::prettyprint::EmitPrettyPrint::new();
         emit.set_markup(true);
         emit.set_max_line_size(max_line_size).expect("validated maximum line size");
@@ -1714,7 +1719,7 @@ impl PrintC {
             name: CAPABILITY_NAME.to_string(),
             flat: false,
             emit: PrintEmit::NoMarkup(EmitNoMarkup::new()),
-            max_line_size: 100,
+            max_line_size: DEFAULT_MAX_LINE_SIZE,
             emit_fd: None,
             revpol: Vec::new(),
             nodepend: Vec::new(),
@@ -2038,9 +2043,8 @@ impl PrintC {
         self.set_export_binding(None);
         self.options = PrintCOptions::new();
         self.rt_ctx.convention = self.options.convention;
-        self.max_line_size = 100;
-        // The constant is inside the upstream emitter's valid range.
-        self.emit.set_max_line_size(100).expect("default maximum line size");
+        self.max_line_size = DEFAULT_MAX_LINE_SIZE;
+        self.emit.set_max_line_size(DEFAULT_MAX_LINE_SIZE).expect("default maximum line size");
         self.emit.set_indent_increment(2);
     }
 
@@ -8889,21 +8893,6 @@ impl PrintC {
                 || self.rt_ctx.hidden_results && skip.is_some_and(|slot|
                     crate::kuna_indirectargs::hidden_result(proto).is_some_and(|result| slot == result.slot + 1))
         });
-        let per_call = proto.is_none()
-            && fd.get_arch().call_target_publication
-                == crate::kuna_calltargettype::CallTargetPublication::PerCallOnly
-            && fd.get_arch().call_target_type && arch.call_target_type
-            && self.rt_ctx.ctypes && !self.options.nocasts;
-        // This receipt was admitted before ActionSetCasts, while its clobber
-        // INDIRECTs were adjacent. Rendering only borrows it; it never infers
-        // a new prototype from the post-cast operations.
-        let inferred_code = if per_call {
-            fd.kuna_call_target_print_type(op).and_then(|pointer| pointer.get_ptr_to())
-        } else {
-            None
-        };
-        let proto = proto.or_else(|| inferred_code.as_ref()
-            .and_then(|code| code.get_code_prototype()).map(|prototype| prototype.as_ref()));
         let Some(proto) = proto else { return self.push_vn_ir(fd,arch,vn,op) };
         let current = match declared_variable_type(fd,arch.decl_high_type,vn) {
             Some(declared) => declared,
@@ -8911,7 +8900,7 @@ impl PrintC {
             // not recompute a dirty High's analysis datatype.
             None => fd.vn_type_read_facing(vn,op)?,
         };
-        let needs_cast = per_call || current.get_ptr_to().is_some_and(|target|
+        let needs_cast = current.get_ptr_to().is_some_and(|target|
                 target.get_metatype() == crate::dtype::type_metatype::TYPE_VOID
                     || self.rt_ctx.ctypes
                         && target.get_metatype() == crate::dtype::type_metatype::TYPE_CODE
@@ -8919,24 +8908,7 @@ impl PrintC {
         let spelling = needs_cast.then(||
             crate::kuna_langc::C_SPELLER.callable_pointer(&self.rt_ctx,proto)).flatten();
         if let Some(spelling) = spelling {
-            let mut spelling = apply_type_names(spelling,self.type_names.as_deref());
-            if per_call {
-                // Stock ClangTypeToken can resolve source/core leaf IDs, not
-                // an anonymous native Code or a minted record/alias. Keep the
-                // declaration structural and bind only admitted actual leaves.
-                // A factory-created plain void is a C keyword, not a host ID.
-                let admitted = |text: &str, spans: &[crate::kuna_langtypes::DeclaratorTypeSpan]| spans.iter().all(|span|
-                    span.datatype.is_host_type() && span.datatype.get_id() != 0
-                        || span.datatype.get_metatype() == crate::dtype::type_metatype::TYPE_VOID
-                            && text.get(span.range.clone()) == Some("void"));
-                if !admitted(&spelling.front,&spelling.front_types)
-                    || !admitted(&spelling.back,&spelling.back_types)
-                {
-                    return self.push_vn_ir(fd,arch,vn,op);
-                }
-                spelling.front_types.retain(|span| span.datatype.is_host_type() && span.datatype.get_id() != 0);
-                spelling.back_types.retain(|span| span.datatype.is_host_type() && span.datatype.get_id() != 0);
-            }
+            let spelling = apply_type_names(spelling,self.type_names.as_deref());
             self.push_op(&tokens::TYPECAST,Some(op_key(op)));
             self.push_op(&TYPED_DECL_JOIN,Some(op_key(op)));
             self.push_typed_declarator_part_ir(&spelling.front,&spelling.front_types,op);
@@ -13794,8 +13766,7 @@ impl IntegerLiteral {
 /// factory + `promoteSize = tlst->getSizeOfInt()`, so the rebuild is exact).
 fn cast_strategy_for(arch: &Architecture, lang: crate::kuna_lang::OutLang) -> Option<LanguageCastStrategy> {
     let tlst = arch.types_rc() as std::rc::Rc<dyn crate::dtype::TypeFactory>;
-    let c = arch.call_target_type && arch.ctypes && lang == crate::kuna_lang::OutLang::C
-        && arch.call_target_publication == crate::kuna_calltargettype::CallTargetPublication::Full;
+    let c = arch.call_target_type && arch.ctypes && lang == crate::kuna_lang::OutLang::C;
     Some(LanguageCastStrategy::new(tlst, lang, c))
 }
 

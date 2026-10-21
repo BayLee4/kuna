@@ -395,8 +395,6 @@ pub struct Architecture {
     /// (kuna `dwarftypedefs`) Keep a DWARF declaration's typedef names and
     /// qualifiers (`kuna_dwarftypedefs`); read by the CLI before the load.
     pub dwarf_typedefs: bool,
-    /// Receiver representability for the existing callable inference owner.
-    pub call_target_publication: crate::kuna_calltargettype::CallTargetPublication,
     /// (kuna `floatglobals`) Let a float vote accept a global the program only
     /// moves through float registers (`kuna_floatglobals`).
     pub float_globals: bool,
@@ -2806,7 +2804,6 @@ impl Architecture {
             ptrdepthcap: false, // (kuna) option ptrdepthcap; reset_defaults sets the shipped default
             call_target_type: false, // (kuna) option calltargettype; reset_defaults sets the shipped default
             dwarf_typedefs: false,
-            call_target_publication: crate::kuna_calltargettype::CallTargetPublication::Full,
             float_globals: true, // (kuna) option floatglobals; reset_defaults sets the shipped default
             kuna_float_scan: None,
             kuna_float_globals: None,
@@ -3407,7 +3404,6 @@ impl Architecture {
         self.caller_reads = true; // (kuna) option callerreads default-on: inert without the Listing, so 0/675 datatest assertions move
         self.call_target_type = false; // (kuna) option calltargettype: default-OFF in the catalog because the XML datatest corpus pins the upstream `code *` spellings and applies no mode; ON in the `aggressive` preset, which `auto` selects under 500 KiB, so it is the default rendering for every real binary
         self.dwarf_typedefs = false; // (kuna) option dwarftypedefs: default-OFF in the catalog (the datatest corpus and the original CLI fixtures pin the looked-through spellings); ON in the `aggressive` preset
-        self.call_target_publication = crate::kuna_calltargettype::CallTargetPublication::Full;
         self.ptrdepthcap = false; // (kuna) DIV-108: default-OFF in the catalog because it changes INFERRED types and the datatest corpus pins the upstream spellings; ON in the `aggressive` preset, which `auto` selects under 500 KiB, so the cap is the default rendering for every real binary
         self.float_bits = true; // (kuna) option floatbits default-on: a float helper that only bit-ops its float-register input into its float-register return types float on both sides
         self.bool_byte = true; // (kuna) option boolbyte default-on: measured 0/675 datatest assertions moved, stages PARITY OK, decbench type_match improved with none worse, speed within budget; docs/features/boolbyte/record.json carries the evidence
@@ -4237,13 +4233,8 @@ impl Architecture {
         ctx.memset_recover = self.memset_recover; // GH-9230/1537 memsetrecover
         ctx.rodata_string = self.rodata_string; // (kuna) rodatastring
         ctx.ptrdepthcap = self.ptrdepthcap; // (kuna) ptrdepthcap
-        ctx.call_target_publication = self.call_target_publication;
-        let full_callable = self.call_target_publication == crate::kuna_calltargettype::CallTargetPublication::Full;
-        let callable_c = self.print.out_lang() == crate::kuna_lang::OutLang::C;
-        ctx.call_target_type = self.call_target_type && self.ctypes && (full_callable || callable_c);
-        // This gate also controls record identity and public parameter/global
-        // retyping. Per-call-only C spelling must not enable those consumers.
-        ctx.call_target_c = ctx.call_target_type && callable_c && full_callable;
+        ctx.call_target_type = self.call_target_type && self.ctypes; // (kuna) calltargettype: only C's own spelling needs it
+        ctx.call_target_c = ctx.call_target_type && self.print.out_lang() == crate::kuna_lang::OutLang::C; // (kuna) calltargettype
         if self.float_globals {
             ctx.float_globals = self.kuna_float_globals.clone(); // (kuna) floatglobals
             ctx.float_globals_pending = self.kuna_float_globals.is_none() && self.kuna_float_scan.is_some();
