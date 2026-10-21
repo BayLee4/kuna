@@ -12,7 +12,9 @@ signature, and a kuna-vs-stock line-diff ratio).
 The core swap uses the same seam as the `KunaDecompiler` extension
 (`integrations/ghidra/KunaDecompiler/`): a reflection write of
 `DecompileProcessFactory.exepath`, which the factory consults before spawning
-the native process. No extension install is needed for the smoke.
+the native process. The smoke runs in a Ghidra profile with the extension
+installed: `kuna_ghidra` speaks the extension's result protocol, so stock Java
+is refused (`extension.require()`).
 
 ## Setup
 
@@ -27,13 +29,15 @@ the native process. No extension install is needed for the smoke.
        "$GHIDRA_INSTALL_DIR/Ghidra/Features/PyGhidra/pypkg/dist" pyghidra
    ```
 
-3. The `kuna_ghidra` binary — NOT part of `make binaries`; build it directly:
+3. The `KunaDecompiler` extension ZIP (see
+   `integrations/ghidra/KunaDecompiler/README.md` for `build.sh`; it bundles the
+   `kuna_ghidra` backend), installed into an isolated profile. The script prints
+   the `export` lines that select the profile and the installed backend:
 
    ```bash
-   cd decompiler && cargo build --release -p kuna-ghidra
+   eval "$(python3 integrations/ghidra/live-smoke/extension.py \
+       integrations/ghidra/KunaDecompiler/dist/*.zip /tmp/kuna-smoke-profile)"
    ```
-
-   (produces `decompiler/target/release/kuna_ghidra`).
 
 ## Run
 

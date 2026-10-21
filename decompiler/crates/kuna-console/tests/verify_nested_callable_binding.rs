@@ -1,5 +1,4 @@
 //! Completed source callback declarations keep their ABI after the default changes.
-use crate::common;
 use std::rc::Rc;
 use kuna_console::engine::ConsoleProgram;
 use kuna_console::ifacedecomp::{register_console_commands, register_decomp_commands, IfaceDecompData, DECOMPILE_MODULE};
@@ -38,14 +37,9 @@ fn verify(program: &ConsoleProgram, code: &Datatype, model: &str, variadic: bool
 #[test]
 fn completed_nested_roots_keep_identity_and_abi_after_default_switch() {
     let repo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap();
-    let fixture = Fixture(common::scratch_file("nested-callable-binding", "fixture"));
-    let result = std::process::Command::new("python3")
-        .arg(repo.join("tests/ghidra/callable/build_nested_default_binding.py"))
-        .arg("--out").arg(&fixture.0).output().expect("original fixture builder requires python3");
-    assert!(result.status.success(), "fixture construction failed: {}\n{}",
-        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    let elf = repo.join("decompiler/crates/kuna-analysis/tests/fixtures/nested_default_binding_i386.elf");
     let before = vec![
-        format!("load file x86:LE:32:default:windows {}", fixture.0.join("nested.elf").display()),
+        format!("load file x86:LE:32:default:windows {}", elf.display()),
         "read symbols".into(), "option defaultprototype __stdcall".into(),
         "parse line typedef int (*Old)(int);".into(),
         "parse line typedef int (__fastcall *Explicit)(int,...);".into(),
@@ -89,8 +83,4 @@ fn completed_nested_roots_keep_identity_and_abi_after_default_switch() {
     verify(p, &explicit, "__fastcall", true, false);
     let returned = code(p, "Nested").get_code_prototype().unwrap().get_output().get_type().unwrap().get_ptr_to().unwrap();
     verify(p, &returned, "__fastcall", true, false);
-}
-struct Fixture(std::path::PathBuf);
-impl Drop for Fixture {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
 }

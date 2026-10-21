@@ -166,6 +166,8 @@ def main():
 
     import pyghidra
     pyghidra.start()
+    import extension
+    extension.require()
     from ghidra.app.decompiler import DecompInterface
 
     field = get_exepath_field()

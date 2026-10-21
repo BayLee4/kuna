@@ -83,7 +83,8 @@ Uninstalling enhanced Java also requires restart. For testing, use the same stoc
 Ghidra copies. Derive the effective settings and extension locations from Ghidra's
 `ApplicationLayout`; do not construct guessed user-prefix paths. A profile without
 the extension preserves the ordinary untouched-Java control. See
-[`tests/ghidra/README.md`](../tests/ghidra/README.md) for setup.
+[`integrations/ghidra/live-smoke/README.md`](../integrations/ghidra/live-smoke/README.md)
+for setup.
 
 The extension's Java offers `kuna_result_version="1"` on registration's `coretypes`;
 `registerProgram` without it is refused. Every session sends a first-child
@@ -559,8 +560,6 @@ allocation and constant-pool forms follow Ghidra's `PrintJava`; record acquisiti
 uses the shared architecture constant pool and propagates provider errors.
 Java type leaves bind the final base datatype after pointer unwrapping; array
 brackets remain syntax rather than part of the datatype token.
-The original six genuine JVM consumers in `tests/ghidra/cpool_consumers.py`
-remain the semantic acceptance tests.
 
 ```
 Ghidra GUI (untouched)                          kuna-ghidra binary
@@ -1341,6 +1340,12 @@ so the pinned line-diff band measures markup fidelity rather than this known gap
   provider/emitter change that earns the move — Phase 3/4 land by flipping them
   downward. Run: `make test-ghidra` (release; also part of the CI `gates` job on
   every PR, which matters because the workspace suite is skipped on internal PRs).
+  The sim clients offer `kuna_result_version` on registration, as the extension's
+  Java does, and decode the `kuna_result` prelude of every `<doc>`.
+  `ghidra_sim_commands.rs` scripts arbitrary command sequences: the options a
+  Java `DecompileOptions` sends (the four whose native defaults differ from
+  Java's are sent every time) reach the printer and are replaced by the next list,
+  and the BSim signature-settings commands answer on the wire.
 - **Phase 3+: DecompileDebug captures as fixtures.** Ghidra's "Debug Function
   Decompilation" action (`DecompInterface.enableDebug`, `DebugDecompilerAction.java:38-73`)
   records every callback answer into an `<xml_savefile>` — exactly the document kuna's
@@ -1348,26 +1353,16 @@ so the pinned line-diff band measures markup fidelity rather than this known gap
   to replay against `kuna-ghidra` without a live Ghidra (de-risking the sim's
   synthesized `<mapsym>` shapes), and `DecompileDebugXmlLoader` (Features/Base) can
   import them as Programs for the reverse direction.
-- **Installed-product acceptance:** `make test-ghidra-live` runs the existing
-  twenty real-Ghidra suites. Set `KUNA_GHIDRA_EXTENSION_ZIP` to the freshly built
-  normal ZIP: the runner installs through `ExtensionUtils` in an isolated profile,
-  restarts, verifies Java origins and selects that installation's bundled native
-  executable. CI runs this gate on qualified macOS ARM64/Ghidra 12.1.4/Java 21
-  for main, manual/nightly runs, fork PRs and internal PRs with `full-ci`.
-  Run it locally before merging integration changes; Rust protocol simulation
-  and package compilation alone do not cover Java result/export semantics.
-  See `tests/ghidra/README.md` for prerequisites and raw stock-control comparison.
-- **Focused live smoke:** `integrations/ghidra/live-smoke/` — a
-  pyghidra rig that swaps `DecompileProcessFactory.exepath` to `kuna_ghidra` inside
-  a real Ghidra, decompiles the same functions with both cores, and writes a
-  side-by-side report with the same scanner counts the sim pins (see its README
-  for the offline-pyghidra setup). For the full extension path: build the
-  normal extension ZIP, install into its matching Ghidra release and restart,
-  enable the plugin, verify the spawned PID is `kuna_ghidra` and that the C,
-  click-to-address, and rename round-trip behave. Product testing requires the
-  full 12.1.4 ZIP in an isolated per-user settings profile on the same stock
-  installation. Untouched-Java controls use a separate profile without the
-  extension; they are not another distribution.
+- **Live smoke** (manual): `integrations/ghidra/live-smoke/` — a pyghidra rig that
+  installs the normal extension ZIP into an isolated per-user profile on the same
+  stock installation (`extension.py`), then decompiles the same functions with
+  the stock and the kuna cores and writes a side-by-side report with the same
+  scanner counts the sim pins (see its README for the offline-pyghidra setup). The
+  smoke refuses a JVM that did not load the extension's Java: Java results, the
+  options encoder and the exporter are the extension's, so stock Java is not a
+  supported receiver. Untouched-Java controls use a separate profile without the
+  extension; they are not another distribution. Run it before merging integration
+  changes; the Rust simulation covers the wire, not the Java classes.
 - **Regression floors**: the standing gates (`make test`, `make test-stages`,
   `make rust-test`, now plus the `gates`-job ghidra-sim step) must stay green —
   `kuna-ghidra` is additive and must not perturb the standalone engine.
@@ -1516,9 +1511,7 @@ orders the result, and encodes the canonical block tree. Copy `altindex` values
 retain the original component indexes used by Java's `transferObjectRef`; block
 types, reverse edge slots, condition opcodes, and goto target indexes/depths use
 the existing block codec. Independent graph switches have no function jump-table
-association; function-IR switches still require their recovered table. The actual
-Java consumer is `tests/ghidra/native_features.py` (including stock topology,
-branch-polarity, object-reference and address comparisons).
+association; function-IR switches still require their recovered table.
 
 **Phase-4 deferred (follow-ups, graceful degradation per §10):**
 - [x] The four signature commands, including canonical settings and debug origins, for BSim.

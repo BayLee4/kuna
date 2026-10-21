@@ -13,7 +13,8 @@ fn roots() -> Vec<String> {
 
 fn program() -> ConsoleProgram {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
-    let source = std::fs::read_to_string(root.join("tests/ghidra/callable/fixtures/return_role_bookkeeping.xml")).unwrap();
+    let source = std::fs::read_to_string(
+        root.join("decompiler/crates/kuna-analysis/tests/fixtures/return_role_bookkeeping_riscv64.xml")).unwrap();
     let mut documents = DocumentStorage::new();
     let image = documents.parse_document(source.as_bytes()).unwrap().get_root().clone();
     let mut program = bootstrap_program(image, "RISCV:LE:64:default:gcc", &roots())

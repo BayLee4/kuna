@@ -23,8 +23,8 @@
 //! `Architecture::dwarf_typedefs` bool keeps the option catalog-visible.
 //!
 //! Default **off** in the catalog (the datatest corpus and the original CLI
-//! fixtures pin the looked-through spellings); the Ghidra product gate
-//! (`tests/ghidra/run.py`) turns it on for its CLI producers.
+//! fixtures pin the looked-through spellings); callers that compare CLI output
+//! with the Ghidra export (the Java product tests) turn it on.
 
 /// Environment variable that gates source-name retention in the DWARF type
 /// mapper. Absent or any off-token => disabled (the default).

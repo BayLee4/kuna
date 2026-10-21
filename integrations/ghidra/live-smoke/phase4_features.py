@@ -76,6 +76,8 @@ def main():
 
     import pyghidra
     pyghidra.start()
+    import extension
+    extension.require()
     from ghidra.app.decompiler import DecompInterface, DecompileProcessFactory
     from ghidra.program.model.pcode import HighFunctionDBUtil
     from ghidra.program.model.symbol import SourceType

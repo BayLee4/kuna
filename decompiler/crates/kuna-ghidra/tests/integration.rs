@@ -5,6 +5,9 @@ mod decompile_at_e2e;
 #[path = "ghidra_sim_e2e.rs"]
 mod ghidra_sim_e2e;
 
+#[path = "ghidra_sim_commands.rs"]
+mod ghidra_sim_commands;
+
 #[path = "inject_e2e.rs"]
 mod inject_e2e;
 

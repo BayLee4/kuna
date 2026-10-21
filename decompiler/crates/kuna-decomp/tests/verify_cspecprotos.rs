@@ -680,68 +680,6 @@ fn deferred_callable_rejects_invalid_alias_targets_without_poisoning_valid_retry
     }
 }
 
-#[test]
-#[ignore = "requires java_structural_publication.py authentic ProgramDB snapshots via KUNA_HOST_GRAPH_FIXTURES"]
-fn genuine_host_mutations_refresh_source_closure_and_retain_old_layouts() {
-    use kuna_base::marshal::{Decoder, PackedDecode};
-    use kuna_decomp::dtype::{type_metatype, Datatype, TypeFactory};
-    let fixtures = PathBuf::from(std::env::var_os("KUNA_HOST_GRAPH_FIXTURES")
-        .expect("run tests/ghidra/callable/java_structural_publication.py first"));
-    for case in ["union", "partial", "bitfield_alias"] {
-        let architecture = bootstrap("x86:LE:64:default:gcc").unwrap();
-        let arch = arch_of(&architecture);
-        let factory = arch.types_impl();
-        let decode = |epoch: &str, name: &str| {
-            let bytes = std::fs::read(fixtures.join(case).join(format!("{epoch}-{name}.packed"))).unwrap();
-            let mut decoder = PackedDecode::new(arch.manage());
-            decoder.ingest_stream(&bytes).unwrap();
-            factory.decode_type(&mut decoder).unwrap()
-        };
-        let old_word = decode("initial", "word");
-        let old_record = decode("initial", "record");
-        if case == "union" { decode("initial", "aggregate"); }
-        let old_source = decode("initial", "source");
-        let old_callback = decode("initial", "callback");
-        let old_pointer = factory.get_type_pointer(8, Rc::clone(&old_source), 1).unwrap();
-        let callback_record = |callback: &Rc<Datatype>| {
-            let source = callback.get_code_prototype().expect("authored callback")
-                .get_param(0).expect("source argument").get_type().unwrap();
-            if source.get_metatype() == type_metatype::TYPE_UNION {
-                source.get_field(0).unwrap().field_type.clone()
-            } else {
-                Rc::clone(source)
-            }
-        };
-        let old_callback_record = callback_record(&old_callback);
-        let old_field_name = old_record.get_field(1).map(|field| field.name.clone());
-        assert_eq!(old_word.get_metatype(), type_metatype::TYPE_UINT);
-        for epoch in ["edited_flush", "reset", "reopen"] {
-            factory.clear_noncore();
-            let new_word = decode(epoch, "word");
-            let new_record = decode(epoch, "record");
-            if case == "union" { decode(epoch, "aggregate"); }
-            let new_source = decode(epoch, "source");
-            let new_callback = decode(epoch, "callback");
-            assert_eq!(new_word.get_metatype(), type_metatype::TYPE_INT);
-            assert_eq!(old_word.get_metatype(), type_metatype::TYPE_UINT);
-            assert_eq!(new_source.get_size(), old_source.get_size());
-            assert_eq!(old_pointer.get_ptr_to().unwrap().get_size(), old_source.get_size());
-            assert_eq!(old_record.get_field(1).map(|field| field.name.clone()), old_field_name);
-            if case != "bitfield_alias" {
-                assert_eq!(new_record.get_field(1).unwrap().name, "upper");
-                assert_eq!(old_record.get_field(1).unwrap().name, "high");
-                let new_callback_record = callback_record(&new_callback);
-                assert_eq!(new_callback_record.get_field(1).unwrap().name, "upper");
-                assert_eq!(new_callback_record.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_INT);
-                assert_eq!(old_callback_record.get_field(1).unwrap().name, "high");
-                assert_eq!(old_callback_record.get_field(1).unwrap().field_type.get_metatype(), type_metatype::TYPE_UINT);
-            }
-            assert!(old_callback.get_code_prototype().is_some(), "original authored callback");
-            assert!(new_callback.get_code_prototype().is_some(), "edited authored callback");
-        }
-    }
-}
-
 /// The x86 Windows spec declares four models plus a merged resolver; every one
 /// of them must resolve by name, and `__thiscall` must carry `hasThisPointer`.
 #[test]

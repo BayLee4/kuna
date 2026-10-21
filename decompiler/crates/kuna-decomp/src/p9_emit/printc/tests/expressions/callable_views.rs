@@ -380,7 +380,16 @@ fn numeric_callable_projection_preserves_non_target_abi_and_pointer_views() {
             print.push_vn_explicit_ir(&fd, &arch, value, reader).unwrap();
             print.recurse();
             let text = print.emit_mut().output_str();
-            if kind == "null" { assert_eq!(text, "NULL"); }
+            if kind == "null" {
+                assert_eq!(text, "NULL");
+                // Java prints the language literal whatever the C `NULL` option says.
+                let mut java = execution_printer(&arch, false);
+                java.set_name(crate::kuna_lang::OutLang::Java.print_name());
+                java.options.null = false;
+                java.push_vn_explicit_ir(&fd, &arch, value, reader).unwrap();
+                java.recurse();
+                assert_eq!(java.emit_mut().output_str(), "null");
+            }
             else if kind == "void" { assert!(text.contains("void *"), "{text}"); }
             else if kind == "object" { assert!(!text.contains("(*)"), "object pointer promoted: {text}"); }
             else { assert!(text.contains("(*)"), "callable declaration erased for {kind}: {text}"); }

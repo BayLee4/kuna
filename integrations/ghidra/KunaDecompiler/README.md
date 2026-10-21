@@ -88,7 +88,7 @@ those classes, uninstall the extension and restart. An untouched-Java
 control uses the same stock installation with a separate per-user settings profile
 that has no extension. Use Ghidra's `ApplicationLayout` to resolve that
 profile's settings and extension directories, rather than guessing user-prefix
-paths; see [the test setup](../../../tests/ghidra/README.md).
+paths; see [the live-smoke setup](../live-smoke/README.md).
 The repository's reference checkout is not an installation target.
 
 The build requires the unmodified installation source/JAR pair, including
