@@ -2949,9 +2949,13 @@ impl BlockGraph {
                 if let Some(targetbl) = self.arena[casebl].get_goto_target() {
                     if let Some(front) = self.get_front_leaf(targetbl) {
                         if let Some(basicbl) = self.sub_block(front, 0) {
+                            // Only graph-only structuring (no jump table) needs the
+                            // edge map; function structuring keeps the in-edge lookup.
                             let switch_basic = self.get_exit_leaf(switch_root)
                                 .and_then(|leaf| self.arena[leaf].get_copy());
+                            let graph_only = self.arena[switch_id].switch_jt_index().is_none();
                             let outindex = switch_basic
+                                .filter(|_| graph_only)
                                 .and_then(|switch| switch_case_edges.get(&(switch, basicbl)))
                                 .map(|&(outindex, _)| outindex)
                                 .or_else(|| {
