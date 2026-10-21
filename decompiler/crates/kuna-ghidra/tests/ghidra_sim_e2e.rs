@@ -500,13 +500,9 @@ const PIN_FAILLOG_RESOLVABLE: [usize; 3] = [0, 0, 0];
 // tables, which a wire session never consults (Ghidra's archives name a
 // callee's parameters itself).
 const PIN_FAILLOG_DIFF_FLOOR: [f64; 3] = [0.02, 0.04, 0.06];
-// The session prints with Ghidra's own defaults (100 columns, no NULL, no
-// in-place operators) where the CLI arm does not. Measured with the CLI's
-// defaults in the session: 0.043 / 0.091 / 0.099. Wrapping alone moves sub_2620
-// to 0.084-0.091 (0.050 -> 0.091 with the other two as they are); `(char *)0x0`
-// and `v = v + 1` against `NULL` and `v += 1` move sub_3320 / sub_3ad0 to
-// 0.152 / 0.143. The ceilings sit just above those measurements.
-const PIN_FAILLOG_DIFF_CEILING: [f64; 3] = [0.095, 0.16, 0.15];
+// Same options in the session and the CLI arm: the markup path wraps at 100
+// columns (EmitPrettyPrint) where the CLI's plain emitter does not.
+const PIN_FAILLOG_DIFF_CEILING: [f64; 3] = [0.09, 0.12, 0.15];
 // Normalized non-empty line count of the flattened markup C, per target: the
 // structural size of what the GUI renders.  A `<break>`-token regression would
 // collapse this to ~1 while leaving every ratio-floor assertion green -- this
@@ -629,6 +625,9 @@ fn ghidra_sim_faillog_pins() {
         .arch_mut()
         .set_kuna_option("libcnames", "off")
         .unwrap_or_else(|e| panic!("libcnames off: {}", e.explain()));
+    // Same print options as the session: its defaults are Ghidra's (the sparse
+    // wire cannot carry kuna's console defaults), so the CLI arm uses them too.
+    oracle.prog.arch_mut().print_mut().reset_wire_option_defaults();
     let mut ratios = Vec::new();
     for (i, parsed) in docs.iter().enumerate() {
         let cli_c = decompile_cli(&mut oracle.prog, &parsed.name.clone(), &addrs[i]);
