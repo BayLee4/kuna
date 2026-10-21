@@ -1170,6 +1170,7 @@ pub fn kuna_banner_text() -> String {
 fn apply_ghidra_mode_defaults(arch: &mut Architecture, result_version: u32) {
     arch.name_style_ghidra = true;
     arch.retain_physical_call_inputs = true;
+    arch.vararg_entry = true;
     arch.call_target_publication = if result_version == RESULT_VERSION {
         kuna_decomp::kuna_calltargettype::CallTargetPublication::Full
     } else {

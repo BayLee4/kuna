@@ -127,6 +127,8 @@ def main(argv=None):
             directory.mkdir()
             environment["KUNA_SMOKE_OUT"] = str(directory)
             environment["PYTHONOPTIMIZE"] = "0"
+            # The CLI producers compared with the host keep DWARF typedef names (default off).
+            environment.setdefault("KUNA_DWARFTYPEDEFS", "1")
             environment["KUNA_GHIDRA_TEST_GROUP"] = args.group
             command = [sys.executable, "-u", str(HERE / suite.script), *probe_args]
             row = {"suite": name, "status": "running", "artifacts": str(directory), "command": command,

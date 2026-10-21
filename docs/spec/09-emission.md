@@ -1309,7 +1309,7 @@ hidden results and other shapes keep their existing dispatch.
 
 ### First promoted-integer variadic entry value
 
-`option varargentry` (default off; the aggressive preset turns it on) gives one existing unrepresented entry local
+`option varargentry` (default off; the Ghidra decompile session turns it on) gives one existing unrepresented entry local
 the recovered interpretation of the first default-promoted `int` after the fixed
 parameters. The P9 owner
 `decompiler/crates/kuna-decomp/src/p9_emit/kuna_varargentry.rs` requires a complete
