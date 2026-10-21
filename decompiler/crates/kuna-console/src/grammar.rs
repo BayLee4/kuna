@@ -1289,6 +1289,13 @@ pub struct CParse<'a> {
     lastdecls: Option<Vec<TypeDeclarator>>,
     /// One-token lookahead buffer (the parser pulls tokens via [`CParse::next`]).
     pushed: Option<PToken>,
+    /// (kuna) Keep an explicit C integer rank (`unsigned long long` on LP64,
+    /// `long` on ILP32) under its authored spelling when the width-named core type
+    /// (`uint8`, `int4`) would spell as a lower rank of the same width. Set only
+    /// for the assertion plane under `ctypes` (the valid-C core type spelling):
+    /// the C the project export writes must declare the type the consumer's own
+    /// declarations use.
+    authored_ranks: bool,
 }
 
 impl<'a> CParse<'a> {
@@ -1324,6 +1331,7 @@ impl<'a> CParse<'a> {
             lasterror: String::new(),
             lastdecls: None,
             pushed: None,
+            authored_ranks: false,
         }
     }
 
@@ -1762,7 +1770,8 @@ impl<'a> CParse<'a> {
     /// A run of exactly one keyword is looked up by name first, so `void`,
     /// `char` and any host-supplied type spelled with a keyword resolve to the
     /// same interned type they always have; only combinations, and the keywords
-    /// the type factory does not name, take the width-driven path.
+    /// the type factory does not name, take the width-driven path (an explicit
+    /// integer combination keeps its canonical C rank when `authored_ranks`).
     fn scalar_specifier(&mut self) -> KunaResult<Rc<Datatype>> {
         let mut kws: Vec<ScalarKw> = Vec::new();
         while let PToken::ScalarSpecifier(kw) = self.peek()? {
@@ -1869,16 +1878,24 @@ impl<'a> CParse<'a> {
         if kws.len() != sign_only + sh + lng + int_ {
             return Ok(None);
         }
-        let size = if sh > 0 {
-            self.factory.get_size_of_short()
+        let (size, signed_name, unsigned_name) = if sh > 0 {
+            (self.factory.get_size_of_short(), "short", "unsigned short")
         } else if lng == 2 {
-            self.factory.get_size_of_long_long()
+            (self.factory.get_size_of_long_long(), "long long", "unsigned long long")
         } else if lng == 1 {
-            self.factory.get_size_of_long()
+            (self.factory.get_size_of_long(), "long", "unsigned long")
         } else {
-            self.factory.get_size_of_int()
+            (self.factory.get_size_of_int(), "int", "unsigned int")
         };
-        self.sized_scalar(size, Some(if uns > 0 { TYPE_UINT } else { TYPE_INT }))
+        let (meta, name) = if uns > 0 { (TYPE_UINT, unsigned_name) } else { (TYPE_INT, signed_name) };
+        // The width-named core type spells as the lowest rank of that width, so
+        // only a rank that shares its width with a lower one needs its own name.
+        let shares_width = (lng == 2 && size == self.factory.get_size_of_long())
+            || (lng == 1 && size == self.factory.get_size_of_int());
+        if self.authored_ranks && shares_width && size > 0 {
+            return self.factory.get_base_named(size, meta, name).map(Some);
+        }
+        self.sized_scalar(size, Some(meta))
     }
 
     /// (kuna) The core type of `size` bytes with the given meta-type, or the
@@ -2698,6 +2715,18 @@ pub fn parse_type(
     Ok((ty, name))
 }
 
+/// [`parse_type`] with the choice of keeping an explicit C integer rank under
+/// its authored spelling (see `CParse::authored_ranks`).
+pub fn parse_type_ranks(
+    input: &str,
+    factory: &dyn TypeFactory,
+    org: DataOrg,
+    authored_ranks: bool,
+) -> KunaResult<(Rc<Datatype>, String)> {
+    let (ty, name, _) = parse_type_with_volatile_ranks(input, factory, org, authored_ranks)?;
+    Ok((ty, name))
+}
+
 /// Longest single line the C grammar accepts. Ghidra's parser uses 4096 bytes, but
 /// `--assert` directives are one line each and a generated struct declaration with a
 /// few hundred fields does not fit in that.
@@ -2709,7 +2738,18 @@ pub fn parse_type_with_volatile(
     factory: &dyn TypeFactory,
     org: DataOrg,
 ) -> KunaResult<(Rc<Datatype>, String, bool)> {
+    parse_type_with_volatile_ranks(input, factory, org, false)
+}
+
+/// [`parse_type_with_volatile`] with the choice of [`parse_type_ranks`].
+pub fn parse_type_with_volatile_ranks(
+    input: &str,
+    factory: &dyn TypeFactory,
+    org: DataOrg,
+    authored_ranks: bool,
+) -> KunaResult<(Rc<Datatype>, String, bool)> {
     let mut parser = CParse::new(factory, org, LINE_BUFFER);
+    parser.authored_ranks = authored_ranks;
     if !parser.parse_stream(input.as_bytes().to_vec(), DocType::ParameterDeclaration)? {
         return Err(KunaError::parse(parser.get_error().to_string()));
     }
@@ -2793,7 +2833,20 @@ pub fn parse_c(
     models: &[String],
     set_prototype: impl FnOnce(PrototypePieces, &str) -> KunaResult<()>,
 ) -> KunaResult<()> {
+    parse_c_ranks(input, factory, org, models, false, set_prototype)
+}
+
+/// [`parse_c`] with the choice of [`parse_type_ranks`].
+pub fn parse_c_ranks(
+    input: &str,
+    factory: &dyn TypeFactory,
+    org: DataOrg,
+    models: &[String],
+    authored_ranks: bool,
+    set_prototype: impl FnOnce(PrototypePieces, &str) -> KunaResult<()>,
+) -> KunaResult<()> {
     let mut parser = CParse::with_models(factory, org, LINE_BUFFER, models);
+    parser.authored_ranks = authored_ranks;
     if !parser.parse_stream(input.as_bytes().to_vec(), DocType::Declaration)? {
         return Err(KunaError::parse(parser.get_error().to_string()));
     }

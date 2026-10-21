@@ -392,6 +392,9 @@ pub struct Architecture {
     /// (kuna `calltargettype`) Give an indirect call's target the
     /// function-pointer type the call states (`kuna_calltargettype`).
     pub call_target_type: bool,
+    /// (kuna `dwarftypedefs`) Keep a DWARF declaration's typedef names and
+    /// qualifiers (`kuna_dwarftypedefs`); read by the CLI before the load.
+    pub dwarf_typedefs: bool,
     /// Receiver representability for the existing callable inference owner.
     pub call_target_publication: crate::kuna_calltargettype::CallTargetPublication,
     /// (kuna `floatglobals`) Let a float vote accept a global the program only
@@ -1371,6 +1374,9 @@ pub struct Architecture {
     /// (ghidra_arch.cc:928-947).  Never set on the standalone path.  Takes
     /// precedence over `name_style_angr` in [`Self::kuna_name_style`].
     pub name_style_ghidra: bool,
+    /// (kuna, Phase 3) Carried to [`ArchContext::retain_physical_call_inputs`](crate::context::ArchContext).
+    /// Set only by the ghidra-mode registerProgram.
+    pub retain_physical_call_inputs: bool,
     /// (kuna) Collapse local-variable declarations whose fully-rendered line is
     /// identical (the scalar analogue of the composite-symbol decl collapse), so a
     /// stack slot mapped onto many same-named HighVariables is declared once
@@ -2799,6 +2805,7 @@ impl Architecture {
             rodata_string: false, // (kuna) option rodatastring; reset_defaults sets the shipped default
             ptrdepthcap: false, // (kuna) option ptrdepthcap; reset_defaults sets the shipped default
             call_target_type: false, // (kuna) option calltargettype; reset_defaults sets the shipped default
+            dwarf_typedefs: false,
             call_target_publication: crate::kuna_calltargettype::CallTargetPublication::Full,
             float_globals: true, // (kuna) option floatglobals; reset_defaults sets the shipped default
             kuna_float_scan: None,
@@ -3002,6 +3009,7 @@ impl Architecture {
             branch_flip: false,
             name_style_angr: false,
             name_style_ghidra: false,
+            retain_physical_call_inputs: false,
             dedup_var_decls: false,
             param_ref_decl: false,
             decl_high_type: false,
@@ -3398,6 +3406,7 @@ impl Architecture {
         self.float_globals = true; // (kuna) option floatglobals default-on
         self.caller_reads = true; // (kuna) option callerreads default-on: inert without the Listing, so 0/675 datatest assertions move
         self.call_target_type = false; // (kuna) option calltargettype: default-OFF in the catalog because the XML datatest corpus pins the upstream `code *` spellings and applies no mode; ON in the `aggressive` preset, which `auto` selects under 500 KiB, so it is the default rendering for every real binary
+        self.dwarf_typedefs = false; // (kuna) option dwarftypedefs: default-OFF in the catalog (the datatest corpus and the original CLI fixtures pin the looked-through spellings); ON in the `aggressive` preset
         self.call_target_publication = crate::kuna_calltargettype::CallTargetPublication::Full;
         self.ptrdepthcap = false; // (kuna) DIV-108: default-OFF in the catalog because it changes INFERRED types and the datatest corpus pins the upstream spellings; ON in the `aggressive` preset, which `auto` selects under 500 KiB, so the cap is the default rendering for every real binary
         self.float_bits = true; // (kuna) option floatbits default-on: a float helper that only bit-ops its float-register input into its float-register return types float on both sides
@@ -4188,6 +4197,7 @@ impl Architecture {
         ctx.reload_arg = self.reload_arg;
         ctx.name_style_angr = self.name_style_angr;
         ctx.name_style_ghidra = self.name_style_ghidra;
+        ctx.retain_physical_call_inputs.set(self.retain_physical_call_inputs);
         // (kuna) carry the duplicate-declaration collapse gate so `emit_local_var_decls`
         // (which reads the ArchContext `arch`) sees `option dedupvardecls`.
         ctx.dedup_var_decls = self.dedup_var_decls;

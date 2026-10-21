@@ -109,6 +109,7 @@ c3
   <com>lo fu d3</com>
   <com>decompile</com>
   <com>print C</com>
+  <com>option conventionprinting on</com>
   <com>option varargentry off</com>
   <com>lo fu entry_capture</com>
   <com>decompile</com>

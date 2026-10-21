@@ -488,10 +488,8 @@ fn local_projection_retains_exact_physical_demand_without_source_width_coercion(
             }
             manager.set_default_code_space(1).unwrap();
             manager.set_default_data_space(1).unwrap();
-            let manager = Rc::new(manager);
-            let mut arch = crate::context::ArchContext::new_shared(Rc::clone(&manager));
-            arch.remote_scope = Some(crate::remote_provider::inert_host_scope(&manager));
-            let arch = Rc::new(arch);
+            let arch = Rc::new(crate::context::ArchContext::new(manager));
+            arch.retain_physical_call_inputs.set(true);
             let mut data = crate::funcdata::Funcdata::new("caller", "caller", arch,
                 Address::new(Rc::clone(&ram), 0x1000), 0x1000_0000, 0x40).unwrap();
             let target = data.new_constant(8, 0x2000);

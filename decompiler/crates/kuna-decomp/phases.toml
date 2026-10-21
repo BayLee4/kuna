@@ -5252,6 +5252,28 @@ live_true = "on"
 live_false = "off"
 
 [[settable]]
+option = "dwarftypedefs"
+values = "on|off"
+default = "off"
+destructive = false
+phase = "P1"
+subphase = "external-refinement"
+strength = "HARD"
+rewind = "P1"
+issue = "ghidra-callable-source-names"
+summary = "Keep the source name of a DWARF declaration's types. The DWARF type mapper looks straight through DW_TAG_typedef and the const/volatile/restrict qualifiers, so a prototype the source writes `int handle(Flags value)` is recovered as `int handle(unsigned char value)` and a global the source writes `extern volatile Fn slot` becomes an untyped sized data symbol. With `on` the mapper keeps the typedef name and the qualifiers on the types of prototype parameters and results, on parameters that carry a frame location, and on top-level data objects, and a data object is published as a typed, type-locked symbol (volatile carried onto its range). Types of locals are unchanged. A typedef of an anonymous aggregate or enum keeps the name it already lends the aggregate."
+use_when = "On when the emitted header must be compiled against code the program source wrote: a consumer that names `Flags` or redeclares `Fn slot` needs the header to declare exactly those types. Off (default in the catalog) keeps the looked-through spellings the datatest corpus pins; the `aggressive` preset, which `auto` selects under 500 KiB, turns it on."
+example = "option dwarftypedefs on"
+source_decompiler = "kuna"
+inspiration = "Ghidra DWARFDataTypeImporter keeps a DW_TAG_typedef as a TypeDef data type and a DW_TAG_volatile_type as a volatile-qualified one"
+change_kind = "analysis-enablement"
+tier = "analysis"
+symptoms = "a parameter the source types with a typedef prints as its underlying integer|a consumer compiled against the header cannot name the source's typedef|a volatile global is declared without volatile or without its typedef'd type"
+live_field = "dwarf_typedefs"
+live_true = "on"
+live_false = "off"
+
+[[settable]]
 option = "floatglobals"
 values = "on|off"
 default = "on"

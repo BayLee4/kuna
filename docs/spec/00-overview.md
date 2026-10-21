@@ -2519,6 +2519,18 @@ that happens to be spelled with a keyword resolve to exactly the interned type
 they always did. Only combinations, and the keywords the type factory does not
 name, take the width-driven path.
 
+Source the user authored — the assertion plane (`--assert`, `decompiler/crates/kuna-console/src/assertions.rs`)
+— keeps, while `ctypes` (the valid-C core type spelling) is on, an explicit integer rank under the spelling it was written in when the
+width-named core type would spell as a lower rank of the same width (`long long`
+where `long` is as wide, `long` where `int` is):
+`unsigned long long` is then a base type of that name and width, not the
+width-named core type, so the header the project export writes declares the same C type the
+consumer's own declaration of that object uses (on an LP64 target `unsigned long`
+and `unsigned long long` are different C types of the same width, and a consumer
+that declares one against a header that declares the other does not compile). The
+console's own commands (`parse line`, `parse file`, `parse type`) keep the
+width-named core types.
+
 (kuna) **An `enum` is laid out and numbered as C lays it out.** Upstream's
 `newEnum` interns every parsed enum at the type factory's `enumsize`, which
 `setupSizes` fills with the default data space's address size — eight bytes on
@@ -2824,6 +2836,7 @@ runtime `on_or_off` parser.
 | `KUNA_TYPEDEPTH` | `typedepth` | DWARF full-depth type resolution, `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_typedepth.rs (TYPEDEPTH_ENV)` |
 | `KUNA_DWARFSTRUCTS` | `dwarfstructs` | DWARF aggregate-layout import (`DW_AT_byte_size` + `DW_TAG_member` walk), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfstructs.rs (DWARFSTRUCTS_ENV)` |
 | `KUNA_CALLTARGETTYPE` | `calltargettype` | DWARF `DW_TAG_subroutine_type` import as a function prototype (off unless the option, or the `aggressive` preset, is on, and never for Rust output), `decompiler/crates/kuna-decomp/src/p5_types/kuna_calltargettype.rs (CALLTARGETTYPE_ENV)` |
+| `KUNA_DWARFTYPEDEFS` | `dwarftypedefs` | DWARF typedef names and cv-qualifiers kept on declaration types (off unless the option, or the `aggressive` preset, is on), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarftypedefs.rs (DWARFTYPEDEFS_ENV)` |
 | `KUNA_DWARFVARIANTS` | `dwarfvariants` | DWARF variant-part (discriminated-union) import (`DW_AT_discr` + `DW_TAG_variant` walk), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfvariants.rs (DWARFVARIANTS_ENV)` |
 | `KUNA_PDATACHAINED` | `pdatachained` | PE `.pdata` chained-`UNWIND_INFO` entry suppression, `decompiler/crates/kuna-analysis/src/analyzers/entry/pe_entry.rs (pdata_begins)` |
 | `KUNA_REXTHUNK` | `rexthunk` | x86-64 PE import-thunk decode drops the `FF 25` one byte into a REX-prefixed tail jump, `decompiler/crates/kuna-analysis/src/loader/kuna_rexthunk.rs (is_rex_tail)` |

@@ -35,6 +35,9 @@ const MAX_TYPE_DEPTH: u32 = 3;
 pub(super) struct TypeWalk {
     guard: Guard,
     active: BTreeSet<String>,
+    /// (kuna `dwarftypedefs`) Keep a typedef's name and the cv-qualifiers instead
+    /// of looking through them. Set only for the types a declaration states.
+    source_names: bool,
 }
 
 /// The recursion-guard arms proper.
@@ -60,7 +63,22 @@ impl TypeWalk {
         } else {
             Guard::Depth { depth: 0 }
         };
-        TypeWalk { guard, active: BTreeSet::new() }
+        TypeWalk { guard, active: BTreeSet::new(), source_names: false }
+    }
+
+    /// A walk for the types a declaration states (prototype parameters and
+    /// results, data objects): it keeps source typedef names and qualifiers when
+    /// the process gate ([`kuna_decomp::kuna_dwarftypedefs::dwarf_typedefs_enabled`])
+    /// is on, and is [`TypeWalk::new`] otherwise.
+    pub(super) fn declaring() -> Self {
+        let mut walk = Self::new();
+        walk.source_names = kuna_decomp::kuna_dwarftypedefs::dwarf_typedefs_enabled();
+        walk
+    }
+
+    /// Whether typedef names and qualifiers are kept (see [`TypeWalk::declaring`]).
+    pub(super) fn keeps_source_names(&self) -> bool {
+        self.source_names
     }
 
     /// (kuna `dwarfstructs`) Claim `name` for field population on this path.

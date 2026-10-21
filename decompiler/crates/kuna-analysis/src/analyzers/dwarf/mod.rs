@@ -674,8 +674,20 @@ fn build_datatype_at(
     // loop (the hop count is bounded) and leaves the cycle guard where it belongs,
     // on the pointer/array/struct arms that actually recurse. (kuna `cppproto`
     // introduced it for C++; `typedepth` extends it to the C callers.)
-    let (die, alias) =
-        if cpp || walk.collapse_qualifiers() { strip_qualifiers(die, dies) } else { (die, None) };
+    let (die, alias) = if cpp || walk.collapse_qualifiers() || walk.keeps_source_names() {
+        let stripped = strip_qualifiers(die, dies);
+        // A kept typedef/qualifier is built by its own arm below, except where
+        // looking through it is what names an anonymous aggregate or enum.
+        if walk.keeps_source_names() && is_transparent(die) && !is_anonymous_nominal(stripped.0) {
+            (die, None)
+        } else if cpp || walk.collapse_qualifiers() {
+            stripped
+        } else {
+            (die, None)
+        }
+    } else {
+        (die, None)
+    };
     if die.language == Some(gimli::DW_LANG_Rust) && die.name == "!" {
         return types.get_type_void().ok();
     }
@@ -716,6 +728,29 @@ fn build_datatype_at(
                 .or_else(|| types.get_type_void().ok())?;
             let psize = die.byte_size.map(i32::try_from).transpose().ok()?.unwrap_or(ptr);
             types.get_type_pointer(psize, pointee, word_size).ok()
+        }
+        // (kuna `dwarftypedefs`) A declaration keeps the typedef's own name and the
+        // qualifiers the source wrote.
+        gimli::DW_TAG_typedef if walk.keeps_source_names() && !die.name.is_empty() => {
+            let built = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?;
+            if built.get_name() == die.name {
+                Some(built)
+            } else {
+                // The producer's own typedef, not the one a later authored
+                // declaration of the same name may create.
+                types.get_typedef(&built, &die.name, nominal_id((off, &die.name)), 0).ok()
+            }
+        }
+        gimli::DW_TAG_const_type | gimli::DW_TAG_volatile_type | gimli::DW_TAG_restrict_type
+            if walk.keeps_source_names() =>
+        {
+            let base = build_datatype(die.type_ref, dies, types, word_size, walk, cpp)?;
+            let qualifier = match die.tag {
+                gimli::DW_TAG_const_type => kuna_decomp::kuna_typequal::CONST,
+                gimli::DW_TAG_volatile_type => kuna_decomp::kuna_typequal::VOLATILE,
+                _ => kuna_decomp::kuna_typequal::RESTRICT,
+            };
+            types.get_qualified_type(base, qualifier).ok()
         }
         // typedef/const/volatile/restrict: transparent — pass through to the
         // underlying DW_AT_type (a null underlying => void).
@@ -850,13 +885,7 @@ fn strip_qualifiers<'a>(
 ) -> (&'a DieSnap, Option<&'a str>) {
     let mut alias: Option<&str> = None;
     for _ in 0..MAX_QUALIFIER_HOPS {
-        if !matches!(
-            die.tag,
-            gimli::DW_TAG_typedef
-                | gimli::DW_TAG_const_type
-                | gimli::DW_TAG_volatile_type
-                | gimli::DW_TAG_restrict_type
-        ) {
+        if !is_transparent(die) {
             break;
         }
         if die.tag == gimli::DW_TAG_typedef && !die.name.is_empty() {
@@ -868,6 +897,29 @@ fn strip_qualifiers<'a>(
         }
     }
     (die, alias)
+}
+
+/// A typedef or cv-qualifier DIE: the hops [`strip_qualifiers`] looks through.
+fn is_transparent(die: &DieSnap) -> bool {
+    matches!(
+        die.tag,
+        gimli::DW_TAG_typedef
+            | gimli::DW_TAG_const_type
+            | gimli::DW_TAG_volatile_type
+            | gimli::DW_TAG_restrict_type
+    )
+}
+
+/// An aggregate or enum DIE without a name of its own, which a typedef names.
+fn is_anonymous_nominal(die: &DieSnap) -> bool {
+    die.name.is_empty()
+        && matches!(
+            die.tag,
+            gimli::DW_TAG_structure_type
+                | gimli::DW_TAG_union_type
+                | gimli::DW_TAG_class_type
+                | gimli::DW_TAG_enumeration_type
+        )
 }
 
 /// Bound on the [`strip_qualifiers`] walk (a real qualifier chain is 1-3 hops).
@@ -1091,7 +1143,7 @@ fn build_pieces(
     word_size: uint4,
 ) -> Option<PrototypePieces> {
     // Return type: a null DW_AT_type is `void` (build_datatype handles None).
-    let mut walk = TypeWalk::new();
+    let mut walk = TypeWalk::declaring();
     let outtype = Some(build_datatype(sub.type_ref, dies, types, word_size, &mut walk, false)?);
 
     let mut intypes = Vec::new();
@@ -1148,12 +1200,17 @@ fn collect_fbreg_locals(
     cfa: i64,
     out: &mut Vec<crate::pass::LocalFact>,
 ) {
-    let mut walk = TypeWalk::new();
     for &coff in &sub.children {
         let Some(child) = dies.get(&coff) else { continue };
         if !matches!(child.tag, gimli::DW_TAG_variable | gimli::DW_TAG_formal_parameter) {
             continue;
         }
+        // A parameter is a declaration the prototype also states; a local is not.
+        let mut walk = if child.tag == gimli::DW_TAG_formal_parameter {
+            TypeWalk::declaring()
+        } else {
+            TypeWalk::new()
+        };
         if child.name.is_empty() {
             continue;
         }
@@ -1359,6 +1416,29 @@ impl AnalysisPass for DwarfPass {
                             continue;
                         }
                         if let Some(addr) = snap.addr_location {
+                            // (kuna `dwarftypedefs`) The declaration itself, with the
+                            // typedef names and qualifiers the source wrote, outranks
+                            // a sized untyped symbol.
+                            if kuna_decomp::kuna_dwarftypedefs::dwarf_typedefs_enabled() {
+                                let declared = build_datatype(
+                                    snap.type_ref,
+                                    &dies,
+                                    types,
+                                    word_size,
+                                    &mut TypeWalk::declaring(),
+                                    false,
+                                )
+                                .filter(|t| t.get_size() > 0);
+                                if let Some(type_) = declared {
+                                    out.typed_data.push(crate::pass::TypedDataFact {
+                                        addr,
+                                        dwarf: true,
+                                        name: snap.name.clone(),
+                                        type_,
+                                    });
+                                    continue;
+                                }
+                            }
                             // Resolve the variable's DW_AT_type to its byte size so
                             // the commit maps a covering SymbolEntry of the right
                             // extent (a size-1 code type would miss a 4-/8-byte

@@ -468,6 +468,9 @@ Three tiers:
 | one floating register carries both integers and genuine floating values | [`fputruncviews`](#fputruncviews) |
 | a variadic body reads an uninitialized first-tail signed-int local | [`varargentry`](#varargentry) |
 | want the raw entry-local presentation instead of va_arg(int) | [`varargentry`](#varargentry) |
+| a parameter the source types with a typedef prints as its underlying integer | [`dwarftypedefs`](#dwarftypedefs) |
+| a consumer compiled against the header cannot name the source's typedef | [`dwarftypedefs`](#dwarftypedefs) |
+| a volatile global is declared without volatile or without its typedef'd type | [`dwarftypedefs`](#dwarftypedefs) |
 | puts/printf arguments untyped so string literals render as bare constants or dat_ addresses | [`libproto`](#libproto) |
 | imports carry no signatures and call arguments stay untyped | [`libproto`](#libproto) |
 | a caller's parameter is unsigned long where it is only ever passed to a libc function that takes a char */int | [`libcsigs`](#libcsigs) |
@@ -2261,17 +2264,25 @@ The control surface: each of these can make output worse on the wrong source sha
 - **Where / provenance:** P6/variable-merging · kuna · transform · kuna-fputruncviews
 - **Example:** `option fputruncviews off`
 
-### `varargentry` -- on | off, default `on`
+### `varargentry` -- on | off, default `off`
 
 - **Symptoms:** a variadic body reads an uninitialized first-tail signed-int local; want the raw entry-local presentation instead of va_arg(int).
 - **What it does:** Capture one recovered signed-int first variadic entry value with va_start, one va_arg(int), and immediate va_end, preserving its existing local and the authored fixed-parameter-plus-ellipsis signature. Require the complete locked fixed boundary, a known noncustom prototype model whose fixed-plus-one-int assignment matches the fixed storage and the genuine consumed SSA input, and an existing signed-int declaration. Capture either at an unconditional entry use before calls or control transfer, or inside one uniquely emitted terminal normal-return leaf containing every live read, with a pure prefix before the first use; non-consuming paths perform no acquisition. Additional unrepresented argument inputs, unknown or differently typed values, skipped tail positions, indirect roles and conditional-only uses outside that leaf case keep their ordinary rendering. This is a recovered promoted-int interpretation, not an authored optional-argument type or a guarantee for arbitrary pointer, wide or heterogeneous callers.
-- **When to flip:** On by default for a variadic body that consumes its first optional argument as a recovered signed int but otherwise prints an uninitialized local. Turn off to preserve the raw entry-local presentation or when the original optional argument had another source type sharing the same storage.
+- **When to flip:** Turn on for a variadic body that consumes its first optional argument as a recovered signed int but otherwise prints an uninitialized local. Leave off to preserve the raw entry-local presentation or when the original optional argument had another source type sharing the same storage.
 - **Where / provenance:** P9/variadic-entry-values · kuna · presentation-default · finite-variadic-entry
-- **Example:** `option varargentry off`
+- **Example:** `option varargentry on`
 
 ## Analysis & loader passes
 
 Program-prep enablement: what is discovered, decoded, and named before any function is decompiled.
+
+### `dwarftypedefs` -- on | off, default `off`
+
+- **Symptoms:** a parameter the source types with a typedef prints as its underlying integer; a consumer compiled against the header cannot name the source's typedef; a volatile global is declared without volatile or without its typedef'd type.
+- **What it does:** Keep the source name of a DWARF declaration's types. The DWARF type mapper looks straight through DW_TAG_typedef and the const/volatile/restrict qualifiers, so a prototype the source writes `int handle(Flags value)` is recovered as `int handle(unsigned char value)` and a global the source writes `extern volatile Fn slot` becomes an untyped sized data symbol. With `on` the mapper keeps the typedef name and the qualifiers on the types of prototype parameters and results, on parameters that carry a frame location, and on top-level data objects, and a data object is published as a typed, type-locked symbol (volatile carried onto its range). Types of locals are unchanged. A typedef of an anonymous aggregate or enum keeps the name it already lends the aggregate.
+- **When to flip:** On when the emitted header must be compiled against code the program source wrote: a consumer that names `Flags` or redeclares `Fn slot` needs the header to declare exactly those types. Off (default in the catalog) keeps the looked-through spellings the datatest corpus pins; the `aggressive` preset, which `auto` selects under 500 KiB, turns it on.
+- **Where / provenance:** P1/external-refinement · kuna · analysis-enablement · ghidra-callable-source-names
+- **Example:** `option dwarftypedefs on`
 
 ### `libproto` -- on | off, default `on`
 

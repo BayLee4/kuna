@@ -368,7 +368,18 @@ impl Funcdata {
         if s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
-        self.set_varnode_properties(vn)?;
+        // Upstream's `newVarnode` queries the local scope with an invalid use
+        // point (`funcdata_varnode.cc:174`), so a restricted (entry - 1) parameter
+        // Symbol does not reach a Varnode created later for the same register.
+        // A host session carries name-locked parameter Symbols, and the entry use
+        // point would name-lock every such Varnode, so two highs of one register
+        // never merge; a standalone decompile keeps its unlocked Symbols and the
+        // use point, which the call-argument Varnodes' mapped flag relies on.
+        if self.get_arch().remote_scope.is_some() {
+            self.set_varnode_properties_at(vn, Address::new_invalid())?;
+        } else {
+            self.set_varnode_properties(vn)?;
+        }
         Ok(vn)
     }
 

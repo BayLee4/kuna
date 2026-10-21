@@ -1169,6 +1169,7 @@ pub fn kuna_banner_text() -> String {
 /// is the sole authority, replayed after every reset before Java option deltas.
 fn apply_ghidra_mode_defaults(arch: &mut Architecture, result_version: u32) {
     arch.name_style_ghidra = true;
+    arch.retain_physical_call_inputs = true;
     arch.call_target_publication = if result_version == RESULT_VERSION {
         kuna_decomp::kuna_calltargettype::CallTargetPublication::Full
     } else {

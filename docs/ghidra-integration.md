@@ -322,6 +322,17 @@ and an absent or already widened source occurrence does not regain source
 geometry. Boolean raw-byte carriers remain unsigned bytes: a modeled extension
 does not establish Boolean normalization or erase noncanonical-byte consumers.
 
+A fresh Varnode of a host session queries its local scope with an invalid use point,
+as upstream's `newVarnode` does, so the host's name-locked parameter Symbols do not
+reach later Varnodes of the same register; a standalone decompile queries at the
+function's entry use point.
+
+A locked source declaration with fewer formals than the body consumes does not erase
+the physical reads the entry probe proved: in a host session (the ghidra-mode
+registerProgram sets `ArchContext::retain_physical_call_inputs`) the call keeps those
+register reads as physical call operands next to the source formals. A standalone
+decompile binds the source formals alone.
+
 Standalone preparation acquires the existing authored `FunctionSeed` once
 before binding. The normal source initializer applies pending declarations,
 retained source facts or recovered pieces under their existing model precedence,

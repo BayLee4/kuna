@@ -2637,6 +2637,28 @@ moves.
   the mode's preset included, and leaves off when the output language is Rust;
   the browser front-end does not export it.
   Chapter 05 covers what the option does to the calls.
+- **Declaration typedefs and qualifiers** (`dwarftypedefs`, off in the catalog, on in
+  the `aggressive` preset) keep the names the source wrote on the types a declaration
+  states. The mapper looks straight through `DW_TAG_typedef` and the `const`,
+  `volatile` and `restrict` qualifiers, so `int handle(Flags value)` was recovered
+  as `int handle(unsigned char value)` and `extern volatile Fn slot` as an untyped
+  data symbol of the right width; a consumer compiled against the emitted header
+  then names a type the header never declares, or redeclares the global under a
+  spelling the header contradicts. With the option on, the types of a subprogram's
+  result and parameters, of a parameter carrying a frame location, and of a
+  top-level variable with an address are built by a walk that keeps the typedef's
+  own name (a typedef of an anonymous aggregate or enum keeps lending that
+  aggregate the name it already lent) and each qualifier on its exact layer. Locals
+  are built as before. A DWARF typedef carries the producer's coordinates as its
+  identity, so a later authored `typedef` of the same name does not collide with
+  it. A variable's declared type is published as a typed symbol, type- and
+  name-locked, ahead of the string literals and untyped names, with `volatile`
+  carried onto the symbol and its address range
+  (`decompiler/crates/kuna-console/src/engine.rs (publish_dwarf_typed_data)`);
+  an existing mapping at the address wins. Like `calltargettype` the mapping happens
+  inside `load file`, so the gate is the `KUNA_DWARFTYPEDEFS` environment variable
+  (chapter 00) the CLI exports ahead of the load from the run's options, the mode's
+  preset included.
 - **Full-depth DWARF types** (`typedepth`, default-on,
   `decompiler/crates/kuna-analysis/src/analyzers/dwarf/kuna_typedepth.rs`) is the
   type mapper's recursion guard, and it exists because the DIE walk can be handed a

@@ -792,6 +792,7 @@ kuna_options! { self, p1;
     },
     "ptrdepthcap" => on_off!(ptrdepthcap, "inferred pointer-nesting cap"),
     "calltargettype" => on_off!(call_target_type, "indirect-call target types"),
+    "dwarftypedefs" => on_off!(dwarf_typedefs, "DWARF declaration typedef and qualifier retention"),
     "floatglobals" => on_off!(float_globals, "float typing of globals moved only through float registers"),
     "callerreads" => on_off!(caller_reads, "return recovery from what the callers read"),
     "codescalar" => on_off!(codescalar, "code-pointee scalar-value guard"),

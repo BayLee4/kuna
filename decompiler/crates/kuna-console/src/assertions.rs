@@ -450,7 +450,7 @@ fn apply_one_program_scoped(prog: &mut ConsoleProgram, body: &Body) -> Result<()
             let org = data_org(prog);
             let text = with_semicolon(decl);
             let models = model_names(prog);
-            crate::grammar::parse_c(&text, prog.arch().types(), org, &models, |_, _| Ok(()))
+            crate::grammar::parse_c_ranks(&text, prog.arch().types(), org, &models, prog.arch().ctypes, |_, _| Ok(()))
                 .map_err(|e| e.explain().to_string())
         }
         Body::Prototype { func, decl } => apply_prototype(prog, func, decl),
@@ -694,7 +694,7 @@ fn apply_prototype(prog: &mut ConsoleProgram, func: &str, decl: &str) -> Result<
     let text = format!("extern {}", with_semicolon(decl));
     let captured: RefCell<Option<(PrototypePieces, String)>> = RefCell::new(None);
     let models = model_names(prog);
-    crate::grammar::parse_c(&text, prog.arch().types(), org, &models, |pieces, model| {
+    crate::grammar::parse_c_ranks(&text, prog.arch().types(), org, &models, prog.arch().ctypes, |pieces, model| {
         *captured.borrow_mut() = Some((pieces, model.to_string()));
         Ok(())
     })
@@ -818,7 +818,7 @@ fn apply_cross_function(
                 return Err("a parameter index must not be negative".into());
             }
             let addr = parse_storage(prog, storage)?;
-            let (ct, pname) = crate::grammar::parse_type(decl, prog.arch().types(), org)
+            let (ct, pname) = crate::grammar::parse_type_ranks(decl, prog.arch().types(), org, prog.arch().ctypes)
                 .map_err(|e| e.explain().to_string())?;
             // A slot no directive has named yet is `undefined<addr_size>` — what
             // the decompiler says about a value it was told nothing about — so
@@ -848,7 +848,7 @@ fn apply_cross_function(
         }
         Body::Return { storage, decl, .. } => {
             let addr = parse_storage(prog, storage)?;
-            let (ct, _) = crate::grammar::parse_type(decl, prog.arch().types(), org)
+            let (ct, _) = crate::grammar::parse_type_ranks(decl, prog.arch().types(), org, prog.arch().ctypes)
                 .map_err(|e| e.explain().to_string())?;
             pieces.output_storage = Some(ParameterPieces {
                 addr,
@@ -879,7 +879,7 @@ fn apply_data(prog: &mut ConsoleProgram, vma: u64, decl: &str) -> Result<(), Str
     let org = data_org(prog);
     let addr = data_addr(prog, vma)?;
     let (ct, name, volatile) =
-        crate::grammar::parse_type_with_volatile(decl, prog.arch().types(), org)
+        crate::grammar::parse_type_with_volatile_ranks(decl, prog.arch().types(), org, prog.arch().ctypes)
             .map_err(|e| e.explain().to_string())?;
     if name.is_empty() {
         return Err("a data declaration must name the symbol".into());
@@ -1013,7 +1013,7 @@ fn seed_one(
     match body {
         Body::Param { index, storage, decl, .. } => {
             let addr = parse_storage(prog, storage)?;
-            let (ct, pname) = crate::grammar::parse_type(decl, prog.arch().types(), org)
+            let (ct, pname) = crate::grammar::parse_type_ranks(decl, prog.arch().types(), org, prog.arch().ctypes)
                 .map_err(|e| e.explain().to_string())?;
             let piece = ParameterPieces {
                 addr,
@@ -1025,7 +1025,7 @@ fn seed_one(
         }
         Body::Return { storage, decl, .. } => {
             let addr = parse_storage(prog, storage)?;
-            let (ct, _) = crate::grammar::parse_type(decl, prog.arch().types(), org)
+            let (ct, _) = crate::grammar::parse_type_ranks(decl, prog.arch().types(), org, prog.arch().ctypes)
                 .map_err(|e| e.explain().to_string())?;
             let piece = ParameterPieces {
                 addr,
@@ -1217,7 +1217,7 @@ fn apply_one_symbol_scoped(
             Ok((crate::kuna_hightarget::apply_local(fd, symbol, newname, None, maxduplicates, Some(prog.arch()))?, None))
         }
         Body::Type { symbol, decl, .. } => {
-            let (ct, newname) = crate::grammar::parse_type(decl, prog.arch().types(), data_org(prog))
+            let (ct, newname) = crate::grammar::parse_type_ranks(decl, prog.arch().types(), data_org(prog), prog.arch().ctypes)
                 .map_err(|e| e.explain().to_string())?;
             let applied = crate::kuna_hightarget::apply_local(fd, symbol, &newname, Some(ct.clone()), maxduplicates, Some(prog.arch()))?;
             Ok((applied, Some(ct)))

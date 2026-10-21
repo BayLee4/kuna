@@ -845,11 +845,7 @@ impl ActionFuncLink {
             }
         }
         if inputlocked && !varargs {
-            // Host sessions only: a standalone decompile keeps the declared
-            // formal list as the call's argument list.
-            if data.get_arch().remote_scope.is_some() {
-                Self::link_physical_inputs(idx, data)?;
-            }
+            Self::link_physical_inputs(idx, data)?;
             let storage = {
                 let active = data.get_call_specs(idx).active_input();
                 (0..active.get_num_trials()).map(|i| {
@@ -896,6 +892,9 @@ impl ActionFuncLink {
         use crate::dtype::type_class;
         use kuna_base::address::Address;
         use kuna_base::space::spacetype;
+        if !data.get_arch().retain_physical_call_inputs.get() {
+            return Ok(());
+        }
         let physical: Vec<_> = {
             let call = data.get_call_specs(idx);
             let proto = call.proto();
@@ -2543,7 +2542,8 @@ mod tests {
         use crate::p4_calls::kuna_calleedeadarg::CalleeEntryDead;
         for authority in ["body", "aligned", "aligned_wide", "site", "site_model", "site_injection",
             "site_effect", "injection", "incomplete", "indirect"] {
-            let mut fx = Fx::host();
+            let mut fx = Fx::new();
+            fx.fd.get_arch().retain_physical_call_inputs.set(true);
             let target = fx.constant(8, 0x2000);
             let op = fx.emit(
                 if authority == "indirect" { OpCode::CPUI_CALLIND } else { OpCode::CPUI_CALL },
@@ -2625,10 +2625,8 @@ mod tests {
                 let register = Rc::new(AddrSpace::new(spacetype::IPTR_PROCESSOR,
                     "register", big, 8, 1, 3, addrspace_flags::hasphysical, 1, 1));
                 manager.insert_space(Rc::clone(&register)).unwrap();
-                let manager = Rc::new(manager);
-                let mut arch = ArchContext::new_shared(Rc::clone(&manager));
-                arch.remote_scope = Some(crate::remote_provider::inert_host_scope(&manager));
-                let arch = Rc::new(arch);
+                let arch = Rc::new(ArchContext::new(manager));
+                arch.retain_physical_call_inputs.set(true);
                 let code = Rc::clone(arch.manage().get_space_by_name("ram").unwrap());
                 let mut data = Funcdata::new("caller", "caller", arch,
                     Address::new(Rc::clone(&code), 0x1000), 0x1000_0000, 0x40).unwrap();

@@ -769,6 +769,12 @@ pub struct ArchContext {
     /// `Architecture::name_style_ghidra`.  Wins over `name_style_angr` in
     /// [`Self::kuna_name_style`].
     pub name_style_ghidra: bool,
+    /// (kuna, Phase 3) Keep the physical ABI reads of a callee whose source
+    /// prototype is locked to fewer formals than the body consumes, as call
+    /// inputs ([`ActionFuncLink`](crate::coreaction_protos::ActionFuncLink)).
+    /// Set only by the ghidra-mode registerProgram, where the host's signature
+    /// is authoritative; the standalone path binds the source formals alone.
+    pub retain_physical_call_inputs: std::cell::Cell<bool>,
     /// (kuna) Collapse local-variable declarations whose fully-rendered line is
     /// identical (the scalar analogue of the composite-symbol decl collapse).  Read
     /// by [`PrintC::emit_local_var_decls`](crate::printc); `option dedupvardecls`,
@@ -1804,6 +1810,7 @@ impl ArchContext {
             name_style_angr: true,
             // (kuna, Phase 3) ghidra-mode-only; never set on the standalone path.
             name_style_ghidra: false,
+            retain_physical_call_inputs: std::cell::Cell::new(false),
             // (kuna) default-off opt-in; the real value is copied from the engine
             // Architecture in `build_arch_handle` (`option dedupvardecls`).
             dedup_var_decls: false,

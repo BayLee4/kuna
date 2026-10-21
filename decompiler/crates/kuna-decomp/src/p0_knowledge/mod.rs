@@ -38,6 +38,8 @@ pub mod kuna_libctypes;
 pub mod kuna_dwarfvariants;
 // (kuna) DWARF full-depth type-resolution option gate (load-time, env-bridged).
 pub mod kuna_typedepth;
+// (kuna) DWARF declaration-boundary typedef/qualifier retention gate (load-time, env-bridged).
+pub mod kuna_dwarftypedefs;
 // (kuna) Degenerate-symbol-name repair option gate (load-time, env-bridged).
 pub mod kuna_symbolnamerepair;
 // (kuna) Symbol-name character sanitizer + option gate (load-time, env-bridged).

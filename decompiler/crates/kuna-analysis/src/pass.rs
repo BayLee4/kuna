@@ -195,6 +195,10 @@ pub struct LocalFact {
 pub struct TypedDataFact {
     /// Virtual address of the object.
     pub addr: u64,
+    /// A DWARF declaration (option `dwarftypedefs`): published with the other
+    /// DWARF globals, ahead of the loader and library names, whatever `datasyms`
+    /// says about those.
+    pub dwarf: bool,
     /// The name the symbol is installed under.
     pub name: String,
     /// The recovered kuna [`Datatype`](kuna_decomp::dtype::Datatype) for the
