@@ -754,20 +754,8 @@ impl<R: Read + 'static, W: Write + 'static> GhidraProcess<R, W> {
                     if signature {
                         arch.allacts.set_current("normalize").map_err(WireError::from)?;
                     }
-                    let driven = kuna_decomp::decompile_drive::decompile_func_full_with_override_dyn(
-                        arch,
-                        &name,
-                        addr.clone(),
-                        0,
-                        &[],
-                        &[],
-                        &[],
-                        None,
-                        &[],
-                        &[],
-                        // The host's EXACT committed parameter storage (empty
-                        // for an unlocked signature — kuna recovers those).
-                        &[],
+                    let driven = kuna_decomp::decompile_drive::decompile_func_full(
+                        arch, &name, addr.clone(), 0, &[], None,
                     );
                     if signature {
                         arch.allacts.set_current(&saved_root).map_err(WireError::from)?;

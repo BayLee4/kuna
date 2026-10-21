@@ -1,6 +1,5 @@
-//! Genuine MIPS raw and final consumers; build the original role fixtures first.
+//! Genuine MIPS raw and final consumers over the committed role images.
 
-use std::path::PathBuf;
 use std::rc::Rc;
 use kuna_base::address::Address;
 use kuna_console::engine::{bootstrap_from_object, ConsoleProgram};
@@ -10,11 +9,11 @@ use kuna_decomp::funcdata::Funcdata;
 use kuna_num::opcodes::OpCode;
 
 fn program(readonly: u8) -> ConsoleProgram {
-    let fixtures = std::env::var_os("KUNA_MIPS_ROLE_FIXTURES").map(PathBuf::from)
-        .expect("build_mips_roles.py must supply the genuine MIPS images");
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    let image = root.join(format!(
+        "decompiler/crates/kuna-analysis/tests/fixtures/mips_role_readonly{readonly}.elf"));
     let mut program = bootstrap_from_object(
-        fixtures.join(format!("readonly{readonly}.elf")).to_str().unwrap(), "",
+        image.to_str().unwrap(), "",
         &[root.join("specs").to_str().unwrap().to_owned()],
     ).expect("original MIPS images and built processor specifications");
     program.read_loader_symbols().unwrap();
@@ -47,7 +46,6 @@ fn opcode_count(fd: &Funcdata, code: OpCode) -> usize {
 }
 
 #[test]
-#[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
 fn original_loaded_calls_distinguish_dirty_full_and_partial_internal_role_definitions() {
     for readonly in [0, 1] {
         let mut program = program(readonly);
@@ -77,7 +75,6 @@ fn original_loaded_calls_distinguish_dirty_full_and_partial_internal_role_defini
 }
 
 #[test]
-#[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
 fn natural_child_preserves_raw_gp_write_and_return_reads() {
     let mut program = program(0);
     let gp = program.arch().get_register_varnode(b"gp").unwrap();
@@ -93,7 +90,6 @@ fn natural_child_preserves_raw_gp_write_and_return_reads() {
 }
 
 #[test]
-#[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
 fn actual_private_spill_reload_and_escape_keep_raw_effects_and_source_formals() {
     for (name, declaration, stores, loads, expected_global) in [
         ("private_gp_spill", "extern int private_gp_spill(void);", 1, 0, None),
@@ -122,7 +118,6 @@ fn actual_private_spill_reload_and_escape_keep_raw_effects_and_source_formals() 
 }
 
 #[test]
-#[ignore = "Requires genuine MIPS role fixtures and built processor specifications"]
 fn actual_direct_child_preserves_a_later_implicit_raw_gp_read() {
     let mut program = program(0);
     let gp = program.arch().get_register_varnode(b"gp").unwrap();

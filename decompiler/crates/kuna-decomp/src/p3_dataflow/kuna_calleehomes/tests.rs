@@ -364,7 +364,7 @@ fn home_gap_requires_a_declared_eight_byte_return_slot_before_it() {
 }
 
 #[test]
-fn home_gap_requires_locked_inputs_and_a_stored_concrete_model_not_an_authored_convention() {
+fn home_gap_requires_a_stored_locked_resolved_known_model() {
     let mut fx = Fx::new();
 
     let no_model = FuncProto::new();
@@ -409,8 +409,7 @@ fn home_gap_requires_locked_inputs_and_a_stored_concrete_model_not_an_authored_c
     let call = call_with_proto(&mut fx, &unlocked_model);
     assert!(call.proto().is_input_locked());
     assert!(!call.proto().is_model_locked());
-    assert!(verified_home_gap(&fx.fd, &call).is_some(),
-        "identical concrete geometry does not depend on an authored convention lock");
+    assert!(verified_home_gap(&fx.fd, &call).is_none());
 
     let mut unresolved = FuncProto::new();
     unresolved.set_internal(

@@ -43,6 +43,7 @@ fn verified_home_gap(fd: &Funcdata, call: &FuncCallSpecs) -> Option<Rc<AddrSpace
     if !proto.has_model()
         || !proto.has_store()
         || !proto.is_input_locked()
+        || !proto.is_model_locked()
         || proto.is_dotdotdot()
         || proto.is_model_unknown()
         || proto.has_custom_storage()
@@ -91,8 +92,7 @@ fn verified_home_gap(fd: &Funcdata, call: &FuncCallSpecs) -> Option<Rc<AddrSpace
 }
 
 /// Translate a callee home cell only when the architecture declares an 8-byte
-/// stack return slot and the current concrete model starts its sole stack input
-/// at byte 40. Authored convention locking adds no physical gap geometry.
+/// stack return slot and the locked model starts its sole stack input at byte 40.
 /// The caller-side proof must still place the translated cell in a negative local.
 /// Kuna does not currently expose the cspec `stackshift` as a model property.
 pub(crate) fn caller_home_cell(

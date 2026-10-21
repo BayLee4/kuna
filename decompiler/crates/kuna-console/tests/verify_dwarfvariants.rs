@@ -17,9 +17,6 @@
 //! variant part alone and not its sibling. (This arm EXTENDS `dwarfstructs` and
 //! is gated on it as well; `dwarfstructs_off_suppresses_the_variant_arm_too` is
 //! the test for that.)
-//! `indirectargs` is pinned OFF in both arms: these assertions observe allocated
-//! ABI signatures and physical hidden-return field accesses, not the independent
-//! source-result presentation that hides those ABI parameters.
 //!
 //! ## The naming rule has a test for the REFUSAL, not only for the happy path
 //!
@@ -89,9 +86,7 @@ fn decompile_in(fixture: &str, funcs: &[&str], variants: bool) -> String {
     let mut prog = prog.expect("bootstrap fixture with built processor specs");
     prog.commit_pending_analysis().expect("analysis commit succeeds");
 
-    // Observe physical ABI signatures/hidden-return accesses in both variant
-    // arms, before independent source-result presentation hides that evidence.
-    let mut cmds = vec!["option indirectargs off".to_string()];
+    let mut cmds: Vec<String> = Vec::new();
     for f in funcs {
         cmds.push(format!("load function {f}"));
         cmds.push("decompile".into());

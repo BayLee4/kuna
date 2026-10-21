@@ -38,7 +38,6 @@ kuna-decomp.workspace = true
 # nothing depends on kuna-ghidra, and dev-deps do not propagate.
 kuna-console.workspace = true
 kuna-analysis.workspace = true
-kuna-harness = { path = "../kuna-harness" }
 
 [lints]
 workspace = true
