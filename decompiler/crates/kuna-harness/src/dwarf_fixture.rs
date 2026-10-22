@@ -27,14 +27,28 @@ pub fn compile_dwarf(source: &Path, standard: &str, flags: &[&str]) -> CompiledD
     let fixture = CompiledDwarf { path, directory };
     let mut command = Command::new(&compiler);
     command.arg(format!("-std={standard}")).args(["-g", "-gdwarf-4", "-O0", "-fno-inline"]);
-    if cfg!(target_os = "macos") || cross {
+    let macho = cfg!(target_os = "macos") && !cross;
+    if cross || macho {
         command.arg("-c");
     } else {
         command.arg("-no-pie");
     }
-    let output = command.args(flags).arg(source).arg("-o").arg(&fixture.path)
+    let object = fixture.path.with_extension("o");
+    let target = if macho { &object } else { &fixture.path };
+    let output = command.args(flags).arg(source).arg("-o").arg(target)
         .output().expect("DWARF producer missing: install clang or set KUNA_DWARF_CC to a real compiler");
     assert!(output.status.success(), "DWARF producer {compiler:?} failed:\n{}",
         String::from_utf8_lossy(&output.stderr));
+    if macho {
+        // A Mach-O object keeps its relocations unapplied and a linked image keeps its DWARF in
+        // the object files, so link the kept object and extract a dSYM beside the image.
+        for (tool, args) in [
+            (&compiler, vec![object.as_os_str(), "-o".as_ref(), fixture.path.as_os_str()]),
+            (&"dsymutil".into(), vec![fixture.path.as_os_str()]),
+        ] {
+            let output = Command::new(tool).args(args).output().expect("Mach-O link and dSYM tools");
+            assert!(output.status.success(), "{tool:?} failed:\n{}", String::from_utf8_lossy(&output.stderr));
+        }
+    }
     fixture
 }
