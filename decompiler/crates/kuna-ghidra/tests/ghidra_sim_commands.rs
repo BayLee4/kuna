@@ -1,8 +1,8 @@
 //! Wire contracts of the extension's native commands, driven in-process like
 //! `ghidra_sim_e2e.rs` (kuna's own loader answers the host queries): the
 //! options list a Java `DecompileOptions` sends reaches the printer and is
-//! replaced, not accumulated, by the next list; the BSim signature commands
-//! answer on the wire.
+//! replaced, not accumulated, by the next list; the BSim signature commands and
+//! `structureGraph` answer on the wire.
 
 #[path = "ghidra_sim/mod.rs"]
 mod ghidra_sim;
@@ -16,6 +16,11 @@ use kuna_decomp::options::{
     ELEM_PARAM1, ELEM_PARAM2,
 };
 use kuna_base::marshal::ElementId;
+use kuna_base::marshal::{Decoder, PackedDecode, ATTRIB_INDEX, ATTRIB_TYPE, ELEM_TARGET};
+use kuna_decomp::block::{
+    BlockGraph, BlockKind, FlowBlock, ATTRIB_ALTINDEX, ATTRIB_END, ATTRIB_REV, ELEM_BHEAD, ELEM_BLOCK,
+    ELEM_EDGE,
+};
 use kuna_ghidra::process::GhidraProcess;
 
 use ghidra_sim::oracle::{generate_tspec, repo_root, SimOracle};
@@ -176,4 +181,85 @@ fn ghidra_sim_signature_commands_answer_deterministically() {
     assert_eq!(payload(1), payload(2), "repeat generateSignatures differs");
     assert!(payload(3).len() > payload(1).len(), "debug signatures carry the simple features and more");
     assert_eq!(payload(1), payload(5), "a refused setting changed the next result");
+}
+
+/// One `<block>` of `structureGraph`'s answer: the canonical output grammar the
+/// Java `BlockGraph` consumes (type, optional `altindex` of a copy, `<bhead>`
+/// headers, child blocks, `<target>`s and `<edge>`s).
+#[derive(Debug)]
+struct Structured {
+    kind: String,
+    original: Option<i64>,
+    children: Vec<Structured>,
+    edges: Vec<(i64, i64)>,
+}
+
+fn read_block(decoder: &mut dyn Decoder, kind: String) -> Structured {
+    let element = decoder.open_element_id(&ELEM_BLOCK).unwrap();
+    decoder.read_signed_integer_id(&ATTRIB_INDEX).unwrap();
+    let original = (kind == "copy").then(|| decoder.read_signed_integer_id(&ATTRIB_ALTINDEX).unwrap());
+    let mut headers = Vec::new();
+    while decoder.peek_element().unwrap() == ELEM_BHEAD.get_id() {
+        let header = decoder.open_element_id(&ELEM_BHEAD).unwrap();
+        decoder.read_signed_integer_id(&ATTRIB_INDEX).unwrap();
+        headers.push(String::from_utf8(decoder.read_string_id(&ATTRIB_TYPE).unwrap()).unwrap());
+        decoder.close_element(header).unwrap();
+    }
+    let children = headers.into_iter().map(|child_kind| read_block(decoder, child_kind)).collect();
+    while decoder.peek_element().unwrap() == ELEM_TARGET.get_id() {
+        decoder.skip_element().unwrap();
+    }
+    let mut edges = Vec::new();
+    while decoder.peek_element().unwrap() == ELEM_EDGE.get_id() {
+        let edge = decoder.open_element_id(&ELEM_EDGE).unwrap();
+        edges.push((
+            decoder.read_signed_integer_id(&ATTRIB_END).unwrap(),
+            decoder.read_signed_integer_id(&ATTRIB_REV).unwrap(),
+        ));
+        decoder.close_element(edge).unwrap();
+    }
+    decoder.close_element(element).unwrap();
+    Structured { kind, original, children, edges }
+}
+
+/// `structureGraph` structures a diamond for the GUI's graph consumers: one list
+/// of an if/else (condition, true branch, false branch) and the join, where the
+/// join is a copy naming its input block and carries the collapsed edge.
+#[test]
+fn ghidra_sim_structure_graph_structures_a_diamond() {
+    let mut graph = BlockGraph::new();
+    let top = graph.arena.insert(FlowBlock::new_kind(BlockKind::Graph));
+    let blocks: Vec<_> = (0..4).map(|_| graph.new_block(top)).collect();
+    for (index, &block) in blocks.iter().enumerate() {
+        graph.block_mut(block).set_index(index as i32);
+    }
+    for (from, to) in [(0, 1), (0, 2), (1, 3), (2, 3)] {
+        graph.add_edge(blocks[from], blocks[to]);
+    }
+    let mut packed = Vec::new();
+    graph.encode(top, &mut PackedEncode::new(&mut packed));
+
+    let (oracle, responses) = run_script(|v, _| {
+        command(v, "structureGraph", &[b"0", &packed]);
+        1
+    });
+    assert!(responses[0].warnings.trim().is_empty(), "warnings: {}", responses[0].warnings);
+    let payload = responses[0].payload.as_ref().expect("structureGraph payload");
+    let mut decoder = PackedDecode::new(&oracle.manager);
+    decoder.ingest_stream(payload).expect("response stream");
+    let result = read_block(&mut decoder, "graph".into());
+    assert_eq!(decoder.peek_element().unwrap(), 0, "trailing elements");
+
+    let [list] = &result.children[..] else { panic!("one top-level component: {result:?}") };
+    assert_eq!(list.kind, "list");
+    let [conditional, join] = &list.children[..] else { panic!("if/else then join: {list:?}") };
+    assert_eq!(conditional.kind, "ifelse");
+    assert_eq!(conditional.children.len(), 3);
+    assert_eq!(
+        conditional.children.iter().map(|c| c.original).collect::<Vec<_>>(),
+        vec![Some(0), Some(2), Some(1)],
+        "condition, true branch, false branch name their input blocks",
+    );
+    assert_eq!((join.kind.as_str(), join.original), ("copy", Some(3)));
+    assert_eq!(join.edges.len(), 1, "the join keeps one collapsed incoming edge");
 }
