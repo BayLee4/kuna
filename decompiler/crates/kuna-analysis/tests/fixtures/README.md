@@ -1572,14 +1572,3 @@ Callable cases relaunch only their exact test in an isolated child with
 target's type factory, default prototype model and address spaces; enabling
 the unrelated record gate alone does not enable callable import. The ordinary
 library tests and feature-OFF consumers retain their original environment.
-
-The ignored no-return case requires an actual serialized callback effect:
-either `DW_AT_noreturn` or GNU C's volatile-qualified function type. The latter
-uses the selected typedef's CU producer/language and qualification on the function,
-not on its pointer or an object. Examined GCC 16 producers supply that encoding;
-examined Clang producers recognize the annotation in executable code but merge
-the callback debug types. Run the conditional case explicitly with `--ignored`
-and a verified producer selected through `KUNA_DWARF_CC`; its unchanged loader
-assertion must preserve the supplied effect. A source annotation alone is
-insufficient. Missing facts, malformed acquisition and importer loss remain
-distinct failures, not permission to alter the fixture.

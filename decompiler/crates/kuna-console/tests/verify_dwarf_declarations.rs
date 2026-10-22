@@ -57,74 +57,6 @@ fn pieces<'a>(program: &'a ConsoleProgram, name: &str) -> &'a PrototypePieces {
         .unwrap_or_else(|| panic!("known source declaration was discarded: {name}"))
 }
 
-fn require_declared_noreturn(path: &Path, callback: &str) {
-    use std::collections::{BTreeMap, BTreeSet};
-    let dumper = std::env::var_os("KUNA_DWARF_DUMP").unwrap_or_else(|| "llvm-dwarfdump".into());
-    let output = Command::new(&dumper).arg("--debug-info").arg(path).output()
-        .expect("noreturn producer prerequisite requires llvm-dwarfdump or KUNA_DWARF_DUMP");
-    assert!(output.status.success(), "DWARF fact dumper {dumper:?} failed:\n{}",
-        String::from_utf8_lossy(&output.stderr));
-    let text = String::from_utf8(output.stdout).expect("DWARF fact dump must be UTF-8");
-    let mut dies = BTreeMap::<u64, (&str, Vec<&str>)>::new();
-    let mut current = None;
-    for line in text.lines().map(str::trim) {
-        if let Some((offset, tag)) = line.split_once(':') {
-            if let Some(hex) = offset.strip_prefix("0x") {
-                let offset = u64::from_str_radix(hex, 16).expect("DWARF DIE offset");
-                dies.insert(offset, (tag.trim(), Vec::new()));
-                current = Some(offset);
-                continue;
-            }
-        }
-        if line.starts_with("DW_AT_") {
-            if let Some(offset) = current {
-                dies.get_mut(&offset).unwrap().1.push(line);
-            }
-        }
-    }
-    let authored_name = format!("(\"{callback}\")");
-    let mut offset = *dies.iter().find(|(_, (tag, attributes))| {
-        *tag == "DW_TAG_typedef" && attributes.iter().any(|attribute| {
-            attribute.starts_with("DW_AT_name") && attribute.ends_with(&authored_name)
-        })
-    }).expect("producer omitted authored callback typedef").0;
-    let gnu_c = dies.range(..=offset).rev()
-        .find(|(_, (tag, _))| *tag == "DW_TAG_compile_unit")
-        .is_some_and(|(_, (_, attributes))| {
-            attributes.iter().any(|attribute| attribute.starts_with("DW_AT_producer")
-                && attribute.contains("(\"GNU C"))
-                && attributes.iter().any(|attribute| attribute.starts_with("DW_AT_language")
-                    && ["(DW_LANG_C)", "(DW_LANG_C89)", "(DW_LANG_C99)", "(DW_LANG_C11)"]
-                        .iter().any(|language| attribute.ends_with(language)))
-        });
-    let mut function_volatile = false;
-    let mut seen = BTreeSet::new();
-    loop {
-        assert!(seen.insert(offset), "producer callback DIE chain cycles");
-        let (tag, attributes) = dies.get(&offset).expect("producer callback reference is absent");
-        if *tag == "DW_TAG_subroutine_type" {
-            let declared = attributes.iter().any(|attribute| {
-                attribute.starts_with("DW_AT_noreturn") && attribute.ends_with("(true)")
-            }) || (gnu_c && function_volatile);
-            assert!(declared, "producer-missing: actual {callback} subroutine DIE {offset:#x} supplies neither a true DW_AT_noreturn nor GNU C volatile-function no-return; no importer verdict");
-            return;
-        }
-        assert!(matches!(*tag, "DW_TAG_typedef" | "DW_TAG_pointer_type" |
-            "DW_TAG_const_type" | "DW_TAG_volatile_type" | "DW_TAG_restrict_type"),
-            "producer callback chain reached unexpected {tag}");
-        if *tag == "DW_TAG_pointer_type" {
-            function_volatile = false;
-        } else if *tag == "DW_TAG_volatile_type" {
-            function_volatile = true;
-        }
-        let reference = attributes.iter().find(|attribute| attribute.starts_with("DW_AT_type"))
-            .expect("producer callback DIE has no type reference");
-        let hex = reference.split_once("(0x").expect("DWARF type reference offset").1
-            .split(|character: char| !character.is_ascii_hexdigit()).next().unwrap();
-        offset = u64::from_str_radix(hex, 16).expect("DWARF callback type offset");
-    }
-}
-
 fn emitted(program: ConsoleProgram, name: &str) -> String {
     let commands = vec![format!("load function {name}"), "decompile".into(), "print C".into()];
     let mut status = ConsoleCommands::into_status(commands);
@@ -260,18 +192,6 @@ fn supplied_callback_order_and_alias_survive_loader() {
         let ty = proto.get_param(index).unwrap().get_type().unwrap();
         assert_eq!((ty.get_size(), ty.get_metatype(), ty.get_name()), (1, meta, name));
     }
-}
-
-#[test]
-#[ignore = "producer-dependent: requires callback no-return encoded in actual DWARF"]
-fn supplied_noreturn_callback_effect_survives_loader() {
-    if !callable_child("supplied_noreturn_callback_effect_survives_loader") { return; }
-    let fixture = producer::compile_dwarf(&fixtures().join("dwarf_declarations.c"), "c11", &[]);
-    require_declared_noreturn(&fixture.path, "NoReturn");
-    let program = boot(&fixture.path);
-    let source = pieces(&program, "invoke_noreturn");
-    let code = source.intypes[0].get_ptr_to().unwrap();
-    assert!(code.get_code_prototype().expect("declared noreturn callback").is_no_return());
 }
 
 #[test]

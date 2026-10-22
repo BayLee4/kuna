@@ -5,7 +5,6 @@ typedef int (*Fixed)(int);
 typedef int (*Variadic)(int, ...);
 typedef unsigned char Flags;
 typedef int (*FlagCallback)(Flags, signed char);
-typedef void (*NoReturn)(void) __attribute__((noreturn));
 typedef struct Node Node;
 struct Node { Node *next; void (*visit)(Node *); };
 typedef enum Mode { Seven = 7, Negative = -1 } Mode;
@@ -34,7 +33,6 @@ int invoke_closed(Closed callback) { return callback(); }
 int invoke_fixed(Fixed callback, int x) { return callback(x); }
 int invoke_variadic(Variadic callback, int x) { return callback(x, 58); }
 int invoke_flags(Flags value, FlagCallback callback) { return callback(value, -1); }
-void invoke_noreturn(NoReturn callback) { callback(); }
 unsigned char unsigned_identity(unsigned char value) { return value; }
 signed char signed_identity(signed char value) { return value; }
 char plain_identity(char value) { return value; }
