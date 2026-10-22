@@ -153,3 +153,27 @@ fn ghidra_sim_signature_settings_answer_on_the_wire() {
     assert_eq!(payload(3), b"f");
     assert_eq!(payload(2), payload(4), "a refused setting leaves the valid one");
 }
+
+/// BSim signatures: `generateSignatures` and `debugSignatures` answer for a function
+/// whose host supplied no prototype, deterministically, and a refused settings
+/// change does not alter the next result.
+#[test]
+fn ghidra_sim_signature_commands_answer_deterministically() {
+    let (_, responses) = run_script(|v, entry| {
+        cmd_set_action(v, "0", "normalize", "");
+        command(v, "generateSignatures", &[b"0", entry]);
+        command(v, "generateSignatures", &[b"0", entry]);
+        command(v, "debugSignatures", &[b"0", entry]);
+        command(v, "setSignatureSettings", &[b"0", b"2"]);
+        command(v, "generateSignatures", &[b"0", entry]);
+        6
+    });
+    let payload = |i: usize| responses[i].payload.clone().expect("payload");
+    for i in 0..6 {
+        assert!(responses[i].warnings.trim().is_empty(), "#{i}: {}", responses[i].warnings);
+    }
+    assert!(payload(1).len() > 16, "an empty signature document");
+    assert_eq!(payload(1), payload(2), "repeat generateSignatures differs");
+    assert!(payload(3).len() > payload(1).len(), "debug signatures carry the simple features and more");
+    assert_eq!(payload(1), payload(5), "a refused setting changed the next result");
+}

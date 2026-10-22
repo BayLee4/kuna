@@ -1047,6 +1047,11 @@ impl Action for ActionNormalizeSetup {
         // C++ coreaction.cc:4618-4629: retain return storage, but remove input
         // symbols and allow the model and return type to be recovered again.
         let fp = data.get_func_proto_mut();
+        if !fp.has_store() {
+            fp.attach_internal_store(std::rc::Rc::new(crate::dtype::Datatype::new(
+                0, crate::dtype::type_metatype::TYPE_VOID,
+            )));
+        }
         fp.clear_input();
         fp.set_model_lock(false);
         fp.set_output_lock(false);
