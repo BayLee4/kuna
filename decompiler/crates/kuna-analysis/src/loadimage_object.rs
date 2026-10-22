@@ -558,23 +558,25 @@ pub struct ObjectLoadImage {
 /// `SymbolEntry` against, and the linker's section-boundary markers
 /// (`__bss_start`, `_edata`, `_end`) are exactly the zero-size entries that would
 /// otherwise plant a spurious name on the first byte of an unrelated object.
+///
+/// A Mach-O symbol table states no sizes: `macho` supplies the extent instead
+/// ([`crate::loader::kuna_machodata`]).
 fn collect_data_sym<'a>(
     sym: &impl object::ObjectSymbol<'a>,
     out: &mut Vec<DataSym>,
     seen: &mut HashSet<u64>,
     mode: NameChars,
+    macho: Option<&crate::loader::kuna_machodata::MachoData>,
 ) {
     if sym.is_undefined() {
         return;
     }
-    let size = sym.size();
+    let Ok(raw) = sym.name_bytes() else { return };
+    let size = macho.map_or_else(|| sym.size(), |macho| macho.extent(sym));
     if size == 0 {
         return;
     }
-    let name = match sym.name_bytes() {
-        Ok(n) if !n.is_empty() => crate::loader::elf_plt::strip_version(n),
-        _ => return,
-    };
+    let name = crate::loader::elf_plt::strip_version(raw);
     if name.is_empty() {
         return;
     }
@@ -861,6 +863,7 @@ impl ObjectLoadImage {
         // the same walks and deduped on its own address set.  See [`DataSym`].
         let mut datasyms: Vec<DataSym> = Vec::new();
         let mut seen_data: HashSet<u64> = HashSet::new();
+        let macho_data = crate::loader::kuna_machodata::MachoData::new(&file);
 
         // 1. `.symtab` defined functions.  Skip *undefined* (import-placeholder)
         //    entries — e.g. the ELF UND `puts@@GLIBC_2.2.5` (`st_value == 0`),
@@ -877,7 +880,7 @@ impl ObjectLoadImage {
         //    COFF object's defined-at-0 function (design §3.6 object-vs-image).
         for sym in file.symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars, macho_data.as_ref());
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -922,7 +925,7 @@ impl ObjectLoadImage {
         //    functions in `.dynsym`.
         for sym in file.dynamic_symbols() {
             if sym.kind() == SymbolKind::Data {
-                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars);
+                collect_data_sym(&sym, &mut datasyms, &mut seen_data, namechars, macho_data.as_ref());
                 continue;
             }
             if sym.kind() != SymbolKind::Text {
@@ -3087,6 +3090,34 @@ mod tests {
         assert_eq!(syms.len(), 4, "exactly the four copy-reloc externs: {syms:?}");
         assert!(syms.iter().all(|(_, n, _)| !n.contains('@')), "no @VERSION in names");
         assert!(syms.iter().all(|(_, _, s)| *s > 0), "no zero-size entries");
+    }
+
+    #[test]
+    fn macho_data_globals_are_data_symbols_with_their_extent_and_not_functions() {
+        // A Mach-O symbol table states no sizes, and its export trie lists data
+        // globals beside functions. Each data symbol spans to the next symbol of
+        // its section (the last one to the section end) and keeps the table's
+        // spelling; an exported global is not a function.
+        let path = format!("{}/tests/fixtures/macho_datasyms_x86_64", env!("CARGO_MANIFEST_DIR"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        let img = ObjectLoadImage::from_bytes(&path, &bytes).unwrap();
+        let mut syms = img.data_symbols();
+        syms.sort();
+        let expected: Vec<(u64, String, u64)> = [
+            (0x100002000, "_exported_count", 4),
+            (0x100002004, "_exported_table", 12),
+            (0x100002010, "_local_total", 4),
+            (0x100002020, "_zeroed", 16),
+        ]
+        .map(|(addr, name, size)| (addr, name.to_string(), size))
+        .to_vec();
+        assert_eq!(syms, expected);
+
+        let functions = fixture_funcsyms("macho_datasyms_x86_64");
+        assert!(functions.values().any(|name| name == "_main"), "main stays a function: {functions:?}");
+        for (addr, name, _) in &expected {
+            assert!(!functions.contains_key(addr), "{name} is data, not a function: {functions:?}");
+        }
     }
 
     #[test]

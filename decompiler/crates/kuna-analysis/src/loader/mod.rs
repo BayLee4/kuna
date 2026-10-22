@@ -81,6 +81,8 @@ pub(crate) mod kuna_rexthunk;
 pub(crate) mod kuna_peordinal;
 pub mod macho_fat;
 pub mod macho_stubs;
+// (kuna `datasyms`) Mach-O data symbols: an extent from the next symbol, the C name.
+pub(crate) mod kuna_machodata;
 pub mod mips_markers;
 pub mod noreturn;
 pub mod pe_iat;

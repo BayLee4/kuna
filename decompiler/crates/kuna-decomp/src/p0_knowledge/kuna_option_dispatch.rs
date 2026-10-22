@@ -1080,7 +1080,7 @@ kuna_options! { self, p1;
     "mips_isa" => on_off!(analysis_mips_isa, "MIPS16 ISA_MODE decode-mode marker pass"),
     "dwarf" => on_off!(analysis_dwarf, "DWARF recovery analysis pass"),
     "datasyms" => {
-        on_off!(analysis_datasyms, "ELF data-symbol (STT_OBJECT) naming")
+        on_off!(analysis_datasyms, "ELF (STT_OBJECT) and Mach-O data-symbol naming")
     },
     "dwarf_lines" => {
         on_off!(analysis_dwarf_lines, "DWARF .debug_line source-line comment pass")

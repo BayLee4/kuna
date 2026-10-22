@@ -282,19 +282,26 @@ fn is_imported_indirect_symbol(raw: u32) -> bool {
     raw & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS) == 0
 }
 
-/// Append the Mach-O exports (name + address) as additive funcsyms, so a call to
-/// an exported function of this image resolves. Shared tail of every `collect`
-/// exit path (including the early-return error arms), mirroring `pe_iat`'s
-/// export append.
+/// Append the Mach-O exports in an executable section (name + address) as
+/// additive funcsyms, so a call to an exported function of this image resolves.
+/// An exported data global is not a function; the data-symbol stream names it.
+/// Shared tail of every `collect` exit path (including the early-return error
+/// arms), mirroring `pe_iat`'s export append.
 fn finish_with_exports(
     neutral: &object::File,
     mut out: MachOIndirectSymbols,
 ) -> MachOIndirectSymbols {
-    use object::read::Object;
+    use object::read::{Object, ObjectSection};
+    let is_code = |address: u64| {
+        neutral.sections().any(|section| {
+            section.kind() == object::SectionKind::Text
+                && (section.address()..section.address().saturating_add(section.size())).contains(&address)
+        })
+    };
     if let Ok(exports) = neutral.exports() {
         for e in exports {
             let name = e.name();
-            if !name.is_empty() {
+            if !name.is_empty() && is_code(e.address()) {
                 out.imports.push(ImportSym {
                     addr: e.address(),
                     name: strip_leading_underscore(name),

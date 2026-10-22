@@ -431,6 +431,18 @@ at `read symbols`, after the option lines are applied, so the gate is the plain
 path. Off drops the stream at the commit and restores the raw `dat_<addr>`
 rendering exactly.
 
+A linked Mach-O image reads the same stream from its one symbol table
+(`loader/kuna_machodata.rs`), which states no sizes. A data symbol therefore spans
+to the next defined symbol of its section, or to the section's end for the last
+one, and keeps the name as the table spells it (leading `_` included), like an ELF
+data symbol and like the image's own function symbols. An object file gets none,
+as an ELF relocatable gets none: its symbols are section-relative. The Mach-O
+export trie lists data globals beside functions, so
+`loader/macho_stubs.rs (finish_with_exports)` registers an export as a function
+only when its address lies in an executable section; an exported global is data,
+and taking it for code made the engine decompile it as an instruction stream and
+ignore its volatile qualifier.
+
 A **declared extent is never trusted to be representable.** `st_size` is a 64-bit
 field of the image that no header check validates, while the type factory sizes
 types in a 32-bit `int4`, so the commit clamps the declared size into `1 ..=

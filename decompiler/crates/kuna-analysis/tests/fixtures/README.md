@@ -911,6 +911,24 @@ LLD=$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/host: //p')/bin
        -undefined dynamic_lookup -e _call_slots -o macho_import_slots m.o
 ```
 
+## Mach-O data symbols
+
+`macho_datasyms_x86_64` (12 KB, linked x86-64 Mach-O, source `macho_datasyms.c`;
+SHA-256 `49ec64cc7a05ef7c46fcfca8fd60a045e96d2301e2a1c0671f3421341d8fe198`) has
+two exported initialized globals (`_exported_count`@`0x100002000`,
+`_exported_table`@`0x100002004`), one local `static` (`_local_total`@`0x100002010`)
+and one exported common (`_zeroed`@`0x100002020`) beside `_main`. The symbol table
+states no sizes, so the loader's data-symbol stream derives them (4, 12, 4 and
+16 bytes: the distance to the next symbol or to the end of the section), and the
+export trie's data globals are not functions
+(`loadimage_object.rs`: `macho_data_globals_are_data_symbols_with_their_extent_and_not_functions`).
+Rebuild with the `macho_imports` recipe above:
+
+```bash
+clang -target x86_64-apple-macos11 -O1 -c macho_datasyms.c -o m.o
+"$LLD" -arch x86_64 -platform_version macos 11.0 11.0 -e _main -o macho_datasyms_x86_64 m.o
+```
+
 ## Mach-O fat/universal + arm64e (PR-8)
 
 The fat/universal + arm64e gate (`kuna-console/tests/verify_macho_fat.rs`, design
